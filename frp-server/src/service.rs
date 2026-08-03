@@ -268,25 +268,48 @@ where
 async fn v2_handshake_and_read(
     io: &mut IoStream,
     addr: Option<std::net::SocketAddr>,
+    deadline: tokio::time::Instant,
     log_prefix: &str,
 ) -> Option<(Vec<u8>, Option<frp_core::v2_handshake::CryptoContext>)> {
-    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(io).await {
-        Ok((Some(p), crypto)) => (p, crypto),
-        Ok((None, crypto)) => {
-            match frp_core::v2_handshake::read_first_frame_after_handshake(io).await {
-                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                Ok((ft, _, _)) => {
-                    tracing::warn!(frame_type = ?ft, peer = ?addr, "{}: unexpected frame type {} after handshake", log_prefix, ft);
-                    return None;
-                }
-                Err(e) => {
-                    tracing::warn!(peer = ?addr, error = %e, "{}: failed to read message after handshake: {}", log_prefix, e);
-                    return None;
+    let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
+        deadline,
+        frp_core::v2_handshake::v2_handshake_server(io),
+    )
+    .await
+    {
+        Ok(r) => match r {
+            Ok((Some(p), crypto)) => (p, crypto),
+            Ok((None, crypto)) => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    frp_core::v2_handshake::read_first_frame_after_handshake(io),
+                )
+                .await
+                {
+                    Ok(r) => match r {
+                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                        Ok((ft, _, _)) => {
+                            tracing::warn!(frame_type = ?ft, peer = ?addr, "{}: unexpected frame type {} after handshake", log_prefix, ft);
+                            return None;
+                        }
+                        Err(e) => {
+                            tracing::warn!(peer = ?addr, error = %e, "{}: failed to read message after handshake: {}", log_prefix, e);
+                            return None;
+                        }
+                    },
+                    Err(_elapsed) => {
+                        tracing::warn!(peer = ?addr, "{}: read first frame after handshake timeout", log_prefix);
+                        return None;
+                    }
                 }
             }
-        }
-        Err(e) => {
-            tracing::warn!(peer = ?addr, error = %e, "{} handshake error: {}", log_prefix, e);
+            Err(e) => {
+                tracing::warn!(peer = ?addr, error = %e, "{} handshake error: {}", log_prefix, e);
+                return None;
+            }
+        },
+        Err(_elapsed) => {
+            tracing::warn!(peer = ?addr, "{} handshake timeout", log_prefix);
             return None;
         }
     };
@@ -630,6 +653,10 @@ impl Service {
                                 }
                                 spawn_boxed(Box::pin(async move {
                                     let _permit = permit;
+                                    // Single absolute deadline covering the initial read phase
+                                    // (WS upgrade + V2 handshake + first frame), matching Go frp's
+                                    // single SetReadDeadline(10s) connReadTimeout semantics.
+                                    let accept_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
                                     match frp_core::transport::accept_websocket(IoStream::Tcp(stream)).await {
                                         Ok(mut ws) => {
                                             info!(addr = %addr, "WebSocket upgrade completed for {}", addr);
@@ -695,7 +722,7 @@ impl Service {
                                                                     Err(_) => false,
                                                                 };
                                                                 if is_v2 {
-                                                                    let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+TLS+yamux V2").await {
+                                                                    let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), accept_deadline, "WS+TLS+yamux V2").await {
                                                                         Some(v) => v,
                                                                         None => return,
                                                                     };
@@ -721,7 +748,7 @@ impl Service {
                                                             Err(_) => false,
                                                         };
                                                         if is_tls_v2 {
-                                                            let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+TLS+V2").await {
+                                                            let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), accept_deadline, "WS+TLS+V2").await {
                                                                 Some(v) => v,
                                                                 None => return,
                                                             };
@@ -762,7 +789,7 @@ impl Service {
                                                             Err(_) => false,
                                                         };
                                                         if is_v2 {
-                                                            let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+yamux V2").await {
+                                                            let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), accept_deadline, "WS+yamux V2").await {
                                                                 Some(v) => v,
                                                                 None => return,
                                                             };
@@ -781,7 +808,7 @@ impl Service {
                                                 }
                                             } else if is_v2 {
                                                 // V2 path: ClientHello/ServerHello handshake
-                                                let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut ws, Some(addr), "WS V2").await {
+                                                let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut ws, Some(addr), accept_deadline, "WS V2").await {
                                                     Some(v) => v,
                                                     None => return,
                                                 };
@@ -2021,10 +2048,13 @@ impl Service {
                         // detection (detect_and_strip_magic) with a timeout.
                         // Matches Go frp's SetReadDeadline(10s) before reading
                         // any data from a new connection (server/service.go:557).
-                        let read_timeout = Duration::from_secs(10);
+                        // Single absolute deadline from task start covering the whole
+                        // initial read phase (magic + TLS detection + first message),
+                        // matching Go's single connReadTimeout deadline.
+                        let accept_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
                         let _permit = permit;
-                        let (ct, stream_io) = match tokio::time::timeout(
-                            read_timeout,
+                        let (ct, stream_io) = match tokio::time::timeout_at(
+                            accept_deadline,
                             detect_and_strip_magic(stream),
                         )
                         .await
@@ -2072,8 +2102,8 @@ impl Service {
                                 // CheckAndEnableTLSServerConnWithTimeout applies during
                                 // TLS detection (server/service.go constant, 10s).
                                 let mut sni_buf = vec![0u8; 4096];
-                                let sni_peek_n = match tokio::time::timeout(
-                                    std::time::Duration::from_secs(10),
+                                let sni_peek_n = match tokio::time::timeout_at(
+                                    accept_deadline,
                                     inner_stream.read(&mut sni_buf),
                                 ).await {
                                     Ok(Ok(n)) if n >= 43 => n,
@@ -2197,16 +2227,16 @@ impl Service {
                                 // the same value instead of a shorter hardcoded one.
                                 let mut ws_peek = vec![0u8; 4];
                                 #[cfg(feature = "websocket")]
-                                let got_http = match tokio::time::timeout(
-                                    std::time::Duration::from_secs(10),
+                                let got_http = match tokio::time::timeout_at(
+                                    accept_deadline,
                                     io.read_exact(&mut ws_peek[..4]),
                                 ).await {
                                     Ok(Ok(n)) if n >= 4 => &ws_peek[..4] == b"GET ",
                                     _ => false,
                                 };
                                 #[cfg(not(feature = "websocket"))]
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(10),
+                                let _ = tokio::time::timeout_at(
+                                    accept_deadline,
                                     io.read_exact(&mut ws_peek[..4]),
                                 ).await;
 
@@ -2254,23 +2284,35 @@ impl Service {
                                                 }
                                             };
                                             if is_v2 {
-                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
-                                                    Ok((Some(p), crypto)) => (p, crypto),
-                                                    Ok((None, crypto)) => {
-                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut ws).await {
-                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                            Ok((ft, _, _)) => {
-                                                                warn!(frame_type = ?ft, addr = %addr, "WS+TLS V2: unexpected frame type {} from {}", ft, addr);
-                                                                return;
-                                                            }
-                                                            Err(e) => {
-                                                                warn!(addr = %addr, error = %e, "WS+TLS V2: failed to read message: {}", e);
-                                                                return;
+                                                let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut ws)).await {
+                                                    Ok(r) => match r {
+                                                        Ok((Some(p), crypto)) => (p, crypto),
+                                                        Ok((None, crypto)) => {
+                                                            match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut ws)).await {
+                                                                Ok(r) => match r {
+                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                    Ok((ft, _, _)) => {
+                                                                        warn!(frame_type = ?ft, addr = %addr, "WS+TLS V2: unexpected frame type {} from {}", ft, addr);
+                                                                        return;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(addr = %addr, error = %e, "WS+TLS V2: failed to read message: {}", e);
+                                                                        return;
+                                                                    }
+                                                                },
+                                                                Err(_elapsed) => {
+                                                                    warn!(addr = %addr, "WS+TLS V2: read first frame after handshake timeout from {}", addr);
+                                                                    return;
+                                                                }
                                                             }
                                                         }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(addr = %addr, error = %e, "WS+TLS V2 handshake error: {}", e);
+                                                        Err(e) => {
+                                                            warn!(addr = %addr, error = %e, "WS+TLS V2 handshake error: {}", e);
+                                                            return;
+                                                        }
+                                                    },
+                                                    Err(_elapsed) => {
+                                                        warn!(addr = %addr, "WS+TLS V2 handshake timeout from {}", addr);
                                                         return;
                                                     }
                                                 };
@@ -2299,23 +2341,35 @@ impl Service {
                                                             Err(_) => false,
                                                         };
                                                         if is_v2 {
-                                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                                Ok((Some(p), crypto)) => (p, crypto),
-                                                                Ok((None, crypto)) => {
-                                                                    match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                        Ok((ft, _, _)) => {
-                                                                            warn!(frame_type = ?ft, addr = %addr, "WS+TLS+yamux V2: unexpected frame type {} from {}", ft, addr);
-                                                                            return;
-                                                                        }
-                                                                        Err(e) => {
-                                                                            warn!(addr = %addr, error = %e, "WS+TLS+yamux V2: failed to read message: {}", e);
-                                                                            return;
+                                                            let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                                                Ok(r) => match r {
+                                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                                    Ok((None, crypto)) => {
+                                                                        match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                                            Ok(r) => match r {
+                                                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                                Ok((ft, _, _)) => {
+                                                                                    warn!(frame_type = ?ft, addr = %addr, "WS+TLS+yamux V2: unexpected frame type {} from {}", ft, addr);
+                                                                                    return;
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    warn!(addr = %addr, error = %e, "WS+TLS+yamux V2: failed to read message: {}", e);
+                                                                                    return;
+                                                                                }
+                                                                            },
+                                                                            Err(_elapsed) => {
+                                                                                warn!(addr = %addr, "WS+TLS+yamux V2: read first frame after handshake timeout from {}", addr);
+                                                                                return;
+                                                                            }
                                                                         }
                                                                     }
-                                                                }
-                                                                Err(e) => {
-                                                                    warn!(addr = %addr, error = %e, "WS+TLS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                    Err(e) => {
+                                                                        warn!(addr = %addr, error = %e, "WS+TLS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                        return;
+                                                                    }
+                                                                },
+                                                                Err(_elapsed) => {
+                                                                    warn!(addr = %addr, "WS+TLS+yamux V2 handshake timeout from {}", addr);
                                                                     return;
                                                                 }
                                                             };
@@ -2367,25 +2421,37 @@ impl Service {
                                             };
                                             if is_v2 {
                                                 // V2 detected on TLS+yamux stream
-                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                    Ok((Some(p), crypto)) => (p, crypto),
-                                                    Ok((None, crypto)) => {
-                                                        // Read Login in plaintext. AEAD wrapping happens in
-                                                        // handle_control after LoginResp (matching Go frp flow).
-                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                            Ok((ft, _, _)) => {
-                                                                warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
-                                                                return;
+                                                let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                                    Ok(r) => match r {
+                                                        Ok((Some(p), crypto)) => (p, crypto),
+                                                        Ok((None, crypto)) => {
+                                                            // Read Login in plaintext. AEAD wrapping happens in
+                                                            // handle_control after LoginResp (matching Go frp flow).
+                                                            match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                                Ok(r) => match r {
+                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                    Ok((ft, _, _)) => {
+                                                                        warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
+                                                                        return;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(addr = %addr, error = %e, "Failed to read V2 message after TLS+yamux handshake from {}: {}", addr, e);
+                                                                        return;
+                                                                    }
+                                                                },
+                                                                Err(_elapsed) => {
+                                                                    warn!(addr = %addr, "V2 TLS+yamux: read first frame after handshake timeout from {}", addr);
+                                                                    return;
+                                                                }
                                                             }
-                                                            Err(e) => {
-                                                            warn!(addr = %addr, error = %e, "Failed to read V2 message after TLS+yamux handshake from {}: {}", addr, e);
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(addr = %addr, error = %e, "V2 TLS+yamux handshake error from {}: {}", addr, e);
                                                             return;
                                                         }
-                                                    }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(addr = %addr, error = %e, "V2 TLS+yamux handshake error from {}: {}", addr, e);
+                                                    },
+                                                    Err(_elapsed) => {
+                                                        warn!(addr = %addr, "V2 TLS+yamux handshake timeout from {}", addr);
                                                         return;
                                                     }
                                                 };
@@ -2412,23 +2478,35 @@ impl Service {
 
                                     if is_v2 {
                                         // V2 path: ClientHello/ServerHello handshake
-                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                            Ok((Some(p), crypto)) => (p, crypto),
-                                            Ok((None, crypto)) => {
-                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                    Ok((ft, _, _)) => {
-                                                        tracing::warn!(frame_type = ?ft, addr = %addr, "TLS V2: unexpected frame type {} after handshake from {}", ft, addr);
-                                                        return;
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(addr = %addr, error = %e, "TLS V2: failed to read message after handshake from {}: {}", addr, e);
-                                                        return;
+                                        let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                            Ok(r) => match r {
+                                                Ok((Some(p), crypto)) => (p, crypto),
+                                                Ok((None, crypto)) => {
+                                                    match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                        Ok(r) => match r {
+                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                            Ok((ft, _, _)) => {
+                                                                tracing::warn!(frame_type = ?ft, addr = %addr, "TLS V2: unexpected frame type {} after handshake from {}", ft, addr);
+                                                                return;
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(addr = %addr, error = %e, "TLS V2: failed to read message after handshake from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        },
+                                                        Err(_elapsed) => {
+                                                            tracing::warn!(addr = %addr, "TLS V2: read first frame after handshake timeout from {}", addr);
+                                                            return;
+                                                        }
                                                     }
                                                 }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(addr = %addr, error = %e, "TLS V2 handshake error from {}: {}", addr, e);
+                                                Err(e) => {
+                                                    tracing::warn!(addr = %addr, error = %e, "TLS V2 handshake error from {}: {}", addr, e);
+                                                    return;
+                                                }
+                                            },
+                                            Err(_elapsed) => {
+                                                tracing::warn!(addr = %addr, "TLS V2 handshake timeout from {}", addr);
                                                 return;
                                             }
                                         };
@@ -2549,23 +2627,35 @@ impl Service {
                                                                 Err(_) => false,
                                                             };
                                                             if is_v2 {
-                                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                                    Ok((Some(p), crypto)) => (p, crypto),
-                                                                    Ok((None, crypto)) => {
-                                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                            Ok((ft, _, _)) => {
-                                                                                warn!(frame_type = ?ft, addr = %addr, "WS+TLS+yamux V2: unexpected frame type {} from {}", ft, addr);
-                                                                                return;
-                                                                            }
-                                                                            Err(e) => {
-                                                                                warn!(addr = %addr, error = %e, "WS+TLS+yamux V2: failed to read message from {}: {}", addr, e);
-                                                                                return;
+                                                                let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                                                    Ok(r) => match r {
+                                                                        Ok((Some(p), crypto)) => (p, crypto),
+                                                                        Ok((None, crypto)) => {
+                                                                            match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                                                Ok(r) => match r {
+                                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                                    Ok((ft, _, _)) => {
+                                                                                        warn!(frame_type = ?ft, addr = %addr, "WS+TLS+yamux V2: unexpected frame type {} from {}", ft, addr);
+                                                                                        return;
+                                                                                    }
+                                                                                    Err(e) => {
+                                                                                        warn!(addr = %addr, error = %e, "WS+TLS+yamux V2: failed to read message from {}: {}", addr, e);
+                                                                                        return;
+                                                                                    }
+                                                                                },
+                                                                                Err(_elapsed) => {
+                                                                                    warn!(addr = %addr, "WS+TLS+yamux V2: read first frame after handshake timeout from {}", addr);
+                                                                                    return;
+                                                                                }
                                                                             }
                                                                         }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        warn!(addr = %addr, error = %e, "WS+TLS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                        Err(e) => {
+                                                                            warn!(addr = %addr, error = %e, "WS+TLS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                            return;
+                                                                        }
+                                                                    },
+                                                                    Err(_elapsed) => {
+                                                                        warn!(addr = %addr, "WS+TLS+yamux V2 handshake timeout from {}", addr);
                                                                         return;
                                                                     }
                                                                 };
@@ -2592,23 +2682,35 @@ impl Service {
                                                         Err(_) => false,
                                                     };
                                                     if is_tls_v2 {
-                                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                            Ok((Some(p), crypto)) => (p, crypto),
-                                                            Ok((None, crypto)) => {
-                                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                    Ok((ft, _, _)) => {
-                                                                        warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
-                                                                        return;
-                                                                    }
-                                                                    Err(e) => {
-                                                                        warn!(addr = %addr, error = %e, "WS+TLS+V2: failed to read message from {}: {}", addr, e);
-                                                                        return;
+                                                        let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                                            Ok(r) => match r {
+                                                                Ok((Some(p), crypto)) => (p, crypto),
+                                                                Ok((None, crypto)) => {
+                                                                    match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                                        Ok(r) => match r {
+                                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                            Ok((ft, _, _)) => {
+                                                                                warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
+                                                                                return;
+                                                                            }
+                                                                            Err(e) => {
+                                                                                warn!(addr = %addr, error = %e, "WS+TLS+V2: failed to read message from {}: {}", addr, e);
+                                                                                return;
+                                                                            }
+                                                                        },
+                                                                        Err(_elapsed) => {
+                                                                            warn!(addr = %addr, "WS+TLS+V2: read first frame after handshake timeout from {}", addr);
+                                                                            return;
+                                                                        }
                                                                     }
                                                                 }
-                                                            }
-                                                            Err(e) => {
-                                                                warn!(addr = %addr, error = %e, "WS+TLS+V2 handshake error from {}: {}", addr, e);
+                                                                Err(e) => {
+                                                                    warn!(addr = %addr, error = %e, "WS+TLS+V2 handshake error from {}: {}", addr, e);
+                                                                    return;
+                                                                }
+                                                            },
+                                                            Err(_elapsed) => {
+                                                                warn!(addr = %addr, "WS+TLS+V2 handshake timeout from {}", addr);
                                                                 return;
                                                             }
                                                         };
@@ -2650,23 +2752,35 @@ impl Service {
                                                         Err(_) => false,
                                                     };
                                                     if is_v2 {
-                                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                            Ok((Some(p), crypto)) => (p, crypto),
-                                                            Ok((None, crypto)) => {
-                                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                    Ok((ft, _, _)) => {
-                                                                        warn!(frame_type = ?ft, addr = %addr, "WS+yamux V2: unexpected frame type {} from {}", ft, addr);
-                                                                        return;
-                                                                    }
-                                                                    Err(e) => {
-                                                                        warn!(addr = %addr, error = %e, "WS+yamux V2: failed to read message from {}: {}", addr, e);
-                                                                        return;
+                                                        let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                                            Ok(r) => match r {
+                                                                Ok((Some(p), crypto)) => (p, crypto),
+                                                                Ok((None, crypto)) => {
+                                                                    match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                                        Ok(r) => match r {
+                                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                            Ok((ft, _, _)) => {
+                                                                                warn!(frame_type = ?ft, addr = %addr, "WS+yamux V2: unexpected frame type {} from {}", ft, addr);
+                                                                                return;
+                                                                            }
+                                                                            Err(e) => {
+                                                                                warn!(addr = %addr, error = %e, "WS+yamux V2: failed to read message from {}: {}", addr, e);
+                                                                                return;
+                                                                            }
+                                                                        },
+                                                                        Err(_elapsed) => {
+                                                                            warn!(addr = %addr, "WS+yamux V2: read first frame after handshake timeout from {}", addr);
+                                                                            return;
+                                                                        }
                                                                     }
                                                                 }
-                                                            }
-                                                            Err(e) => {
-                                                                warn!(addr = %addr, error = %e, "WS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                Err(e) => {
+                                                                    warn!(addr = %addr, error = %e, "WS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                    return;
+                                                                }
+                                                            },
+                                                            Err(_elapsed) => {
+                                                                warn!(addr = %addr, "WS+yamux V2 handshake timeout from {}", addr);
                                                                 return;
                                                             }
                                                         };
@@ -2685,23 +2799,35 @@ impl Service {
                                             }
                                         } else if is_v2 {
                                             // V2 path: ClientHello/ServerHello handshake
-                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
-                                                Ok((Some(p), crypto)) => (p, crypto),
-                                                Ok((None, crypto)) => {
-                                                    match frp_core::v2_handshake::read_first_frame_after_handshake(&mut ws).await {
-                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                        Ok((ft, _, _)) => {
-                                                            warn!(frame_type = ?ft, addr = %addr, "WS V2 (main): unexpected frame type {} after handshake from {}", ft, addr);
-                                                            return;
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(addr = %addr, error = %e, "WS V2 (main): failed to read message after handshake from {}: {}", addr, e);
-                                                            return;
+                                            let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut ws)).await {
+                                                Ok(r) => match r {
+                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                    Ok((None, crypto)) => {
+                                                        match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut ws)).await {
+                                                            Ok(r) => match r {
+                                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                Ok((ft, _, _)) => {
+                                                                    warn!(frame_type = ?ft, addr = %addr, "WS V2 (main): unexpected frame type {} after handshake from {}", ft, addr);
+                                                                    return;
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!(addr = %addr, error = %e, "WS V2 (main): failed to read message after handshake from {}: {}", addr, e);
+                                                                    return;
+                                                                }
+                                                            },
+                                                            Err(_elapsed) => {
+                                                                warn!(addr = %addr, "WS V2 (main): read first frame after handshake timeout from {}", addr);
+                                                                return;
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                Err(e) => {
-                                                    warn!(addr = %addr, error = %e, "WS V2 (main) handshake error from {}: {}", addr, e);
+                                                    Err(e) => {
+                                                        warn!(addr = %addr, error = %e, "WS V2 (main) handshake error from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                },
+                                                Err(_elapsed) => {
+                                                    warn!(addr = %addr, "WS V2 (main) handshake timeout from {}", addr);
                                                     return;
                                                 }
                                             };
@@ -2761,25 +2887,37 @@ impl Service {
                                             }
 
                                             // V2 handshake: may receive ClientHello or first message
-                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                Ok((Some(p), crypto)) => (p, crypto),
-                                                Ok((None, crypto)) => {
-                                                    // Read Login in plaintext. AEAD wrapping happens in
-                                                    // handle_control after LoginResp (matching Go frp flow).
-                                                    match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                        Ok((ft, _, _)) => {
-                                                            warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
-                                                            return;
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(addr = %addr, error = %e, "Failed to read V2 message after handshake from {}: {}", addr, e);
-                                                            return;
+                                            let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                                Ok(r) => match r {
+                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                    Ok((None, crypto)) => {
+                                                        // Read Login in plaintext. AEAD wrapping happens in
+                                                        // handle_control after LoginResp (matching Go frp flow).
+                                                        match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                            Ok(r) => match r {
+                                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                Ok((ft, _, _)) => {
+                                                                    warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                                    return;
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!(addr = %addr, error = %e, "Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                                    return;
+                                                                }
+                                                            },
+                                                            Err(_elapsed) => {
+                                                                warn!(addr = %addr, "V2 yamux: read first frame after handshake timeout from {}", addr);
+                                                                return;
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                Err(e) => {
-                                                    warn!(addr = %addr, error = %e, "V2 handshake error from {}: {}", addr, e);
+                                                    Err(e) => {
+                                                        warn!(addr = %addr, error = %e, "V2 handshake error from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                },
+                                                Err(_elapsed) => {
+                                                    warn!(addr = %addr, "V2 yamux handshake timeout from {}", addr);
                                                     return;
                                                 }
                                             };
@@ -2795,25 +2933,37 @@ impl Service {
                                     let mut io = IoStream::Tcp(inner_stream);
 
                                     // V2 handshake: may receive ClientHello or first message
-                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                        Ok((Some(p), crypto)) => (p, crypto),
-                                        Ok((None, crypto)) => {
-                                            // Read Login in plaintext. AEAD wrapping happens in
-                                            // handle_control after LoginResp (matching Go frp flow).
-                                            match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                Ok((ft, _, _)) => {
-                                                    warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
-                                                    return;
-                                                }
-                                                Err(e) => {
-                                                    warn!(addr = %addr, error = %e, "Failed to read V2 message after handshake from {}: {}", addr, e);
-                                                    return;
+                                    let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                        Ok(r) => match r {
+                                            Ok((Some(p), crypto)) => (p, crypto),
+                                            Ok((None, crypto)) => {
+                                                // Read Login in plaintext. AEAD wrapping happens in
+                                                // handle_control after LoginResp (matching Go frp flow).
+                                                match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                    Ok(r) => match r {
+                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                        Ok((ft, _, _)) => {
+                                                            warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                            return;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(addr = %addr, error = %e, "Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    },
+                                                    Err(_elapsed) => {
+                                                        warn!(addr = %addr, "V2: read first frame after handshake timeout from {}", addr);
+                                                        return;
+                                                    }
                                                 }
                                             }
-                                        }
-                                        Err(e) => {
-                                            warn!(addr = %addr, error = %e, "V2 handshake error from {}: {}", addr, e);
+                                            Err(e) => {
+                                                warn!(addr = %addr, error = %e, "V2 handshake error from {}: {}", addr, e);
+                                                return;
+                                            }
+                                        },
+                                        Err(_elapsed) => {
+                                            warn!(addr = %addr, "V2 handshake timeout from {}", addr);
                                             return;
                                         }
                                     };
@@ -2864,25 +3014,37 @@ impl Service {
                                             };
                                             if is_v2 {
                                                 // V2 detected on yamux stream! Do V2 handshake + dispatch
-                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                    Ok((Some(p), crypto)) => (p, crypto),
-                                                    Ok((None, crypto)) => {
-                                                        // Read Login in plaintext. AEAD wrapping happens in
-                                                        // handle_control after LoginResp (matching Go frp flow).
-                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                            Ok((ft, _, _)) => {
-                                                                warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
-                                                                return;
-                                                            }
-                                                            Err(e) => {
-                                                                warn!(addr = %addr, error = %e, "Failed to read V2 message after handshake from {}: {}", addr, e);
-                                                                return;
+                                                let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                                    Ok(r) => match r {
+                                                        Ok((Some(p), crypto)) => (p, crypto),
+                                                        Ok((None, crypto)) => {
+                                                            // Read Login in plaintext. AEAD wrapping happens in
+                                                            // handle_control after LoginResp (matching Go frp flow).
+                                                            match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                                Ok(r) => match r {
+                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                    Ok((ft, _, _)) => {
+                                                                        warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                                        return;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(addr = %addr, error = %e, "Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                                        return;
+                                                                    }
+                                                                },
+                                                                Err(_elapsed) => {
+                                                                    warn!(addr = %addr, "V2: read first frame after handshake timeout from {}", addr);
+                                                                    return;
+                                                                }
                                                             }
                                                         }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(addr = %addr, error = %e, "V2 handshake error from {}: {}", addr, e);
+                                                        Err(e) => {
+                                                            warn!(addr = %addr, error = %e, "V2 handshake error from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    },
+                                                    Err(_elapsed) => {
+                                                        warn!(addr = %addr, "V2 handshake timeout from {}", addr);
                                                         return;
                                                     }
                                                 };
