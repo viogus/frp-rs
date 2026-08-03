@@ -716,6 +716,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                                 None,
                                                 None,
                                                 None,
+                                                None,
                                             )
                                             .await;
                                             debug!(visitor_name = %visitor_name, "Visitor '{}' XTCP encrypted P2P closed", visitor_name);
@@ -727,6 +728,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                                 p2p_w,
                                                 use_compression,
                                                 vec![],
+                                                None,
                                                 None,
                                             )
                                             .await;
@@ -849,6 +851,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 None,
                                 None,
                                 None,
+                                None,
                             )
                             .await;
                             debug!(visitor_name = %visitor_name, "Visitor '{}' STCP fallback encrypted relay closed", visitor_name);
@@ -860,6 +863,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 srv_w,
                                 use_compression,
                                 vec![],
+                                None,
                                 None,
                             )
                             .await;
@@ -960,6 +964,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 None,
                                 None,
                                 None,
+                                None,
                             )
                             .await;
                             debug!(visitor_name = %visitor_name, "Visitor '{}' STCP encrypted relay closed", visitor_name);
@@ -971,6 +976,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 srv_w,
                                 use_compression,
                                 vec![],
+                                None,
                                 None,
                             )
                             .await;

@@ -1,6 +1,7 @@
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::bandwidth::BandwidthLimiter;
@@ -14,6 +15,13 @@ use crate::transport::IoStream;
 /// so a transport read containing many small frames costs one write instead of
 /// one write per frame.
 const MAX_WORK_TO_USER_BATCH: usize = 256 * 1024;
+
+/// Body-less HTTP 504 response written to the user when the backend (work
+/// conn) produces no response bytes within `header_timeout`. Matches Go frp's
+/// `httputil.ReverseProxy` + `ResponseHeaderTimeoutS` (VhostHTTPTimeout)
+/// semantics: the response head never arrived in time, so the client gets a
+/// bare `504 Gateway Timeout` with `Content-Length: 0` and no body.
+const GATEWAY_TIMEOUT_504: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n";
 
 /// Emit a TRACE-level event with a hex-encoded field.
 ///
@@ -217,20 +225,45 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
 
 /// Bridge work→user direction: read from work (plain or via CipherReader),
 /// decompress, apply read bandwidth limit, write to user.
+///
+/// When `header_timeout` is `Some`, only the FIRST read on this direction is
+/// wrapped in `tokio::time::timeout` — if the backend produces no response
+/// bytes before the deadline (Go frp VhostHTTPTimeout / ResponseHeaderTimeoutS
+/// semantics), a body-less `504 Gateway Timeout` is written to the user and
+/// the direction ends. First byte arrival is taken as the (approximate) start
+/// of the response head; subsequent reads are never timed out.
 async fn bridge_work_to_user(
     mut work_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     mut read_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
 ) {
     let mut buf = PoolGuard::acquire();
     let cap = buf.as_mut_slice().len();
     let mut decomp_buf = Vec::new();
     let mut batch_buf = Vec::new();
     let mut decompressor = make_decompressor(use_compression);
+    let mut header_timeout = header_timeout;
     'read_loop: loop {
-        let n = match work_r.read(buf.as_mut_slice()).await {
+        let read_res = match header_timeout.take() {
+            Some(timeout) => {
+                match tokio::time::timeout(timeout, work_r.read(buf.as_mut_slice())).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        tracing::debug!(
+                            "bridge work_to_user: backend response header timeout, writing 504"
+                        );
+                        let _ = user_w.write_all(GATEWAY_TIMEOUT_504).await;
+                        let _ = user_w.flush().await;
+                        break 'read_loop;
+                    }
+                }
+            }
+            None => work_r.read(buf.as_mut_slice()).await,
+        };
+        let n = match read_res {
             Ok(0) => break,
             Ok(n) => {
                 trace_hex!(n, first_hex = %crate::hex_encode(&buf.raw_buf()[..n.min(32)]), "bridge work_to_user: read {} bytes", n);
@@ -343,6 +376,7 @@ pub async fn bridge_encrypted_io(
     read_limiter: Option<&mut BandwidthLimiter>,
     write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
 ) {
     tracing::debug!(use_compression, "bridge_encrypted_io: starting");
     let (u_r, u_w) = user.into_split().unwrap();
@@ -358,6 +392,7 @@ pub async fn bridge_encrypted_io(
         read_limiter,
         write_limiter,
         metrics,
+        header_timeout,
     )
     .await;
 }
@@ -387,6 +422,7 @@ pub async fn bridge_encrypted(
     read_limiter: Option<&mut BandwidthLimiter>,
     write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
 ) {
     tracing::debug!(use_compression, "bridge_encrypted: starting");
     let mut enc_work_w = CipherWriter::new(work_w, *key);
@@ -412,13 +448,20 @@ pub async fn bridge_encrypted(
         write_limiter,
         metrics.clone(),
     );
-    let work_to_user =
-        bridge_work_to_user(enc_work_r, user_w, use_compression, read_limiter, metrics);
+    let work_to_user = bridge_work_to_user(
+        enc_work_r,
+        user_w,
+        use_compression,
+        read_limiter,
+        metrics,
+        header_timeout,
+    );
 
     let _ = tokio::join!(user_to_work, work_to_user);
 }
 
 /// Plain (unencrypted) bidirectional bridge with optional compression.
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_plain(
     user_r: impl AsyncReadExt + Unpin,
     user_w: impl AsyncWriteExt + Unpin,
@@ -427,6 +470,7 @@ pub async fn bridge_plain(
     use_compression: bool,
     pre_read: Vec<u8>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
 ) {
     let had_pre_read = !pre_read.is_empty();
     tracing::debug!(
@@ -443,7 +487,14 @@ pub async fn bridge_plain(
         None,
         metrics.clone(),
     );
-    let work_to_user = bridge_work_to_user(work_r, user_w, use_compression, None, metrics);
+    let work_to_user = bridge_work_to_user(
+        work_r,
+        user_w,
+        use_compression,
+        None,
+        metrics,
+        header_timeout,
+    );
 
     let _ = tokio::join!(user_to_work, work_to_user);
 }
@@ -468,6 +519,7 @@ pub async fn bridge_plain_rate_limited(
     read_limiter: Option<&mut BandwidthLimiter>,
     write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
 ) {
     let user_to_work = bridge_user_to_work(
         user_r,
@@ -477,7 +529,14 @@ pub async fn bridge_plain_rate_limited(
         write_limiter,
         metrics.clone(),
     );
-    let work_to_user = bridge_work_to_user(work_r, user_w, use_compression, read_limiter, metrics);
+    let work_to_user = bridge_work_to_user(
+        work_r,
+        user_w,
+        use_compression,
+        read_limiter,
+        metrics,
+        header_timeout,
+    );
 
     let _ = tokio::join!(user_to_work, work_to_user);
 }
@@ -503,6 +562,7 @@ mod tests {
                 w_w_bridge,
                 false,
                 vec![],
+                None,
                 None,
             )
             .await;
@@ -534,7 +594,7 @@ mod tests {
 
         tokio::spawn(async move {
             bridge_plain(
-                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge, false, pre_read, None,
+                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge, false, pre_read, None, None,
             )
             .await;
         });
@@ -574,6 +634,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         });
@@ -605,6 +666,7 @@ mod tests {
                 &key,
                 true,
                 vec![],
+                None,
                 None,
                 None,
                 None,
@@ -640,6 +702,7 @@ mod tests {
                 &key,
                 false,
                 vec![],
+                None,
                 None,
                 None,
                 None,
@@ -711,7 +774,17 @@ mod tests {
         let work_r = TwoFullChunks(0);
         let user_w = CountingWriter(Arc::new(AtomicUsize::new(0)));
 
-        bridge_plain(user_r, user_w, work_r, work_w, false, Vec::new(), None).await;
+        bridge_plain(
+            user_r,
+            user_w,
+            work_r,
+            work_w,
+            false,
+            Vec::new(),
+            None,
+            None,
+        )
+        .await;
 
         // Two full-capacity reads => no per-chunk flush; exactly one final flush.
         assert_eq!(
@@ -793,6 +866,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         )
         .await;
 
@@ -855,7 +929,7 @@ mod tests {
         let (u_w, mut u_r_test) = tokio::io::duplex(65536);
 
         tokio::spawn(async move {
-            bridge_work_to_user(w_r, u_w, false, None, None).await;
+            bridge_work_to_user(w_r, u_w, false, None, None, None).await;
         });
 
         w_w_test.write_all(b"work->user").await.unwrap();
@@ -876,7 +950,7 @@ mod tests {
         let (u_w, mut u_r_test) = tokio::io::duplex(65536);
 
         tokio::spawn(async move {
-            bridge_work_to_user(w_r, u_w, true, None, None).await;
+            bridge_work_to_user(w_r, u_w, true, None, None, None).await;
         });
 
         // Write compressed data that needs flush to produce final bytes
@@ -928,7 +1002,7 @@ mod tests {
         });
 
         let w2u = tokio::spawn(async move {
-            bridge_work_to_user(enc_reader, u_w_sink, false, None, None).await;
+            bridge_work_to_user(enc_reader, u_w_sink, false, None, None, None).await;
         });
 
         // Write plaintext, read decrypted output
@@ -999,7 +1073,7 @@ mod tests {
         let (user_tx, mut user_rx) = tokio::io::duplex(64 * 1024);
 
         let bridge = tokio::spawn(async move {
-            bridge_work_to_user(work_rx, user_tx, true, None, None).await;
+            bridge_work_to_user(work_rx, user_tx, true, None, None, None).await;
         });
         let writer = tokio::spawn(async move {
             work_tx.write_all(&compressed).await.unwrap();
@@ -1023,7 +1097,7 @@ mod tests {
         let timer_ticks = ticks.clone();
 
         let bridge = tokio::spawn(async move {
-            bridge_work_to_user(work_rx, user_tx, true, None, None).await;
+            bridge_work_to_user(work_rx, user_tx, true, None, None, None).await;
         });
         let timer = tokio::spawn(async move {
             for _ in 0..5 {
@@ -1073,6 +1147,7 @@ mod tests {
                 Some(&mut rlim),
                 Some(&mut wlim),
                 None,
+                None,
             )
             .await;
         });
@@ -1114,6 +1189,7 @@ mod tests {
                 vec![],
                 None,
                 Some(&mut wlim),
+                None,
                 None,
             )
             .await;

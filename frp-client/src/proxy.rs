@@ -342,6 +342,7 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
                 read_lim.as_mut(),
                 write_lim.as_mut(),
                 Some(proxy_metrics.clone()),
+                None,
             )
             .await;
             debug!(name = %name, "Proxy {} encrypted bridge closed", name);
@@ -365,6 +366,7 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
             read_lim.as_mut(),
             write_lim.as_mut(),
             Some(proxy_metrics.clone()),
+            None,
         )
         .await;
         debug!(name = %name, "Proxy {} rate-limited bridge closed", name);

@@ -532,6 +532,17 @@ pub(crate) async fn assign_work_to_proxy(
         proxy_info.as_ref().map(|p| p.bandwidth_limit_mode.as_str()),
     );
 
+    // HTTP vhost backend response-header timeout (Go frp compat:
+    // VhostHTTPTimeout drives httputil.ReverseProxy.ResponseHeaderTimeoutS).
+    // Only HTTP-family proxies get the timeout; TCP/STCP/XTCP bridges have no
+    // such semantic. 0 (unset) disables the timeout, matching Go where the
+    // ReverseProxy transport never arms a header deadline.
+    let header_timeout = if proxy_type.starts_with("http") && state.vhost_http_timeout > 0 {
+        Some(std::time::Duration::from_secs(state.vhost_http_timeout))
+    } else {
+        None
+    };
+
     tokio::spawn(async move {
         let _guard = guard;
         let _drain = drain_guard;
@@ -579,6 +590,7 @@ pub(crate) async fn assign_work_to_proxy(
                     None,
                     None,
                     Some(metrics.clone()),
+                    header_timeout,
                 )
                 .await;
                 return;
@@ -598,6 +610,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -616,6 +629,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -634,6 +648,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -652,6 +667,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -670,6 +686,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -687,6 +704,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -712,6 +730,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -729,6 +748,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -746,6 +766,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -801,6 +822,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 } else {
@@ -814,6 +836,7 @@ pub(crate) async fn assign_work_to_proxy(
                         read_lim.as_mut(),
                         write_lim.as_mut(),
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
@@ -836,6 +859,7 @@ pub(crate) async fn assign_work_to_proxy(
                         comp_key,
                         bridge_pre_read,
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 } else {
@@ -847,6 +871,7 @@ pub(crate) async fn assign_work_to_proxy(
                         comp_key,
                         bridge_pre_read,
                         Some(metrics.clone()),
+                        header_timeout,
                     )
                     .await;
                 }
