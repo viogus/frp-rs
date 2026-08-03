@@ -150,8 +150,9 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         ctx.state.proxy_metrics.remove(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
         {
-            let mut routes = ctx.state.vnet_routes.write().await;
-            routes.retain(|_, (_, name)| name != &cp.proxy_name);
+            ctx.state
+                .remove_proxy_vnet_routes_and_broadcast(&ctx.run_id, &cp.proxy_name)
+                .await;
         }
     }
     // Stop the listener task

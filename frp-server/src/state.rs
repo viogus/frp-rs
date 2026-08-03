@@ -659,24 +659,29 @@ impl AppState {
 
 #[cfg(feature = "vnet")]
 impl AppState {
-    /// Queue a route advertisement to every online control except `exclude_run_id`.
+    /// Queue a route advertisement to every online control that participates in
+    /// the advertisement's virtual net (except `exclude_run_id`). Controls
+    /// without any route in that vnet never see it — the isolation guarantee.
     pub(crate) async fn broadcast_vnet_route_advertise(
         &self,
         exclude_run_id: &str,
         adv: &msg::VnetRouteAdvertise,
     ) {
-        for tx in self.other_control_txs(exclude_run_id).await {
+        let vnet = adv.virtual_net.clone().unwrap_or_default();
+        for tx in self.control_txs_in_vnet(exclude_run_id, &vnet).await {
             let _ = tx.try_send(InternalMsg::VnetRouteAdvertiseForward { msg: adv.clone() });
         }
     }
 
-    /// Queue a route removal to every online control except `exclude_run_id`.
+    /// Queue a route removal to every online control that participates in the
+    /// removal's virtual net (except `exclude_run_id`).
     pub(crate) async fn broadcast_vnet_route_remove(
         &self,
         exclude_run_id: &str,
         rem: &msg::VnetRouteRemove,
     ) {
-        for tx in self.other_control_txs(exclude_run_id).await {
+        let vnet = rem.virtual_net.clone().unwrap_or_default();
+        for tx in self.control_txs_in_vnet(exclude_run_id, &vnet).await {
             let _ = tx.try_send(InternalMsg::VnetRouteRemoveForward { msg: rem.clone() });
         }
     }
@@ -709,12 +714,84 @@ impl AppState {
         }
     }
 
-    async fn other_control_txs(&self, exclude_run_id: &str) -> Vec<mpsc::Sender<InternalMsg>> {
+    /// Senders for every online control (other than `exclude_run_id`) that has
+    /// at least one route in `vnet`. Used to scope vnet route broadcasts to
+    /// peers on the same virtual net.
+    async fn control_txs_in_vnet(
+        &self,
+        exclude_run_id: &str,
+        vnet: &str,
+    ) -> Vec<mpsc::Sender<InternalMsg>> {
+        let mut run_ids: HashSet<String> = HashSet::new();
+        {
+            let routes = self.vnet_routes.read().await;
+            for ((vn, _), (rid, _)) in routes.iter() {
+                if vn == vnet && rid != exclude_run_id {
+                    run_ids.insert(rid.clone());
+                }
+            }
+        }
         let map = self.run_id_to_ctl_tx.read().await;
-        map.iter()
-            .filter(|(run_id, _)| run_id.as_str() != exclude_run_id)
-            .map(|(_, ctl)| ctl.tx.clone())
+        run_ids
+            .iter()
+            .filter_map(|rid| map.get(rid).map(|ctl| ctl.tx.clone()))
             .collect()
+    }
+
+    /// Remove every vnet route registered by `proxy_name` for `run_id` and
+    /// broadcast a removal to peers on the same virtual nets. Called by the
+    /// close-proxy handler so peer clients invalidate their routes when a
+    /// proxy closes. The retain is guarded by `run_id`: visitor route names
+    /// are per-client, so a same-named route owned by another client must
+    /// survive.
+    pub(crate) async fn remove_proxy_vnet_routes_and_broadcast(
+        &self,
+        run_id: &str,
+        proxy_name: &str,
+    ) {
+        let removed: Vec<(String, String)> = {
+            let mut routes = self.vnet_routes.write().await;
+            let removed: Vec<(String, String)> = routes
+                .iter()
+                .filter(|(_, (rid, name))| rid == run_id && name == proxy_name)
+                .map(|((vn, _), _)| (vn.clone(), proxy_name.to_string()))
+                .collect();
+            routes.retain(|_, (rid, name)| !(rid == run_id && name == proxy_name));
+            removed
+        };
+        let mut seen = HashSet::new();
+        for (vn, name) in removed {
+            if seen.insert(vn.clone()) {
+                self.broadcast_vnet_route_remove(
+                    run_id,
+                    &msg::VnetRouteRemove {
+                        proxy_name: name,
+                        virtual_net: (!vn.is_empty()).then_some(vn),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Whether `run_id` may send a `VnetPacket` addressed to `proxy_name`.
+    ///
+    /// Isolation check: the source must participate in the target route's
+    /// virtual net (i.e. it must own at least one route in that vnet). Unknown
+    /// target routes are denied — drop by default. Different virtual nets have
+    /// isolated routing tables (design spec).
+    pub(crate) async fn vnet_packet_source_allowed(&self, run_id: &str, proxy_name: &str) -> bool {
+        let routes = self.vnet_routes.read().await;
+        // Existence check: the source is allowed iff there is *some* virtual
+        // net in which both the source has a route and the target route lives.
+        // (A multi-homed proxy may be reached by members of any of its vnets;
+        // a `find`-then-verify would depend on HashMap iteration order.)
+        routes.iter().any(|((vn, _), (_, name))| {
+            name == proxy_name
+                && routes
+                    .iter()
+                    .any(|((vn2, _), (rid2, _))| vn2 == vn && rid2 == run_id)
+        })
     }
 }
 
@@ -777,5 +854,148 @@ mod tests {
 
         drop(guard_b);
         assert!(state.run_mu_map.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "vnet")]
+    async fn insert_control(state: &Arc<AppState>, run_id: &str) -> mpsc::Receiver<InternalMsg> {
+        let (tx, rx) = mpsc::channel(16);
+        let mut map = state.run_id_to_ctl_tx.write().await;
+        map.insert(
+            run_id.to_string(),
+            ControlTx {
+                tx,
+                client_addr: None,
+                login_time: Instant::now(),
+                login_time_unix: 0,
+                pool_stats: Arc::new(PoolStats::default()),
+                user: String::new(),
+                control_id: 1,
+            },
+        );
+        rx
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn vnet_route_broadcast_only_reaches_same_vnet_peers() {
+        let state = test_state();
+        let mut sender_rx = insert_control(&state, "run-a").await;
+        let mut peer_rx = insert_control(&state, "run-b").await;
+        let mut other_vnet_rx = insert_control(&state, "run-c").await;
+        // run-b participates in vnet-a; run-c only in vnet-b.
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-b".to_string(), "peer-b".to_string()),
+            );
+            routes.insert(
+                ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
+                ("run-c".to_string(), "peer-c".to_string()),
+            );
+        }
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "vnet-visitor".to_string(),
+            subnet: "2001:db8::1/128".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+        state.broadcast_vnet_route_advertise("run-a", &adv).await;
+
+        match tokio::time::timeout(Duration::from_secs(5), peer_rx.recv()).await {
+            Ok(Some(InternalMsg::VnetRouteAdvertiseForward { msg })) => {
+                assert_eq!(msg.proxy_name, "vnet-visitor");
+                assert_eq!(msg.virtual_net.as_deref(), Some("vnet-a"));
+            }
+            other => panic!("expected forwarded advertise, got {:?}", other),
+        }
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "source run must not receive its own broadcast"
+        );
+        assert!(
+            other_vnet_rx.try_recv().is_err(),
+            "different-vnet peer must not receive the broadcast"
+        );
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn remove_proxy_vnet_routes_broadcasts_to_same_vnet_peers() {
+        let state = test_state();
+        let mut peer_rx = insert_control(&state, "run-b").await;
+        {
+            let mut routes = state.vnet_routes.write().await;
+            // run-a's proxy owns two vnet-a routes and one vnet-b route.
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-a".to_string(), "vnet-proxy".to_string()),
+            );
+            routes.insert(
+                ("vnet-a".to_string(), "2001:db8::/64".to_string()),
+                ("run-a".to_string(), "vnet-proxy".to_string()),
+            );
+            routes.insert(
+                ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
+                ("run-a".to_string(), "vnet-proxy".to_string()),
+            );
+            // run-b participates in vnet-a, so it receives the vnet-a removal.
+            routes.insert(
+                ("vnet-a".to_string(), "172.16.0.0/16".to_string()),
+                ("run-b".to_string(), "peer-b".to_string()),
+            );
+        }
+
+        state
+            .remove_proxy_vnet_routes_and_broadcast("run-a", "vnet-proxy")
+            .await;
+
+        assert!(
+            state
+                .vnet_routes
+                .read()
+                .await
+                .iter()
+                .all(|(_, (_, name))| name != "vnet-proxy"),
+            "all routes for the closed proxy must be removed"
+        );
+
+        // Two removals are broadcast (vnet-a + vnet-b), but run-b only
+        // receives the one for vnet-a.
+        let mut received = Vec::new();
+        while let Ok(InternalMsg::VnetRouteRemoveForward { msg }) = peer_rx.try_recv() {
+            received.push(msg);
+        }
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].proxy_name, "vnet-proxy");
+        assert_eq!(received[0].virtual_net.as_deref(), Some("vnet-a"));
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn vnet_packet_source_allowed_respects_isolation() {
+        let state = test_state();
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-a".to_string(), "peer-a".to_string()),
+            );
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.1.0/24".to_string()),
+                ("run-b".to_string(), "target-b".to_string()),
+            );
+            routes.insert(
+                ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
+                ("run-c".to_string(), "target-c".to_string()),
+            );
+        }
+        // run-a is in vnet-a and may reach target-b (also vnet-a).
+        assert!(state.vnet_packet_source_allowed("run-a", "target-b").await);
+        // run-c is only in vnet-b; reaching target-b (vnet-a) is denied.
+        assert!(!state.vnet_packet_source_allowed("run-c", "target-b").await);
+        // A source with no route in the target's vnet is denied.
+        assert!(!state.vnet_packet_source_allowed("run-b", "target-c").await);
+        // Unknown target routes are denied.
+        assert!(!state.vnet_packet_source_allowed("run-a", "missing").await);
     }
 }

@@ -71,6 +71,7 @@ fn is_udp_port_bindable(bind_addr: &str, port: u16) -> bool {
 #[allow(clippy::items_after_test_module)]
 mod unregister_generation_tests {
     use super::*;
+    use std::time::Duration;
 
     fn test_state() -> Arc<AppState> {
         let cfg = frp_core::config::ServerConfig::default();
@@ -167,6 +168,12 @@ mod unregister_generation_tests {
                 ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
                 ("run-b".to_string(), "proxy-b".to_string()),
             );
+            // run-b also participates in vnet-a, so it is a peer of run-a's
+            // vnet-a routes and must receive the broadcast removes below.
+            routes.insert(
+                ("vnet-a".to_string(), "10.99.0.0/24".to_string()),
+                ("run-b".to_string(), "proxy-b-vnet-a".to_string()),
+            );
         }
 
         unregister_control(&state, "run-a", 1, false).await;
@@ -174,12 +181,13 @@ mod unregister_generation_tests {
         let routes = state.vnet_routes.read().await;
         assert!(routes.iter().all(|(_, (run_id, _))| run_id != "run-a"));
         assert!(routes.contains_key(&("vnet-b".to_string(), "10.1.0.0/24".to_string())));
+        assert!(routes.contains_key(&("vnet-a".to_string(), "10.99.0.0/24".to_string())));
         drop(routes);
 
         let mut removes = Vec::new();
         for _ in 0..2 {
-            match peer_rx.recv().await {
-                Some(InternalMsg::VnetRouteRemoveForward { msg }) => removes.push(msg),
+            match tokio::time::timeout(Duration::from_secs(5), peer_rx.recv()).await {
+                Ok(Some(InternalMsg::VnetRouteRemoveForward { msg })) => removes.push(msg),
                 other => panic!("expected forwarded remove, got {:?}", other),
             }
         }

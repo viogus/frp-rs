@@ -1206,8 +1206,9 @@ async fn deliver_tunnel_ingress(
         let matched = dst.as_ref().is_some_and(|ip| {
             subnets.get(proxy).is_some_and(|cidr| {
                 let mut rt = frp_vnet::router::RouteTable::new();
-                rt.insert(proxy, cidr)
-                    .is_ok_and(|_| rt.lookup(ip) == Some(proxy))
+                // Single-route match; the vnet dimension is not relevant here.
+                rt.insert("", proxy, cidr)
+                    .is_ok_and(|_| rt.lookup("", ip) == Some(proxy))
             })
         });
         if matched {

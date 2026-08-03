@@ -6,6 +6,10 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
+/// (subnet, tun_name, virtual_net) of a peer vnet route.
+#[cfg(feature = "vnet")]
+type VnetPeerRoute = (String, String, String);
+
 /// Internal request from a visitor task to the control loop.
 /// Visitor sends NatHoleVisitor on the control connection (Go frps compat:
 /// fresh TCP connections with NatHoleVisitor are not handled by Go frps v0.69.1).
@@ -191,11 +195,12 @@ pub struct Service {
     /// Per-proxy subnet CIDR for directing virtual_net visitor return traffic.
     #[cfg(feature = "vnet")]
     vnet_tun_subnets: Arc<Mutex<HashMap<String, String>>>,
-    /// Peer proxy name → (advertised subnet, TUN interface) for OS routes that
-    /// were injected from VnetRouteAdvertise. Used to remove them on
-    /// VnetRouteRemove and on control disconnect.
+    /// Peer proxy name → (advertised subnet, TUN interface, virtual net) for
+    /// OS routes injected from VnetRouteAdvertise. The vnet is stored so route
+    /// table entries can be removed in the right partition on VnetRouteRemove
+    /// and on control disconnect.
     #[cfg(feature = "vnet")]
-    vnet_peer_routes: Arc<Mutex<HashMap<String, (String, String)>>>,
+    vnet_peer_routes: Arc<Mutex<HashMap<String, VnetPeerRoute>>>,
 }
 
 impl Service {
@@ -956,6 +961,7 @@ impl Service {
                     &self.vnet_tun_cancels,
                     &self.vnet_controller,
                     &p.name,
+                    &p.virtual_net,
                     &writer,
                     v2,
                 )
@@ -1374,26 +1380,45 @@ impl Service {
                             }
                             #[cfg(feature = "vnet")]
                             Ok(FrpMessage::VnetRouteAdvertise(adv)) => {
-                                info!(subnet = %adv.subnet, proxy_name = %adv.proxy_name, "peer vnet route advertisement received");
-                                // Update the shared route table (TX direction lookup).
-                                {
-                                    let route_table = self.vnet_controller.route_table();
-                                    let mut routes = route_table.write().await;
-                                    if let Err(e) = routes.insert(&adv.proxy_name, &adv.subnet) {
-                                        warn!(%e, "failed to add vnet route");
+                                // Isolation: only accept routes for virtual nets
+                                // this client participates in. Advertisements for
+                                // other vnets are ignored (design spec: different
+                                // virtual nets have isolated routing tables).
+                                let vnet = adv.virtual_net.clone().unwrap_or_default();
+                                if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
+                                    debug!(
+                                        vnet,
+                                        proxy_name = %adv.proxy_name,
+                                        "ignoring vnet route advertisement for unknown virtual net"
+                                    );
+                                } else {
+                                    info!(vnet, subnet = %adv.subnet, proxy_name = %adv.proxy_name, "peer vnet route advertisement received");
+                                    // Update the shared route table (TX direction lookup).
+                                    {
+                                        let route_table = self.vnet_controller.route_table();
+                                        let mut routes = route_table.write().await;
+                                        if let Err(e) =
+                                            routes.insert(&vnet, &adv.proxy_name, &adv.subnet)
+                                        {
+                                            warn!(%e, "failed to add vnet route");
+                                        }
                                     }
-                                }
-                                // Inject OS route so the kernel sends matching packets
-                                // through the TUN device instead of the default gateway.
-                                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                                {
-                                    let names = self.vnet_tun_names.lock().await;
-                                    if let Some(tun_name) = names.values().next() {
-                                        add_os_route(&adv.subnet, tun_name);
-                                        self.vnet_peer_routes.lock().await.insert(
-                                            adv.proxy_name.clone(),
-                                            (adv.subnet.clone(), tun_name.clone()),
-                                        );
+                                    // Inject OS route so the kernel sends matching packets
+                                    // through the TUN device instead of the default gateway.
+                                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                    {
+                                        let names = self.vnet_tun_names.lock().await;
+                                        if let Some(tun_name) = names.values().next() {
+                                            add_os_route(&adv.subnet, tun_name);
+                                            self.vnet_peer_routes.lock().await.insert(
+                                                adv.proxy_name.clone(),
+                                                (
+                                                    adv.subnet.clone(),
+                                                    tun_name.clone(),
+                                                    vnet.clone(),
+                                                ),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1426,13 +1451,21 @@ impl Service {
                             }
                             #[cfg(feature = "vnet")]
                             Ok(FrpMessage::VnetRouteRemove(adv)) => {
-                                info!(proxy_name = %adv.proxy_name, "peer vnet route removed");
-                                if let Some((subnet, tun_name)) =
-                                    self.vnet_peer_routes.lock().await.remove(&adv.proxy_name)
+                                let vnet = adv.virtual_net.clone().unwrap_or_default();
+                                info!(vnet, proxy_name = %adv.proxy_name, "peer vnet route removed");
+                                if let Some((subnet, tun_name, _)) = self
+                                    .vnet_peer_routes
+                                    .lock()
+                                    .await
+                                    .remove(&adv.proxy_name)
                                 {
                                     remove_os_route(&subnet, &tun_name);
                                 }
-                                self.vnet_controller.route_table().write().await.remove(&adv.proxy_name);
+                                self.vnet_controller
+                                    .route_table()
+                                    .write()
+                                    .await
+                                    .remove(&vnet, &adv.proxy_name);
                                 self.vnet_controller
                                     .unregister_visitor_route(&adv.proxy_name)
                                     .await;
@@ -1726,13 +1759,13 @@ impl Service {
                 // table entries so a reconnect starts from a clean slate.
                 {
                     let peer_routes = self.vnet_peer_routes.lock().await;
-                    for (proxy_name, (subnet, tun_name)) in peer_routes.iter() {
+                    for (proxy_name, (subnet, tun_name, vnet)) in peer_routes.iter() {
                         remove_os_route(subnet, tun_name);
                         self.vnet_controller
                             .route_table()
                             .write()
                             .await
-                            .remove(proxy_name);
+                            .remove(vnet, proxy_name);
                     }
                 }
                 self.vnet_peer_routes.lock().await.clear();
@@ -2622,8 +2655,19 @@ impl Service {
 
         // Drop TUN state for removed and changed proxies before recreating it.
         // Changed proxies must get a fresh TUN and a fresh delivery channel.
+        // The vnet comes from the pre-reload config (removed proxies are still
+        // present there; self.cfg is refreshed at the end of the reload).
         #[cfg(feature = "vnet")]
         for name in delta.removed.iter().chain(delta.changed.iter()) {
+            let vnet = self
+                .cfg
+                .read()
+                .await
+                .proxies
+                .iter()
+                .find(|p| &p.name == name)
+                .map(|p| p.virtual_net.clone())
+                .unwrap_or_default();
             remove_vnet_tun(
                 &self.vnet_tuns,
                 &self.vnet_tun_tx,
@@ -2631,7 +2675,11 @@ impl Service {
                 &self.vnet_tun_names,
                 &self.vnet_tun_subnets,
                 &self.vnet_controller.route_table(),
+                &self.vnet_peer_routes,
+                writer,
+                v2,
                 name,
+                &vnet,
             )
             .await;
         }
@@ -2675,6 +2723,7 @@ impl Service {
                     &self.vnet_tun_cancels,
                     &self.vnet_controller,
                     name,
+                    &p.virtual_net,
                     writer,
                     v2,
                 )
@@ -2873,6 +2922,36 @@ impl Service {
     }
 }
 
+/// Compute the set of virtual nets this client participates in.
+///
+/// Every vnet/TUN proxy contributes its `virtual_net` (empty string for the
+/// default net), and every `virtual_net` visitor joins the default net. Used
+/// to filter inbound `VnetRouteAdvertise`: a route for a virtual net we are
+/// not part of is ignored (design spec: different virtual nets have isolated
+/// routing tables).
+#[cfg(feature = "vnet")]
+fn local_vnet_set(cfg: &frp_core::config::ClientConfig) -> std::collections::HashSet<String> {
+    let mut vnets = std::collections::HashSet::new();
+    for p in &cfg.proxies {
+        if vnet_tun_params(p, &cfg.virtual_net.address).is_some() {
+            vnets.insert(if p.virtual_net.is_empty() {
+                String::new()
+            } else {
+                p.virtual_net.clone()
+            });
+        }
+    }
+    for v in &cfg.visitors {
+        if v.plugin
+            .as_ref()
+            .is_some_and(|pl| pl.plugin_type == VISITOR_PLUGIN_VIRTUAL_NET)
+        {
+            vnets.insert(String::new());
+        }
+    }
+    vnets
+}
+
 /// Resolve the local TUN address, netmask, and MTU for a vnet proxy.
 #[cfg(feature = "vnet")]
 fn vnet_tun_params(
@@ -2959,12 +3038,14 @@ async fn register_vnet_tun(
 
 /// Spawn the controller for a registered TUN and publish its TX channel.
 #[cfg(feature = "vnet")]
+#[allow(clippy::too_many_arguments)]
 async fn spawn_vnet_tun_controller(
     vnet_tuns: &VnetTunMap,
     vnet_tun_tx: &VnetTunTxMap,
     vnet_tun_cancels: &VnetTunCancelMap,
     vnet_controller: &Arc<frp_vnet::controller::ClientVnetController>,
     proxy_name: &str,
+    vnet: &str,
     writer: &Arc<Mutex<WriteHalf>>,
     v2: bool,
 ) -> Option<()> {
@@ -2985,8 +3066,9 @@ async fn spawn_vnet_tun_controller(
     let ctl_writer = writer.clone();
     let client_controller = vnet_controller.clone();
     let pn = proxy_name.to_string();
+    let vn = vnet.to_string();
     tokio::spawn(async move {
-        let ctrl = frp_vnet::controller::VnetController::new(pn.clone(), client_controller, v2);
+        let ctrl = frp_vnet::controller::VnetController::new(pn.clone(), client_controller, v2, vn);
         tokio::select! {
             result = ctrl.run(tun, ctl_writer, tun_rx) => {
                 if let Err(e) = result {
@@ -3034,8 +3116,11 @@ async fn send_vnet_route_advertise(
     }
 }
 
-/// Drop a TUN proxy's maps, cancel its controller, and remove its routes.
+/// Drop a TUN proxy's maps, cancel its controller, remove its OS/routing
+/// table entries, and notify the server so peer clients invalidate their
+/// routes for this proxy.
 #[cfg(feature = "vnet")]
+#[allow(clippy::too_many_arguments)]
 async fn remove_vnet_tun(
     vnet_tuns: &VnetTunMap,
     vnet_tun_tx: &VnetTunTxMap,
@@ -3043,16 +3128,47 @@ async fn remove_vnet_tun(
     vnet_tun_names: &Arc<Mutex<HashMap<String, String>>>,
     vnet_tun_subnets: &Arc<Mutex<HashMap<String, String>>>,
     route_table: &Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
+    vnet_peer_routes: &Arc<Mutex<HashMap<String, VnetPeerRoute>>>,
+    writer: &Arc<Mutex<WriteHalf>>,
+    v2: bool,
     proxy_name: &str,
+    vnet: &str,
 ) {
     if let Some(cancel) = vnet_tun_cancels.lock().await.remove(proxy_name) {
         let _ = cancel.send(true);
     }
     vnet_tuns.lock().await.remove(proxy_name);
     vnet_tun_tx.lock().await.remove(proxy_name);
-    vnet_tun_names.lock().await.remove(proxy_name);
-    vnet_tun_subnets.lock().await.remove(proxy_name);
-    route_table.write().await.remove(proxy_name);
+    let tun_name = vnet_tun_names.lock().await.remove(proxy_name);
+    // Remove the OS route for the local TUN subnet (the kernel also cleans it
+    // up on TUN teardown, but explicit removal keeps add/remove symmetric).
+    if let Some(cidr) = vnet_tun_subnets.lock().await.remove(proxy_name) {
+        if let Some(ref tun_name) = tun_name {
+            remove_os_route(&cidr, tun_name);
+        }
+    }
+    // Defensively drop any peer route recorded under this proxy name so a
+    // stale OS route never survives the proxy's removal.
+    if let Some((subnet, peer_tun_name, _)) = vnet_peer_routes.lock().await.remove(proxy_name) {
+        remove_os_route(&subnet, &peer_tun_name);
+    }
+    route_table.write().await.remove(vnet, proxy_name);
+    // Notify the server so peer clients invalidate their routes for this proxy.
+    let rem = msg::VnetRouteRemove {
+        proxy_name: proxy_name.to_string(),
+        virtual_net: if vnet.is_empty() {
+            None
+        } else {
+            Some(vnet.to_string())
+        },
+    };
+    let msg = FrpMessage::VnetRouteRemove(rem);
+    let mut w = writer.lock().await;
+    if let Err(e) = write_msg(&mut *w, &msg, v2).await {
+        tracing::warn!(proxy_name, error = %e, "failed to send VnetRouteRemove for '{}'", proxy_name);
+    } else {
+        tracing::info!(proxy_name, "VnetRouteRemove sent for '{}'", proxy_name);
+    }
 }
 
 /// Apply the client `start` allowlist and `enabled` flag to a proxy list.
@@ -3629,7 +3745,14 @@ mod tests {
         let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
         let names = Arc::new(Mutex::new(HashMap::new()));
         let subnets = Arc::new(Mutex::new(HashMap::new()));
+        let peer_routes = Arc::new(Mutex::new(HashMap::new()));
         let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
+        let (_peer, writer_raw) = tokio::io::duplex(4096);
+        let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
+        let (_, writer_half) = tokio::io::split(writer_stream);
+        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
+            writer_half,
+        )));
         let (tun, configured) = fake_tun();
 
         register_vnet_tun(
@@ -3655,7 +3778,7 @@ mod tests {
         route_table
             .write()
             .await
-            .insert("vnet-a", "10.0.0.0/24")
+            .insert("corp-net", "vnet-a", "10.0.0.0/24")
             .unwrap();
         remove_vnet_tun(
             &tuns,
@@ -3664,7 +3787,11 @@ mod tests {
             &names,
             &subnets,
             &route_table,
+            &peer_routes,
+            &writer,
+            false,
             "vnet-a",
+            "corp-net",
         )
         .await;
         assert!(tuns.lock().await.is_empty());
@@ -3683,6 +3810,7 @@ mod tests {
         let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
         let names = Arc::new(Mutex::new(HashMap::new()));
         let subnets = Arc::new(Mutex::new(HashMap::new()));
+        let peer_routes = Arc::new(Mutex::new(HashMap::new()));
         let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
         let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
         let (_peer, writer_raw) = tokio::io::duplex(4096);
@@ -3712,6 +3840,7 @@ mod tests {
             &cancels,
             &controller,
             "vnet-a",
+            "corp-net",
             &writer,
             false,
         )
@@ -3731,7 +3860,11 @@ mod tests {
             &names,
             &subnets,
             &route_table,
+            &peer_routes,
+            &writer,
+            false,
             "vnet-a",
+            "corp-net",
         )
         .await;
         assert!(tx_map.lock().await.is_empty());
@@ -3756,6 +3889,7 @@ mod tests {
             &cancels,
             &controller,
             "vnet-a",
+            "corp-net",
             &writer,
             false,
         )
@@ -3779,8 +3913,143 @@ mod tests {
             &names,
             &subnets,
             &route_table,
+            &peer_routes,
+            &writer,
+            false,
             "vnet-a",
+            "corp-net",
         )
         .await;
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn remove_vnet_tun_sends_vnet_route_remove_and_cleans_maps() {
+        let tuns: VnetTunMap = Arc::new(Mutex::new(HashMap::new()));
+        let tx: VnetTunTxMap = Arc::new(Mutex::new(HashMap::new()));
+        let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
+        let names = Arc::new(Mutex::new(HashMap::new()));
+        let subnets = Arc::new(Mutex::new(HashMap::new()));
+        let peer_routes = Arc::new(Mutex::new(HashMap::new()));
+        let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
+        let (mut peer, writer_raw) = tokio::io::duplex(4096);
+        let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
+        let (_, writer_half) = tokio::io::split(writer_stream);
+        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
+            writer_half,
+        )));
+
+        // Pre-populate every map the removal path must clean up.
+        names.lock().await.insert("vnet-a".into(), "tun0".into());
+        subnets
+            .lock()
+            .await
+            .insert("vnet-a".into(), "10.0.0.0/24".into());
+        route_table
+            .write()
+            .await
+            .insert("corp-net", "vnet-a", "10.0.0.0/24")
+            .unwrap();
+        route_table
+            .write()
+            .await
+            .insert("other-net", "other", "10.9.0.0/24")
+            .unwrap();
+        peer_routes.lock().await.insert(
+            "vnet-a".into(),
+            ("192.168.0.0/24".into(), "tun0".into(), "corp-net".into()),
+        );
+        tuns.lock().await.insert("vnet-a".into(), None);
+        tx.lock().await.insert("vnet-a".into(), mpsc::channel(4).0);
+        cancels
+            .lock()
+            .await
+            .insert("vnet-a".into(), watch::channel(false).0);
+
+        remove_vnet_tun(
+            &tuns,
+            &tx,
+            &cancels,
+            &names,
+            &subnets,
+            &route_table,
+            &peer_routes,
+            &writer,
+            false,
+            "vnet-a",
+            "corp-net",
+        )
+        .await;
+
+        assert!(tuns.lock().await.is_empty());
+        assert!(tx.lock().await.is_empty());
+        assert!(cancels.lock().await.is_empty());
+        assert!(names.lock().await.is_empty());
+        assert!(subnets.lock().await.is_empty());
+        assert!(peer_routes.lock().await.is_empty());
+        // The removed proxy's route is gone; unrelated vnets are untouched.
+        assert_eq!(
+            route_table
+                .read()
+                .await
+                .lookup("corp-net", &"10.0.0.5".parse().unwrap()),
+            None
+        );
+        assert_eq!(
+            route_table
+                .read()
+                .await
+                .lookup("other-net", &"10.9.0.5".parse().unwrap()),
+            Some("other")
+        );
+
+        // A VnetRouteRemove for the proxy's virtual net is sent to the server.
+        match frp_core::protocol::read_msg_v1(&mut peer).await.unwrap() {
+            FrpMessage::VnetRouteRemove(rem) => {
+                assert_eq!(rem.proxy_name, "vnet-a");
+                assert_eq!(rem.virtual_net.as_deref(), Some("corp-net"));
+            }
+            other => panic!("expected VnetRouteRemove frame, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn local_vnet_set_collects_participating_vnets() {
+        let mut cfg = frp_core::config::ClientConfig::default();
+        cfg.virtual_net.address = "10.0.0.1".into();
+        cfg.proxies.push(frp_core::config::ProxyConfig {
+            name: "vnet-a".into(),
+            proxy_type: "vnet".into(),
+            vnet_ip: "10.0.0.2".into(),
+            vnet_netmask: "255.255.255.0".into(),
+            virtual_net: "corp-net".into(),
+            ..Default::default()
+        });
+        cfg.proxies.push(frp_core::config::ProxyConfig {
+            name: "vnet-default".into(),
+            proxy_type: "vnet".into(),
+            vnet_ip: "10.1.0.2".into(),
+            vnet_netmask: "255.255.255.0".into(),
+            ..Default::default()
+        });
+        cfg.visitors.push(frp_core::config::VisitorConfig {
+            name: "vnet-visitor".into(),
+            visitor_type: "stcp".into(),
+            plugin: Some(frp_core::config::VisitorPluginConfig {
+                plugin_type: "virtual_net".into(),
+                destination_ip: "100.86.0.1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let vnets = local_vnet_set(&cfg);
+        assert!(vnets.contains("corp-net"));
+        assert!(
+            vnets.contains(""),
+            "default-net proxies and virtual_net visitors join the default vnet"
+        );
+        assert!(!vnets.contains("other-net"));
     }
 }

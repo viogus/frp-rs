@@ -22,33 +22,43 @@ pub struct VnetController {
     client: Arc<ClientVnetController>,
     /// Proxy name for this controller.
     proxy_name: String,
+    /// Virtual net this controller belongs to (empty = default vnet).
+    /// Lookups and route updates are scoped to this vnet for isolation.
+    vnet: String,
     /// Whether to use V2 protocol framing.
     v2: bool,
 }
 
 impl VnetController {
-    pub fn new(proxy_name: String, client: Arc<ClientVnetController>, v2: bool) -> Self {
+    pub fn new(
+        proxy_name: String,
+        client: Arc<ClientVnetController>,
+        v2: bool,
+        vnet: String,
+    ) -> Self {
         Self {
             client,
             proxy_name,
+            vnet,
             v2,
         }
     }
 
-    /// Update the local route table from server advertisements.
+    /// Update the local route table from server advertisements (scoped to the
+    /// controller's virtual net).
     pub async fn update_route(&self, name: &str, subnet: &str) -> anyhow::Result<()> {
         let table = self.client.route_table();
         let mut routes = table.write().await;
-        routes.insert(name, subnet)?;
-        tracing::info!(%subnet, %name, "vnet route updated");
+        routes.insert(&self.vnet, name, subnet)?;
+        tracing::info!(vnet = %self.vnet, %subnet, %name, "vnet route updated");
         Ok(())
     }
 
-    /// Remove a route.
+    /// Remove a route (scoped to the controller's virtual net).
     pub async fn remove_route(&self, name: &str) {
         let table = self.client.route_table();
         let mut routes = table.write().await;
-        routes.remove(name);
+        routes.remove(&self.vnet, name);
     }
 
     /// Return the proxy name for this controller.
@@ -113,7 +123,11 @@ impl VnetController {
                         // Fall back to control-connection VnetPacket routing
                         // (visitor host routes and peer TUN-backed proxies).
                         let routes = self.client.route_table();
-                        let target = routes.read().await.lookup(&dst_ip).map(str::to_string);
+                        let target = routes
+                            .read()
+                            .await
+                            .lookup(&self.vnet, &dst_ip)
+                            .map(str::to_string);
                         if let Some(target) = target {
                             let vnet_pkt = frp_core::msg::VnetPacket {
                                 proxy_name: target,
@@ -195,13 +209,16 @@ impl ClientVnetController {
 
     /// Register a `virtual_net` visitor host route (e.g. `100.86.0.1/32`)
     /// mapped to the visitor name and its packet delivery channel.
+    ///
+    /// Visitor routes belong to the default virtual net (the advertisement is
+    /// sent with `virtual_net: None`), so they are inserted under `""`.
     pub async fn register_visitor_route(
         &self,
         name: &str,
         cidr: &str,
         packet_tx: mpsc::Sender<Vec<u8>>,
     ) -> anyhow::Result<()> {
-        self.routes.write().await.insert(name, cidr)?;
+        self.routes.write().await.insert("", name, cidr)?;
         self.visitor_txs
             .lock()
             .await
@@ -212,7 +229,7 @@ impl ClientVnetController {
 
     /// Remove a `virtual_net` visitor route and its delivery channel.
     pub async fn unregister_visitor_route(&self, name: &str) {
-        self.routes.write().await.remove(name);
+        self.routes.write().await.remove("", name);
         self.visitor_txs.lock().await.remove(name);
         tracing::info!(visitor_name = %name, "virtual_net visitor route removed");
     }
@@ -389,7 +406,7 @@ mod tests {
             routes
                 .read()
                 .await
-                .lookup(&IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
+                .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
             Some("vnet-visitor")
         );
 
@@ -398,7 +415,7 @@ mod tests {
             routes
                 .read()
                 .await
-                .lookup(&IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
+                .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
             None
         );
     }
@@ -496,7 +513,12 @@ mod tests {
             ctl_w,
         )));
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
-        let ctrl = VnetController::new("plugin-proxy".to_string(), client.clone(), false);
+        let ctrl = VnetController::new(
+            "plugin-proxy".to_string(),
+            client.clone(),
+            false,
+            String::new(),
+        );
         let handle = tokio::spawn(async move {
             ctrl.run(tun, writer, tun_packet_rx).await.unwrap();
         });
@@ -536,7 +558,12 @@ mod tests {
             ctl_w,
         )));
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
-        let ctrl = VnetController::new("plugin-proxy".to_string(), client.clone(), false);
+        let ctrl = VnetController::new(
+            "plugin-proxy".to_string(),
+            client.clone(),
+            false,
+            String::new(),
+        );
         let handle = tokio::spawn(async move {
             ctrl.run(tun, writer, tun_packet_rx).await.unwrap();
         });
@@ -560,7 +587,7 @@ mod tests {
             .route_table()
             .write()
             .await
-            .insert("v6-target", "2001:db8::/64")
+            .insert("", "v6-target", "2001:db8::/64")
             .unwrap();
 
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
@@ -575,7 +602,12 @@ mod tests {
             ctl_w,
         )));
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
-        let ctrl = VnetController::new("plugin-proxy".to_string(), client.clone(), false);
+        let ctrl = VnetController::new(
+            "plugin-proxy".to_string(),
+            client.clone(),
+            false,
+            String::new(),
+        );
         let handle = tokio::spawn(async move {
             ctrl.run(tun, writer, tun_packet_rx).await.unwrap();
         });
