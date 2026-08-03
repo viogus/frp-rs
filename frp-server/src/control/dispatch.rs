@@ -61,6 +61,7 @@ fn match_internal_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
             protocol,
             candidate_addrs,
             assisted_addrs,
+            detect_behavior,
         } => Box::pin(async move {
             super::nathole::handle_write_resp(
                 ctx,
@@ -73,7 +74,7 @@ fn match_internal_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
                     protocol,
                     candidate_addrs,
                     assisted_addrs,
-                    ..Default::default()
+                    detect_behavior,
                 },
             )
             .await;

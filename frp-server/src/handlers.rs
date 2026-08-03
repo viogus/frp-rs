@@ -735,6 +735,7 @@ pub(crate) async fn handle_nat_hole_visitor(
                 protocol: cr.protocol.clone(),
                 candidate_addrs: cr.candidate_addrs.clone(),
                 assisted_addrs: cr.assisted_addrs.clone(),
+                detect_behavior: cr.detect_behavior.clone(),
             })
             .await;
     }

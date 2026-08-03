@@ -280,6 +280,7 @@ pub(crate) async fn handle_nat_hole_resp(
             resp_msg.protocol.clone(),
             resp_msg.candidate_addrs.clone(),
             resp_msg.assisted_addrs.clone(),
+            resp_msg.detect_behavior.clone(),
         )
         .await
     {
@@ -651,8 +652,16 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         use crate::nathole::controller as nathole_ctrl;
         let visitor_local_ips = classify::parse_ips(&visitor_assisted);
         let client_local_ips = classify::parse_ips(&client_assisted);
+        debug!(
+            tid = %tid,
+            v_mapped = ?visitor_mapped,
+            v_assisted = ?visitor_assisted,
+            c_mapped = ?client_mapped,
+            "XTCP: classify inputs"
+        );
         let v_feature = classify::classify_nat_feature(&visitor_mapped, &visitor_local_ips).ok();
         let c_feature = classify::classify_nat_feature(&client_mapped, &client_local_ips).ok();
+        debug!(tid = %tid, v_feature = ?v_feature, c_feature = ?c_feature, "XTCP: classify results");
 
         // Run analysis and build responses
         let analysis_index;
@@ -800,6 +809,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 protocol: v_resp.protocol.clone(),
                 candidate_addrs: v_resp.candidate_addrs.clone(),
                 assisted_addrs: v_resp.assisted_addrs.clone(),
+                detect_behavior: v_resp.detect_behavior.clone(),
             })
             .await
         {
@@ -828,6 +838,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                     protocol: cr.protocol.clone(),
                     candidate_addrs: cr.candidate_addrs.clone(),
                     assisted_addrs: cr.assisted_addrs.clone(),
+                    detect_behavior: cr.detect_behavior.clone(),
                 })
                 .await
             {

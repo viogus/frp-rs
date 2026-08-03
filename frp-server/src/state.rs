@@ -80,6 +80,7 @@ pub enum InternalMsg {
         protocol: Option<String>,
         candidate_addrs: Option<Vec<String>>,
         assisted_addrs: Option<Vec<String>>,
+        detect_behavior: Option<msg::NatHoleDetectBehavior>,
     },
     /// Send a CloseProxy message to the client via its control channel.
     /// Used by the dashboard delete API to notify the client to shut

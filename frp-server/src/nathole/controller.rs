@@ -220,6 +220,7 @@ impl Controller {
                         protocol: None,
                         candidate_addrs: None,
                         assisted_addrs: None,
+                        detect_behavior: None,
                     });
                 }
                 return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
@@ -377,6 +378,7 @@ impl Controller {
     }
 
     /// Forward NatHoleResp to the visitor via control channel.
+    #[allow(clippy::too_many_arguments)]
     pub async fn forward_nat_hole_resp_via_ctl(
         &self,
         sid: &str,
@@ -385,6 +387,7 @@ impl Controller {
         protocol: Option<String>,
         candidate_addrs: Option<Vec<String>>,
         assisted_addrs: Option<Vec<String>>,
+        detect_behavior: Option<msg::NatHoleDetectBehavior>,
     ) -> bool {
         let tx = {
             let sessions = self.sessions.read().await;
@@ -399,6 +402,7 @@ impl Controller {
                     protocol,
                     candidate_addrs,
                     assisted_addrs,
+                    detect_behavior,
                 })
                 .await;
             return true;
