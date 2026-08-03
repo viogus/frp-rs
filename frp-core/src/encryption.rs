@@ -432,6 +432,7 @@ impl SnappyDecompressor {
     ) -> Result<SnappyFeedStatus, String> {
         Err("compression not compiled".into())
     }
+    #[allow(dead_code)] // stub: only called when the compression feature is on
     pub(crate) fn has_pending(&self) -> bool {
         false
     }

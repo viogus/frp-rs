@@ -216,6 +216,7 @@ mod quic_admission_tests {
 }
 
 #[inline]
+#[allow(dead_code)] // only used in TLS/WS/KCP accept paths, not in every feature set
 fn is_v1_type_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
 }

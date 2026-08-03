@@ -1,4 +1,5 @@
 use std::io;
+#[allow(unused_imports)] // unused in the micro (no-feature) build
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;

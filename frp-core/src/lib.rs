@@ -56,6 +56,11 @@ pub mod xtcp_p2p {
     pub fn derive_detect_key(_sk: &str) -> [u8; 16] {
         [0u8; 16]
     }
+    /// Stub mirror of the real `P2pStream` trait (defined in the kcp-enabled
+    /// module) so callers can box either transport behind the same trait
+    /// object even when kcp (and the XTCP data planes) are compiled out.
+    pub trait P2pStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+    impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> P2pStream for T {}
     #[allow(clippy::too_many_arguments)]
     pub async fn xtcp_p2p_connect_yamux(
         _socket: UdpSocket,

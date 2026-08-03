@@ -708,6 +708,7 @@ pub async fn run_vhost_https_listener(
 /// Read up to `buf.len()` bytes for the TLS ClientHello. Reads until we have
 /// the full ClientHello record (content type 0x16 + TLS record header), or
 /// the buffer is full, or EOF.
+#[allow(dead_code)] // TLS/HTTPS vhost paths only; absent in the micro build
 async fn read_client_hello_prefix<S: tokio::io::AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut [u8],

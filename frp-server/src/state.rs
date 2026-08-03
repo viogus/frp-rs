@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use frp_core::auth::{AuthConfig, OidcVerifier};
 use frp_core::metrics::ProxyMetricsRegistry;
+use frp_core::msg;
 #[cfg(feature = "vnet")]
-use frp_core::msg::{self, VnetRouteAdvertise, VnetRouteRemove};
+use frp_core::msg::{VnetRouteAdvertise, VnetRouteRemove};
 use frp_core::transport::IoStream;
 
 use crate::nathole::controller::Controller;

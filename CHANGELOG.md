@@ -4,6 +4,18 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **Binary profile audit**: fixed two `tiny`/`micro` build regressions — the
+  `detect_behavior` field on `InternalMsg::WriteNatHoleResp` referenced
+  `msg::NatHoleDetectBehavior` behind a vnet-gated import (`frp-server/src/
+  state.rs`), and the no-kcp `xtcp_p2p` stub lacked the `P2pStream` trait that
+  `frp-client` boxes at its data-plane dispatch. Both `tiny` (frps-tiny
+  ~3.2MB / frpc-tiny ~2.7MB) and `micro` (frps-micro ~1.9MB / frpc-micro
+  ~2.0MB) now build with **zero warnings** across all four profiles
+  (default/full/tiny/micro) — the remaining dead-code warnings were
+  feature-gated utility code (snappy stub `has_pending`, `is_v1_type_byte`,
+  vhost `read_client_hello_prefix`, an unused import). Doc size tables
+  updated to measured sizes (default ~5.0/4.5MB incl. QUIC; full ~5.3/4.5MB).
+
 - **QUIC transport is now default ON**: the `quic` feature joined the default
   feature set of `frp-core`, `frp-client` and `frp-server`, so a plain
   `cargo build --release -p frps -p frpc` includes the QUIC transport and the

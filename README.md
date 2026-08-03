@@ -103,8 +103,8 @@ but not literally 100% — see "Known limitations" below.
 
 | Metric | Go frp v0.70.1 | frp-rs (default) | frp-rs (full) | frp-rs (`tiny`) | frp-rs (`micro`) |
 |--------|---------------|------------------|---------------|-----------------|-------------------|
-| frps binary | ~14 MB | ~5.2 MB | ~7.8 MB | ~4.4 MB | ~2.6 MB |
-| frpc binary | ~12 MB | ~5.4 MB | ~6.0 MB | ~3.8 MB | ~2.7 MB |
+| frps binary | ~14 MB | ~5.0 MB | ~5.3 MB | ~3.2 MB | ~1.9 MB |
+| frpc binary | ~12 MB | ~4.5 MB | ~4.5 MB | ~2.7 MB | ~2.0 MB |
 | Memory (idle) | ~8-12 MB | ~2-4 MB | ~2-4 MB | ~1.5-3 MB | ~1-2 MB |
 
 **Four build sizes via feature flags.** Trim unused protocols and features to match your deployment:
@@ -132,16 +132,16 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 **兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 68 项常规兼容性测试加 16 项 XTCP 两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
-**体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.2 MB，frpc ~5.4 MB，约为 Go frp 的 1/2.5。全功能版本（full）frps ~7.8 MB，frpc ~6.0 MB。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
+**体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.0 MB，frpc ~4.5 MB（含 QUIC 传输），约为 Go frp 的 1/3。全功能版本（full）frps ~5.3 MB，frpc ~4.5 MB。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
 **功能裁剪。** 四级构建体系，按需组合，适配从云端到嵌入式的全场景（SSH/QUIC/dashboard 需显式启用）：
 
 | 版本 | 体积 (frps/frpc) | 保留能力 | 适用场景 |
 |------|-----------------|---------|---------|
 | **default** | ~5.0MB / ~4.5MB | TCP/WS/TLS/KCP/QUIC、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
-| **full** | ~7.8MB / ~6.0MB | 全部传输层 + SSH + dashboard（需 `--features "ssh,quic,dashboard"`） | 全功能部署 |
-| **tiny** | ~4.4MB / ~3.8MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/压缩/TCP mux | 边缘设备、嵌入式 |
-| **micro** | ~2.6MB / ~2.7MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
+| **full** | ~5.3MB / ~4.5MB | 全部传输层 + SSH + dashboard（需 `--features "ssh,quic,dashboard"`） | 全功能部署 |
+| **tiny** | ~3.2MB / ~2.7MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/压缩/TCP mux | 边缘设备、嵌入式 |
+| **micro** | ~1.9MB / ~2.0MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
 
 每个 feature 均可独立开关，18 个编译期 feature flag 精细控制二进制内容。无需修改代码，Cargo feature 即按需裁剪。
 
@@ -204,13 +204,13 @@ enabled by default; dashboard is opt-in:
 # Default — core transports + SSH + QUIC, no dashboard (~5.0 MB frps, ~4.5 MB frpc)
 cargo build --release -p frps -p frpc
 
-# Full — all features (~7.8 MB frps, ~6.0 MB frpc)
+# Full — all features (~5.3 MB frps, ~4.5 MB frpc)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
 
-# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard/compression, keeps TLS+HTTP proxy+TCP mux (~4.4 MB / ~3.8 MB)
+# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard/compression, keeps TLS+HTTP proxy+TCP mux (~3.2 MB / ~2.7 MB)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
 
-# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~2.6 MB / ~2.7 MB)
+# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~1.9 MB / ~2.0 MB)
 cargo build --release -p frps -p frpc --no-default-features --features micro
 ```
 

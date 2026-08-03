@@ -320,6 +320,8 @@ async fn bridge_work_to_user(
         if let Err(e) = dec.validate_partial_eof() {
             #[cfg(feature = "compression")]
             tracing::warn!(error = %e, "snappy EOF validation failed in bridge: {}", e);
+            #[cfg(not(feature = "compression"))]
+            let _ = e;
         }
     }
 
