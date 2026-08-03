@@ -261,7 +261,7 @@ pub(crate) async fn handle_nat_hole_resp(
             protocol: resp_msg.protocol.clone(),
             candidate_addrs: resp_msg.candidate_addrs.clone(),
             assisted_addrs: resp_msg.assisted_addrs.clone(),
-            ..Default::default()
+            detect_behavior: resp_msg.detect_behavior.clone(),
         }));
         let _ = write_ctl_msg(&mut accept_writer, &forward, ctx.v2).await;
         ctx.state
