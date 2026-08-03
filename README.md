@@ -77,8 +77,12 @@ but not literally 100% — see "Known limitations" below.
 - **All 10 client plugins**: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`,
   `https2http`, `https2https`, `http2http`, `tls2raw`, `virtual_net`.
 - **XTCP**: Cross-compat with Go frp (requires public internet for STUN/NAT probes).
-  frp-rs XTCP visitors default to the KCP P2P data plane (Go frp defaults to
-  QUIC) so Go providers negotiate KCP. See [full audit](docs/go-frp-compat-audit.md) for details.
+  Both P2P data planes are supported — KCP+yamux (default) and QUIC
+  (`protocol="quic"`, `quic` feature is default ON). One known limitation:
+  a **Go** visitor with the default `protocol="quic"` cannot talk to a Rust
+  provider (Go frp v0.70.1 sends `"ip:port"` as the QUIC SNI, which rustls
+  rejects); set `protocol = "kcp"` on such a visitor. See
+  [full audit](docs/go-frp-compat-audit.md) for details.
 
 ### Known limitations (as of frp-rs 0.7.1)
 
@@ -130,11 +134,11 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 ### frp-rs 核心优势
 
-**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 68 项常规兼容性测试加 16 项 XTCP 两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
+**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 68 项常规兼容性测试加 17 项 XTCP 两两矩阵测试（含 QUIC 数据面）。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
 **体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.0 MB，frpc ~4.5 MB（含 QUIC 传输），约为 Go frp 的 1/3。全功能版本（full）frps ~5.3 MB，frpc ~4.5 MB。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
-**功能裁剪。** 四级构建体系，按需组合，适配从云端到嵌入式的全场景（SSH/QUIC/dashboard 需显式启用）：
+**功能裁剪。** 四级构建体系，按需组合，适配从云端到嵌入式的全场景（QUIC/SSH 默认启用，dashboard 需显式启用）：
 
 | 版本 | 体积 (frps/frpc) | 保留能力 | 适用场景 |
 |------|-----------------|---------|---------|
@@ -736,7 +740,7 @@ frp-rs/
     entrypoint.c           Minimal static entrypoint (FRP_MODE, conf path)
     README.md              Docker build documentation
   scripts/
-    compat-test.sh         Go↔Rust cross-compatibility test suite (68 + 16 XTCP scenarios)
+    compat-test.sh         Go↔Rust cross-compatibility test suite (68 regular + 17 XTCP scenarios)
   frps.toml               Example server config
   frpc.toml               Example client config
   CLAUDE.md               Claude Code project instructions
