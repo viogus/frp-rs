@@ -993,15 +993,22 @@ fn vnet_visitor_route_target_run_id(
     source_run_id: &str,
     proxy_name: &str,
 ) -> Option<String> {
+    // Pick deterministically: collect every qualifying candidate (the source
+    // owns a route in the candidate's vnet) and take the lexicographically
+    // smallest vnet. HashMap iteration order is process-dependent, so a plain
+    // `.find()` would make the choice nondeterministic when the source
+    // participates in several vnets that each advertise a same-named visitor.
     routes
         .iter()
-        .find(|((vn, _), (_, name))| {
+        .filter(|((vn, _), (_, name))| {
             name == proxy_name
                 && routes
                     .iter()
                     .any(|((vn2, _), (rid2, _))| vn2 == vn && rid2 == source_run_id)
         })
-        .map(|(_, (run_id, _))| run_id.clone())
+        .map(|((vn, _), (run_id, _))| (vn.clone(), run_id.clone()))
+        .min()
+        .map(|(_, run_id)| run_id)
 }
 
 #[cfg(test)]
@@ -1122,6 +1129,43 @@ mod identity_binding_tests {
             super::vnet_visitor_route_target_run_id(&routes, "run-z", "visitor"),
             None
         );
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_visitor_route_deterministic_when_source_in_multiple_vnets() {
+        use std::collections::HashMap;
+
+        let mut routes = HashMap::new();
+        // Same visitor name in two virtual nets, advertised by two run_ids.
+        routes.insert(
+            ("vnet-a".to_string(), "10.0.0.1/32".to_string()),
+            ("run-a".to_string(), "visitor".to_string()),
+        );
+        routes.insert(
+            ("vnet-b".to_string(), "10.0.0.1/32".to_string()),
+            ("run-b".to_string(), "visitor".to_string()),
+        );
+        // run-c participates in both vnets, so both visitors are reachable.
+        routes.insert(
+            ("vnet-a".to_string(), "10.99.0.0/24".to_string()),
+            ("run-c".to_string(), "peer-a".to_string()),
+        );
+        routes.insert(
+            ("vnet-b".to_string(), "10.99.0.0/24".to_string()),
+            ("run-c".to_string(), "peer-b".to_string()),
+        );
+
+        // Both candidates qualify; the result must not depend on HashMap
+        // iteration order. The lexicographically smallest vnet wins
+        // ("vnet-a" < "vnet-b" → run-a). Repeatedly asserting the same value
+        // guards the determinism guarantee.
+        for _ in 0..25 {
+            assert_eq!(
+                super::vnet_visitor_route_target_run_id(&routes, "run-c", "visitor"),
+                Some("run-a".to_string())
+            );
+        }
     }
 }
 

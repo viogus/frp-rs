@@ -352,6 +352,12 @@ mod oidc_impl {
         )
     }
 
+    /// Hard cap on the replay-protection cache entry count. Lazy 24h-TTL
+    /// pruning alone cannot bound memory when a holder of valid signed tokens
+    /// submits many unique jtis (login throttling was removed); at capacity the
+    /// soonest-expiring entry is evicted to make room for the new jti.
+    const MAX_SEEN_JTIS: usize = 100_000;
+
     /// Server-side OIDC verifier. Discovers JWKS from issuer, verifies JWT tokens,
     /// and enforces subject binding for ping/NewWorkConn.
     pub struct OidcVerifier {
@@ -694,8 +700,9 @@ mod oidc_impl {
         /// same jti + different subject → rejected (cross-identity replay). Tokens
         /// without a jti claim are allowed (cannot be tracked — documented limitation;
         /// TLS + exp remain the primary defenses). The cache holds each jti until
-        /// `expiry + leeway` (or a fixed TTL when exp is absent) and prunes expired
-        /// entries lazily on each call, so it never grows unbounded.
+        /// `expiry + leeway` (or a fixed TTL when exp is absent or already past),
+        /// prunes expired entries lazily on each call, and caps the entry count
+        /// (`MAX_SEEN_JTIS`), evicting the soonest-expiring entry when full.
         pub fn check_replay(
             &self,
             jti: Option<&str>,
@@ -714,13 +721,15 @@ mod oidc_impl {
                 .unwrap_or_default()
                 .as_secs() as i64;
             // Keep the jti in the cache until exp (+ leeway aligned with
-            // jsonwebtoken's default 60s clock skew). Without an exp claim,
-            // fall back to a fixed 1h TTL. The deadline is capped at 24h so a
-            // far-future `exp` (or `skip_expiry` accepting long-lived tokens)
-            // cannot make the cache grow unbounded — replay protection only
-            // needs to cover the token's realistic lifetime.
+            // jsonwebtoken's default 60s clock skew). Without an exp claim —
+            // or when exp is already in the past (skip_expiry accepting
+            // expired tokens) — fall back to a fixed 1h TTL so the entry is
+            // actually tracked instead of being pruned on the next call. The
+            // deadline is capped at 24h so a far-future `exp` cannot make the
+            // cache grow unbounded — replay protection only needs to cover
+            // the token's realistic lifetime.
             const MAX_JTI_TTL_SECS: i64 = 24 * 3600;
-            let deadline = if expiry > 0 {
+            let deadline = if expiry > now {
                 (expiry + 60).min(now + MAX_JTI_TTL_SECS)
             } else {
                 now + 3600
@@ -736,6 +745,19 @@ mod oidc_impl {
                     "OIDC: JWT jti {jti} reused with a different subject (replay suspected)"
                 )),
                 None => {
+                    if seen.len() >= MAX_SEEN_JTIS {
+                        // Cache is at its size cap: evict the entry whose
+                        // deadline is soonest (keeps tracking of the longest
+                        // lived jtis), then insert the new one. This bounds
+                        // memory even under a flood of unique jtis.
+                        if let Some(oldest) = seen
+                            .iter()
+                            .min_by_key(|(_, (_, d))| *d)
+                            .map(|(k, _)| k.clone())
+                        {
+                            seen.remove(&oldest);
+                        }
+                    }
                     seen.insert(jti.to_string(), (subject.to_string(), deadline));
                     Ok(())
                 }
@@ -1121,6 +1143,45 @@ mod oidc_impl {
                 .check_replay(Some("jti-old"), "alice", now() + 3600)
                 .is_ok());
             assert_eq!(v.seen_jtis.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn check_replay_caps_entry_count() {
+            let v = test_verifier();
+            let now = now();
+            // Pre-fill the cache to its size cap with unexpired entries, then
+            // insert one more jti. The cache must stay bounded and still track
+            // the newest jti (the soonest-expiring entry is evicted to make
+            // room).
+            {
+                let mut seen = v.seen_jtis.lock().unwrap();
+                for i in 0..MAX_SEEN_JTIS {
+                    seen.insert(format!("pre-jti-{i}"), ("alice".to_string(), now + 100_000));
+                }
+                assert_eq!(seen.len(), MAX_SEEN_JTIS);
+            }
+            assert!(v.check_replay(Some("new-jti"), "alice", now + 3600).is_ok());
+            let seen = v.seen_jtis.lock().unwrap();
+            assert!(seen.len() <= MAX_SEEN_JTIS);
+            assert!(seen.contains_key("new-jti"));
+        }
+
+        #[test]
+        fn check_replay_past_exp_uses_fixed_ttl() {
+            let v = test_verifier();
+            let now = now();
+            // An expired `exp` (e.g. accepted via skip_expiry) must still be
+            // tracked: fall back to the fixed 1h TTL instead of computing a
+            // deadline in the past that would be pruned on the next call.
+            assert!(v
+                .check_replay(Some("jti-expired"), "alice", now - 100)
+                .is_ok());
+            let seen = v.seen_jtis.lock().unwrap();
+            let deadline = seen.get("jti-expired").map(|(_, d)| *d);
+            assert!(
+                deadline.is_some_and(|d| d > now),
+                "expired-exp jti must be tracked with a deadline in the future"
+            );
         }
     }
 }
