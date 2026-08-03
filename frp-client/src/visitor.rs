@@ -37,8 +37,9 @@ pub(crate) struct VisitorListenerConfig {
     pub max_retries_an_hour: i32,
     pub min_retry_interval: i64,
     pub stun_server: String,
-    /// XTCP P2P data plane protocol: "kcp" or "quic" (Go frp v0.70.1 compat).
-    /// Default: "kcp" because the frp-rs data plane only implements KCP.
+    /// XTCP P2P data plane protocol: "kcp" (default) or "quic".
+    /// Both data planes are implemented; "kcp" is the default (Go compat
+    /// matrix forces kcp), "quic" requires the `quic` feature.
     pub p2p_protocol: String,
     pub visitor_tx: mpsc::Sender<crate::service::VisitorRequest>,
     pub fallback_to: String,

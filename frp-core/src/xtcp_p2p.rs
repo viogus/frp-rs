@@ -1130,15 +1130,22 @@ pub async fn xtcp_p2p_connect_quic(
     // 3. QUIC data plane over the punched socket.
     if is_server {
         // Provider = QUIC server: self-signed TLS, accept connection + stream.
+        // Bound the stream accept by the hole-punch timeout so a visitor that
+        // never writes (quinn opens streams lazily on first write) cannot pin
+        // the provider task forever — the caller reports NatHoleReport(false)
+        // on error.
         let tls_config = crate::transport::generate_self_signed_tls_config()
             .map_err(|e| format!("generate self-signed TLS config: {e}"))?;
         let conn = crate::quic::quic_accept_on_socket(std_socket, tls_config, params)
             .await
             .map_err(|e| format!("QUIC accept: {e}"))?;
-        let stream = conn
-            .accept_bi_owned()
-            .await
-            .map_err(|e| format!("QUIC accept stream: {e}"))?;
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms.max(1)),
+            conn.accept_bi_owned(),
+        )
+        .await
+        .map_err(|_| format!("QUIC stream accept timeout after {timeout_ms}ms"))?
+        .map_err(|e| format!("QUIC accept stream: {e}"))?;
         Ok(stream)
     } else {
         // Visitor = QUIC client: dial (InsecureSkipVerify) + open stream.

@@ -1515,9 +1515,10 @@ pub struct VisitorConfig {
     /// Shared secret key — must match the STCP proxy's `sk`.
     #[serde(default, alias = "secretKey", alias = "sk")]
     pub secret_key: String,
-    /// Protocol for XTCP P2P connections: "kcp" or "quic".
-    /// The frp-rs XTCP data plane only implements KCP, so the default is "kcp"
-    /// even though Go frp v0.70.1 defaults XTCP visitors to "quic".
+    /// Protocol for XTCP P2P connections: "kcp" (default) or "quic".
+    /// Both data planes are implemented; "kcp" is the default because the Go
+    /// compat matrix forces kcp, while "quic" matches Go frp v0.70.1's default
+    /// (Go XTCP visitors default to "quic") and requires the `quic` feature.
     #[serde(default = "default_xtcp_protocol", alias = "protocol")]
     pub protocol: String,
     /// Optional server user for auth matching.

@@ -964,9 +964,9 @@ write_frpc_config_xtcp_provider() {
 write_frpc_config_xtcp_visitor() {
     local impl="$1" server_host="$2" server_port="$3" token="$4" visitor_port="$5" \
           server_name="$6" sk="$7" out="$8" features="${9:-}"
-    local has_enc=false has_comp=false has_kcp=false
+    local has_enc=false has_comp=false has_kcp=false has_quic=false
     for feat in $features; do
-        case "$feat" in enc) has_enc=true ;; compression) has_comp=true ;; kcp) has_kcp=true ;; esac
+        case "$feat" in enc) has_enc=true ;; compression) has_comp=true ;; kcp) has_kcp=true ;; quic) has_quic=true ;; esac
     done
     if [[ "$impl" == "go" ]]; then
         {
@@ -982,7 +982,9 @@ write_frpc_config_xtcp_visitor() {
             # No fallbackTo — P2P must succeed for the test to pass.
             # STCP fallback would mask XTCP failures (compat matrix P1).
             # Go frp v0.70 defaults to protocol="quic" for XTCP P2P tunnel.
-            # Rust only supports KCP. Force Go to use KCP for Go↔Rust compat.
+            # Force KCP (or explicitly QUIC) per the scenario's features so the
+            # Go↔Rust data plane matches the Rust implementation.
+            if $has_quic; then printf 'protocol = "quic"\n'; fi
             if $has_kcp; then printf 'protocol = "kcp"\n'; fi
             if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
@@ -1001,9 +1003,8 @@ write_frpc_config_xtcp_visitor() {
             printf 'bind_addr = "127.0.0.1"\nbind_port = %s\n' "$visitor_port"
             # No fallback_to — P2P must succeed for the test to pass.
             # STCP fallback would mask XTCP failures (compat matrix P1).
-            # Rust only supports KCP for the XTCP P2P tunnel; force it so
-            # Go frps advertises KCP to Go providers too.
-            printf 'protocol = "kcp"\n'
+            # XTCP P2P tunnel protocol: kcp (default) or quic per features.
+            if $has_quic; then printf 'protocol = "quic"\n'; else printf 'protocol = "kcp"\n'; fi
             if $has_enc; then printf 'use_encryption = true\n'; fi
             if $has_comp; then printf 'use_compression = true\n'; fi
         } > "$out"
@@ -3656,6 +3657,8 @@ test_xtcp_go_frps_go_prov_rust_vis() { run_xtcp_test "xtcp-go-frps-go-prov-rust-
 test_xtcp_go_frps_rust_prov_go_vis() { run_xtcp_test "xtcp-go-frps-rust-prov-go-vis" go rust go "kcp"; }
 test_xtcp_rust_frps_go_prov_rust_vis() { run_xtcp_test "xtcp-rust-frps-go-prov-rust-vis" rust go rust ""; }
 test_xtcp_rust_frps_rust_prov_go_vis() { run_xtcp_test "xtcp-rust-frps-rust-prov-go-vis" rust rust go "kcp"; }
+test_xtcp_rust_frps_rust_prov_go_vis_quic() { run_xtcp_test "xtcp-rust-frps-rust-prov-go-vis-quic" rust rust go "quic"; }
+test_xtcp_go_frps_go_prov_rust_vis_quic() { run_xtcp_test "xtcp-go-frps-go-prov-rust-vis-quic" go go rust "quic"; }
 
 # ── XTCP encrypted variants ──
 
@@ -4632,6 +4635,9 @@ if ${XTCP_ONLY:-false} || [[ "${RUN_XTCP:-0}" == "1" ]]; then
         "test_xtcp_go_frps_rust_prov_go_vis"
         "test_xtcp_rust_frps_go_prov_rust_vis"
         "test_xtcp_rust_frps_rust_prov_go_vis"
+        # QUIC data plane
+        "test_xtcp_rust_frps_rust_prov_go_vis_quic"
+        "test_xtcp_go_frps_go_prov_rust_vis_quic"
         # Encrypted
         "test_xtcp_g2g_enc"
         "test_xtcp_r2r_enc"
