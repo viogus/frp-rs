@@ -270,6 +270,29 @@ pub(crate) async fn authenticate(
                     warn!(peer = ?peer, "OIDC auth failed: subject claim is empty");
                     return Err(());
                 }
+                // jti replay protection: same jti + same subject is allowed
+                // (frpc reconnects reuse the cached token); same jti +
+                // different subject is rejected as a cross-identity replay.
+                if let Err(e) = verifier.check_replay(
+                    oidc_token.jti.as_deref(),
+                    &oidc_token.subject,
+                    oidc_token.expiry,
+                ) {
+                    warn!(peer = ?peer, error = %e, "OIDC login rejected: {}", e);
+                    let (_, mut writer) = tokio::io::split(stream);
+                    let resp = FrpMessage::LoginResp(msg::LoginResp {
+                        version: Some(frp_core::VERSION.into()),
+                        run_id: None,
+                        error: Some(err_msg(
+                            state.detailed_errors_to_client,
+                            format!("OIDC authentication failed: {e}"),
+                            "OIDC authentication failed",
+                        )),
+                        server_additional_auth_scopes: None,
+                    });
+                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                    return Err(());
+                }
                 info!(subject = %oidc_token.subject, "OIDC login verified: subject={}", oidc_token.subject);
                 Some(oidc_token.subject)
             }

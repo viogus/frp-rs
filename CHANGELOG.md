@@ -14,6 +14,16 @@ All notable changes to frp-rs.
   virtual net — the same subnet may coexist in different vnets and lookups are
   vnet-scoped — with isolation/broadcast/close/packet tests in `frp-vnet` and
   `frp-server`.
+- **OIDC JWT jti replay protection (frp-rs enhancement)**: the server now
+  tracks seen `jti` claims on login. Same jti + same subject is allowed
+  (frpc reuses its cached token on reconnect); same jti + different subject
+  is rejected as a cross-identity replay. Tokens without a `jti` claim pass
+  (documented limitation — they cannot be tracked). Cache entries live until
+  `exp + leeway` (60s, capped at 24h; fixed 1h TTL without `exp`) and are
+  pruned lazily. Go frp v0.70.1 has no jti check — this is defense-in-depth;
+  the primary defenses remain TLS + short-lived tokens. Tests: 4 unit tests
+  in `frp-core` (`check_replay_*`) + 2 integration tests in
+  `frp-server/tests/oidc_integration.rs`.
 
 - **HTTP vhost 504 Gateway Timeout (Go v0.70.1 compat)**: when the backend
   (work conn) produces no response headers within `vhost_http_timeout`

@@ -319,6 +319,9 @@ mod oidc_impl {
     pub struct LoginOidcToken {
         pub subject: String,
         pub expiry: i64,
+        /// JWT ID claim ("jti"), when present in the token. Used for replay
+        /// protection (see `OidcVerifier::check_replay`).
+        pub jti: Option<String>,
     }
 
     /// Cached JWKS keys.
@@ -360,6 +363,10 @@ mod oidc_impl {
         skip_issuer: bool,
         skip_nbf: bool,
         http: reqwest::Client,
+        /// Replay-protection cache: jti → (subject, deadline_unix_seconds).
+        /// A jti seen with a different subject is rejected; the same jti with
+        /// the same subject is allowed (frpc reconnects reuse the cached token).
+        seen_jtis: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
     }
 
     impl OidcVerifier {
@@ -420,6 +427,7 @@ mod oidc_impl {
                 skip_issuer,
                 skip_nbf,
                 http,
+                seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
             };
 
             if verifier.skip_expiry {
@@ -519,14 +527,17 @@ mod oidc_impl {
         ///
         /// # Security: jti replay prevention
         ///
-        /// TODO: Add jti (JWT ID) replay prevention. The current implementation
-        /// validates signature, expiry (unless skip_expiry is set), issuer,
-        /// and audience, but does NOT track previously-seen `jti` claims.
-        /// A stolen token can be replayed until it expires — the only defense
-        /// is the `exp` claim. For production deployments, add a time-bounded
-        /// cache (e.g. TTL = max clock_skew + token lifetime) keyed by jti
-        /// to detect and reject replayed JWTs. This is a defense-in-depth
-        /// measure; the primary protection is TLS transport + short-lived tokens.
+        /// Implemented via `check_replay`, called by the server after this
+        /// method succeeds. Semantics (user-approved): a jti reused with the
+        /// same subject is allowed — frpc caches the OIDC token until expiry
+        /// and legitimately re-sends it on reconnect (and for Ping/NewWorkConn);
+        /// a jti reused with a different subject is rejected as a cross-identity
+        /// replay. Tokens without a jti claim are allowed (documented
+        /// limitation — they cannot be tracked; TLS + exp remain the primary
+        /// defenses). The cache holds each jti until `expiry + leeway` (or a
+        /// fixed TTL when exp is absent) and prunes expired entries lazily on
+        /// each call, so it never grows unbounded. Go frp v0.70.1 has no jti
+        /// check — this is a frp-rs-specific defense-in-depth measure.
         pub async fn verify_login(&self, token: &str) -> Result<LoginOidcToken, String> {
             let header = jsonwebtoken::decode_header(token)
                 .map_err(|e| format!("OIDC: failed to decode JWT header: {e}"))?;
@@ -658,9 +669,11 @@ mod oidc_impl {
                             continue;
                         }
                         let exp = data.claims["exp"].as_i64().unwrap_or(0);
+                        let jti = data.claims["jti"].as_str().map(|s| s.to_string());
                         return Ok(LoginOidcToken {
                             subject: sub,
                             expiry: exp,
+                            jti,
                         });
                     }
                     Err(e) => {
@@ -674,6 +687,59 @@ mod oidc_impl {
                 message: format!("OIDC: JWT verification failed: {last_err}"),
                 refresh_warranted,
             })
+        }
+
+        /// Check a verified login token's jti for replay. Semantics (user-approved):
+        /// same jti + same subject → allowed (frpc reconnects reuse the cached token);
+        /// same jti + different subject → rejected (cross-identity replay). Tokens
+        /// without a jti claim are allowed (cannot be tracked — documented limitation;
+        /// TLS + exp remain the primary defenses). The cache holds each jti until
+        /// `expiry + leeway` (or a fixed TTL when exp is absent) and prunes expired
+        /// entries lazily on each call, so it never grows unbounded.
+        pub fn check_replay(
+            &self,
+            jti: Option<&str>,
+            subject: &str,
+            expiry: i64,
+        ) -> Result<(), String> {
+            let Some(jti) = jti else {
+                // No jti claim: nothing to track. This is a documented limitation —
+                // such tokens cannot be replayed-detected, so TLS + exp stay the
+                // primary defenses.
+                return Ok(());
+            };
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            // Keep the jti in the cache until exp (+ leeway aligned with
+            // jsonwebtoken's default 60s clock skew). Without an exp claim,
+            // fall back to a fixed 1h TTL. The deadline is capped at 24h so a
+            // far-future `exp` (or `skip_expiry` accepting long-lived tokens)
+            // cannot make the cache grow unbounded — replay protection only
+            // needs to cover the token's realistic lifetime.
+            const MAX_JTI_TTL_SECS: i64 = 24 * 3600;
+            let deadline = if expiry > 0 {
+                (expiry + 60).min(now + MAX_JTI_TTL_SECS)
+            } else {
+                now + 3600
+            };
+
+            let mut seen = self.seen_jtis.lock().unwrap_or_else(|e| e.into_inner());
+            // Lazy pruning of expired entries prevents unbounded growth.
+            seen.retain(|_, (_, d)| *d > now);
+
+            match seen.get(jti) {
+                Some((stored_subject, _)) if stored_subject == subject => Ok(()),
+                Some(_) => Err(format!(
+                    "OIDC: JWT jti {jti} reused with a different subject (replay suspected)"
+                )),
+                None => {
+                    seen.insert(jti.to_string(), (subject.to_string(), deadline));
+                    Ok(())
+                }
+            }
         }
 
         /// Verify a ping JWT — also checks subject matches.
@@ -987,6 +1053,76 @@ mod oidc_impl {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Build an `OidcVerifier` without any network I/O. The real `new()`
+        /// fetches openid-configuration and JWKS; `check_replay` only touches
+        /// `seen_jtis`, so it is testable in isolation.
+        fn test_verifier() -> OidcVerifier {
+            OidcVerifier {
+                audience: String::new(),
+                issuer: String::new(),
+                jwks_uri: String::new(),
+                jwks: tokio::sync::RwLock::new(None),
+                skip_expiry: false,
+                skip_issuer: false,
+                skip_nbf: false,
+                http: reqwest::Client::new(),
+                seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        fn now() -> i64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        }
+
+        #[test]
+        fn check_replay_same_subject_reuse_allowed() {
+            let v = test_verifier();
+            // frpc reconnect reuses the cached token with the same jti+subject.
+            assert!(v.check_replay(Some("jti-1"), "alice", now() + 3600).is_ok());
+            assert!(v.check_replay(Some("jti-1"), "alice", now() + 3600).is_ok());
+        }
+
+        #[test]
+        fn check_replay_different_subject_rejected() {
+            let v = test_verifier();
+            assert!(v.check_replay(Some("jti-2"), "alice", now() + 3600).is_ok());
+            let err = v
+                .check_replay(Some("jti-2"), "mallory", now() + 3600)
+                .expect_err("jti reused with a different subject must be rejected");
+            assert!(err.contains("replay"), "unexpected error message: {err}");
+        }
+
+        #[test]
+        fn check_replay_no_jti_allowed() {
+            let v = test_verifier();
+            // Tokens without a jti claim cannot be tracked — documented limitation.
+            assert!(v.check_replay(None, "alice", now() + 3600).is_ok());
+            assert!(v.seen_jtis.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn check_replay_expired_entry_pruned() {
+            let v = test_verifier();
+            // Pre-seed an entry whose deadline is already in the past. The next
+            // call must prune it lazily, then accept the jti as a new entry.
+            v.seen_jtis
+                .lock()
+                .unwrap()
+                .insert("jti-old".to_string(), ("alice".to_string(), now() - 1));
+            assert!(v
+                .check_replay(Some("jti-old"), "alice", now() + 3600)
+                .is_ok());
+            assert_eq!(v.seen_jtis.lock().unwrap().len(), 1);
+        }
+    }
 }
 
 #[cfg(feature = "oidc")]
@@ -1004,6 +1140,7 @@ pub struct OidcVerifier;
 pub struct LoginOidcToken {
     pub subject: String,
     pub expiry: i64,
+    pub jti: Option<String>,
 }
 #[cfg(not(feature = "oidc"))]
 impl OidcClient {
@@ -1040,6 +1177,16 @@ impl OidcVerifier {
         _expected_sub: &str,
     ) -> Result<(), String> {
         Err("OIDC feature disabled at compile time".into())
+    }
+    /// Stub — jti replay checking is unreachable when the oidc feature is
+    /// disabled (AuthMethod::Oidc is compiled out).
+    pub fn check_replay(
+        &self,
+        _jti: Option<&str>,
+        _subject: &str,
+        _expiry: i64,
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 
