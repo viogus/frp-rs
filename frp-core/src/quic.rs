@@ -148,6 +148,21 @@ impl QuicConnection {
         Ok(QuicStream::new_borrowed(send, recv))
     }
 
+    /// Accept the next bidirectional stream, keeping a reference to the
+    /// connection inside the returned stream so it outlives the stream.
+    ///
+    /// Use when the caller returns only the stream and drops the
+    /// `QuicConnection` handle (e.g., the XTCP QUIC data plane), otherwise
+    /// the connection would be torn down once the handle is dropped.
+    pub async fn accept_bi_owned(&self) -> io::Result<QuicStream> {
+        let (send, recv) = self
+            .conn
+            .accept_bi()
+            .await
+            .map_err(|e| io::Error::other(format!("quinn accept_bi: {e}")))?;
+        Ok(QuicStream::new(self.conn.clone(), send, recv))
+    }
+
     /// Open a new bidirectional stream to the remote peer (client side).
     pub async fn open_bi(&self) -> io::Result<QuicStream> {
         let (send, recv) = self
@@ -172,6 +187,25 @@ impl QuicConnection {
     pub fn set_max_concurrent_bi_streams(&self, count: u32) {
         self.conn.set_max_concurrent_bi_streams(count.max(1).into());
     }
+}
+
+/// Build a quinn `TransportConfig` from Go-frp-compatible parameters.
+///
+/// Shared by the listener, dial, and on-socket (XTCP P2P) code paths:
+/// max_idle_timeout, keep_alive_interval and max_concurrent_bidi_streams
+/// all come from the same `QuicTransportParams`.
+fn build_quic_transport_config(params: &QuicTransportParams) -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(params.max_idle_timeout_secs as u64)
+            .try_into()
+            .unwrap(),
+    ));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(
+        params.keepalive_period_secs as u64,
+    )));
+    transport.max_concurrent_bidi_streams(params.effective_max_incoming_streams().into());
+    transport
 }
 
 /// QUIC listener — binds a UDP socket and accepts QUIC connections.
@@ -236,19 +270,8 @@ impl QuicListener {
         let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
             .map_err(|e| io::Error::other(format!("QUIC TLS config: {e}")))?;
 
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(
-            std::time::Duration::from_secs(params.max_idle_timeout_secs as u64)
-                .try_into()
-                .unwrap(),
-        ));
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(
-            params.keepalive_period_secs as u64,
-        )));
-        transport.max_concurrent_bidi_streams(params.effective_max_incoming_streams().into());
-
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
-        server_config.transport_config(Arc::new(transport));
+        server_config.transport_config(Arc::new(build_quic_transport_config(&params)));
 
         let socket = std::net::UdpSocket::bind(addr)?;
         let endpoint = quinn::Endpoint::new(
@@ -387,19 +410,8 @@ pub async fn dial_quic_connection_with_params(
     let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
         .map_err(|e| io::Error::other(format!("QUIC TLS config: {e}")))?;
 
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        std::time::Duration::from_secs(params.max_idle_timeout_secs as u64)
-            .try_into()
-            .unwrap(),
-    ));
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(
-        params.keepalive_period_secs as u64,
-    )));
-    transport.max_concurrent_bidi_streams(params.effective_max_incoming_streams().into());
-
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
-    client_config.transport_config(Arc::new(transport));
+    client_config.transport_config(Arc::new(build_quic_transport_config(&params)));
 
     // Bind to the correct address family for the remote peer (IPv4 or IPv6).
     let bind_addr = if remote.is_ipv6() {
@@ -423,6 +435,93 @@ pub async fn dial_quic_connection_with_params(
         .await
         .map_err(|e| io::Error::other(format!("quinn connecting: {e}")))?;
 
+    Ok(QuicConnection { conn })
+}
+
+/// Dial a QUIC connection on an existing UDP socket (XTCP QUIC data plane).
+///
+/// The socket that won the NAT hole punch is handed directly to quinn so the
+/// NAT mapping is preserved — matching Go frp v0.70.1's `quic.Dial` on the
+/// hole-punched UDP conn. TLS skips certificate verification
+/// (InsecureSkipVerify=true) because Go frp uses a runtime self-signed cert,
+/// and the ALPN is `frp`. Returns the first bidirectional stream plus the
+/// `QuicConnection` handle.
+pub async fn quic_dial_on_socket(
+    socket: std::net::UdpSocket,
+    remote: SocketAddr,
+    server_name: &str,
+    params: QuicTransportParams,
+) -> io::Result<(QuicStream, QuicConnection)> {
+    // No CA on a hole-punched peer socket: skip certificate verification
+    // (InsecureSkipVerify=true), matching Go frp's auto-generated certs.
+    let verifier = std::sync::Arc::new(crate::transport::InsecureSkipVerify);
+    let mut tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+
+    tls_config.alpn_protocols = vec![b"frp".to_vec()];
+
+    let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+        .map_err(|e| io::Error::other(format!("QUIC TLS config: {e}")))?;
+
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
+    client_config.transport_config(Arc::new(build_quic_transport_config(&params)));
+
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|e| io::Error::other(format!("quinn endpoint: {e}")))?;
+    endpoint.set_default_client_config(client_config);
+
+    let conn = endpoint
+        .connect(remote, server_name)
+        .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?
+        .await
+        .map_err(|e| io::Error::other(format!("quinn connecting: {e}")))?;
+    let connection = QuicConnection { conn };
+    let stream = connection.open_bi().await?;
+    Ok((stream, connection))
+}
+
+/// Accept a QUIC connection on an existing UDP socket (XTCP QUIC data plane).
+///
+/// Server-side counterpart of [`quic_dial_on_socket`]: sets the `frp` ALPN on
+/// `tls_config`, wraps it in QUIC TLS, and hands the hole-punched UDP socket
+/// to quinn (matching Go frp's `quic.Listen` on the winning UDP conn).
+/// Waits for the first connection and returns its handle; the caller then
+/// accepts a bidirectional stream.
+pub async fn quic_accept_on_socket(
+    socket: std::net::UdpSocket,
+    mut tls_config: rustls::ServerConfig,
+    params: QuicTransportParams,
+) -> io::Result<QuicConnection> {
+    tls_config.alpn_protocols = vec![b"frp".to_vec()];
+
+    let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+        .map_err(|e| io::Error::other(format!("QUIC TLS config: {e}")))?;
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
+    server_config.transport_config(Arc::new(build_quic_transport_config(&params)));
+
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|e| io::Error::other(format!("quinn endpoint: {e}")))?;
+
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or_else(|| io::Error::other("quinn endpoint closed"))?;
+    let conn = incoming
+        .await
+        .map_err(|e| io::Error::other(format!("quinn accept conn: {e}")))?;
     Ok(QuicConnection { conn })
 }
 

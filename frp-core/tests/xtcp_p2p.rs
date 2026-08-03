@@ -461,3 +461,83 @@ async fn test_makehole_candidate_port_scanning() {
     assert_eq!(peer_a, addr_b);
     assert_eq!(peer_b, addr_a);
 }
+
+/// QUIC data plane roundtrip: hole-punch on loopback, then the provider
+/// (QUIC server) accepts the connection + stream while the visitor (QUIC
+/// client) dials + opens the stream, and data flows both ways.
+///
+/// Verifies the Go v0.70.1 `protocol=quic` data plane path: the punched UDP
+/// socket is handed to quinn directly (no yamux) and the first bidirectional
+/// stream carries the bridged data.
+#[cfg(feature = "quic")]
+#[tokio::test]
+async fn test_quic_roundtrip_loopback() {
+    let (a, b, _addr_a, _addr_b) = bind_pair().await;
+
+    let candidate_a = vec![a.local_addr().unwrap().to_string()];
+    let candidate_b = vec![b.local_addr().unwrap().to_string()];
+
+    const MSG: &[u8] = b"hello xtcp p2p over quic!";
+    const REPLY: &[u8] = b"hello from the visitor!";
+
+    // Punch + QUIC handshake in parallel. No detect_behavior/sid/key →
+    // simplified "frp" magic punch. Server side is the provider (accepts),
+    // client side the visitor (dials). QUIC streams open on first write
+    // (quinn's open_bi is lazy), so the client writes its first payload
+    // inside the join — otherwise the server's accept_bi would block
+    // forever waiting for a stream that never opens.
+    let (stream_a, stream_b) = tokio::join!(
+        xtcp_p2p::xtcp_p2p_connect_quic(
+            a,
+            &candidate_b,
+            &[],
+            None,
+            5000,
+            None,
+            None,
+            true, // is_server = true (provider / QUIC server)
+        ),
+        async {
+            let mut s = xtcp_p2p::xtcp_p2p_connect_quic(
+                b,
+                &candidate_a,
+                &[],
+                None,
+                5000,
+                None,
+                None,
+                false, // is_server = false (visitor / QUIC client)
+            )
+            .await?;
+            // First write opens the QUIC stream on the wire; the server's
+            // accept_bi returns once it can see this stream.
+            s.write_all(MSG).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(s)
+        },
+    );
+
+    let mut provider = stream_a.expect("provider QUIC stream");
+    let mut visitor = stream_b.expect("visitor QUIC stream");
+
+    // Provider reads the client's first payload (already queued).
+    let mut buf = vec![0u8; MSG.len()];
+    tokio::time::timeout(Duration::from_secs(10), provider.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .expect("provider read");
+    assert_eq!(&buf, MSG, "provider should receive the visitor's payload");
+
+    // Provider → visitor
+    tokio::time::timeout(Duration::from_secs(10), provider.write_all(REPLY))
+        .await
+        .unwrap()
+        .expect("provider write");
+    provider.flush().await.expect("provider flush");
+
+    let mut buf = vec![0u8; REPLY.len()];
+    tokio::time::timeout(Duration::from_secs(10), visitor.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .expect("visitor read");
+    assert_eq!(&buf, REPLY, "visitor should receive provider's reply");
+}

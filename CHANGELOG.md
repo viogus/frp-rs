@@ -4,6 +4,21 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **XTCP QUIC data plane (Go v0.70.1 `protocol=quic` compat)**: `resp.protocol`
+  is now honored — `"quic"` runs the hole-punched UDP socket straight into
+  quinn (`quic_dial_on_socket` / `quic_accept_on_socket` in
+  `frp-core/src/quic.rs`, shared `build_quic_transport_config` helper, and
+  `accept_bi_owned` so the returned stream keeps the connection alive). The
+  visitor is the QUIC client (dials + opens the stream), the provider the
+  QUIC server (accepts + accepts); TLS is a runtime self-signed cert +
+  InsecureSkipVerify with ALPN `frp`, and QUIC multiplexes streams so no
+  yamux is used. `xtcp_p2p_connect_quic` in `frp-core/src/xtcp_p2p.rs` does
+  punch → QUIC → first stream. Both the visitor (`visitor.rs` dispatch on
+  `p2p_protocol == "quic"`) and the provider (`handle_nat_hole_resp` dispatch
+  on `resp.protocol == "quic"`) select it; when the `quic` feature is
+  disabled they warn + fail instead of silently falling back to KCP. Covered
+  by `test_quic_roundtrip_loopback`.
+
 - **XTCP MakeHole executed on the provider side + Go v0.70.1 punch semantics**:
   the provider previously called `xtcp_p2p_connect_yamux` with
   `candidates=&[]`, `behavior=None`, and the peer addresses stuffed into

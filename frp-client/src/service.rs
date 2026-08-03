@@ -2158,6 +2158,7 @@ impl Service {
         let candidate_addrs = resp.candidate_addrs.unwrap_or_default();
         let assisted_addrs = resp.assisted_addrs.unwrap_or_default();
         let detect_behavior = resp.detect_behavior.clone();
+        let p2p_protocol = resp.protocol.clone().unwrap_or_default();
         info!(proxy_name = %proxy_name, candidate_count = %candidate_addrs.len(), "XTCP provider '{}': received {} candidate addresses from server",
             proxy_name, candidate_addrs.len());
 
@@ -2254,27 +2255,71 @@ impl Service {
             } else {
                 Some(sid_clone.as_str())
             };
-            // Provider acts as yamux server: accepts the visitor's stream.
+            // Data-plane protocol dispatch: the server echoes the visitor's
+            // `protocol` (NatHoleVisitor → NatHoleResp) back to both peers.
+            // Go v0.70.1 visitors default to "quic"; a Rust visitor's
+            // `protocol` config field selects it. Anything else (incl. "" or
+            // "tcp") falls through to the KCP+yamux data plane.
+            //
+            // Provider roles: yamux server (accepts the visitor's yamux
+            // stream) or QUIC server (accepts the QUIC connection + stream).
             // Go v0.70.1 semantics: candidate_addrs = the peer's mapped addrs,
             // assisted_addrs = the peer's assisted addrs, and the server's
             // detect_behavior drives the MakeHole probe. (Previously these were
             // passed as candidates=&[]/behavior=None, which made the simplified
             // punch fail with "no candidate addresses" — the provider never
             // actually hole-punched.)
-            match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
-                socket,
-                &candidate_addrs,
-                &assisted_addrs,
-                detect_behavior.as_ref(),
-                conv,
-                kcp_cfg,
-                hp_timeout,
-                false, // yamux_client = false (provider/server)
-                p2p_sid,
-                p2p_key.as_ref(),
-            )
-            .await
-            {
+            let p2p_stream: Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> =
+                match p2p_protocol.as_str() {
+                    "quic" => {
+                        #[cfg(all(feature = "quic", feature = "kcp"))]
+                        {
+                            match frp_core::xtcp_p2p::xtcp_p2p_connect_quic(
+                                socket,
+                                &candidate_addrs,
+                                &assisted_addrs,
+                                detect_behavior.as_ref(),
+                                hp_timeout,
+                                p2p_sid,
+                                p2p_key.as_ref(),
+                                true, // is_server = true (provider is QUIC server)
+                            )
+                            .await
+                            {
+                                Ok(s) => Ok(Box::new(s) as Box<_>),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        #[cfg(not(all(feature = "quic", feature = "kcp")))]
+                        {
+                            warn!(proxy_name = %proxy_name_clone,
+                            "XTCP provider '{}': protocol 'quic' requested but the quic feature is disabled; refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
+                            proxy_name_clone);
+                            Err(format!(
+                                "XTCP provider '{}': protocol 'quic' requires the quic feature",
+                                proxy_name_clone
+                            ))
+                        }
+                    }
+                    _ => match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                        socket,
+                        &candidate_addrs,
+                        &assisted_addrs,
+                        detect_behavior.as_ref(),
+                        conv,
+                        kcp_cfg,
+                        hp_timeout,
+                        false, // yamux_client = false (provider/server)
+                        p2p_sid,
+                        p2p_key.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(s) => Ok(Box::new(s) as Box<_>),
+                        Err(e) => Err(e),
+                    },
+                };
+            match p2p_stream {
                 Ok(mut p2p_stream) => {
                     // Send NatHoleReport with success=true after successful hole punch
                     // (Go frp compat: provider reports hole punch result to server).
@@ -2285,7 +2330,7 @@ impl Service {
                     let mut w = resp_writer.lock().await;
                     let _ = frp_core::protocol::write_msg(&mut *w, &ok_report, resp_v2).await;
                     drop(w);
-                    info!(proxy_name = %proxy_name_clone, "XTCP provider '{}': P2P connected via KCP+yamux", proxy_name_clone);
+                    info!(proxy_name = %proxy_name_clone, protocol = %p2p_protocol, "XTCP provider '{}': P2P connected", proxy_name_clone);
                     if let Some(ref local) = local_addr {
                         match tokio::net::TcpStream::connect(local).await {
                             Ok(local_conn) => {
@@ -2347,7 +2392,7 @@ impl Service {
                     }
                 }
                 Err(e) => {
-                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': UDP+KCP+yamux hole punch failed", proxy_name_clone);
+                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': UDP hole punch + data plane connect failed", proxy_name_clone);
                     let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                         sid: Some(sid_clone.clone()),
                         success: false,

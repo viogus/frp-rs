@@ -641,22 +641,63 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     .unwrap_or(fallback_timeout_ms);
                                 let assisted = resp.assisted_addrs.clone().unwrap_or_default();
                                 let behavior = resp.detect_behavior.clone();
-                                match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
-                                    socket,
-                                    &candidates,
-                                    &assisted,
-                                    behavior.as_ref(),
-                                    conv,
-                                    kcp_cfg,
-                                    hp_timeout,
-                                    true, // yamux_client = visitor
-                                    p2p_sid,
-                                    p2p_key.as_ref(),
-                                )
-                                .await
-                                {
+                                // Data-plane dispatch: the configured
+                                // `p2p_protocol` ("kcp" default, "quic" for the
+                                // QUIC data plane, Go v0.70.1 compat) selects the
+                                // transport. The visitor is the QUIC client /
+                                // yamux client (opens the stream).
+                                let p2p_stream: Result<
+                                    Box<dyn frp_core::xtcp_p2p::P2pStream>,
+                                    String,
+                                > = if pp.as_str() == "quic" {
+                                    #[cfg(all(feature = "quic", feature = "kcp"))]
+                                    {
+                                        match frp_core::xtcp_p2p::xtcp_p2p_connect_quic(
+                                            socket,
+                                            &candidates,
+                                            &assisted,
+                                            behavior.as_ref(),
+                                            hp_timeout,
+                                            p2p_sid,
+                                            p2p_key.as_ref(),
+                                            false, // is_server = false (visitor is QUIC client)
+                                        )
+                                        .await
+                                        {
+                                            Ok(s) => Ok(Box::new(s) as Box<_>),
+                                            Err(e) => Err(e),
+                                        }
+                                    }
+                                    #[cfg(not(all(feature = "quic", feature = "kcp")))]
+                                    {
+                                        warn!(visitor_name = %visitor_name, "Visitor '{}': protocol 'quic' requested but the quic feature is disabled; refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)", visitor_name);
+                                        Err(format!(
+                                            "Visitor '{}': protocol 'quic' requires the quic feature",
+                                            visitor_name
+                                        ))
+                                    }
+                                } else {
+                                    match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                                        socket,
+                                        &candidates,
+                                        &assisted,
+                                        behavior.as_ref(),
+                                        conv,
+                                        kcp_cfg,
+                                        hp_timeout,
+                                        true, // yamux_client = visitor
+                                        p2p_sid,
+                                        p2p_key.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(s) => Ok(Box::new(s) as Box<_>),
+                                        Err(e) => Err(e),
+                                    }
+                                };
+                                match p2p_stream {
                                     Ok(mut p2p_stream) => {
-                                        info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected via KCP", visitor_name);
+                                        info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected", visitor_name);
                                         let use_enc = use_encryption && !sk.is_empty();
                                         let (user_r, user_w) =
                                             user_conn.take().unwrap().into_split();
@@ -693,7 +734,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                         hole_punch_ok = true;
                                     }
                                     Err(e) => {
-                                        debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}': UDP+KCP hole punch failed: {}", visitor_name, e);
+                                        debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}': UDP hole punch + data plane connect failed: {}", visitor_name, e);
                                     }
                                 }
                             } else {

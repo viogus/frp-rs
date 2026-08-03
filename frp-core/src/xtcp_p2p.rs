@@ -51,9 +51,13 @@
 //! | `read_timeout_ms` | Yes | Used as the detect-wait timeout (Go `ReadTimeoutMs`) |
 //!
 //! The winning socket — the one the peer's detect reply arrived on — is
-//! returned and used for the KCP data plane, matching Go's `result.lConn`
+//! returned and used for the data plane, matching Go's `result.lConn`
 //! semantics (a reply on an extra listener socket only has a working NAT
-//! mapping on that socket).
+//! mapping on that socket). The data plane is either KCP (with yamux on
+//! top, `xtcp_p2p_connect_yamux`) or, when the `quic` feature is enabled and
+//! the negotiated `protocol` is `"quic"`, QUIC directly over the punched
+//! socket (`xtcp_p2p_connect_quic` — no yamux, since QUIC multiplexes
+//! streams itself; Go v0.70.1 `quic.Dial`/`quic.Listen` on `result.lConn`).
 //!
 //! **Known remaining differences from Go:** `slices.Compact` in Go only
 //! removes *adjacent* duplicates, we sort+dedup the detect-address set;
@@ -1051,6 +1055,103 @@ pub async fn xtcp_p2p_connect_yamux(
     );
 
     Ok(tokio_stream)
+}
+
+// ---------------------------------------------------------------------------
+// XTCP P2P connect with QUIC data plane (Go v0.70.1 `protocol=quic` compat)
+// ---------------------------------------------------------------------------
+//
+// Go frp v0.70.1 runs QUIC directly over the hole-punched UDP socket — no
+// yamux, because QUIC multiplexes streams itself:
+//   UDP socket → QUIC connection → bidirectional stream → user stream
+//
+// The visitor acts as the QUIC client (dials + opens a stream), the provider
+// as the QUIC server (accepts + accepts a stream). TLS uses a runtime
+// self-signed cert on the server and InsecureSkipVerify on the client (Go
+// frp behavior); the ALPN is `frp`.
+
+/// Trait object for a P2P data-plane stream — either the KCP/yamux stream
+/// (`xtcp_p2p_connect_yamux`) or the QUIC stream (`xtcp_p2p_connect_quic`).
+/// Call sites box the chosen transport so the bridge code is shared.
+pub trait P2pStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> P2pStream for T {}
+
+/// Punch a UDP NAT hole and create a QUIC-over-UDP P2P stream.
+///
+/// Counterpart of [`xtcp_p2p_connect_yamux`] for the QUIC data plane
+/// (`protocol = "quic"` in Go frp v0.70.1). `is_server` selects the QUIC
+/// role: `true` = provider (QUIC server, accepts the connection + stream),
+/// `false` = visitor (QUIC client, dials + opens the stream).
+///
+/// The winning hole-punch socket is handed to quinn directly so the NAT
+/// mapping is preserved (`quic.Dial`/`quic.Listen` on `result.lConn` in Go).
+/// `sid`/`key` enable Go-compat NatHoleSid detection; when both are `None`
+/// the simple "frp" magic is used (Rust↔Rust).
+#[cfg(feature = "quic")]
+#[allow(clippy::too_many_arguments)]
+pub async fn xtcp_p2p_connect_quic(
+    socket: UdpSocket,
+    candidates: &[String],
+    assisted: &[String],
+    behavior: Option<&crate::msg::NatHoleDetectBehavior>,
+    timeout_ms: u64,
+    sid: Option<&str>,
+    key: Option<&[u8; 16]>,
+    is_server: bool,
+) -> Result<crate::quic::QuicStream, String> {
+    // 1. Punch hole. With a server-provided DetectBehavior use the full Go
+    //    MakeHole state machine, otherwise the simplified punch. The winning
+    //    socket (the one the peer's detect reply arrived on) keeps the only
+    //    NAT mapping the peer can reach, so the QUIC endpoint must use it.
+    let (win_socket, peer_addr) = match behavior {
+        Some(b) => {
+            punch_udp_hole_makehole_owned(socket, candidates, assisted, b, timeout_ms, sid, key)
+                .await?
+        }
+        None => {
+            let peer_addr = punch_udp_hole(&socket, candidates, timeout_ms, sid, key).await?;
+            (socket, peer_addr)
+        }
+    };
+
+    tracing::info!(
+        peer = %peer_addr,
+        role = if is_server { "server" } else { "client" },
+        "XTCP P2P QUIC: hole punched to {}",
+        peer_addr,
+    );
+
+    // 2. Hand the winning tokio socket to quinn as a std socket.
+    let std_socket = win_socket
+        .into_std()
+        .map_err(|e| format!("convert UDP socket to std: {e}"))?;
+    let params = crate::quic::QuicTransportParams::default();
+
+    // 3. QUIC data plane over the punched socket.
+    if is_server {
+        // Provider = QUIC server: self-signed TLS, accept connection + stream.
+        let tls_config = crate::transport::generate_self_signed_tls_config()
+            .map_err(|e| format!("generate self-signed TLS config: {e}"))?;
+        let conn = crate::quic::quic_accept_on_socket(std_socket, tls_config, params)
+            .await
+            .map_err(|e| format!("QUIC accept: {e}"))?;
+        let stream = conn
+            .accept_bi_owned()
+            .await
+            .map_err(|e| format!("QUIC accept stream: {e}"))?;
+        Ok(stream)
+    } else {
+        // Visitor = QUIC client: dial (InsecureSkipVerify) + open stream.
+        let (stream, _conn) = crate::quic::quic_dial_on_socket(
+            std_socket,
+            peer_addr,
+            &peer_addr.ip().to_string(),
+            params,
+        )
+        .await
+        .map_err(|e| format!("QUIC dial: {e}"))?;
+        Ok(stream)
+    }
 }
 
 // --- Fallback when tcp-mux is disabled ---
