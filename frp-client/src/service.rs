@@ -1451,24 +1451,37 @@ impl Service {
                             }
                             #[cfg(feature = "vnet")]
                             Ok(FrpMessage::VnetRouteRemove(adv)) => {
+                                // Isolation: mirror the advertise handler — only
+                                // accept removals for virtual nets this client
+                                // participates in. Removals for other vnets are
+                                // ignored (defensive symmetry; in practice there
+                                // is no matching route to clean up anyway).
                                 let vnet = adv.virtual_net.clone().unwrap_or_default();
-                                info!(vnet, proxy_name = %adv.proxy_name, "peer vnet route removed");
-                                if let Some((subnet, tun_name, _)) = self
-                                    .vnet_peer_routes
-                                    .lock()
-                                    .await
-                                    .remove(&adv.proxy_name)
-                                {
-                                    remove_os_route(&subnet, &tun_name);
+                                if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
+                                    debug!(
+                                        vnet,
+                                        proxy_name = %adv.proxy_name,
+                                        "ignoring vnet route removal for unknown virtual net"
+                                    );
+                                } else {
+                                    info!(vnet, proxy_name = %adv.proxy_name, "peer vnet route removed");
+                                    if let Some((subnet, tun_name, _)) = self
+                                        .vnet_peer_routes
+                                        .lock()
+                                        .await
+                                        .remove(&adv.proxy_name)
+                                    {
+                                        remove_os_route(&subnet, &tun_name);
+                                    }
+                                    self.vnet_controller
+                                        .route_table()
+                                        .write()
+                                        .await
+                                        .remove(&vnet, &adv.proxy_name);
+                                    self.vnet_controller
+                                        .unregister_visitor_route(&adv.proxy_name)
+                                        .await;
                                 }
-                                self.vnet_controller
-                                    .route_table()
-                                    .write()
-                                    .await
-                                    .remove(&vnet, &adv.proxy_name);
-                                self.vnet_controller
-                                    .unregister_visitor_route(&adv.proxy_name)
-                                    .await;
                             }
                             Ok(_) => {
                                 // Other messages are ignored
