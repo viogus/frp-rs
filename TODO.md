@@ -134,5 +134,9 @@ Remaining known gaps (documented, architectural):
 - HTTP vhost `responseHeaders`, 504 timeouts, h2c (byte-level forwarding vs
   Go's HTTP reverse proxy).
 - HTTP plugin `enableHTTP2` (byte-level bridge).
-- XTCP MakeHole assisted probing / QUIC data plane polish and VirtualNet
-  isolation/routing reload (see plan `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`).
+- XTCP **data plane**: hole-punching/coordination is complete (16/16 XTCP
+  pairwise compat, 2026-08); Rust uses KCP+yamux for the P2P stream while Go
+  frp v0.70.1 negotiates quic or kcp via the `protocol` field — the QUIC
+  data-plane variant for Go↔Rust XTCP is not implemented. Plus VirtualNet
+  isolation/routing reload (see plan
+  `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`).

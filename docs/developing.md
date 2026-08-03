@@ -189,7 +189,7 @@ When a new work connection arrives:
 
 ### NAT Hole Punching (XTCP)
 
-XTCP enables direct peer-to-peer connections between two frpc clients behind NAT. The server acts as a pure relay (no server-side STUN).
+XTCP enables direct peer-to-peer connections between two frpc clients behind NAT. The server coordinates the control plane (NAT classification, 5-mode behavior recommendation, session management) but never relays XTCP data and sends no probe packets — provider and visitor each do their own STUN.
 
 ```
 Visitor                Server                    Provider
@@ -207,9 +207,12 @@ Visitor                Server                    Provider
    │◄──NatHoleResp───────│                          │
    │                      │──NatHoleResp────────────►│
    │                      │                          │
-   │◄══════════ TCP simultaneous open ══════════════►│
+   │◄══ MakeHole UDP probing ══►│  (5-mode DetectBehavior: sender probes
+   │   (sender/receiver roles,   │   assisted+candidate addrs, TTL, port
+   │    candidate/random ports)  │   scanning; winner socket selected)
    │                      │                          │
-   │◄══════════ encrypted P2P bridge ═══════════════►│
+   │◄══ KCP+yamux P2P data plane ═►│  (runs on the winning socket)
+   │   (encrypted bridge to local) │
    │                      │                          │
    │                      │◄──NatHoleReport─────────│  (session complete)
 ```
@@ -224,7 +227,7 @@ Two paths for visitor connections:
 
 **STCP fallback**: if hole punch fails (e.g., both sides behind symmetric NAT), the visitor falls back to an STCP proxy specified by the `fallback_to` config field.
 
-**XTCP P2P encryption**: after hole punch, the P2P connection uses `bridge_encrypted` when `use_encryption=true` and `sk` is non-empty. The key is derived via `PBKDF2-SHA1(sk, salt="frp", iter=64, keylen=16)` -- using the proxy's SecretKey (not the auth token). Both sides derive the same key from the shared SecretKey.
+**XTCP P2P encryption**: after hole punch, the P2P stream (KCP-over-UDP + yamux, running on the socket that received the peer's detect reply) is bridged to the local service with `bridge_encrypted` when `use_encryption=true` and `sk` is non-empty. The key is derived via `PBKDF2-SHA1(sk, salt="frp", iter=64, keylen=16)` -- using the proxy's SecretKey (not the auth token). Probe packets (NatHoleSid) use the same derivation; without a secret key, Rust↔Rust probes use the `"frp"` magic. Both sides derive the same key from the shared SecretKey.
 
 **Module structure** (`frp-server/src/nathole/`):
 - `mod.rs` -- module root, `NAT_HOLE_TIMEOUT = 10s`
