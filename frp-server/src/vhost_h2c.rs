@@ -264,6 +264,7 @@ async fn handle_stream(
     // write keeps backpressure end-to-end.
     let body_task = tokio::spawn(async move {
         let mut client_w = client_w;
+        let end_stream = body.is_end_stream();
         while let Some(Ok(data)) = body.data().await {
             if !data.is_empty() {
                 if has_content_length {
@@ -278,7 +279,8 @@ async fn handle_stream(
             }
             let _ = body.flow_control().release_capacity(data.len());
         }
-        if !has_content_length {
+        if !has_content_length && !end_stream {
+            // Stream had an open body: terminate the chunked framing.
             let _ = client_w.write_all(b"0\r\n\r\n").await;
         }
         let _ = client_w.flush().await;
@@ -348,7 +350,14 @@ fn build_http1_request_head(request: &http::Request<RecvStream>) -> Vec<u8> {
         head.extend_from_slice(b"\r\n");
     }
     if !has_content_length {
-        head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        // Align with Go's http.Transport: a request with no body (h2 stream
+        // ended with HEADERS) is sent with Content-Length: 0; an open stream
+        // with unknown length is chunked-framed.
+        if request.body().is_end_stream() {
+            head.extend_from_slice(b"Content-Length: 0\r\n");
+        } else {
+            head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        }
     }
     head.extend_from_slice(b"\r\n");
     head
@@ -658,8 +667,8 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         }
     };
     let Some(parsed) = parse_response_head(&head) else {
-        tracing::debug!("h2c backend sent a malformed response head");
-        return Ok(());
+        tracing::debug!("h2c backend sent a malformed response head, sending 502");
+        return send_h2_error(respond, 502, &[], Bytes::new()).await;
     };
     let ParsedHead {
         status,

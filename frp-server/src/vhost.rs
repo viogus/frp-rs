@@ -473,7 +473,6 @@ async fn serve_vhost_request<S>(
     };
 
     let pre_read = buf[..n].to_vec();
-    let request_text = String::from_utf8_lossy(&buf[..n]);
 
     // HTTP/2 prior-knowledge preface (h2c): binary frames, no text Host
     // header. The listener's single read may return a partial preface (TCP
@@ -482,7 +481,14 @@ async fn serve_vhost_request<S>(
     // for all 24 preface bytes). `H2_PREFACE.starts_with(&pre_read)` covers
     // the short-prefix case; `pre_read.starts_with(H2_PREFACE)` the case
     // where frames arrived together with the preface.
-    if vhost_h2c::H2_PREFACE.starts_with(&pre_read) || pre_read.starts_with(vhost_h2c::H2_PREFACE) {
+    let is_h2 = pre_read.starts_with(vhost_h2c::H2_PREFACE)
+        || (vhost_h2c::H2_PREFACE.starts_with(&pre_read) && n < vhost_h2c::H2_PREFACE.len());
+    if is_h2 {
+        // A short first read may be a partial HTTP/2 preface ("P", "PR",
+        // "PRI"…) — read the remaining bytes and confirm the full 24-byte
+        // preface before committing to the h2 path. A truncated HTTP/1.1
+        // request (e.g. "POST …" cut to "P") falls back to the HTTP/1.1
+        // parser (Go's bufio-based h2 server matches the exact line).
         let mut prefix_len = n;
         while prefix_len < vhost_h2c::H2_PREFACE.len() {
             let m = match tokio::time::timeout(
@@ -496,9 +502,54 @@ async fn serve_vhost_request<S>(
             };
             prefix_len += m;
         }
-        return vhost_h2c::serve_h2c_request(stream, buf[..prefix_len].to_vec(), state, peer).await;
+        if buf[..vhost_h2c::H2_PREFACE.len()] == *vhost_h2c::H2_PREFACE {
+            return vhost_h2c::serve_h2c_request(stream, buf[..prefix_len].to_vec(), state, peer)
+                .await;
+        }
+        return handle_http1_request(
+            stream,
+            buf[..prefix_len].to_vec(),
+            state,
+            peer,
+            scheme,
+            wrap,
+        )
+        .await;
+    }
+    return handle_http1_request(stream, pre_read, state, peer, scheme, wrap).await;
+}
+
+/// HTTP/1.1 vhost path: finish reading the request head (up to 4096 bytes or
+/// the \r\n\r\n terminator), extract Host/path/auth, resolve the route, and
+/// forward the stream via InternalMsg::ProxyUserConn.
+async fn handle_http1_request<S>(
+    mut stream: S,
+    mut pre_read: Vec<u8>,
+    state: Arc<AppState>,
+    peer: std::net::SocketAddr,
+    scheme: &str,
+    wrap: impl FnOnce(S) -> frp_core::transport::IoStream,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    // The vhost listener's single read may be short (e.g. an h2c-misdetected
+    // HTTP/1.1 request): keep reading until the head terminator or the cap.
+    let timeout_secs = state.vhost_http_timeout.max(1);
+    while pre_read.len() < 4096 && !pre_read.windows(4).any(|w| w == b"\r\n\r\n") {
+        let mut buf = [0u8; 4096];
+        let m = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            stream.read(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(m)) if m > 0 => m,
+            _ => break,
+        };
+        pre_read.extend_from_slice(&buf[..m]);
     }
 
+    let request_text = String::from_utf8_lossy(&pre_read).into_owned();
     let host = match extract_host_header(&request_text) {
         Some(h) => h.to_string(),
         None => {
