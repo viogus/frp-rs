@@ -22,6 +22,16 @@ All notable changes to frp-rs.
   `sendSidMessageToRangePorts`); and NatHoleSid `nonce` is a random 0-19 '0'
   string like Go (`strings.Repeat("0", rand.IntN(20))`).
 
+- **Rust frps XTCP coordination fix**: `detect_behavior` (role/ttl/send_delay/
+  read_timeout chosen by the 5-mode analyzer) was computed but dropped when
+  NatHoleResp was forwarded through `InternalMsg::WriteNatHoleResp`, so Go
+  peers received a zero-valued DetectBehavior with an empty Role and their
+  MakeHole could not tell sender from receiver — every rust-frps XTCP scenario
+  with a Go peer failed. The internal message now carries `detect_behavior`
+  and all construction sites fill it. Verified: XTCP pairwise compat went
+  from 4/16 (main) / 10/16 (MakeHole work) to **16/16**, and the full
+  68-scenario suite is green.
+
 - **V2 post-handshake Login read timeout**: after a V2 ClientHello handshake,
   the read of the next frame (the Login message) is now bounded by the same
   10s `V2_HANDSHAKE_TIMEOUT` as the handshake itself, closing a gap where a
