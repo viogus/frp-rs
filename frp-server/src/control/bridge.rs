@@ -192,11 +192,20 @@ async fn write_msg_v2_nof<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
 ) -> Result<(), frp_core::Error> {
-    use frp_core::protocol::{write_v2_frame_raw, V2_FRAME_TYPE_MESSAGE};
+    use frp_core::protocol::{write_v2_frame_raw, V2_FRAME_TYPE_MESSAGE, V2_MAX_FRAME_PAYLOAD};
     let type_id = msg.v2_type_id();
     let mut payload = Vec::with_capacity(2 + 512);
     payload.extend_from_slice(&type_id.to_be_bytes());
     serde_json::to_writer(&mut payload, msg)?;
+    if payload.len() > V2_MAX_FRAME_PAYLOAD as usize {
+        return Err(frp_core::Error::Protocol(
+            format!(
+                "V2 payload too large: {} > {V2_MAX_FRAME_PAYLOAD}",
+                payload.len()
+            )
+            .into(),
+        ));
+    }
     write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await
 }
 
@@ -259,11 +268,6 @@ async fn run_udp_work_conn(
     let writer = async move {
         debug!(proxy_name = %writer_name, "UDP work conn writer task started for '{}'", writer_name);
         let mut buf = vec![0u8; udp_packet_size];
-        // Reusable content buffer: filled from `buf` then moved into the
-        // message via mem::take (client work_conn.rs pattern). The UDPPacket
-        // owns its Vec, so a fresh allocation per packet is unavoidable, but
-        // this keeps the fill/move path identical for a future encrypt path.
-        let mut content = Vec::with_capacity(udp_packet_size);
         loop {
             let received = tokio::select! {
                 biased;
@@ -275,10 +279,12 @@ async fn run_udp_work_conn(
             };
             match received {
                 Ok((n, src)) => {
-                    content.clear();
-                    content.extend_from_slice(&buf[..n]);
+                    // UDPPacket owns its Vec and the wire format base64-encodes
+                    // it, so one allocation + copy per packet is inherent to
+                    // the message model (same as to_vec; a reused buffer would
+                    // gain nothing here).
                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                        content: std::mem::take(&mut content),
+                        content: buf[..n].to_vec(),
                         local_addr: local_addr.clone(),
                         remote_addr: Some(msg::UdpAddr {
                             ip: src.ip().to_string(),
