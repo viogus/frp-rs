@@ -654,8 +654,10 @@ impl Service {
                                 spawn_boxed(Box::pin(async move {
                                     let _permit = permit;
                                     // Single absolute deadline covering the initial read phase
-                                    // (WS upgrade + V2 handshake + first frame), matching Go frp's
-                                    // single SetReadDeadline(10s) connReadTimeout semantics.
+                                    // (V2 handshake + first frame) after the WS upgrade, matching
+                                    // Go frp's single SetReadDeadline(10s) connReadTimeout
+                                    // semantics. The upgrade itself is bounded by accept_websocket's
+                                    // internal HANDSHAKE_TIMEOUT.
                                     let accept_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
                                     match frp_core::transport::accept_websocket(IoStream::Tcp(stream)).await {
                                         Ok(mut ws) => {
@@ -690,10 +692,16 @@ impl Service {
                                                     let stream = frp_core::transport::IoStream::BufferedRead(
                                                         magic.to_vec(), 0, Box::new(ws),
                                                     );
-                                                    let tls_stream = match tls_acceptor.accept(stream).await {
-                                                        Ok(s) => s,
-                                                        Err(e) => {
-                                                            tracing::warn!(addr = %addr, error = %e, "TLS handshake failed on WS from {}: {}", addr, e);
+                                                    let tls_stream = match tokio::time::timeout_at(accept_deadline, tls_acceptor.accept(stream)).await {
+                                                        Ok(r) => match r {
+                                                            Ok(s) => s,
+                                                            Err(e) => {
+                                                                tracing::warn!(addr = %addr, error = %e, "TLS handshake failed on WS from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        },
+                                                        Err(_elapsed) => {
+                                                            tracing::warn!(addr = %addr, "TLS handshake timeout from {}", addr);
                                                             return;
                                                         }
                                                     };
@@ -732,7 +740,7 @@ impl Service {
                                                                     let io = frp_core::transport::IoStream::BufferedRead(
                                                                         magic.to_vec(), 0, Box::new(io),
                                                                     );
-                                                                    crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                                    crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None, accept_deadline).await;
                                                                 }
                                                             }
                                                             Err(e) => {
@@ -757,7 +765,7 @@ impl Service {
                                                             let io = frp_core::transport::IoStream::BufferedRead(
                                                                 chicken.to_vec(), 0, Box::new(io),
                                                             );
-                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None).await;
+                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None, accept_deadline).await;
                                                         }
                                                     }
                                                 }
@@ -799,7 +807,7 @@ impl Service {
                                                             let io = IoStream::BufferedRead(
                                                                 mux_magic.to_vec(), 0, Box::new(io),
                                                             );
-                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None, accept_deadline).await;
                                                         }
                                                     }
                                                     Err(e) => {
@@ -816,7 +824,7 @@ impl Service {
                                             } else {
                                                 // V1 fallback: replay consumed 7 bytes
                                                 let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
-                                                crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None).await;
+                                                crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None, accept_deadline).await;
                                             }
                                         }
                                         Err(e) => {
@@ -2185,7 +2193,7 @@ impl Service {
                                                 sni_data.remove(0);
                                             }
                                             let stream = IoStream::PreRead(sni_data, inner_stream);
-                                            crate::handlers::dispatch_v1_message(stream, state, Some(addr), None, Some(addr.to_string())).await;
+                                            crate::handlers::dispatch_v1_message(stream, state, Some(addr), None, Some(addr.to_string()), accept_deadline).await;
                                             return;
                                         }
                                         // first_byte is always 0x17 or 0x16 here
@@ -2376,7 +2384,7 @@ impl Service {
                                                             crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                                         } else {
                                                             let io = IoStream::BufferedRead(v2_magic.to_vec(), 0, Box::new(io));
-                                                            crate::handlers::dispatch_v1_message(io, state, Some(addr), Some(incoming), None).await;
+                                                            crate::handlers::dispatch_v1_message(io, state, Some(addr), Some(incoming), None, accept_deadline).await;
                                                         }
                                                     }
                                                     Err(e) => {
@@ -2385,7 +2393,7 @@ impl Service {
                                                 }
                                             } else {
                                                 let ws = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
-                                                crate::handlers::dispatch_v1_message(ws, state, Some(addr), None, None).await;
+                                                crate::handlers::dispatch_v1_message(ws, state, Some(addr), None, None, accept_deadline).await;
                                             }
                                         }
                                         Err(e) => {
@@ -2459,7 +2467,7 @@ impl Service {
                                             } else {
                                                 // Not V2. Replay consumed bytes for V1 processing.
                                                 let io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
-                                                crate::handlers::dispatch_v1_message(io, state, Some(addr), Some(incoming), None).await;
+                                                crate::handlers::dispatch_v1_message(io, state, Some(addr), Some(incoming), None, accept_deadline).await;
                                             }
                                         }
                                         Err(e) => {
@@ -2515,7 +2523,7 @@ impl Service {
                                     } else {
                                         // V1 fallback: replay consumed 7 bytes
                                         let io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
-                                        crate::handlers::dispatch_v1_message(io, state, Some(addr), None, Some(addr.to_string())).await;
+                                        crate::handlers::dispatch_v1_message(io, state, Some(addr), None, Some(addr.to_string()), accept_deadline).await;
                                     }
                                 }
                             }
@@ -2538,7 +2546,7 @@ impl Service {
                                     }
                                     info!(addr = %addr, "TLS head byte (0x17) but TLS feature not enabled, falling back to V1");
                                     let stream = IoStream::PreRead(pre_read_bytes, inner_stream);
-                                    crate::handlers::dispatch_v1_message(stream, state, Some(addr), None, Some(addr.to_string())).await;
+                                    crate::handlers::dispatch_v1_message(stream, state, Some(addr), None, Some(addr.to_string()), accept_deadline).await;
                                     return;
                                 }
                                 warn!(addr = %addr, "TLS connection from {} but TLS feature not enabled", addr);
@@ -2594,12 +2602,18 @@ impl Service {
                                                 let stream = frp_core::transport::IoStream::BufferedRead(
                                                     magic.to_vec(), 0, Box::new(ws),
                                                 );
-                                                let tls_stream = match tls_acceptor.accept(stream).await {
-                                                    Ok(s) => s,
-                                                    Err(e) => {
-                                                        warn!(addr = %addr, error = %e, "TLS handshake failed on WS from {}: {}", addr, e);
-                                                        return;
-                                                    }
+                                                let tls_stream = match tokio::time::timeout_at(accept_deadline, tls_acceptor.accept(stream)).await {
+                                                        Ok(r) => match r {
+                                                            Ok(s) => s,
+                                                            Err(e) => {
+                                                                warn!(addr = %addr, error = %e, "TLS handshake failed on WS from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        },
+                                                        Err(_elapsed) => {
+                                                            warn!(addr = %addr, "TLS handshake timeout from {}", addr);
+                                                            return;
+                                                        }
                                                 };
                                                 info!(addr = %addr, "TLS-over-WebSocket connection from {}", addr);
 
@@ -2665,7 +2679,7 @@ impl Service {
                                                                 let io = frp_core::transport::IoStream::BufferedRead(
                                                                     magic.to_vec(), 0, Box::new(io),
                                                                 );
-                                                                crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                                crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None, accept_deadline).await;
                                                             }
                                                         }
                                                         Err(e) => {
@@ -2720,7 +2734,7 @@ impl Service {
                                                         let io = frp_core::transport::IoStream::BufferedRead(
                                                             chicken.to_vec(), 0, Box::new(io),
                                                         );
-                                                        crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None).await;
+                                                        crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None, accept_deadline).await;
                                                     }
                                                 }
                                             }
@@ -2790,7 +2804,7 @@ impl Service {
                                                         let io = IoStream::BufferedRead(
                                                             mux_magic.to_vec(), 0, Box::new(io),
                                                         );
-                                                        crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                        crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None, accept_deadline).await;
                                                     }
                                                 }
                                                 Err(e) => {
@@ -2835,7 +2849,7 @@ impl Service {
                                         } else {
                                             // V1 fallback: replay consumed 7 bytes
                                             let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
-                                            crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None).await;
+                                            crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None, accept_deadline).await;
                                         }
                                     }
                                     Err(e) => {
@@ -3052,7 +3066,7 @@ impl Service {
                                             } else {
                                                 // Not V2. Replay consumed bytes and process as V1.
                                                 let io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
-                                                crate::handlers::dispatch_v1_message(io, state, Some(addr), Some(incoming), None).await;
+                                                crate::handlers::dispatch_v1_message(io, state, Some(addr), Some(incoming), None, accept_deadline).await;
                                             }
                                         }
                                         Err(e) => {
@@ -3063,7 +3077,7 @@ impl Service {
                                     // stream_io is IoStream::PreRead — its AsyncRead replays
                                     // the consumed bytes (including type byte) before reading
                                     // the rest from the TcpStream.
-                                    crate::handlers::dispatch_v1_message(stream_io, state, Some(addr), None, Some(addr.to_string())).await;
+                                    crate::handlers::dispatch_v1_message(stream_io, state, Some(addr), None, Some(addr.to_string()), accept_deadline).await;
                                 }
                             }
                         }

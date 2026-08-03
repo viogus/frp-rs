@@ -902,13 +902,9 @@ pub(crate) async fn dispatch_v1_message(
     addr: Option<std::net::SocketAddr>,
     incoming: Option<frp_core::mux::IncomingStreams>,
     visitor_addr: Option<String>,
+    deadline: tokio::time::Instant,
 ) {
-    match tokio::time::timeout(
-        Duration::from_secs(10),
-        frp_core::protocol::read_msg_v1(&mut io),
-    )
-    .await
-    {
+    match tokio::time::timeout_at(deadline, frp_core::protocol::read_msg_v1(&mut io)).await {
         Ok(Ok(FrpMessage::Login(login))) => {
             control::handle_control(io, *login, state, addr, incoming, false, None, false).await;
         }
