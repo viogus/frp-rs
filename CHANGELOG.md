@@ -4,6 +4,18 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **XTCP QUIC Go-visitor interop**: vendored rustls 0.23.41
+  (`vendor/rustls`, `[patch.crates-io]`) with a one-line server-side patch
+  that treats an invalid TLS SNI as "no SNI" — Go frp v0.70.1 QUIC visitors
+  send `"ip:port"` as the SNI, which upstream rustls 0.23 rejected with a
+  fatal alert (see `docs/superpowers/notes/2026-08-04-mimalloc-throughput-ab.md` §6;
+  drop the patch when the workspace moves past rustls 0.23).
+- **HTTP plugin `enableHTTP2` honored** on `https2http` / `https2https`:
+  ALPN h2 inbound (default true), inbound h2 decoded and forwarded to the
+  backend as HTTP/1.1, matching Go frp semantics.
+- **Baseline tooling**: `throughput-baseline.sh` / `latency-baseline.sh`
+  now probe proxy registration before measuring and export `RUST_LOG=warn`
+  (yamux per-frame INFO logs throttled the bridge); baselines re-committed.
 - **KCP robustness + compat expansion**: the in-tree KCP state machine gains
   a proptest fuzz suite (random/truncated/mutated/multi-segment inputs never
   panic; conv-mismatch and oversized-PUSH invariants), and the FEC shard

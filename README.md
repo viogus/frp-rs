@@ -80,11 +80,14 @@ but not literally 100% — see "Known limitations" below.
   `https2http`, `https2https`, `http2http`, `tls2raw`, `virtual_net`.
 - **XTCP**: Cross-compat with Go frp (requires public internet for STUN/NAT probes).
   Both P2P data planes are supported — KCP+yamux (default) and QUIC
-  (`protocol="quic"`, `quic` feature is default ON). One known limitation:
-  a **Go** visitor with the default `protocol="quic"` cannot talk to a Rust
-  provider (Go frp v0.70.1 sends `"ip:port"` as the QUIC SNI, which rustls
-  rejects); set `protocol = "kcp"` on such a visitor. See
-  [full audit](docs/go-frp-compat-audit.md) for details.
+  (`protocol="quic"`, `quic` feature is default ON). Go visitors using the
+  default `protocol="quic"` interoperate with Rust providers: Go frp v0.70.1
+  sends the peer `"ip:port"` as the QUIC TLS SNI, which upstream rustls 0.23
+  rejects as an invalid server name — frp-rs vendors rustls with a one-line
+  server-side patch treating an invalid SNI as "no SNI" (equivalent to the
+  upstream `invalid_sni_policy = IgnoreAll` added in rustls 0.24; see
+  [audit note §6](docs/superpowers/notes/2026-08-04-mimalloc-throughput-ab.md)).
+  See [full audit](docs/go-frp-compat-audit.md) for details.
 
 ### Known limitations (as of frp-rs 0.7.1)
 

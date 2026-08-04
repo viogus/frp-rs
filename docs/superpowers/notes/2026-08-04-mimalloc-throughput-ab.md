@@ -75,3 +75,51 @@ Baseline script fixes that made the numbers trustworthy:
 - `4d27b5d` export `RUST_LOG=warn` — yamux logs one line per frame at INFO and throttles the bridge when stderr is a pipe
 
 Gate rule stays: any config dropping >5% vs these committed files rejects the change. Note the values are host-specific; regenerate on the reference machine before judging cross-machine diffs.
+
+## 6. Vendored rustls: Go XTCP QUIC visitor SNI interop (commit in this series)
+
+**Problem:** Go frp v0.70.1 XTCP QUIC visitors send the peer address —
+`"ip:port"` — as the TLS SNI hostname (`client/visitor/xtcp.go` →
+`NewClientTLSConfig(..., raddr.String())`). Upstream rustls 0.23 parses that
+as `ServerNamePayload::Invalid` and rejects the handshake with a fatal
+`illegal_parameter` alert, so a Go QUIC visitor could never connect to a
+Rust XTCP QUIC provider (the README's workaround was `protocol="kcp"` on the
+visitor). rustls 0.23 has no configuration to relax this; the
+`ServerConfig::invalid_sni_policy` knob only exists in unpublished 0.24-dev.
+
+**Fix:** vendored rustls 0.23.41 into `vendor/rustls` with a one-line
+server-side patch — `ServerNamePayload::Invalid` now yields `None` ("no SNI")
+instead of a fatal alert, the exact semantics of upstream
+`invalid_sni_policy = IgnoreAll`. Wired via `[patch.crates-io]` in the
+workspace `Cargo.toml`; drop the patch when the workspace moves past
+rustls 0.23. Rust↔Rust XTCP QUIC already dialed with a bare IP
+(`xtcp_p2p.rs`) and is unaffected; rustls client behavior is untouched.
+**Maintenance note:** the vendored copy pins rustls at 0.23.41 — upstream
+0.23.x security fixes do not flow in automatically, so audit the vendored
+tree (and the patch) when rustls releases a new 0.23.x.
+
+**Security assessment (why relaxing server-side invalid-SNI rejection is
+safe here):**
+
+- SNI is advisory on the server: it selects a certificate from the (single)
+  `cert_resolver`; it is not used for authentication or authorization in
+  frp's TLS paths. Accepting an invalid SNI as "no SNI" cannot downgrade a
+  connection.
+- All affected frp server TLS roles (frps control TLS, QUIC, plugin TLS,
+  vhost HTTPS) already serve a single cert and do not key routing on SNI
+  legality; the vhost HTTPS path falls back to Host-header routing when SNI
+  is absent, which is unchanged.
+- The XTCP QUIC P2P path this exists for runs on auto-generated self-signed
+  certs with InsecureSkipVerify semantics — there is no certificate chain to
+  spoof.
+- Upstream rustls considers `IgnoreAll` a supported policy (0.24), so the
+  patch tracks an upstream-blessed behavior, not a novel relaxation.
+- The client-side SNI construction is untouched: rustls clients still reject
+  malformed `ServerName`s at construction time.
+
+**Regression test:** `frp-core/tests/xtcp_quic_sni.rs` hand-crafts a full
+TLS 1.3 ClientHello carrying the exact Go-style SNI `"1.2.3.4:7000"` and
+asserts the server proceeds to its ServerHello flight instead of failing;
+a `valid_sni_still_works` case guards the test rig itself. Full workspace
+test run with the patched rustls: frp-core 433, frp-client 108,
+frp-server 135, all green.
