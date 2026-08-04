@@ -938,10 +938,9 @@ async fn add_security_headers(req: axum::extract::Request, next: Next) -> axum::
 // Field names, pagination, filtering, sorting and prune semantics follow
 // Go frp v0.70.0 `server/http/controller_v2.go` + `server/http/model/v2.go`.
 //
-// NOTE: a pre-existing `dashboard_v2.rs` module carries an earlier, less
-// accurate v2 implementation. It is out of this task's write scope, so this
-// in-place module is the authoritative v2 implementation; the old module is
-// left untouched (see final report for cleanup suggestion).
+// NOTE: a pre-existing `dashboard_v2.rs` module carried an earlier, less
+// accurate v2 implementation; it was removed in the same commit that added
+// this in-place module. This module is the authoritative v2 implementation.
 mod v2 {
     use super::*;
     use axum::routing::post;
@@ -1353,6 +1352,16 @@ mod v2 {
     }
 
     /// Go `buildV2PageResp` / `paginateV2Items`.
+    /// Resolve a proxy's owning client identifier the way Go v0.70.0 does:
+    /// the client's configured clientID if set, otherwise its run_id.
+    fn resolved_client_id(state: &Arc<AppState>, run_id: &str) -> String {
+        state
+            .client_registry
+            .get_by_run_id(run_id)
+            .map(|i| i.client_id().to_string())
+            .unwrap_or_else(|| run_id.to_string())
+    }
+
     fn paginate<T: Serialize>(mut items: Vec<T>, page: u32, page_size: u32) -> PageResp<T> {
         let total = items.len();
         let start = ((page as usize).saturating_sub(1)).saturating_mul(page_size as usize);
@@ -1810,7 +1819,7 @@ mod v2 {
                 }
             }
             if let Some(ref cid) = q.client_id {
-                if !cid.is_empty() && p.run_id != cid.as_str() {
+                if !cid.is_empty() && cid != resolved_client_id(&state, &p.run_id).as_str() {
                     continue;
                 }
             }
@@ -1830,7 +1839,7 @@ mod v2 {
             let resp = ProxyResp {
                 name: p.name.clone(),
                 user: p.user.clone(),
-                client_id: p.run_id.clone(),
+                client_id: resolved_client_id(&state, &p.run_id),
                 spec,
                 status: ProxyStatus {
                     phase: if online { "online" } else { "offline" }.into(),
@@ -1903,7 +1912,7 @@ mod v2 {
         Ok(Json(ProxyResp {
             name: p.name.clone(),
             user: p.user.clone(),
-            client_id: p.run_id.clone(),
+            client_id: resolved_client_id(&state, &p.run_id),
             spec: proxy_spec(&p),
             status: ProxyStatus {
                 phase: if online { "online" } else { "offline" }.into(),
@@ -1948,7 +1957,22 @@ mod v2 {
                 })
                 .collect()
         } else {
-            Vec::new()
+            // Go parity: a proxy without metrics still reports 7 zero points
+            // (one per day), not an empty list.
+            let today_secs = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            (0..TRAFFIC_DAYS)
+                .map(|i| {
+                    let age = (TRAFFIC_DAYS - 1 - i) as i64;
+                    TrafficPoint {
+                        date: format_date_ymd(today_secs - age * 86400),
+                        traffic_in: 0,
+                        traffic_out: 0,
+                    }
+                })
+                .collect()
         };
 
         Ok(Json(ProxyTrafficResp {
