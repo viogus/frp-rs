@@ -1167,7 +1167,6 @@ dependencies = [
  "data-encoding",
  "futures-util",
  "jsonwebtoken",
- "kcp",
  "libc",
  "md-5",
  "opentelemetry",
@@ -1991,15 +1990,6 @@ dependencies = [
  "serde",
  "serde_json",
  "simple_asn1",
-]
-
-[[package]]
-name = "kcp"
-version = "0.6.0"
-dependencies = [
- "bytes",
- "log",
- "thiserror 2.0.18",
 ]
 
 [[package]]

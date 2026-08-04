@@ -1,10 +1,12 @@
 //! KCP transport — reliable stream over UDP.
 //!
-//! Direct wrapper around the `kcp` crate (vendored 0.6.0 with Go compat patches)
-//! and `kcp_compat::Fec` for forward error correction (GF(2^8) Vandermonde).
+//! In-tree KCP protocol implementation (`protocol.rs`, aligned with kcp-go
+//! v5.6.13 wire behavior) plus `kcp_compat::Fec` for forward error
+//! correction (GF(2^8) Vandermonde).
 
 mod config;
 mod listener;
+pub mod protocol;
 pub mod session;
 mod socket;
 mod stream;

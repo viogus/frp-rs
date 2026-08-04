@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::config::KcpConfig;
+use super::protocol::{Error as KcpError, Kcp};
 use crate::kcp_compat::Fec;
 
 const FEC_HEADER_SIZE: usize = 6;
@@ -74,7 +75,7 @@ impl Write for KcpWriter {
 pub struct KcpSession {
     conv: u32,
     _peer_addr: std::net::SocketAddr,
-    kcp: kcp::Kcp<KcpWriter>,
+    kcp: Kcp<KcpWriter>,
     fec: Option<Fec>,
     config: KcpConfig,
     fec_seqid: u32,
@@ -116,9 +117,9 @@ impl KcpSession {
 
         let writer = KcpWriter::new();
         let mut kcp = if config.stream {
-            kcp::Kcp::new_stream(conv, writer)
+            Kcp::new_stream(conv, writer)
         } else {
-            kcp::Kcp::new(conv, writer)
+            Kcp::new(conv, writer)
         };
         kcp.set_mtu(config.mtu).ok();
         kcp.set_wndsize(config.wnd_size.0, config.wnd_size.1);
@@ -130,11 +131,10 @@ impl KcpSession {
         );
 
         // Go frp (kcp-go) calls SetACKNoDelay(false) on its KCP sessions.
-        // The Rust kcp crate does not expose a set_ack_no_delay API, and
-        // its default behavior is equivalent to ACKNoDelay=false (ACKs are
-        // accumulated in acklist and flushed on the next tick rather than
-        // sent immediately). Verified: Rust kcp 0.6.0 always batches ACKs
-        // — no action needed.
+        // Our in-tree KCP implementation does not expose a set_ack_no_delay
+        // API; its default behavior is equivalent to ACKNoDelay=false (ACKs
+        // are accumulated in acklist and flushed on the next tick rather than
+        // sent immediately) — no action needed.
 
         let alive = Arc::new(AtomicBool::new(true));
 
@@ -198,16 +198,9 @@ impl KcpSession {
                         shard.resize(max_size, 0);
                     }
 
-                    // Stack-allocated array avoids heap allocation for shard_refs Vec.
-                    debug_assert!(
-                        self.config.data_shards <= 64,
-                        "data_shards > 64 not supported"
-                    );
                     let n = self.pending_shards.len();
-                    let mut shard_refs: [&[u8]; 64] = [&[]; 64];
-                    for (i, s) in self.pending_shards.iter().enumerate() {
-                        shard_refs[i] = s.as_slice();
-                    }
+                    let mut shard_refs: Vec<&[u8]> = Vec::with_capacity(n);
+                    shard_refs.extend(self.pending_shards.iter().map(Vec::as_slice));
                     let all_shards = fec.encode(&shard_refs[..n]);
 
                     // Output parity shards (skip data shards, already sent).
@@ -370,12 +363,7 @@ impl KcpSession {
                 }
 
                 // Track which data shards were already received (to avoid double-feed).
-                // Fixed-size array avoids heap allocation.
-                debug_assert!(
-                    self.config.data_shards <= 64,
-                    "data_shards > 64 not supported in decode path"
-                );
-                let mut had_data = [false; 64];
+                let mut had_data = vec![false; group.shards.len()];
                 for (i, s) in group
                     .shards
                     .iter()
@@ -503,7 +491,7 @@ impl KcpSession {
                         Err(e) => return Err(io::Error::other(e)),
                     }
                 }
-                Err(kcp::Error::RecvQueueEmpty) => return Ok(()),
+                Err(KcpError::RecvQueueEmpty) => return Ok(()),
                 Err(e) => return Err(io::Error::other(e)),
             }
         }

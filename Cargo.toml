@@ -46,7 +46,6 @@ tokio-util = { version = "0.7", features = ["compat"] }
 h2 = "0.4"
 http = "1"
 bytes = "1"
-kcp = "0.6"
 quinn = "0.11"
 
 frp-vnet = { path = "frp-vnet" }
@@ -67,10 +66,3 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
-
-# Patched kcp crate — kcp-go v5.6.13 compat fixes:
-#   1. RTO linear backoff (rto += rx_rto/2, not rto += rto/2)
-#   2. Flush ordering: fast_retransmit before RTO
-#   3. Early retransmit: fastack>0 && new_segs==0
-[patch.crates-io]
-kcp = { path = "frp-core/vendored/kcp-0.6.0" }
