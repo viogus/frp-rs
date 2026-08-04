@@ -43,18 +43,35 @@ pub fn derive_key(token: &str) -> [u8; 16] {
 /// Encrypt data using AES-128-CFB with a random 16-byte IV.
 /// Returns: [16-byte IV][ciphertext]
 pub fn encrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(data.len() + 16);
+    encrypt_into(data, key, &mut out)?;
+    Ok(out)
+}
+
+/// Encrypt into an existing buffer, reusing its allocation.
+/// Output layout identical to [`encrypt`]: [16-byte IV][ciphertext].
+pub fn encrypt_into(data: &[u8], key: &[u8; 16], out: &mut Vec<u8>) -> Result<(), String> {
     let mut iv = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut iv);
-    let mut result = iv.to_vec();
-    result.extend_from_slice(data);
+    out.clear();
+    out.extend_from_slice(&iv);
+    out.extend_from_slice(data);
     let cipher = Aes128CfbEnc::new(key.into(), &iv.into());
-    cipher.encrypt(&mut result[16..]);
-    Ok(result)
+    cipher.encrypt(&mut out[16..]);
+    Ok(())
 }
 
 /// Decrypt data using AES-128-CFB.
 /// Input: [16-byte IV][ciphertext]
 pub fn decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(data.len().saturating_sub(16));
+    decrypt_into(data, key, &mut out)?;
+    Ok(out)
+}
+
+/// Decrypt into an existing buffer, reusing its allocation.
+/// Output identical to [`decrypt`].
+pub fn decrypt_into(data: &[u8], key: &[u8; 16], out: &mut Vec<u8>) -> Result<(), String> {
     if data.len() < 16 {
         return Err("data too short for AES-CFB (need at least 16-byte IV)".into());
     }
@@ -62,10 +79,11 @@ pub fn decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
         .try_into()
         .expect("IV is exactly 16 bytes: length checked above");
     let ciphertext = &data[16..];
-    let mut result = ciphertext.to_vec();
+    out.clear();
+    out.extend_from_slice(ciphertext);
     let cipher = Aes128CfbDec::new(key.into(), iv.into());
-    cipher.decrypt(&mut result);
-    Ok(result)
+    cipher.decrypt(out);
+    Ok(())
 }
 
 /// Compress data using Snappy (matching Go frp v0.69.1).
@@ -174,18 +192,27 @@ impl SnappyCompressor {
 /// Decompress Snappy-compressed data.
 #[cfg(feature = "compression")]
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    decompress_into(data, &mut out)?;
+    Ok(out)
+}
+
+/// Decompress into an existing buffer, reusing its allocation.
+/// Output identical to [`decompress`].
+#[cfg(feature = "compression")]
+pub fn decompress_into(data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     use snap::read::FrameDecoder;
     use std::io::Read;
     let mut decoder = FrameDecoder::new(data);
-    let mut result = Vec::new();
+    out.clear();
     decoder
-        .read_to_end(&mut result)
+        .read_to_end(out)
         .map_err(|e| format!("snappy decompress: {e}"))?;
-    Ok(result)
+    Ok(())
 }
 
 #[cfg(not(feature = "compression"))]
-pub fn decompress(_data: &[u8]) -> Result<Vec<u8>, String> {
+pub fn decompress_into(_data: &[u8], _out: &mut Vec<u8>) -> Result<(), String> {
     Err("compression not compiled".into())
 }
 
@@ -935,5 +962,53 @@ mod tests {
         let k1 = derive_key("secret1");
         let k2 = derive_key("secret2");
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_into_roundtrip_and_wire_equiv() {
+        let key: [u8; 16] = *b"0123456789abcdef";
+        let data = b"udp payload payload payload";
+        let mut key_buf = [0u8; 16];
+        key_buf.copy_from_slice(&key);
+
+        // encrypt → decrypt roundtrip through the _into variants (the random
+        // IV differs per call, so compare decrypted plaintext, not ciphertext).
+        let mut enc = Vec::new();
+        encrypt_into(data, &key_buf, &mut enc).unwrap();
+        assert_eq!(enc.len(), data.len() + 16);
+        let mut dec = Vec::new();
+        decrypt_into(&enc, &key_buf, &mut dec).unwrap();
+        assert_eq!(dec, data);
+
+        // _into must reuse the buffer (capacity retained), not reallocate.
+        let cap_before = enc.capacity();
+        encrypt_into(data, &key_buf, &mut enc).unwrap();
+        assert!(enc.capacity() >= cap_before, "capacity must be retained");
+
+        // decrypt_into output identical to decrypt.
+        let dec_plain = decrypt(&enc, &key_buf).unwrap();
+        let mut dec_into = Vec::new();
+        decrypt_into(&enc, &key_buf, &mut dec_into).unwrap();
+        assert_eq!(dec_plain, dec_into);
+    }
+
+    #[test]
+    fn test_compress_decompress_into_wire_equiv() {
+        let data = b"compressible compressible compressible compressible data";
+        // compress is deterministic → _into output must be byte-identical.
+        let plain = compress(data).unwrap();
+        let mut into = Vec::new();
+        compress_into(data, &mut into).unwrap();
+        assert_eq!(
+            plain, into,
+            "compress_into must match compress byte-for-byte"
+        );
+
+        // decompress_into output identical to decompress, and roundtrips.
+        let mut out = Vec::new();
+        decompress_into(&plain, &mut out).unwrap();
+        assert_eq!(out, data);
+        let out_plain = decompress(&plain).unwrap();
+        assert_eq!(out_plain, out);
     }
 }

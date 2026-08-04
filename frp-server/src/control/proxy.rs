@@ -69,15 +69,18 @@ pub(crate) async fn handle_udp_packet<W: AsyncWriteExt + Unpin>(
                 None => (false, false),
             },
         };
-        if flags.0 {
-            if let Ok(decrypted) = encryption::decrypt(&payload, &ctx.reloadable.encryption_key) {
-                payload = decrypted;
-            }
+        if flags.0
+            && encryption::decrypt_into(
+                &payload,
+                &ctx.reloadable.encryption_key,
+                &mut ctl.udp_dec_scratch,
+            )
+            .is_ok()
+        {
+            std::mem::swap(&mut payload, &mut ctl.udp_dec_scratch);
         }
-        if flags.1 {
-            if let Ok(decompressed) = encryption::decompress(&payload) {
-                payload = decompressed;
-            }
+        if flags.1 && encryption::decompress_into(&payload, &mut ctl.udp_decomp_scratch).is_ok() {
+            std::mem::swap(&mut payload, &mut ctl.udp_decomp_scratch);
         }
     }
     let sock_opt = proxy_name

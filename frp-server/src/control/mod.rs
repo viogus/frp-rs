@@ -71,6 +71,11 @@ pub(crate) struct ControlState {
     /// per-packet path avoids an async `proxy_manager.get()`. Removed on
     /// proxy close / control cleanup.
     pub udp_proxy_flags: std::collections::HashMap<String, (bool, bool)>,
+    /// Ping-pong scratch for the per-packet decrypt/decompress chain,
+    /// keeping their allocations across packets (control-scoped; packets are
+    /// handled synchronously so sharing is safe).
+    pub udp_dec_scratch: Vec<u8>,
+    pub udp_decomp_scratch: Vec<u8>,
     pub last_ping: Instant,
 }
 

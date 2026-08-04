@@ -1281,6 +1281,8 @@ mod vnet_route_tests {
             udp_sockets: HashMap::new(),
             udp_local_to_proxy: HashMap::new(),
             udp_proxy_flags: HashMap::new(),
+            udp_dec_scratch: Vec::new(),
+            udp_decomp_scratch: Vec::new(),
             last_ping: Instant::now(),
         };
         (ctx, ctl)

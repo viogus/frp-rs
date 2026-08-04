@@ -798,6 +798,8 @@ pub(crate) async fn authenticate(
             udp_sockets,
             udp_local_to_proxy,
             udp_proxy_flags: std::collections::HashMap::new(),
+            udp_dec_scratch: Vec::new(),
+            udp_decomp_scratch: Vec::new(),
             last_ping,
         },
         internal_tx,
