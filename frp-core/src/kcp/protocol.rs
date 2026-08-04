@@ -2060,7 +2060,7 @@ mod tests {
             }
         }
 
-        /// A valid PUSH packet truncated to a random prefix (0..=len).
+        // A valid PUSH packet truncated to a random prefix (0..=len).
         prop_compose! {
             fn arb_truncated_push()(
                 conv in any::<u32>(),
@@ -2074,8 +2074,8 @@ mod tests {
             }
         }
 
-        /// A valid PUSH packet with 0..8 random byte overwrites (may corrupt
-        /// the conv, cmd, len field, payload ...).
+        // A valid PUSH packet with 0..8 random byte overwrites (may corrupt
+        // the conv, cmd, len field, payload ...).
         prop_compose! {
             fn arb_mutated_push()(
                 conv in any::<u32>(),
