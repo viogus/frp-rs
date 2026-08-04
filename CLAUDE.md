@@ -68,7 +68,7 @@ Feature flags across crates:
 | `vnet` | frp-core/server/client | L3 VPN / TUN device routing |
 | `admin` | frp-client | frpc admin API (axum) |
 | `admin-auth` | frp-core | shared admin auth helpers (token/basic) |
-| `mimalloc` | frps/frpc | mimalloc global allocator (exclusive with mem-profile) |
+| `mimalloc` | frps/frpc | mimalloc global allocator (exclusive with mem-profile) — measured no ≥5% throughput gain in the 2026-08 A/B (see `docs/superpowers/notes/2026-08-04-mimalloc-throughput-ab.md`), keep opt-in |
 | `mem-profile` | frp-core/server/client | CountingAlloc global allocator + MEMPROFILE emitter (dev only) |
 | `profiling` | frp-core | profiling feature gate (dev only) |
 | `otel` | frp-core/server/client | OpenTelemetry tracing + OTLP export (~+2-3MB) |
