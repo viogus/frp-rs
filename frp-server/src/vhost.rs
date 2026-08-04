@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -156,6 +157,13 @@ struct VhostTables {
 /// Manages HTTP VHost routing table (domain + location -> proxy).
 pub struct VhostManager {
     inner: RwLock<VhostTables>,
+    /// Gate for `lookup_by_path`: true while any location route exists.
+    /// Every HTTP request used to linearly scan all location routes even
+    /// when none were registered; the flag skips the scan (and the RwLock
+    /// read) in that common case. Relaxed ordering is fine — a stale false
+    /// after a register only defers the scan by one request, and a stale
+    /// true after unregister just runs a scan that finds nothing.
+    has_location_routes: AtomicBool,
 }
 
 impl Default for VhostManager {
@@ -173,6 +181,7 @@ impl VhostManager {
                 by_proxy: HashMap::new(),
                 by_proxy_locations: HashMap::new(),
             }),
+            has_location_routes: AtomicBool::new(false),
         }
     }
 
@@ -275,6 +284,9 @@ impl VhostManager {
             tables
                 .by_proxy_locations
                 .insert(proxy_name.to_string(), loc_entries);
+            // Enable the lookup_by_path scan gate (held under the write lock,
+            // so it stays consistent with the tables).
+            self.has_location_routes.store(true, Ordering::Relaxed);
         }
 
         Ok(())
@@ -313,6 +325,11 @@ impl VhostManager {
                         tables.location_routes.remove(loc);
                     }
                 }
+            }
+            // Clear the scan gate when the last location route is removed
+            // (held under the write lock, so it stays consistent).
+            if tables.location_routes.is_empty() {
+                self.has_location_routes.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -373,6 +390,12 @@ impl VhostManager {
     /// For each matching prefix, finds the first route whose location prefix-matches
     /// the path by iterating the sorted Vec (matching Go's getLocked pattern).
     pub async fn lookup_by_path(&self, path: &str, http_user: &str) -> Option<VhostRouteMatch> {
+        // Fast path: with no location routes registered the scan below can
+        // never match — skip the RwLock read and the linear iteration (every
+        // HTTP request used to pay this scan).
+        if !self.has_location_routes.load(Ordering::Relaxed) {
+            return None;
+        }
         let tables = self.inner.read().await;
         // Find longest matching prefix
         let mut best: Option<(usize, VhostRouteMatch)> = None;
@@ -596,14 +619,23 @@ async fn handle_http1_request<S>(
                 map.get(&forward.run_id).cloned()
             };
             if let Some(ctl_tx) = internal_tx {
-                let _ = ctl_tx
+                // send().await: backpressure is correct — a full control
+                // channel must not silently drop a user connection (Go frp
+                // blocks and lets the TCP backlog absorb the burst). This
+                // runs in a per-connection spawned task, so the await is
+                // free. A closed channel means the control handler died
+                // between lookup and dispatch; the connection drops.
+                if let Err(e) = ctl_tx
                     .tx
-                    .try_send(InternalMsg::ProxyUserConn {
+                    .send(InternalMsg::ProxyUserConn {
                         proxy_name: forward.proxy_name,
                         user_conn: wrap(stream),
                         pre_read: forward.request_head,
                     })
-                    .ok();
+                    .await
+                {
+                    warn!(host = %host, path = %path, error = %e, "{} VHost route for '{}' path '{}' found but control channel closed", scheme, host, path);
+                }
             } else {
                 warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control handler gone", scheme, host, path);
                 write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
@@ -835,15 +867,21 @@ pub async fn run_vhost_https_listener(
                             map.get(route.run_id.as_ref()).cloned()
                         };
                         if let Some(ctl_tx) = internal_tx {
-                            let _ = ctl_tx
+                            // send().await: same backpressure rationale as the
+                            // HTTP vhost path — runs in a per-connection
+                            // spawned task, so the await is free.
+                            if let Err(e) = ctl_tx
                                 .tx
-                                .try_send(InternalMsg::ProxyUserConn {
+                                .send(InternalMsg::ProxyUserConn {
                                     proxy_name: route.proxy_name.to_string(),
                                     // Passthrough: raw encrypted bytes, no TLS wrap.
                                     user_conn: frp_core::transport::IoStream::Tcp(stream),
                                     pre_read,
                                 })
-                                .ok();
+                                .await
+                            {
+                                warn!(sni = %sni, error = %e, "HTTPS VHost route for '{}' found but control channel closed", sni);
+                            }
                         } else {
                             warn!(sni = %sni, "HTTPS VHost route for '{}' found but control handler gone", sni);
                         }

@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UdpSocket};
@@ -745,6 +746,11 @@ pub(crate) async fn handle_new_proxy(
                     .await;
                     return;
                 }
+                // Enable the SNI-sniff gate in the accept loop: at least one
+                // HTTPS proxy can be routed via ClientHello SNI. Decremented
+                // on unregister/close (unregister_control, handle_close_proxy,
+                // dashboard proxy delete).
+                state.https_proxy_count.fetch_add(1, Ordering::Relaxed);
                 info!(
                     proxy_name = %np.proxy_name, domains = ?domains, "VHost SNI routes registered for HTTPS proxy '{}': domains={:?}",
                     np.proxy_name, domains
@@ -1047,25 +1053,22 @@ pub(crate) async fn listen_and_proxy(
         match listener.accept().await {
             Ok((user_conn, _addr)) => {
                 frp_core::transport::set_nodelay(&user_conn);
-                match internal_tx.try_send(InternalMsg::ProxyUserConn {
-                    proxy_name: proxy_name.clone(),
-                    user_conn: IoStream::Tcp(user_conn),
-                    pre_read: vec![],
-                }) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        // Channel is temporarily full — drop this connection
-                        // and continue accepting. Do NOT stop the listener.
-                        tracing::debug!(
-                            proxy_name = %proxy_name,
-                            "Proxy listener backpressure, dropping user connection for '{}'",
-                            proxy_name
-                        );
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        warn!(proxy_name = %proxy_name, "Control handler gone, stopping proxy listener for '{}'", proxy_name);
-                        break;
-                    }
+                // send().await: backpressure is correct — the control channel
+                // (cap 1024) can fill under a burst of user connections; Go frp
+                // blocks here and lets the TCP backlog absorb the burst. This
+                // accept loop is single-task, so stalling it only pauses this
+                // proxy's accepts. A closed channel means the control handler
+                // is gone — stop the listener.
+                if let Err(e) = internal_tx
+                    .send(InternalMsg::ProxyUserConn {
+                        proxy_name: proxy_name.clone(),
+                        user_conn: IoStream::Tcp(user_conn),
+                        pre_read: vec![],
+                    })
+                    .await
+                {
+                    warn!(proxy_name = %proxy_name, error = %e, "Control handler gone, stopping proxy listener for '{}'", proxy_name);
+                    break;
                 }
             }
             Err(e) => {
@@ -1197,6 +1200,10 @@ pub(crate) async fn unregister_control(
     // VHost unregister outside port lock to avoid holding it across awaits
     for p in &proxies {
         state.vhost_manager.unregister(&p.name).await;
+        // Decrement the SNI-sniff gate count for https proxies.
+        if p.proxy_type == "https" {
+            state.dec_https_proxy_count();
+        }
         state.tcpmux_manager.unregister(&p.name).await;
         state.proxy_metrics.remove(&p.name).await;
     }
@@ -1285,11 +1292,20 @@ async fn tcp_group_listener(
                                 map.get(&backend_run_id).map(|c| c.tx.clone())
                             };
                             if let Some(tx) = ctl_tx {
-                                if let Err(e) = tx.try_send(InternalMsg::ProxyUserConn {
-                                    proxy_name: backend,
-                                    user_conn: frp_core::transport::IoStream::Tcp(conn),
-                                    pre_read: vec![],
-                                }) {
+                                // send().await: same backpressure rationale as
+                                // listen_and_proxy — the group accept loop
+                                // stalls until the backend control handler
+                                // drains, letting the kernel backlog absorb
+                                // bursts. A closed channel means the backend
+                                // control is gone; the connection is dropped.
+                                if let Err(e) = tx
+                                    .send(InternalMsg::ProxyUserConn {
+                                        proxy_name: backend,
+                                        user_conn: frp_core::transport::IoStream::Tcp(conn),
+                                        pre_read: vec![],
+                                    })
+                                    .await
+                                {
                                     debug!(
                                         group = %group_name,
                                         error = %e,

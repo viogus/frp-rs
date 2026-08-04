@@ -1967,13 +1967,16 @@ pub fn set_keepalive(stream: &tokio::net::TcpStream, secs: u64) {
 }
 
 /// Connect to a target through an HTTP CONNECT or SOCKS5 proxy.
-/// Returns a raw TcpStream that tunnels to `target_host:target_port`.
+/// Returns an IoStream that tunnels to `target_host:target_port` — an
+/// `IoStream::BufferedRead` when the CONNECT response read-ahead captured
+/// bytes past the headers.
 async fn connect_via_proxy(
     proxy_url: &str,
     target_host: &str,
     target_port: u16,
     dial_timeout_secs: u64,
-) -> Result<tokio::net::TcpStream, crate::Error> {
+    keepalive_secs: u64,
+) -> Result<IoStream, crate::Error> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::time::{timeout, Duration};
 
@@ -1990,6 +1993,11 @@ async fn connect_via_proxy(
     .await
     .map_err(|_| crate::Error::Transport(format!("proxy dial timeout to {proxy_addr}").into()))?
     .map_err(|e| crate::Error::Transport(format!("proxy dial to {proxy_addr}: {e}").into()))?;
+
+    // Configure TCP keepalive and disable Nagle on the tunneled connection,
+    // matching connect_direct (Go frp parity).
+    set_keepalive(&stream, keepalive_secs);
+    crate::transport::set_nodelay(&stream);
 
     match scheme {
         "http" | "https" => {
@@ -2013,7 +2021,7 @@ async fn connect_via_proxy(
             .map_err(|_| crate::Error::Transport("proxy CONNECT write timeout".into()))?
             .map_err(|e| crate::Error::Transport(format!("proxy CONNECT write: {e}").into()))?;
 
-            let mut reader = BufReader::new(&mut stream);
+            let mut reader = BufReader::new(stream);
 
             const HTTP_PROXY_MAX_LINE: usize = 16 * 1024; // 16 KiB per line
             const HTTP_PROXY_MAX_TOTAL: usize = 64 * 1024; // 64 KiB total headers
@@ -2078,6 +2086,28 @@ async fn connect_via_proxy(
                     break;
                 }
             }
+
+            // Capture any bytes BufReader read-ahead past the CONNECT response
+            // headers — the tunneled peer's first message can arrive in the
+            // same TCP segment. Dropping them (the previous behavior) silently
+            // ate up to 8 KiB of read-ahead, corrupting the first protocol
+            // message. Mirrors the WS upgrade paths' leftover handling.
+            let leftover = reader.buffer().to_vec();
+            let stream = reader.into_inner();
+
+            if !leftover.is_empty() {
+                tracing::debug!(
+                    leftover_len = leftover.len(),
+                    "proxy CONNECT: replaying {} read-ahead bytes via BufferedRead",
+                    leftover.len()
+                );
+                return Ok(IoStream::BufferedRead(
+                    leftover,
+                    0,
+                    Box::new(IoStream::Tcp(stream)),
+                ));
+            }
+            return Ok(IoStream::Tcp(stream));
         }
         "socks5" | "socks5h" => {
             // SOCKS5 handshake. Go golib semantics:
@@ -2242,10 +2272,7 @@ async fn connect_via_proxy(
         }
     }
 
-    // Disable Nagle on the tunneled stream (Go frp parity).
-    crate::transport::set_nodelay(&stream);
-
-    Ok(stream)
+    Ok(IoStream::Tcp(stream))
 }
 
 /// Parse a proxy URL into (scheme, auth, host, port).
@@ -2389,9 +2416,10 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 &opts.server_addr
             };
             let ca_file = opts.tls_ca_file.as_deref();
-            let (stream, _conn) = crate::quic::dial_quic(&addr, server_name, ca_file)
-                .await
-                .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}").into()))?;
+            let (stream, _conn) =
+                crate::quic::dial_quic(&addr, server_name, ca_file, Some(opts.dial_timeout_secs))
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}").into()))?;
             return Ok(IoStream::Quic(stream));
         }
         _ => {}
@@ -2399,10 +2427,10 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
 
     // TCP, WebSocket, WSS: connect via upstream proxy if configured, otherwise direct TCP.
     #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
-    let mut stream = if let Some(ref proxy_url) = opts.proxy_url {
+    let mut stream: IoStream = if let Some(ref proxy_url) = opts.proxy_url {
         if proxy_url.is_empty() {
             // Empty string = direct connection
-            connect_direct(&addr, peer, opts).await?
+            IoStream::Tcp(connect_direct(&addr, peer, opts).await?)
         } else {
             // socks5h: the proxy resolves the hostname (remote DNS) — pass the
             // original server_addr instead of the locally resolved IP.
@@ -2416,11 +2444,12 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 proxy_target,
                 opts.server_port,
                 opts.dial_timeout_secs,
+                opts.keepalive_secs,
             )
             .await?
         }
     } else {
-        connect_direct(&addr, peer, opts).await?
+        IoStream::Tcp(connect_direct(&addr, peer, opts).await?)
     };
 
     // Tls detect / yamux wrapping / V2-V1 detection are all handled by the
@@ -2469,7 +2498,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                     ))
                 }
             } else {
-                Ok(IoStream::Tcp(stream))
+                Ok(stream)
             }
         }
         #[cfg(feature = "websocket")]

@@ -91,6 +91,16 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     };
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
+
+    // Set socket buffer sizes (1 MiB each), matching the listener — an
+    // outbound dial otherwise keeps the OS defaults (~212KB on Linux),
+    // which can drop KCP bursts under load.
+    if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
+        tracing::debug!(error = %e, "KCP: dial failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
+    }
+    if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
+        tracing::debug!(error = %e, "KCP: dial failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
+    }
     let socket = Arc::new(socket);
 
     let (kcp_socket, handle, _accept_rx) = KcpSocket::new(socket, config.clone());

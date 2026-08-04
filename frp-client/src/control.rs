@@ -1,17 +1,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
-use frp_core::config::{ProxyConfig, VisitorConfig};
 use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::mux::{self, YamuxSession};
 use frp_core::protocol::write_msg_v1;
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
 use frp_core::transport::{dial_server, DialOptions, IoStream, TransportProtocol};
-use frp_core::TransportError;
 use frp_core::VERSION;
 
 use crate::util::opt_if_empty;
@@ -25,8 +23,6 @@ type LoginRet = (
 );
 #[cfg(not(feature = "quic"))]
 type LoginRet = (IoStream, String, Option<YamuxSession>);
-
-use crate::proxy;
 
 /// Whether the control connection should wrap its transport stream in yamux
 /// when `tcp_mux` is enabled. Go frp v0.70.1 applies yamux over TCP, KCP,
@@ -247,6 +243,7 @@ impl ControlConnection {
                     self.tls_cert_file.as_deref(),
                     self.tls_key_file.as_deref(),
                     self.quic_params.clone(),
+                    Some(self.dial_server_timeout as u64),
                 )
                 .await
                 .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}").into()))?;
@@ -521,140 +518,6 @@ impl ControlConnection {
             _ => Err(frp_core::Error::Protocol(
                 "Unexpected response to login".into(),
             )),
-        }
-    }
-
-    /// Register a proxy with the server.
-    pub async fn register_proxy(
-        &self,
-        p: &ProxyConfig,
-        local_addr: &str,
-        stream: &mut IoStream,
-    ) -> Result<msg::NewProxyResp, frp_core::Error> {
-        let np = proxy::create_new_proxy_msg(p, local_addr, &self.user);
-        debug!(
-            name = %p.name,
-            proxy_type = %p.proxy_type,
-            remote_port = p.remote_port,
-            encrypted = p.use_encryption,
-            compressed = p.use_compression,
-            "NewProxy message prepared"
-        );
-        info!(name = %p.name, proxy_type = %p.proxy_type, remote_port = %p.remote_port, local_addr = %local_addr,
-            "Registering proxy '{}' type={} remote_port={} local={}",
-            p.name, p.proxy_type, p.remote_port, local_addr);
-        if self.v2 {
-            stream.write_v2_frame(&np).await?;
-        } else {
-            stream.write_v1_frame(&np).await?;
-        }
-        info!(name = %p.name, "NewProxy sent for '{}', waiting for response...", p.name);
-        let mut iterations = 0u32;
-        loop {
-            if iterations >= 100 {
-                return Err(frp_core::Error::Transport(TransportError::Other(format!(
-                    "Proxy '{}' registration failed: too many non-response messages",
-                    p.name
-                ))));
-            }
-            iterations += 1;
-            let resp_msg = if self.v2 {
-                stream.read_v2_frame().await?
-            } else {
-                stream.read_v1_frame().await?
-            };
-            match resp_msg {
-                FrpMessage::NewProxyResp(resp) => {
-                    if let Some(err) = resp.error {
-                        return Err(frp_core::Error::Transport(TransportError::Other(format!(
-                            "Proxy '{}' registration failed: {err}",
-                            p.name
-                        ))));
-                    }
-                    info!(name = %p.name, remote_addr = ?resp.remote_addr, "Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
-                    return Ok(resp);
-                }
-                FrpMessage::ReqWorkConn(_) => {
-                    debug!("Skipping ReqWorkConn during proxy registration (pool conns spawned separately)");
-                    continue;
-                }
-                other => {
-                    warn!(proxy_name = %p.name, type_byte = other.v1_type_byte(), "Unexpected message during NewProxy registration");
-                    continue;
-                }
-            }
-        }
-    }
-
-    /// Register an XTCP/STCP visitor on the control connection.
-    /// Go frps v0.69.1 requires visitor registration before the visitor can
-    /// send NatHoleVisitor on the control connection. Without this, the
-    /// server responds with "auth failed".
-    pub async fn register_visitor(
-        &self,
-        v: &VisitorConfig,
-        stream: &mut IoStream,
-    ) -> Result<msg::NewVisitorConnResp, frp_core::Error> {
-        let nvc = crate::proxy::create_visitor_conn_msg(
-            &v.server_name,
-            &v.secret_key,
-            v.use_encryption,
-            v.use_compression,
-            Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
-            Some(self.user.as_str()).filter(|s| !s.is_empty()),
-            Some(self.run_id.as_str()).filter(|s| !s.is_empty()),
-        );
-        debug!(
-            server_name = %v.server_name,
-            encrypted = v.use_encryption,
-            compressed = v.use_compression,
-            "NewVisitorConn message prepared"
-        );
-        info!(visitor_name = %v.name, proxy_name = %v.server_name, "Registering visitor '{}' for proxy '{}'", v.name, v.server_name);
-        if self.v2 {
-            stream.write_v2_frame(&nvc).await?;
-        } else {
-            stream.write_v1_frame(&nvc).await?;
-        }
-        let mut iterations = 0u32;
-        loop {
-            if iterations >= 100 {
-                return Err(frp_core::Error::Transport(TransportError::Other(format!(
-                    "Visitor '{}' registration failed: too many non-response messages",
-                    v.name
-                ))));
-            }
-            iterations += 1;
-            let resp_msg = if self.v2 {
-                stream.read_v2_frame().await?
-            } else {
-                stream.read_v1_frame().await?
-            };
-            match resp_msg {
-                FrpMessage::NewVisitorConnResp(resp) => {
-                    if let Some(err) = resp.error {
-                        return Err(frp_core::Error::Transport(TransportError::Other(format!(
-                            "Visitor '{}' registration failed: {err}",
-                            v.name
-                        ))));
-                    }
-                    info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
-                    return Ok(resp);
-                }
-                FrpMessage::ReqWorkConn(_) => {
-                    // Go frps v0.69.1 responds to NewVisitorConn with ReqWorkConn
-                    // instead of NewVisitorConnResp. Treat as success.
-                    info!(visitor_name = %v.name, "Visitor '{}' registered (Go frps compat: ReqWorkConn after NewVisitorConn)", v.name);
-                    return Ok(msg::NewVisitorConnResp {
-                        proxy_name: v.server_name.clone(),
-                        error: None,
-                    });
-                }
-                other => {
-                    warn!(visitor_name = %v.name, type_byte = other.v1_type_byte(), "Unexpected message during NewVisitorConn registration");
-                    continue;
-                }
-            }
         }
     }
 

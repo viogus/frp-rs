@@ -420,26 +420,30 @@ pub(crate) async fn authenticate(
     info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
 
     // --- Server plugin: login hook ---
-    let login_content = serde_json::json!({
-        "version": login.version,
-        "hostname": login.hostname,
-        "os": login.os,
-        "user": login.user,
-        "run_id": run_id,
-        "remote_addr": peer.map(|a| a.to_string()),
-        "metas": login.metas,
-    });
-    if let Err(reason) = state.plugin_manager.notify("login", login_content).await {
-        warn!(run_id = %run_id, reason = %reason, "Login for run_id {} rejected by server plugin: {}", run_id, reason);
-        let (_, mut writer) = tokio::io::split(stream);
-        let resp = FrpMessage::LoginResp(msg::LoginResp {
-            version: Some(frp_core::VERSION.into()),
-            run_id: None,
-            error: Some(reason),
-            server_additional_auth_scopes: None,
+    // Skip payload construction entirely when no plugins are configured
+    // (the default) — json! builds a full Value on every login otherwise.
+    if !state.plugin_manager.is_empty() {
+        let login_content = serde_json::json!({
+            "version": login.version,
+            "hostname": login.hostname,
+            "os": login.os,
+            "user": login.user,
+            "run_id": run_id,
+            "remote_addr": peer.map(|a| a.to_string()),
+            "metas": login.metas,
         });
-        let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-        return Err(());
+        if let Err(reason) = state.plugin_manager.notify("login", login_content).await {
+            warn!(run_id = %run_id, reason = %reason, "Login for run_id {} rejected by server plugin: {}", run_id, reason);
+            let (_, mut writer) = tokio::io::split(stream);
+            let resp = FrpMessage::LoginResp(msg::LoginResp {
+                version: Some(frp_core::VERSION.into()),
+                run_id: None,
+                error: Some(reason),
+                server_additional_auth_scopes: None,
+            });
+            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+            return Err(());
+        }
     }
 
     // --- Set up internal channel ---
@@ -578,13 +582,15 @@ pub(crate) async fn authenticate(
             Some(additional_auth_scopes)
         },
     });
-    // Hex-dump the raw LoginResp frame for Go compat debugging
-    if tracing::enabled!(tracing::Level::INFO) {
+    // Hex-dump the raw LoginResp frame for Go compat debugging.
+    // debug-level only: re-serializing the frame purely for logging cost
+    // an allocation + utf8_lossy on every login at the default INFO level.
+    if tracing::enabled!(tracing::Level::DEBUG) {
         let type_byte = resp.v1_type_byte();
         let payload = serde_json::to_vec(&resp).unwrap_or_default();
         let frame_len = 9 + payload.len();
         let proto_label = if v2 { "V2" } else { "V1" };
-        info!(
+        debug!(
             peer = ?peer, run_id = %run_id,
             type_byte = format_args!("{:#04x}", type_byte),
             payload_len = payload.len(),

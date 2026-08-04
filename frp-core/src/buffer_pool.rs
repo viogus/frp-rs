@@ -18,9 +18,9 @@ use std::sync::Mutex;
 /// i.e. 4 KiB – 1 MiB). Read once at process start via `LazyLock`.
 ///
 /// This buffer size is used by the encrypted/compressed bridge data
-/// path (`bridge.rs`) and the V2 frame read path (`protocol.rs`).
-/// The plain (unencrypted) bridge path uses `tokio::io::copy_bidirectional`
-/// which has its own internal buffers and is not affected by this constant.
+/// path (`bridge.rs`), the V2 frame read path (`protocol.rs`), and —
+/// via `copy_bidirectional_with_sizes` — the plain (unencrypted)
+/// bridge path, so `FRP_BRIDGE_BUF_KB` applies uniformly.
 pub static BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FRP_BRIDGE_BUF_KB")
         .ok()

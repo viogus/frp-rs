@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, warn};
 
 use frp_core::bandwidth::BandwidthLimiter;
+use frp_core::buffer_pool::BUFFER_SIZE;
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
@@ -57,7 +58,11 @@ fn build_start_work_conn(
         },
         // For XTCP STCP fallback: set empty nat_hole_sid marker so Rust frpc
         // knows this work conn is for STCP bridging, not XTCP notification.
-        nat_hole_sid: if req.proxy_type == "xtcp" {
+        nat_hole_sid: if req
+            .proxy_info
+            .as_ref()
+            .is_some_and(|p| p.proxy_type == "xtcp")
+        {
             Some(String::new())
         } else {
             None
@@ -222,7 +227,15 @@ async fn run_udp_work_conn(
     // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
     // frames in flight without flush.
     let no_flush = matches!(work_conn, IoStream::Tcp(_));
-    let (mut w_r, mut w_w) = work_conn.into_split().unwrap();
+    let (w_r, mut w_w) = work_conn.into_split().unwrap();
+    // Buffer the frame reads: read_msg_v1/v2 issue two read_exact calls per
+    // packet (header + payload), so BufReader amortizes them into one
+    // syscall per packet — and one syscall for several small packets. The
+    // write half is untouched (separate object), so no flush semantics
+    // change. Never wraps CFB/AEAD streams — UDP work conns are never
+    // Cipher-wrapped; the bridge cipher is applied per-bridge after
+    // StartWorkConn.
+    let mut w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
     let sock_reader = sock.clone();
@@ -441,7 +454,16 @@ async fn relay_plain_fast_inner(
             }
         }
         (mut user_conn, mut work_conn) => {
-            match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
+            // Sized buffers so FRP_BRIDGE_BUF_KB governs the plain path too
+            // (copy_bidirectional would otherwise use tokio's 8 KiB default).
+            match tokio::io::copy_bidirectional_with_sizes(
+                &mut user_conn,
+                &mut work_conn,
+                *BUFFER_SIZE,
+                *BUFFER_SIZE,
+            )
+            .await
+            {
                 Ok((a, b)) => {
                     metrics.record_traffic(a, b);
                 }
@@ -460,7 +482,14 @@ async fn relay_plain_fast_inner(
     mut work_conn: IoStream,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
-    match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
+    match tokio::io::copy_bidirectional_with_sizes(
+        &mut user_conn,
+        &mut work_conn,
+        *BUFFER_SIZE,
+        *BUFFER_SIZE,
+    )
+    .await
+    {
         Ok((a, b)) => {
             metrics.record_traffic(a, b);
         }
@@ -508,8 +537,19 @@ pub(crate) async fn assign_work_to_proxy(
     }
     .map_or((String::new(), 0), |(ip, port)| (ip, port));
 
-    // Look up proxy info for dst address
-    let proxy_info = state.proxy_manager.get(&req.proxy_name).await;
+    // Proxy metadata is carried in the request (fetched once by the
+    // dispatcher). When the snapshot is None — the STCP/XTCP
+    // visitor-before-provider-registration race, where the request was
+    // enqueued before the proxy was visible to the dispatcher — re-fetch
+    // from the proxy map at bridge time (the old behavior), so the bridge
+    // uses the now-registered proxy's metadata instead of empty
+    // local_addr/dst_port. Clone the Arc (cheap refcount bump) so the
+    // borrow does not block moving `req` into the spawned bridge task
+    // below.
+    let proxy_info = match req.proxy_info.clone() {
+        Some(info) => Some(info),
+        None => state.proxy_manager.get(&req.proxy_name).await,
+    };
     let dst_addr = proxy_info
         .as_ref()
         .and_then(|p| p.local_addr.clone())
@@ -551,7 +591,7 @@ pub(crate) async fn assign_work_to_proxy(
     // doesn't send a premature FIN, so the provider can safely consume
     // this frame without the old ECONNRESET race.
     // V2-aware: use V2 or V1 framing based on protocol version.
-    if req.proxy_type == "xtcp" {
+    if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
         let dummy = FrpMessage::NatHoleSid(msg::NatHoleSid::default());
         if v2 {
             let _ = work_conn.write_v2_frame(&dummy).await;
@@ -560,7 +600,7 @@ pub(crate) async fn assign_work_to_proxy(
         }
     }
 
-    debug!(proxy_name = %req.proxy_name, proxy_type = %req.proxy_type, "Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
+    debug!(proxy_name = %req.proxy_name, proxy_type = %proxy_info.as_ref().map(|p| p.proxy_type.as_str()).unwrap_or(""), "Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, proxy_info.as_ref().map(|p| p.proxy_type.as_str()).unwrap_or(""));
 
     let proxy_name = req.proxy_name.clone();
     let metrics = state.proxy_metrics.get_or_create(&proxy_name).await;
@@ -570,7 +610,9 @@ pub(crate) async fn assign_work_to_proxy(
     let pre_read = req.pre_read;
     let enc_key = req.use_encryption;
     let comp_key = req.use_compression;
-    let proxy_type = req.proxy_type.clone();
+    // Borrow the proxy type from the carried Arc — no per-connection String
+    // clone (the request previously deep-cloned it).
+    let proxy_type = proxy_info.as_ref().map(|p| p.proxy_type.as_str());
 
     let (bw_rate, bw_mode) = parse_bandwidth_config(
         proxy_info.as_ref().and_then(|p| {
@@ -588,11 +630,12 @@ pub(crate) async fn assign_work_to_proxy(
     // Only HTTP-family proxies get the timeout; TCP/STCP/XTCP bridges have no
     // such semantic. 0 (unset) disables the timeout, matching Go where the
     // ReverseProxy transport never arms a header deadline.
-    let header_timeout = if proxy_type.starts_with("http") && state.vhost_http_timeout > 0 {
-        Some(std::time::Duration::from_secs(state.vhost_http_timeout))
-    } else {
-        None
-    };
+    let header_timeout =
+        if proxy_type.is_some_and(|t| t.starts_with("http")) && state.vhost_http_timeout > 0 {
+            Some(std::time::Duration::from_secs(state.vhost_http_timeout))
+        } else {
+            None
+        };
 
     tokio::spawn(async move {
         let _guard = guard;
@@ -621,12 +664,22 @@ pub(crate) async fn assign_work_to_proxy(
             None
         };
 
+        // The response-header injector only fires for HTTP-family proxies
+        // with configured headers; clone the HashMap at bridge time instead
+        // of deep-cloning it into every pending request at enqueue time.
+        // Uses the resolved metadata (bridge-time re-fetch when the
+        // enqueue-time snapshot was None).
+        let injector_headers = proxy_info
+            .as_ref()
+            .filter(|p| p.proxy_type.starts_with("http"))
+            .map(|p| p.response_headers.clone())
+            .filter(|h| !h.is_empty());
+
         // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
         // which writes them through the CipherWriter (matching Go frp streaming CFB).
         if use_enc {
             let key = encryption_key;
-            if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
-                let headers = req.response_headers;
+            if let Some(headers) = injector_headers {
                 let (u_r, u_w) = req.user_conn.into_split().unwrap();
                 let (w_r, w_w) = work_conn.into_split().unwrap();
                 let injector = ResponseHeaderInjector::new(w_r, headers);
@@ -846,9 +899,18 @@ pub(crate) async fn assign_work_to_proxy(
             // copy_bidirectional avoids this: both directions run to completion
             // within the same function, and the work side is only shut down
             // after the full bidirectional copy finishes.
-            if proxy_type == "xtcp" {
+            if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
                 let mut user_conn = req.user_conn;
-                match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
+                // Sized buffers so FRP_BRIDGE_BUF_KB governs the XTCP STCP
+                // fallback path too.
+                match tokio::io::copy_bidirectional_with_sizes(
+                    &mut user_conn,
+                    &mut work_conn,
+                    *BUFFER_SIZE,
+                    *BUFFER_SIZE,
+                )
+                .await
+                {
                     Ok((a, b)) => {
                         metrics.record_traffic(a, b);
                     }
@@ -860,8 +922,8 @@ pub(crate) async fn assign_work_to_proxy(
                 // Bandwidth limiting active: use rate-limited plain bridge.
                 let (u_r, u_w) = req.user_conn.into_split().unwrap();
                 let (w_r, w_w) = work_conn.into_split().unwrap();
-                if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
-                    let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
+                if let Some(headers) = injector_headers {
+                    let injector = ResponseHeaderInjector::new(w_r, headers);
                     frp_core::bridge::bridge_plain_rate_limited(
                         u_r,
                         u_w,
@@ -890,7 +952,7 @@ pub(crate) async fn assign_work_to_proxy(
                     )
                     .await;
                 }
-            } else if !comp_key && bridge_pre_read.is_empty() && req.response_headers.is_empty() {
+            } else if !comp_key && bridge_pre_read.is_empty() && injector_headers.is_none() {
                 // Fast path: pure plain relay with no compression, no VHost
                 // pre-read, and no header injection. On Linux, try zero-copy
                 // splice for Tcp-to-Tcp; otherwise use copy_bidirectional.
@@ -899,8 +961,8 @@ pub(crate) async fn assign_work_to_proxy(
                 // Slow path: compression, VHost pre-read, or header injection.
                 let (u_r, u_w) = req.user_conn.into_split().unwrap();
                 let (w_r, w_w) = work_conn.into_split().unwrap();
-                if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
-                    let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
+                if let Some(headers) = injector_headers {
+                    let injector = ResponseHeaderInjector::new(w_r, headers);
                     frp_core::bridge::bridge_plain(
                         u_r,
                         u_w,

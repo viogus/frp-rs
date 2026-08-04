@@ -241,16 +241,21 @@ async fn handle_stream(
     // re-encoding. `IoStream::SshChannel` is a type-erased byte stream —
     // exactly what the bridge expects.
     let (client, control) = tokio::io::duplex(128 * 1024);
+    // send().await: backpressure is correct — a full control channel must
+    // not silently drop a user connection (the HTTP/1.1 path uses the same
+    // pattern). This runs in a per-connection task, so the await is free.
+    // A closed channel means the control handler is gone — answer 502,
+    // matching the HTTP/1.1 path.
     if ctl_tx
         .tx
-        .try_send(InternalMsg::ProxyUserConn {
+        .send(InternalMsg::ProxyUserConn {
             proxy_name: forward.proxy_name,
             user_conn: frp_core::transport::IoStream::SshChannel(Box::new(control)),
             pre_read: forward.request_head,
         })
+        .await
         .is_err()
     {
-        // Control channel full or gone — the HTTP/1.1 path answers 502 here.
         return send_h2_error(respond, 502, &[], Bytes::new()).await;
     }
 

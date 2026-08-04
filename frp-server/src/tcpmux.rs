@@ -241,14 +241,23 @@ pub async fn run_tcpmux_listener(
             };
 
             if let Some(ctl_tx) = internal_tx {
-                let _ = ctl_tx
+                // send().await: backpressure is correct — a full control
+                // channel must not silently drop a user connection (Go frp
+                // blocks and lets the TCP backlog absorb the burst). This
+                // runs in a per-connection spawned task, so the await is
+                // free. A closed channel means the control handler died
+                // between lookup and dispatch; the connection drops.
+                if let Err(e) = ctl_tx
                     .tx
-                    .try_send(InternalMsg::ProxyUserConn {
+                    .send(InternalMsg::ProxyUserConn {
                         proxy_name: route.proxy_name.clone(),
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
                         pre_read,
                     })
-                    .ok();
+                    .await
+                {
+                    warn!(host = %host, error = %e, "TCPMux: route for '{}' found but control channel closed", host);
+                }
             } else {
                 warn!(
                     host = %host,

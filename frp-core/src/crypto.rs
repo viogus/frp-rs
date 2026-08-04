@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[cfg(feature = "chacha20")]
-use chacha20poly1305::aead::{Aead, AeadInPlace};
+use chacha20poly1305::aead::AeadInPlace;
 #[cfg(feature = "chacha20")]
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
 use rand::RngCore;
@@ -157,25 +157,30 @@ impl AeadCipher {
         }
     }
 
-    fn decrypt(&self, nonce: &[u8], mut in_out: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, String> {
+    /// Decrypts `buf` (ciphertext || tag) in place, returning the plaintext
+    /// length. Avoids the fresh `Vec` allocation + copy the old `decrypt`
+    /// did per frame on the read path.
+    fn decrypt_in_place(&self, nonce: &[u8], buf: &mut [u8], aad: &[u8]) -> Result<usize, String> {
         match self {
             Self::Aes256Gcm(key) => {
                 let nonce = Nonce::try_assume_unique_for_key(nonce)
                     .map_err(|e| format!("aes-gcm nonce: {e}"))?;
                 let aad = Aad::from(aad);
                 let plaintext_len = key
-                    .open_in_place(nonce, aad, &mut in_out)
+                    .open_in_place(nonce, aad, buf)
                     .map_err(|e| format!("aes-gcm decrypt: {e}"))?
                     .len();
-                in_out.truncate(plaintext_len);
-                Ok(in_out)
+                Ok(plaintext_len)
             }
             #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305(c) => {
                 let nonce = chacha20poly1305::XNonce::from_slice(nonce);
-                let payload = chacha20poly1305::aead::Payload { msg: &in_out, aad };
-                c.decrypt(nonce, payload)
-                    .map_err(|e| format!("xchacha20 decrypt: {e}"))
+                let tag_start = buf.len() - 16; // both algorithms use a 16-byte tag
+                let (ciphertext, tag_bytes) = buf.split_at_mut(tag_start);
+                let tag = chacha20poly1305::Tag::from_slice(tag_bytes);
+                c.decrypt_in_place_detached(nonce, aad, ciphertext, tag)
+                    .map_err(|e| format!("xchacha20 decrypt: {e}"))?;
+                Ok(tag_start)
             }
         }
     }
@@ -195,11 +200,21 @@ struct AeadReadState {
     header_read: bool,
     frame_count: u64,
     max_frame_count: Option<u64>,
+    /// Fixed pre-allocated frame buffer, sized `max_ciphertext` once at
+    /// construction and never resized. Ciphertext is read into `buf[..]`,
+    /// decrypted in place, and served to callers via `buf_pos` — no
+    /// per-frame allocation or copy (mirrors the `header_buf` pattern).
     buf: Vec<u8>,
+    /// Bytes of decrypted plaintext currently available in `buf` to serve.
+    buf_filled: usize,
     buf_pos: usize,
     err: Option<io::Error>,
-    scratch: Vec<u8>,
-    scratch_filled: usize,
+    /// Target length of the read in flight (0 when no read is in flight;
+    /// the target of a resumed read never changes, so this also
+    /// distinguishes a fresh read from a resumed one).
+    read_len: usize,
+    /// Bytes of the read in flight already consumed from the inner stream.
+    read_filled: usize,
     /// Per-frame header persisted across polls so a mid-ciphertext `Pending`
     /// does not re-read (and re-consume) the 4-byte length header.
     header_buf: [u8; AEAD_FRAME_HEADER_SIZE],
@@ -259,8 +274,10 @@ impl AeadStream {
         let nonce_size = algorithm.nonce_size();
         let write_nonce = generate_random(nonce_size)?;
 
-        // Pre-allocate read scratch to max frame size so per-frame read_exact
-        // calls reuse the same allocation (split_off preserves capacity).
+        // Pre-allocate the read frame buffer to max frame size once. The
+        // buffer is zero-filled here (a single construction-time memset),
+        // then read into and decrypted in place for the lifetime of the
+        // stream — no per-frame allocation, memset, or split-off copy.
         let max_ciphertext = DEFAULT_MAX_PAYLOAD_SIZE + algorithm.overhead();
 
         Ok(Self {
@@ -273,11 +290,12 @@ impl AeadStream {
                 header_read: false,
                 frame_count: 0,
                 max_frame_count: algorithm.max_frame_count(),
-                buf: Vec::new(),
+                buf: vec![0u8; max_ciphertext],
+                buf_filled: 0,
                 buf_pos: 0,
                 err: None,
-                scratch: Vec::with_capacity(max_ciphertext),
-                scratch_filled: 0,
+                read_len: 0,
+                read_filled: 0,
                 header_buf: [0u8; AEAD_FRAME_HEADER_SIZE],
                 header_have: false,
                 aad_buf: Vec::with_capacity(nonce_size + AEAD_FRAME_HEADER_SIZE),
@@ -317,14 +335,14 @@ impl AsyncRead for AeadStream {
         }
 
         // Serve from buffered plaintext
-        if self.read.buf_pos < self.read.buf.len() {
-            let available = self.read.buf.len() - self.read.buf_pos;
+        if self.read.buf_pos < self.read.buf_filled {
+            let available = self.read.buf_filled - self.read.buf_pos;
             let to_copy = available.min(buf.remaining());
             buf.put_slice(&self.read.buf[self.read.buf_pos..self.read.buf_pos + to_copy]);
             self.read.buf_pos += to_copy;
-            if self.read.buf_pos >= self.read.buf.len() {
-                self.read.buf.clear();
+            if self.read.buf_pos >= self.read.buf_filled {
                 self.read.buf_pos = 0;
+                self.read.buf_filled = 0;
             }
             return Poll::Ready(Ok(()));
         }
@@ -334,13 +352,13 @@ impl AsyncRead for AeadStream {
         match this.poll_read_frame(cx) {
             Poll::Ready(Ok(true)) => {
                 // Serve from new buffer
-                let available = this.read.buf.len() - this.read.buf_pos;
+                let available = this.read.buf_filled - this.read.buf_pos;
                 let to_copy = available.min(buf.remaining());
                 buf.put_slice(&this.read.buf[this.read.buf_pos..this.read.buf_pos + to_copy]);
                 this.read.buf_pos += to_copy;
-                if this.read.buf_pos >= this.read.buf.len() {
-                    this.read.buf.clear();
+                if this.read.buf_pos >= this.read.buf_filled {
                     this.read.buf_pos = 0;
+                    this.read.buf_filled = 0;
                 }
                 Poll::Ready(Ok(()))
             }
@@ -363,12 +381,20 @@ impl AeadStream {
     fn poll_read_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         tracing::debug!(read_header_read = %self.read.header_read, read_frame_count = %self.read.frame_count, "[AEAD-READ] poll_read_frame called, read_header_read={}, read_frame_count={}",
             self.read.header_read, self.read.frame_count);
-        // Read stream nonce on first frame
+        // Read stream nonce on first frame, directly into its pre-allocated
+        // slot (the fixed frame buffer is reserved for ciphertext).
         if !self.read.header_read {
-            match self.read_exact(self.read.nonce.len(), cx) {
-                Poll::Ready(Ok(data)) => {
-                    self.read.nonce.copy_from_slice(&data);
-                    self.read.stream_nonce = Some(data.to_vec());
+            let nonce_len = self.read.nonce.len();
+            match Self::poll_read_exact(
+                &mut self.inner,
+                cx,
+                &mut self.read.read_len,
+                &mut self.read.read_filled,
+                &mut self.read.nonce,
+                nonce_len,
+            ) {
+                Poll::Ready(Ok(())) => {
+                    self.read.stream_nonce = Some(self.read.nonce.clone());
                     self.read.header_read = true;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -380,17 +406,22 @@ impl AeadStream {
         // polls: once obtained, a mid-ciphertext `Pending` re-enters this fn but
         // must not re-read the header (those bytes are already consumed).
         if !self.read.header_have {
-            match self.read_exact(AEAD_FRAME_HEADER_SIZE, cx) {
-                Poll::Ready(Ok(data)) => {
-                    self.read.header_buf.copy_from_slice(&data);
+            match Self::poll_read_exact(
+                &mut self.inner,
+                cx,
+                &mut self.read.read_len,
+                &mut self.read.read_filled,
+                &mut self.read.header_buf,
+                AEAD_FRAME_HEADER_SIZE,
+            ) {
+                Poll::Ready(Ok(())) => {
                     self.read.header_have = true;
                 }
                 // Clean EOF only when the header read consumed ZERO bytes (we are
                 // exactly at a frame boundary). A partial header followed by EOF is
                 // a truncated stream and must surface as an error, not a clean end.
                 Poll::Ready(Err(ref e))
-                    if e.kind() == io::ErrorKind::UnexpectedEof
-                        && self.read.scratch_filled == 0 =>
+                    if e.kind() == io::ErrorKind::UnexpectedEof && self.read.read_filled == 0 =>
                 {
                     return Poll::Ready(Ok(false)); // clean EOF at frame boundary
                 }
@@ -424,11 +455,20 @@ impl AeadStream {
             )));
         }
 
-        let ciphertext = match self.read_exact(ciphertext_len, cx) {
-            Poll::Ready(Ok(data)) => data,
+        // Read the ciphertext into the fixed frame buffer, then decrypt in
+        // place — no per-frame allocation or copy.
+        match Self::poll_read_exact(
+            &mut self.inner,
+            cx,
+            &mut self.read.read_len,
+            &mut self.read.read_filled,
+            &mut self.read.buf,
+            ciphertext_len,
+        ) {
+            Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
-        };
+        }
 
         let stream_nonce = self
             .read
@@ -439,14 +479,14 @@ impl AeadStream {
         self.read.aad_buf.extend_from_slice(stream_nonce);
         self.read.aad_buf.extend_from_slice(&header);
 
-        let plaintext = match self.read.cipher.decrypt(
+        let plaintext_len = match self.read.cipher.decrypt_in_place(
             &self.read.nonce,
-            ciphertext,
+            &mut self.read.buf[..ciphertext_len],
             &self.read.aad_buf,
         ) {
-            Ok(p) => {
-                tracing::debug!(frame = %self.read.frame_count, plaintext_len = %p.len(), "[AEAD-READ] frame={} decrypt OK, plaintext_len={}", self.read.frame_count, p.len());
-                p
+            Ok(len) => {
+                tracing::debug!(frame = %self.read.frame_count, plaintext_len = %len, "[AEAD-READ] frame={} decrypt OK, plaintext_len={}", self.read.frame_count, len);
+                len
             }
             Err(e) => {
                 #[cfg(debug_assertions)]
@@ -470,36 +510,40 @@ impl AeadStream {
 
         // Frame consumed: allow the next frame to read its own header.
         self.read.header_have = false;
-        self.read.buf = plaintext;
+        self.read.buf_filled = plaintext_len;
         self.read.buf_pos = 0;
         Poll::Ready(Ok(true))
     }
 
-    fn read_exact(&mut self, len: usize, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
-        // Resume an in-progress read of this exact length, or start a fresh one.
-        // On completion the scratch is emptied (len 0), so any new read re-sizes.
-        // Invariant: between reads the scratch is empty (`filled == 0`); a resumed
-        // read has `scratch.len() == len`. If this trips, some exit path failed to
-        // reset state and the resize guard below would treat stale bytes as freshly
-        // read (silent frame corruption).
-        assert!(
-            self.read.scratch_filled == 0 || self.read.scratch.len() == len,
-            "read_exact state leak: filled={} scratch_len={} len={}",
-            self.read.scratch_filled,
-            self.read.scratch.len(),
-            len,
-        );
-        if self.read.scratch.len() != len {
-            self.read.scratch.clear();
-            // Always zero-initialize: passing &mut [u8] of uninitialized
-            // memory to ReadBuf::new() is UB per Rust reference validity
-            // rules, even when guarded by a fill counter.
-            self.read.scratch.resize(len, 0);
-            self.read.scratch_filled = 0;
+    /// Poll-read exactly `len` bytes from the inner stream into `dst`,
+    /// resuming an in-progress read of the same length across `Pending`
+    /// polls. `dst.len()` must be >= `len`; `dst` must be the same slice
+    /// on resume (each call site passes its own fixed buffer).
+    ///
+    /// Fresh reads are distinguished from resumed ones by `read_len`: it is
+    /// reset to 0 when a read completes, so a non-zero `read_len` equal to
+    /// `len` means "resume". A length change mid-read is a state leak.
+    fn poll_read_exact(
+        inner: &mut Box<dyn AsyncReadWriteUnpin>,
+        cx: &mut Context<'_>,
+        read_len: &mut usize,
+        read_filled: &mut usize,
+        dst: &mut [u8],
+        len: usize,
+    ) -> Poll<io::Result<()>> {
+        if *read_len != len {
+            debug_assert!(
+                *read_len == 0,
+                "read_exact state leak: read_len={} len={}",
+                *read_len,
+                len,
+            );
+            *read_len = len;
+            *read_filled = 0;
         }
-        while self.read.scratch_filled < len {
-            let mut rb = ReadBuf::new(&mut self.read.scratch[self.read.scratch_filled..]);
-            let pin = Pin::new(&mut *self.inner);
+        while *read_filled < len {
+            let mut rb = ReadBuf::new(&mut dst[*read_filled..len]);
+            let pin = Pin::new(&mut **inner);
             match pin.poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
@@ -507,24 +551,19 @@ impl AeadStream {
                         // No progress on a Ready poll => inner reached EOF before `len` bytes.
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            format!(
-                                "AEAD stream: unexpected EOF (need {len}, got {})",
-                                self.read.scratch_filled
-                            ),
+                            format!("AEAD stream: unexpected EOF (need {len}, got {read_filled})"),
                         )));
                     }
-                    self.read.scratch_filled += n;
+                    *read_filled += n;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending, // progress saved in read_scratch_filled
+                Poll::Pending => return Poll::Pending, // progress saved in read_filled
             }
         }
-        // split_off(0) returns the data while preserving self.read.scratch's
-        // capacity — next read_exact with same or smaller len reuses the
-        // allocation (resize only zero-fills, no heap alloc).
-        let data = self.read.scratch.split_off(0);
-        self.read.scratch_filled = 0;
-        Poll::Ready(Ok(data))
+        // Completed: the counters are the fresh-read marker for the next read
+        // (which may target a different buffer with a different length).
+        *read_len = 0;
+        Poll::Ready(Ok(()))
     }
 }
 

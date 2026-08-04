@@ -375,6 +375,12 @@ pub struct AppState {
     pub run_mu_map: Arc<std::sync::Mutex<HashMap<String, Arc<RunMuEntry>>>>,
     pub proxy_bind_addr: String,
     pub vhost_manager: Arc<VhostManager>,
+    /// Number of HTTPS proxies with registered SNI routes. The main accept
+    /// loop gates the ClientHello SNI peek on this: when zero, the sniff
+    /// (2x4KiB allocs + 4KiB blocking pre-read + parse + vhost lookup on
+    /// every TLS connection) is skipped entirely. Incremented on https
+    /// registration, decremented on unregister/close.
+    pub https_proxy_count: AtomicUsize,
     pub vhost_http_port: u16,
     pub xtcp: XtcpState,
     pub oidc: OidcState,
@@ -528,6 +534,7 @@ impl AppState {
             run_mu_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             proxy_bind_addr,
             vhost_manager: Arc::new(VhostManager::new()),
+            https_proxy_count: AtomicUsize::new(0),
             vhost_http_port: 0, // set by Service::run() before starting listeners
             dashboard_start: std::time::Instant::now(),
             xtcp: XtcpState {
@@ -654,6 +661,26 @@ impl AppState {
             entry: entry.clone(),
         };
         (entry.mu.clone(), guard)
+    }
+
+    /// Decrement the SNI-sniff gate count (`https_proxy_count`), saturating
+    /// at zero. The dashboard delete path and the client CloseProxy path can
+    /// race — both observe the proxy before either removes it — and a plain
+    /// fetch_sub would underflow to `usize::MAX`, permanently enabling the
+    /// SNI-sniff gate (perf-only, no correctness impact).
+    pub fn dec_https_proxy_count(&self) {
+        let mut cur = self.https_proxy_count.load(AtomicOrdering::Relaxed);
+        while cur > 0 {
+            match self.https_proxy_count.compare_exchange_weak(
+                cur,
+                cur - 1,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 }
 

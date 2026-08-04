@@ -170,7 +170,7 @@ AppState
 - WebSocket connections on main port also dispatch the same message types after upgrade.
 
 **Control handler** (`control/mod.rs`): the most complex file. Runs a `tokio::select!` loop with:
-1. **Biased** `internal_rx.recv()` — prioritized to reduce proxy connection latency
+1. **Fair** `internal_rx.recv()` — deliberately NOT biased: an always-ready internal queue must not starve control reads (heartbeat pings) or shutdown. A regression test in `mod.rs` enforces this (asserts no `biased;` in the loop and bounded control p99 under internal pressure).
 2. `read_msg_v1(&mut reader)` — inbound messages from the client
 
 Internal message variants drive the work connection lifecycle:
@@ -239,7 +239,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 
 - **TCP**: fully implemented (control + work connections, TLS, WebSocket upgrade)
 - **WebSocket**: fully implemented — dial, accept, message dispatch (control + work connections)
-- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Architecture: `KcpSocket` driver (UDP event loop), `KcpSession` per-peer (in-tree Kcp protocol + FEC), `KcpStream` (AsyncRead/AsyncWrite). The KCP state machine is implemented in-tree (`kcp/protocol.rs`, aligned with kcp-go v5.6.13 wire behavior) — the vendored `kcp` crate and its `[patch.crates-io]` entry are gone. `conv_index: HashMap<u32, SocketAddr>` provides O(1) write-path lookup. Write backpressure via `Arc<AtomicUsize>` shared between `KcpSocket` and `KcpStream` (gates `poll_write` at 1024 unprocessed messages). Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. Our KCP handler follows same order. Verified with Go frpc v0.70.1: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test in `frp-core/tests/kcp.rs` (real UDP sockets).
+- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Architecture: `KcpSocket` driver (UDP event loop), `KcpSession` per-peer (in-tree Kcp protocol + FEC), `KcpStream` (AsyncRead/AsyncWrite). The KCP state machine is implemented in-tree (`kcp/protocol.rs`, aligned with kcp-go v5.6.13 wire behavior) — the vendored `kcp` crate and its `[patch.crates-io]` entry are gone. `conv_index: HashMap<u32, SocketAddr>` provides O(1) write-path lookup. Write backpressure via `Arc<AtomicUsize>` shared between `KcpSocket` and `KcpStream` (gates `poll_write` at 200 unprocessed messages, `KCP_WRITE_BACKLOG_THRESHOLD` — pre-full gate for the 256-cap channel). Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. Our KCP handler follows same order. Verified with Go frpc v0.70.1: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test in `frp-core/tests/kcp.rs` (real UDP sockets).
 - **QUIC**: fully implemented — dial, accept, message dispatch (requires TLS cert on server)
 - **TcpMux** (`frp-core/src/mux.rs`, ~604 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn via `server_mux`/`client_mux`. Double-poll pattern flushes pending frames to socket. A zero keepalive interval is normalized to the 30s default instead of causing an immediate timeout or spin.
 - **Dashboard** (`frp-server/src/dashboard.rs`, ~2166 lines): basic status API with axum (version, uptime, client/proxy counts)

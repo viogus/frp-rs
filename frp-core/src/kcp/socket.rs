@@ -183,33 +183,7 @@ impl KcpSocket {
                             self.to_remove.push(*key);
                         }
                     }
-                    // Mark dead before removal so KcpStream::poll_write fails fast.
-                    for key in &self.to_remove {
-                        if let Some(session) = self.sessions.get(key) {
-                            session.mark_dead();
-                        }
-                    }
-                    for key in self.to_remove.drain(..) {
-                        self.sessions.remove(&key);
-                        self.conv_index.remove(&key.0);
-                        // Remove from reverse addr index only if this was the last session for this addr.
-                        if let Some(&conv) = self.peer_addr_index.get(&key.1) {
-                            if conv == key.0 {
-                                let has_other = self.sessions.iter().any(|((_, a), _)| *a == key.1);
-                                if !has_other {
-                                    self.peer_addr_index.remove(&key.1);
-                                }
-                            }
-                        }
-                        self.session_created_at.remove(&key);
-                        let ip = key.1.ip();
-                        if let Some(count) = self.peer_session_counts.get_mut(&ip) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                self.peer_session_counts.remove(&ip);
-                            }
-                        }
-                    }
+                    self.drain_to_remove();
                     // Clean up sessions that were never accepted by the listener.
                     // These are created from garbage packets that happen to pass
                     // the first input() check but are never picked up.
@@ -257,14 +231,24 @@ impl KcpSocket {
                         WriteRequest::Data(data) => {
                             let len = data.len();
                             // O(1) lookup via conv_index instead of O(n) iter().find().
-                            let _result = self.conv_index.get(&conv)
-                                .and_then(|addr| self.sessions.get_mut(&(conv, *addr)))
+                            let addr = self.conv_index.get(&conv).copied();
+                            let _result = addr
+                                .and_then(|a| self.sessions.get_mut(&(conv, a)))
                                 .map(|s| s.send(&data))
                                 .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
                             if let Err(ref e) = _result {
                                 tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed — session not found");
                             } else {
                                 tracing::trace!(conv, len, "KCP SOCKET: write queued {} bytes", len);
+                                // Flush-on-write: Go kcp-go flushes on every
+                                // Write, but the driver otherwise only drains
+                                // output on the 10ms tick / explicit Flush —
+                                // V1 control messages (Login/NewProxy/
+                                // StartWorkConn) would sit in the send queue
+                                // up to ~10-30ms per control round trip.
+                                if let Some(peer_addr) = addr {
+                                    self.flush_session_output(conv, peer_addr).await;
+                                }
                             }
                             // Decrement backlog and wake ONE blocked writer.
                             // notify_one() stores a permit if no waiters exist,
@@ -287,29 +271,12 @@ impl KcpSocket {
                             // wakeup, not the backlog gate).
                             tracing::trace!(conv, "KCP SOCKET: flush");
                             let addr = self.conv_index.get(&conv).copied();
-                            let packets = if let Some(session) = addr
-                                .and_then(|a| self.sessions.get_mut(&(conv, a)))
-                            {
-                                let now_ms = self.start.elapsed().as_millis() as u32;
-                                match session.force_flush(now_ms) {
-                                    Ok(pkts) => pkts,
-                                    Err(e) => {
-                                        tracing::debug!(conv, error = %e, "KCP SOCKET: force_flush error");
-                                        Vec::new()
-                                    }
-                                }
+                            let npkts = if let Some(peer_addr) = addr {
+                                self.flush_session_output(conv, peer_addr).await
                             } else {
-                                Vec::new()
+                                0
                             };
-                            // Send all output packets immediately.
-                            if let Some(peer_addr) = addr {
-                                for pkt in &packets {
-                                    if let Err(e) = self.socket.send_to(pkt, peer_addr).await {
-                                        tracing::debug!(conv, peer = %peer_addr, error = %e, "KCP SOCKET: flush send error");
-                                    }
-                                }
-                            }
-                            tracing::trace!(conv, npkts = packets.len(), "KCP SOCKET: flush sent {} packets", packets.len());
+                            tracing::trace!(conv, npkts, "KCP SOCKET: flush sent {} packets", npkts);
                             let _ = tx.send(());
                         }
                     }
@@ -327,6 +294,15 @@ impl KcpSocket {
                             if let Some(session) = self.sessions.get_mut(&key) {
                                 if let Err(e) = session.input(&data) {
                                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");
+                                } else {
+                                    // Deliver received data to the stream
+                                    // immediately instead of waiting for the
+                                    // next 10ms tick (Go kcp-go reads on
+                                    // arrival).
+                                    if let Err(e) = session.recv_and_push() {
+                                        tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP recv push error");
+                                        self.to_remove.push(key);
+                                    }
                                 }
                             } else {
                                 // FEC fallback: parity shards and data shards whose conv
@@ -346,6 +322,11 @@ impl KcpSocket {
                                     if let Some(session) = self.sessions.get_mut(&fk) {
                                         if let Err(e) = session.input(&data) {
                                             tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback input error");
+                                        } else if let Err(e) = session.recv_and_push() {
+                                            // Same immediate-delivery path as
+                                            // the direct-session lookup above.
+                                            tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback recv push error");
+                                            self.to_remove.push(fk);
                                         }
                                     }
                                 } else if key.0 != 0 {
@@ -433,6 +414,12 @@ impl KcpSocket {
                             tracing::warn!(error = %e, "KCP UDP recv error");
                         }
                     }
+                    // Drain sessions whose read channel closed during this
+                    // recv. The tick arm clears `to_remove` before its own
+                    // scan, so entries pushed here would otherwise never be
+                    // removed — session objects, index entries, and per-IP
+                    // counts would leak.
+                    self.drain_to_remove();
                 }
 
                 Some((conv, addr)) = self.accept_notify_rx.recv() => {
@@ -452,6 +439,69 @@ impl KcpSocket {
                 }
             }
         }
+    }
+
+    /// Remove the sessions queued on `to_remove` (marking them dead first
+    /// so KcpStream::poll_write fails fast) and drop their index entries.
+    /// Called from the tick arm after its scan and from the recv arm after
+    /// each receive — the tick arm clears `to_remove` before scanning, so
+    /// sessions pushed by the recv arm (read channel closed mid-recv) would
+    /// otherwise be wiped without ever being removed.
+    fn drain_to_remove(&mut self) {
+        // Mark dead before removal so KcpStream::poll_write fails fast.
+        for key in &self.to_remove {
+            if let Some(session) = self.sessions.get(key) {
+                session.mark_dead();
+            }
+        }
+        for key in self.to_remove.drain(..) {
+            self.sessions.remove(&key);
+            self.conv_index.remove(&key.0);
+            // Remove from reverse addr index only if this was the last session for this addr.
+            if let Some(&conv) = self.peer_addr_index.get(&key.1) {
+                if conv == key.0 {
+                    let has_other = self.sessions.iter().any(|((_, a), _)| *a == key.1);
+                    if !has_other {
+                        self.peer_addr_index.remove(&key.1);
+                    }
+                }
+            }
+            self.session_created_at.remove(&key);
+            let ip = key.1.ip();
+            if let Some(count) = self.peer_session_counts.get_mut(&ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.peer_session_counts.remove(&ip);
+                }
+            }
+        }
+    }
+
+    /// Flush a session's pending KCP output to the wire immediately.
+    /// Shared by the Data handler (flush-on-write, matching kcp-go's
+    /// flush-on-every-Write behavior) and the Flush handler (StartWorkConn
+    /// ordering guarantee). No-op when the session is gone. Returns the
+    /// number of output packets force_flush produced.
+    async fn flush_session_output(&mut self, conv: u32, peer_addr: SocketAddr) -> usize {
+        let packets = if let Some(session) = self.sessions.get_mut(&(conv, peer_addr)) {
+            let now_ms = self.start.elapsed().as_millis() as u32;
+            match session.force_flush(now_ms) {
+                Ok(pkts) => pkts,
+                Err(e) => {
+                    tracing::debug!(conv, error = %e, "KCP SOCKET: force_flush error");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        // Send all output packets immediately.
+        for pkt in &packets {
+            if let Err(e) = self.socket.send_to(pkt, peer_addr).await {
+                tracing::debug!(conv, peer = %peer_addr, error = %e, "KCP SOCKET: flush send error");
+            }
+        }
+        packets.len()
     }
 
     /// Extract (conv, peer_addr) key from a raw UDP packet.

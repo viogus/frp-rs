@@ -146,8 +146,73 @@ async fn splice_direction(
             }
         };
 
-        // EAGAIN sentinel — re-await readable.
+        // EAGAIN sentinel — src ran dry or the pipe is full (dst slow).
         if n_read == 0 {
+            // A full pipe is the only way a readable src can still EAGAIN,
+            // and nothing else drains it (Phase B only runs after a
+            // successful Phase A), so move whatever it holds to dst before
+            // waiting — otherwise the wait below could never be satisfied.
+            // Parking on dst.writable() mirrors Phase B's backpressure
+            // handling.
+            let mut pending: libc::c_int = 0;
+            // SAFETY: pipe_rd_fd is a live fd; FIONREAD writes the number
+            // of queued bytes into `pending`. The pointer is not retained.
+            let drained = unsafe { libc::ioctl(pipe_rd_fd, libc::FIONREAD, &mut pending) };
+            if drained == 0 && pending > 0 {
+                loop {
+                    let mut guard = dst.writable().await?;
+                    let ret = unsafe {
+                        libc::splice(
+                            pipe_rd_fd,
+                            std::ptr::null_mut(),
+                            dst_fd,
+                            std::ptr::null_mut(),
+                            PIPE_CAPACITY,
+                            flags,
+                        )
+                    };
+                    if ret > 0 {
+                        counter.fetch_add(ret as u64, Ordering::Relaxed);
+                        // Keep the WRITABLE bit for the next chunk.
+                        guard.retain_ready(); // no-op, satisfies #[must_use]
+                        continue;
+                    }
+                    if ret == 0 {
+                        break; // pipe fully drained
+                    }
+                    let err = io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::EAGAIN) => {
+                            // dst send buffer full — clear WRITABLE and
+                            // park until the peer reads.
+                            guard.clear_ready();
+                        }
+                        Some(libc::EINTR) => continue,
+                        _ => return Err(err),
+                    }
+                }
+            }
+            // The pipe now has room. Park until it is writable again or src
+            // receives fresh data, then retry Phase A. Do NOT re-await
+            // src.readable() directly here: AsyncFd readiness is
+            // level-triggered, so while src still has buffered data the
+            // reactor re-arms the READABLE bit immediately and the retry
+            // spins on epoll + splice without making progress. Clearing the
+            // pipe's WRITABLE bit after the wake forces a fresh epoll
+            // report instead of an immediate re-poll on the stale bit.
+            tokio::select! {
+                guard = pipe_wr.writable() => {
+                    // The pipe has room again. Clear its WRITABLE bit so the
+                    // next writable() await re-registers with epoll instead
+                    // of returning immediately on the stale bit. writable()
+                    // only errors if the pipe fd is closed — nothing to
+                    // clear then.
+                    if let Ok(mut guard) = guard {
+                        guard.clear_ready();
+                    }
+                }
+                _ = src.readable() => {}
+            }
             continue;
         }
 
@@ -359,6 +424,54 @@ mod tests {
             Err(_timeout) => {
                 panic!("bridge_splice timed out after 5s — likely hung");
             }
+        }
+    }
+
+    /// Backpressure: a slow reader must not deadlock or busy-spin the relay.
+    /// The pipe fills (dst send buffer full), Phase B parks on dst writable,
+    /// and the transfer completes once the peer starts reading.
+    #[tokio::test]
+    async fn test_bridge_splice_backpressure_slow_reader() {
+        let ((bridge_user, mut test_user), (bridge_work, mut test_work)) =
+            socket_pairs().await.expect("socket pairs");
+
+        let handle = tokio::spawn(async move { bridge_splice(bridge_user, bridge_work).await });
+
+        // 4 MiB burst against a deliberately slow peer: the kernel send
+        // buffer and the relay pipe stay full for the tail of the transfer.
+        let payload = vec![0xabu8; 4 * 1024 * 1024];
+        let payload_len = payload.len();
+        let write = tokio::spawn(async move {
+            test_user.write_all(&payload).await.expect("write burst");
+            test_user.shutdown().await.expect("shutdown user write");
+        });
+
+        let mut received = 0usize;
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                test_work.read(&mut chunk),
+            )
+            .await
+            .expect("slow reader stalled — backpressure must make progress")
+            .expect("read");
+            if n == 0 {
+                break; // EOF after full drain
+            }
+            received += n;
+            // Slow the reader down so backpressure actually builds.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        write.await.expect("writer");
+        assert_eq!(received, payload_len);
+
+        drop(test_work);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            Ok(Ok(Ok((u2w, _w2u)))) => assert_eq!(u2w, payload_len as u64),
+            Ok(Ok(Err(e))) => panic!("bridge_splice error: {}", e),
+            Ok(Err(join_err)) => panic!("join error: {}", join_err),
+            Err(_timeout) => panic!("bridge_splice timed out under backpressure"),
         }
     }
 

@@ -12,6 +12,10 @@ impl HttpPluginManager {
     pub fn new(_configs: Vec<frp_core::config::HttpPluginConfig>) -> Self {
         Self
     }
+    /// Stub: no plugins are ever configured in this build.
+    pub fn is_empty(&self) -> bool {
+        true
+    }
     pub async fn notify(&self, _op: &str, _content: serde_json::Value) -> Result<(), String> {
         Ok(())
     }

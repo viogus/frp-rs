@@ -24,6 +24,26 @@ pub fn wire_proxy_name(user: &str, name: &str) -> String {
     }
 }
 
+/// Wire-level visitor target name matching Go frp's BuildTargetServerProxyName:
+///
+/// - If server_user is non-empty: {server_user}.{server_name}
+/// - Else if client user is non-empty: {user}.{server_name}
+/// - Otherwise: {server_name}
+///
+/// The server echoes this name back in NewVisitorConnResp, so registration
+/// response matching (pipelined registration) keys on it.
+pub fn visitor_wire_name(
+    server_user: Option<&str>,
+    user: Option<&str>,
+    server_name: &str,
+) -> String {
+    match (server_user, user) {
+        (Some(su), _) if !su.is_empty() => format!("{su}.{server_name}"),
+        (_, Some(u)) if !u.is_empty() => format!("{u}.{server_name}"),
+        _ => server_name.to_string(),
+    }
+}
+
 /// Build a NewVisitorConn message for an STCP/XTCP visitor connection.
 /// sign_key = MD5(sk + timestamp) matching Go frp v0.69.1 behaviour.
 pub fn create_visitor_conn_msg(
@@ -53,11 +73,7 @@ pub fn create_visitor_conn_msg(
     // - If server_user is non-empty: {server_user}.{server_name}
     // - Else if client user is non-empty: {user}.{server_name}
     // - Otherwise: {server_name}
-    let proxy_name = match (server_user, user) {
-        (Some(su), _) if !su.is_empty() => format!("{su}.{server_name}"),
-        (_, Some(u)) if !u.is_empty() => format!("{u}.{server_name}"),
-        _ => server_name.to_string(),
-    };
+    let proxy_name = visitor_wire_name(server_user, user, server_name);
     FrpMessage::NewVisitorConn(msg::NewVisitorConn {
         proxy_name,
         sign_key,
@@ -371,19 +387,88 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
         .await;
         debug!(name = %name, "Proxy {} rate-limited bridge closed", name);
     } else {
-        let mut local = local;
-        let mut work = work;
-        match tokio::io::copy_bidirectional(&mut local, &mut work).await {
+        // Fast path: raw Tcp-to-Tcp on Linux takes the zero-copy splice(2)
+        // relay (mirror of the server's relay_plain_fast); everything else
+        // falls back to the buffered bidirectional copy.
+        relay_plain_fast(local, work, name, &proxy_metrics).await;
+    }
+}
+
+/// Relay plain traffic between the local service and the work connection.
+/// On Linux, tries the zero-copy splice(2) relay when the work connection
+/// is a raw TCP stream; otherwise uses copy_bidirectional.
+async fn relay_plain_fast(
+    local: tokio::net::TcpStream,
+    work: IoStream,
+    name: &str,
+    metrics: &Arc<frp_core::metrics::ProxyMetrics>,
+) {
+    relay_plain_fast_inner(local, work, name, metrics).await
+}
+
+/// Linux: try splice(2) zero-copy relay when both sides are raw TCP.
+#[cfg(target_os = "linux")]
+async fn relay_plain_fast_inner(
+    local: tokio::net::TcpStream,
+    work: IoStream,
+    name: &str,
+    metrics: &Arc<frp_core::metrics::ProxyMetrics>,
+) {
+    // Two-arm match so the Tcp arm consumes the streams while the other
+    // arm binds fresh mutable variables for the copy fallthrough.
+    match work {
+        IoStream::Tcp(work) => match frp_core::splice::bridge_splice(local, work).await {
             Ok((to_work, to_local)) => {
-                proxy_metrics.bytes_in.fetch_add(to_work, Ordering::Relaxed);
-                proxy_metrics
-                    .bytes_out
-                    .fetch_add(to_local, Ordering::Relaxed);
+                metrics.bytes_in.fetch_add(to_work, Ordering::Relaxed);
+                metrics.bytes_out.fetch_add(to_local, Ordering::Relaxed);
                 debug!(name = %name, to_work = %to_work, to_local = %to_local, "Proxy {} closed: {}B to server, {}B to local", name, to_work, to_local);
             }
             Err(e) => {
-                debug!(name = %name, error = %e, "Proxy {} bridge error: {}", name, e);
+                debug!(name = %name, error = %e, "Proxy {} splice bridge closed: {}", name, e);
             }
+        },
+        mut work => {
+            let mut local = local;
+            copy_bidirectional_sized(&mut local, &mut work, name, metrics).await;
+        }
+    }
+}
+
+/// Non-Linux: just use copy_bidirectional.
+#[cfg(not(target_os = "linux"))]
+async fn relay_plain_fast_inner(
+    mut local: tokio::net::TcpStream,
+    mut work: IoStream,
+    name: &str,
+    metrics: &Arc<frp_core::metrics::ProxyMetrics>,
+) {
+    copy_bidirectional_sized(&mut local, &mut work, name, metrics).await;
+}
+
+/// Bidirectional copy with FRP_BRIDGE_BUF_KB-sized buffers so the plain
+/// path honors the same knob as the encrypted/compressed bridge path
+/// (copy_bidirectional would otherwise use tokio's 8 KiB default).
+async fn copy_bidirectional_sized(
+    local: &mut tokio::net::TcpStream,
+    work: &mut IoStream,
+    name: &str,
+    metrics: &Arc<frp_core::metrics::ProxyMetrics>,
+) {
+    match tokio::io::copy_bidirectional_with_sizes(
+        local,
+        work,
+        *frp_core::buffer_pool::BUFFER_SIZE,
+        *frp_core::buffer_pool::BUFFER_SIZE,
+    )
+    .await
+    {
+        Ok((to_work, to_local)) => {
+            metrics.bytes_in.fetch_add(to_work, Ordering::Relaxed);
+            metrics.bytes_out.fetch_add(to_local, Ordering::Relaxed);
+            debug!(name = %name, to_work = %to_work, to_local = %to_local, "Proxy {} closed: {}B to server, {}B to local", name, to_work, to_local);
+        }
+        Err(e) => {
+            debug!(name = %name, error = %e, "Proxy {} bridge error: {}", name, e);
         }
     }
 }

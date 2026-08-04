@@ -730,6 +730,10 @@ async fn handle_store_proxy_delete(
     }
     // Clean up VHost and TCPMux routes
     state.vhost_manager.unregister(&name).await;
+    // Decrement the SNI-sniff gate count for https proxies.
+    if proxy.proxy_type == "https" {
+        state.dec_https_proxy_count();
+    }
     state.tcpmux_manager.unregister(&name).await;
     state.proxy_metrics.remove(&name).await;
     state.proxy_manager.remove(&name).await;
@@ -776,6 +780,10 @@ async fn handle_proxies_delete(
                 state.xtcp.sk_index.write().await.remove(key);
             }
             state.vhost_manager.unregister(name).await;
+            // Decrement the SNI-sniff gate count for https proxies.
+            if proxy.proxy_type == "https" {
+                state.dec_https_proxy_count();
+            }
             state.tcpmux_manager.unregister(name).await;
             state.proxy_metrics.remove(name).await;
             state.proxy_manager.remove(name).await;

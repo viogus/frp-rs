@@ -376,7 +376,14 @@ async fn run_udp_work_conn(
     udp_packet_size: usize,
     proxy_protocol_version: String,
 ) {
-    let (mut w_r, mut w_w) = work.into_split().unwrap();
+    let (w_r, mut w_w) = work.into_split().unwrap();
+    // Buffer the frame reads: read_msg_v1/v2 issue two read_exact calls per
+    // packet (header + payload), so BufReader amortizes them into one
+    // syscall per packet — and one syscall for several small packets. The
+    // write half is untouched (separate object), so no flush semantics
+    // change. UDP work conns are never Cipher-wrapped (the bridge cipher is
+    // applied per-packet to the payload), so exact-read framing is safe.
+    let mut w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let last_remote: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>> =
         Arc::new(std::sync::Mutex::new(None));

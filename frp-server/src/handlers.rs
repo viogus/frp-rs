@@ -992,6 +992,12 @@ pub(crate) async fn validate_new_work_conn_auth(
 /// rejects the connection.
 #[instrument(skip(state), fields(run_id = %run_id))]
 pub(crate) async fn run_new_work_conn_plugin(run_id: &str, state: &AppState) -> Result<(), String> {
+    // Skip payload construction entirely when no plugins are configured
+    // (the default) — every work conn / yamux stream used to build a
+    // full json! Value just for the notify loop.
+    if state.plugin_manager.is_empty() {
+        return Ok(());
+    }
     let nwc_content = serde_json::json!({
         "run_id": run_id,
     });

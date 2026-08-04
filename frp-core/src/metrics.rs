@@ -143,6 +143,14 @@ impl ProxyMetricsRegistry {
     }
 
     pub async fn get_or_create(&self, name: &str) -> Arc<ProxyMetrics> {
+        // Read-first: bridge setup calls this on every connection and the
+        // entry almost always exists — avoid taking the write lock (which
+        // excludes all other readers) on the hot path. The create path
+        // re-checks under the write lock, so a concurrent insert between
+        // the two looks up the existing entry (same semantics as entry()).
+        if let Some(metrics) = self.metrics.read().await.get(name) {
+            return metrics.clone();
+        }
         let mut map = self.metrics.write().await;
         map.entry(name.to_string())
             .or_insert_with(|| Arc::new(ProxyMetrics::new(name.to_string())))

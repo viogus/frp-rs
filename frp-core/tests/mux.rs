@@ -170,9 +170,11 @@ async fn client_can_open_stream_after_idle_keepalive_tick() {
     let (_server_control, _incoming, _client_control, session) =
         connected_mux_pair(client_config, server_config).await;
 
-    // Mutation check: reintroducing a six-Pending-poll idle counter kills this
-    // healthy client. Advance beyond that exact boundary without wall time.
-    advance_keepalive_ticks(interval, 7).await;
+    // Idle ticks must not kill a healthy client below the liveness bound
+    // (MAX_IDLE_KEEPALIVE_TICKS = 3): a buggy per-Pending-poll counter would
+    // close it within the first tick. Paused time suppresses yamux's
+    // real-time PING/PONG, so no transport activity resets the counter here.
+    advance_keepalive_ticks(interval, 2).await;
 
     let stream = tokio::time::timeout(Duration::from_secs(1), session.open_stream())
         .await
@@ -192,9 +194,11 @@ async fn server_keeps_healthy_connection_open_without_new_inbound_streams() {
     let (_server_control, mut incoming, _client_control, session) =
         connected_mux_pair(client_config, server_config).await;
 
-    // The removed implementation killed the server after six idle ticks,
-    // despite the peer being healthy. Advance beyond that exact boundary.
-    advance_keepalive_ticks(interval, 7).await;
+    // Idle ticks below the liveness bound (MAX_IDLE_KEEPALIVE_TICKS = 3)
+    // must not kill the server while the peer is healthy. Paused time
+    // suppresses yamux's real-time PING/PONG, so no transport activity
+    // resets the counter here.
+    advance_keepalive_ticks(interval, 2).await;
 
     let mut client_stream = tokio::time::timeout(Duration::from_secs(1), session.open_stream())
         .await
@@ -219,6 +223,66 @@ async fn server_keeps_healthy_connection_open_without_new_inbound_streams() {
         .await
         .expect("server should read from the accepted stream");
     assert_eq!(byte, *b"x");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_opened_while_driver_busy_reaches_peer_promptly() {
+    // The client driver task and this test run on different workers, so a
+    // Notify wakeup fired while the driver is mid-iteration (processing
+    // inbound I/O) would be lost, leaving the new stream's SYN/window
+    // frames unflushed until the next keepalive tick (60s here, far beyond
+    // the test window). The watch-based wakeup is stateful and must never
+    // lose the signal: the stream must reach the server promptly, with no
+    // keepalive-tick dependence.
+    let interval = Duration::from_secs(60);
+    let (_server_control, mut incoming, client_control, session) =
+        connected_mux_pair(mux_config(interval), mux_config(interval)).await;
+
+    // Keep the client driver busy: the server floods the control stream
+    // while this task drains it client-side, so the driver spends the test
+    // window routing inbound I/O rather than parked in select.
+    let server_flood = tokio::spawn(async move {
+        let mut server_control = _server_control;
+        let payload = vec![0xabu8; 64 * 1024];
+        for _ in 0..16 {
+            server_control
+                .write_all(&payload)
+                .await
+                .expect("flood write");
+        }
+    });
+    let drain = tokio::spawn(async move {
+        let mut sink = [0u8; 4096];
+        let mut control = client_control;
+        loop {
+            if control.read(&mut sink).await.expect("drain read") == 0 {
+                break;
+            }
+        }
+    });
+
+    for i in 0..8u8 {
+        let mut stream = session
+            .open_stream()
+            .await
+            .expect("open_stream must succeed while the driver is busy");
+        stream.write_all(&[i]).await.expect("write on new stream");
+        stream.flush().await.expect("flush new stream");
+
+        let mut server_stream = tokio::time::timeout(Duration::from_secs(5), incoming.recv())
+            .await
+            .expect("accepted stream must arrive promptly (no keepalive-tick dependence)")
+            .expect("server session must remain open");
+        let mut byte = [0u8; 1];
+        server_stream
+            .read_exact(&mut byte)
+            .await
+            .expect("server should read from the accepted stream");
+        assert_eq!(byte[0], i);
+    }
+
+    drain.abort();
+    server_flood.abort();
 }
 
 #[tokio::test]
@@ -290,9 +354,11 @@ async fn dead_peer_session_closes_after_bounded_idle_keepalive_ticks() {
 
     // Paused time suppresses yamux's real-time PING/PONG, so neither driver
     // observes transport I/O. The bounded liveness counter must close both
-    // sides after MAX_IDLE_KEEPALIVE_TICKS (12) rather than retaining the
-    // session indefinitely.
-    advance_keepalive_ticks(interval, 13).await;
+    // sides after MAX_IDLE_KEEPALIVE_TICKS (3) rather than retaining the
+    // session indefinitely. Advance 6 ticks for margin: the first server
+    // tick can consume a straggling setup-phase pong (activity reset), and
+    // the final advance's timer may not fire before the checks below.
+    advance_keepalive_ticks(interval, 6).await;
 
     let server_next = tokio::time::timeout(Duration::from_secs(1), incoming.recv())
         .await

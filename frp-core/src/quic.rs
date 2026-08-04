@@ -306,12 +306,15 @@ impl QuicListener {
 
 /// Dial a QUIC connection to a remote peer with default transport parameters.
 ///
+/// `dial_timeout_secs` bounds the handshake like TCP dials bound by
+/// `dial_server_timeout`; `None` keeps quinn's own timers (e.g. XTCP P2P).
 /// Returns the first bidirectional stream plus a `QuicConnection` handle
 /// for opening additional streams (e.g., work connections).
 pub async fn dial_quic(
     addr: &str,
     server_name: &str,
     ca_file: Option<&str>,
+    dial_timeout_secs: Option<u64>,
 ) -> io::Result<(QuicStream, QuicConnection)> {
     dial_quic_with_params(
         addr,
@@ -320,6 +323,7 @@ pub async fn dial_quic(
         None,
         None,
         QuicTransportParams::default(),
+        dial_timeout_secs,
     )
     .await
 }
@@ -333,10 +337,18 @@ pub async fn dial_quic_with_params(
     cert_file: Option<&str>,
     key_file: Option<&str>,
     params: QuicTransportParams,
+    dial_timeout_secs: Option<u64>,
 ) -> io::Result<(QuicStream, QuicConnection)> {
-    let connection =
-        dial_quic_connection_with_params(addr, server_name, ca_file, cert_file, key_file, params)
-            .await?;
+    let connection = dial_quic_connection_with_params(
+        addr,
+        server_name,
+        ca_file,
+        cert_file,
+        key_file,
+        params,
+        dial_timeout_secs,
+    )
+    .await?;
     let stream = connection.open_bi().await?;
     Ok((stream, connection))
 }
@@ -350,6 +362,7 @@ pub async fn dial_quic_connection_with_params(
     cert_file: Option<&str>,
     key_file: Option<&str>,
     params: QuicTransportParams,
+    dial_timeout_secs: Option<u64>,
 ) -> io::Result<QuicConnection> {
     // Go frp compat: server_addr may be a hostname, not just an IP
     // (Go transport/quic.go resolves via net.ResolveUDPAddr).
@@ -429,11 +442,26 @@ pub async fn dial_quic_connection_with_params(
     .map_err(|e| io::Error::other(format!("quinn endpoint: {e}")))?;
     endpoint.set_default_client_config(client_config);
 
-    let conn = endpoint
+    let connecting = endpoint
         .connect(remote, server_name)
-        .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?
-        .await
-        .map_err(|e| io::Error::other(format!("quinn connecting: {e}")))?;
+        .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?;
+
+    // Bound the handshake like TCP dials (dial_server_timeout): on a
+    // blackholed server quinn's idle timeout (~30s) would otherwise hang the
+    // dial well past the 10s TCP bound. quinn's own handshake timers are
+    // untouched; only the pathological case is bounded.
+    let conn = match dial_timeout_secs {
+        Some(secs) => tokio::time::timeout(std::time::Duration::from_secs(secs), connecting)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("QUIC dial timeout to {addr}"),
+                )
+            })?,
+        None => connecting.await,
+    };
+    let conn = conn.map_err(|e| io::Error::other(format!("quinn connecting: {e}")))?;
 
     Ok(QuicConnection { conn })
 }

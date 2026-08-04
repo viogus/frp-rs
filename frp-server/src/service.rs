@@ -176,6 +176,7 @@ mod quic_admission_tests {
                 None,
                 None,
                 frp_core::quic::QuicTransportParams::default(),
+                None,
             )
             .await
             .unwrap()
@@ -605,6 +606,11 @@ impl Service {
         let _tls_acceptor: Option<()> = None;
 
         let max_accept_rate = self.cfg.max_accept_rate.unwrap_or(0);
+        // Hoisted accept-rate-limiter gate: when max_accept_rate == 0 the
+        // limiter is a no-op (rate 0.0 → try_acquire always Ok), so skip
+        // taking the mutex on every accept. The limiter never changes after
+        // startup, so this is computed once per listener task.
+        let rate_limiter_enabled = max_accept_rate > 0;
         let listener = TcpListener::bind(&bind_addr).await?;
         info!(bind_addr = %bind_addr, "frps listener started on {}", bind_addr);
 
@@ -642,9 +648,11 @@ impl Service {
                                     warn!(addr = %addr, "Max connections reached, rejecting WebSocket from {}", addr);
                                     continue;
                                 }
-                                let rate_wait = {
+                                let rate_wait = if rate_limiter_enabled {
                                     let mut rl = state.accept_rate_limiter.lock().unwrap();
                                     rl.try_acquire().err()
+                                } else {
+                                    None
                                 };
                                 if let Some(wait) = rate_wait {
                                     warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying WebSocket {}ms", wait.as_millis());
@@ -991,9 +999,11 @@ impl Service {
                                             warn!(addr = %addr, "Max connections reached, rejecting KCP from {}", addr);
                                             continue;
                                         }
-                                        let rate_wait = {
+                                        let rate_wait = if rate_limiter_enabled {
                                             let mut rl = state.accept_rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
                                             rl.try_acquire().err()
+                                        } else {
+                                            None
                                         };
                                         if let Some(wait) = rate_wait {
                                             warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying KCP {}ms", wait.as_millis());
@@ -1530,9 +1540,11 @@ impl Service {
                                             warn!(addr = %quic_addr, "Max connections reached, rejecting QUIC from {}", quic_addr);
                                             continue;
                                         }
-                                        let rate_wait = {
+                                        let rate_wait = if rate_limiter_enabled {
                                             let mut rl = state.accept_rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
                                             rl.try_acquire().err()
+                                        } else {
+                                            None
                                         };
                                         if let Some(wait) = rate_wait {
                                             warn!(addr = %quic_addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying QUIC {}ms", wait.as_millis());
@@ -2031,8 +2043,6 @@ impl Service {
                         );
                     }
                     let state = self.state.clone();
-                    #[cfg(feature = "tls")]
-                    let acceptor = state.tls_acceptor.read_ok().clone();
 
                     let permit = state.conn_semaphore.as_ref()
                         .and_then(|s| s.clone().try_acquire_owned().ok());
@@ -2041,10 +2051,14 @@ impl Service {
                         continue;
                     }
                     // Rate limit: extract into non-async scope so MutexGuard
-                    // doesn't live across any .await boundary.
-                    let rate_wait = {
+                    // doesn't live across any .await boundary. When disabled
+                    // (max_accept_rate == 0) skip the lock entirely — the
+                    // limiter is a no-op.
+                    let rate_wait = if rate_limiter_enabled {
                         let mut rl = state.accept_rate_limiter.lock().unwrap();
                         rl.try_acquire().err()
+                    } else {
+                        None
                     };
                     if let Some(wait) = rate_wait {
                         warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached ({} conn/s), delaying {}ms", max_accept_rate, wait.as_millis());
@@ -2085,6 +2099,12 @@ impl Service {
                         match ct {
                             #[cfg(feature = "tls")]
                         ConnectionType::Tls(first_byte) => {
+                                // Read the TLS acceptor lazily: only TLS
+                                // connections need it. Taking the RwLock read
+                                // + clone on every accepted connection
+                                // (including plain V1/WS traffic) was pure
+                                // overhead on the hot accept path.
+                                let acceptor = state.tls_acceptor.read_ok().clone();
                                 // Extract inner TcpStream and pre-read bytes.
                                 // detect_and_strip_magic consumed 7 bytes; replay them
                                 // (minus the Go frp 0x17 prefix) for TLS.
@@ -2103,61 +2123,83 @@ impl Service {
                                 }
 
                                 // --- SNI peek for HTTPS proxy routing ---
-                                // Read ClientHello bytes (up to 4KB) from inner stream.
-                                // The inner stream is positioned at byte 7 of the original
-                                // connection. Combine with pre_read_bytes for full ClientHello.
-                                // 10s timeout matches Go frp's connReadTimeout, which
-                                // CheckAndEnableTLSServerConnWithTimeout applies during
-                                // TLS detection (server/service.go constant, 10s).
-                                let mut sni_buf = vec![0u8; 4096];
-                                let sni_peek_n = match tokio::time::timeout_at(
-                                    accept_deadline,
-                                    inner_stream.read(&mut sni_buf),
-                                ).await {
-                                    Ok(Ok(n)) if n >= 43 => n,
-                                    Ok(Ok(_)) => 0,
-                                    _ => {
-                                        warn!(addr = %addr, "TLS read timeout from {} during SNI check", addr);
-                                        return;
+                                // Only pay the cost (2x4KiB heap allocs + a
+                                // 4KiB blocking pre-read + ClientHello parse +
+                                // vhost lookup) when at least one HTTPS proxy
+                                // is registered; otherwise the sniff could
+                                // never match a route, so skip straight to the
+                                // normal TLS accept. The count is maintained
+                                // by https registration/unregistration.
+                                let mut sni_data = if state
+                                    .https_proxy_count
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    > 0
+                                {
+                                    // Read ClientHello bytes (up to 4KB) from inner stream.
+                                    // The inner stream is positioned at byte 7 of the original
+                                    // connection. Combine with pre_read_bytes for full ClientHello.
+                                    // 10s timeout matches Go frp's connReadTimeout, which
+                                    // CheckAndEnableTLSServerConnWithTimeout applies during
+                                    // TLS detection (server/service.go constant, 10s).
+                                    let mut sni_buf = [0u8; 4096];
+                                    let sni_peek_n = match tokio::time::timeout_at(
+                                        accept_deadline,
+                                        inner_stream.read(&mut sni_buf),
+                                    ).await {
+                                        Ok(Ok(n)) if n >= 43 => n,
+                                        Ok(Ok(_)) => 0,
+                                        _ => {
+                                            warn!(addr = %addr, "TLS read timeout from {} during SNI check", addr);
+                                            return;
+                                        }
+                                    };
+
+                                    // Build full ClientHello data (pre-read magic bytes + SNI peek)
+                                    // in a single allocation instead of clone-then-extend.
+                                    let mut sni_data =
+                                        Vec::with_capacity(pre_read_bytes.len() + sni_peek_n);
+                                    sni_data.extend_from_slice(&pre_read_bytes);
+                                    if sni_peek_n > 0 {
+                                        sni_data.extend_from_slice(&sni_buf[..sni_peek_n]);
                                     }
-                                };
 
-                                // Build full ClientHello data (pre-read magic bytes + SNI peek)
-                                let mut sni_data = pre_read_bytes.clone();
-                                if sni_peek_n > 0 {
-                                    sni_data.extend_from_slice(&sni_buf[..sni_peek_n]);
-                                }
-
-                                // Try SNI-based routing for HTTPS proxies
-                                if !sni_data.is_empty() {
-                                    if let Some(sni_host) = crate::vhost::extract_sni_from_client_hello(&sni_data) {
-                                        debug!(addr = %addr, sni_host = %sni_host, "SNI from {}: {}", addr, sni_host);
-                                        // SNI routing: no HTTP auth, so http_user is empty string.
-                                        // SNI routing: no HTTP path, so pass empty string.
-                                        // Routes with empty locations (HTTPS SNI) match any path.
-                                        if let Some(route) = state.vhost_manager.lookup_wildcard(&sni_host, "", "").await {
-                                            let ctl_tx = {
-                                                let map = state.run_id_to_ctl_tx.read().await;
-                                                map.get(route.run_id.as_ref()).cloned()
-                                            };
-                                            if let Some(ctl) = ctl_tx {
-                                                info!(sni_host = %sni_host, proxy_name = %route.proxy_name, addr = %addr,
-                                                    "SNI route '{}' → HTTPS proxy '{}' from {}",
-                                                    sni_host, route.proxy_name, addr);
-                                                // send().await: backpressure is correct —
-                                                // silently dropping the connection after
-                                                // consuming TLS ClientHello bytes would
-                                                // confuse the client.
-                                                let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
-                                                    proxy_name: route.proxy_name.to_string(),
-                                                    user_conn: IoStream::Tcp(inner_stream),
-                                                    pre_read: sni_data,
-                                                }).await;
-                                                return;
+                                    // Try SNI-based routing for HTTPS proxies
+                                    if !sni_data.is_empty() {
+                                        if let Some(sni_host) = crate::vhost::extract_sni_from_client_hello(&sni_data) {
+                                            debug!(addr = %addr, sni_host = %sni_host, "SNI from {}: {}", addr, sni_host);
+                                            // SNI routing: no HTTP auth, so http_user is empty string.
+                                            // SNI routing: no HTTP path, so pass empty string.
+                                            // Routes with empty locations (HTTPS SNI) match any path.
+                                            if let Some(route) = state.vhost_manager.lookup_wildcard(&sni_host, "", "").await {
+                                                let ctl_tx = {
+                                                    let map = state.run_id_to_ctl_tx.read().await;
+                                                    map.get(route.run_id.as_ref()).cloned()
+                                                };
+                                                if let Some(ctl) = ctl_tx {
+                                                    info!(sni_host = %sni_host, proxy_name = %route.proxy_name, addr = %addr,
+                                                        "SNI route '{}' → HTTPS proxy '{}' from {}",
+                                                        sni_host, route.proxy_name, addr);
+                                                    // send().await: backpressure is correct —
+                                                    // silently dropping the connection after
+                                                    // consuming TLS ClientHello bytes would
+                                                    // confuse the client.
+                                                    let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
+                                                        proxy_name: route.proxy_name.to_string(),
+                                                        user_conn: IoStream::Tcp(inner_stream),
+                                                        pre_read: sni_data,
+                                                    }).await;
+                                                    return;
+                                                }
                                             }
                                         }
                                     }
-                                }
+                                    sni_data
+                                } else {
+                                    // No HTTPS proxies — replay just the pre-read
+                                    // bytes; the TLS handshake reads the rest from
+                                    // the socket.
+                                    pre_read_bytes
+                                };
 
                                 // No SNI match — check acceptor before creating stream.
                                 let acceptor = match acceptor {

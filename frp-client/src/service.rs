@@ -47,6 +47,8 @@ use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
+#[cfg(feature = "vnet")]
+use frp_core::transport::IoStream;
 use frp_core::transport::{TransportProtocol, WriteHalf};
 
 use frp_core::metrics::ProxyMetricsRegistry;
@@ -84,6 +86,34 @@ fn virtual_net_visitor_route_adv(
         subnet: frp_vnet::router::host_route_cidr(&ip),
         virtual_net: None,
     })
+}
+
+/// Advertise a vnet visitor's host route on the control connection after its
+/// registration succeeds. Shared by both visitor-registration response paths
+/// (NewVisitorConnResp and the Go frps ReqWorkConn ack) in the pipelined
+/// registration read loop.
+#[cfg(feature = "vnet")]
+async fn advertise_vnet_visitor_route(
+    control_stream: &mut IoStream,
+    v2: bool,
+    v: &frp_core::config::VisitorConfig,
+) {
+    if let Some(adv) = virtual_net_visitor_route_adv(v) {
+        let send_result = if v2 {
+            control_stream
+                .write_v2_frame(&FrpMessage::VnetRouteAdvertise(adv))
+                .await
+        } else {
+            control_stream
+                .write_v1_frame(&FrpMessage::VnetRouteAdvertise(adv))
+                .await
+        };
+        if let Err(e) = send_result {
+            warn!(visitor_name = %v.name, error = %e, "failed to send vnet route advertisement for visitor '{}'", v.name);
+        } else {
+            info!(visitor_name = %v.name, "vnet route advertised for visitor '{}'", v.name);
+        }
+    }
 }
 
 fn reconnect_delay_after_session(
@@ -560,8 +590,9 @@ impl Service {
     }
 
     /// Compute reconnect delay with the Go frp dev two-phase fast-backoff.
-    /// Phase 1 (first 3 retries within 60s window): 200ms base, 0.5 jitter, no cap.
-    /// Phase 2 (after that): 1s base, 2x factor, 0.1 jitter, cap 20s.
+    /// Phase 1 (first 3 retries within 60s window): 200ms base × full jitter
+    /// (0.5-1.5), no cap.
+    /// Phase 2 (after that): 1s base, 2x factor, full jitter (0.5-1.5), cap 20s.
     ///
     /// Matches Go frp dev wait.FastBackoffManager:
     ///   FastBackoffOptions{
@@ -596,10 +627,12 @@ impl Service {
 
         // Phase 1: fast retries
         if counts_in_fast_retry_window <= 3 {
-            // Jitter is additive: 200ms + random(0, 0.5 * 200ms)
-            let base_ms = 200;
-            let jitter_ms = rng.gen_range(0..=100);
-            return Duration::from_millis((base_ms + jitter_ms) as u64);
+            // Full jitter: 200ms × random(0.5, 1.5) → 100-300ms (mean 200ms).
+            // Multiplicative jitter de-synchronizes clients restarting
+            // together: additive jitter confined everyone to a 100ms-wide
+            // window that re-clustered on every restart (thundering herd).
+            let ms = 200.0 * rng.gen_range(0.5..=1.5);
+            return Duration::from_millis(ms as u64);
         }
 
         // Phase 2: exponential backoff
@@ -616,10 +649,12 @@ impl Service {
                 break;
             }
         }
-        // Additive jitter: duration_ms + random(0, 0.1 * duration_ms)
-        let jitter_ms = (rng.gen::<f64>() * 0.1 * duration_ms as f64) as u64;
-        duration_ms = duration_ms.saturating_add(jitter_ms);
-        let duration_ms = duration_ms.min(20_000);
+        // Full jitter: base × random(0.5, 1.5), capped at 20s. The phase-1
+        // mean dropped slightly (250ms → 200ms) but the order of magnitude
+        // and phase structure are unchanged; the spread replaces the old
+        // ±10% additive band — at the 20s cap clients no longer all fire
+        // within the same 20-22s window.
+        let duration_ms = ((duration_ms as f64 * rng.gen_range(0.5..=1.5)) as u64).min(20_000);
 
         Duration::from_millis(duration_ms)
     }
@@ -715,9 +750,11 @@ impl Service {
 
         // Main session loop with reconnection.
         // Go frp dev two-phase fast-backoff:
-        //   Phase 1 (first 3 retries within 60s window): 200ms + 0.5 jitter
-        //   Phase 2 (after that): 1s × 2ⁿ + 0.1 jitter, cap 20s
-        // Matches Go frp dev wait.FastBackoffManager.
+        //   Phase 1 (first 3 retries within 60s window): 200ms × full jitter (0.5-1.5)
+        //   Phase 2 (after that): 1s × 2ⁿ × full jitter (0.5-1.5), cap 20s
+        // Matches Go frp dev wait.FastBackoffManager (full multiplicative
+        // jitter replaces the additive jitter so clients restarting together
+        // de-synchronize instead of re-clustering in a narrow band).
         let mut did_login_once = false;
         let mut consecutive_err_count: u32 = 0;
         let mut fast_retry_timestamps: Vec<Instant> = Vec::new();
@@ -853,125 +890,17 @@ impl Service {
 
             let session_alive = Arc::new(AtomicBool::new(true));
 
-            // Register proxies using IoStream directly (supports TCP and TLS).
-            // NOTE: each proxy is registered sequentially via a NewProxy
-            // request/response round-trip over the control channel. N proxies
-            // cost N sequential network round-trips. Batching could speed up
-            // registration for clients with many proxies, but would require
-            // protocol changes beyond Go frp v0.70.0 wire compatibility.
-            for p in &proxies {
-                let local_addr = self
-                    .proxy_info_map
-                    .read()
-                    .await
-                    .get(&wire_proxy_name(&cfg_local.user, &p.name))
-                    .map(|info| info.local_addr.clone())
-                    .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-                match ctl
-                    .register_proxy(p, &local_addr, &mut control_stream)
-                    .await
-                {
-                    Ok(resp) => {
-                        let remote = resp
-                            .remote_addr
-                            .unwrap_or_else(|| format!("0.0.0.0:{}", p.remote_port));
-                        info!(proxy_name = %p.name, remote = %remote, "Proxy '{}' registered on remote port {}", p.name, remote);
-                        // Update runtime info for admin API
-                        let mut map = self.proxy_info_map.write().await;
-                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
-                        {
-                            info.remote_addr = remote;
-                            info.err.clear();
-                            info.phase = ProxyPhase::Running;
-                        }
-
-                        #[cfg(feature = "vnet")]
-                        if vnet_tun_params(p, &cfg_local.virtual_net.address).is_some() {
-                            if let Err(e) = self.open_vnet_tun_for_proxy(p, &cfg_local).await {
-                                warn!(proxy_name = %p.name, error = %e, "TUN open/register failed (need root/CAP_NET_ADMIN?)");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(proxy_name = %p.name, error = %e, "Failed to register proxy '{}': {}", p.name, e);
-                        let mut map = self.proxy_info_map.write().await;
-                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
-                        {
-                            info.err = e.to_string();
-                            info.phase = ProxyPhase::StartErr(e.to_string());
-                        }
-                    }
-                }
-            }
-
-            // Register STCP/XTCP visitors on the control connection.
-            // Go frps v0.69.1 requires visitor registration before NatHoleVisitor
-            // can be sent on the control connection (otherwise: "auth failed").
-            let session_visitors = self.cfg.read().await.visitors.clone();
-            for v in &session_visitors {
-                if !v.enabled {
-                    continue;
-                }
-                if v.bind_port == 0 {
-                    continue;
-                }
-                match ctl.register_visitor(v, &mut control_stream).await {
-                    Ok(_) => {
-                        info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
-                        // Virtual-net visitors advertise their destination IP
-                        // as a host route instead of binding a local listener.
-                        #[cfg(feature = "vnet")]
-                        if let Some(adv) = virtual_net_visitor_route_adv(v) {
-                            let send_result = if v2 {
-                                control_stream
-                                    .write_v2_frame(&FrpMessage::VnetRouteAdvertise(adv))
-                                    .await
-                            } else {
-                                control_stream
-                                    .write_v1_frame(&FrpMessage::VnetRouteAdvertise(adv))
-                                    .await
-                            };
-                            if let Err(e) = send_result {
-                                warn!(visitor_name = %v.name, error = %e, "failed to send vnet route advertisement for visitor '{}'", v.name);
-                            } else {
-                                info!(visitor_name = %v.name, "vnet route advertised for visitor '{}'", v.name);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(visitor_name = %v.name, error = %e, "Failed to register visitor '{}': {}", v.name, e);
-                    }
-                }
-            }
-
-            // Split control stream for reading and writing
-            let (mut reader, raw_writer) = control_stream.into_split()?;
-            let writer = Arc::new(Mutex::new(raw_writer));
-
-            // Spawn VnetControllers for all vnet proxies now that the
-            // control connection writer is available.
-            #[cfg(feature = "vnet")]
-            for p in &proxies {
-                if vnet_tun_params(p, &cfg_local.virtual_net.address).is_none() {
-                    continue;
-                }
-                if spawn_vnet_tun_controller(
-                    &self.vnet_tuns,
-                    &self.vnet_tun_tx,
-                    &self.vnet_tun_cancels,
-                    &self.vnet_controller,
-                    &p.name,
-                    &p.virtual_net,
-                    &writer,
-                    v2,
-                )
-                .await
-                .is_some()
-                {
-                    send_vnet_route_advertise(&writer, v2, p).await;
-                }
-            }
-
+            // Shared pool/work-conn configuration. Both the registration read
+            // loop (below) and the on-demand ReqWorkConn handler in the message
+            // loop build a byte-identical WorkConnConfig differing only in
+            // `pool_id`. Collapse into one macro (defined here so its free
+            // identifier references resolve against the locals in scope).
+            let client_scopes: Vec<String> = cfg_local
+                .auth
+                .as_ref()
+                .map(|a| a.additional_auth_scopes.clone())
+                .unwrap_or_default();
+            let server_scopes = self.server_auth_scopes.read().await.clone();
             // Bind local UDP sockets for UDP proxies.
             // UDP data flows over work connections (Go frp v0.69.1 compat).
             // Sockets are shared with work conn tasks via Arc.
@@ -1014,18 +943,6 @@ impl Service {
                     info!(proxy_name = %p.name, local_addr = %local_addr, enc_label = %enc_label, "UDP proxy '{}' ready, bridging to {} ({})", p.name, local_addr, enc_label);
                 }
             }
-
-            // Spawn initial pool work connections
-            let client_scopes: Vec<String> = cfg_local
-                .auth
-                .as_ref()
-                .map(|a| a.additional_auth_scopes.clone())
-                .unwrap_or_default();
-            let server_scopes = self.server_auth_scopes.read().await.clone();
-            // Both the pool-spawn loop below and the on-demand ReqWorkConn
-            // handler build a byte-identical WorkConnConfig differing only in
-            // `pool_id`. Collapse into one macro (defined here so its free
-            // identifier references resolve against the locals in scope).
             macro_rules! work_conn_config {
                 ($pool_id:expr) => {{
                     #[cfg(feature = "quic")]
@@ -1076,10 +993,297 @@ impl Service {
             }
 
             // Go frp compat: work connections are created ONLY in response to
-            // ReqWorkConn messages from the server (handled in the message loop
-            // below, which calls spawn_wc!(-1)). Do NOT eagerly spawn pool_count
-            // connections here; pool_count is sent to the server via Login so it
-            // knows how many ReqWorkConn messages to issue.
+            // ReqWorkConn messages from the server (pool pre-warm sent right
+            // after LoginResp, NewVisitorConn acks, and on-demand requests —
+            // handled in the registration read loop below and the message loop
+            // further down). Do NOT eagerly spawn pool_count connections here;
+            // pool_count is sent to the server via Login so it knows how many
+            // ReqWorkConn messages to issue.
+            let handle_req_work_conn = || {
+                // Go frp v0.70.1 spawns each ReqWorkConn handler asynchronously
+                // with no client-side in-flight cap (client/control.go:
+                // handleReqWorkConn). Spawn directly so a burst of requests
+                // cannot overflow a queue or tear down the control session;
+                // each work conn's dial/StartWorkConn read is still bounded by
+                // its own timeout in work_conn.rs.
+                debug!("Received ReqWorkConn, spawning work connection");
+                crate::work_conn::spawn_work_conn(work_conn_config!(-1));
+            };
+
+            // Register proxies using IoStream directly (supports TCP and TLS).
+            // Pipelined: write ALL NewProxy frames first, then collect the
+            // responses in a single read loop — N proxies no longer cost N
+            // sequential network round-trips (Go frpc registers each proxy in
+            // its own goroutine, so Go frps may answer out of order; each
+            // response is matched to its proxy by wire proxy_name). ReqWorkConn
+            // frames arriving in this window (pool pre-warm, or a user conn
+            // hitting the server mid-registration) are handled here instead of
+            // dropped: skipping them left the pool empty after login and let
+            // the server's work-conn wait stall for up to 10s.
+            let mut pending_proxies: Vec<(String, usize)> = Vec::new();
+            let mut write_failed = false;
+            for (idx, p) in proxies.iter().enumerate() {
+                let local_addr = self
+                    .proxy_info_map
+                    .read()
+                    .await
+                    .get(&wire_proxy_name(&cfg_local.user, &p.name))
+                    .map(|info| info.local_addr.clone())
+                    .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
+                let np = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_local.user);
+                debug!(
+                    name = %p.name,
+                    proxy_type = %p.proxy_type,
+                    remote_port = p.remote_port,
+                    encrypted = p.use_encryption,
+                    compressed = p.use_compression,
+                    "NewProxy message prepared"
+                );
+                info!(name = %p.name, proxy_type = %p.proxy_type, remote_port = %p.remote_port, local_addr = %local_addr,
+                    "Registering proxy '{}' type={} remote_port={} local={}",
+                    p.name, p.proxy_type, p.remote_port, local_addr);
+                let wire_name = wire_proxy_name(&cfg_local.user, &p.name);
+                let write_result = if v2 {
+                    control_stream.write_v2_frame(&np).await
+                } else {
+                    control_stream.write_v1_frame(&np).await
+                };
+                if let Err(e) = write_result {
+                    // A failed write leaves the stream state undefined; record
+                    // the failure, mark the proxy failed, and skip the response
+                    // phase entirely (responses for the unwritten requests may
+                    // never arrive — see `write_failed`/`aborted` below).
+                    write_failed = true;
+                    warn!(proxy_name = %p.name, error = %e, "Failed to register proxy '{}': {}", p.name, e);
+                    let mut map = self.proxy_info_map.write().await;
+                    if let Some(info) = map.get_mut(&wire_name) {
+                        info.err = e.to_string();
+                        info.phase = ProxyPhase::StartErr(e.to_string());
+                    }
+                    continue;
+                }
+                pending_proxies.push((wire_name, idx));
+            }
+
+            // Register STCP/XTCP visitors on the control connection.
+            // Go frps v0.69.1 requires visitor registration before NatHoleVisitor
+            // can be sent on the control connection (otherwise: "auth failed").
+            // Pipelined like the proxies: write all NewVisitorConn frames, then
+            // resolve them in the shared read loop below.
+            let session_visitors_cfg = self.cfg.read().await.visitors.clone();
+            let session_visitors: Vec<&frp_core::config::VisitorConfig> = session_visitors_cfg
+                .iter()
+                .filter(|v| v.enabled && v.bind_port != 0)
+                .collect();
+            let mut pending_visitors: Vec<(String, usize)> = Vec::new();
+            for (idx, v) in session_visitors.iter().enumerate() {
+                let nvc = crate::proxy::create_visitor_conn_msg(
+                    &v.server_name,
+                    &v.secret_key,
+                    v.use_encryption,
+                    v.use_compression,
+                    Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
+                    Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
+                    Some(run_id.as_str()).filter(|s| !s.is_empty()),
+                );
+                debug!(
+                    server_name = %v.server_name,
+                    encrypted = v.use_encryption,
+                    compressed = v.use_compression,
+                    "NewVisitorConn message prepared"
+                );
+                info!(visitor_name = %v.name, proxy_name = %v.server_name, "Registering visitor '{}' for proxy '{}'", v.name, v.server_name);
+                let wire_name = crate::proxy::visitor_wire_name(
+                    Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
+                    Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
+                    &v.server_name,
+                );
+                let write_result = if v2 {
+                    control_stream.write_v2_frame(&nvc).await
+                } else {
+                    control_stream.write_v1_frame(&nvc).await
+                };
+                if let Err(e) = write_result {
+                    write_failed = true;
+                    warn!(visitor_name = %v.name, error = %e, "Failed to register visitor '{}': {}", v.name, e);
+                    continue;
+                }
+                pending_visitors.push((wire_name, idx));
+            }
+
+            // Collect responses. NewProxyResp/NewVisitorConnResp are matched to
+            // their request by wire proxy_name — Go frps processes each
+            // registration in its own goroutine, so responses may arrive out of
+            // order. ReqWorkConn spawns a work connection (pool pre-warm,
+            // NewVisitorConn ack, or an on-demand user conn that arrived while
+            // the client was still registering).
+            let mut aborted = write_failed;
+            let mut unexpected = 0u32;
+            while !aborted && (!pending_proxies.is_empty() || !pending_visitors.is_empty()) {
+                let resp_msg = if v2 {
+                    match control_stream.read_v2_frame().await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!(error = %e, "Registration response read failed: {}", e);
+                            aborted = true;
+                            continue;
+                        }
+                    }
+                } else {
+                    match control_stream.read_v1_frame().await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!(error = %e, "Registration response read failed: {}", e);
+                            aborted = true;
+                            continue;
+                        }
+                    }
+                };
+                match resp_msg {
+                    FrpMessage::NewProxyResp(resp) => {
+                        // Match by wire proxy_name: responses may arrive in any
+                        // order relative to the requests they answer.
+                        let Some(pos) = pending_proxies
+                            .iter()
+                            .position(|(name, _)| *name == resp.proxy_name)
+                        else {
+                            unexpected += 1;
+                            warn!(proxy_name = %resp.proxy_name, "NewProxyResp for proxy not in this registration batch");
+                            continue;
+                        };
+                        let (_, idx) = pending_proxies.swap_remove(pos);
+                        let p = &proxies[idx];
+                        if let Some(err) = resp.error {
+                            warn!(proxy_name = %p.name, error = %err, "Failed to register proxy '{}': {}", p.name, err);
+                            let mut map = self.proxy_info_map.write().await;
+                            if let Some(info) =
+                                map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
+                            {
+                                info.err = err.clone();
+                                info.phase = ProxyPhase::StartErr(err);
+                            }
+                        } else {
+                            let remote = resp
+                                .remote_addr
+                                .unwrap_or_else(|| format!("0.0.0.0:{}", p.remote_port));
+                            info!(proxy_name = %p.name, remote = %remote, "Proxy '{}' registered on remote port {}", p.name, remote);
+                            // Update runtime info for admin API
+                            let mut map = self.proxy_info_map.write().await;
+                            if let Some(info) =
+                                map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
+                            {
+                                info.remote_addr = remote;
+                                info.err.clear();
+                                info.phase = ProxyPhase::Running;
+                            }
+
+                            #[cfg(feature = "vnet")]
+                            if vnet_tun_params(p, &cfg_local.virtual_net.address).is_some() {
+                                if let Err(e) = self.open_vnet_tun_for_proxy(p, &cfg_local).await {
+                                    warn!(proxy_name = %p.name, error = %e, "TUN open/register failed (need root/CAP_NET_ADMIN?)");
+                                }
+                            }
+                        }
+                    }
+                    FrpMessage::NewVisitorConnResp(resp) => {
+                        let Some(pos) = pending_visitors
+                            .iter()
+                            .position(|(name, _)| *name == resp.proxy_name)
+                        else {
+                            unexpected += 1;
+                            warn!(proxy_name = %resp.proxy_name, "NewVisitorConnResp for visitor not in this registration batch");
+                            continue;
+                        };
+                        let (_, idx) = pending_visitors.swap_remove(pos);
+                        let v = session_visitors[idx];
+                        if let Some(err) = resp.error {
+                            warn!(visitor_name = %v.name, error = %err, "Failed to register visitor '{}': {}", v.name, err);
+                        } else {
+                            info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
+                            // Virtual-net visitors advertise their destination IP
+                            // as a host route instead of binding a local listener.
+                            #[cfg(feature = "vnet")]
+                            advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
+                        }
+                    }
+                    FrpMessage::ReqWorkConn(_) => {
+                        handle_req_work_conn();
+                        // Go frps v0.69.1 acks a successful NewVisitorConn with
+                        // an anonymous ReqWorkConn (no proxy_name). While
+                        // visitors are still pending, attribute the ack to the
+                        // oldest one (FIFO — the sequential reader used to
+                        // consume the first ReqWorkConn after each
+                        // NewVisitorConn as that visitor's success signal).
+                        if !pending_visitors.is_empty() {
+                            let (_, idx) = pending_visitors.remove(0);
+                            let v = session_visitors[idx];
+                            info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}' (Go frps compat: ReqWorkConn after NewVisitorConn)", v.name, v.server_name);
+                            #[cfg(feature = "vnet")]
+                            advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
+                        }
+                    }
+                    other => {
+                        unexpected += 1;
+                        warn!(
+                            type_byte = other.v1_type_byte(),
+                            "Unexpected message during registration"
+                        );
+                    }
+                }
+                if unexpected >= 100 {
+                    warn!("Registration aborted: too many unexpected messages");
+                    aborted = true;
+                }
+            }
+
+            // Any request still pending here never got an answer (write
+            // failure, read error, or too many unexpected frames). Mark the
+            // proxies failed and log the unresolved visitors; the session
+            // continues — registration errors do not abort the client
+            // (login_fail_exit only governs the login phase).
+            if !pending_proxies.is_empty() || !pending_visitors.is_empty() {
+                warn!(proxies = %pending_proxies.len(), visitors = %pending_visitors.len(), "Registration aborted; marking still-pending proxies/visitors as failed");
+                for (wire_name, _) in pending_proxies.drain(..) {
+                    let mut map = self.proxy_info_map.write().await;
+                    if let Some(info) = map.get_mut(&wire_name) {
+                        info.err = "registration aborted (no response)".to_string();
+                        info.phase =
+                            ProxyPhase::StartErr("registration aborted (no response)".to_string());
+                    }
+                }
+                for (_, idx) in pending_visitors.drain(..) {
+                    let v = session_visitors[idx];
+                    warn!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registration unresolved", v.name);
+                }
+            }
+
+            // Split control stream for reading and writing
+            let (mut reader, raw_writer) = control_stream.into_split()?;
+            let writer = Arc::new(Mutex::new(raw_writer));
+
+            // Spawn VnetControllers for all vnet proxies now that the
+            // control connection writer is available.
+            #[cfg(feature = "vnet")]
+            for p in &proxies {
+                if vnet_tun_params(p, &cfg_local.virtual_net.address).is_none() {
+                    continue;
+                }
+                if spawn_vnet_tun_controller(
+                    &self.vnet_tuns,
+                    &self.vnet_tun_tx,
+                    &self.vnet_tun_cancels,
+                    &self.vnet_controller,
+                    &p.name,
+                    &p.virtual_net,
+                    &writer,
+                    v2,
+                )
+                .await
+                .is_some()
+                {
+                    send_vnet_route_advertise(&writer, v2, p).await;
+                }
+            }
 
             // Shared graceful shutdown signal for all visitor listener tasks.
             // Set to true at session end so tasks exit cleanly (Fix 8).
@@ -1088,13 +1292,17 @@ impl Service {
             // Cancel old visitor listener tasks from a previous session.
             // Signal gracefully and wait briefly for the previous session's
             // visitors to exit, instead of aborting them (Go frp compat:
-            // visitor_manager.Close() closes each visitor cleanly).
-            for h in visitor_handles.drain(..) {
-                // Previous session's visitor_shutdown was already set when
-                // the session ended; tasks should exit on their own.
-                // Give them a moment to notice and exit.
-                let _ = tokio::time::timeout(Duration::from_millis(500), h).await;
-            }
+            // visitor_manager.Close() closes each visitor cleanly). The
+            // previous session's visitor_shutdown was already set when the
+            // session ended; tasks should exit on their own. join_all waits on
+            // all tasks in parallel — per-task sequential 500ms timeouts would
+            // multiply the reconnect delay by the number of stuck visitors.
+            // Dropped (still-running) tasks poll the shutdown flag and exit.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(500),
+                futures_util::future::join_all(visitor_handles.drain(..)),
+            )
+            .await;
 
             // Spawn STCP/XTCP visitor listeners
             let session_visitors = self.cfg.read().await.visitors.clone();
@@ -1306,15 +1514,8 @@ impl Service {
                     msg = read_msg(&mut reader, v2) => {
                         match msg {
                             Ok(FrpMessage::ReqWorkConn(_)) => {
-                                // Go frp v0.70.1 spawns each ReqWorkConn handler
-                                // asynchronously with no client-side in-flight cap
-                                // (client/control.go:handleReqWorkConn). Spawn
-                                // directly so a burst of requests cannot overflow a
-                                // queue or tear down the control session; each work
-                                // conn's dial/StartWorkConn read is still bounded by
-                                // its own timeout in work_conn.rs.
-                                debug!("Received ReqWorkConn, spawning work connection");
-                                crate::work_conn::spawn_work_conn(work_conn_config!(-1));
+                                // Shared with the registration read loop above.
+                                handle_req_work_conn();
                             }
                             Ok(FrpMessage::Pong(pong)) => {
                                 if let Some(ref err) = pong.error {
@@ -1826,9 +2027,14 @@ impl Service {
 
             // Wait briefly for visitor tasks to notice the shutdown signal and
             // exit gracefully (timeout so we never block reconnection).
-            for h in visitor_handles.drain(..) {
-                let _ = tokio::time::timeout(Duration::from_millis(500), h).await;
-            }
+            // join_all waits on all tasks in parallel — sequential per-task
+            // 500ms timeouts would cost N×500ms for N stuck visitors, twice per
+            // reconnect. Dropped (still-running) tasks poll the shutdown flag.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(500),
+                futures_util::future::join_all(visitor_handles.drain(..)),
+            )
+            .await;
 
             // Check if admin stop was requested
             if shutdown_flag.load(Ordering::SeqCst) {
@@ -3307,6 +3513,24 @@ fn remove_os_route(subnet: &str, tun_name: &str) {
 /// macOS, uses `/sbin/ifconfig`. On other platforms (e.g. Windows),
 /// returns an empty vec.
 fn list_local_ips_for_nat_hole(max_items: usize) -> Vec<String> {
+    // Cache with 30s TTL: the XTCP provider path calls this once per
+    // provider session, and each call re-reads /proc/net/fib_trie (or spawns
+    // /sbin/ifconfig / `ip` subprocesses on the fallback paths). Local IPs
+    // change rarely; the refresh cadence mirrors the visitor path's 30s TTL
+    // cache in visitor.rs. Keyed on max_items so a caller asking for more
+    // entries than the cached result holds never gets a short answer.
+    static CACHE: std::sync::Mutex<Option<(usize, Vec<String>, Instant)>> =
+        std::sync::Mutex::new(None);
+    {
+        if let Ok(cache) = CACHE.lock() {
+            if let Some((ref cached_max, ref ips, ref time)) = *cache {
+                if *cached_max == max_items && time.elapsed() < std::time::Duration::from_secs(30) {
+                    return ips.clone();
+                }
+            }
+        }
+    }
+
     let mut ips: Vec<String> = Vec::new();
 
     // Linux: parse /proc/net/fib_trie for local IPs
@@ -3418,6 +3642,16 @@ fn list_local_ips_for_nat_hole(max_items: usize) -> Vec<String> {
         }
     }
 
+    // Update cache. Empty results are NOT cached: the first call in a
+    // container where /proc/net/fib_trie is unreadable would otherwise pin
+    // an empty list for the 30s TTL, masking a later re-read that succeeds
+    // (e.g. once the `ip` fallback works or the network comes up).
+    if !ips.is_empty() {
+        if let Ok(mut cache) = CACHE.lock() {
+            *cache = Some((max_items, ips.clone(), Instant::now()));
+        }
+    }
+
     ips
 }
 
@@ -3507,29 +3741,38 @@ mod tests {
         // Go frp v0.70.1's fastBackoffImpl resets only when the retry callback
         // reports success; keepControllerWorking always reports an error after a
         // session closes, so escalation continues regardless of session length.
+        // With full multiplicative jitter a single sample can land below the
+        // previous level, so escalation is asserted on the mean over samples.
         let mut errors = 0;
         let mut retries = Vec::new();
-        let delays = (0..5)
+        let fast_delays = (0..3)
             .map(|_| reconnect_delay_after_session(&mut errors, &mut retries))
             .collect::<Vec<_>>();
-
-        assert!(delays[..3]
+        // Phase 1 stays sub-second (100-300ms).
+        assert!(fast_delays
             .iter()
             .all(|delay| *delay < Duration::from_secs(1)));
-        assert!(delays[3] >= Duration::from_secs(10));
-        assert!(delays[4] >= delays[3]);
-        assert_eq!(errors, 5);
+        fn mean_level(consecutive: u32, window: u32) -> f64 {
+            (0..200)
+                .map(|_| Service::fast_backoff_delay(consecutive, window).as_millis() as f64)
+                .sum::<f64>()
+                / 200.0
+        }
+        let m4 = mean_level(4, 4); // phase 2, 16s base (partially capped at 20s)
+        let m5 = mean_level(5, 5); // phase 2, 20s capped base
+        assert!(m5 > m4, "phase-2 mean should escalate: {m5} > {m4}");
+        assert_eq!(errors, 3);
     }
 
     #[test]
     fn fast_backoff_delay_phase1_fast_retry() {
-        // First 3 retries (counts_in_fast_retry_window <= 3) use 200ms + 0.5 jitter
-        // Expected range: 200ms-300ms
+        // First 3 retries (counts_in_fast_retry_window <= 3) use
+        // 200ms × full jitter (0.5-1.5) → 100ms-300ms.
         for i in 1..=3u32 {
             for _ in 0..100 {
                 let delay = Service::fast_backoff_delay(i, i);
                 let ms = delay.as_millis();
-                assert!(ms >= 200, "delay {ms}ms too low for fast retry {i}");
+                assert!(ms >= 100, "delay {ms}ms too low for fast retry {i}");
                 assert!(ms <= 300, "delay {ms}ms too high for fast retry {i}");
             }
         }
@@ -3538,35 +3781,37 @@ mod tests {
     #[test]
     fn fast_backoff_delay_phase2_base_first() {
         // After fast retries (counts_in_fast_retry_window > 3), consecutive_err_count=1
-        // Go frp: InitDurationIfFail(1s) * Factor(2) = 2s + 10% additive jitter -> 2000-2200ms
+        // Go frp: InitDurationIfFail(1s) * Factor(2) = 2s × full jitter (0.5-1.5)
+        // -> 1000-3000ms
         for _ in 0..100 {
             let delay = Service::fast_backoff_delay(1, 4);
             let ms = delay.as_millis();
-            assert!(ms >= 2000, "delay {ms}ms below 2s for phase2 first");
-            assert!(ms <= 2200, "delay {ms}ms above 2.2s for phase2 first");
+            assert!(ms >= 1000, "delay {ms}ms below 1s for phase2 first");
+            assert!(ms <= 3000, "delay {ms}ms above 3s for phase2 first");
         }
     }
 
     #[test]
     fn fast_backoff_delay_phase2_exponential() {
-        // consecutive_err_count=4, counts_in_fast_retry_window=5 -> 1s*2^4=16s + 10% jitter
-        // Range: 16000-17600ms
+        // consecutive_err_count=4, counts_in_fast_retry_window=5 -> 1s*2^4=16s
+        // × full jitter (0.5-1.5) -> 8000-24000ms, capped at 20000ms
         for _ in 0..100 {
             let delay = Service::fast_backoff_delay(4, 5);
             let ms = delay.as_millis();
-            assert!(ms >= 16000, "delay {ms}ms below 16s for err=4");
-            assert!(ms <= 17600, "delay {ms}ms above 17.6s for err=4");
+            assert!(ms >= 8000, "delay {ms}ms below 8s for err=4");
+            assert!(ms <= 20000, "delay {ms}ms above 20s cap for err=4");
         }
     }
 
     #[test]
     fn fast_backoff_delay_phase2_caps_at_20s() {
-        // High consecutive_err_count should cap at 20s
+        // High consecutive_err_count caps the base at 20s; full jitter then
+        // spreads it to 10-20s (never above the cap).
         for _ in 0..100 {
             let delay = Service::fast_backoff_delay(20, 20);
             let ms = delay.as_millis();
-            assert!(ms >= 20000, "delay {ms}ms below 20s cap");
-            assert!(ms <= 21000, "delay {ms}ms above 21s cap (20s + 10% jitter)");
+            assert!(ms >= 10000, "delay {ms}ms below 10s at the 20s cap");
+            assert!(ms <= 20000, "delay {ms}ms above 20s cap");
         }
     }
 

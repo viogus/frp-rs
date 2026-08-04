@@ -3,8 +3,9 @@
 //! Handles NewWorkConn, VisitorConn, ProxyUserConn, and UDP work connection
 //! InternalMsg dispatch, pool assignment, and XTCP NatHoleSid delivery.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use tracing::{debug, info, warn};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::transport::IoStream;
 
+use crate::proxy::ProxyInfo;
 use crate::service::InternalMsg;
 
 use super::bridge;
@@ -53,8 +55,10 @@ pub(crate) struct PendingRequest {
     pub(crate) use_encryption: bool,
     pub(crate) use_compression: bool,
     pub(crate) created_at: Instant,
-    pub(crate) response_headers: HashMap<String, String>,
-    pub(crate) proxy_type: String,
+    /// Proxy metadata fetched once by the dispatcher. `assign_work_to_proxy`
+    /// reads local_addr/remote_port/bandwidth_limit/etc. from it instead of
+    /// re-acquiring the proxy-map RwLock per user connection.
+    pub(crate) proxy_info: Option<Arc<ProxyInfo>>,
 }
 
 // ---- Helpers ----
@@ -298,32 +302,33 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
     proxy_name: String,
     visitor_conn: IoStream,
 ) -> Result<(), ()> {
-    // NewUserConn plugin hook — control-enabled plugins can reject
-    let user_content = serde_json::json!({
-        "proxy_name": proxy_name,
-        "run_id": ctx.run_id,
-    });
-    if let Err(reason) = ctx
-        .state
-        .plugin_manager
-        .notify("new_user_conn", user_content)
-        .await
-    {
-        debug!(proxy_name = %proxy_name, reason = %reason, "NewUserConn plugin hook rejected (VisitorConn): {}", reason);
-        return Ok(());
+    // NewUserConn plugin hook — control-enabled plugins can reject.
+    // Skip payload construction when no plugins are configured (the
+    // default) — every user conn used to build a full json! Value
+    // just for the notify loop.
+    if !ctx.state.plugin_manager.is_empty() {
+        let user_content = serde_json::json!({
+            "proxy_name": proxy_name,
+            "run_id": ctx.run_id,
+        });
+        if let Err(reason) = ctx
+            .state
+            .plugin_manager
+            .notify("new_user_conn", user_content)
+            .await
+        {
+            debug!(proxy_name = %proxy_name, reason = %reason, "NewUserConn plugin hook rejected (VisitorConn): {}", reason);
+            return Ok(());
+        }
     }
     debug!(proxy_name = %proxy_name, run_id = %ctx.run_id, "STCP visitor conn for proxy {} on run_id {}", proxy_name, ctx.run_id);
-    let (enc, comp, response_headers, proxy_type) = {
-        let p = ctx.state.proxy_manager.get(&proxy_name).await;
-        let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
-        let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
-        let rh = p
-            .as_ref()
-            .map(|p| p.response_headers.clone())
-            .unwrap_or_default();
-        let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
-        (e, c, rh, pt)
-    };
+    // Fetch proxy metadata once and carry it in the request — the bridge
+    // reads it from here instead of re-locking the proxy map.
+    let proxy_info = ctx.state.proxy_manager.get(&proxy_name).await;
+    let (enc, comp) = proxy_info
+        .as_ref()
+        .map(|p| (p.use_encryption, p.use_compression))
+        .unwrap_or((false, false));
     assign_or_queue(
         &mut ctl.work_pool,
         &mut ctl.pending_requests,
@@ -336,8 +341,7 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
             use_encryption: enc,
             use_compression: comp,
             created_at: Instant::now(),
-            response_headers,
-            proxy_type,
+            proxy_info,
         },
     )
     .await
@@ -355,24 +359,31 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
     user_conn: IoStream,
     pre_read: Vec<u8>,
 ) -> Result<(), ()> {
-    // NewUserConn plugin hook — control-enabled plugins can reject
-    let user_content = serde_json::json!({
-        "proxy_name": proxy_name,
-        "run_id": ctx.run_id,
-    });
-    if let Err(reason) = ctx
-        .state
-        .plugin_manager
-        .notify("new_user_conn", user_content)
-        .await
-    {
-        debug!(proxy_name = %proxy_name, reason = %reason, "NewUserConn plugin hook rejected (ProxyUserConn): {}", reason);
-        return Ok(());
+    // NewUserConn plugin hook — control-enabled plugins can reject.
+    // Skip payload construction when no plugins are configured (the
+    // default) — every user conn used to build a full json! Value
+    // just for the notify loop.
+    if !ctx.state.plugin_manager.is_empty() {
+        let user_content = serde_json::json!({
+            "proxy_name": proxy_name,
+            "run_id": ctx.run_id,
+        });
+        if let Err(reason) = ctx
+            .state
+            .plugin_manager
+            .notify("new_user_conn", user_content)
+            .await
+        {
+            debug!(proxy_name = %proxy_name, reason = %reason, "NewUserConn plugin hook rejected (ProxyUserConn): {}", reason);
+            return Ok(());
+        }
     }
     debug!(proxy_name = %proxy_name, run_id = %ctx.run_id, "User conn for proxy {} on run_id {}", proxy_name, ctx.run_id);
     // Group load balancing: if proxy belongs to a group,
-    // select a backend (possibly on a different run_id).
-    let (target_proxy, target_run_id) = {
+    // select a backend (possibly on a different run_id). The fetched
+    // metadata is retained and carried into the pending request when the
+    // backend is this same proxy, so the bridge never re-locks the map.
+    let (target_proxy, target_run_id, orig_info) = {
         let p = ctx.state.proxy_manager.get(&proxy_name).await;
         let group = p
             .as_ref()
@@ -390,12 +401,12 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
                 .await
             {
                 info!(proxy_name = %proxy_name, backend = %backend, backend_run_id = %backend_run_id, "Group LB: {} -> backend {} (run_id {})", proxy_name, backend, backend_run_id);
-                (backend, backend_run_id)
+                (backend, backend_run_id, p)
             } else {
-                (proxy_name.clone(), ctx.run_id.clone())
+                (proxy_name.clone(), ctx.run_id.clone(), p)
             }
         } else {
-            (proxy_name.clone(), ctx.run_id.clone())
+            (proxy_name.clone(), ctx.run_id.clone(), p)
         }
     };
     // If backend is on a different run_id, forward to that handler
@@ -443,17 +454,17 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             return Ok(());
         }
     }
-    let (enc, comp, response_headers, proxy_type) = {
-        let p = ctx.state.proxy_manager.get(&target_proxy).await;
-        let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
-        let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
-        let rh = p
-            .as_ref()
-            .map(|p| p.response_headers.clone())
-            .unwrap_or_default();
-        let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
-        (e, c, rh, pt)
+    // Fetch the backend's metadata once (reusing the group-selection fetch
+    // when the backend is the same proxy) and carry it in the request.
+    let proxy_info = if target_proxy == proxy_name {
+        orig_info
+    } else {
+        ctx.state.proxy_manager.get(&target_proxy).await
     };
+    let (enc, comp) = proxy_info
+        .as_ref()
+        .map(|p| (p.use_encryption, p.use_compression))
+        .unwrap_or((false, false));
     assign_or_queue(
         &mut ctl.work_pool,
         &mut ctl.pending_requests,
@@ -466,8 +477,7 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             use_encryption: enc,
             use_compression: comp,
             created_at: Instant::now(),
-            response_headers,
-            proxy_type,
+            proxy_info,
         },
     )
     .await

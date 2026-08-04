@@ -1136,6 +1136,7 @@ dependencies = [
  "frp-core",
  "frp-server",
  "frp-vnet",
+ "futures-util",
  "h2",
  "http",
  "md-5",

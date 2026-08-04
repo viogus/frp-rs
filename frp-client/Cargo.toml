@@ -16,6 +16,7 @@ tempfile = "3"
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }
 frp-vnet = { workspace = true, optional = true }
+futures-util.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -169,6 +169,10 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         }
         // Clean up VHost routes
         ctx.state.vhost_manager.unregister(&cp.proxy_name).await;
+        // Decrement the SNI-sniff gate count for https proxies.
+        if info.proxy_type == "https" {
+            ctx.state.dec_https_proxy_count();
+        }
         ctx.state.proxy_metrics.remove(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
         {

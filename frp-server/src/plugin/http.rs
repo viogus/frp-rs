@@ -94,6 +94,13 @@ impl HttpPluginManager {
         }
     }
 
+    /// True when no plugins are configured (the default). Hot paths (login,
+    /// work conn, user conn) skip building the notify payload and the notify
+    /// loop entirely when this is true.
+    pub fn is_empty(&self) -> bool {
+        self.plugins.is_empty()
+    }
+
     /// Notify all plugins about an event.
     ///
     /// Go frp v0.70.1 compat (`pkg/plugin/server/http.go` + `manager.go`):
