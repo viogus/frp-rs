@@ -12,7 +12,9 @@ fn percentiles_us(mut samples_ns: Vec<u128>) -> (f64, f64, f64, f64, f64) {
     let n = samples_ns.len();
     let pick = |p: f64| -> f64 {
         // nearest-rank; clamp index to the last element
-        let idx = ((p * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+        let idx = ((p * n as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
         samples_ns[idx] as f64 / 1000.0
     };
     let mean = samples_ns.iter().sum::<u128>() as f64 / n as f64 / 1000.0;
@@ -86,8 +88,15 @@ pub async fn run(cli: &Cli) -> Result<()> {
             "msg_bytes": cli.msg_bytes,
             "p50_us": p50, "p95_us": p95, "p99_us": p99, "max_us": max, "mean_us": mean,
         });
-        let mut f = std::fs::OpenOptions::new()
-            .create(true).append(true).open(path)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true);
+        if cli.json_truncate {
+            opts.write(true).truncate(true);
+        } else {
+            opts.append(true);
+        }
+        let mut f = opts
+            .open(path)
             .with_context(|| format!("open json_out {path}"))?;
         writeln!(f, "{record}").context("write json_out")?;
     }

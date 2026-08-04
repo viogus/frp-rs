@@ -3,8 +3,8 @@
 //! Three dimensions x 6 scenarios. CI-only via STRESS_TEST=1.
 //! Launched by scripts/stress-test.sh.
 
-use clap::Parser;
 use anyhow::Result;
+use clap::Parser;
 
 mod scenarios;
 
@@ -39,9 +39,14 @@ struct Cli {
     #[arg(long, default_value = "0")]
     streams: usize,
 
-    /// Write structured JSON result to this path (append mode)
+    /// Write structured JSON result to this path (append mode unless --json-truncate)
     #[arg(long)]
     json_out: Option<String>,
+
+    /// Truncate (overwrite) the --json-out file instead of appending, so repeated
+    /// runs cannot stack stale rows from earlier invocations into one file.
+    #[arg(long, default_value = "false")]
+    json_truncate: bool,
 
     /// Configuration label recorded in JSON output (e.g. "plain", "tls")
     #[arg(long, default_value = "unlabeled")]
@@ -66,12 +71,14 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let cli = Cli::parse();
-    tracing::info!("frp-stress starting: scenario={}, duration={}s", cli.scenario, cli.duration);
+    tracing::info!(
+        "frp-stress starting: scenario={}, duration={}s",
+        cli.scenario,
+        cli.duration
+    );
 
     match cli.scenario.as_str() {
         "memory" => scenarios::memory::run(&cli).await?,
