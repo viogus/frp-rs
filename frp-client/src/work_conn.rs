@@ -397,6 +397,9 @@ async fn run_udp_work_conn(
     let reader = async move {
         debug!(proxy_name = %pn_r, "UDP reader '{}' started", pn_r);
         let mut first_packet = true;
+        // Ping-pong scratch for the decrypt/decompress chain (per-session).
+        let mut scratch_a: Vec<u8> = Vec::new();
+        let mut scratch_b: Vec<u8> = Vec::new();
         loop {
             tokio::select! {
                 biased;
@@ -419,15 +422,19 @@ async fn run_udp_work_conn(
                             }
                             let n = up.content.len();
                             let mut payload = up.content;
-                            if use_enc {
-                                if let Ok(d) = encryption::decrypt(&payload, &enc_key) {
-                                    payload = d;
-                                }
+                            // Ping-pong scratch buffers (per-session) so the
+                            // decrypt/decompress chain reuses allocations
+                            // instead of allocating per packet.
+                            if use_enc
+                                && encryption::decrypt_into(&payload, &enc_key, &mut scratch_a)
+                                    .is_ok()
+                            {
+                                std::mem::swap(&mut payload, &mut scratch_a);
                             }
-                            if use_comp {
-                                if let Ok(d) = encryption::decompress(&payload) {
-                                    payload = d;
-                                }
+                            if use_comp
+                                && encryption::decompress_into(&payload, &mut scratch_b).is_ok()
+                            {
+                                std::mem::swap(&mut payload, &mut scratch_b);
                             }
                             // Prepend PROXY header on the first packet of the
                             // session (Go: first packet of each remote conn).
@@ -500,6 +507,9 @@ async fn run_udp_work_conn(
         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
         let mut buf = vec![0u8; buf_size];
         let mut payload = Vec::with_capacity(buf_size);
+        // Ping-pong scratch for the compress/encrypt chain (per-session).
+        let mut scratch_c: Vec<u8> = Vec::new();
+        let mut scratch_d: Vec<u8> = Vec::new();
         let mut keepalive = tokio::time::interval(Duration::from_secs(30));
         keepalive.tick().await;
         loop {
@@ -515,11 +525,15 @@ async fn run_udp_work_conn(
                                 "UDP writer '{}': recv'd {} bytes from local {}", pn_w, n, src);
                             payload.clear();
                             payload.extend_from_slice(&buf[..n]);
-                            if use_comp {
-                                if let Ok(c) = encryption::compress(&payload) { payload = c; }
+                            if use_comp && encryption::compress_into(&payload, &mut scratch_c).is_ok()
+                            {
+                                std::mem::swap(&mut payload, &mut scratch_c);
                             }
-                            if use_enc {
-                                if let Ok(e) = encryption::encrypt(&payload, &enc_key) { payload = e; }
+                            if use_enc
+                                && encryption::encrypt_into(&payload, &enc_key, &mut scratch_d)
+                                    .is_ok()
+                            {
+                                std::mem::swap(&mut payload, &mut scratch_d);
                             }
                             let remote_addr = last_remote_w.lock().unwrap().map(|sa| msg::UdpAddr {
                                 ip: sa.ip().to_string(),

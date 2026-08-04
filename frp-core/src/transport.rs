@@ -3445,7 +3445,94 @@ pub fn build_tls_connector(
 ///
 /// If cert_file/key_file are provided, present client certificate to server (mTLS).
 #[cfg(feature = "tls")]
+/// Process-local "last connector" cache for [`build_tls_connector_skip_verify`].
+///
+/// Rebuilding a connector re-reads and re-parses PEM files and constructs a
+/// verifier — repeated per dial even though the config is identical. Cache
+/// the most recent one keyed by (path, mtime): a reload that changes the CA
+/// or client-cert files yields a different mtime, so the entry self-invalidates.
+/// `tokio_rustls::TlsConnector` is an `Arc<ClientConfig>` — sharing is free.
+struct ConnectorKey {
+    // (path, mtime) — mtime None means "configured but file missing", which
+    // must stay distinct from "not configured" (None) for cache correctness.
+    ca: Option<(String, Option<std::time::SystemTime>)>,
+    cert: Option<(String, Option<std::time::SystemTime>)>,
+    key: Option<(String, Option<std::time::SystemTime>)>,
+}
+
+impl PartialEq for ConnectorKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ca == other.ca && self.cert == other.cert && self.key == other.key
+    }
+}
+
+fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn non_empty(p: Option<&str>) -> Option<&str> {
+    match p {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    }
+}
+
+fn connector_key(
+    ca_file: Option<&str>,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+) -> ConnectorKey {
+    ConnectorKey {
+        ca: non_empty(ca_file).map(|p| (p.to_string(), file_mtime(p))),
+        cert: non_empty(cert_file).map(|p| (p.to_string(), file_mtime(p))),
+        key: non_empty(key_file).map(|p| (p.to_string(), file_mtime(p))),
+    }
+}
+
+static CONNECTOR_CACHE: std::sync::Mutex<Option<(ConnectorKey, TlsConnector)>> =
+    std::sync::Mutex::new(None);
+
+/// Number of actual connector builds (cache misses). Test-only — lets tests
+/// assert a cache hit did not rebuild.
+#[cfg(test)]
+static CONNECTOR_BUILD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only accessor: how many times the connector was actually rebuilt.
+#[cfg(test)]
+fn connector_build_count() -> usize {
+    CONNECTOR_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Build a TLS client connector with certificate verification skipped when no
+/// CA file is given (InsecureSkipVerify=true, matching Go frp's default for
+/// auto-generated self-signed certs). With `ca_file`, verify against it
+/// (mTLS when client cert/key are also provided). The most recent connector
+/// is cached per (path, mtime) — see [`ConnectorKey`].
 pub fn build_tls_connector_skip_verify(
+    ca_file: Option<&str>,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+) -> Result<TlsConnector, crate::Error> {
+    let key = connector_key(ca_file, cert_file, key_file);
+    if let Some((cached_key, cached)) = CONNECTOR_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        if *cached_key == key {
+            return Ok(cached.clone());
+        }
+    }
+
+    let connector = build_tls_connector_skip_verify_inner(ca_file, cert_file, key_file)?;
+    #[cfg(test)]
+    CONNECTOR_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *CONNECTOR_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, connector.clone()));
+    Ok(connector)
+}
+
+fn build_tls_connector_skip_verify_inner(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
     key_file: Option<&str>,
@@ -3902,6 +3989,63 @@ mod tests {
         assert!(
             err.to_string().contains("WS frame too large"),
             "unexpected error: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod connector_cache_tests {
+    // These run as ONE test: CONNECTOR_CACHE / CONNECTOR_BUILD_COUNT are
+    // process-global statics, so parallel tests would race on them.
+    use super::*;
+
+    fn dummy_ca_pem() -> String {
+        "-----BEGIN CERTIFICATE-----\nMIID\n-----END CERTIFICATE-----\n".to_string()
+    }
+
+    #[test]
+    fn cache_behavior() {
+        // 1) Cache hit: identical args must not rebuild.
+        let before = connector_build_count();
+        let _ = build_tls_connector_skip_verify(None, None, None).unwrap();
+        let _ = build_tls_connector_skip_verify(None, None, None).unwrap();
+        assert_eq!(
+            connector_build_count(),
+            before + 1,
+            "second call with identical args must hit the cache"
+        );
+
+        // 2) mtime change → new key → rebuild.
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, dummy_ca_pem()).unwrap();
+        let ca = ca_path.to_str().unwrap().to_string();
+        let before = connector_build_count();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
+        assert_eq!(
+            connector_build_count(),
+            before + 1,
+            "unchanged CA must hit cache"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&ca_path, dummy_ca_pem()).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
+        assert_eq!(
+            connector_build_count(),
+            before + 2,
+            "changed CA file must rebuild the connector"
+        );
+
+        // 3) A failing build must not be cached (and a missing-file key must
+        //    not collide with the no-CA entry from step 1).
+        let before = connector_build_count();
+        assert!(build_tls_connector_skip_verify(Some("/nonexistent/ca.pem"), None, None).is_err());
+        assert!(build_tls_connector_skip_verify(Some("/nonexistent/ca.pem"), None, None).is_err());
+        assert_eq!(
+            connector_build_count(),
+            before,
+            "failed builds must not be cached"
         );
     }
 }

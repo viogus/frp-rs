@@ -36,19 +36,19 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 ```bash
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~5.1MB), frpc (~4.3MB)
+# → frps (~8.9MB), frpc (~8.0MB)
 
 # Full (all features; dashboard is the only opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~5.3MB), frpc (~4.3MB)
+# → frps (~9.7MB), frpc (~8.0MB)
 
 # Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~3.0MB), frpc-tiny (~2.6MB)
+# → frps-tiny (~5.4MB), frpc-tiny (~4.9MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~1.8MB), frpc-micro (~1.9MB)
+# → frps-micro (~3.5MB), frpc-micro (~3.3MB)
 ```
 
 Feature flags across crates:
@@ -104,7 +104,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 804 passed, 0 failed |
-| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.1MB/frpc ~4.3MB default; ~5.3/4.3 full; frps-tiny ~3.0MB/frpc-tiny ~2.6MB; frps-micro ~1.8MB/frpc-micro ~1.9MB) |
+| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~8.9MB/frpc ~8.0MB default; ~9.7/8.0 full; frps-tiny ~5.4MB/frpc-tiny ~4.9MB; frps-micro ~3.5MB/frpc-micro ~3.3MB — measured 2026-08-05; the earlier ~5.1MB record was stale/inaccurate) |
 | `compat-test.sh` (Go frp v0.70.1) | 72 run_test scenarios + 17 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 9 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
