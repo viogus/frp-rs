@@ -64,7 +64,20 @@ run_case() {
   "$FRPS" -c /tmp/lat-frps.toml & PIDS+=($!)
   sleep 1
   "$FRPC" -c /tmp/lat-frpc.toml & PIDS+=($!)
-  sleep 2
+  # Wait for proxy registration: frps binds remote_port only after the
+  # proxy registers, so a connectable port means the pipeline is ready.
+  local ready=0
+  for i in $(seq 1 10); do
+    if python3 -c "
+import socket
+try:
+    s = socket.create_connection(('127.0.0.1', 18001), timeout=0.3); s.close(); exit(0)
+except Exception: exit(1)
+" 2>/dev/null; then ready=1; break; fi
+    sleep 1
+  done
+  if [ "$ready" != "1" ]; then echo "WARN: proxy port 18001 not ready after 10s"; fi
+  sleep 1
 
   rc=0
   "$STRESS" --scenario latency --mode "$mode" --port "$REMOTE_PORT" \
