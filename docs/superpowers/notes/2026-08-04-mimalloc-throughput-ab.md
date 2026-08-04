@@ -60,6 +60,18 @@ Operational findings during the audit:
 - Background (nohup/pipe) runs of the baseline hung; foreground execution was reliable.
 - The `throughput-baseline.sh` probe-port readiness check (18001 connectable = proxy registered) is load-bearing: without it, `plain` produced 0-byte rows when the client beat proxy registration.
 
-## 5. Baseline staleness concern (open)
+## 5. Baseline re-baselined (2026-08-04, closed)
 
-`scripts/frp-stress/baselines/throughput-Mac.jsonl` records `plain` 1114.7 MB/s (and `mux` 640.9, `tls` 712.0). The same machine at load < 2 reproduces only ~140 MB/s `plain` today, while a direct (no-frp) echo benchmark hits 869 MB/s — the machine's network stack is not the limit. The historical file is suspected to come from a different machine or measurement method (or pre-dates a data-path change) and **should be re-baselined before it is trusted as a gate reference**. Re-baselining requires a dedicated idle machine; do not block on it.
+`scripts/frp-stress/baselines/throughput-Mac.jsonl` previously recorded `plain` 1114.7 MB/s (`mux` 640.9, `tls` 712.0). The same machine at load < 3 reproduces only ~148 MB/s `plain` today while a direct (no-frp) echo benchmark hits ~865 MB/s — the machine's network stack is not the limit. The historical file came from a different machine or measurement method (or pre-dates a data-path change) and is **not** a valid gate reference.
+
+Re-baselined 2026-08-04 with the fixed tooling (commits `2461cb8`, `4d27b5d`):
+
+- **throughput-Mac.jsonl** (load ~2.4 window): plain 148.0 / encrypt 129.4 / compress 244.2 / encrypt_compress 241.6 / mux 79.7 / tls 147.9 MB/s
+- **latency-Mac.jsonl** (2000 samples): steady p50=304µs p99=735µs; setup_cold p50=1993µs p99=2948µs; setup_warm p50=1608µs p99=3023µs
+
+Baseline script fixes that made the numbers trustworthy:
+
+- `2461cb8` probe remote_port before measuring — frps binds the port only after proxy registration; the old fixed 2s sleep raced registration and produced 0-byte / refused rows
+- `4d27b5d` export `RUST_LOG=warn` — yamux logs one line per frame at INFO and throttles the bridge when stderr is a pipe
+
+Gate rule stays: any config dropping >5% vs these committed files rejects the change. Note the values are host-specific; regenerate on the reference machine before judging cross-machine diffs.
