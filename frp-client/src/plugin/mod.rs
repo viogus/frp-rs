@@ -19,6 +19,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 mod context;
+#[cfg(feature = "tls")]
+mod h2;
 mod http;
 mod http2http;
 mod http2https;

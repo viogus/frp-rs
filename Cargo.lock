@@ -1131,10 +1131,13 @@ version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
+ "bytes",
  "data-encoding",
  "frp-core",
  "frp-server",
  "frp-vnet",
+ "h2",
+ "http",
  "md-5",
  "rand 0.8.6",
  "rcgen",

@@ -27,13 +27,16 @@ axum = { workspace = true, optional = true }
 toml.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
+h2 = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 rand.workspace = true
 data-encoding.workspace = true
 
 [features]
 default = ["tls", "kcp", "quic", "websocket", "oidc", "vnet", "admin", "compression", "chacha20", "tcp-mux"]
 admin = ["dep:axum", "frp-core/admin-auth"]
-tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls"]
+tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls", "dep:h2", "dep:http", "dep:bytes"]
 quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
 websocket = ["frp-core/websocket"]

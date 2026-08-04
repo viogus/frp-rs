@@ -95,8 +95,12 @@ but not literally 100% — see "Known limitations" below.
   clients are decoded with the `h2` crate, forwarded to providers as plain
   HTTP/1.1, and backend HTTP/1.1 responses (including chunked bodies) are
   re-encoded as HTTP/2 — matching Go's `httputil.ReverseProxy` semantics.
-- **HTTP plugin `enableHTTP2`**: parsed but not honored — the tunnel bridge is
-  byte-oriented; clients automatically fall back to HTTP/1.1.
+- **HTTP plugin `enableHTTP2`**: honored on `https2http` / `https2https` (Go
+  parity: defaults to true, advertises ALPN `h2` on the TLS listener; inbound
+  h2 requests are decoded with the `h2` crate and forwarded to the backend as
+  plain HTTP/1.1 — matching Go's `http.Server` + `httputil.ReverseProxy`
+  semantics; `false` restricts the listener to HTTP/1.1). `http2http` /
+  `http2https` are plaintext HTTP/1.1 only and have no such field (Go parity).
 - **`pprof` endpoints**: `/debug/pprof/*` is a placeholder (no Go-style CPU
   profiles); `/healthz` and pprof are outside auth, matching Go.
 - **UDP bandwidth limiting**: Go v0.70.1's UDP forwarder has no limiter, so

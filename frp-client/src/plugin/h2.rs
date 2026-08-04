@@ -1,0 +1,628 @@
+//! HTTP/2 (TLS ALPN `h2`) support for the `https2http` / `https2https` plugins.
+//!
+//! Go frp's `https2http` / `https2https` plugins accept HTTP/2 clients on the
+//! TLS listener when `enableHTTP2` is not explicitly `false` (default `true`):
+//! `net/http` negotiates h2 via ALPN and `httputil.ReverseProxy` forwards each
+//! request to the backend as plain HTTP/1.1 (with `requestHeaders` injection
+//! and `hostHeaderRewrite`). The byte-level plugin bridge cannot decode h2
+//! frames, so this module implements the h2 path on top of the `h2` crate —
+//! the same approach as the server-side h2c vhost path
+//! (`frp-server/src/vhost_h2c.rs`): decode inbound h2 requests, forward to the
+//! backend as HTTP/1.1, and re-encode the backend's HTTP/1.1 response
+//! (including chunked decoding) as h2 frames.
+//!
+//! `http2http` / `http2https` are unaffected: Go defines no `enableHTTP2`
+//! field on those options (plaintext inbound, HTTP/1.1 only).
+
+use std::collections::HashMap;
+
+use bytes::Bytes;
+use h2::server::SendResponse;
+use h2::{RecvStream, SendStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tracing::debug;
+
+use frp_core::transport::set_nodelay;
+
+/// Backend the h2 request is forwarded to. `https2http` uses plain TCP;
+/// `https2https` wraps it in TLS (Go https2https.go connects with
+/// `InsecureSkipVerify=true`, see the plugin's connector construction).
+#[derive(Clone)]
+pub(crate) enum Backend {
+    Plain {
+        host: String,
+        port: u16,
+    },
+    Tls {
+        connector: tokio_rustls::TlsConnector,
+        host: String,
+        port: u16,
+    },
+}
+
+type DynStream = Box<dyn DynIo>;
+
+trait DynIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> DynIo for T {}
+
+/// Serve one inbound TLS connection whose ALPN negotiated `h2`.
+pub(crate) async fn serve_h2_connection<S>(
+    stream: S,
+    target: String,
+    host_rewrite: String,
+    request_headers: HashMap<String, String>,
+    backend: Backend,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut connection: h2::server::Connection<S, Bytes> = match h2::server::Builder::new()
+        // Bound concurrent streams like Go's http.Server (default 250) to
+        // cap per-connection memory (same as the vhost h2c path).
+        .max_concurrent_streams(100)
+        .handshake(stream)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(error = %e, "https plugin h2 handshake failed");
+            return;
+        }
+    };
+
+    loop {
+        match connection.accept().await {
+            Some(Ok((request, respond))) => {
+                let target = target.clone();
+                let host_rewrite = host_rewrite.clone();
+                let request_headers = request_headers.clone();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_stream(
+                        request,
+                        respond,
+                        &target,
+                        &host_rewrite,
+                        &request_headers,
+                        backend,
+                    )
+                    .await
+                    {
+                        debug!(error = %e, "https plugin h2 stream error");
+                    }
+                });
+            }
+            Some(Err(e)) => {
+                debug!(error = %e, "https plugin h2 connection error");
+                break;
+            }
+            None => break,
+        }
+    }
+}
+
+/// Handle one HTTP/2 stream: forward to the backend as plain HTTP/1.1 and
+/// re-encode the backend's response (with chunked decoding) as h2 frames.
+async fn handle_stream(
+    request: http::Request<RecvStream>,
+    respond: SendResponse<Bytes>,
+    target: &str,
+    host_rewrite: &str,
+    request_headers: &HashMap<String, String>,
+    backend: Backend,
+) -> Result<(), h2::Error> {
+    let has_content_length = request.headers().contains_key("content-length");
+    let head = build_http1_request_head(&request, host_rewrite, request_headers);
+
+    // A refused/unreachable backend answers 502 (Go ReverseProxy ErrorHandler).
+    let remote = match connect_backend(&backend).await {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(target = %target, error = %e, "https plugin h2 backend connect failed");
+            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        }
+    };
+
+    // Forward the h2 request body on a separate task so a slow upload cannot
+    // block reading the backend's (possibly early) response — Go ReverseProxy
+    // streams both directions concurrently (vhost_h2c uses the same pattern
+    // through a duplex pair). A head without Content-Length was emitted with
+    // `Transfer-Encoding: chunked` (Go http.Transport behavior for
+    // unknown-length bodies), so body bytes are framed accordingly.
+    let (mut remote_r, mut remote_w) = tokio::io::split(remote);
+    let mut body = request.into_body();
+    let end_stream = body.is_end_stream();
+    let body_task = tokio::spawn(async move {
+        if remote_w.write_all(&head).await.is_err() {
+            return;
+        }
+        while let Some(Ok(data)) = body.data().await {
+            let len = data.len();
+            if !data.is_empty() {
+                if has_content_length {
+                    if remote_w.write_all(&data).await.is_err() {
+                        return;
+                    }
+                } else {
+                    let frame = format!("{:X}\r\n", len);
+                    if remote_w.write_all(frame.as_bytes()).await.is_err()
+                        || remote_w.write_all(&data).await.is_err()
+                        || remote_w.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            let _ = body.flow_control().release_capacity(len);
+        }
+        if !has_content_length && !end_stream {
+            // Stream had an open body: terminate the chunked framing.
+            let _ = remote_w.write_all(b"0\r\n\r\n").await;
+        }
+        let _ = remote_w.flush().await;
+        let _ = remote_w.shutdown().await;
+    });
+
+    // Read the backend's HTTP/1.1 response and re-encode it as h2. Once the
+    // response is fully relayed the body forwarder has served its purpose —
+    // stop it so the h2 stream can wind down even if the client is still
+    // trickling request bytes (same as vhost_h2c).
+    let result = stream_h2_response(&mut remote_r, respond).await;
+    body_task.abort();
+    result
+}
+
+async fn connect_backend(backend: &Backend) -> std::io::Result<DynStream> {
+    match backend {
+        Backend::Plain { host, port } => {
+            let s = TcpStream::connect((host.as_str(), *port)).await?;
+            set_nodelay(&s);
+            Ok(Box::new(s))
+        }
+        Backend::Tls {
+            connector,
+            host,
+            port,
+        } => {
+            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+            set_nodelay(&tcp);
+            let server_name =
+                rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad backend hostname")
+                })?;
+            let tls = connector.connect(server_name, tcp).await?;
+            Ok(Box::new(tls))
+        }
+    }
+}
+
+/// Hop-by-hop headers dropped when converting between HTTP/1.1 and HTTP/2
+/// (RFC 7540 §8.1.2.2 forbids them; Go's net/http drops them too).
+fn is_hop_by_hop(name: &str) -> bool {
+    const HOP: [&str; 5] = [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Re-encode an h2 request as an HTTP/1.1 request head with the plugin's
+/// `request_headers` injected (Go `Header.Set` semantics: an existing header
+/// with the same name is replaced) and `host_header_rewrite` applied. A body
+/// without Content-Length is forwarded with `Transfer-Encoding: chunked` (Go
+/// http.Transport behavior for unknown-length bodies).
+fn build_http1_request_head(
+    request: &http::Request<RecvStream>,
+    host_rewrite: &str,
+    request_headers: &HashMap<String, String>,
+) -> Vec<u8> {
+    let mut head = Vec::with_capacity(512);
+    head.extend_from_slice(request.method().as_str().as_bytes());
+    head.push(b' ');
+    let target = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    head.extend_from_slice(target.as_bytes());
+    head.extend_from_slice(b" HTTP/1.1\r\n");
+
+    let has_content_length = request.headers().contains_key("content-length");
+    for (name, value) in request.headers() {
+        let n = name.as_str();
+        if is_hop_by_hop(n) || n.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        // Skip headers that request_headers will override (Go Header.Set).
+        if request_headers.keys().any(|k| k.eq_ignore_ascii_case(n)) {
+            continue;
+        }
+        // Guard against HTTP header injection via h2 header values — Go's
+        // http.Transport rejects CR/LF in header values.
+        if value.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+            continue;
+        }
+        head.extend_from_slice(n.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    // Host: host_header_rewrite wins; "host" in request_headers is skipped
+    // (Go's Header.Set cannot set Host — it is controlled by
+    // hostHeaderRewrite or the original request); else the `:authority`.
+    let host_value = if !host_rewrite.is_empty() {
+        Some(host_rewrite.as_bytes())
+    } else {
+        request.uri().authority().map(|a| a.as_str().as_bytes())
+    };
+    if let Some(h) = host_value {
+        head.extend_from_slice(b"Host: ");
+        head.extend_from_slice(h);
+        head.extend_from_slice(b"\r\n");
+    }
+    // Inject configured request headers (Go rewriteHTTPPluginRequest).
+    for (k, v) in request_headers {
+        if k.eq_ignore_ascii_case("host") || is_hop_by_hop(k) {
+            continue;
+        }
+        if v.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+            continue;
+        }
+        head.extend_from_slice(k.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(v.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    if !has_content_length {
+        if request.body().is_end_stream() {
+            head.extend_from_slice(b"Content-Length: 0\r\n");
+        } else {
+            head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        }
+    }
+    head.extend_from_slice(b"Connection: close\r\n\r\n");
+    head
+}
+
+/// Send a body-less (or single-chunk) HTTP/2 error response.
+async fn send_h2_error(
+    mut respond: SendResponse<Bytes>,
+    status: u16,
+    extra: &[(&str, &str)],
+    body: Bytes,
+) -> Result<(), h2::Error> {
+    let mut resp = http::Response::builder().status(status).body(()).unwrap();
+    for &(k, v) in extra {
+        let name = http::header::HeaderName::from_bytes(k.as_bytes()).unwrap();
+        resp.headers_mut()
+            .insert(name, http::HeaderValue::from_str(v).unwrap());
+    }
+    if body.is_empty() {
+        respond.send_response(resp, true)?;
+        return Ok(());
+    }
+    resp.headers_mut()
+        .insert("content-type", http::HeaderValue::from_static("text/html"));
+    let mut send = respond.send_response(resp, false)?;
+    send.send_data(body, true)?;
+    Ok(())
+}
+
+/// Read bytes until the end of the HTTP/1.1 response head (`\r\n\r\n`),
+/// returning head + any body bytes that arrived with it.
+async fn read_until_head(r: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            return Ok(buf);
+        }
+        // Guard against a malicious backend with unbounded headers.
+        if buf.len() > 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "response head exceeds 1 MiB",
+            ));
+        }
+        let n = r.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before response head",
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// Parsed HTTP/1.1 response head.
+struct ParsedHead {
+    status: u16,
+    headers: Vec<(http::HeaderName, http::HeaderValue)>,
+    /// Offset into the original head buffer where the body begins.
+    body_offset: usize,
+}
+
+fn trim_ascii_ws(mut b: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = b.split_first() {
+        if first == b' ' || first == b'\t' {
+            b = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&last, rest)) = b.split_last() {
+        if last == b' ' || last == b'\t' {
+            b = rest;
+        } else {
+            break;
+        }
+    }
+    b
+}
+
+fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
+    let head_end = head.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let head_bytes = &head[..head_end];
+    let first_crlf = head_bytes.windows(2).position(|w| w == b"\r\n")?;
+    let status_line = std::str::from_utf8(&head_bytes[..first_crlf]).ok()?;
+    let mut parts = status_line.split_whitespace();
+    parts.next()?; // HTTP/1.1
+    let status: u16 = parts.next()?.parse().ok()?;
+
+    let mut headers = Vec::new();
+    for line in head_bytes[first_crlf + 2..head_end - 2].split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = trim_ascii_ws(line);
+        if line.is_empty() {
+            continue;
+        }
+        let colon = line.iter().position(|&b| b == b':')?;
+        let name = std::str::from_utf8(&line[..colon]).ok()?;
+        let value = std::str::from_utf8(trim_ascii_ws(&line[colon + 1..])).ok()?;
+        if let (Ok(n), Ok(v)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            headers.push((n, v));
+        }
+    }
+    Some(ParsedHead {
+        status,
+        headers,
+        body_offset: head_end,
+    })
+}
+
+fn header_value<'a>(
+    headers: &'a [(http::HeaderName, http::HeaderValue)],
+    name: &str,
+) -> Option<&'a http::HeaderValue> {
+    headers
+        .iter()
+        .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
+fn parse_hex(b: &[u8]) -> std::io::Result<usize> {
+    let s = std::str::from_utf8(b)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
+    usize::from_str_radix(s.trim(), 16)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))
+}
+
+/// Incremental response-body reader that starts with the bytes that arrived
+/// together with the response head.
+struct BodyReader<'a, R: AsyncRead + Unpin> {
+    inner: &'a mut R,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl<'a, R: AsyncRead + Unpin> BodyReader<'a, R> {
+    fn new(inner: &'a mut R, initial: Vec<u8>) -> Self {
+        Self {
+            inner,
+            buf: initial,
+            pos: 0,
+        }
+    }
+
+    fn available(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos += n;
+    }
+
+    /// Append more bytes from the inner stream. Returns `Ok(false)` on EOF.
+    async fn read_more(&mut self) -> std::io::Result<bool> {
+        if self.pos > 0 && self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        }
+        let mut tmp = [0u8; 8192];
+        let n = self.inner.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        self.buf.extend_from_slice(&tmp[..n]);
+        Ok(true)
+    }
+
+    async fn read_exact(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(n.min(8192));
+        while out.len() < n {
+            if self.available().is_empty() && !self.read_more().await? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "eof in response body",
+                ));
+            }
+            let take = (n - out.len()).min(self.available().len());
+            out.extend_from_slice(&self.available()[..take]);
+            self.consume(take);
+        }
+        Ok(out)
+    }
+
+    /// Read one CRLF (or LF) terminated line including its terminator.
+    async fn read_line(&mut self) -> std::io::Result<Vec<u8>> {
+        loop {
+            let avail = self.available();
+            if let Some(rel) = avail.windows(2).position(|w| w == b"\r\n") {
+                let line = avail[..rel + 2].to_vec();
+                self.consume(rel + 2);
+                return Ok(line);
+            }
+            if let Some(rel) = avail.iter().position(|&b| b == b'\n') {
+                let line = avail[..rel + 1].to_vec();
+                self.consume(rel + 1);
+                return Ok(line);
+            }
+            if !self.read_more().await? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "eof in chunk line",
+                ));
+            }
+        }
+    }
+}
+
+fn is_blank_line(b: &[u8]) -> bool {
+    b.iter().all(|&c| matches!(c, b'\r' | b'\n' | b' ' | b'\t'))
+}
+
+/// Decode a chunked response body and stream it as HTTP/2 DATA frames.
+/// Read errors truncate the body (Go treats an aborted backend body as EOF).
+async fn stream_chunked_body(
+    reader: &mut BodyReader<'_, impl AsyncRead + Unpin>,
+    send: &mut SendStream<Bytes>,
+) -> Result<(), h2::Error> {
+    loop {
+        let line = match reader.read_line().await {
+            Ok(l) => l,
+            Err(_) => return Ok(()),
+        };
+        let mut line = line.as_slice();
+        if line.ends_with(b"\r\n") {
+            line = &line[..line.len() - 2];
+        } else if line.ends_with(b"\n") {
+            line = &line[..line.len() - 1];
+        }
+        let line = trim_ascii_ws(line);
+        if line.is_empty() {
+            continue;
+        }
+        // Drop chunk extensions ("size;ext=val").
+        let size_part = line.split(|&b| b == b';').next().unwrap_or(line);
+        let size = match parse_hex(trim_ascii_ws(size_part)) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+        if size == 0 {
+            // Trailing headers until the final blank line (RFC 7230 §4.1.2).
+            loop {
+                match reader.read_line().await {
+                    Ok(t) if !is_blank_line(&t) => continue,
+                    Ok(_) | Err(_) => break,
+                }
+            }
+            return Ok(());
+        }
+        let data = match reader.read_exact(size).await {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+        if reader.read_exact(2).await.is_err() {
+            return Ok(()); // missing trailing CRLF
+        }
+        send.send_data(Bytes::from(data), false)?;
+    }
+}
+
+/// Read the backend HTTP/1.1 response from `r`, send the HTTP/2 response head,
+/// then stream the body (decoding chunked transfer-encoding) as HTTP/2 DATA
+/// frames. A backend that closes before the head produces `502 Bad Gateway`
+/// (Go ReverseProxy semantics).
+async fn stream_h2_response<R: AsyncRead + Unpin>(
+    r: &mut R,
+    mut respond: SendResponse<Bytes>,
+) -> Result<(), h2::Error> {
+    let head = match read_until_head(r).await {
+        Ok(h) => h,
+        Err(_e) => {
+            debug!("https plugin backend closed before response head, sending 502");
+            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        }
+    };
+    let Some(parsed) = parse_response_head(&head) else {
+        debug!("https plugin backend sent a malformed response head, sending 502");
+        return send_h2_error(respond, 502, &[], Bytes::new()).await;
+    };
+    let ParsedHead {
+        status,
+        headers,
+        body_offset,
+    } = parsed;
+
+    let mut resp = http::Response::builder().status(status).body(()).unwrap();
+    for (n, v) in &headers {
+        if is_hop_by_hop(n.as_str()) {
+            continue;
+        }
+        resp.headers_mut().insert(n.clone(), v.clone());
+    }
+
+    let content_length = header_value(&headers, "content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+    let chunked = header_value(&headers, "transfer-encoding")
+        .map(|v| {
+            v.to_str()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .contains("chunked")
+        })
+        .unwrap_or(false);
+
+    let mut send = respond.send_response(resp, false)?;
+    let mut reader = BodyReader::new(r, head[body_offset..].to_vec());
+
+    if chunked {
+        stream_chunked_body(&mut reader, &mut send).await?;
+    } else if let Some(mut remaining) = content_length {
+        while remaining > 0 {
+            let n = remaining.min(8192);
+            let data = match reader.read_exact(n).await {
+                Ok(d) => d,
+                Err(_) => break, // truncated body
+            };
+            remaining -= data.len();
+            send.send_data(Bytes::from(data), false)?;
+        }
+    } else {
+        // No length framing: read to EOF (the backend closes the connection).
+        loop {
+            if reader.available().is_empty() {
+                match reader.read_more().await {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            if reader.available().is_empty() {
+                break;
+            }
+            let data = reader.available().to_vec();
+            reader.consume(data.len());
+            send.send_data(Bytes::from(data), false)?;
+        }
+    }
+    send.send_data(Bytes::new(), true)?;
+    Ok(())
+}

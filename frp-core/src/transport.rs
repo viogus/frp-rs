@@ -3134,7 +3134,23 @@ pub fn build_tls_acceptor(
     key_file: &str,
     ca_file: Option<&str>,
 ) -> Result<TlsAcceptor, crate::Error> {
-    let config = build_tls_server_config(cert_file, key_file, ca_file)?;
+    build_tls_acceptor_with_alpn(cert_file, key_file, ca_file, &[])
+}
+
+/// Like [`build_tls_acceptor`], but advertises the given ALPN protocols to
+/// clients (e.g. `b"h2"`, `b"http/1.1"`). An empty slice leaves the
+/// `rustls::ServerConfig` ALPN list untouched (no ALPN advertised).
+#[cfg(feature = "tls")]
+pub fn build_tls_acceptor_with_alpn(
+    cert_file: &str,
+    key_file: &str,
+    ca_file: Option<&str>,
+    alpn: &[&[u8]],
+) -> Result<TlsAcceptor, crate::Error> {
+    let mut config = build_tls_server_config(cert_file, key_file, ca_file)?;
+    if !alpn.is_empty() {
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    }
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 

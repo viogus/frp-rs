@@ -990,7 +990,12 @@ pub struct PluginConfig {
     /// Go frp compat: requestHeaders.set.
     #[serde(default)]
     pub request_headers: std::collections::HashMap<String, String>,
-    /// Enable HTTP/2 for the plugin tunnel (https2http/https2https).
+    /// Enable HTTP/2 for the plugin TLS listener (https2http/https2https).
+    /// Defaults to true (Go frp's `Complete()` backfills nil → true): the
+    /// listener advertises ALPN `h2` + `http/1.1` and inbound h2 requests are
+    /// decoded and forwarded to the backend as HTTP/1.1. `false` restricts
+    /// the listener to HTTP/1.1. http2http/http2https have no such field
+    /// (plaintext inbound, HTTP/1.1 only) — Go parity.
     /// Go frp compat: enableHTTP2.
     #[serde(default, alias = "enableHTTP2")]
     pub enable_http2: Option<bool>,

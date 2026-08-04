@@ -20,8 +20,10 @@ use tracing::debug;
 
 use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
-use frp_core::transport::build_tls_acceptor;
+use frp_core::transport::build_tls_acceptor_with_alpn;
 
+#[cfg(feature = "tls")]
+use super::h2::{serve_h2_connection, Backend};
 #[cfg(feature = "tls")]
 use super::serve_plugin;
 #[cfg(feature = "tls")]
@@ -45,14 +47,39 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
     }
     let host_rewrite = cfg.host_header_rewrite.clone();
     let request_headers = cfg.request_headers.clone();
-    let tls_acceptor = build_tls_acceptor(&cfg.crt_file, &cfg.key_file, None)?;
+    // Go frp compat: enableHTTP2 defaults to true and only exists on the
+    // https2http/https2https options — it controls whether the TLS listener
+    // negotiates h2 via ALPN (http2http/http2https are plaintext HTTP/1.1
+    // only and have no such field).
+    let enable_h2 = cfg.enable_http2 != Some(false);
+    let alpn: &[&[u8]] = if enable_h2 {
+        &[b"h2", b"http/1.1"]
+    } else {
+        &[b"http/1.1"]
+    };
+    let tls_acceptor = build_tls_acceptor_with_alpn(&cfg.crt_file, &cfg.key_file, None, alpn)?;
+    let (backend_host, backend_port) = split_host_port(&target_addr);
+    let backend_host = backend_host.to_string();
     serve_plugin(
         "https2http",
-        (target_addr, host_rewrite, request_headers, tls_acceptor),
-        |tcp, peer, (target, rewrite, headers, acceptor)| async move {
+        (
+            target_addr,
+            host_rewrite,
+            request_headers,
+            tls_acceptor,
+            backend_host,
+            backend_port,
+            enable_h2,
+        ),
+        |tcp, peer, (target, rewrite, headers, acceptor, host, port, enable_h2)| async move {
             match acceptor.accept(tcp).await {
                 Ok(tls) => {
-                    if let Err(e) = handle_conn(tls, &target, &rewrite, &headers).await {
+                    // ALPN h2 negotiated → decode h2 frames and forward to the
+                    // backend as HTTP/1.1 (Go http.Server + ReverseProxy).
+                    if enable_h2 && tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                        let backend = Backend::Plain { host, port };
+                        serve_h2_connection(tls, target, rewrite, headers, backend).await;
+                    } else if let Err(e) = handle_conn(tls, &target, &rewrite, &headers).await {
                         debug!(%peer, error = %e, "https2http: {peer} error: {e}");
                     }
                 }

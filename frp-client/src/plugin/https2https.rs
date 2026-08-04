@@ -23,8 +23,10 @@ use tracing::debug;
 
 use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
-use frp_core::transport::{build_tls_acceptor, build_tls_connector_skip_verify};
+use frp_core::transport::{build_tls_acceptor_with_alpn, build_tls_connector_skip_verify};
 
+#[cfg(feature = "tls")]
+use super::h2::{serve_h2_connection, Backend};
 #[cfg(feature = "tls")]
 use super::serve_plugin;
 #[cfg(feature = "tls")]
@@ -48,12 +50,22 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
     }
     let host_rewrite = cfg.host_header_rewrite.clone();
     let request_headers = cfg.request_headers.clone();
-    let tls_acceptor = build_tls_acceptor(&cfg.crt_file, &cfg.key_file, None)?;
+    // Go frp compat: enableHTTP2 defaults to true, controls ALPN h2 on the
+    // inbound TLS listener only (outbound is always HTTP/1.1).
+    let enable_h2 = cfg.enable_http2 != Some(false);
+    let alpn: &[&[u8]] = if enable_h2 {
+        &[b"h2", b"http/1.1"]
+    } else {
+        &[b"http/1.1"]
+    };
+    let tls_acceptor = build_tls_acceptor_with_alpn(&cfg.crt_file, &cfg.key_file, None, alpn)?;
     // Go frp compat (https2https.go:45): the HTTPS backend is connected with
     // InsecureSkipVerify — frp does not validate the backend certificate.
     let tls_connector = build_tls_connector_skip_verify(None, None, None).map_err(|e| {
         frp_core::Error::Transport(format!("https2https plugin: TLS connector: {e}").into())
     })?;
+    let (backend_host, backend_port) = split_host_port(&target_addr);
+    let backend_host = backend_host.to_string();
     serve_plugin(
         "https2https",
         (
@@ -62,17 +74,30 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
             request_headers,
             tls_acceptor,
             tls_connector,
+            backend_host,
+            backend_port,
+            enable_h2,
         ),
-        |tcp, peer, (target, rewrite, headers, acceptor, connector)| async move {
-            match acceptor.accept(tcp).await {
-                Ok(client_tls) => {
-                    if let Err(e) =
-                        handle_conn(client_tls, &target, &rewrite, &headers, &connector).await
-                    {
-                        debug!(%peer, error = %e, "https2https: {peer} error: {e}");
+        |tcp, peer, (target, rewrite, headers, acceptor, connector, host, port, enable_h2)| {
+            async move {
+                match acceptor.accept(tcp).await {
+                    Ok(client_tls) => {
+                        if enable_h2 && client_tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                            let backend = Backend::Tls {
+                                connector,
+                                host,
+                                port,
+                            };
+                            serve_h2_connection(client_tls, target, rewrite, headers, backend)
+                                .await;
+                        } else if let Err(e) =
+                            handle_conn(client_tls, &target, &rewrite, &headers, &connector).await
+                        {
+                            debug!(%peer, error = %e, "https2https: {peer} error: {e}");
+                        }
                     }
+                    Err(e) => debug!(%peer, %e, "https2https: {peer} TLS accept error: {e}"),
                 }
-                Err(e) => debug!(%peer, %e, "https2https: {peer} TLS accept error: {e}"),
             }
         },
     )
