@@ -1387,7 +1387,7 @@ mod tests {
         let pkt = make_push(0x2222_2222, 0, 0, 0, b"x");
         match b.input(&pkt) {
             Err(Error::ConvInconsistent(0x1111_1111, 0x2222_2222)) => {}
-            other => panic!("expected ConvInconsistent, got {:?}", other.map(|n| n)),
+            other => panic!("expected ConvInconsistent, got {:?}", other),
         }
     }
 
@@ -1404,7 +1404,7 @@ mod tests {
             }
             other => panic!(
                 "expected InvalidSegmentDataSize, got {:?}",
-                other.map(|n| n)
+                other
             ),
         }
     }
@@ -1429,7 +1429,7 @@ mod tests {
             }
             other => panic!(
                 "expected InvalidSegmentDataSize from second segment, got {:?}",
-                other.map(|n| n)
+                other
             ),
         }
     }

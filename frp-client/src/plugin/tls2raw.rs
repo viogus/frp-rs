@@ -30,7 +30,9 @@
 
 use frp_core::config::PluginConfig;
 
-use super::{serve_plugin, PluginHandle};
+#[cfg(feature = "tls")]
+use super::serve_plugin;
+use super::PluginHandle;
 
 #[cfg(feature = "tls")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
