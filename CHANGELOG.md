@@ -4,6 +4,14 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **UDP proxy zero-alloc data path**: per-packet encrypt/decrypt/compress/
+  decompress now reuse session-scoped scratch buffers (frp-core `*_into`
+  variants, byte-identical wire output) instead of allocating up to 4 Vecs
+  per packet; snap's FrameEncoder/Decoder stay per-packet because UDP
+  packets are independent snappy streams on the Go wire.
+- **TLS client connector cached** per (path, mtime): every dial previously
+  re-read + re-parsed the PEM files and rebuilt the rustls verifier; the
+  last connector is now shared (Arc) until a CA/cert file changes.
 - **XTCP QUIC Go-visitor interop**: vendored rustls 0.23.41
   (`vendor/rustls`, `[patch.crates-io]`) with a one-line server-side patch
   that treats an invalid TLS SNI as "no SNI" — Go frp v0.70.1 QUIC visitors

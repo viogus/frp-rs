@@ -198,7 +198,9 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Decompress into an existing buffer, reusing its allocation.
-/// Output identical to [`decompress`].
+/// Output identical to [`decompress`]. On error the buffer may hold partial
+/// output — callers must only use it after `Ok` (the UDP ping-pong callers
+/// swap only on `is_ok()`).
 #[cfg(feature = "compression")]
 pub fn decompress_into(data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     use snap::read::FrameDecoder;
