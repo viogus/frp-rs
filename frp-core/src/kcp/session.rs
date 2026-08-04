@@ -898,7 +898,7 @@ mod tests {
 
         // Build a raw KCP packet (not FEC format, but valid KCP header).
         // KCP header: conv(4B) + cmd(1B) + frg(1B) + wnd(2B) + ...
-        // All zeros = conv=0, cmd=0 (PUSH), frg=0 — will not cause panic.
+        // All zeros = conv=0, cmd=0 (invalid — PUSH is 0x51), frg=0 — will not cause panic.
         let raw_pkt = [0u8; 24]; // minimum KCP header size
                                  // This may or may not produce an error from kcp (depends on internal
                                  // validation), but it should NOT panic.

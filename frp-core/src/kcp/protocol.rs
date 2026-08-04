@@ -752,7 +752,9 @@ impl<Output> Kcp<Output> {
                 }
                 self.incr += (mss * mss) / self.incr + (mss / 16);
                 if (self.cwnd as usize + 1) * mss <= self.incr {
-                    self.cwnd = self.incr.div_ceil(mss) as u16;
+                    // kcp-go uses floor division here; div_ceil would over-inflate
+                    // cwnd by up to one MSS per round in congestion avoidance.
+                    self.cwnd = (self.incr / mss) as u16;
                 }
             }
             if self.cwnd > self.rmt_wnd {
@@ -1083,6 +1085,9 @@ impl<Output: Write> Kcp<Output> {
                 snd_segment.resendts = self.current + snd_segment.rto + rtomin;
             } else if snd_segment.fastack >= resent {
                 // ── fast retransmit (kcp-go: before RTO) ──
+                // xmit <= fastlimit gate is kept to match the vendored C-port
+                // behavior (kcp-go v5.6.13 dropped it; keeping it preserves the
+                // pre-existing interop behavior with Go peers).
                 if snd_segment.xmit <= self.fastlimit || self.fastlimit == 0 {
                     need_send = true;
                     snd_segment.xmit += 1;
@@ -1383,6 +1388,49 @@ mod tests {
         match b.input(&pkt) {
             Err(Error::ConvInconsistent(0x1111_1111, 0x2222_2222)) => {}
             other => panic!("expected ConvInconsistent, got {:?}", other.map(|n| n)),
+        }
+    }
+
+    #[test]
+    fn input_rejects_oversized_push_segment() {
+        let mut b = Kcp::new(0x1122_3344, PacketWriter::default());
+        let mss = b.mss;
+        let big = vec![0xAB; mss + 1];
+        let pkt = make_push(0x1122_3344, 0, 0, 0, &big);
+        match b.input(&pkt) {
+            Err(Error::InvalidSegmentDataSize(expected, actual)) => {
+                assert_eq!(expected, mss);
+                assert_eq!(actual, mss + 1);
+            }
+            other => panic!(
+                "expected InvalidSegmentDataSize, got {:?}",
+                other.map(|n| n)
+            ),
+        }
+    }
+
+    #[test]
+    fn input_accepts_zero_len_push_heartbeat() {
+        let mut b = Kcp::new(0x1122_3344, PacketWriter::default());
+        let pkt = make_push(0x1122_3344, 0, 0, 0, b"");
+        b.input(&pkt).expect("zero-length PUSH must be accepted");
+    }
+
+    #[test]
+    fn input_validates_each_segment_in_multi_segment_datagram() {
+        let mut b = Kcp::new(0x1122_3344, PacketWriter::default());
+        let mss = b.mss;
+        let mut pkt = make_push(0x1122_3344, 0, 0, 0, b"hello");
+        pkt.extend(make_push(0x1122_3344, 1, 0, 0, &vec![0xCD; mss + 1]));
+        match b.input(&pkt) {
+            Err(Error::InvalidSegmentDataSize(expected, actual)) => {
+                assert_eq!(expected, mss);
+                assert_eq!(actual, mss + 1);
+            }
+            other => panic!(
+                "expected InvalidSegmentDataSize from second segment, got {:?}",
+                other.map(|n| n)
+            ),
         }
     }
 
