@@ -239,6 +239,14 @@ impl ClientRegistry {
         let clients = self.clients.read_ok();
         clients.get(key).cloned()
     }
+
+    /// Look up a client by its run_id (via the secondary run_id→key index).
+    pub fn get_by_run_id(&self, run_id: &str) -> Option<ClientInfo> {
+        let idx = self.run_index.read_ok();
+        let key = idx.get(run_id)?;
+        let clients = self.clients.read_ok();
+        clients.get(key).cloned()
+    }
 }
 
 impl Default for ClientRegistry {
