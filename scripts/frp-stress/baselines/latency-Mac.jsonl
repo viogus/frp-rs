@@ -1,3 +1,3 @@
-{"label":"steady","max_us":442.75,"mean_us":107.547158,"mode":"steady","msg_bytes":64,"p50_us":95.375,"p95_us":164.708,"p99_us":265.417,"samples":2000}
-{"label":"setup_cold","max_us":1373.084,"mean_us":281.457763,"mode":"setup","msg_bytes":64,"p50_us":255.375,"p95_us":387.75,"p99_us":588.083,"samples":2000}
-{"label":"setup_warm","max_us":3219.708,"mean_us":222.89233850000002,"mode":"setup","msg_bytes":64,"p50_us":199.084,"p95_us":308.708,"p99_us":501.666,"samples":2000}
+{"label":"steady","max_us":1424.625,"mean_us":319.300908,"mode":"steady","msg_bytes":64,"p50_us":304.333,"p95_us":347.125,"p99_us":734.5,"samples":2000}
+{"label":"setup_cold","max_us":14827.25,"mean_us":1961.168838,"mode":"setup","msg_bytes":64,"p50_us":1993.167,"p95_us":2426.458,"p99_us":2947.625,"samples":2000}
+{"label":"setup_warm","max_us":88035.0,"mean_us":1752.7150625,"mode":"setup","msg_bytes":64,"p50_us":1607.792,"p95_us":2382.208,"p99_us":3023.333,"samples":2000}
