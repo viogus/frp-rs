@@ -231,7 +231,7 @@ and the rest are default ON):
 | `ssh` | SSH gateway (russh) |
 | `quic` | QUIC transport (quinn, ~1 MB) |
 | `dashboard` | Metrics/status API (prometheus, axum) |
-| `kcp` | KCP transport |
+| `kcp` | KCP transport (in-tree, kcp-go compatible) |
 | `websocket` | WebSocket transport |
 | `oidc` | OIDC auth (jsonwebtoken, reqwest) |
 | `tls` | TLS encryption (rustls) |
@@ -704,7 +704,7 @@ frp-rs/
       encryption.rs       Key derivation (PBKDF2-SHA1) + Snappy compression
       crypto.rs           V2 AEAD algorithms (AES-256-GCM / XChaCha20-Poly1305)
       v2_handshake.rs     V2 ClientHello/ServerHello + capability negotiation
-      kcp/                KCP transport (mod, session, socket, stream, listener, config)
+      kcp/                KCP transport (protocol, mod, session, socket, stream, listener, config)
       kcp_compat.rs       KCP interop helpers
       metrics.rs          ProxyMetricsRegistry + ConnGuard (per-proxy counters)
       msg.rs              Wire protocol message structs

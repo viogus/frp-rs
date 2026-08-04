@@ -20,7 +20,7 @@ used by both `frp-server` and `frp-client`.
 | `stun` | RFC 5389 STUN Binding Request/Response + XOR-MAPPED-ADDRESS |
 | `crypto` | V2 AEAD primitives (AES-256-GCM, XChaCha20-Poly1305) |
 | `v2_handshake` | V2 capability negotiation + key exchange |
-| `kcp` | KCP reliable transport wrapper (`kcp/` directory: `mod.rs`, `session.rs`, `socket.rs`, `stream.rs`, `listener.rs`, `config.rs`) |
+| `kcp` | KCP reliable transport wrapper (`kcp/` directory: `protocol.rs` in-tree state machine + `mod.rs`, `session.rs`, `socket.rs`, `stream.rs`, `listener.rs`, `config.rs`) |
 | `quic` | QUIC transport wrapper (quinn) |
 | `bandwidth` | Token-bucket bandwidth limiter |
 | `metrics` | `ProxyMetrics` counters + `ConnGuard` RAII tracking |

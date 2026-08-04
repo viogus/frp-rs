@@ -450,7 +450,7 @@ The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, an
 | Feature | Crate | What it removes |
 |---------|-------|-----------------|
 | `quic` | frp-core | QUIC transport (quinn) — **default ON** (was opt-in) |
-| `kcp` | frp-core | KCP transport (kcp) |
+| `kcp` | frp-core | KCP transport (in-tree, kcp-go v5.6.13 aligned) |
 | `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
 | `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
@@ -774,7 +774,6 @@ The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be 
 | Encoding | `data_encoding` |
 | Compression | `snap` |
 | QUIC | `quinn` |
-| KCP | `kcp` |
 | TcpMux | `yamux` |
 | OIDC/JWT | `jsonwebtoken` |
 | Logging | `tracing` + `tracing-subscriber` + `tracing-appender` |

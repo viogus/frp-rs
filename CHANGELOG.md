@@ -4,6 +4,16 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **KCP self-implementation (in-tree protocol core)**: replaced the vendored
+  `kcp` crate (~1.6k lines) with an in-tree KCP state machine
+  (`frp-core/src/kcp/protocol.rs`, aligned with kcp-go v5.6.13 wire behavior).
+  Preserves the 3 kcp-go compat patches (linear RTO backoff, flush ordering,
+  early retransmit) and RFC 6298 RTO calc; removes the `[patch.crates-io]` kcp
+  entry and the external dependency entirely. The socket/session/stream
+  wrapper and the FEC/GF(2^8) layer are unchanged. New tests: header codec,
+  fragmentation, lossy-link model, retransmit patch coverage, window probes,
+  oversized-PUSH guard. Interop verified against Go frp v0.70.1 — 4 KCP compat
+  scenarios + 4 XTCP KCP scenarios, both directions.
 - **VirtualNet full reload cleanup + isolation enforcement**: removing or
   updating a vnet proxy now removes its OS routes and sends `VnetRouteRemove`
   to the server; the server scopes `VnetRouteAdvertise`/`VnetRouteRemove`
