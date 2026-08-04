@@ -1402,10 +1402,7 @@ mod tests {
                 assert_eq!(expected, mss);
                 assert_eq!(actual, mss + 1);
             }
-            other => panic!(
-                "expected InvalidSegmentDataSize, got {:?}",
-                other
-            ),
+            other => panic!("expected InvalidSegmentDataSize, got {:?}", other),
         }
     }
 
