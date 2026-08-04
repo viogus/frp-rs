@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::process::{Child, Command};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::net::TcpSocket;
 use tokio::task::JoinHandle;
@@ -11,24 +13,72 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 use frp_server::service::Service;
 
+/// Ports already handed out by this process. Parallel tests must never
+/// receive the same port twice — the probe-then-drop window in
+/// allocate_port would otherwise let a second test grab the port before
+/// the first test's server binds it (CI flake: a tcpmux CONNECT landing on
+/// a foreign listener → connection reset).
+static USED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// Bind to a random port, return the port number, then drop the socket.
-/// Small race window between drop and reuse, but negligible on localhost.
-/// Falls back to a random ephemeral port on sandboxed environments where
-/// explicit binding is disallowed.
+/// Never returns a port already handed out by this process, and re-verifies
+/// the port is still bindable right before returning (narrows the
+/// probe-then-drop window). Falls back to a random ephemeral port on
+/// sandboxed environments where explicit binding is disallowed.
 pub fn allocate_port() -> u16 {
-    if let Ok(socket) = TcpSocket::new_v4() {
-        if socket.bind("127.0.0.1:0".parse().unwrap()).is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                return addr.port();
+    for _ in 0..64 {
+        let Some(port) = probe_ephemeral_port() else {
+            return sandbox_fallback();
+        };
+        {
+            let mut used = USED_PORTS.lock().unwrap();
+            if !used.insert(port) {
+                continue; // already handed out in this process — probe again
+            }
+            // Narrow the probe-then-drop window: confirm the port is still
+            // free before handing it out.
+            if !port_is_free(port) {
+                used.remove(&port);
+                continue;
             }
         }
+        return port;
     }
-    // Sandbox fallback: return an ephemeral port (49152-65535 range).
-    // Tests that need the port will bind to 0 and read the actual port.
+    sandbox_fallback()
+}
+
+/// Bind to an ephemeral port and return the kernel-assigned number.
+fn probe_ephemeral_port() -> Option<u16> {
+    let socket = TcpSocket::new_v4().ok()?;
+    socket.bind("127.0.0.1:0".parse().unwrap()).ok()?;
+    socket.local_addr().ok().map(|a| a.port())
+}
+
+/// Re-bind `port` to confirm it is still available (the probe socket was
+/// dropped, so a concurrent test could have taken it in between).
+fn port_is_free(port: u16) -> bool {
+    TcpSocket::new_v4()
+        .and_then(|s| s.bind(format!("127.0.0.1:{port}").parse().unwrap()))
+        .is_ok()
+}
+
+/// Sandbox fallback: return an ephemeral port (49152-65535 range).
+/// Tests that need the port will bind to 0 and read the actual port.
+/// Deterministic per process, so walk past ports already handed out to
+/// avoid handing the same fallback port to two tests.
+fn sandbox_fallback() -> u16 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_usize(std::process::id() as usize);
-    49152 + (h.finish() % 16384) as u16
+    let base = 49152 + (h.finish() % 16384) as u16;
+    let mut used = USED_PORTS.lock().unwrap();
+    for i in 0..16384u16 {
+        let port = 49152 + ((base - 49152 + i) % 16384);
+        if used.insert(port) {
+            return port;
+        }
+    }
+    base
 }
 
 /// Start the frp server on the given config, returning the join handle.

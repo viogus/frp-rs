@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Once;
+use std::sync::{LazyLock, Mutex, Once};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task::JoinHandle;
@@ -21,11 +22,66 @@ pub fn init_tracing() {
     });
 }
 
+/// Ports already handed out by this process. Parallel tests must never
+/// receive the same port twice — the probe-then-drop window in
+/// allocate_port would otherwise let a second test grab the port before
+/// the first test's server binds it (CI flake: client traffic landing on
+/// a foreign listener → connection reset).
+static USED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// Bind to a random port, return the port number.
+/// Never returns a port already handed out by this process, and re-verifies
+/// the port is still bindable right before returning (narrows the
+/// probe-then-drop window).
 pub fn allocate_port() -> u16 {
-    let socket = TcpSocket::new_v4().expect("create socket");
-    socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
-    socket.local_addr().unwrap().port()
+    for _ in 0..64 {
+        let socket = match TcpSocket::new_v4() {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        if socket.bind("127.0.0.1:0".parse().unwrap()).is_err() {
+            break;
+        }
+        let port = match socket.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => break,
+        };
+        {
+            let mut used = USED_PORTS.lock().unwrap();
+            if !used.insert(port) {
+                continue; // already handed out in this process — probe again
+            }
+            // Narrow the probe-then-drop window: confirm the port is still
+            // free before handing it out.
+            if TcpSocket::new_v4()
+                .and_then(|s| s.bind(format!("127.0.0.1:{port}").parse().unwrap()))
+                .is_err()
+            {
+                used.remove(&port);
+                continue;
+            }
+        }
+        return port;
+    }
+    sandbox_fallback()
+}
+
+/// Sandbox fallback: return an ephemeral port (49152-65535 range).
+/// Deterministic per process, so walk past ports already handed out to
+/// avoid handing the same fallback port to two tests.
+fn sandbox_fallback() -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_usize(std::process::id() as usize);
+    let base = 49152 + (h.finish() % 16384) as u16;
+    let mut used = USED_PORTS.lock().unwrap();
+    for i in 0..16384u16 {
+        let port = 49152 + ((base - 49152 + i) % 16384);
+        if used.insert(port) {
+            return port;
+        }
+    }
+    base
 }
 
 /// Start a simple TCP echo server on the given port.
