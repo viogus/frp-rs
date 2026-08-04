@@ -5506,6 +5506,222 @@ test_r2g_kcp() {
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, KCP transport + TLS
+# Go frp v0.70.1 supports KCP+TLS: Go frpc realConnect() applies the same TLS
+# hooks (DialHookCustomTLSHeadByte + WithTLSConfig) with WithProtocol("kcp");
+# Go frps HandleListener() runs CheckAndEnableTLSServerConn over its
+# kcpListener. Rust side: transport.rs dials KCP then wraps in TLS; service.rs
+# accept path strips 0x17/0x16 prefix and does TLS accept over KCP.
+# =============================================================================
+test_g2r_kcp_tls() {
+    local name="go-to-rust-kcp-tls"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local kcp_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-kcp-tls"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "kcp=$kcp_port tls"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # KCP uses UDP — wait for TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Go frpc with transport.protocol=kcp + TLS connects to the KCP port directly
+    write_frpc_config go "$kcp_port" "$token" "$echo_port" "$proxy_port" "kcp-tls" "$TEST_DIR/$name/frpc.toml" "kcp tls"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "kcp-tls-test-data" "kcp-tls-test-data" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, KCP transport + TLS
+# =============================================================================
+test_r2g_kcp_tls() {
+    local name="rust-to-go-kcp-tls"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local kcp_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-kcp-tls"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "kcp=$kcp_port tls"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # KCP uses UDP — wait for TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Rust frpc with transport_protocol=kcp + TLS connects to the KCP port directly
+    write_frpc_config rust "$kcp_port" "$token" "$echo_port" "$proxy_port" "kcp-tls" "$TEST_DIR/$name/frpc.toml" "kcp tls"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "kcp-tls-r2g-test" "kcp-tls-r2g-test" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc -> Rust frps, KCP transport + tcpMux (yamux over KCP)
+# Go frp v0.70.1 supports KCP+tcpMux: frpc connector Open() wraps the KCP
+# realConnect() result in fmux.Client; frps HandleListener() wraps every
+# non-QUIC connection (incl. kcpListener) in fmux.Server when TCPMux is on.
+# =============================================================================
+test_g2r_kcp_mux() {
+    local name="go-to-rust-kcp-mux"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local kcp_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-kcp-mux"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "kcp=$kcp_port mux"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # KCP uses UDP — wait for TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Go frpc with transport.protocol=kcp + tcpMux=true connects to the KCP port
+    write_frpc_config go "$kcp_port" "$token" "$echo_port" "$proxy_port" "kcp-mux" "$TEST_DIR/$name/frpc.toml" "kcp mux"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "kcp-mux-test-data" "kcp-mux-test-data" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, KCP transport + tcpMux (yamux over KCP)
+# =============================================================================
+test_r2g_kcp_mux() {
+    local name="rust-to-go-kcp-mux"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local kcp_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-kcp-mux"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "kcp=$kcp_port mux"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # KCP uses UDP — wait for TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Rust frpc with transport_protocol=kcp + tcp_mux=true connects to the KCP port
+    write_frpc_config rust "$kcp_port" "$token" "$echo_port" "$proxy_port" "kcp-mux" "$TEST_DIR/$name/frpc.toml" "kcp mux"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "kcp-mux-r2g-test" "kcp-mux-r2g-test" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Go frpc -> Rust frps, QUIC transport
 # =============================================================================
 test_g2r_quic() {
@@ -6183,7 +6399,8 @@ cleanup_pids
 # Test: Rust frps -> Rust frpc, KCP transport (Rust↔Rust)
 # =============================================================================
 # Phase 8: KCP + QUIC transport cross-compat
-# Rust↔Rust KCP: both sides use raw kcp crate, wire-compatible.
+# Rust↔Rust KCP: both sides use the in-tree KCP implementation
+# (kcp-go v5.6.13 aligned), wire-compatible.
 run_test test_kcp_rust_to_rust
 # KCP Go↔Rust: FEC compat + poll_flush fix. Control login, work conn routing
 # all working. echo server 100ms delay workaround for kcp-go Close() race.
@@ -6191,12 +6408,14 @@ run_test test_g2r_kcp
 run_test test_r2g_kcp
 # KCP+encrypted bridge (Rust-Rust only): KCP transport with AES-128-CFB encryption.
 run_test test_kcp_rust_encrypted
-# KCP+TLS and KCP+tcpMux: Rust-Rust only tests (Go frp doesn't support KCP+TLS
-# combined), not blocked by Go compat. TODO: implement test functions.
-# run_test test_g2r_kcp_tls
-# run_test test_r2g_kcp_tls
-# run_test test_g2r_kcp_mux
-# run_test test_r2g_kcp_mux
+# KCP+TLS and KCP+tcpMux: Go frp v0.70.1 supports both. Go frps applies TLS
+# detection + yamux to its kcpListener (server/service.go HandleListener);
+# Go frpc realConnect() applies TLS hooks with WithProtocol("kcp") and
+# fmux.Client (client/connector.go). Rust side implements the same paths.
+run_test test_g2r_kcp_tls
+run_test test_r2g_kcp_tls
+run_test test_g2r_kcp_mux
+run_test test_r2g_kcp_mux
 
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
 run_test test_quic_rust_to_rust

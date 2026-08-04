@@ -4,6 +4,17 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **KCP robustness + compat expansion**: the in-tree KCP state machine gains
+  a proptest fuzz suite (random/truncated/mutated/multi-segment inputs never
+  panic; conv-mismatch and oversized-PUSH invariants), and the FEC shard
+  grouping now implements kcp-go's 60 s continuity expiry
+  (`FEC_GROUP_EXPIRE_MS`, pruned alongside the 3-group cap). Zero-length PUSH
+  frames are consumed without forwarding — a malicious peer can no longer
+  force an EOF via an empty frame. Four previously commented-out Go↔Rust
+  compat scenarios are now enabled and green: KCP+TLS and KCP+tcpMux in both
+  directions (Go frp v0.70.1 supports these combinations — KCP only replaces
+  the underlying transport, TLS/yamux stack on top). Compat suite is now
+  72 run_test scenarios + 17 XTCP pairwise.
 - **KCP self-implementation (in-tree protocol core)**: replaced the vendored
   `kcp` crate (~1.6k lines) with an in-tree KCP state machine
   (`frp-core/src/kcp/protocol.rs`, aligned with kcp-go v5.6.13 wire behavior).
