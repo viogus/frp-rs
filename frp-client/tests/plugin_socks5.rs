@@ -3,6 +3,8 @@
 //!
 //! Go frp compat: Socks5ProxyPlugin.
 
+use std::time::Duration;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -96,9 +98,14 @@ async fn test_socks5_plugin_connect_no_auth() {
         .expect("start socks5 plugin");
     let mut s = socks5_connect(handle.local_addr, backend, None).await;
     s.write_all(b"hello-via-socks5").await.unwrap();
-    let mut buf = [0u8; 32];
-    let n = s.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"hello-via-socks5", "echo through socks5");
+    // read_exact: a single read() may return a partial echo; loop until the
+    // full payload arrives (echo backend satisfies this).
+    let mut buf = vec![0u8; b"hello-via-socks5".len()];
+    tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut buf))
+        .await
+        .expect("echo timeout")
+        .expect("echo read");
+    assert_eq!(buf, b"hello-via-socks5", "echo through socks5");
 }
 
 #[tokio::test]
@@ -115,13 +122,12 @@ async fn test_socks5_plugin_connect_with_auth() {
         .expect("start socks5 plugin");
     let mut s = socks5_connect(handle.local_addr, backend, Some(("alice", "s3cret"))).await;
     s.write_all(b"authed-data").await.unwrap();
-    let mut buf = [0u8; 32];
-    let n = s.read(&mut buf).await.unwrap();
-    assert_eq!(
-        &buf[..n],
-        b"authed-data",
-        "echo through authenticated socks5"
-    );
+    let mut buf = vec![0u8; b"authed-data".len()];
+    tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut buf))
+        .await
+        .expect("echo timeout")
+        .expect("echo read");
+    assert_eq!(buf, b"authed-data", "echo through authenticated socks5");
 }
 
 #[tokio::test]

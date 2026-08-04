@@ -311,17 +311,29 @@ fn v2_quic_r2r_tcp_proxy() {
     stream.write_all(msg).expect("write");
     stream.flush().ok();
 
-    let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).expect("read");
-    assert_eq!(&buf[..n], msg, "echo mismatch");
+    // read_exact: a single read() may return a partial echo.
+    let mut buf = vec![0u8; msg.len()];
+    stream.read_exact(&mut buf).expect("read echo");
+    assert_eq!(&buf, &msg[..], "echo mismatch");
 
     eprintln!("\u{2713} V2+QUIC TCP proxy tunnel works");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Probe a free TCP port (bind-to-0, read, drop). The caller binds shortly
-/// after; the window is small and this test is single-threaded.
+/// Probe a free TCP port (bind-to-0, read, drop) for frps/frpc to bind.
+/// The probe socket is released before the child process binds, so there is
+/// a small probe-then-drop window; narrow it by re-verifying the port is
+/// still free right before returning (bind-verify like the hardened
+/// allocate_port in tests/common, minus the in-process dedup), retrying if
+/// it was taken.
 fn probe_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+    for _ in 0..16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("could not find a stable free port");
 }

@@ -21,9 +21,9 @@ async fn main() {
         eprintln!("fatal: {info}");
     }));
     let cli = parse_frps_args();
-    // Only emit when CountingAlloc is actually installed: with mimalloc also
-    // enabled the CountingAlloc is not the global allocator, so the emitter
-    // would report all-zero numbers (misleading).
+    // mem-profile and mimalloc are mutually exclusive (the #[global_allocator]
+    // guards are cfg-exclusive): with both enabled neither allocator is
+    // installed, so the emitter must not run either.
     #[cfg(all(feature = "mem-profile", not(feature = "mimalloc")))]
     frp_core::mem_profile::spawn_emitter();
     run(cli).await;
