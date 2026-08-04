@@ -28,10 +28,20 @@ const FEC_HEADER_SIZE: usize = 6;
 const TYPE_DATA: u16 = 0xf1;
 const TYPE_PARITY: u16 = 0xf2;
 const MAX_SHARD_SETS: usize = 3;
+/// kcp-go `fecExpire` (fec.go, ms): a shard that sits in the FEC decoder
+/// longer than this is treated as stale residue and dropped by the time-based
+/// continuity check (`fecDecoder.decode()` timeout policy, applied on every
+/// incoming packet). Mirrored here per shard group: a group that receives no
+/// shard for this long is discarded even if it never filled to data_shards
+/// (partial group after extreme reordering / a long silent period).
+const FEC_GROUP_EXPIRE_MS: u64 = 60_000;
 
 struct ShardGroup {
     shards: Vec<Option<Vec<u8>>>,
     received_count: usize,
+    /// Monotonic millisecond timestamp (session FEC clock) of the last shard
+    /// received into this group — mirrors kcp-go's `fecElement.ts`.
+    last_active_ms: u64,
 }
 
 /// Writer that collects each `write_all` call as a separate packet.
@@ -81,6 +91,11 @@ pub struct KcpSession {
     fec_seqid: u32,
     /// Received FEC shard groups, keyed by shard_begin (seqid - seqid % total).
     shard_groups: HashMap<u32, ShardGroup>,
+    /// Monotonic clock used for FEC group expiry (ms since session creation).
+    fec_clock_base: std::time::Instant,
+    /// Clock override: when set, `fec_now_ms()` returns it instead of the
+    /// real clock, so tests can simulate long silent gaps deterministically.
+    fec_clock_override: Option<u64>,
     recv_buf: Vec<u8>,
     read_tx: mpsc::Sender<Vec<u8>>,
     shutdown: bool,
@@ -146,6 +161,8 @@ impl KcpSession {
             config,
             fec_seqid: 0,
             shard_groups: HashMap::new(),
+            fec_clock_base: std::time::Instant::now(),
+            fec_clock_override: None,
             recv_buf: Vec::new(), // lazily allocated on first recv_and_push
             read_tx,
             shutdown: false,
@@ -323,13 +340,18 @@ impl KcpSession {
             let shard_begin = seqid.wrapping_sub(seqid % total as u32);
             let shard_index = seqid as usize % total;
 
+            // Refresh activity: any shard received for this group keeps it
+            // alive (kcp-go stamps every inserted fecElement with currentMs()).
+            let now = self.fec_now_ms();
             let group = self
                 .shard_groups
                 .entry(shard_begin)
                 .or_insert_with(|| ShardGroup {
                     shards: vec![None; total],
                     received_count: 0,
+                    last_active_ms: now,
                 });
+            group.last_active_ms = now;
 
             // Feed data shards to KCP immediately (Go kcp-go behavior).
             // Raw KCP data = shard_data[2..][..SIZE-2] where SIZE is first 2 bytes.
@@ -445,6 +467,23 @@ impl KcpSession {
 
         loop {
             match self.kcp.peeksize() {
+                Ok(0) => {
+                    // len=0 PUSH frame (empty heartbeat segment): consume it
+                    // from the receive queue but do NOT forward an empty frame.
+                    // KcpStream::poll_read would return Ok(0) for it, which
+                    // tokio treats as EOF and tears down the connection.
+                    // kcp-go never sends empty PUSH, but a malicious or buggy
+                    // peer may. A zero total peek size only happens when the
+                    // whole fragment chain is empty, so `recv` below pops the
+                    // entire chain — reassembly of non-empty chains is untouched.
+                    tracing::trace!(
+                        conv = self.conv,
+                        "KCP SESSION: consuming empty frame (len=0 PUSH), not forwarding"
+                    );
+                    let mut empty = [0u8; 0];
+                    self.kcp.recv(&mut empty).map_err(io::Error::other)?;
+                    continue;
+                }
                 Ok(size) => {
                     if size > self.recv_buf.len() {
                         self.recv_buf.resize(size, 0);
@@ -519,7 +558,16 @@ impl KcpSession {
         self.shutdown = true;
     }
 
+    /// Time-based FEC continuity detection (mirrors kcp-go fec.go timeout
+    /// policy): drop any group that hasn't received a shard within
+    /// `FEC_GROUP_EXPIRE_MS`. A partially-filled group can otherwise pin
+    /// memory indefinitely after extreme reordering or a long silent period.
     fn prune_old_groups(&mut self) {
+        let now = self.fec_now_ms();
+        self.shard_groups
+            .retain(|_, g| now.saturating_sub(g.last_active_ms) <= FEC_GROUP_EXPIRE_MS);
+
+        // Keep the existing "max 3 shard sets" cap on top of the time check.
         while self.shard_groups.len() > MAX_SHARD_SETS {
             let oldest = self.shard_groups.keys().copied().min();
             if let Some(key) = oldest {
@@ -528,6 +576,22 @@ impl KcpSession {
                 break;
             }
         }
+    }
+
+    /// Current FEC continuity-clock time in milliseconds. Uses a monotonic
+    /// clock in production; tests may pin an explicit value via
+    /// `set_fec_clock_ms`.
+    fn fec_now_ms(&self) -> u64 {
+        match self.fec_clock_override {
+            Some(ms) => ms,
+            None => self.fec_clock_base.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// Pin the FEC continuity clock to a fixed value (test helper).
+    #[cfg(test)]
+    pub fn set_fec_clock_ms(&mut self, ms: u64) {
+        self.fec_clock_override = Some(ms);
     }
 }
 
@@ -903,5 +967,131 @@ mod tests {
                                  // This may or may not produce an error from kcp (depends on internal
                                  // validation), but it should NOT panic.
         let _ = receiver.input(&raw_pkt);
+    }
+
+    /// Build a raw KCP PUSH segment with a 24-byte header (same wire layout
+    /// as the `make_push` helper in protocol.rs tests). 0x51 = KCP_CMD_PUSH.
+    fn make_push(conv: u32, sn: u32, frg: u8, ts: u32, data: &[u8]) -> Vec<u8> {
+        let mut pkt = Vec::with_capacity(24 + data.len());
+        pkt.extend_from_slice(&conv.to_le_bytes());
+        pkt.push(0x51);
+        pkt.push(frg);
+        pkt.extend_from_slice(&128u16.to_le_bytes()); // wnd
+        pkt.extend_from_slice(&ts.to_le_bytes());
+        pkt.extend_from_slice(&sn.to_le_bytes());
+        pkt.extend_from_slice(&0u32.to_le_bytes()); // una
+        pkt.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        pkt.extend_from_slice(data);
+        pkt
+    }
+
+    #[test]
+    fn test_fec_stale_partial_group_pruned_by_timeout() {
+        // A partially-filled FEC group must be dropped once it receives no
+        // shard for FEC_GROUP_EXPIRE_MS, mirroring kcp-go fec.go's timeout
+        // policy (`fecExpire`). The existing MAX_SHARD_SETS cap stays on top.
+        let config = fec_config(); // data_shards=3, parity_shards=2
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(16);
+        let mut sender = KcpSession::new(6, "127.0.0.1:9001".parse().unwrap(), config.clone(), tx1);
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(16);
+        let mut receiver = KcpSession::new(6, "127.0.0.1:9000".parse().unwrap(), config, tx2);
+
+        // Pin the FEC clock so the silent gap can be simulated deterministically.
+        receiver.set_fec_clock_ms(0);
+
+        // Produce one complete FEC group and feed only 2 of its 3 data shards,
+        // so the group never completes.
+        sender.send(b"one").unwrap();
+        sender.send(b"two").unwrap();
+        sender.send(b"three").unwrap();
+        let mut packets = Vec::new();
+        for tick in 0..30 {
+            packets.extend(sender.update(10 + tick * 10).unwrap());
+            if packets
+                .iter()
+                .filter(|p| p.len() >= 6 && u16::from_le_bytes([p[4], p[5]]) == TYPE_DATA)
+                .count()
+                >= 3
+            {
+                break;
+            }
+        }
+        let mut fed = 0usize;
+        for pkt in &packets {
+            if pkt.len() >= 6 && u16::from_le_bytes([pkt[4], pkt[5]]) == TYPE_DATA && fed < 2 {
+                receiver.input(pkt).unwrap();
+                fed += 1;
+            }
+        }
+        assert_eq!(fed, 2);
+        assert_eq!(receiver.shard_groups.len(), 1, "partial group retained");
+
+        // Still within the expiry window: prune must keep the group.
+        receiver.set_fec_clock_ms(FEC_GROUP_EXPIRE_MS - 1);
+        receiver.prune_old_groups();
+        assert_eq!(
+            receiver.shard_groups.len(),
+            1,
+            "active group survives prune"
+        );
+
+        // Group silent longer than FEC_GROUP_EXPIRE_MS: prune (as invoked from
+        // input()) must drop the stale residue.
+        receiver.set_fec_clock_ms(FEC_GROUP_EXPIRE_MS + 1);
+        receiver.prune_old_groups();
+        assert!(
+            receiver.shard_groups.is_empty(),
+            "stale partial group must be pruned after FEC_GROUP_EXPIRE_MS"
+        );
+    }
+
+    #[test]
+    fn test_zero_len_push_consumed_without_forwarding() {
+        // A len=0 PUSH segment must be consumed without being forwarded as an
+        // empty frame — an empty frame would make KcpStream::poll_read return
+        // Ok(0), which tokio treats as EOF and tears the connection down.
+        let config = test_config();
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(16);
+        let mut s2 = KcpSession::new(9, "127.0.0.1:9000".parse().unwrap(), config, tx2);
+
+        // Empty PUSH first (sn=0), then a real PUSH (sn=1) from the same peer.
+        s2.input(&make_push(9, 0, 0, 0, b"")).unwrap();
+        s2.input(&make_push(9, 1, 0, 0, b"after empty")).unwrap();
+
+        s2.update(10).unwrap();
+        s2.recv_and_push().unwrap();
+
+        let mut frames = Vec::new();
+        while let Ok(d) = rx2.try_recv() {
+            frames.push(d);
+        }
+        assert!(
+            frames.iter().all(|f| !f.is_empty()),
+            "no empty frame may be forwarded, got {:?}",
+            frames
+        );
+        assert_eq!(frames, vec![b"after empty".to_vec()]);
+    }
+
+    #[test]
+    fn test_zero_len_push_in_fragment_chain_reassembles() {
+        // An empty segment in the MIDDLE of a fragment chain (frg=1 empty,
+        // frg=0 carries data) must not corrupt reassembly: the chain's total
+        // peek size is non-zero, so the normal path merges it into one frame.
+        let config = test_config();
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(16);
+        let mut s2 = KcpSession::new(10, "127.0.0.1:9000".parse().unwrap(), config, tx2);
+
+        s2.input(&make_push(10, 0, 1, 0, b"")).unwrap();
+        s2.input(&make_push(10, 1, 0, 0, b"tail")).unwrap();
+
+        s2.update(10).unwrap();
+        s2.recv_and_push().unwrap();
+
+        let mut frames = Vec::new();
+        while let Ok(d) = rx2.try_recv() {
+            frames.push(d);
+        }
+        assert_eq!(frames, vec![b"tail".to_vec()]);
     }
 }

@@ -2038,4 +2038,273 @@ mod tests {
     fn link_massive_loss_fast() {
         run_lossy(Mode::Fast, 500, 50);
     }
+
+    // ── 7. proptest fuzz of the input() state machine ────────────────────
+    //
+    // `Kcp::input` consumes untrusted wire bytes (24-byte little-endian
+    // header + multi-segment datagrams). The core fuzz invariant is that
+    // **no input may ever panic** — returning Ok or Err are both acceptable.
+    // A few targeted scenarios additionally pin the safe-error invariants:
+    //   * a mismatched conv      -> Err(ConvInconsistent)
+    //   * an oversized/truncated -> Err(InvalidSegmentDataSize)
+    mod proptest_fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Fuzz harness: run `Kcp::input` under `catch_unwind`. A panic fails
+        /// the test; a clean Ok/Err is the expected outcome for every input.
+        fn input_no_panic(kcp: &mut Kcp<PacketWriter>, bytes: &[u8]) -> Result<usize> {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kcp.input(bytes))) {
+                Ok(r) => r,
+                Err(_) => panic!("Kcp::input panicked on input of {} bytes", bytes.len()),
+            }
+        }
+
+        /// A valid PUSH packet truncated to a random prefix (0..=len).
+        prop_compose! {
+            fn arb_truncated_push()(
+                conv in any::<u32>(),
+                sn in any::<u32>(),
+                data in prop::collection::vec(any::<u8>(), 0..256),
+                cut in 0usize..KCP_OVERHEAD + 256usize,
+            ) -> Vec<u8> {
+                let pkt = make_push(conv, sn, 0, 0, &data);
+                let n = cut.min(pkt.len());
+                pkt[..n].to_vec()
+            }
+        }
+
+        /// A valid PUSH packet with 0..8 random byte overwrites (may corrupt
+        /// the conv, cmd, len field, payload ...).
+        prop_compose! {
+            fn arb_mutated_push()(
+                conv in any::<u32>(),
+                sn in any::<u32>(),
+                data in prop::collection::vec(any::<u8>(), 0..128),
+                flips in prop::collection::vec((any::<usize>(), any::<u8>()), 0..8),
+            ) -> Vec<u8> {
+                let mut pkt = make_push(conv, sn, 0, 0, &data);
+                for (i, byte) in flips {
+                    let idx = i % pkt.len();
+                    pkt[idx] = byte;
+                }
+                pkt
+            }
+        }
+
+        /// One KCP segment for multi-segment datagrams: a valid PUSH (with
+        /// random fragment count — covers the frg-chain reassembly surface),
+        /// a valid ACK, a random malformed blob, or a header claiming a huge
+        /// data length.
+        fn arb_segment() -> impl Strategy<Value = Vec<u8>> {
+            prop_oneof![
+                (
+                    any::<u32>(),
+                    any::<u32>(),
+                    any::<u8>(),
+                    prop::collection::vec(any::<u8>(), 0..128)
+                )
+                    .prop_map(|(conv, sn, frg, data)| make_push(conv, sn, frg, 0, &data)),
+                (any::<u32>(), any::<u32>(), any::<u16>())
+                    .prop_map(|(conv, sn, wnd)| make_ack(conv, sn, wnd, 0)),
+                prop::collection::vec(any::<u8>(), 0..64),
+                (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(|(conv, sn, huge)| {
+                    let mut pkt = make_push(conv, sn, 0, 0, b"");
+                    pkt[KCP_OVERHEAD - 4..KCP_OVERHEAD].copy_from_slice(&huge.to_le_bytes());
+                    pkt
+                }),
+            ]
+        }
+
+        proptest! {
+            /// Core invariant: arbitrary bytes (0..=2048) must never panic.
+            #[test]
+            fn fuzz_random_bytes_never_panics(
+                conv in any::<u32>(),
+                bytes in prop::collection::vec(any::<u8>(), 0..2048),
+            ) {
+                let mut kcp = Kcp::new(conv, PacketWriter::default());
+                let _ = input_no_panic(&mut kcp, &bytes);
+            }
+        }
+
+        proptest! {
+            /// Any prefix of a valid PUSH or ACK packet must never panic.
+            #[test]
+            fn fuzz_truncated_packets_never_panics(
+                push in arb_truncated_push(),
+                ack_cut in 0usize..KCP_OVERHEAD + 1usize,
+            ) {
+                let mut kcp = Kcp::new(0x1122_3344, PacketWriter::default());
+                let _ = input_no_panic(&mut kcp, &push);
+
+                let ack = make_ack(0x1122_3344, 0, 0, 0);
+                let n = ack_cut.min(ack.len());
+                let _ = input_no_panic(&mut kcp, &ack[..n]);
+            }
+        }
+
+        proptest! {
+            /// Byte flips on a valid packet (including the len field) must never panic.
+            #[test]
+            fn fuzz_mutated_packets_never_panics(
+                mutated in arb_mutated_push(),
+            ) {
+                let mut kcp = Kcp::new(0x1122_3344, PacketWriter::default());
+                let _ = input_no_panic(&mut kcp, &mutated);
+            }
+        }
+
+        proptest! {
+            /// 1..4 concatenated valid/malformed segments in one datagram must never panic.
+            #[test]
+            fn fuzz_multi_segment_datagrams_never_panics(
+                segments in prop::collection::vec(arb_segment(), 1..5),
+            ) {
+                let mut datagram = Vec::new();
+                for seg in &segments {
+                    datagram.extend_from_slice(seg);
+                }
+                let mut kcp = Kcp::new(0x1122_3344, PacketWriter::default());
+                let _ = input_no_panic(&mut kcp, &datagram);
+            }
+        }
+
+        proptest! {
+            /// Legal send→flush→input round trips interleaved with random
+            /// garbage packets: never panic, and every legal payload still
+            /// arrives intact and in order. Garbage packets get a non-matching
+            /// conv so they are rejected as ConvInconsistent and can never be
+            /// mistaken for legitimate data.
+            #[test]
+            fn fuzz_legal_traffic_with_garbage(
+                payloads in prop::collection::vec(
+                    prop::collection::vec(any::<u8>(), 1..128), 1..16),
+                garbage in prop::collection::vec(
+                    prop::collection::vec(any::<u8>(), 0..64), 0..16),
+            ) {
+                const CONV: u32 = 0x1122_3344;
+                let mut a = Kcp::new(CONV, PacketWriter::default());
+                let mut b = Kcp::new(CONV, PacketWriter::default());
+                // nc=true: every queued segment flushes on the next update().
+                a.set_nodelay(true, 10, 2, true);
+                b.set_nodelay(true, 10, 2, true);
+
+                let mut t = 0u32;
+                let mut delivered: Vec<Vec<u8>> = Vec::new();
+                let mut buf = vec![0u8; 2048];
+
+                for (i, payload) in payloads.iter().enumerate() {
+                    // Sender: one message per round, flushed immediately.
+                    a.send(payload).unwrap();
+                    a.update(t).unwrap();
+                    let pushes = a.output_mut().drain();
+
+                    // Receiver: mix in a garbage packet (rejected by conv).
+                    if i % 2 == 0 {
+                        if let Some(g) = garbage.get(i / 2) {
+                            let mut junk = g.clone();
+                            if junk.len() >= 4 {
+                                junk[..4].copy_from_slice(&CONV.wrapping_add(1).to_le_bytes());
+                            }
+                            let _ = input_no_panic(&mut b, &junk);
+                        }
+                    }
+
+                    for pkt in &pushes {
+                        let _ = input_no_panic(&mut b, pkt);
+                    }
+
+                    // Receiver flushes ACKs back to the sender.
+                    b.update(t).unwrap();
+                    let acks = b.output_mut().drain();
+                    for pkt in &acks {
+                        let _ = input_no_panic(&mut a, pkt);
+                    }
+
+                    // Drain whatever became deliverable.
+                    loop {
+                        match b.recv(&mut buf) {
+                            Ok(n) => delivered.push(buf[..n].to_vec()),
+                            Err(Error::RecvQueueEmpty) => break,
+                            Err(e) => panic!("recv failed on legal traffic: {e:?}"),
+                        }
+                    }
+                    t += 10;
+                }
+
+                prop_assert_eq!(&delivered, &payloads,
+                    "legal payloads must arrive intact and in order");
+            }
+        }
+
+        proptest! {
+            /// Invariant: a datagram with a mismatched conv is rejected with
+            /// Err(ConvInconsistent), never accepted.
+            #[test]
+            fn wrong_conv_returns_conv_inconsistent(
+                expected in any::<u32>(),
+                other in any::<u32>(),
+                sn in any::<u32>(),
+                data in prop::collection::vec(any::<u8>(), 0..64),
+            ) {
+                prop_assume!(expected != other);
+                let mut kcp = Kcp::new(expected, PacketWriter::default());
+                let pkt = make_push(other, sn, 0, 0, &data);
+                let result = input_no_panic(&mut kcp, &pkt);
+                let ok = matches!(&result, Err(Error::ConvInconsistent(e, o))
+                    if *e == expected && *o == other);
+                prop_assert!(ok,
+                    "expected ConvInconsistent({expected}, {other}), got {result:?}");
+            }
+        }
+
+        proptest! {
+            /// Invariant: a PUSH payload beyond MSS is rejected with
+            /// Err(InvalidSegmentDataSize) instead of growing the recv buffer.
+            #[test]
+            fn oversized_push_returns_invalid_segment_data_size(
+                conv in any::<u32>(),
+                // sn must be inside the initial recv window (rcv_wnd = 128);
+                // out-of-window segments are skipped, not size-checked.
+                sn in 0u32..128u32,
+                extra in 1usize..4096usize,
+            ) {
+                let mut kcp = Kcp::new(conv, PacketWriter::default());
+                let mss = kcp.mss;
+                let big = vec![0xabu8; mss + extra];
+                let pkt = make_push(conv, sn, 0, 0, &big);
+                let result = input_no_panic(&mut kcp, &pkt);
+                let ok = matches!(&result, Err(Error::InvalidSegmentDataSize(expected, actual))
+                    if *expected == mss && *actual == mss + extra);
+                prop_assert!(ok,
+                    "expected InvalidSegmentDataSize({mss}, {}), got {result:?}",
+                    mss + extra);
+            }
+        }
+
+        proptest! {
+            /// Invariant: a header whose len field exceeds the remaining bytes
+            /// (truncation attack) is rejected with Err(InvalidSegmentDataSize).
+            #[test]
+            fn truncated_len_field_returns_invalid_segment_data_size(
+                conv in any::<u32>(),
+                sn in any::<u32>(),
+                data in prop::collection::vec(any::<u8>(), 0..64),
+                claimed in 1u32..=u32::MAX,
+            ) {
+                prop_assume!((claimed as usize) > data.len());
+                let mut pkt = make_push(conv, sn, 0, 0, &data);
+                pkt[KCP_OVERHEAD - 4..KCP_OVERHEAD].copy_from_slice(&claimed.to_le_bytes());
+                let mut kcp = Kcp::new(conv, PacketWriter::default());
+                let result = input_no_panic(&mut kcp, &pkt);
+                let ok = matches!(&result,
+                    Err(Error::InvalidSegmentDataSize(claimed_len, remaining))
+                        if *claimed_len == claimed as usize && *remaining == data.len());
+                prop_assert!(ok,
+                    "expected InvalidSegmentDataSize({claimed}, {}), got {result:?}",
+                    data.len());
+            }
+        }
+    }
 }

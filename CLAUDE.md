@@ -96,9 +96,9 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 771 passed, 0 failed |
+| `cargo test --workspace --all-features` | 804 passed, 0 failed |
 | `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.1MB/frpc ~4.3MB default; ~5.3/4.3 full; frps-tiny ~3.0MB/frpc-tiny ~2.6MB; frps-micro ~1.8MB/frpc-micro ~1.9MB) |
-| `compat-test.sh` (Go frp v0.70.1) | 68 run_test scenarios + 17 XTCP pairwise, all green in CI |
+| `compat-test.sh` (Go frp v0.70.1) | 72 run_test scenarios + 17 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 9 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
@@ -255,7 +255,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **Integration tests**: KCP real-UDP-socket test (`frp-core/tests/kcp.rs`), XTCP hole-punch e2e (`frp-server/tests/xtcp_hole_punch.rs`), plus 13+ server integration tests covering control handler, vhost, proxy registration, OIDC, reload, graceful drain.
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
 - **Perf baselines** (4-axis program, host-specific JSONL committed under `scripts/frp-stress/baselines/`): `scripts/throughput-baseline.sh` (MB/s per cipher/transport config), `scripts/latency-baseline.sh` (steady-state RTT + connection-setup percentiles), `scripts/memory-baseline.sh` (idle-hold + churn footprint via the `mem-profile` counting allocator + `ps` RSS). Run manually before/after a data-plane change; not blocking CI gates. Gate rule: a change to one axis must not regress the others (>5% throughput/MB/s, or RTT p99).
-- **Cross-compat tests**: `scripts/compat-test.sh` — 68 run_test scenarios + 17 XTCP pairwise scenarios against Go frp v0.70.1 (V2 included). Runs on every push via `compat.yml`; XTCP compat runs daily on VPS via `xtcp-compat.yml`.
+- **Cross-compat tests**: `scripts/compat-test.sh` — 72 run_test scenarios + 17 XTCP pairwise scenarios against Go frp v0.70.1 (V2 included, plus KCP+TLS and KCP+tcpMux Go↔Rust scenarios since the in-tree KCP landed). Runs on every push via `compat.yml`; XTCP compat runs daily on VPS via `xtcp-compat.yml`.
 - **Security audit**: Run `cargo audit` and `cargo deny check` before each release to catch known vulnerabilities and license issues in the dependency tree.
 
 ### Test Coverage Gaps
