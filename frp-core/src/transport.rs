@@ -3453,23 +3453,31 @@ pub fn build_tls_connector(
 /// or client-cert files yields a different mtime, so the entry self-invalidates.
 /// `tokio_rustls::TlsConnector` is an `Arc<ClientConfig>` — sharing is free.
 struct ConnectorKey {
-    // (path, mtime) — mtime None means "configured but file missing", which
-    // must stay distinct from "not configured" (None) for cache correctness.
-    ca: Option<(String, Option<std::time::SystemTime>)>,
-    cert: Option<(String, Option<std::time::SystemTime>)>,
-    key: Option<(String, Option<std::time::SystemTime>)>,
+    // (path, mtime, size) — mtime None means "configured but file missing",
+    // which must stay distinct from "not configured" (None) for cache
+    // correctness. Size is included so a content rewrite that lands inside
+    // the filesystem mtime granularity window (1s FAT 2s) still invalidates
+    // when the length changes.
+    ca: Option<(String, Option<std::time::SystemTime>, u64)>,
+    cert: Option<(String, Option<std::time::SystemTime>, u64)>,
+    key: Option<(String, Option<std::time::SystemTime>, u64)>,
 }
 
+#[cfg(feature = "tls")]
 impl PartialEq for ConnectorKey {
     fn eq(&self, other: &Self) -> bool {
         self.ca == other.ca && self.cert == other.cert && self.key == other.key
     }
 }
 
-fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).ok()?.modified().ok()
+#[cfg(feature = "tls")]
+fn file_stat(path: &str) -> Option<(std::time::SystemTime, u64)> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
 }
 
+#[cfg(feature = "tls")]
 fn non_empty(p: Option<&str>) -> Option<&str> {
     match p {
         Some(s) if !s.is_empty() => Some(s),
@@ -3477,18 +3485,29 @@ fn non_empty(p: Option<&str>) -> Option<&str> {
     }
 }
 
+#[cfg(feature = "tls")]
 fn connector_key(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
     key_file: Option<&str>,
 ) -> ConnectorKey {
     ConnectorKey {
-        ca: non_empty(ca_file).map(|p| (p.to_string(), file_mtime(p))),
-        cert: non_empty(cert_file).map(|p| (p.to_string(), file_mtime(p))),
-        key: non_empty(key_file).map(|p| (p.to_string(), file_mtime(p))),
+        ca: non_empty(ca_file).map(|p| {
+            let (t, len) = file_stat(p).map_or((None, 0), |(t, len)| (Some(t), len));
+            (p.to_string(), t, len)
+        }),
+        cert: non_empty(cert_file).map(|p| {
+            let (t, len) = file_stat(p).map_or((None, 0), |(t, len)| (Some(t), len));
+            (p.to_string(), t, len)
+        }),
+        key: non_empty(key_file).map(|p| {
+            let (t, len) = file_stat(p).map_or((None, 0), |(t, len)| (Some(t), len));
+            (p.to_string(), t, len)
+        }),
     }
 }
 
+#[cfg(feature = "tls")]
 static CONNECTOR_CACHE: std::sync::Mutex<Option<(ConnectorKey, TlsConnector)>> =
     std::sync::Mutex::new(None);
 
@@ -3504,6 +3523,7 @@ fn connector_build_count() -> usize {
     CONNECTOR_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(feature = "tls")]
 /// Build a TLS client connector with certificate verification skipped when no
 /// CA file is given (InsecureSkipVerify=true, matching Go frp's default for
 /// auto-generated self-signed certs). With `ca_file`, verify against it
@@ -3532,6 +3552,7 @@ pub fn build_tls_connector_skip_verify(
     Ok(connector)
 }
 
+#[cfg(feature = "tls")]
 fn build_tls_connector_skip_verify_inner(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
@@ -4028,7 +4049,9 @@ mod connector_cache_tests {
             before + 1,
             "unchanged CA must hit cache"
         );
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // 2) mtime/size change → new key → rebuild. Sleep past the mtime
+        //    granularity window (1s on ext4/apfs, 2s on FAT).
+        std::thread::sleep(std::time::Duration::from_millis(2100));
         std::fs::write(&ca_path, dummy_ca_pem()).unwrap();
         let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
         assert_eq!(

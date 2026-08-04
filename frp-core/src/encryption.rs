@@ -218,6 +218,11 @@ pub fn decompress_into(_data: &[u8], _out: &mut Vec<u8>) -> Result<(), String> {
     Err("compression not compiled".into())
 }
 
+#[cfg(not(feature = "compression"))]
+pub fn decompress(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("compression not compiled".into())
+}
+
 /// Streaming Snappy decompressor for use in bridges.
 ///
 /// Unlike [`decompress`], this handles data arriving in arbitrary TCP chunks:
