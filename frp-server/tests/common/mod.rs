@@ -92,8 +92,22 @@ pub async fn start_test_server(mut cfg: ServerConfig) -> (JoinHandle<()>, u16) {
     let handle = tokio::spawn(async move {
         let _ = service.run().await;
     });
-    // Give the server time to bind and start accepting
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // Wait until the server actually accepts connections (poll instead of a
+    // fixed sleep: on slow CI the old 150ms sleep was not always enough).
+    // The probe connection is accepted and closed by the server harmlessly.
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let mut ready = false;
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        ready,
+        "test server did not start listening on {addr} in time"
+    );
     (handle, port)
 }
 

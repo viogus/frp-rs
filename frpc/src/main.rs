@@ -149,7 +149,10 @@ async fn main() {
         eprintln!("fatal: {info}");
     }));
     let cmd = parse_frpc_args();
-    #[cfg(feature = "mem-profile")]
+    // Only emit when CountingAlloc is actually installed: with mimalloc also
+    // enabled the CountingAlloc is not the global allocator, so the emitter
+    // would report all-zero numbers (misleading).
+    #[cfg(all(feature = "mem-profile", not(feature = "mimalloc")))]
     frp_core::mem_profile::spawn_emitter();
     match cmd {
         FrpcCmd::Run(args) => run_normal(args).await,

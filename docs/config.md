@@ -766,7 +766,7 @@ All other features gate only the runtime behavior. Their config fields are alway
 | `chacha20` | V2 cipher fields | XChaCha20-Poly1305 V2 cipher not compiled |
 | `ssh` | `[ssh_tunnel_gateway]` section | SSH gateway not compiled |
 | `dashboard` | `[web_server]` section | Dashboard HTTP endpoints not compiled |
-| `http-proxy` | `type = "http_proxy"` plugin config | HTTP proxy plugin not compiled |
+| `http-proxy` | `type = "http_proxy"` plugin config | Server-side HTTP plugin manager not compiled; the client `http_proxy` plugin compiles unconditionally |
 
 ---
 

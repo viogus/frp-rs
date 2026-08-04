@@ -22,7 +22,7 @@ thiserror = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 sha1 = "0.10"
 md-5 = "0.10"
 data-encoding = "2"

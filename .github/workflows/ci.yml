@@ -36,6 +36,15 @@ jobs:
         run: cargo test --workspace --all-features --lib
       - name: Build binaries (needed for integration tests)
         run: cargo build --bin frps --bin frpc
+      - name: Build frps with dashboard feature (for dashboard integration tests)
+        run: cargo build --bin frps --features dashboard
+      - name: Run dashboard integration tests
+        # dashboard_integration.rs / dashboard_v2_integration.rs are cfg-gated
+        # on the `dashboard` feature and never compile under default features;
+        # run them here so the only opt-in business feature has CI coverage.
+        run: cargo test -p frp-server --features dashboard --test dashboard_integration --test dashboard_v2_integration
+        env:
+          FRPS_BIN: ${{ github.workspace }}/target/debug/frps
       - name: Run tests
         run: cargo test --workspace
         env:

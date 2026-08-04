@@ -41,9 +41,6 @@ profiling = ["frp-server/profiling"]
 # Use mimalloc global allocator (~10-20% throughput gain for network workloads).
 # Mutually exclusive with mem-profile (only one #[global_allocator] allowed).
 mimalloc = ["dep:mimalloc"]
-# Nightly-only optimizations (requires +nightly toolchain).
-# Enables panic_immediate_abort to skip drop glue on panic path (~30-50KB savings).
-nightly = []
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }

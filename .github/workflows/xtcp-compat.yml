@@ -41,7 +41,7 @@ jobs:
             echo "VPS host configured: yes"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "SKIP: XTCP_VPS_HOST or XTCP_VPS_SSH_KEY not set."
+            echo "::warning::XTCP_VPS_HOST or XTCP_VPS_SSH_KEY not set — XTCP compat tests SKIPPED. A silent green run would mask the daily XTCP NAT coverage being lost."
           fi
         env:
           XTCP_VPS_HOST: ${{ secrets.XTCP_VPS_HOST }}

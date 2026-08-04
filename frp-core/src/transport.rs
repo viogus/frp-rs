@@ -421,7 +421,8 @@ impl AsyncRead for WsByteStream {
                         return Poll::Ready(Ok(()));
                     }
                     Poll::Ready(Some(Ok(Message::Text(text)))) => {
-                        let data = text.into_bytes();
+                        // tungstenite >=0.26 wraps TEXT payloads in Utf8Bytes.
+                        let data = text.as_str().as_bytes().to_vec();
                         let len = data.len().min(buf.remaining());
                         buf.put_slice(&data[..len]);
                         if len < data.len() {
@@ -771,7 +772,7 @@ impl AsyncWrite for WsByteStream {
                         Poll::Ready(Ok(())) => {
                             match tungstenite
                                 .as_mut()
-                                .start_send(Message::Binary(buf.to_vec()))
+                                .start_send(Message::Binary(buf.to_vec().into()))
                             {
                                 Ok(()) => needs_flush_local = true,
                                 Err(e) => return Poll::Ready(Err(io::Error::other(e))),

@@ -244,20 +244,31 @@ async fn test_dashboard_offline_clients_listed() {
     drop(io.into_encrypted(enc_key));
 
     // Wait for the server to notice the disconnect (control cleanup).
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-    let resp = auth_client()
-        .get(frps.dashboard_url("/api/clients"))
-        .basic_auth("admin", Some("admin"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let json: serde_json::Value = resp.json().await.unwrap();
-    let arr = json.as_array().expect("clients array");
+    // Poll the clients API instead of a fixed sleep: on slow CI the old
+    // 1.5s sleep was not always enough.
+    let client = auth_client();
+    let mut offline_seen = false;
+    for _ in 0..50 {
+        let resp = client
+            .get(frps.dashboard_url("/api/clients"))
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        let arr = json.as_array().expect("clients array");
+        if arr
+            .iter()
+            .any(|c| c["clientID"] == "offline-client-1" && c["online"] == false)
+        {
+            offline_seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     assert!(
-        arr.iter()
-            .any(|c| c["clientID"] == "offline-client-1" && c["online"] == false),
-        "offline client must remain listed with online=false, got: {json}"
+        offline_seen,
+        "offline client never appeared in /api/clients"
     );
 }

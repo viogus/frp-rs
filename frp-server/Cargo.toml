@@ -28,9 +28,8 @@ data-encoding.workspace = true
 tokio-tungstenite = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 tokio-util.workspace = true
-# ws feature pulls tokio-tungstenite 0.29 alongside frp-core's 0.24.
-# TARGET: Remove when v1 dashboard WebSocket is fully supplanted by v2 REST
-# polling (target: v0.8.0).
+# TARGET: Remove the axum "ws" feature (dashboard WebSocket) when v1
+# dashboard WebSocket is fully supplanted by v2 REST polling (target: v0.8.0).
 axum = { workspace = true, optional = true, features = ["ws"] }
 prometheus = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
@@ -59,6 +58,7 @@ profiling = ["frp-core/profiling"]
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tempfile = "3"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
 axum = { workspace = true }

@@ -15,13 +15,34 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Resolve binary path relative to the workspace root.
-/// `env!("CARGO_MANIFEST_DIR")` is `frp-server/`; the workspace root is one level up.
+/// Monotonic counter so parallel test invocations never collide on the
+/// shared temp directory (fixed `/tmp/frp-v2-quic-test` used to be reused
+/// across runs, caching stale certs and logs).
+static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Unique per-run temp directory under the system temp dir.
+fn run_dir() -> PathBuf {
+    let seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("frp-v2-quic-{}-{}", std::process::id(), seq))
+}
+
+/// Resolve binary path for a workspace member.
+/// Prefers `<NAME>_BIN` env var (set by CI, e.g. `FRPS_BIN`), then
+/// `CARGO_BIN_EXE_<name>` (set by Cargo when building the bin), then the
+/// workspace `target/debug` dir.
 fn workspace_bin(name: &str) -> PathBuf {
+    let env_key = format!("{}_BIN", name.to_uppercase().replace('-', "_"));
+    if let Ok(path) = std::env::var(&env_key) {
+        return PathBuf::from(path);
+    }
+    if let Ok(path) = std::env::var(format!("CARGO_BIN_EXE_{name}")) {
+        return PathBuf::from(path);
+    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().unwrap();
     workspace_root.join("target/debug").join(name)
@@ -44,120 +65,52 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Generate self-signed TLS cert/key for QUIC test.
-/// Returns (server_cert_path, server_key_path, ca_cert_path).
+/// Generate a CA → server cert chain with rcgen (no external `openssl`
+/// binary, no stale on-disk cache).
 ///
-/// Generates a proper CA → server cert chain:
-/// - CA cert (self-signed, CA:TRUE) — used by frpc as tls_ca_file
-/// - Server cert (signed by CA, CA:FALSE, CN=localhost) — used by frps
-fn ensure_tls_certs() -> (String, String, String) {
-    let dir = std::env::temp_dir().join("frp-v2-quic-test");
-    std::fs::create_dir_all(&dir).ok();
-    let ca_key = dir.join("ca-key.pem");
-    let ca_cert = dir.join("ca-cert.pem");
-    let srv_key = dir.join("server-key.pem");
-    let srv_cert = dir.join("server-cert.pem");
+/// Returns (server_cert_path, server_key_path, ca_cert_path). The CA cert is
+/// used by frpc as `tls_ca_file`; the server cert (CN/SAN=localhost) is used
+/// by frps. Certs are written as PEM under `dir`.
+fn ensure_tls_certs(dir: &Path) -> (String, String, String) {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
-    let ca_cert_str = ca_cert.to_str().unwrap().to_string();
-    let srv_cert_str = srv_cert.to_str().unwrap().to_string();
-    let srv_key_str = srv_key.to_str().unwrap().to_string();
+    // CA (self-signed, CA:TRUE)
+    let mut ca_params = CertificateParams::new(Vec::<String>::default()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
-    if ca_cert.exists() && srv_cert.exists() && srv_key.exists() {
-        return (srv_cert_str, srv_key_str, ca_cert_str);
-    }
+    // Server cert (signed by CA, CA:FALSE, SAN=localhost)
+    let mut srv_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    srv_params.is_ca = IsCa::NoCa;
+    let srv_key = KeyPair::generate().unwrap();
+    let srv_cert = srv_params.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
 
-    // Generate CA key + self-signed CA cert
-    let output = Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-            ca_key.to_str().unwrap(),
-            "-out",
-            ca_cert.to_str().unwrap(),
-            "-days",
-            "3650",
-            "-nodes",
-            "-subj",
-            "/CN=frp-test-ca",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-        ])
-        .output()
-        .expect("openssl not found — install openssl or set RUSTIC_SKIP_QUIC=1");
-    assert!(
-        output.status.success(),
-        "openssl CA cert gen failed: {:?}",
-        output
-    );
+    let ca_path = dir.join("ca-cert.pem");
+    let srv_cert_path = dir.join("server-cert.pem");
+    let srv_key_path = dir.join("server-key.pem");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    std::fs::write(&srv_cert_path, srv_cert.pem()).unwrap();
+    std::fs::write(&srv_key_path, srv_key.serialize_pem()).unwrap();
 
-    // Generate server key + CSR
-    let output = Command::new("openssl")
-        .args([
-            "req",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-            srv_key.to_str().unwrap(),
-            "-out",
-            dir.join("server.csr").to_str().unwrap(),
-            "-days",
-            "3650",
-            "-nodes",
-            "-subj",
-            "/CN=localhost",
-        ])
-        .output()
-        .expect("openssl not found");
-    assert!(
-        output.status.success(),
-        "openssl server key gen failed: {:?}",
-        output
-    );
-
-    // Write extfile with SAN for the server cert
-    let ext_path = dir.join("server.ext");
-    std::fs::write(&ext_path, "subjectAltName=DNS:localhost\n").unwrap();
-
-    // Sign server CSR with CA (including SAN extension)
-    let output = Command::new("openssl")
-        .args([
-            "x509",
-            "-req",
-            "-in",
-            dir.join("server.csr").to_str().unwrap(),
-            "-CA",
-            ca_cert.to_str().unwrap(),
-            "-CAkey",
-            ca_key.to_str().unwrap(),
-            "-CAcreateserial",
-            "-out",
-            srv_cert.to_str().unwrap(),
-            "-days",
-            "3650",
-            "-extfile",
-            ext_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("openssl not found");
-    assert!(
-        output.status.success(),
-        "openssl server cert sign failed: {:?}",
-        output
-    );
-
-    (srv_cert_str, srv_key_str, ca_cert_str)
+    (
+        srv_cert_path.to_str().unwrap().to_string(),
+        srv_key_path.to_str().unwrap().to_string(),
+        ca_path.to_str().unwrap().to_string(),
+    )
 }
 
 struct FrpsProcess {
     child: Child,
+    dir: PathBuf,
 }
 
 impl FrpsProcess {
     fn start(port: u16, cert: &str, key: &str) -> Self {
-        let dir = std::env::temp_dir().join("frp-v2-quic-test");
+        let dir = run_dir();
         std::fs::create_dir_all(&dir).ok();
         let config_path = dir.join("frps.toml");
         let log_path = dir.join("frps.log");
@@ -205,7 +158,7 @@ port = 0
             panic!("frps did not start");
         }
 
-        FrpsProcess { child }
+        FrpsProcess { child, dir }
     }
 }
 
@@ -213,16 +166,18 @@ impl Drop for FrpsProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 struct FrpcProcess {
     child: Child,
+    dir: PathBuf,
 }
 
 impl FrpcProcess {
     fn start(server_port: u16, ca_cert: &str, backend_port: u16, proxy_port: u16) -> Self {
-        let dir = std::env::temp_dir().join("frp-v2-quic-test");
+        let dir = run_dir();
         std::fs::create_dir_all(&dir).ok();
         let config_path = dir.join("frpc.toml");
         let log_path = dir.join("frpc.log");
@@ -264,7 +219,7 @@ remote_port = {proxy_port}
             .spawn()
             .expect("failed to start frpc");
 
-        FrpcProcess { child }
+        FrpcProcess { child, dir }
     }
 }
 
@@ -272,12 +227,9 @@ impl Drop for FrpcProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
-
-const SERVER_PORT: u16 = 17890;
-const PROXY_PORT: u16 = 17891;
-const BACKEND_PORT: u16 = 17892;
 
 #[test]
 fn v2_quic_r2r_tcp_proxy() {
@@ -299,13 +251,20 @@ fn v2_quic_r2r_tcp_proxy() {
         return;
     }
 
-    let (server_cert, server_key, ca_cert) = ensure_tls_certs();
+    let dir = run_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let (server_cert, server_key, ca_cert) = ensure_tls_certs(&dir);
 
-    // Start backend TCP echo server.
-    let backend =
-        std::net::TcpListener::bind(format!("127.0.0.1:{}", BACKEND_PORT)).expect("bind backend");
+    // Dynamic ports: bind an ephemeral port for the backend and probe two
+    // more for frps/frpc (no hard-coded constants that collide under load).
+    let backend_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let server_port = probe_port();
+    let proxy_port = probe_port();
+
+    // Backend TCP echo server.
     std::thread::spawn(move || {
-        for mut s in backend.incoming().flatten() {
+        for mut s in backend_listener.incoming().flatten() {
             let mut buf = [0u8; 1024];
             while let Ok(n) = s.read(&mut buf) {
                 if n == 0 {
@@ -317,22 +276,25 @@ fn v2_quic_r2r_tcp_proxy() {
     });
 
     // Start frps (server cert = end-entity cert signed by CA).
-    let _frps = FrpsProcess::start(SERVER_PORT, &server_cert, &server_key);
+    let _frps = FrpsProcess::start(server_port, &server_cert, &server_key);
 
     // Start frpc (V2 + QUIC). Use CA cert as trust anchor.
-    let _frpc = FrpcProcess::start(SERVER_PORT, &ca_cert, BACKEND_PORT, PROXY_PORT);
+    let _frpc = FrpcProcess::start(server_port, &ca_cert, backend_port, proxy_port);
 
     // Wait for proxy to be ready.
-    if !wait_for_port(PROXY_PORT, Duration::from_secs(10)) {
-        let dir = std::env::temp_dir().join("frp-v2-quic-test");
-        let frps_log = dir.join("frps.log");
-        let frpc_log = dir.join("frpc.log");
-        eprintln!("--- frps log ({}) ---", frps_log.display());
-        if let Ok(log) = std::fs::read_to_string(&frps_log) {
+    if !wait_for_port(proxy_port, Duration::from_secs(10)) {
+        eprintln!(
+            "--- frpc log ({}) ---",
+            _frpc.dir.join("frpc.log").display()
+        );
+        if let Ok(log) = std::fs::read_to_string(_frpc.dir.join("frpc.log")) {
             eprintln!("{log}");
         }
-        eprintln!("--- frpc log ({}) ---", frpc_log.display());
-        if let Ok(log) = std::fs::read_to_string(&frpc_log) {
+        eprintln!(
+            "--- frps log ({}) ---",
+            _frps.dir.join("frps.log").display()
+        );
+        if let Ok(log) = std::fs::read_to_string(_frps.dir.join("frps.log")) {
             eprintln!("{log}");
         }
         panic!("proxy port not ready");
@@ -340,7 +302,7 @@ fn v2_quic_r2r_tcp_proxy() {
 
     // Test TCP tunnel through V2-QUIC proxy.
     let mut stream = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", PROXY_PORT).parse().unwrap(),
+        &format!("127.0.0.1:{proxy_port}").parse().unwrap(),
         Duration::from_secs(5),
     )
     .expect("connect to proxy");
@@ -354,4 +316,12 @@ fn v2_quic_r2r_tcp_proxy() {
     assert_eq!(&buf[..n], msg, "echo mismatch");
 
     eprintln!("\u{2713} V2+QUIC TCP proxy tunnel works");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Probe a free TCP port (bind-to-0, read, drop). The caller binds shortly
+/// after; the window is small and this test is single-threaded.
+fn probe_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
 }

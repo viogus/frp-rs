@@ -66,13 +66,20 @@ Feature flags across crates:
 | `http-proxy` | frp-server | HTTP proxy plugin (reqwest) |
 | `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
 | `vnet` | frp-core/server/client | L3 VPN / TUN device routing |
+| `admin` | frp-client | frpc admin API (axum) |
+| `admin-auth` | frp-core | shared admin auth helpers (token/basic) |
+| `mimalloc` | frps/frpc | mimalloc global allocator (exclusive with mem-profile) |
+| `mem-profile` | frp-core/server/client | CountingAlloc global allocator + MEMPROFILE emitter (dev only) |
+| `profiling` | frp-core | profiling feature gate (dev only) |
+| `otel` | frp-core/server/client | OpenTelemetry tracing + OTLP export (~+2-3MB) |
+| `debug-logs` | frp-core | debug/trace logging (dev only) |
 
-All features default ON. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
+Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, vnet, compression, chacha20, tcp-mux, ssh; frpc = websocket, kcp, quic, oidc, tls, vnet, admin, compression, chacha20, tcp-mux. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
 
-**Opt-in (NOT default):** `mem-profile` (frp-core → frp-server/client → frps/frpc) installs a `CountingAlloc` global allocator + a 1 Hz `MEMPROFILE` stderr emitter for memory measurement. Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
+**Opt-in (NOT default):** `dashboard`, `mimalloc`, `otel`, `debug-logs`, `profiling`, `mem-profile` (frps/frpc); `http-proxy` is a server-side opt-in (the client http_proxy plugin compiles unconditionally). `mem-profile` installs a `CountingAlloc` global allocator + a 1 Hz `MEMPROFILE` stderr emitter and is mutually exclusive with `mimalloc` (only one `#[global_allocator]` — with both enabled the emitter reports all-zero numbers). Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
 
-- No `cargo check` variation needed — use `cargo build` for the full workspace.
-- Tests live inline (`#[cfg(test)] mod tests`), no separate test crates.
+- No `cargo check` variation needed for day-to-day work — `cargo build` covers the full workspace; ci.yml additionally gates the size tiers with `cargo check --no-default-features --features tiny|micro`.
+- Unit tests live inline (`#[cfg(test)] mod tests`); integration tests live in per-crate `tests/` dirs (`frp-server/tests/`, `frp-client/tests/`, `frp-core/tests/`).
 
 ## Development Workflow (mandatory)
 

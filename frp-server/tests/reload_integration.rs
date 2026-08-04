@@ -275,8 +275,11 @@ remote_port = {proxy_a_remote}
             .spawn()
             .expect("failed to start frpc");
 
-        // Wait for proxy A to be ready
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Wait for proxy A to be ready (poll the remote port).
+        assert!(
+            wait_for_port(proxy_a_remote, 10),
+            "proxy A never became ready"
+        );
 
         // ---- Step 6: Test proxy A works ----
         let echo_result = tcp_echo(proxy_a_remote, b"hello-from-a", 5);
@@ -327,8 +330,11 @@ remote_port = {proxy_b_remote}
             .expect("kill command failed");
         assert!(kill_status.success(), "kill -USR1 failed");
 
-        // Wait for reload to take effect
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Wait for reload to take effect (proxy B's remote port must come up).
+        assert!(
+            wait_for_port(proxy_b_remote, 10),
+            "proxy B never became ready after reload"
+        );
 
         // ---- Step 9: Verify proxy A still works (no interruption) ----
         let echo_a_after = tcp_echo(proxy_a_remote, b"hello-a-after", 5);
