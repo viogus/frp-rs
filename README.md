@@ -86,7 +86,9 @@ but not literally 100% — see "Known limitations" below.
   rejects as an invalid server name — frp-rs vendors rustls with a one-line
   server-side patch treating an invalid SNI as "no SNI" (equivalent to the
   upstream `invalid_sni_policy = IgnoreAll` added in rustls 0.24; see
-  [audit note §6](docs/superpowers/notes/2026-08-04-mimalloc-throughput-ab.md)).
+  [audit note §6](docs/superpowers/notes/2026-08-04-mimalloc-throughput-ab.md);
+  full plan + maintenance notes in
+  [2026-08-04-xtcp-quic-sni-compat.md](docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md)).
   See [full audit](docs/go-frp-compat-audit.md) for details.
 
 ### Known limitations (as of frp-rs 0.7.1)
