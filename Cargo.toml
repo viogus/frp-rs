@@ -60,6 +60,15 @@ mimalloc = "0.1.52"
 # Release profile: slim, LTO, single codegen unit, stripped symbols, abort on panic.
 # After cargo build --release, compress further with:
 #   upx --best --lzma target/release/frps target/release/frpc
+# Vendored rustls 0.23.41 with a server-side patch: Go frp XTCP QUIC visitors
+# send "ip:port" as the TLS SNI, which upstream rustls 0.23 rejects with a
+# fatal alert (ServerNamePayload::Invalid). The patch treats invalid SNI as
+# "no SNI" (upstream 0.24 `invalid_sni_policy = IgnoreAll`). See
+# docs/superpowers/notes/2026-08-04-mimalloc-throughput-ab.md §6. Drop when
+# the workspace moves past rustls 0.23.
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }
+
 [profile.release]
 opt-level = "z"
 lto = "fat"

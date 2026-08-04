@@ -244,9 +244,11 @@ selected by the `protocol` field (visitor decides; Go visitors default to
   quinn (`xtcp_p2p_connect_quic` — no yamux, QUIC multiplexes streams
   itself), self-signed TLS + InsecureSkipVerify, ALPN `frp`. The visitor is
   the QUIC client, the provider the QUIC server. Requires the `quic` feature
-  (default ON). Known limitation: a **Go** visitor with `protocol="quic"`
-  cannot talk to a Rust provider — Go frp v0.70.1 sends `"ip:port"` as the
-  QUIC SNI, which rustls rejects; set `protocol = "kcp"` on the Go visitor.
+  (default ON). Go visitors with `protocol="quic"` interoperate: Go frp
+  v0.70.1 sends `"ip:port"` as the QUIC SNI, which upstream rustls 0.23
+  rejects — frp-rs vendors rustls with a server-side patch that treats an
+  invalid SNI as "no SNI" (see the audit note §6; drop the patch when the
+  workspace moves past rustls 0.23).
 
 **XTCP P2P encryption**: after hole punch, the P2P stream is bridged to the
 local service with `bridge_encrypted` when `use_encryption=true` and `sk` is
