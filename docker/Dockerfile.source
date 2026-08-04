@@ -54,6 +54,8 @@ RUN rustup target add $(cat /tmp/rust_target)
 # Build frp-rs from source
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
+# vendored rustls (SNI patch) — required by [patch.crates-io] in Cargo.toml
+COPY vendor/ vendor/
 COPY frp-core/ frp-core/
 COPY frp-server/ frp-server/
 COPY frp-client/ frp-client/

@@ -17,7 +17,6 @@
 
 #![cfg(feature = "tls")]
 
-use std::io::Write;
 use std::sync::Arc;
 
 use rustls::ServerConnection;
