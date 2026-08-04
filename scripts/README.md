@@ -104,7 +104,7 @@ VPS may have other programs using ports. `remote-frps.sh start` handles this:
 
 No TOCTOU fix needed — acceptable race for CI. VPS frps lifetime is per-test (~5 seconds).
 
-## Test Matrix: 16 Pairwise Tests
+## Test Matrix: 17 Pairwise Tests
 
 ### Unencrypted (2³ = 8 combinations)
 
@@ -131,6 +131,12 @@ No TOCTOU fix needed — acceptable race for CI. VPS frps lifetime is per-test (
 | 14 | Rust | Go | Rust | `xtcp-rust-frps-go-prov-rust-vis-enc` |
 | 15 | Rust | Rust | Go | `xtcp-rust-frps-rust-prov-go-vis-enc` |
 | 16 | Rust | Rust | Rust | `xtcp-r2r-enc` |
+
+### QUIC data plane
+
+| # | frps | Provider | Visitor | Test name |
+|---|------|----------|---------|------------|
+| 17 | Go | Go | Rust | `xtcp-go-frps-go-prov-rust-vis-quic` |
 
 **Execution order:** Baselines first (`g2g-basic` → `r2r-basic`). If baseline fails, all tests using that frps are suspect. Then cross-tests. Encrypted variants last.
 
@@ -191,13 +197,11 @@ iptables -A INPUT -p tcp --dport 17000:17100 -j ACCEPT
 
 frps binds high ports only (17000+). Port range must cover `start_port .. start_port+100` for conflict fallback. Recommend opening 17000–17100.
 
-### 5. Install nc (netcat) on VPS
+### 5. No nc (netcat) required
 
-```bash
-apt install netcat-openbsd  # or: yum install nmap-ncat
-```
-
-`remote-frps.sh` uses `nc -z` to verify frps is ready.
+`remote-frps.sh` verifies frps is ready by polling `ss -tlnp` on the VPS
+(`wait_remote_port`) rather than `nc -z`, so netcat does not need to be
+installed.
 
 ### 6. Add GitHub Secrets
 
@@ -291,7 +295,7 @@ All 10 tests use raw V1 TCP protocol messages against in-process frps — no act
 
 | File | Purpose |
 |------|---------|
-| `scripts/compat-test.sh` | Main compat test harness (~3870 lines) |
+| `scripts/compat-test.sh` | Main compat test harness (~6250 lines) |
 | `scripts/remote-frps.sh` | VPS frps lifecycle (start/stop/status) |
 | `scripts/download-go-frp.sh` | Download Go frp pre-built binaries |
 | `.github/workflows/xtcp-compat.yml` | Daily CI workflow for XTCP |

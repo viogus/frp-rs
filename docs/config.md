@@ -33,10 +33,10 @@ Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field map
 | `max_ports_per_client` | `u64` | `0` | `maxPortsPerClient` | Maximum number of proxies a single client can register. 0 = unlimited. |
 | `vhost_http_timeout` | `u64` | `60` | `vhostHTTPTimeout` | Timeout in seconds for backend HTTP response in VHost handler. |
 | `user_conn_timeout` | `u64` | `10` | `userConnTimeout` | Idle timeout in seconds on user-facing proxy connections. |
-| `detailed_errors_to_client` | `bool` | `false` | `detailedErrorsToClient` | When true, full Rust error details are included in client-facing error responses. When false (default), internal errors are replaced with generic messages. |
+| `detailed_errors_to_client` | `bool` | `true` | `detailedErrorsToClient` | When true (default), full Rust error details are included in client-facing error responses. When false, internal errors are replaced with generic messages. |
 | `tcp_mux_passthrough` | `bool` | `false` | `tcpMuxPassthrough` | When `tcp_mux` is enabled and yamux init fails, forward raw bytes to the VHost handler instead of closing the connection. |
 | `udp_packet_size` | `usize` | `1500` | `udpPacketSize` | UDP packet buffer size in bytes. Controls the receive buffer for UDP proxy datagrams. |
-| `nat_hole_analysis_data_reserve_hours` | `u64` | `1` | `natholeAnalysisDataReserveHours` | How long historical NAT behavior records are kept (in hours). Used by XTCP NAT analysis. |
+| `nat_hole_analysis_data_reserve_hours` | `u64` | `168` | `natholeAnalysisDataReserveHours` | How long historical NAT behavior records are kept (in hours). Used by XTCP NAT analysis. |
 | `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional TOML/INI config files to merge. Relative to the main config file directory. |
 
 ### `[auth]` Section
@@ -74,7 +74,7 @@ file.path = "/run/secrets/frp-token"
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `level` | `string` | `"info"` | `log.level` | Log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`. Also controllable via `RUST_LOG` env var. |
-| `file` | `string` | `""` | `log.file` | Log file path. Empty = stderr. Uses daily rotation. |
+| `file` | `string` | `"console"` | `log.file` | Log output target: `"console"` (default, stderr) or a file path. Uses daily rotation for file output. |
 | `max_days` | `i32` | `3` | `log.maxDays` | Maximum days to retain rotated log files. |
 
 ### `[web_server]` Section
@@ -83,7 +83,7 @@ Dashboard and metrics HTTP server.
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `addr` | `string` | `""` | `webServer.addr` | Dashboard bind address. Empty = same as `bind_addr`. |
+| `addr` | `string` | `"127.0.0.1"` | `webServer.addr` | Dashboard bind address. Empty string binds to all interfaces. |
 | `port` | `u16` | `0` | `webServer.port` | Dashboard port. 0 = disabled. |
 | `user` | `string` | `""` | `webServer.user` | Basic Auth username for dashboard and management API. |
 | `password` | `string` | `""` | `webServer.password` | Basic Auth password for dashboard and management API. |
@@ -99,8 +99,8 @@ Transport-level settings for the server.
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `tcp_mux` | `bool` | `true` | `transport.tcpMux` | Enable TCP multiplexing (yamux) for work connections. When enabled, all proxies share a single TCP connection. |
-| `tcp_mux_keepalive_interval` | `i64` | `30` | `transport.tcpMuxKeepaliveInterval` | Keepalive interval in seconds for mux connections. |
-| `heartbeat_timeout` | `i64` | `90` | `transport.heartbeatTimeout` | Heartbeat timeout in seconds. Server disconnects the client if no `Ping` received within this interval. |
+| `tcp_mux_keepalive_interval` | `i64` | `30` | `transport.tcpMuxKeepaliveInterval` | Keepalive interval in seconds for mux connections. Serde default is `0`; a zero value is normalized to the 30s default at load time. |
+| `heartbeat_timeout` | `i64` | `90` | `transport.heartbeatTimeout` | Heartbeat timeout in seconds. Server disconnects the client if no `Ping` received within this interval. When `tcp_mux` is enabled (the default), this is normalized to `-1` (disabled — yamux keepalive covers liveness). |
 
 ### `[ssh_tunnel_gateway]` Section
 
@@ -146,6 +146,7 @@ The server config loader accepts both Rust (snake_case) and Go frp (camelCase) k
 - Flat `auth_method`, `auth_token`, `log_file`, `log_level`, `log_max_days`, `web_server_*` keys are automatically nested into the correct subsections.
 - `sshTunnelGateway` (camelCase) is normalized to `ssh_tunnel_gateway`.
 - `token` at top level is automatically copied into `[auth]`.
+- Exception: `tls_enable`, `tls_cert_file`, `tls_key_file`, `tls_ca_file` have no camelCase aliases — use the snake_case names.
 
 ### Server Config Reload (SIGUSR1)
 
@@ -253,21 +254,21 @@ enable_control = true
 | `transport_protocol` | `string` | `"tcp"` | `protocol` | Transport protocol: `"tcp"`, `"websocket"` / `"ws"`, `"wss"`, `"quic"`, `"kcp"`. |
 | `token` | `string` | `""` | `auth.token` | Authentication token. Must match the server's token. This is a convenience field; for full auth config use `[auth]` section. |
 | `user` | `string` | `""` | `user` | User identity string for multi-tenant setups. Sent in the Login message. |
-| `client_id` | `string` | `""` | `clientId` | Unique client identifier. Auto-generated (UUID v4) if empty. |
+| `client_id` | `string` | `""` | `clientId` | Unique client identifier. When empty, no ID is sent — Login sends `None` (not auto-generated). |
 | `metas` | `map<string,string>` | `{}` | `metadatas` | Client-level metadata key-value pairs sent in the Login message. Available to server plugins. |
 | `proxy_url` | `string` | `""` | `transport.proxyURL` | Upstream HTTP/SOCKS5 proxy for the client-to-server control connection. Supports `http://` and `socks5://` schemes. Empty = direct connection. |
-| `nat_hole_stun_server` | `string` | `""` | `natHoleStunServer` | Custom STUN server address for NAT traversal. Format: `"stun:host:port"`. Empty = use default. |
+| `nat_hole_stun_server` | `string` | `"stun.easyvoip.com:3478"` | `natHoleStunServer` | Custom STUN server address for NAT traversal. Format: `"stun:host:port"`. |
 | `start` | `string[]` | `[]` | `start` | Selective proxy start list. If non-empty, only proxies with names in this list are started. Empty = start all proxies. |
 | `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional TOML/INI config files to merge. Relative to the main config file directory. |
-| `tls_enable` | `bool` | `false` | `tlsEnable` | Enable TLS for the connection to the server. |
+| `tls_enable` | `bool` | `true` | `tlsEnable` | Enable TLS for the connection to the server. |
 | `tls_cert_file` | `string` | `""` | `tlsCertFile` | Client TLS certificate PEM file (for mTLS). |
 | `tls_key_file` | `string` | `""` | `tlsKeyFile` | Client TLS private key PEM file (for mTLS). |
 | `tls_ca_file` | `string` | `""` | `tlsCaFile` / `tlsTrustedCaFile` | CA certificate PEM file for verifying the server's TLS certificate. |
 | `tls_server_name` | `string` | `""` | `tlsServerName` | Server name for TLS SNI. Empty = use `server_addr`. |
-| `disable_custom_tls_first_byte` | `bool` | `false` | `disableCustomTLSFirstByte` | When true, the client skips the Go frp protocol marker byte (`0x17`) and starts TLS directly. Set this when connecting to a non-frp TLS endpoint. |
+| `disable_custom_tls_first_byte` | `bool` | `true` | `disableCustomTLSFirstByte` | When true, the client skips the Go frp protocol marker byte (`0x17`) and starts TLS directly. Set this when connecting to a non-frp TLS endpoint. |
 | `login_fail_exit` | `bool` | `true` | `loginFailExit` | When true, the client exits on login failure. When false, it keeps retrying. |
-| `pool_count` | `i32` | `0` | `poolCount` | Number of pre-established work connections kept in the server-side pool. Higher values reduce latency for new proxy connections. |
-| `heartbeat_interval` | `i64` | `30` | `transport.heartbeatInterval` | Ping interval in seconds. Client sends a heartbeat `Ping` at this interval. |
+| `pool_count` | `i32` | `1` | `poolCount` | Number of pre-established work connections kept in the server-side pool. Higher values reduce latency for new proxy connections. |
+| `heartbeat_interval` | `i64` | `30` | `transport.heartbeatInterval` | Ping interval in seconds. Client sends a heartbeat `Ping` at this interval. When `tcp_mux` is enabled (the default), this is normalized to `-1` (disabled — yamux keepalive covers liveness). |
 | `dns_server` | `string` | `""` | `dnsServer` | Custom DNS server address for resolving `server_addr`. Empty = system DNS. |
 | `dial_server_keepalive` | `i64` | `0` | `dialServerKeepalive` | TCP keepalive interval in seconds for outbound connections to the server. 0 = disabled. |
 | `connect_server_local_ip` | `string` | `""` | `connectServerLocalIP` | Local IP address to bind when dialing the frp server. Empty = system default. |
@@ -303,7 +304,7 @@ Admin REST API for the client. Same fields as the server `[web_server]` section.
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `addr` | `string` | `""` | `webServer.addr` | Admin API bind address. |
+| `addr` | `string` | `"127.0.0.1"` | `webServer.addr` | Admin API bind address. Empty string binds to all interfaces. |
 | `port` | `u16` | `0` | `webServer.port` | Admin API port. 0 = disabled. |
 | `user` | `string` | `""` | `webServer.user` | Basic Auth username for the admin API. |
 | `password` | `string` | `""` | `webServer.password` | Basic Auth password for the admin API. |
@@ -430,7 +431,7 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 |-------|------|---------|-------------------|-------------|
 | `name` | `string` | — | **Required.** | Unique proxy name. Used as identifier in logs, admin API, and routing. |
 | `type` | `string` | — | **Required.** | Proxy type: `"tcp"`, `"udp"`, `"http"`, `"https"`, `"stcp"`, `"xtcp"`, `"tcpmux"`, `"sudp"`. |
-| `local_ip` | `string` | `""` | `localIp` | Local service IP address. Default = `"127.0.0.1"` in most setups. |
+| `local_ip` | `string` | `"127.0.0.1"` | `localIp` | Local service IP address. |
 | `local_port` | `u16` | `0` | `localPort` | Local service port. |
 | `remote_port` | `u16` | `0` | `remotePort` | Remote port to expose on the server. 0 = auto-assign from server's port range. |
 | `use_encryption` | `bool` | `false` | `useEncryption` | Encrypt proxy traffic with AES-128-CFB (derived from auth token for TCP/UDP/HTTP; from `sk` for STCP/XTCP). |
@@ -441,16 +442,16 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `bandwidth_limit` | `string` | `""` | `bandwidthLimit` | Bandwidth limit string, e.g. `"1MB"`, `"500KB"`, `"100K"`. Supports suffixes: K/KB, M/MB, G/GB (case-insensitive). |
-| `bandwidth_limit_mode` | `string` | `""` | `bandwidthLimitMode` | Bandwidth limit mode: `"client"` (limit client→server), `"server"` (limit server→client), or empty (both directions). |
+| `bandwidth_limit` | `string` | `""` | `bandwidthLimit` | Bandwidth limit string, e.g. `"1MB"`, `"500KB"`. Only `KB`/`MB` suffixes are accepted (1024-based, case-insensitive); bare numbers, `K`/`M`/`G`, and `GB` are rejected (treated as unlimited). |
+| `bandwidth_limit_mode` | `string` | `"client"` | `bandwidthLimitMode` | Bandwidth limit mode: `"client"` (limit client→server), `"server"` (limit server→client), or `"both"` (both directions). |
 | `group` | `string` | `""` | `group` | Proxy group name for load balancing. Proxies with the same group name are treated as a pool. |
 | `group_key` | `string` | `""` | `groupKey` | Group key for authentication within a proxy group. |
 | `health_check_type` | `string` | `""` | `healthCheckType` | Health check type: `"tcp"` (connect check) or `"http"` (HTTP GET check). Empty = no health checks. |
-| `health_check_url` | `string` | `"/"` | `healthCheckURL` | URL path for HTTP health checks. Only used when `health_check_type = "http"`. |
+| `health_check_url` | `string` | `""` | `healthCheckURL` | URL path for HTTP health checks. Only used when `health_check_type = "http"`. |
 | `health_check_http_headers` | `map<string,string>` | `{}` | `healthCheckHTTPHeaders` | Custom HTTP headers sent with health check requests. |
-| `health_check_interval_seconds` | `u64` | `0` | `healthCheckIntervalS` | Seconds between health checks. Minimum 10. |
-| `health_check_timeout_seconds` | `u64` | `0` | `healthCheckTimeoutS` | Health check connect/read timeout in seconds. Minimum 3. |
-| `health_check_max_failed` | `u32` | `0` | `healthCheckMaxFailed` | Consecutive failures before marking the proxy unhealthy. Minimum 1. |
+| `health_check_interval_seconds` | `u64` | `10` | `healthCheckIntervalS` | Seconds between health checks. Minimum 10. |
+| `health_check_timeout_seconds` | `u64` | `3` | `healthCheckTimeoutS` | Health check connect/read timeout in seconds. Minimum 3. |
+| `health_check_max_failed` | `u32` | `1` | `healthCheckMaxFailed` | Consecutive failures before marking the proxy unhealthy. Minimum 1. |
 | `multiplexer` | `string` | `""` | `multiplexer` | Multiplexer type for the proxy connection (e.g. `"yamux"`). |
 
 ### HTTP/HTTPS Proxy Fields
@@ -482,7 +483,7 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 |-------|------|---------|-------------------|-------------|
 | `annotations` | `map<string,string>` | `{}` | `annotations` | Arbitrary key-value annotations (e.g. `{ owner = "team-a" }`). |
 | `metas` | `map<string,string>` | `{}` | `metas` | Key-value metadata sent to server plugins for this proxy. |
-| `proxy_protocol_version` | `string` | `""` | `proxyProtocolVersion` | HAProxy PROXY protocol version: `"v1"`, `"v2"`, or `""` (disabled). When set, the server prepends a PROXY protocol header to each connection. |
+| `proxy_protocol_version` | `string` | `""` | `proxyProtocolVersion` | HAProxy PROXY protocol version: `"v1"`, `"v2"`, or `""` (disabled). When set, the client prepends a PROXY protocol header to each connection to the local service. |
 
 ### `[proxies.plugin]` Section
 
@@ -614,10 +615,10 @@ through the frps server to a remote STCP/XTCP proxy.
 | `server_name` | `string` | `""` | `serverName` | **Required.** The STCP/XTCP proxy name to connect to (must match the proxy's `name`). |
 | `secret_key` | `string` | `""` | `sk` / `secretKey` | **Required.** Shared secret key. Must match the STCP proxy's `sk`. |
 | `server_user` | `string` | `""` | `serverUser` | Optional server-side user for auth matching. |
-| `bind_addr` | `string` | `"0.0.0.0"` | `bindAddr` | Local address to bind for accepting visitor connections. |
+| `bind_addr` | `string` | `"127.0.0.1"` | `bindAddr` | Local address to bind for accepting visitor connections. |
 | `bind_port` | `u16` | `0` | `bindPort` | Local port for the visitor listener. 0 = disabled. |
 | `plugin` | `[visitors.plugin]` | — | `plugin` | Optional visitor plugin. `type = "virtual_net"` with `destinationIP` advertises the IP as a vnet host route instead of binding a local listener. |
-| `fallback_timeout_ms` | `u64` | `5000` | `fallbackTimeoutMs` | XTCP fallback timeout in milliseconds. After this time without a successful hole punch, fall back to the `fallback_to` visitor (usually STCP). |
+| `fallback_timeout_ms` | `u64` | `1000` | `fallbackTimeoutMs` | XTCP fallback timeout in milliseconds. After this time without a successful hole punch, fall back to the `fallback_to` visitor (usually STCP). |
 | `fallback_to` | `string` | `""` | `fallbackTo` | Fallback visitor name if XTCP hole punch fails. Typically points to an STCP visitor. |
 | `disable_assisted_addrs` | `bool` | `false` | `disableAssistedAddrs` | Disable NAT traversal assisted address reporting (STUN-discovered mapped addresses shared between peers during XTCP hole punching). |
 | `use_encryption` | `bool` | `false` | `useEncryption` | Encrypt tunnel traffic with AES-128-CFB (key derived from `secret_key`). |
@@ -625,7 +626,7 @@ through the frps server to a remote STCP/XTCP proxy.
 | `protocol` | `string` | `"kcp"` | `protocol` | XTCP P2P data-plane protocol: `"kcp"` (default) or `"quic"`. The QUIC data plane (Go v0.70.1 `protocol=quic` compat: hole-punched UDP socket handed to quinn, no yamux, self-signed TLS + InsecureSkipVerify) is built in by default (the `quic` feature is default ON); use `"quic"` when interoperating with a Go frp visitor (Go defaults to `"quic"`). On a build without the feature, `"quic"` fails loudly instead of silently falling back to KCP. |
 | `keep_tunnel_open` | `bool` | `false` | `keepTunnelOpen` | When true, the XTCP visitor retries NAT hole punching instead of falling back to STCP after a connection ends. |
 | `max_retries_an_hour` | `i32` | `8` | `maxRetriesAnHour` | Maximum XTCP NAT hole punch retries per hour. |
-| `min_retry_interval` | `i64` | `30` | `minRetryInterval` | Minimum interval in seconds between XTCP retry attempts. |
+| `min_retry_interval` | `i64` | `90` | `minRetryInterval` | Minimum interval in seconds between XTCP retry attempts. |
 
 ### Visitor TOML Examples
 
@@ -692,12 +693,12 @@ The `bandwidth_limit` field accepts human-readable strings with these suffixes:
 
 | Suffix | Multiplier | Example | Bytes/sec |
 |--------|-----------|---------|-----------|
-| (none) | 1 | `"500"` | 500 |
-| `K` / `KB` | 1,000 | `"500KB"` | 500,000 |
-| `M` / `MB` | 1,000,000 | `"10MB"` | 10,000,000 |
-| `G` / `GB` | 1,000,000,000 | `"1GB"` | 1,000,000,000 |
+| `KB` | 1,024 | `"500KB"` | 512,000 |
+| `MB` | 1,048,576 | `"10MB"` | 10,485,760 |
 
-Suffixes are case-insensitive. An empty string or `"0"` means no limit.
+Only `KB` and `MB` suffixes are accepted, case-insensitively. Bare numbers
+(`"500"`), single-letter suffixes (`"K"`/`"M"`/`"G"`), and `GB` are
+rejected. An empty string or `"0"` means no limit.
 
 ---
 

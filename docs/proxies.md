@@ -62,7 +62,7 @@ health_check_url = "/health"
 
 | Field | Description |
 |-------|-------------|
-| `bandwidth_limit` | Bandwidth limit, e.g. `"1MB"` (`"500KB"`, `"1GB"`). Empty = unlimited. |
+| `bandwidth_limit` | Bandwidth limit, e.g. `"1MB"` or `"500KB"`. Only `KB`/`MB` suffixes are supported (1024 base). Empty = unlimited. |
 | `bandwidth_limit_mode` | `"client"` or `"server"`. Which side applies the limit. |
 | `group` / `group_key` | Load balancing group. Proxies with the same group share connections. `group_key` enables sticky sessions (hash-based affinity). |
 | `proxy_protocol_version` | HAProxy PROXY protocol: `"v1"`, `"v2"`, or `""` (disabled). |
@@ -95,7 +95,7 @@ User → frps:6001/UDP → [UDPPacket on work conn] → frpc → 127.0.0.1:53/UD
 Unlike TCP proxies, UDP traffic uses a dedicated work connection. frps listens on
 a UDP socket at `remote_port`, encapsulates each datagram as a `UDPPacket` wire
 message, and sends it over the work connection. frpc unwraps and forwards to the
-local UDP service. The server-level `udp_packet_size` setting (default 65535)
+local UDP service. The server-level `udp_packet_size` setting (default 1500)
 controls the datagram receive buffer.
 
 ### Encryption & Compression
@@ -104,7 +104,7 @@ Not supported. UDP datagrams are forwarded as-is inside the wire protocol.
 
 ### Health Checks
 
-TCP and HTTP health checks are **NOT** applicable to UDP proxies.
+TCP and HTTP health checks: the client starts a TCP health check for any proxy type (including UDP) that sets a non-empty `health_check_type`.
 
 ### Type-Specific Fields
 
@@ -248,7 +248,7 @@ health_check_max_failed = 3
 | `host_header_rewrite` | Rewrite the Host header before forwarding to the local service. Useful when the backend expects a specific hostname. |
 | `http_user` / `http_password` | HTTP Basic Auth credentials. Requests without matching credentials receive 401. |
 | `route_by_http_user` | Route requests by the Basic Auth username (overrides domain/path routing). |
-| `allow_users` | List of allowed Basic Auth usernames for access control. |
+| `allow_users` | Not implemented on the HTTP vhost path — use `http_user`/`http_password` or `route_by_http_user` for access control. |
 | `headers` | Custom HTTP request headers to add to proxied requests. |
 | `response_headers` | Custom HTTP response headers to inject into responses. |
 
@@ -280,7 +280,8 @@ local_port = 8443
 custom_domains = ["secure.example.com"]
 ```
 
-On the server, TLS certificate and key are required:
+On the server, TLS certificate and key are optional — when not configured,
+a self-signed certificate is generated automatically:
 
 ```toml
 # frps.toml
@@ -294,12 +295,12 @@ tls_key_file = "/etc/frp/server.key"
 ```
 Browser → frps:443/TLS (SNI: secure.example.com) → [SNI routing] → frpc → 127.0.0.1:8443
 
-Browser → frps:443/TLS (SNI: unknown.com) → TLS handshake fails / 404
+Browser → frps:443/TLS (SNI: unknown.com) → connection silently closed
 ```
 
-frps performs TLS termination, extracts the SNI hostname from the ClientHello,
-and routes to the matching proxy. The frps-to-frpc bridge then carries the
-decrypted stream.
+frps does not terminate TLS. It parses the SNI hostname from the ClientHello,
+routes to the matching proxy, and tunnels the original encrypted bytes through
+unchanged.
 
 ### Encryption & Compression
 
@@ -320,10 +321,10 @@ hostname only, no path-based routing):
 |-------|-------------|
 | `custom_domains` | **Required.** Domains matched against the TLS SNI hostname. |
 | `subdomain` | Sub-domain routing (works with server-level `sub_domain_host`). |
-| `host_header_rewrite` | Rewrite Host header after TLS termination. |
-| `http_user` / `http_password` | HTTP Basic Auth (checked after TLS termination). |
-| `headers` | Custom HTTP request headers. |
-| `response_headers` | Custom HTTP response headers. |
+| `host_header_rewrite` | Not applied on the HTTPS path — bytes are tunneled as-is. |
+| `http_user` / `http_password` | Not checked on the HTTPS path (no Basic Auth after SNI routing). |
+| `headers` | Not injected on the HTTPS path. |
+| `response_headers` | Not injected on the HTTPS path. |
 
 Server-level fields for HTTPS VHost (`frps.toml`):
 
@@ -409,7 +410,7 @@ Provider fields:
 |-------|-------------|
 | `sk` | **Required.** Secret key for visitor authentication. Must match the visitor's `secret_key`. |
 | `virtual_net` | Virtual network namespace. Proxies in different virtual nets cannot see each other even with the same `sk`. |
-| `allow_users` | List of allowed visitor run_ids. Empty = all visitors allowed. |
+| `allow_users` | List of allowed visitor run_ids. Empty = only the owner (provider's user) can access; `["*"]` = all visitors allowed. |
 
 Visitor fields (`[[visitors]]` in frpc.toml):
 
@@ -557,7 +558,7 @@ Provider fields:
 |-------|-------------|
 | `sk` | **Required.** Secret key for encryption and visitor matching. |
 | `virtual_net` | Virtual network namespace for isolation. |
-| `allow_users` | Allowed visitor run_ids (empty = all allowed). |
+| `allow_users` | Allowed visitor run_ids. Empty = only the owner (provider's user) can access; `["*"]` = all visitors allowed. |
 
 Visitor fields (`[[visitors]]`):
 
@@ -568,10 +569,10 @@ Visitor fields (`[[visitors]]`):
 | `secret_key` | Secret key matching the provider's `sk`. |
 | `bind_addr` / `bind_port` | Local address and port for the visitor listener. |
 | `fallback_to` | STCP proxy name for fallback if hole punch fails. |
-| `fallback_timeout_ms` | Fallback timeout in milliseconds (default: 5000). |
+| `fallback_timeout_ms` | Fallback timeout in milliseconds (default: 1000). |
 | `keep_tunnel_open` | Retry hole punch after connection ends instead of falling back. |
 | `max_retries_an_hour` | Max XTCP retries per hour (default: 8). |
-| `min_retry_interval` | Min seconds between retry attempts (default: 30). |
+| `min_retry_interval` | Min seconds between retry attempts (default: 90). |
 | `disable_assisted_addrs` | Disable NAT traversal assisted address reporting. |
 | `use_encryption` / `use_compression` | Must match provider settings. |
 
@@ -579,7 +580,7 @@ Server-level fields (`frps.toml`):
 
 | Field | Description |
 |-------|-------------|
-| `nat_hole_analysis_data_reserve_hours` | How long NAT behavior history is kept (default: 1). |
+| `nat_hole_analysis_data_reserve_hours` | How long NAT behavior history is kept (default: 168). |
 
 ---
 
@@ -638,9 +639,8 @@ frps → 200 Connection Established → [bridge] → frpc → 127.0.0.1:5432
    through a work connection to frpc, which connects to the local service.
 5. If no matching route is found, frps returns 404.
 
-The `multiplexer` field (when set to `"yamux"`) enables yamux multiplexing over
-the work connection, allowing multiple concurrent streams to share a single
-underlying TCP connection.
+The `multiplexer` field is stored/forwarded only and does not drive behavior —
+yamux multiplexing is controlled by the global `tcp_mux` setting.
 
 ### Proxy Authentication
 
@@ -677,7 +677,7 @@ Server-level fields (`frps.toml`):
 | Field | Description |
 |-------|-------------|
 | `tcpmux_httpconnect_port` | Port for the TCPMux HTTP CONNECT listener (0 = disabled). |
-| `tcp_mux_passthrough` | When true, if yamux init fails on a muxed connection, forward raw bytes to the VHost handler instead of closing. |
+| `tcp_mux_passthrough` | When true, CONNECT passthrough mode sends no 200 response — the full CONNECT request bytes are forwarded as pre-read data to the matched backend proxy. |
 
 ---
 
@@ -700,13 +700,13 @@ Server-level fields (`frps.toml`):
 |-------|------|---------|-------------|
 | `name` | string | — | Unique proxy name (required) |
 | `type` | string | — | Proxy type (required) |
-| `local_ip` | string | `""` | Local service IP |
+| `local_ip` | string | `"127.0.0.1"` | Local service IP |
 | `local_port` | u16 | `0` | Local service port |
 | `remote_port` | u16 | `0` | Remote port (0 = auto-assign). Not used by STCP/XTCP/TCPMux/HTTP/HTTPS. |
 | `use_encryption` | bool | `false` | Encrypt proxy traffic (AES-128-CFB) |
 | `use_compression` | bool | `false` | Compress proxy traffic (Snappy) |
 | `bandwidth_limit` | string | `""` | Bandwidth limit, e.g. `"1MB"` |
-| `bandwidth_limit_mode` | string | `""` | `"client"` or `"server"` |
+| `bandwidth_limit_mode` | string | `"client"` | `"client"`, `"server"`, or `"both"` |
 | `group` | string | `""` | Proxy group for load balancing |
 | `group_key` | string | `""` | Group key for sticky sessions |
 | `annotations` | map | `{}` | Key-value annotations |
@@ -719,10 +719,10 @@ Server-level fields (`frps.toml`):
 | Field | Default | Description |
 |-------|---------|-------------|
 | `health_check_type` | `""` | `"tcp"` or `"http"`. Empty = disabled. |
-| `health_check_url` | `"/"` | URL path for HTTP health checks. |
-| `health_check_interval_seconds` | `0` | Seconds between checks (min 10). |
-| `health_check_timeout_seconds` | `0` | Connect timeout per check (min 3). |
-| `health_check_max_failed` | `0` | Consecutive failures before marking unhealthy (min 1). |
+| `health_check_url` | `""` | URL path for HTTP health checks. |
+| `health_check_interval_seconds` | `10` | Seconds between checks (min 10). |
+| `health_check_timeout_seconds` | `3` | Connect timeout per check (min 3). |
+| `health_check_max_failed` | `1` | Consecutive failures before marking unhealthy (min 1). |
 | `health_check_http_headers` | `{}` | Custom HTTP headers for health check requests. |
 
 ### Encryption & Compression Details

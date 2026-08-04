@@ -167,7 +167,7 @@ Available tags:
 
 Images are built from **scratch** (no base image). The Rust binary is linked
 statically against musl, and the C entrypoint is compiled with `-static`.
-Total image size is approximately 3 MB.
+Total image size is approximately 2–3 MB.
 
 ### Docker Compose Example
 
@@ -452,9 +452,9 @@ enable_prometheus = true
 
 The `/metrics` endpoint exposes proxy-level counters in Prometheus text format:
 
-- `frp_proxy_traffic_in` — bytes received from clients (per proxy)
-- `frp_proxy_traffic_out` — bytes sent to clients (per proxy)
-- `frp_proxy_connections` — current active connections (per proxy)
+- `frp_server_traffic_in` — bytes received from clients (per proxy)
+- `frp_server_traffic_out` — bytes sent to clients (per proxy)
+- `frp_server_connection_counts` — current active connections (per proxy)
 
 Scrape configuration in Prometheus:
 
@@ -503,7 +503,7 @@ The dashboard provides:
 | `GET /` | HTML dashboard (version, uptime, client/proxy counts) |
 | `GET /api/status` | JSON status |
 | `GET /api/proxies` | List all proxies with traffic stats |
-| `GET /api/proxy/:name` | Single proxy detail |
+| `GET /api/proxies/{name}` | Single proxy detail (also `GET /api/proxy/{type}/{name}`) |
 | `GET /api/proxy/:name/traffic` | Traffic counters for a proxy |
 | `GET /metrics` | Prometheus text format (if enabled) |
 
@@ -741,10 +741,9 @@ bandwidth_limit_mode = "client"   # "client" or "server"
 
 | Suffix | Value |
 |--------|-------|
-| `K` / `KB` | kilobytes (1,000 bytes) |
-| `M` / `MB` | megabytes (1,000,000 bytes) |
-| `G` / `GB` | gigabytes (1,000,000,000 bytes) |
-| No suffix | bytes |
+| `KB` | kibibytes (1024 bytes) |
+| `MB` | mebibytes (1024 × 1024 bytes) |
+| Any other suffix (e.g. `K`, `G`, `GB`) or no suffix | **not accepted** — the value is treated as unlimited |
 
 `bandwidth_limit_mode`:
 - `"client"` — limit bandwidth on the frpc side (download from local service)

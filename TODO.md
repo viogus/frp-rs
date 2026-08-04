@@ -44,7 +44,7 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 - 3.1 OpenTelemetry tracing — `otel` feature, OTLP exporter, 13 `#[instrument]` sites, all log calls use structured fields (completed 2026-07-12). `frps/Cargo.toml:24`, `frps/src/main.rs:64-150`
 - 3.3 `/metrics` auth — `EnablePrometheus` gate + admin Basic auth. `frp-server/src/dashboard.rs:669-702`
 - 4.4 Admin WebSocket event stream — `GET /api/events`, `ServerEvent` broadcast. `frp-server/src/event.rs`, `dashboard.rs:550-640`
-- 4.3 Plugin hot-reload on client — live kill+restart, no frpc restart. `frp-client/src/service.rs:1285-1470`
+- 4.3 Plugin hot-reload on client — live kill+restart, no frpc restart. `frp-client/src/service.rs:~2490-2930`
 
 **Perf / size**
 - 5.1 / #100 Buffer pooling — `PoolGuard`, no raw `vec![0u8;65536]`, `BUFFER_SIZE=32768`. `frp-core/src/bridge.rs`, `buffer_pool.rs`
@@ -53,9 +53,9 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 
 **Engineering**
 - 6.1 Protocol fuzz tests — proptest over V1/V2 frames + all type bytes. `frp-core/src/protocol.rs:946-1145`
-- 6.2 Config-normalization property tests — idempotency + flat/nested equivalence. `frp-core/src/config.rs:1888-2121`
-- 6.4 TLS cert hot-reload — 60s mtime poll + SIGUSR1. `frp-server/src/service.rs:1210-1276`
-- 6.5 Graceful connection drain — counter + timeout on SIGINT/SIGTERM. `frp-server/src/service.rs:2088-2108`
+- 6.2 Config-normalization property tests — idempotency + flat/nested equivalence. `frp-core/src/config.rs:~5075+`
+- 6.4 TLS cert hot-reload — 60s mtime poll + SIGUSR1. `frp-server/src/service.rs:~1940-1978`
+- 6.5 Graceful connection drain — counter + timeout on SIGINT/SIGTERM. `frp-server/src/service.rs:~3100-3123`
 - 6.6 Admin API TLS — `TlsListener`, shares hot-reload acceptor. `frp-server/src/dashboard.rs:19-80,719-726`
 
 **Performance program (4-axis, 2026-07)** — throughput → CPU → latency → memory:

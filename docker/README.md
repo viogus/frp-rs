@@ -6,20 +6,23 @@
 
 | 镜像 | 平台 |
 |------|------|
-| `ghcr.io/viogus/frps-rs:latest` | linux/amd64, arm64 |
-| `ghcr.io/viogus/frpc-rs:latest` | linux/amd64, arm64 |
-| `ghcr.io/viogus/frps-tiny-rs:latest` | linux/amd64, arm64 |
-| `ghcr.io/viogus/frpc-tiny-rs:latest` | linux/amd64, arm64 |
-| `ghcr.io/viogus/frps-micro-rs:latest` | linux/amd64, arm64 |
-| `ghcr.io/viogus/frpc-micro-rs:latest` | linux/amd64, arm64 |
+| `ghcr.io/viogus/frps-rs:latest` | linux/amd64, linux/arm64, linux/arm/v7 |
+| `ghcr.io/viogus/frpc-rs:latest` | linux/amd64, linux/arm64, linux/arm/v7 |
+| `ghcr.io/viogus/frps-tiny-rs:latest` | linux/amd64, linux/arm64, linux/arm/v7 |
+| `ghcr.io/viogus/frpc-tiny-rs:latest` | linux/amd64, linux/arm64, linux/arm/v7 |
+| `ghcr.io/viogus/frps-micro-rs:latest` | linux/amd64, linux/arm64, linux/arm/v7 |
+| `ghcr.io/viogus/frpc-micro-rs:latest` | linux/amd64, linux/arm64, linux/arm/v7 |
 
-`:test` 标签 (源码构建) 和 `:vX.Y.Z` 版本标签也适用于所有 6 个变体。
+`:test` 标签 (源码构建) 和 `:vX.Y.Z` 版本标签同样覆盖 6 个变体；tiny/micro
+变体使用带后缀的标签（`:testtiny`/`:testmicro`、`:vX.Y.Ztiny`/`:vX.Y.Zmicro`）。
+`:latest` 只推送到 2 个主镜像（frps-rs、frpc-rs）。
 
 ## 构建方式
 
 | Dockerfile | 用途 |
 |------------|------|
-| `Dockerfile.source` | 从源码编译（交叉编译），arm64 使用 `aarch64-unknown-linux-gnu` |
+| `Dockerfile.source` | 从源码编译（交叉编译），arm64 使用 `aarch64-unknown-linux-musl` |
+| `build.sh` | 下载 GitHub release 二进制构建镜像（非源码编译的构建路径） |
 
 ## 用法
 
@@ -82,7 +85,7 @@ services:
 | `FRP_TLS_CERT_FILE` | — | TLS 证书文件 |
 | `FRP_TLS_KEY_FILE` | — | TLS 私钥文件 |
 | `FRP_DASHBOARD_PORT` | `0` | Dashboard 端口 (0 = 禁用) |
-| `FRP_DASHBOARD_ADDR` | `""` | Dashboard 绑定地址 |
+| `FRP_DASHBOARD_ADDR` | `0.0.0.0` | Dashboard 绑定地址 |
 | `FRP_DASHBOARD_USER` | `""` | Dashboard 用户名 |
 | `FRP_DASHBOARD_PWD` | `""` | Dashboard 密码 |
 
@@ -101,5 +104,7 @@ services:
 
 ## 自动更新
 
-Release 标签推送时自动构建 `latest` + 版本标签镜像。
-Push 到 `main`（`docker/**` 变更）时自动构建 `test` 标签镜像。
+Release 标签（`v*`）推送时自动构建 `latest` + 版本标签镜像。
+Push 到 `main` 时自动构建 `test` 标签镜像（触发器为 `branches: [main]` +
+`tags: v*`，无 `docker/**` 路径过滤）。
+Pull Request 也会构建 `:pr-N` 标签镜像。

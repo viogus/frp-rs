@@ -41,14 +41,18 @@ XTCP_VPS_SSH_KEY=~/.ssh/xtcp-ci bash scripts/compat-test.sh \
 | Step | Detail |
 |------|--------|
 | 1. Create user | `frp-test`, no sudo, password locked |
-| 2. SSH config | `authorized_keys` with `restrict` + `command=` (limited to `/tmp/frp-xtcp-test`) |
+| 2. SSH config | `authorized_keys` with plain key, no options (`restrict`/`command=` not applied — see Security below) |
 | 3. Firewall | Opens tcp 17000–17100 (auto-detect ufw / firewalld / iptables) |
 | 4. netcat | Installs if missing (apt/yum/dnf/apk) |
 
 ## Security
 
 - `frp-test` has no sudo, no password
-- SSH key restricted by `command=` — only runs commands in `/tmp/frp-xtcp-test`
-- `restrict` disables port forwarding, agent forwarding, pty, X11
+- SSH key is written **without** options (plain key). `vps-setup.sh` deliberately
+  skips `restrict`/`command=` — `restrict` causes SSH agent hangs on some
+  OpenSSH versions. `command=` (limiting the key to `/tmp/frp-xtcp-test`) and
+  `restrict` (disabling port forwarding, agent forwarding, pty, X11) remain
+  available as **manual** hardening options — see "Restrict authorized_keys"
+  in `scripts/README.md`.
 - Token is ephemeral (generated per test run)
 - No persistent state on VPS between test runs (`remote-frps.sh stop` cleans `/tmp/frp-xtcp-test`)

@@ -80,11 +80,10 @@ password = "s3cret"
 
 ### Authentication
 
-If `username` and `password` are both non-empty, the server advertises
-USERNAME/PASSWORD auth (method 0x02) in addition to NO_AUTH (0x00). Clients
-that support user/pass will be challenged; clients without credentials can
-still use NO_AUTH. If credentials are set and the client sends incorrect
-credentials, the connection is rejected.
+If `username` and `password` are both non-empty, the proxy accepts **only**
+USERNAME/PASSWORD auth (method 0x02). Clients that offer only NO_AUTH (0x00)
+are rejected with `0xFF` (no acceptable method). If credentials are set and
+the client sends incorrect credentials, the connection is rejected.
 
 Omit both `username` and `password` for an open SOCKS5 proxy (no auth).
 
@@ -247,8 +246,8 @@ No.
 ## 6. HTTP to HTTPS (`plugin.type = "http2https"`)
 
 Reverse proxy: frpc accepts plain HTTP and forwards to an HTTPS backend. The
-plugin connects to the backend via TLS, verifying its certificate with system
-root CAs.
+plugin connects to the backend via TLS but does **not** verify the backend
+certificate (`InsecureSkipVerify`).
 
 ### Configuration
 
@@ -269,7 +268,8 @@ host_header_rewrite = "backend.example.com"
 - Same HTTP request parsing and forwarding as `http2http`
 - Connects to the backend via TCP + TLS (rustls)
 - Server Name Indication (SNI) is set from the `local_addr` hostname
-- Backend TLS certificate is verified against system root CAs
+- Backend TLS certificate is **not** verified (`InsecureSkipVerify`, matching
+  Go frp behavior)
 - The forwarded request is sent over the encrypted TLS connection
 
 ### TLS Requirements
@@ -361,7 +361,7 @@ host_header_rewrite = "internal-api.example.com"
 - Accepts TLS on the incoming connection using `crt_file`/`key_file`
 - Decrypts the HTTP request
 - Establishes a new TLS connection to the backend (SNI from `local_addr`
-  hostname, verified against system root CAs)
+  hostname, without backend certificate verification)
 - Forwards the request over the backend TLS connection
 - Copies the response back through both TLS layers
 
@@ -369,7 +369,8 @@ host_header_rewrite = "internal-api.example.com"
 
 - Requires **TLS feature** (`tls` — enabled by default)
 - **`crt_file` and `key_file` are required** — for the plugin listener
-- Backend TLS is verified with system root CAs (no custom CA support)
+- Backend TLS certificate is **not** verified (`InsecureSkipVerify`, matching
+  Go frp behavior)
 
 ### Fields
 
@@ -384,9 +385,9 @@ host_header_rewrite = "internal-api.example.com"
 
 ## 9. TLS to Raw (`plugin.type = "tls2raw"`)
 
-TLS termination to raw TCP. The plugin connects to a local TLS service
-(frpc acts as TLS client), decrypts the stream, and forwards the raw bytes
-through the frp tunnel.
+TLS termination to raw TCP. frpc terminates TLS **on the tunnel side** (acting
+as the TLS server), then connects to a local plain TCP service and relays the
+decrypted bytes.
 
 ### Configuration
 
@@ -399,35 +400,42 @@ remote_port = 9000
 [proxies.plugin]
 type = "tls2raw"
 local_addr = "127.0.0.1:5432"
+crt_file = "/etc/frp/edge.crt"
+key_file = "/etc/frp/edge.key"
 ```
 
 ### Behavior
 
-- Each tunnel connection triggers a TCP connection to `local_addr`
-- The TCP connection is upgraded to TLS (frpc is the TLS client)
-- SNI is set from the `local_addr` hostname
-- Backend TLS certificate is verified against system root CAs
-- After TLS handshake, raw bytes are relayed bidirectionally between the
-  tunnel and the TLS stream
+- Each tunnel connection is terminated by frpc with a TLS handshake (frpc is
+  the TLS **server**, using `crt_file`/`key_file`)
+- After TLS termination, frpc connects to the local plain TCP service at
+  `local_addr`
+- If `proxy_protocol_version` is set to `v1`/`v2`, a PROXY protocol header is
+  written to the local connection so the service sees the real client IP/port
+- Decrypted bytes are relayed bidirectionally between the TLS stream and the
+  raw TCP connection
 
 ### Use Case
 
-Expose a local TLS-only service (e.g., a PostgreSQL server requiring TLS)
-through frp while handling the TLS layer on frpc. The public-facing frp
-connection is handled by the proxy `type = "tcp"` — it is not TLS-aware.
-TLS is stripped at the plugin, and raw TCP flows through the tunnel.
+Expose a public TLS endpoint that forwards to a local plain-TCP service (e.g.,
+a PostgreSQL or Redis server that is not TLS-aware). The public-facing frp
+connection is handled by the proxy `type = "tcp"` — it is not TLS-aware. The
+plugin terminates TLS on frpc and passes plaintext to the local service.
 
 ### TLS Requirements
 
 - Requires **TLS feature** (`tls` — enabled by default)
-- No `crt_file`/`key_file` needed — frpc is a TLS client, not server
-- Backend TLS certificate is verified with system root CAs
+- **`crt_file` and `key_file` are required** — PEM-format TLS certificate and
+  private key used by frpc to terminate TLS on the tunnel side
+- The local backend is plain TCP — no certificate verification
 
 ### Fields
 
 | Field       | Type   | Required | Description                                    |
 |-------------|--------|----------|------------------------------------------------|
-| `local_addr`| string | **yes**  | Local TLS service `host:port`                  |
+| `local_addr`| string | **yes**  | Local plain TCP service `host:port`            |
+| `crt_file`  | string | **yes**  | Path to TLS certificate PEM file               |
+| `key_file`  | string | **yes**  | Path to TLS private key PEM file               |
 
 ------------------------------------------------------------------------------
 
@@ -446,8 +454,8 @@ All fields available in the `[proxies.plugin]` section:
 | `local_path`          | static_file                                | Filesystem directory to serve                  |
 | `strip_prefix`        | static_file                                | URL prefix to strip before filesystem lookup   |
 | `host_header_rewrite` | http2http, http2https, https2http, https2https | Override Host header sent to backend        |
-| `crt_file`            | https2http, https2https                    | TLS certificate PEM for plugin listener        |
-| `key_file`            | https2http, https2https                    | TLS private key PEM for plugin listener        |
+| `crt_file`            | https2http, https2https, tls2raw           | TLS certificate PEM for plugin listener        |
+| `key_file`            | https2http, https2https, tls2raw           | TLS private key PEM for plugin listener        |
 
 ------------------------------------------------------------------------------
 
@@ -463,7 +471,7 @@ All fields available in the `[proxies.plugin]` section:
 | http2https       | **yes**              | no            | `local_addr`                  |
 | https2http       | **yes**              | no            | `local_addr`, `crt_file`, `key_file` |
 | https2https      | **yes**              | no            | `local_addr`, `crt_file`, `key_file` |
-| tls2raw          | **yes**              | no            | `local_addr`                  |
+| tls2raw          | **yes**              | no            | `local_addr`, `crt_file`, `key_file` |
 | virtual_net      | no                   | no            | `[virtualNet] address`        |
 
 Plugins compiled without the required feature will return a descriptive error

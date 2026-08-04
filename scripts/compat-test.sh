@@ -3642,7 +3642,7 @@ run_xtcp_test() {
     fi
 }
 
-# ═══ XTCP test definitions (12 pairwise matrix) ══════════════════════════════
+# ═══ XTCP test definitions (17 pairwise matrix) ══════════════════════════════
 
 # ── XTCP baselines (same-implementation) ──
 
@@ -4622,7 +4622,7 @@ if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
 fi
 
 if ${XTCP_ONLY:-false} || [[ "${RUN_XTCP:-0}" == "1" ]]; then
-    # ── 16 tests, shardable across CI matrix jobs ──
+    # ── 17 tests, shardable across CI matrix jobs ──
     # Use --shard INDEX/TOTAL to split across N parallel jobs
     XTCP_TESTS=(
         # Unencrypted

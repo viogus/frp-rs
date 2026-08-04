@@ -4,25 +4,31 @@ frp-rs is a native Rust implementation of [frp](https://github.com/fatedier/frp)
 
 ## 1. Workspace Overview
 
-The project is a Cargo workspace with five crates arranged in a layered dependency graph:
+The project is a Cargo workspace with six crates arranged in a layered dependency graph:
 
 ```
-frps ──────────────► frp-server ──────────────► frp-core
-(server binary)      (server logic)             (shared library)
-                                                   ▲
-frpc ──────────────► frp-client ──────────────┘
-(client binary)      (client logic)
+frps ──────────────► frp-server ──────► frp-core
+(server binary)      (server logic)      (shared library)
+                       │                   ▲
+                       └──► frp-vnet ──────┘
+                            (virtual net)
+
+frpc ──────────────► frp-client ──────► frp-core
+(client binary)      (client logic)      (shared library)
+                       │                   ▲
+                       └──► frp-vnet ──────┘
+                            (virtual net)
 ```
 
 Dependencies flow **upward** through this diagram (binaries depend on logic crates, which depend on the shared library):
 
 | Crate | Purpose | Key Modules |
 |-------|---------|-------------|
-| **frp-core** | Shared library with no internal workspace dependencies | Protocol framing (`protocol.rs`), message types (`msg.rs`), config parsing (`config.rs`), transport abstraction (`transport.rs`), auth (`auth.rs`), encryption (`encryption.rs`), bridge (`bridge.rs`), mux (`mux.rs`), QUIC (`quic.rs`), KCP (`kcp.rs`), STUN (`stun.rs`), V2 handshake (`v2_handshake.rs`), cipher streams (`cipher_stream.rs`) |
-| **frp-server** | Server logic -- control handler, proxy registration, connection bridging | Service + accept loop (`service.rs`), control handler (`control/mod.rs`), proxy management (`proxy.rs`), bridge assignment (`control/bridge.rs`), proxy registration (`control/proxy_ops.rs`), NAT hole punching (`nathole/`), VHost routing (`vhost.rs`), dashboard (`dashboard.rs`), SSH gateway (`ssh_gateway.rs`), TCPMux (`tcpmux.rs`), admin API (`admin.rs`), reload (`reload.rs`), state (`state.rs`), handlers (`handlers.rs`) |
+| **frp-core** | Shared library with no internal workspace dependencies | Protocol framing (`protocol.rs`), message types (`msg.rs`), config parsing (`config.rs`), transport abstraction (`transport.rs`), auth (`auth.rs`), encryption (`encryption.rs`), bridge (`bridge.rs`), mux (`mux.rs`), QUIC (`quic.rs`), KCP (`kcp/`), STUN (`stun.rs`), V2 handshake (`v2_handshake.rs`), cipher streams (`cipher_stream.rs`) |
+| **frp-server** | Server logic -- control handler, proxy registration, connection bridging | Service + accept loop (`service.rs`), control handler (`control/mod.rs`), proxy management (`proxy.rs`), bridge assignment (`control/bridge.rs`), proxy registration (`control/proxy_ops.rs`), NAT hole punching (`nathole/`), VHost routing (`vhost.rs`), dashboard + admin API (`dashboard.rs`), SSH gateway (`ssh_gateway.rs`), TCPMux (`tcpmux.rs`), config reload (SIGUSR1, `service.rs`), state (`state.rs`), handlers (`handlers.rs`) |
 | **frp-client** | Client logic -- service lifecycle, control connection, local bridging | Client service (`service.rs`), work connections (`work_conn.rs`), visitor mode (`visitor.rs`), admin API (`admin.rs`), health checks (`health.rs`), client plugins (`plugin/`) |
-| **frps** | Server binary | CLI argument parsing (`args.rs`), logging setup, calls `frp_server::Service::run()` |
-| **frpc** | Client binary | CLI argument parsing (`args.rs`), logging setup, calls `frp_client::Service::run()` |
+| **frps** | Server binary | CLI argument parsing (`frp_core::cli`), logging setup, calls `frp_server::Service::run()` |
+| **frpc** | Client binary | CLI argument parsing (`frp_core::cli`), logging setup, calls `frp_client::Service::run()` |
 
 `frp-core` has no dependencies on other workspace crates -- it defines the wire protocol, message types, and transport primitives that both server and client use. The `frp-server` and `frp-client` crates contain the protocol logic but no `main()` functions; binaries live in `frps/` and `frpc/`.
 
@@ -185,7 +191,7 @@ When a new work connection arrives:
 1. Pop from `pending_requests` if non-empty -- bridge immediately
 2. If no pending requests, push to `work_pool` (if below `pool_cap`)
 
-**Bridging** (`control/bridge.rs`, `assign_work_to_proxy`): after sending `StartWorkConn` with proxy metadata (encryption flag, compression flag), the server bridges the user connection to the work connection using either `tokio::io::copy_bidirectional` (plain) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy with 4-byte big-endian length prefix framing).
+**Bridging** (`control/bridge.rs`, `assign_work_to_proxy`): after sending `StartWorkConn` with proxy metadata (encryption flag, compression flag), the server bridges the user connection to the work connection using either `tokio::io::copy_bidirectional` (plain) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy, streaming — a single 16-byte IV then continuous ciphertext, no per-frame length prefix).
 
 ### NAT Hole Punching (XTCP)
 
@@ -262,12 +268,12 @@ SecretKey.
 
 ```
 ┌───────────┬────────────────────────────────┬──────────────────────┐
-│ 1 byte    │ 8 bytes (big-endian)           │ N bytes (max 64 KiB) │
+│ 1 byte    │ 8 bytes (big-endian)           │ N bytes (max 10 KiB) │
 │ type      │ payload length (i64)           │ UTF-8 JSON           │
 └───────────┴────────────────────────────────┴──────────────────────┘
 ```
 
-9-byte header followed by JSON payload. `read_v1_frame()` reads the header, validates length <= 64 KiB, then reads the payload. `deserialize_v1()` dispatches by type byte to the correct `FrpMessage` variant.
+9-byte header followed by JSON payload. `read_v1_frame()` reads the header, validates length <= 10 KiB (10_240, matching Go frp), then reads the payload. `deserialize_v1()` dispatches by type byte to the correct `FrpMessage` variant.
 
 Message type bytes (from `frp-core/src/msg.rs`):
 
@@ -306,7 +312,7 @@ Encryption in the control handler is protocol-aware: V1 uses AES-128-CFB (`Ciphe
 
 **Control connection:** AES-128-CFB. Key derived via `PBKDF2-SHA1(token, salt="frp", iterations=64, keylen=16)`. Implemented in `frp-core/src/encryption.rs`.
 
-**Encrypted bridge (data plane):** AES-128-CFB streaming with Snappy compression (compress first, then encrypt). Framing: 4-byte big-endian length prefix + 16-byte IV + CFB-encrypted payload. Implemented in `frp-core/src/bridge.rs`.
+**Encrypted bridge (data plane):** AES-128-CFB streaming with Snappy compression (compress first, then encrypt). Framing: one random 16-byte IV written before the first ciphertext block, then a continuous CFB stream (no per-frame length prefix). Implemented in `frp-core/src/bridge.rs`.
 
 **V2 control:** AEAD (AES-256-GCM or ChaCha20-Poly1305). Keys derived via HKDF-SHA256 from the transcript hash. Implemented in `frp-core/src/crypto.rs`.
 
@@ -325,17 +331,20 @@ OIDC authentication is also supported when the `oidc` feature is enabled. The se
 ```rust
 pub enum IoStream {
     Tcp(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
-    Kcp(KcpStream),
-    Quic(QuicStream),
+    Tls(Box<dyn AsyncReadWrite>, SocketAddr),      // TLS-wrapped transport
+    Kcp(KcpStream),                                // #[cfg(feature = "kcp")]
+    Quic(QuicStream),                              // #[cfg(feature = "quic")]
+    WebSocket(WsByteStream),                       // #[cfg(feature = "websocket")]
     Yamux(YamuxStream),
-    WebSocket(WebSocketStream),
-    PreRead(Vec<u8>, usize, Box<IoStream>),  // replay bytes before inner stream
-    BufferedRead(Vec<u8>, usize, Box<IoStream>), // same as PreRead (backward compat)
+    Cipher(Box<CipherStream<IoStream>>),           // AES-128-CFB control stream
+    Aead(Box<AeadStream>),                         // V2 AEAD control stream
+    SshChannel(Box<dyn AsyncReadWrite>),           // SSH reverse-forward channel
+    PreRead(Vec<u8>, TcpStream),                   // replay bytes before TCP stream
+    BufferedRead(Vec<u8>, usize, Box<IoStream>),   // buffered bytes before inner stream
 }
 ```
 
-`IoStream::into_split()` returns `Box<dyn AsyncRead>` / `Box<dyn AsyncWrite>` -- the work connection bridge uses this to erase the concrete stream type. The `WsByteStream` adapter wraps WebSocket binary messages into `AsyncRead`/`AsyncWrite` so the V1 protocol operates over WebSocket without changes.
+`IoStream::into_split()` returns the static enum halves `ReadHalf`/`WriteHalf` — enum dispatch replaces the old `Box<dyn AsyncRead>` / `Box<dyn AsyncWrite>` (zero heap allocation, match-based static dispatch instead of vtable). The `WebSocket` variant wraps WebSocket binary messages into `AsyncRead`/`AsyncWrite` so the V1 protocol operates over WebSocket without changes.
 
 **Config normalization** (`frp-core/src/config.rs`): full Go to Rust config compatibility layer. TOML values are converted via `toml_to_json()` to `serde_json::Value`, then deserialized into config structs. Legacy fields like `[common]`, `auth_method`, `log_file`, `web_server_*` are normalized.
 
@@ -419,19 +428,19 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 ```bash
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~5.0MB), frpc (~4.5MB)
+# → frps (~5.1MB), frpc (~4.3MB)
 
 # Full (all features; dashboard is the only opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~5.3MB), frpc (~4.5MB)
+# → frps (~5.3MB), frpc (~4.3MB)
 
 # Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~3.2MB), frpc-tiny (~2.7MB)
+# → frps-tiny (~3.0MB), frpc-tiny (~2.6MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~1.9MB), frpc-micro (~2.0MB)
+# → frps-micro (~1.8MB), frpc-micro (~1.9MB)
 ```
 
 The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and `frps-micro`/`frpc-micro` respectively.
@@ -550,7 +559,7 @@ sudo tcpdump -i lo -X -s 0 port 7000
 
 ### Unit Tests
 
-Tests live inline in `#[cfg(test)] mod tests` blocks within source files. There are no separate test crates.
+Unit tests live inline in `#[cfg(test)] mod tests` blocks within source files. Integration tests live in the `frp-server/tests/` and `frp-client/tests/` directories (see "Writing New Tests" below).
 
 ```bash
 # Run all tests
@@ -576,7 +585,7 @@ cargo test -- --ignored
 The compat test suite verifies Go frp <-> Rust frp interop across all proxy types and transport protocols:
 
 ```bash
-# Full suite (40 default + 2 guarded)
+# Full suite (68 run_test scenarios, 2 of which are gated on Go frp V2)
 bash scripts/compat-test.sh --verbose
 
 # Filter by proxy type and direction
@@ -609,7 +618,7 @@ bash scripts/vps-setup.sh
 bash scripts/remote-frps.sh xtcp
 ```
 
-XTCP CI uses sharded matrix jobs (`.github/workflows/xtcp-compat.yml`) with per-shard directories for isolation. 16 tests across a 2x2 matrix (Go/Rust server, Go/Rust client) covering 4 pairwise combinations.
+XTCP CI uses sharded matrix jobs (`.github/workflows/xtcp-compat.yml`) with per-shard directories for isolation. 17 tests covering the 2x2 implementation matrix (Go/Rust server × Go/Rust client) plus QUIC-data-plane and encrypted variants.
 
 ### Writing New Tests
 
@@ -623,7 +632,7 @@ Follow these conventions:
 
 ### Benchmarks
 
-Criterion micro-benchmarks in `frp-core/benches/crypto_bridge.rs` (9 groups) and `frp-server/benches/nathole.rs` (2 groups):
+Criterion micro-benchmarks in `frp-core/benches/crypto_bridge.rs` (8 groups) and `frp-server/benches/nathole.rs` (2 groups):
 
 ```bash
 # Run all benchmarks (slow — runs each bench many times)
@@ -654,8 +663,8 @@ Monitors memory, connection counts, and throughput. Runs weekly in CI via `.gith
 ### Property & Fuzz Tests
 
 Proptest-based tests verify correctness under adversarial inputs:
-- **Config normalization** (`frp-core/src/config.rs`): 14 tests — idempotency, flat↔nested equivalence, camelCase→snake_case
-- **Protocol fuzzing** (`frp-core/src/protocol.rs`): 13 tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
+- **Config normalization** (`frp-core/src/config.rs`): 9 proptest! blocks — idempotency, flat↔nested equivalence, camelCase→snake_case
+- **Protocol fuzzing** (`frp-core/src/protocol.rs`): 6 fuzz tests + 20 regular tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
 
 ## 7. Release Process
 

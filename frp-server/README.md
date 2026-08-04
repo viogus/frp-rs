@@ -62,7 +62,8 @@ UdpNeedsWorkConn
 use frp_server::service::Service;
 use frp_server::state::AppState;
 
-let service = Service::new(config).await?;
+// `config_file` is optional (`None` when no config-file reload is wanted)
+let service = Service::new(config, config_file).await?;
 service.run().await?;
 ```
 
@@ -73,9 +74,13 @@ frp-server = { path = "../frp-server" }
 
 ## Feature Flags
 
+All features below are enabled by default (`default = ["websocket", "kcp",
+"quic", "oidc", "tls", "http-proxy", "vnet", "compression", "chacha20",
+"tcp-mux", "ssh"]`) except `dashboard`, which is opt-in.
+
 | Feature | Removes |
 |---------|---------|
-| `dashboard` | Prometheus metrics, axum status API |
+| `dashboard` | Prometheus metrics, axum status API (opt-in) |
 | `ssh` | SSH gateway (russh) |
 | `oidc` | OIDC token verification |
 | `http-proxy` | HTTP proxy plugin (reqwest) |
@@ -83,3 +88,7 @@ frp-server = { path = "../frp-server" }
 | `quic` | QUIC transport listener |
 | `kcp` | KCP transport listener |
 | `tls` | TLS encryption (rustls, tokio-rustls) |
+| `vnet` | Virtual net TUN support (frp-vnet) |
+| `compression` | Snappy compression support |
+| `chacha20` | ChaCha20-Poly1305 encryption |
+| `tcp-mux` | yamux TCP multiplexing |

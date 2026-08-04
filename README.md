@@ -52,15 +52,17 @@ suitable as a drop-in replacement for either the client or server side.
 | HTTPS VHost routing  | —      | ✅     |
 | Dashboard (web UI)   | —      | ✅     |
 | Management REST API  | ✅     | ✅     |
-| Prometheus metrics   | —      | ✅     |
+| Prometheus metrics   | ✅     | ✅     |
 | Server config reload | —      | ✅     |
 | Config directory mode| ✅     | ✅     |
 | Client plugins       | ✅     | —      |
 | Visitor (STCP/XTCP)  | ✅     | —      |
-| Store (runtime config) | ✅   | —      |
+| Store (runtime config) | ✅   | ✅*    |
 | VirtualNet (L3 VPN)  | ✅     | ✅     |
 
 Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`, `https2http`, `https2https`, `http2http`, `tls2raw`, `virtual_net`.
+
+\* Store semantics differ: the client store (`store.path`) persists runtime proxy/visitor entries for admin API CRUD; the server store (`frps_store.json`) persists dashboard-created proxies.
 
 ### Go frp Compatibility Notes
 
@@ -107,17 +109,17 @@ but not literally 100% — see "Known limitations" below.
 
 **Smaller and lighter than Go frp.** Rust compiles to native code with no runtime, no GC, and aggressive size optimizations:
 
-| Metric | Go frp v0.70.1 | frp-rs (default) | frp-rs (full) | frp-rs (`tiny`) | frp-rs (`micro`) |
-|--------|---------------|------------------|---------------|-----------------|-------------------|
-| frps binary | ~14 MB | ~5.0 MB | ~5.3 MB | ~3.2 MB | ~1.9 MB |
-| frpc binary | ~12 MB | ~4.5 MB | ~4.5 MB | ~2.7 MB | ~2.0 MB |
-| Memory (idle) | ~8-12 MB | ~2-4 MB | ~2-4 MB | ~1.5-3 MB | ~1-2 MB |
+| Metric | Go frp v0.70.1 | frp-rs (default) | frp-rs (`tiny`) | frp-rs (`micro`) |
+|--------|---------------|------------------|-----------------|-------------------|
+| frps binary | ~14 MB | ~5.1 MB | ~3.0 MB | ~1.8 MB |
+| frpc binary | ~12 MB | ~4.3 MB | ~2.6 MB | ~1.9 MB |
+| Memory (idle) | ~8-12 MB | ~2-4 MB | ~1.5-3 MB | ~1-2 MB |
 
-**Four build sizes via feature flags.** Trim unused protocols and features to match your deployment:
+**Build sizes via feature flags.** Trim unused protocols and features to match your deployment. `frps`'s `default` feature set already enables every transport and the SSH gateway, so `default` and `full` produce the same binary — the only opt-in feature is `dashboard`:
 
-- **default**: Core transports (TCP, WS, TLS, KCP, QUIC), OIDC auth, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux, and the SSH gateway. Dashboard is opt-in.
-- **full** (`--features "ssh,quic,dashboard"`): All transports + SSH gateway + dashboard/metrics.
-- **`tiny`**: Drops QUIC, KCP, WebSocket, SSH, OIDC, dashboard, and compression. Keeps TLS, HTTP proxy, TCP mux. Ideal for edge devices.
+- **default** (= full minus dashboard): TCP, WS, TLS, KCP, QUIC, OIDC auth, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux, vnet, and the SSH gateway.
+- **full** (`--features "ssh,quic,dashboard"`): default + dashboard/metrics. (`ssh` and `quic` are redundant here — both are already on by default.)
+- **`tiny`**: Drops QUIC, KCP, WebSocket, SSH, OIDC, dashboard, and compression. Keeps TLS and TCP mux (frps also keeps the HTTP proxy plugin). Ideal for edge devices.
 - **`micro`**: Core only — no TLS, no compression, no chacha20, no HTTP proxy, no TCP mux. Minimal attack surface and footprint.
 
 ```bash
@@ -138,18 +140,18 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 **兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 68 项常规兼容性测试加 17 项 XTCP 两两矩阵测试（含 QUIC 数据面）。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
-**体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.0 MB，frpc ~4.5 MB（含 QUIC 传输），约为 Go frp 的 1/3。全功能版本（full）frps ~5.3 MB，frpc ~4.5 MB。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
+**体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.1 MB，frpc ~4.3 MB（含 QUIC/KCP/SSH 等全部默认 feature），约为 Go frp 的 1/3。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
 **功能裁剪。** 四级构建体系，按需组合，适配从云端到嵌入式的全场景（QUIC/SSH 默认启用，dashboard 需显式启用）：
 
 | 版本 | 体积 (frps/frpc) | 保留能力 | 适用场景 |
 |------|-----------------|---------|---------|
-| **default** | ~5.0MB / ~4.5MB | TCP/WS/TLS/KCP/QUIC、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
-| **full** | ~5.3MB / ~4.5MB | 全部传输层 + SSH + dashboard（需 `--features "ssh,quic,dashboard"`） | 全功能部署 |
-| **tiny** | ~3.2MB / ~2.7MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/压缩/TCP mux | 边缘设备、嵌入式 |
-| **micro** | ~1.9MB / ~2.0MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
+| **default** | ~5.1MB / ~4.3MB | TCP/WS/TLS/KCP/QUIC、SSH、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux、vnet | 通用部署 |
+| **full** | ~5.3MB / ~4.3MB | default + dashboard（`--features "ssh,quic,dashboard"`，ssh/quic 已默认启用） | 全功能部署 |
+| **tiny** | ~3.0MB / ~2.6MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/TCP mux（frps 另保留 HTTP 代理） | 边缘设备、嵌入式 |
+| **micro** | ~1.8MB / ~1.9MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
 
-每个 feature 均可独立开关，18 个编译期 feature flag 精细控制二进制内容。无需修改代码，Cargo feature 即按需裁剪。
+每个 feature 均可独立开关（frps 20 个、frpc 18 个编译期 feature flag），精细控制二进制内容。无需修改代码，Cargo feature 即按需裁剪。
 
 ---
 
@@ -177,7 +179,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
               └─────────────────────────────┘
 ```
 
-The project is split into five crates:
+The project is split into six crates:
 
 | Crate | Purpose |
 |-------|---------|
@@ -186,6 +188,7 @@ The project is split into five crates:
 | **frps** | Server binary with CLI argument parsing and logging setup |
 | **frp-client** | Client logic: service lifecycle, control connection, work connection loop, local bridge |
 | **frpc** | Client binary with CLI argument parsing and logging setup |
+| **frp-vnet** | L3 VPN / TUN device routing, used by the `virtual_net` proxy and visitor plugins |
 
 ---
 
@@ -207,16 +210,16 @@ Four size tiers (see [Why frp-rs?](#why-frp-rs) for sizes). SSH and QUIC are
 enabled by default; dashboard is opt-in:
 
 ```bash
-# Default — core transports + SSH + QUIC, no dashboard (~5.0 MB frps, ~4.5 MB frpc)
+# Default — core transports + SSH + QUIC, no dashboard (~5.1 MB frps, ~4.3 MB frpc)
 cargo build --release -p frps -p frpc
 
-# Full — all features (~5.3 MB frps, ~4.5 MB frpc)
+# Full — default + dashboard (~5.3 MB frps, ~4.3 MB frpc)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
 
-# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard/compression, keeps TLS+HTTP proxy+TCP mux (~3.2 MB / ~2.7 MB)
+# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard/compression, keeps TLS+TCP mux (frps also HTTP proxy) (~3.0 MB / ~2.6 MB)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
 
-# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~1.9 MB / ~2.0 MB)
+# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~1.8 MB / ~1.9 MB)
 cargo build --release -p frps -p frpc --no-default-features --features micro
 ```
 
@@ -236,6 +239,13 @@ and the rest are default ON):
 | `chacha20` | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
 | `http-proxy` | HTTP proxy plugin |
 | `tcp-mux` | yamux stream multiplexing (~80 KB) |
+| `vnet` | L3 VPN / TUN device routing (frp-vnet) |
+| `admin` | Admin REST API on frpc (axum) |
+| `mem-profile` | Counting-allocator memory profiling (off in shipped builds) |
+| `debug-logs` | Verbose debug logging for development |
+| `otel` | OpenTelemetry tracing + OTLP export |
+
+`tiny`/`micro` are binary-level profiles (`frps/Cargo.toml`, `frpc/Cargo.toml`) that select a fixed feature set; they build `frps-tiny`/`frpc-tiny`/`frps-micro`/`frpc-micro` binaries respectively.
 
 `quic` implies `tls`; `oidc` implies `reqwest`; `ssh` implies `rand`.
 
@@ -247,7 +257,7 @@ and the rest are default ON):
    ./target/release/frps -c frps.toml
    ```
 
-   The default `frps.toml` listens on `0.0.0.0:7000` with token auth.
+   The example `frps.toml` binds `0.0.0.0:17000` (control + KCP, TLS enabled, token auth), with HTTP/HTTPS vhosts on 10080/10443 and the dashboard on 7500. Port 7000 appears only in the commented native-format block.
 
 2. Start the client:
 
@@ -348,7 +358,7 @@ Send `SIGUSR1` to the frps process to hot-reload these settings from the config 
 - `auth.token` — updates encryption key and accepts new token for future logins
 - `allow_ports` / `allow_port_start` / `allow_port_end` — adjusts port allocation range
 
-Settings that require a restart: `bind_port`, `bind_addr`, TLS settings, OIDC settings.
+Settings that require a restart: `bind_port`, `bind_addr`, the `tls_enable` switch, and OIDC settings. TLS certificate/key/CA **paths** are hot-reloaded (the TLS acceptor is rebuilt atomically).
 
 ### Management REST API
 
@@ -358,18 +368,22 @@ Both frps (dashboard) and frpc expose a management API over HTTP with Basic Auth
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/status` | Server status (version, uptime, client/proxy counts) |
+| GET | `/api/serverinfo` | Server info (Go frp dashboard parity) |
 | GET | `/api/proxies` | List all proxies with traffic stats |
-| GET | `/api/proxy/:name` | Proxy detail |
-| GET | `/api/proxy/:name/traffic` | Proxy traffic counters |
+| GET | `/api/proxies/{name}` | Proxy detail (alias: `/api/proxy/{type}/{name}`) |
+| GET | `/api/proxy/{type}` | List proxies of one type |
+| GET | `/api/proxy/{name}/traffic` | Proxy traffic counters |
+| GET | `/api/clients` / `/api/clients/{run_id}` | Connected clients |
 | GET | `/metrics` | Prometheus text format (if `enable_prometheus = true`) |
 
 **frpc endpoints** (on admin port):
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/status` | Proxy status grouped by type |
+| GET | `/api/metrics` | Prometheus text format |
 | GET | `/api/config` | Current config (sensitive values redacted) |
 | PUT | `/api/config` | Update config file + trigger reload |
-| GET | `/api/reload?strictConfig=true` | Reload proxies from config |
+| GET/POST | `/api/reload` | Reload proxies from config (strict mode via JSON body `{"strict_config": true}`) |
 | POST | `/api/stop` | Gracefully stop the client |
 
 ### Client (`frpc.toml`)
@@ -403,7 +417,7 @@ use_compression = false
 |-------|---------|-------------|
 | `server_addr` | — | Server address (required) |
 | `server_port` | `7000` | Server control port |
-| `transport_protocol` | `"tcp"` | Transport: tcp, websocket/ws, wss, quic |
+| `transport_protocol` | `"tcp"` | Transport: tcp, kcp, websocket/ws, wss, quic |
 | `token` | `""` | Authentication token (must match server) |
 | `auth.tokenSource` | — | Dynamic token source: `file://path` or `exec://command` (exec requires `TokenSourceExec` unsafe feature) |
 | `user` | `""` | User identity for multi-tenant setups |
@@ -478,11 +492,11 @@ buffer defaults to 32 KiB (matching Go frp) and can be tuned via the
 | `host_header_rewrite` | `""` | Rewrite the Host header |
 | `group` / `group_key` | `""` | Proxy group for load balancing |
 | `health_check_type` | `""` | Health check: tcp or http |
-| `health_check_interval_seconds` | `0` | Seconds between health checks (min 10) |
-| `health_check_timeout_seconds` | `0` | Health check connect timeout (min 3) |
-| `health_check_max_failed` | `0` | Consecutive failures before marking unhealthy (min 1) |
-| `bandwidth_limit` | `""` | Bandwidth limit (e.g. "1MB") |
-| `bandwidth_limit_mode` | `""` | Bandwidth limit mode (client/server) |
+| `health_check_interval_seconds` | `10` | Seconds between health checks (min 10) |
+| `health_check_timeout_seconds` | `3` | Health check connect timeout (min 3) |
+| `health_check_max_failed` | `1` | Consecutive failures before marking unhealthy (min 1) |
+| `bandwidth_limit` | `""` | Bandwidth limit (e.g. "1MB"; only "KB"/"MB" suffixes, 1024-based) |
+| `bandwidth_limit_mode` | `"client"` | Bandwidth limit mode (client/server) |
 | `multiplexer` | `""` | Multiplexer type for the proxy |
 | `metas` | `{}` | Key-value metadata for the proxy |
 | `annotations` | `{}` | Key-value annotations for the proxy |
@@ -517,7 +531,7 @@ JSON framing over TCP.
 ```
 
 - **Type byte** identifies the message kind.
-- **Length** is a big-endian 64-bit integer, capped at 64 KiB.
+- **Length** is a big-endian 64-bit integer, capped at 10 KiB (`V1_MAX_MSG_LENGTH`, matching Go frp). The V2 framing raises the payload cap to 64 KiB.
 - **Payload** is UTF-8 JSON serialized via serde_json.
 
 ### Message Types
@@ -651,17 +665,15 @@ When `use_compression = true`, data is compressed with **Snappy** (matching Go f
 v0.70.1) before encryption. Compression is applied first, then encryption:
 
 ```
-plaintext → Snappy compress → AES-128-CFB encrypt → [4-byte BE len][encrypted frame]
+plaintext → Snappy compress → AES-128-CFB encrypt → [16-byte IV][ciphertext stream]
 ```
 
-Each encrypted frame contains a random 16-byte IV followed by the CFB-encrypted
-(possibly compressed) data:
+The encrypted bridge is a **streaming** CFB channel: the writer sends one random
+16-byte IV before the first ciphertext block, then encrypts continuously with
+shared cipher state (`CipherWriter`/`CipherReader` in `frp-core/src/cipher_stream.rs`) —
+there is no per-frame length prefix. The reader consumes the IV on its first read.
 
-```
-[4-byte BE len][16-byte IV][AES-128-CFB encrypted (Snappy-compressed? plaintext)]
-```
-
-- Supported for TCP proxies (both client and server bridge paths) and control connections.
+- Supported for TCP proxies (both client and server bridge paths), XTCP P2P channels, and control connections.
 - Note: Go frp v0.70.1 golib source says salt `"crypto"` but the pre-built binary uses `"frp"`. This codebase uses `"frp"` for binary compatibility.
 
 ## Documentation
@@ -682,61 +694,95 @@ frp-rs/
     Cargo.toml
     src/
       lib.rs              Error types, Result, VERSION
-      args.rs             CLI argument parsing (shared by frps + frpc)
+      cli.rs              CLI argument parsing (shared by frps + frpc)
       admin_auth.rs       HTTP Basic Auth middleware (admin API / dashboard)
       auth.rs             MD5 token authentication + OIDC verification
-      bridge.rs           Encrypted data bridge (AES-128-CFB framed)
-      cipher_stream.rs    AES-128-CFB streaming encrypt/decrypt
+      bridge.rs           Encrypted/compressed data bridge (streaming CFB)
+      cipher_stream.rs    AES-128-CFB streaming encrypt/decrypt (CipherReader/CipherWriter)
       config.rs           TOML config structs + Go→Rust compat normalization
+      config_store.rs     Runtime config store (client proxy/visitor CRUD)
       encryption.rs       Key derivation (PBKDF2-SHA1) + Snappy compression
-      kcp.rs              KCP transport wrapper
+      crypto.rs           V2 AEAD algorithms (AES-256-GCM / XChaCha20-Poly1305)
+      v2_handshake.rs     V2 ClientHello/ServerHello + capability negotiation
+      kcp/                KCP transport (mod, session, socket, stream, listener, config)
+      kcp_compat.rs       KCP interop helpers
       metrics.rs          ProxyMetricsRegistry + ConnGuard (per-proxy counters)
       msg.rs              Wire protocol message structs
       mux.rs              TCP multiplexing (yamux)
       protocol.rs         V1/V2 frame read/write
       quic.rs             QUIC transport wrapper
-      transport.rs        TCP/TLS/WebSocket dial + accept + IoStream abstraction
-      v1_compat.rs        Go frp v0.70.1 compatibility helpers
+      transport.rs        TCP/TLS/WebSocket/KCP/QUIC dial + accept + IoStream abstraction
+      xtcp_p2p.rs         XTCP MakeHole hole punching (Go frp semantics)
+      stun.rs             STUN client for NAT traversal
+      proxy_protocol.rs   HAProxy PROXY protocol header builder
+      bandwidth.rs        Token-bucket bandwidth limiter
+      buffer_pool.rs      Reusable bridge buffers (FRP_BRIDGE_BUF_KB)
+      backoff.rs, logging.rs, system.rs, splice.rs, mem_profile.rs, profiling.rs,
+      feature_gate.rs, unsafe_features.rs, internal_listener.rs
   frp-server/             Server library
     Cargo.toml
     src/
       lib.rs
-      service.rs          AppState, InternalMsg, accept loop, reload
+      service.rs          Accept loop, connection dispatch, SIGUSR1 reload
+      state.rs            AppState, InternalMsg, run_id → control routing
+      handlers.rs         Connection dispatch helpers (work/visitor/NAT hole)
+      registry.rs         ProxyManager registry + port allocation
+      proxy.rs            ProxyInfo, proxy registration
       control/
-        mod.rs            Per-client control handler, work pool, select loop
-        bridge.rs         Encrypted/plain bridge (+ proxy auth)
+        mod.rs            Per-client control handler, select loop
+        dispatch.rs       Inbound control message dispatch
+        login.rs          Login handshake + run_id
+        pool.rs           Work connection pool + pending request queue
         proxy_ops.rs      NewProxy/CloseProxy handler, listen_and_proxy
-      proxy.rs            ProxyManager, ProxyInfo, port allocation
-      vhost.rs            HTTP/HTTPS VHost routing + Host header parsing
+        bridge.rs         Encrypted/plain bridge (+ proxy auth)
+        nathole.rs        NAT hole punch over the control channel
+      vhost.rs            HTTP/HTTPS VHost routing + Host/SNI parsing
+      vhost_h2c.rs        HTTP/2 cleartext (h2c) decode/re-encode
       tcpmux.rs           TCPMux HTTP CONNECT domain routing
-      dashboard.rs        Dashboard web UI + REST API
-      dashboard.html      Dashboard HTML template (embedded via include_str!)
-      metrics/
-        mod.rs            Metrics module root
-        prom.rs           Prometheus gauge registry + /metrics rendering
+      dashboard.rs        Dashboard web UI + REST API (v1/v2)
+      ssh_gateway.rs      SSH tunnel gateway (tcpip-forward / forwarded-tcpip)
+      store.rs            Dashboard proxy persistence (frps_store.json)
+      plugin/             Server HTTP plugins (mod.rs, http.rs)
+      metrics/            Prometheus gauges + /metrics rendering (mod.rs, prom.rs)
       nathole/            XTCP NAT hole punch coordinator (controller, classify, analysis)
+      event.rs, lock.rs
   frps/                   Server binary
     Cargo.toml
-    src/main.rs
+    src/main.rs, main-tiny.rs, main-micro.rs
   frp-client/             Client library
     Cargo.toml
     src/
       lib.rs
-      admin.rs            Admin REST API server (status, config, reload, stop)
       service.rs          Login, proxy registration, message/select loop,
                           work connection spawning, health checks, UDP work conns
       control.rs          ControlConnection, login handshake, hostname resolution
+      work_conn.rs        Work connection dial + local service bridge
+      proxy.rs            NewProxy message builder, local TCP connect, bridge
+      proxy_runtime.rs    Runtime proxy state (ProxyRuntimeInfo)
+      visitor.rs          STCP/XTCP visitor listener + fallback
+      reload.rs           Config snapshot + SIGUSR1 hot reload
+      health.rs           TCP/HTTP health checks
+      admin.rs            Admin REST API server (status, config, reload, stop, metrics)
+      store.rs            Runtime proxy/visitor store (admin API CRUD)
+      util.rs
       plugin/
         mod.rs            Plugin dispatch
-        http.rs           HTTP proxy plugin
-        socks5.rs         SOCKS5 proxy plugin
-        static_file.rs    Static file serving plugin
-      proxy.rs            NewProxy message builder, local TCP connect, bridge
+        http.rs, socks5.rs, static_file.rs, unix_socket.rs
+        http2http.rs, http2https.rs, https2http.rs, https2https.rs, tls2raw.rs
+        context.rs, visitor.rs
   frpc/                   Client binary
     Cargo.toml
-    src/main.rs
+    src/main.rs, main-tiny.rs, main-micro.rs
+  frp-vnet/               L3 VPN / TUN device routing
+    Cargo.toml
+    src/
+      lib.rs              vnet control protocol + crate root
+      controller.rs       VnetController, RouteTable, per-vnet routing
+      router.rs           Packet router
+      virtual_client.rs   Virtual client (provider side)
+      tun.rs, tun_linux.rs, tun_macos.rs, tun_windows.rs
+      msg.rs              vnet control message types
   docker/                 Docker build infrastructure
-    Dockerfile             Multi-stage image (downloads release binary)
     Dockerfile.source      Multi-stage image (builds from Rust source)
     build.sh               Release binary download + verification script
     entrypoint.c           Minimal static entrypoint (FRP_MODE, conf path)
@@ -763,7 +809,9 @@ that both ends build on.
 
 ## Docker
 
-Pre-built Docker images are published to GitHub Container Registry on every push to `main`:
+Pre-built Docker images are published to GitHub Container Registry. `:latest`
+tracks release tags; pushes to `main` build the `:test` tag (and
+`:testtiny`/`:testmicro` for the tiny/micro variants):
 
 ```bash
 # Server (built from source)
@@ -776,7 +824,7 @@ docker run -d -p 7000:7000 -v $(pwd)/frps.toml:/app/frp.toml ghcr.io/viogus/frps
 ```
 
 One Dockerfile variant in `docker/`:
-- `Dockerfile.source` — builds from source via multi-stage Rust image (used for CI auto-builds)
+- `Dockerfile.source` — builds from source via multi-stage Rust image (used for CI auto-builds); `docker/build.sh` is the alternative download-and-verify path
 
 ---
 
