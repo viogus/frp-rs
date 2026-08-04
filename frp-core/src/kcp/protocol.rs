@@ -2095,16 +2095,19 @@ mod tests {
             }
         }
 
-        /// One KCP segment for multi-segment datagrams: a valid PUSH, a valid
-        /// ACK, a random malformed blob, or a header claiming a huge data length.
+        /// One KCP segment for multi-segment datagrams: a valid PUSH (with
+        /// random fragment count — covers the frg-chain reassembly surface),
+        /// a valid ACK, a random malformed blob, or a header claiming a huge
+        /// data length.
         fn arb_segment() -> impl Strategy<Value = Vec<u8>> {
             prop_oneof![
                 (
                     any::<u32>(),
                     any::<u32>(),
+                    any::<u8>(),
                     prop::collection::vec(any::<u8>(), 0..128)
                 )
-                    .prop_map(|(conv, sn, data)| make_push(conv, sn, 0, 0, &data)),
+                    .prop_map(|(conv, sn, frg, data)| make_push(conv, sn, frg, 0, &data)),
                 (any::<u32>(), any::<u32>(), any::<u16>())
                     .prop_map(|(conv, sn, wnd)| make_ack(conv, sn, wnd, 0)),
                 prop::collection::vec(any::<u8>(), 0..64),
