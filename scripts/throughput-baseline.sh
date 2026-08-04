@@ -13,6 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# yamux logs a frame-per-line at INFO; silence it or the bridge is throttled
+# by stderr writes during the measurement window.
+export RUST_LOG=warn
+
 DURATION="${1:-10}"
 STREAMS="${2:-1}"
 FRPS_PORT=18000
