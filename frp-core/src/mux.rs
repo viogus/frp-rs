@@ -57,6 +57,19 @@ const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(feature = "tcp-mux")]
 const MAX_IDLE_KEEPALIVE_TICKS: u32 = 3;
 
+/// Absolute floor for the dead-session silence bound (wall-clock seconds).
+/// The configured `keepalive_interval` only drives the scan cadence — yamux-rs
+/// 0.14 hardcodes its actual PING period at 10s (`rtt::PING_INTERVAL`) and
+/// auto-pongs incoming pings, so a healthy link always shows inbound bytes
+/// within ~10s regardless of interval. The dead bound must never drop below
+/// this floor: with a small interval (e.g. 1s, the client's clamp minimum)
+/// `3 ticks × interval` would be 3s — below the peer's ping period — and a
+/// perfectly healthy session would be killed seconds after login (observed in
+/// production). 30s = 3× the 10s ping period, matching Go frp's hashicorp
+/// yamux KeepAliveTimeout default.
+#[cfg(feature = "tcp-mux")]
+const MIN_IDLE_DEAD_TIME: Duration = Duration::from_secs(30);
+
 /// Wrapper type for a yamux stream compatible with tokio's AsyncRead/AsyncWrite.
 #[cfg(feature = "tcp-mux")]
 pub type YamuxStream = Compat<Stream>;
@@ -395,6 +408,11 @@ where
     // poll picks up queued stream writes into pending_frames; the second
     // poll actually sends them on the wire.
     let keepalive = normalized_keepalive_interval(mux_cfg.keepalive_interval);
+    // Dead-session bound in wall-clock time. The configured interval only
+    // sets the scan cadence — yamux-rs's actual PING period is a hardcoded
+    // 10s — so floor the bound at MIN_IDLE_DEAD_TIME to never kill a healthy
+    // peer when the configured interval is small (see const docs).
+    let dead_after = MIN_IDLE_DEAD_TIME.max(keepalive.saturating_mul(MAX_IDLE_KEEPALIVE_TICKS));
     let mut consecutive_idle = 0u32;
     tokio::task::spawn(async move {
         loop {
@@ -423,10 +441,11 @@ where
                     } else {
                         consecutive_idle += 1;
                     }
-                    if consecutive_idle >= MAX_IDLE_KEEPALIVE_TICKS {
+                    if keepalive.saturating_mul(consecutive_idle) >= dead_after {
                         warn!(
                             ticks = consecutive_idle,
                             keepalive_secs = keepalive.as_secs(),
+                            dead_after_secs = dead_after.as_secs(),
                             "yamux server: no transport I/O for too many keepalive intervals; closing dead session"
                         );
                         break;
@@ -553,6 +572,9 @@ where
     let (opened_tx, mut bg_opened) = watch::channel(());
     let opened = Arc::new(opened_tx);
     let keepalive = normalized_keepalive_interval(mux_cfg.keepalive_interval);
+    // Dead-session bound in wall-clock time — see server_mux for why the
+    // configured interval cannot be used alone as the dead bound.
+    let dead_after = MIN_IDLE_DEAD_TIME.max(keepalive.saturating_mul(MAX_IDLE_KEEPALIVE_TICKS));
     let mut consecutive_idle = 0u32;
 
     tokio::task::spawn(async move {
@@ -645,10 +667,11 @@ where
                     } else {
                         consecutive_idle += 1;
                     }
-                    if consecutive_idle >= MAX_IDLE_KEEPALIVE_TICKS {
+                    if keepalive.saturating_mul(consecutive_idle) >= dead_after {
                         warn!(
                             ticks = consecutive_idle,
                             keepalive_secs = keepalive.as_secs(),
+                            dead_after_secs = dead_after.as_secs(),
                             "yamux client: no transport I/O for too many keepalive intervals; closing dead session"
                         );
                         bg_alive.store(false, Ordering::Release);

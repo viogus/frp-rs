@@ -171,9 +171,10 @@ async fn client_can_open_stream_after_idle_keepalive_tick() {
         connected_mux_pair(client_config, server_config).await;
 
     // Idle ticks must not kill a healthy client below the liveness bound
-    // (MAX_IDLE_KEEPALIVE_TICKS = 3): a buggy per-Pending-poll counter would
-    // close it within the first tick. Paused time suppresses yamux's
-    // real-time PING/PONG, so no transport activity resets the counter here.
+    // (a 1s interval yields a 30s wall-clock bound — MIN_IDLE_DEAD_TIME): a
+    // buggy per-Pending-poll counter would close it within the first tick.
+    // Paused time suppresses yamux's real-time PING/PONG, so no transport
+    // activity resets the counter here.
     advance_keepalive_ticks(interval, 2).await;
 
     let stream = tokio::time::timeout(Duration::from_secs(1), session.open_stream())
@@ -194,7 +195,7 @@ async fn server_keeps_healthy_connection_open_without_new_inbound_streams() {
     let (_server_control, mut incoming, _client_control, session) =
         connected_mux_pair(client_config, server_config).await;
 
-    // Idle ticks below the liveness bound (MAX_IDLE_KEEPALIVE_TICKS = 3)
+    // Idle ticks below the liveness bound (30s wall-clock for a 1s interval)
     // must not kill the server while the peer is healthy. Paused time
     // suppresses yamux's real-time PING/PONG, so no transport activity
     // resets the counter here.
@@ -354,11 +355,12 @@ async fn dead_peer_session_closes_after_bounded_idle_keepalive_ticks() {
 
     // Paused time suppresses yamux's real-time PING/PONG, so neither driver
     // observes transport I/O. The bounded liveness counter must close both
-    // sides after MAX_IDLE_KEEPALIVE_TICKS (3) rather than retaining the
-    // session indefinitely. Advance 6 ticks for margin: the first server
-    // tick can consume a straggling setup-phase pong (activity reset), and
-    // the final advance's timer may not fire before the checks below.
-    advance_keepalive_ticks(interval, 6).await;
+    // sides after the wall-clock dead bound (30s floor for a 1s interval —
+    // see MIN_IDLE_DEAD_TIME) rather than retaining the session
+    // indefinitely. Advance 35 ticks for margin: the first server tick can
+    // consume a straggling setup-phase pong (activity reset), and the final
+    // advance's timer may not fire before the checks below.
+    advance_keepalive_ticks(interval, 35).await;
 
     let server_next = tokio::time::timeout(Duration::from_secs(1), incoming.recv())
         .await
