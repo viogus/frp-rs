@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use frp_core::msg::{FrpMessage, NewProxy};
-use russh::server::{Auth, Handler, Msg, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet};
+use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
+use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet};
 use tokio::sync::mpsc;
 
 use crate::service::AppState;
@@ -756,10 +756,12 @@ impl Handler for SshSession {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         // Accept session channels (needed for exec_request/shell_request)
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn channel_open_forwarded_tcpip(
@@ -769,8 +771,9 @@ impl Handler for SshSession {
         _port: u32,
         _origin: &str,
         _origin_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         // Server-opened reverse channels do not pass through this callback
         // (it only handles client-initiated forwarded-tcpip, a non-standard
         // pattern). Reject client-initiated ones.
@@ -779,7 +782,10 @@ impl Handler for SshSession {
             "SSH gateway {}: rejecting client-initiated forwarded-tcpip channel",
             self.run_id
         );
-        Ok(false)
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
     }
 
     async fn channel_open_direct_tcpip(
@@ -789,10 +795,14 @@ impl Handler for SshSession {
         _port: u32,
         _origin: &str,
         _origin_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         // Reject: no -L (local forward) support
-        Ok(false)
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
     }
 
     // ── Data (bridged by control handler) ───────────────────
