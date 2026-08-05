@@ -58,6 +58,10 @@ fn build_start_work_conn(
         },
         // For XTCP STCP fallback: set empty nat_hole_sid marker so Rust frpc
         // knows this work conn is for STCP bridging, not XTCP notification.
+        // When `proxy_info` is None the proxy was already unregistered in the
+        // enqueue→bridge window, so this path is already broken (the bridge
+        // fails or the peer rejects the StartWorkConn); omitting the marker
+        // there is acceptable because the proxy type is unknown anyway.
         nat_hole_sid: if req
             .proxy_info
             .as_ref()

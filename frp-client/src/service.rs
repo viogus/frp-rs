@@ -1112,35 +1112,93 @@ impl Service {
             }
 
             // Collect responses. NewProxyResp/NewVisitorConnResp are matched to
-            // their request by wire proxy_name — Go frps processes each
-            // registration in its own goroutine, so responses may arrive out of
-            // order. ReqWorkConn spawns a work connection (pool pre-warm,
-            // NewVisitorConn ack, or an on-demand user conn that arrived while
-            // the client was still registering).
+            // their request by wire proxy_name — the server answers
+            // synchronously in request order, but matching by name keeps this
+            // robust regardless of response order. ReqWorkConn spawns a work
+            // connection (pool pre-warm — written by the server immediately
+            // after LoginResp, BEFORE any registration response — a
+            // NewVisitorConn success ack, or an on-demand user conn that
+            // arrived while the client was still registering).
             let mut aborted = write_failed;
             let mut unexpected = 0u32;
+            // False until the first NewProxyResp / NewVisitorConnResp /
+            // visitor-ack ReqWorkConn has been handled. The server's pool
+            // pre-warm ReqWorkConns always precede every registration
+            // response on the wire (see I2), so anonymous ReqWorkConns
+            // received before this point can never be visitor acks.
+            let mut seen_registration_response = false;
+            // Anonymous ReqWorkConns consumed so far — bounds the pool
+            // pre-warm when no proxy registration exists to mark its end.
+            let mut req_work_conns_seen = 0usize;
             while !aborted && (!pending_proxies.is_empty() || !pending_visitors.is_empty()) {
-                let resp_msg = if v2 {
-                    match control_stream.read_v2_frame().await {
-                        Ok(m) => m,
-                        Err(e) => {
+                // Go frp v0.70.1 never acks control-channel NewVisitorConn —
+                // its stcp/xtcp visitors register per user connection when the
+                // connection arrives, not at startup. A pure-visitor client
+                // must therefore not wait forever for a visitor ack the server
+                // will never send. Once every proxy response is in, give the
+                // remaining visitor acks a 2s grace period — our server writes
+                // its ack in the same control iteration as the pool conns (ms
+                // under load, ~200x headroom) — then assume the un-acked
+                // visitors registered (Go frps semantics) and stop reading.
+                // Any frames the server still writes afterwards are handled by
+                // the session's main read loop.
+                let resp_msg = if pending_proxies.is_empty() && !pending_visitors.is_empty() {
+                    let read = async {
+                        if v2 {
+                            control_stream.read_v2_frame().await
+                        } else {
+                            control_stream.read_v1_frame().await
+                        }
+                    };
+                    match tokio::time::timeout(Duration::from_millis(2000), read).await {
+                        Ok(Ok(m)) => m,
+                        Ok(Err(e)) => {
                             warn!(error = %e, "Registration response read failed: {}", e);
                             aborted = true;
                             continue;
                         }
+                        Err(_elapsed) => {
+                            // The server will not ack the remaining visitors
+                            // (Go frps semantics: NewVisitorConn succeeds
+                            // silently; per-user connections register
+                            // themselves when they arrive). FIFO-drain them
+                            // as registered — same semantics as the
+                            // ReqWorkConn attribution above, but with no
+                            // server response at all.
+                            while !pending_visitors.is_empty() {
+                                let (_, idx) = pending_visitors.remove(0);
+                                let v = session_visitors[idx];
+                                info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}' (no registration response — assumed registered)", v.name, v.server_name);
+                                #[cfg(feature = "vnet")]
+                                advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
+                            }
+                            break;
+                        }
                     }
                 } else {
-                    match control_stream.read_v1_frame().await {
-                        Ok(m) => m,
-                        Err(e) => {
-                            warn!(error = %e, "Registration response read failed: {}", e);
-                            aborted = true;
-                            continue;
+                    if v2 {
+                        match control_stream.read_v2_frame().await {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!(error = %e, "Registration response read failed: {}", e);
+                                aborted = true;
+                                continue;
+                            }
+                        }
+                    } else {
+                        match control_stream.read_v1_frame().await {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!(error = %e, "Registration response read failed: {}", e);
+                                aborted = true;
+                                continue;
+                            }
                         }
                     }
                 };
                 match resp_msg {
                     FrpMessage::NewProxyResp(resp) => {
+                        seen_registration_response = true;
                         // Match by wire proxy_name: responses may arrive in any
                         // order relative to the requests they answer.
                         let Some(pos) = pending_proxies
@@ -1186,12 +1244,36 @@ impl Service {
                         }
                     }
                     FrpMessage::NewVisitorConnResp(resp) => {
+                        seen_registration_response = true;
                         let Some(pos) = pending_visitors
                             .iter()
                             .position(|(name, _)| *name == resp.proxy_name)
                         else {
                             unexpected += 1;
-                            warn!(proxy_name = %resp.proxy_name, "NewVisitorConnResp for visitor not in this registration batch");
+                            // Defensive: an out-of-batch response is almost
+                            // always a REJECTED visitor whose earlier
+                            // ReqWorkConn ack was misattributed (e.g. a pool
+                            // pre-warm conn consumed as its success signal),
+                            // leaving the failure unnamed and discarded here.
+                            // Resolve the wire name against the configured
+                            // visitor list and surface the error so a future
+                            // ordering change cannot silently swallow an auth
+                            // failure.
+                            let configured = session_visitors.iter().find(|v| {
+                                crate::proxy::visitor_wire_name(
+                                    Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
+                                    Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
+                                    &v.server_name,
+                                ) == resp.proxy_name
+                            });
+                            match configured {
+                                Some(v) => {
+                                    warn!(visitor_name = %v.name, proxy_name = %resp.proxy_name, error = ?resp.error, "NewVisitorConnResp for visitor '{}' (wire '{}') not in this registration batch: {:?}", v.name, resp.proxy_name, resp.error)
+                                }
+                                None => {
+                                    warn!(proxy_name = %resp.proxy_name, "NewVisitorConnResp for visitor not in this registration batch")
+                                }
+                            }
                             continue;
                         };
                         let (_, idx) = pending_visitors.swap_remove(pos);
@@ -1208,19 +1290,41 @@ impl Service {
                     }
                     FrpMessage::ReqWorkConn(_) => {
                         handle_req_work_conn();
-                        // Go frps v0.69.1 acks a successful NewVisitorConn with
-                        // an anonymous ReqWorkConn (no proxy_name). While
-                        // visitors are still pending, attribute the ack to the
-                        // oldest one (FIFO — the sequential reader used to
-                        // consume the first ReqWorkConn after each
-                        // NewVisitorConn as that visitor's success signal).
-                        if !pending_visitors.is_empty() {
+                        // Go frps v0.69.1 acks a successful NewVisitorConn on
+                        // the control channel with an anonymous ReqWorkConn
+                        // (no proxy_name; failures get a named
+                        // NewVisitorConnResp{error}). While visitors are
+                        // still pending, attribute the ack to the oldest one
+                        // (FIFO — the server answers registrations in request
+                        // order, so acks arrive in visitor order).
+                        //
+                        // The server writes its pool pre-warm ReqWorkConns
+                        // immediately after LoginResp, BEFORE it processes any
+                        // registration frame, so they always precede every
+                        // NewProxyResp/NewVisitorConnResp on the wire. An
+                        // anonymous ReqWorkConn can therefore only be a
+                        // visitor success ack once a registration response has
+                        // been seen. (With no proxies there is no NewProxyResp
+                        // to mark the pool's end; the client's own pool_count
+                        // bounds it instead — the server never sends more pool
+                        // conns than the client asked for.) Without this gate
+                        // the pool conns were FIFO-attributed to the oldest
+                        // pending visitors, marking them registered (and
+                        // advertising vnet routes) before the server had even
+                        // seen their NewVisitorConn — a rejected visitor's
+                        // real response then hit the out-of-batch branch above
+                        // and was silently discarded.
+                        let pool_conns_done = seen_registration_response
+                            || (pending_proxies.is_empty()
+                                && req_work_conns_seen >= pool_count.max(1) as usize);
+                        if pool_conns_done && !pending_visitors.is_empty() {
                             let (_, idx) = pending_visitors.remove(0);
                             let v = session_visitors[idx];
                             info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}' (Go frps compat: ReqWorkConn after NewVisitorConn)", v.name, v.server_name);
                             #[cfg(feature = "vnet")]
                             advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
                         }
+                        req_work_conns_seen += 1;
                     }
                     other => {
                         unexpected += 1;

@@ -2251,10 +2251,23 @@ impl Service {
                                 // TLS acceptor exists — wrap stream to replay consumed bytes
                                 // for the TLS handshake.
                                 let stream = PreReadStream::new(sni_data, inner_stream);
-                                let tls_stream = match acceptor.accept(stream).await {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        warn!(addr = %addr, error = %e, "TLS handshake failed from {}: {}", addr, e);
+                                // Bound the TLS handshake: when https_proxy_count == 0 the
+                                // SNI-sniff peek is skipped and its timeout was the only
+                                // bound on this accept. A client that sends only the TLS
+                                // marker byte (0x17/0x16) then goes silent would otherwise
+                                // park here forever, holding a task, fd, and a
+                                // conn_semaphore permit (slowloris / permit exhaustion).
+                                // Same deadline and shape as the WS+TLS accept above.
+                                let tls_stream = match tokio::time::timeout_at(accept_deadline, acceptor.accept(stream)).await {
+                                    Ok(r) => match r {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            warn!(addr = %addr, error = %e, "TLS handshake failed from {}: {}", addr, e);
+                                            return;
+                                        }
+                                    },
+                                    Err(_elapsed) => {
+                                        warn!(addr = %addr, "TLS handshake timeout from {}", addr);
                                         return;
                                     }
                                 };

@@ -48,6 +48,12 @@ pub(crate) struct PoolEntry {
 }
 
 /// A pending request from a proxy listener waiting for a work connection.
+///
+/// The metadata below (local_addr/bandwidth limits via `proxy_info`) is
+/// snapshotted when the request is enqueued; a config reload in the
+/// enqueue→bridge window bridges to the stale backend. Self-limiting (the
+/// bridge is one-shot) and narrow (one work-conn round trip), so no refresh
+/// is done.
 pub(crate) struct PendingRequest {
     pub(crate) proxy_name: String,
     pub(crate) user_conn: IoStream,

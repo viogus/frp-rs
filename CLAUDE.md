@@ -181,7 +181,7 @@ Internal message variants drive the work connection lifecycle:
 - `WriteNatHoleSid` / `WriteNatHoleResp` / `WriteNatHoleReport` → forwarded to visitor via control channel (Go frp compat path)
 - `Shutdown` → old control handler stops when superseded by new connection with same run_id
 
-**Bridging** (`assign_work_to_proxy` in `frp-server/src/control/bridge.rs`): sends `StartWorkConn` over the work connection, writes any pre-read bytes (from HTTP VHost parsing), then either uses `tokio::io::copy_bidirectional` (plain) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy, streaming — a single 16-byte IV then continuous ciphertext, no per-frame length prefix).
+**Bridging** (`assign_work_to_proxy` in `frp-server/src/control/bridge.rs`): sends `StartWorkConn` over the work connection, writes any pre-read bytes (from HTTP VHost parsing), then either uses `tokio::io::copy_bidirectional_with_sizes` (plain, 32 KiB per direction) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy, streaming — a single 16-byte IV then continuous ciphertext, no per-frame length prefix). The client-side plain relay mirrors this (`relay_plain_fast` with splice(2) on Linux, `copy_bidirectional_with_sizes` fallback elsewhere).
 
 ### Encryption
 
@@ -203,7 +203,7 @@ Note: Go frp v0.70.1 golib source says salt `"crypto"` but the pre-built binary 
 
 **TCP_NODELAY:** every raw-`TcpStream` on the data path (client control/work dials via `connect_direct`/`connect_via_proxy`, server control/work/visitor + user-proxy + vhost + tcpmux accepts, client local-service dials, SSH gateway, plugin forwarders) calls `frp_core::transport::set_nodelay` — matches Go frp's `net.TCPConn` default (`NoDelay(true)`). For TLS/mux/WS-wrapped streams it is set on the underlying `TcpStream` before wrapping. Errors are logged at debug and ignored (a failed socket option must not kill a connection). KCP sets its own nodelay; QUIC/UDP are excluded. Wire-invisible.
 
-**Bridge buffer size:** `frp_core::buffer_pool::BUFFER_SIZE` defaults to **32 KiB** (matches Go frp `io.Copy`; was 64 KiB — halved for per-connection footprint). Override with `FRP_BRIDGE_BUF_KB` (4–1024). Note the plain proxy path uses `tokio::io::copy_bidirectional` (its own internal buffers), so `BUFFER_SIZE` and the `PoolGuard` pool affect the **encrypted/compressed** bridge path, not plain.
+**Bridge buffer size:** `frp_core::buffer_pool::BUFFER_SIZE` defaults to **32 KiB** (matches Go frp `io.Copy`; was 64 KiB — halved for per-connection footprint). Override with `FRP_BRIDGE_BUF_KB` (4–1024). The plain bridge copies with `copy_bidirectional_with_sizes(a, b, *BUFFER_SIZE, *BUFFER_SIZE)` (tokio ≥ 1.52), so `BUFFER_SIZE` applies to the plain path too; the encrypted/compressed path uses the `PoolGuard` buffer pool (also `BUFFER_SIZE`).
 
 ### Config Normalization
 
@@ -241,7 +241,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **WebSocket**: fully implemented — dial, accept, message dispatch (control + work connections)
 - **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Architecture: `KcpSocket` driver (UDP event loop), `KcpSession` per-peer (in-tree Kcp protocol + FEC), `KcpStream` (AsyncRead/AsyncWrite). The KCP state machine is implemented in-tree (`kcp/protocol.rs`, aligned with kcp-go v5.6.13 wire behavior) — the vendored `kcp` crate and its `[patch.crates-io]` entry are gone. `conv_index: HashMap<u32, SocketAddr>` provides O(1) write-path lookup. Write backpressure via `Arc<AtomicUsize>` shared between `KcpSocket` and `KcpStream` (gates `poll_write` at 200 unprocessed messages, `KCP_WRITE_BACKLOG_THRESHOLD` — pre-full gate for the 256-cap channel). Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. Our KCP handler follows same order. Verified with Go frpc v0.70.1: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test in `frp-core/tests/kcp.rs` (real UDP sockets).
 - **QUIC**: fully implemented — dial, accept, message dispatch (requires TLS cert on server)
-- **TcpMux** (`frp-core/src/mux.rs`, ~604 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn via `server_mux`/`client_mux`. Double-poll pattern flushes pending frames to socket. A zero keepalive interval is normalized to the 30s default instead of causing an immediate timeout or spin.
+- **TcpMux** (`frp-core/src/mux.rs`, ~699 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn via `server_mux`/`client_mux`. Double-poll pattern flushes pending frames to socket. A zero keepalive interval is normalized to the 30s default instead of causing an immediate timeout or spin. Dead-conn detection: `MAX_IDLE_KEEPALIVE_TICKS = 3` (~90s idle). `open_stream` is wakeup-loss-proof (`watch` channel, not `Notify`) and fails fast once the driver has died (`alive` flag).
 - **Dashboard** (`frp-server/src/dashboard.rs`, ~2166 lines): basic status API with axum (version, uptime, client/proxy counts)
 - **VHost** (`frp-server/src/vhost.rs`, ~1300 lines): HTTP/HTTPS VHost routing with Host header parsing, SNI, pre-read byte forwarding
 

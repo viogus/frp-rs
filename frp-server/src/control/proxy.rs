@@ -146,7 +146,7 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         );
         return Ok(());
     }
-    if let Some(info) = ctx.state.proxy_manager.get(&cp.proxy_name).await {
+    let is_https = if let Some(info) = ctx.state.proxy_manager.get(&cp.proxy_name).await {
         if let Some(port) = info.remote_port {
             // Clean up the appropriate port manager (TCP or UDP — Go frp compat).
             if info.proxy_type == "udp" || info.proxy_type == "sudp" {
@@ -169,10 +169,6 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         }
         // Clean up VHost routes
         ctx.state.vhost_manager.unregister(&cp.proxy_name).await;
-        // Decrement the SNI-sniff gate count for https proxies.
-        if info.proxy_type == "https" {
-            ctx.state.dec_https_proxy_count();
-        }
         ctx.state.proxy_metrics.remove(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
         {
@@ -180,12 +176,23 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
                 .remove_proxy_vnet_routes_and_broadcast(&ctx.run_id, &cp.proxy_name)
                 .await;
         }
-    }
+        info.proxy_type == "https"
+    } else {
+        false
+    };
     // Stop the listener task
     if let Some(handle) = ctl.listener_handles.remove(&cp.proxy_name) {
         handle.abort();
     }
-    ctx.state.proxy_manager.remove(&cp.proxy_name).await;
+    // Decrement the SNI-sniff gate count only when the proxy was actually
+    // removed. The dashboard delete path races this handler — both observe
+    // the proxy before either removes it, and a double decrement would leave
+    // https_proxy_count at 0 while https proxies still exist, silently
+    // disabling SNI sniff (HTTPS vhost routing) until the next lifecycle
+    // event. Gating on remove()'s result makes exactly one path decrement.
+    if ctx.state.proxy_manager.remove(&cp.proxy_name).await && is_https {
+        ctx.state.dec_https_proxy_count();
+    }
     // Drop cached UDP encryption/compression flags for this proxy so a later
     // re-registration with different flags picks up the new values.
     ctl.udp_proxy_flags.remove(&cp.proxy_name);
@@ -395,7 +402,19 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
     // Do NOT use remove_client() — it removes ALL proxies for this run_id,
     // which in supersession would delete the new handler's proxies.
     for name in &proxy_names {
-        ctx.state.proxy_manager.remove(name).await;
+        // Decrement the SNI-sniff gate count only when the proxy was
+        // actually removed here — a racing dashboard delete may have removed
+        // it first, and a double decrement would leave https_proxy_count at 0
+        // while https proxies still exist, silently disabling SNI sniff.
+        let is_https = ctx
+            .state
+            .proxy_manager
+            .get(name)
+            .await
+            .is_some_and(|i| i.proxy_type == "https");
+        if ctx.state.proxy_manager.remove(name).await && is_https {
+            ctx.state.dec_https_proxy_count();
+        }
         ctl.udp_proxy_flags.remove(name);
     }
     info!(run_id = %ctx.run_id, "Control connection {} removed", ctx.run_id);

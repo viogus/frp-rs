@@ -1198,12 +1198,14 @@ pub(crate) async fn unregister_control(
     // Clear per-client port usage tracking (matching Go frp's portsUsedNum cleanup).
     state.client_ports_used.write().await.remove(run_id);
     // VHost unregister outside port lock to avoid holding it across awaits
+    //
+    // NOTE: the SNI-sniff gate count (https_proxy_count) is NOT decremented
+    // here. This function only cleans up routing/ports — the actual
+    // proxy_manager.remove() calls happen in the caller (control::cleanup),
+    // and the decrement must be gated on remove()'s result so a racing
+    // dashboard delete can never double-decrement (see control/proxy.rs).
     for p in &proxies {
         state.vhost_manager.unregister(&p.name).await;
-        // Decrement the SNI-sniff gate count for https proxies.
-        if p.proxy_type == "https" {
-            state.dec_https_proxy_count();
-        }
         state.tcpmux_manager.unregister(&p.name).await;
         state.proxy_metrics.remove(&p.name).await;
     }

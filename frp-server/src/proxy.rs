@@ -163,7 +163,13 @@ impl ProxyManager {
         self.proxies.read().await.get(name).cloned()
     }
 
-    pub async fn remove(&self, name: &str) {
+    /// Remove a proxy, returning `true` if it was actually present and removed.
+    ///
+    /// Callers that maintain derived counters (e.g. the SNI-sniff gate
+    /// `https_proxy_count`) must only update them when this returns `true`:
+    /// removal paths can race (dashboard delete vs CloseProxy vs client
+    /// disconnect) and both may observe the proxy before either removes it.
+    pub async fn remove(&self, name: &str) -> bool {
         let mut proxies = self.proxies.write().await;
         if let Some(info) = proxies.remove(name) {
             // Clean up group index
@@ -197,6 +203,9 @@ impl ProxyManager {
             if let Some(client_proxies) = by_client.get_mut(&info.run_id) {
                 client_proxies.remove(name);
             }
+            true
+        } else {
+            false
         }
     }
 

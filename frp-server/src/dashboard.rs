@@ -730,13 +730,17 @@ async fn handle_store_proxy_delete(
     }
     // Clean up VHost and TCPMux routes
     state.vhost_manager.unregister(&name).await;
-    // Decrement the SNI-sniff gate count for https proxies.
-    if proxy.proxy_type == "https" {
-        state.dec_https_proxy_count();
-    }
     state.tcpmux_manager.unregister(&name).await;
     state.proxy_metrics.remove(&name).await;
-    state.proxy_manager.remove(&name).await;
+    // Decrement the SNI-sniff gate count only when the proxy was actually
+    // removed — the client CloseProxy path races this handler and both may
+    // observe the proxy before either removes it. A double decrement would
+    // leave https_proxy_count at 0 while https proxies still exist, silently
+    // disabling SNI sniff (HTTPS vhost routing) until the next lifecycle
+    // event.
+    if state.proxy_manager.remove(&name).await && proxy.proxy_type == "https" {
+        state.dec_https_proxy_count();
+    }
     // Remove from store if present
     state.proxy_config_store.write().await.remove(&name);
 
@@ -780,13 +784,15 @@ async fn handle_proxies_delete(
                 state.xtcp.sk_index.write().await.remove(key);
             }
             state.vhost_manager.unregister(name).await;
-            // Decrement the SNI-sniff gate count for https proxies.
-            if proxy.proxy_type == "https" {
-                state.dec_https_proxy_count();
-            }
             state.tcpmux_manager.unregister(name).await;
             state.proxy_metrics.remove(name).await;
-            state.proxy_manager.remove(name).await;
+            // Decrement the SNI-sniff gate count only when the proxy was
+            // actually removed — CloseProxy / client disconnect race this
+            // bulk delete, and a double decrement would leave
+            // https_proxy_count at 0 while https proxies still exist.
+            if state.proxy_manager.remove(name).await && proxy.proxy_type == "https" {
+                state.dec_https_proxy_count();
+            }
             state.proxy_config_store.write().await.remove(name);
             deleted.push(name.clone());
         }

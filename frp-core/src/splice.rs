@@ -155,12 +155,27 @@ async fn splice_direction(
             // Parking on dst.writable() mirrors Phase B's backpressure
             // handling.
             let mut pending: libc::c_int = 0;
-            // SAFETY: pipe_rd_fd is a live fd; FIONREAD writes the number
-            // of queued bytes into `pending`. The pointer is not retained.
+            // SAFETY: pipe_rd_fd is a live fd borrowed from the pipe_rd
+            // AsyncFd for the duration of this call; FIONREAD writes the
+            // number of queued bytes into `pending`. The pointer is not
+            // retained after the call returns.
             let drained = unsafe { libc::ioctl(pipe_rd_fd, libc::FIONREAD, &mut pending) };
-            if drained == 0 && pending > 0 {
+            if drained != 0 {
+                // FIONREAD failing is practically impossible on a live fd,
+                // but without the byte count the drain loop below cannot
+                // run — and with the pipe full nothing else ever drains it,
+                // so the park after this block would wait forever, deadlocking
+                // the bridge. Return the error instead.
+                return Err(io::Error::last_os_error());
+            }
+            if pending > 0 {
                 loop {
                     let mut guard = dst.writable().await?;
+                    // SAFETY: pipe_rd_fd and dst_fd are live fds borrowed
+                    // from their AsyncFd wrappers for the duration of this
+                    // call; splice does not take ownership of either
+                    // descriptor, and the null offset pointers keep the
+                    // kernel-managed pipe/socket positions.
                     let ret = unsafe {
                         libc::splice(
                             pipe_rd_fd,
@@ -220,6 +235,10 @@ async fn splice_direction(
         let mut remaining = n_read;
         while remaining > 0 {
             let mut guard = dst.writable().await?;
+            // SAFETY: pipe_rd_fd and dst_fd are live fds borrowed from their
+            // AsyncFd wrappers for the duration of this call; splice does not
+            // take ownership of either descriptor, and the null offset
+            // pointers keep the kernel-managed pipe/socket positions.
             let ret = unsafe {
                 libc::splice(
                     pipe_rd_fd,
