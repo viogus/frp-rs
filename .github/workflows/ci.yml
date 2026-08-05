@@ -88,3 +88,38 @@ jobs:
             target/release/frps
             target/release/frpc
           retention-days: 7
+
+  security:
+    name: Security (cargo-audit + cargo-deny)
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-security-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Install Rust stable
+        run: rustup default stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo audit (dependency vulnerability scan)
+        # RUSTSEC-2026-0194/0195 (quick-xml via the opt-in pprof profiling
+        # path) and RUSTSEC-2023-0071 (rsa Marvin sidechannel, unreachable —
+        # frp-rs only verifies RSA signatures, never private-key ops) are
+        # documented pre-existing issues with no upstream fix. Full rationale
+        # in CLAUDE.md "Security audit" and deny.toml [advisories].
+        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071
+      - name: cargo deny check (advisories + licenses + bans + sources)
+        # --all-features so the graph matches Cargo.lock (which cargo audit
+        # scans): opt-in deps like pprof -> inferno -> quick-xml are otherwise
+        # invisible to the license/advisory checks.
+        run: cargo deny --all-features check

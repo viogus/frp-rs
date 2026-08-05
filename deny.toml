@@ -45,6 +45,11 @@ allow = [
 exceptions = [
     # ring: ISC-style with OpenSSL exception for BoringSSL-derived code
     { name = "ring", allow = ["ISC", "OpenSSL"] },
+    # inferno 0.11 (flamegraph rendering): CDDL-1.0, OSI-approved weak
+    # copyleft. Pulled only by pprof via the opt-in `profiling` feature
+    # (dev-only, absent from all shipped default/tiny/micro builds). Scoped
+    # here so the global allow list stays strict.
+    { name = "inferno", allow = ["CDDL-1.0"] },
 ]
 
 [[licenses.clarify]]
