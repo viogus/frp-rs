@@ -540,6 +540,13 @@ type BoxedWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
 /// Splits exactly like the per-variant arms did (the same `tokio::io::split`
 /// / `into_split` per variant), so the halves wrap the same streams.
 /// Returns an `Err` with a log message for variants that cannot be bridged.
+///
+/// Reachability note: on the old encrypted+injector path the work conn was
+/// split with `into_split().unwrap()` — panicking on `Cipher`/`Aead` and on
+/// `PreRead` carrying buffered bytes. Here those cases degrade to an `Err`
+/// warn or a silent split instead. Work conns only ever arrive as plain
+/// pooled/NewWorkConn streams (`PreRead` is built in the main accept loop
+/// only), so the reachable behavior is unchanged.
 fn split_work_conn_halves(
     work_conn: IoStream,
 ) -> Result<(BoxedReadHalf, BoxedWriteHalf), &'static str> {
