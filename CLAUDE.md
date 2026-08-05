@@ -111,7 +111,7 @@ Every feature, fix, and test change follows three rules:
 | `hex` crate | removed — inline `hex_encode` in frp-core |
 | `let _ =` error discards | all commented (`vhost.rs`, `tcpmux.rs`) |
 | `exec://` token source | always blocked by `UnsafeFeatures::default()` |
-| Security audit | `cargo audit` + `cargo deny check` before release |
+| Security audit | `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` + `cargo deny check` before release |
 | Go frp parity (2026-08-02) | 20-task pass merged (PR #221): OIDC/QUIC/KCP+TLS/WS/UDP/PROXY/plugin/client-management parity, `{single=N}` allowPorts + 24h reservations, HTTPS vhost SNI passthrough, fail-closed HTTP server plugins, **SSH gateway `ssh -R`** (tcpip-forward/forwarded-tcpip), dashboard offline clients/root auth/store 0600, XTCP **MakeHole** state machine, IPv6 vnet routing |
 
 Key perf optimizations (3 audit cycles):
@@ -263,7 +263,9 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
 - **Perf baselines** (4-axis program, host-specific JSONL committed under `scripts/frp-stress/baselines/`): `scripts/throughput-baseline.sh` (MB/s per cipher/transport config), `scripts/latency-baseline.sh` (steady-state RTT + connection-setup percentiles), `scripts/memory-baseline.sh` (idle-hold + churn footprint via the `mem-profile` counting allocator + `ps` RSS). Run manually before/after a data-plane change; not blocking CI gates. Gate rule: a change to one axis must not regress the others (>5% throughput/MB/s, or RTT p99).
 - **Cross-compat tests**: `scripts/compat-test.sh` — 72 run_test scenarios + 17 XTCP pairwise scenarios against Go frp v0.70.1 (V2 included, plus KCP+TLS and KCP+tcpMux Go↔Rust scenarios since the in-tree KCP landed). Runs on every push via `compat.yml`; XTCP compat runs daily on VPS via `xtcp-compat.yml`.
-- **Security audit**: Run `cargo audit` and `cargo deny check` before each release to catch known vulnerabilities and license issues in the dependency tree.
+- **Security audit**: Run `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` and `cargo deny check` before each release. The three ignores are pre-existing issues with **no upstream fix** (cargo-audit ≥0.21 dropped `audit.toml` config file support — flags are the only mechanism; keep reasons in sync with the CI job in `ci.yml`):
+  - `RUSTSEC-2026-0194/0195` (quick-xml 0.26, high): dev-only `profiling` feature chain pprof 0.15 → inferno 0.11.21 → quick-xml 0.26. pprof 0.15.0 is the latest release; nothing newer resolves. Never compiled into release binaries.
+  - `RUSTSEC-2023-0071` (rsa 0.10.0-rc.18, Marvin attack, medium): pinned by russh 0.62.5 (latest) via ssh-key 0.7.0-rc.11. Advisory has no fixed upgrade. Affects frps SSH gateway (RSA host keys/auth) only. Re-check on every russh bump.
 
 ### Test Coverage Gaps
 
