@@ -13,9 +13,9 @@ use super::hs;
 #[cfg(feature = "std")]
 use crate::WantsVerifier;
 use crate::builder::ConfigBuilder;
-use crate::common_state::{CommonState, Side};
 #[cfg(feature = "std")]
-use crate::common_state::{Protocol, State};
+use crate::common_state::State;
+use crate::common_state::{CommonState, Protocol, Side};
 use crate::conn::{ConnectionCommon, ConnectionCore, UnbufferedConnectionCommon};
 #[cfg(doc)]
 use crate::crypto;
@@ -398,6 +398,18 @@ pub struct ServerConfig {
     /// do any resumption.
     pub send_tls13_tickets: usize,
 
+    /// Upper bound on the number of TLS 1.3 tickets sent in response to a
+    /// client [RFC 9149] `ticket_request` extension.
+    ///
+    /// A client requesting `n` tickets receives `min(n, max_tls13_tickets)`.
+    /// Set to 0 to ignore client requests entirely (clients get
+    /// `send_tls13_tickets` regardless).
+    ///
+    /// The default is 0 (extension is ignored, preserving current behavior).
+    ///
+    /// [RFC 9149]: https://datatracker.ietf.org/doc/html/rfc9149
+    pub max_tls13_tickets: usize,
+
     /// If set to `true`, requires the client to support the extended
     /// master secret extraction method defined in [RFC 7627].
     ///
@@ -558,13 +570,14 @@ impl ServerConfig {
     /// We support a given TLS version if it's quoted in the configured
     /// versions *and* at least one ciphersuite for this version is
     /// also configured.
-    pub(crate) fn supports_version(&self, v: ProtocolVersion) -> bool {
+    pub(crate) fn supports_version(&self, v: ProtocolVersion, protocol: Protocol) -> bool {
         self.versions.contains(v)
             && self
                 .provider
                 .cipher_suites
                 .iter()
                 .any(|cs| cs.version().version == v)
+            && protocol.supports_version(v)
     }
 
     #[cfg(feature = "std")]

@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.71"
 name = "rustls"
-version = "0.23.41"
+version = "0.23.43"
 build = "build.rs"
 exclude = [
     "src/testdata",
@@ -101,6 +101,15 @@ zlib = ["dep:zlib-rs"]
 name = "rustls"
 path = "src/lib.rs"
 
+[[example]]
+name = "test_ca"
+path = "examples/internal/test_ca.rs"
+
+[[bench]]
+name = "benchmarks"
+path = "benches/benchmarks.rs"
+harness = false
+required-features = ["ring"]
 
 [dependencies.aws-lc-rs]
 version = "1.14"
