@@ -542,11 +542,13 @@ type BoxedWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
 /// Returns an `Err` with a log message for variants that cannot be bridged.
 ///
 /// Reachability note: on the old encrypted+injector path the work conn was
-/// split with `into_split().unwrap()` — panicking on `Cipher`/`Aead` and on
-/// `PreRead` carrying buffered bytes. Here those cases degrade to an `Err`
-/// warn or a silent split instead. Work conns only ever arrive as plain
-/// pooled/NewWorkConn streams (`PreRead` is built in the main accept loop
-/// only), so the reachable behavior is unchanged.
+/// split with `into_split().unwrap()` — panicking on `PreRead`/`BufferedRead`
+/// carrying unconsumed buffered bytes, and silently splitting `Cipher`/`Aead`
+/// into a broken double-encrypted bridge. Here those cases degrade to an `Err`
+/// warn or a plain split instead. Reachable work conns arrive as
+/// `Tcp`/`Tls`/`Kcp`/`WS`/`Yamux`/`SshChannel`/empty-`PreRead`/consumed-
+/// `BufferedRead` (all split identically to the old code), so the reachable
+/// behavior is unchanged.
 fn split_work_conn_halves(
     work_conn: IoStream,
 ) -> Result<(BoxedReadHalf, BoxedWriteHalf), &'static str> {
