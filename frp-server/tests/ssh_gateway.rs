@@ -42,11 +42,15 @@ impl russh::client::Handler for TestSshClient {
         _connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
-        // Bridge the forwarded-tcpip channel to the local -R target
-        // (the "local service" behind ssh -R). ChannelStream is a full
-        // AsyncRead+AsyncWrite pair — use copy_bidirectional.
+        // Accept the channel (0.62+: an unhandled handle drops with
+        // AdministrativelyProhibited), then bridge the forwarded-tcpip
+        // channel to the local -R target (the "local service" behind
+        // ssh -R). ChannelStream is a full AsyncRead+AsyncWrite pair —
+        // use copy_bidirectional.
+        reply.accept().await;
         if let Some(target) = self.local_target.clone() {
             let mut stream = Box::pin(channel.into_stream());
             tokio::spawn(async move {
