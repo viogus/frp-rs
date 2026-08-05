@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::{debug, warn};
 
 use frp_core::bandwidth::BandwidthLimiter;
@@ -524,6 +524,297 @@ fn parse_bandwidth_config(
     (bw_rate, bw_mode)
 }
 
+/// Type-erased bridge halves: erasing the per-transport types lets
+/// `bridge_encrypted` & friends share one monomorphization.
+type BoxedReadHalf = Box<dyn AsyncRead + Unpin + Send>;
+type BoxedWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// Split a work `IoStream` into boxed read/write halves.
+///
+/// The bridge helpers (`bridge_encrypted` & friends) are generic over their
+/// stream types, so the old per-variant `match` on the work conn
+/// monomorphized `bridge_encrypted` once per IoStream variant (~10 copies,
+/// each several KiB). Boxing the halves erases the types so a single
+/// monomorphization is shared by every transport.
+///
+/// Splits exactly like the per-variant arms did (the same `tokio::io::split`
+/// / `into_split` per variant), so the halves wrap the same streams.
+/// Returns an `Err` with a log message for variants that cannot be bridged.
+fn split_work_conn_halves(
+    work_conn: IoStream,
+) -> Result<(BoxedReadHalf, BoxedWriteHalf), &'static str> {
+    Ok(match work_conn {
+        IoStream::Tcp(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        #[cfg(feature = "tls")]
+        IoStream::Tls(work, _) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        #[cfg(feature = "kcp")]
+        IoStream::Kcp(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        #[cfg(feature = "websocket")]
+        IoStream::WebSocket(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        #[cfg(feature = "quic")]
+        IoStream::Quic(work) => {
+            let (r, w) = work.into_split();
+            (Box::new(r), Box::new(w))
+        }
+        IoStream::Yamux(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        IoStream::SshChannel(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        IoStream::PreRead(_, work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        IoStream::BufferedRead(_, _, inner) => {
+            let (r, w) = inner.into_split().unwrap();
+            (Box::new(r), Box::new(w))
+        }
+        IoStream::Cipher(_) => return Err("Cipher stream unexpected in server bridge"),
+        IoStream::Aead(_) => return Err("Aead stream unexpected in server bridge"),
+        // Reachable when frp-core's quic feature is enabled through a
+        // dev-dependency while frp-server's own quic feature is off.
+        #[allow(unreachable_patterns)]
+        _ => return Err("unsupported IoStream variant in encrypted server bridge"),
+    })
+}
+
+/// Bridge a user connection to a work connection for one proxy.
+///
+/// Runs inside the spawned bridge task. Extracted from `assign_work_to_proxy`
+/// so the spawn site is a plain call and the bridge logic lives in its own
+/// state machine instead of a 54 KiB inline closure.
+#[inline(never)]
+async fn run_work_bridge(
+    mut work_conn: IoStream,
+    req: PendingRequest,
+    proxy_info: Option<Arc<crate::proxy::ProxyInfo>>,
+    encryption_key: [u8; 16],
+    metrics: Arc<frp_core::metrics::ProxyMetrics>,
+    header_timeout: Option<std::time::Duration>,
+    state: Arc<AppState>,
+) {
+    let _guard = ConnGuard::new(metrics.clone());
+    let _drain = ActiveGuard::new(&state);
+
+    // Use encryption if the proxy config requests it (req.use_encryption
+    // comes from proxy_manager). For XTCP STCP fallback, we previously
+    // forced plain bridge to avoid a dual-CipherWriter deadlock — that
+    // deadlock is now fixed by eager IV flush in CipherWriter::poll_flush.
+    // Go frpc v0.69.1 ignores swc.use_encryption (not in its struct) and
+    // uses its own proxy config, so the server MUST match.
+    let use_enc = req.use_encryption;
+
+    // Create bandwidth limiters per direction.
+    // Go frp dev compat: server-side bandwidth limiter only for "server" mode.
+    // Go wraps BOTH read and write directions with a single rate limiter when
+    // mode == "server" (proxy.go:479-481). "client" mode is the client's
+    // responsibility; "both" is not a recognized Go mode.
+    let (bw_rate, bw_mode) = parse_bandwidth_config(
+        proxy_info.as_ref().and_then(|p| {
+            if p.bandwidth_limit.is_empty() {
+                None
+            } else {
+                Some(p.bandwidth_limit.as_str())
+            }
+        }),
+        proxy_info.as_ref().map(|p| p.bandwidth_limit_mode.as_str()),
+    );
+    let mut read_lim = if bw_rate > 0 && bw_mode == "server" {
+        Some(BandwidthLimiter::new(bw_rate))
+    } else {
+        None
+    };
+    let mut write_lim = if bw_rate > 0 && bw_mode == "server" {
+        Some(BandwidthLimiter::new(bw_rate))
+    } else {
+        None
+    };
+
+    // The response-header injector only fires for HTTP-family proxies
+    // with configured headers; clone the HashMap at bridge time instead
+    // of deep-cloning it into every pending request at enqueue time.
+    // Uses the resolved metadata (bridge-time re-fetch when the
+    // enqueue-time snapshot was None).
+    let injector_headers = proxy_info
+        .as_ref()
+        .filter(|p| p.proxy_type.starts_with("http"))
+        .map(|p| p.response_headers.clone())
+        .filter(|h| !h.is_empty());
+
+    // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
+    // which writes them through the CipherWriter (matching Go frp streaming CFB).
+    if use_enc {
+        let key = encryption_key;
+        let (u_r, u_w) = req.user_conn.into_split().unwrap();
+        // One boxed split for every IoStream variant — a single
+        // monomorphization of bridge_encrypted instead of one per variant.
+        let (w_r, w_w) = match split_work_conn_halves(work_conn) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                warn!("{msg}");
+                return;
+            }
+        };
+        if let Some(headers) = injector_headers {
+            let injector = ResponseHeaderInjector::new(w_r, headers);
+            frp_core::bridge::bridge_encrypted(
+                u_r,
+                u_w,
+                injector,
+                w_w,
+                &key,
+                req.use_compression,
+                req.pre_read,
+                None,
+                None,
+                Some(metrics.clone()),
+                header_timeout,
+            )
+            .await;
+            // Matches the original inline closure: the injector path skips
+            // the "bridge completed" debug below.
+            return;
+        }
+        frp_core::bridge::bridge_encrypted(
+            u_r,
+            u_w,
+            w_r,
+            w_w,
+            &key,
+            req.use_compression,
+            req.pre_read,
+            read_lim.as_mut(),
+            write_lim.as_mut(),
+            Some(metrics.clone()),
+            header_timeout,
+        )
+        .await;
+    } else {
+        // Pass VHost pre-read bytes through bridge_plain so the bridge
+        // can coordinate: write pre_read first, then skip work_w shutdown
+        // to let the backend response flow back to the user.
+        let bridge_pre_read = req.pre_read;
+        let comp_key = req.use_compression;
+
+        // XTCP STCP fallback (plain, no encryption): use copy_bidirectional
+        // directly instead of bridge_plain. bridge_plain's join! pattern
+        // drops the work writer (sending FIN) as soon as the user reader
+        // reaches EOF. For STCP fallback the visitor's test client
+        // half-closes after sending data, so the server sees EOF on the
+        // user side ~60ms before the provider starts its bridge. The
+        // premature FIN on the work connection races with the provider's
+        // copy_bidirectional startup and produces ECONNRESET on VPS.
+        // copy_bidirectional avoids this: both directions run to completion
+        // within the same function, and the work side is only shut down
+        // after the full bidirectional copy finishes.
+        if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
+            let mut user_conn = req.user_conn;
+            // Sized buffers so FRP_BRIDGE_BUF_KB governs the XTCP STCP
+            // fallback path too.
+            match tokio::io::copy_bidirectional_with_sizes(
+                &mut user_conn,
+                &mut work_conn,
+                *BUFFER_SIZE,
+                *BUFFER_SIZE,
+            )
+            .await
+            {
+                Ok((a, b)) => {
+                    metrics.record_traffic(a, b);
+                }
+                Err(e) => {
+                    debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
+                }
+            }
+        } else if read_lim.is_some() || write_lim.is_some() {
+            // Bandwidth limiting active: use rate-limited plain bridge.
+            let (u_r, u_w) = req.user_conn.into_split().unwrap();
+            let (w_r, w_w) = work_conn.into_split().unwrap();
+            if let Some(headers) = injector_headers {
+                let injector = ResponseHeaderInjector::new(w_r, headers);
+                frp_core::bridge::bridge_plain_rate_limited(
+                    u_r,
+                    u_w,
+                    injector,
+                    w_w,
+                    comp_key,
+                    bridge_pre_read,
+                    read_lim.as_mut(),
+                    write_lim.as_mut(),
+                    Some(metrics.clone()),
+                    header_timeout,
+                )
+                .await;
+            } else {
+                frp_core::bridge::bridge_plain_rate_limited(
+                    u_r,
+                    u_w,
+                    w_r,
+                    w_w,
+                    comp_key,
+                    bridge_pre_read,
+                    read_lim.as_mut(),
+                    write_lim.as_mut(),
+                    Some(metrics.clone()),
+                    header_timeout,
+                )
+                .await;
+            }
+        } else if !comp_key && bridge_pre_read.is_empty() && injector_headers.is_none() {
+            // Fast path: pure plain relay with no compression, no VHost
+            // pre-read, and no header injection. On Linux, try zero-copy
+            // splice for Tcp-to-Tcp; otherwise use copy_bidirectional.
+            relay_plain_fast(req.user_conn, work_conn, &metrics).await;
+        } else {
+            // Slow path: compression, VHost pre-read, or header injection.
+            let (u_r, u_w) = req.user_conn.into_split().unwrap();
+            let (w_r, w_w) = work_conn.into_split().unwrap();
+            if let Some(headers) = injector_headers {
+                let injector = ResponseHeaderInjector::new(w_r, headers);
+                frp_core::bridge::bridge_plain(
+                    u_r,
+                    u_w,
+                    injector,
+                    w_w,
+                    comp_key,
+                    bridge_pre_read,
+                    Some(metrics.clone()),
+                    header_timeout,
+                )
+                .await;
+            } else {
+                frp_core::bridge::bridge_plain(
+                    u_r,
+                    u_w,
+                    w_r,
+                    w_w,
+                    comp_key,
+                    bridge_pre_read,
+                    Some(metrics.clone()),
+                    header_timeout,
+                )
+                .await;
+            }
+        }
+    }
+    debug!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);
+}
+
 pub(crate) async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
@@ -608,393 +899,31 @@ pub(crate) async fn assign_work_to_proxy(
 
     let proxy_name = req.proxy_name.clone();
     let metrics = state.proxy_metrics.get_or_create(&proxy_name).await;
-    let guard = ConnGuard::new(metrics.clone());
-    let drain_guard = ActiveGuard::new(&state);
-
-    let pre_read = req.pre_read;
-    let enc_key = req.use_encryption;
-    let comp_key = req.use_compression;
-    // Borrow the proxy type from the carried Arc — no per-connection String
-    // clone (the request previously deep-cloned it).
-    let proxy_type = proxy_info.as_ref().map(|p| p.proxy_type.as_str());
-
-    let (bw_rate, bw_mode) = parse_bandwidth_config(
-        proxy_info.as_ref().and_then(|p| {
-            if p.bandwidth_limit.is_empty() {
-                None
-            } else {
-                Some(p.bandwidth_limit.as_str())
-            }
-        }),
-        proxy_info.as_ref().map(|p| p.bandwidth_limit_mode.as_str()),
-    );
 
     // HTTP vhost backend response-header timeout (Go frp compat:
     // VhostHTTPTimeout drives httputil.ReverseProxy.ResponseHeaderTimeoutS).
     // Only HTTP-family proxies get the timeout; TCP/STCP/XTCP bridges have no
     // such semantic. 0 (unset) disables the timeout, matching Go where the
     // ReverseProxy transport never arms a header deadline.
-    let header_timeout =
-        if proxy_type.is_some_and(|t| t.starts_with("http")) && state.vhost_http_timeout > 0 {
-            Some(std::time::Duration::from_secs(state.vhost_http_timeout))
-        } else {
-            None
-        };
+    let header_timeout = if proxy_info
+        .as_ref()
+        .is_some_and(|p| p.proxy_type.starts_with("http"))
+        && state.vhost_http_timeout > 0
+    {
+        Some(std::time::Duration::from_secs(state.vhost_http_timeout))
+    } else {
+        None
+    };
 
-    tokio::spawn(async move {
-        let _guard = guard;
-        let _drain = drain_guard;
-        // Use encryption if the proxy config requests it (req.use_encryption
-        // comes from proxy_manager). For XTCP STCP fallback, we previously
-        // forced plain bridge to avoid a dual-CipherWriter deadlock — that
-        // deadlock is now fixed by eager IV flush in CipherWriter::poll_flush.
-        // Go frpc v0.69.1 ignores swc.use_encryption (not in its struct) and
-        // uses its own proxy config, so the server MUST match.
-        let use_enc = enc_key;
-
-        // Create bandwidth limiters per direction.
-        // Go frp dev compat: server-side bandwidth limiter only for "server" mode.
-        // Go wraps BOTH read and write directions with a single rate limiter when
-        // mode == "server" (proxy.go:479-481). "client" mode is the client's
-        // responsibility; "both" is not a recognized Go mode.
-        let mut read_lim = if bw_rate > 0 && bw_mode == "server" {
-            Some(BandwidthLimiter::new(bw_rate))
-        } else {
-            None
-        };
-        let mut write_lim = if bw_rate > 0 && bw_mode == "server" {
-            Some(BandwidthLimiter::new(bw_rate))
-        } else {
-            None
-        };
-
-        // The response-header injector only fires for HTTP-family proxies
-        // with configured headers; clone the HashMap at bridge time instead
-        // of deep-cloning it into every pending request at enqueue time.
-        // Uses the resolved metadata (bridge-time re-fetch when the
-        // enqueue-time snapshot was None).
-        let injector_headers = proxy_info
-            .as_ref()
-            .filter(|p| p.proxy_type.starts_with("http"))
-            .map(|p| p.response_headers.clone())
-            .filter(|h| !h.is_empty());
-
-        // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
-        // which writes them through the CipherWriter (matching Go frp streaming CFB).
-        if use_enc {
-            let key = encryption_key;
-            if let Some(headers) = injector_headers {
-                let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                let (w_r, w_w) = work_conn.into_split().unwrap();
-                let injector = ResponseHeaderInjector::new(w_r, headers);
-                frp_core::bridge::bridge_encrypted(
-                    u_r,
-                    u_w,
-                    injector,
-                    w_w,
-                    &key,
-                    comp_key,
-                    pre_read,
-                    None,
-                    None,
-                    Some(metrics.clone()),
-                    header_timeout,
-                )
-                .await;
-                return;
-            }
-            match work_conn {
-                IoStream::Tcp(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        &key,
-                        comp_key,
-                        pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-                #[cfg(feature = "tls")]
-                IoStream::Tls(work, _) => {
-                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        &key,
-                        comp_key,
-                        pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-                #[cfg(feature = "kcp")]
-                IoStream::Kcp(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        &key,
-                        comp_key,
-                        pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-                #[cfg(feature = "websocket")]
-                IoStream::WebSocket(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        &key,
-                        comp_key,
-                        pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-                #[cfg(feature = "quic")]
-                IoStream::Quic(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                    let (w_r, w_w) = work.into_split();
-                    frp_core::bridge::bridge_encrypted(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        &key,
-                        comp_key,
-                        pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-                IoStream::Yamux(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        &key,
-                        comp_key,
-                        pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-                IoStream::Cipher(_) => {
-                    warn!("Cipher stream unexpected in server bridge");
-                    return;
-                }
-                IoStream::Aead(_) => {
-                    warn!("Aead stream unexpected in server bridge");
-                    return;
-                }
-                IoStream::SshChannel(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        &key,
-                        comp_key,
-                        pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-                IoStream::PreRead(_, work) => {
-                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        &key,
-                        comp_key,
-                        pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-                IoStream::BufferedRead(_, _, inner) => {
-                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                    let (w_r, w_w) = inner.into_split().unwrap();
-                    frp_core::bridge::bridge_encrypted(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        &key,
-                        comp_key,
-                        pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-                // Reachable when frp-core's quic feature is enabled through a
-                // dev-dependency while frp-server's own quic feature is off.
-                #[allow(unreachable_patterns)]
-                _ => {
-                    warn!("unsupported IoStream variant in encrypted server bridge");
-                    return;
-                }
-            }
-        } else {
-            // Pass VHost pre-read bytes through bridge_plain so the bridge
-            // can coordinate: write pre_read first, then skip work_w shutdown
-            // to let the backend response flow back to the user.
-            let bridge_pre_read = pre_read;
-
-            // XTCP STCP fallback (plain, no encryption): use copy_bidirectional
-            // directly instead of bridge_plain. bridge_plain's join! pattern
-            // drops the work writer (sending FIN) as soon as the user reader
-            // reaches EOF. For STCP fallback the visitor's test client
-            // half-closes after sending data, so the server sees EOF on the
-            // user side ~60ms before the provider starts its bridge. The
-            // premature FIN on the work connection races with the provider's
-            // copy_bidirectional startup and produces ECONNRESET on VPS.
-            // copy_bidirectional avoids this: both directions run to completion
-            // within the same function, and the work side is only shut down
-            // after the full bidirectional copy finishes.
-            if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
-                let mut user_conn = req.user_conn;
-                // Sized buffers so FRP_BRIDGE_BUF_KB governs the XTCP STCP
-                // fallback path too.
-                match tokio::io::copy_bidirectional_with_sizes(
-                    &mut user_conn,
-                    &mut work_conn,
-                    *BUFFER_SIZE,
-                    *BUFFER_SIZE,
-                )
-                .await
-                {
-                    Ok((a, b)) => {
-                        metrics.record_traffic(a, b);
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
-                    }
-                }
-            } else if read_lim.is_some() || write_lim.is_some() {
-                // Bandwidth limiting active: use rate-limited plain bridge.
-                let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                let (w_r, w_w) = work_conn.into_split().unwrap();
-                if let Some(headers) = injector_headers {
-                    let injector = ResponseHeaderInjector::new(w_r, headers);
-                    frp_core::bridge::bridge_plain_rate_limited(
-                        u_r,
-                        u_w,
-                        injector,
-                        w_w,
-                        comp_key,
-                        bridge_pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                } else {
-                    frp_core::bridge::bridge_plain_rate_limited(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        comp_key,
-                        bridge_pre_read,
-                        read_lim.as_mut(),
-                        write_lim.as_mut(),
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-            } else if !comp_key && bridge_pre_read.is_empty() && injector_headers.is_none() {
-                // Fast path: pure plain relay with no compression, no VHost
-                // pre-read, and no header injection. On Linux, try zero-copy
-                // splice for Tcp-to-Tcp; otherwise use copy_bidirectional.
-                relay_plain_fast(req.user_conn, work_conn, &metrics).await;
-            } else {
-                // Slow path: compression, VHost pre-read, or header injection.
-                let (u_r, u_w) = req.user_conn.into_split().unwrap();
-                let (w_r, w_w) = work_conn.into_split().unwrap();
-                if let Some(headers) = injector_headers {
-                    let injector = ResponseHeaderInjector::new(w_r, headers);
-                    frp_core::bridge::bridge_plain(
-                        u_r,
-                        u_w,
-                        injector,
-                        w_w,
-                        comp_key,
-                        bridge_pre_read,
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                } else {
-                    frp_core::bridge::bridge_plain(
-                        u_r,
-                        u_w,
-                        w_r,
-                        w_w,
-                        comp_key,
-                        bridge_pre_read,
-                        Some(metrics.clone()),
-                        header_timeout,
-                    )
-                    .await;
-                }
-            }
-        }
-        debug!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);
-    });
+    tokio::spawn(run_work_bridge(
+        work_conn,
+        req,
+        proxy_info,
+        encryption_key,
+        metrics,
+        header_timeout,
+        state,
+    ));
 }
 
 #[cfg(test)]

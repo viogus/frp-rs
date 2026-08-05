@@ -5,7 +5,9 @@
 //! initialisation.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -59,6 +61,208 @@ where
         let _ = auth_success.send(());
     }
     Ok(())
+}
+
+/// Write a LoginResp error frame and drop the stream.
+///
+/// Every auth-failure path in `authenticate` sends the same shape of
+/// LoginResp (version + error, no run_id) and then returns `Err(())`.
+/// Extracted into its own function so the login state machine contains
+/// one copy of the message construction + write instead of six.
+#[inline(never)]
+async fn send_login_error(
+    stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
+    error: String,
+    v2: bool,
+) {
+    let (_, mut writer) = tokio::io::split(stream);
+    let resp = FrpMessage::LoginResp(msg::LoginResp {
+        version: Some(frp_core::VERSION.into()),
+        run_id: None,
+        error: Some(error),
+        server_additional_auth_scopes: None,
+    });
+    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+}
+
+/// Verify login credentials and run timestamp replay protection.
+///
+/// On success returns the verified OIDC subject (if any) together with the
+/// still-open stream for the caller's post-auth phases. On failure sends a
+/// LoginResp error (consuming the stream) and returns `Err(())`.
+///
+/// Extracted from `authenticate` so the large login future is split into
+/// two smaller state machines (auth phase + setup phase).
+#[inline(never)]
+async fn verify_login_auth(
+    stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
+    login: &msg::Login,
+    state: &Arc<AppState>,
+    peer: Option<SocketAddr>,
+    v2: bool,
+    internal: bool,
+) -> Result<
+    (
+        Option<String>,
+        Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
+    ),
+    (),
+> {
+    // --- Authenticate ---
+    // Internal connections (SSH gateway) with AlwaysAuthPass bypass all auth.
+    // always_auth_pass is Option<Option<bool>>: outer Option is ClientSpec presence
+    // (Go clients never send ClientSpec; only internal/Rust connections do).
+    // Inner Option<bool> defaults to false. Only Some(Some(true)) triggers bypass.
+    let is_auth_bypass = internal
+        && login
+            .client_spec
+            .as_ref()
+            .and_then(|cs| cs.always_auth_pass)
+            .unwrap_or(false);
+    if is_auth_bypass {
+        info!(
+            peer = ?peer,
+            run_id = ?login.run_id,
+            "Internal connection with AlwaysAuthPass, bypassing authentication",
+        );
+    }
+
+    let oidc_subject: Option<String> = if is_auth_bypass {
+        None
+    } else if let Some(ref verifier) = state.oidc.verifier {
+        let token = login.privilege_key.as_deref().unwrap_or("");
+        match verifier.verify_login(token).await {
+            Ok(oidc_token) => {
+                if oidc_token.subject.trim().is_empty() {
+                    warn!(peer = ?peer, "OIDC auth failed: subject claim is empty");
+                    return Err(());
+                }
+                // jti replay protection: same jti + same subject is allowed
+                // (frpc reconnects reuse the cached token); same jti +
+                // different subject is rejected as a cross-identity replay.
+                if let Err(e) = verifier.check_replay(
+                    oidc_token.jti.as_deref(),
+                    &oidc_token.subject,
+                    oidc_token.expiry,
+                ) {
+                    warn!(peer = ?peer, error = %e, "OIDC login rejected: {}", e);
+                    send_login_error(
+                        stream,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            format!("OIDC authentication failed: {e}"),
+                            "OIDC authentication failed",
+                        ),
+                        v2,
+                    )
+                    .await;
+                    return Err(());
+                }
+                info!(subject = %oidc_token.subject, "OIDC login verified: subject={}", oidc_token.subject);
+                Some(oidc_token.subject)
+            }
+            Err(e) => {
+                warn!(peer = ?peer, error = %e, "OIDC auth failed for {:?}: {}", peer, e);
+                send_login_error(
+                    stream,
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        format!("OIDC authentication failed: {e}"),
+                        "OIDC authentication failed",
+                    ),
+                    v2,
+                )
+                .await;
+                return Err(());
+            }
+        }
+    } else {
+        let auth_cfg = state.reloadable.read_ok().auth_cfg.clone();
+        let login_auth = auth_cfg.resolve_token().and_then(|token| {
+            auth_cfg.validate_login_with_token(
+                &token,
+                login.privilege_key.as_deref(),
+                login.timestamp,
+            )
+        });
+        if let Err(e) = login_auth {
+            warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
+            // Emit WebSocket event for dashboard subscribers
+            #[cfg(feature = "dashboard")]
+            {
+                let _ = state.event_tx.send(crate::event::ServerEvent::Error {
+                    message: format!("Authentication failed for {:?}", peer),
+                    context: Some("login".into()),
+                });
+            }
+            send_login_error(
+                stream,
+                err_msg(
+                    state.detailed_errors_to_client,
+                    e,
+                    "token authentication failed",
+                ),
+                v2,
+            )
+            .await;
+            return Err(());
+        }
+
+        // --- Replay protection: timestamp freshness + duplicate detection ---
+        if auth_cfg.token_auth_timeout && auth_cfg.authentication_timeout > 0 {
+            if let Some(ts) = login.timestamp {
+                if let Err(e) = frp_core::auth::validate_timestamp_freshness(
+                    ts,
+                    auth_cfg.authentication_timeout,
+                ) {
+                    warn!(peer = ?peer, error = %e, "Login timestamp outside acceptable window: {}", e);
+                    send_login_error(stream, e, v2).await;
+                    return Err(());
+                }
+                // Use client-provided run_id for duplicate detection.
+                // When the client doesn't send one (old/Rust clients or tests),
+                // generate a unique UUID so concurrent logins within the same
+                // second don't collide. Replay protection is weaker without
+                // a client-provided run_id (attacker could replay within the
+                // timestamp freshness window), but the login throttle and
+                // timestamp freshness check provide layered defense.
+                let run_id_for_check = login
+                    .run_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let mut used = state.used_timestamps.lock().await;
+                let entry = used.entry(ts).or_default();
+                if !entry.insert(run_id_for_check.clone()) {
+                    warn!(
+                        peer = ?peer, run_id = %run_id_for_check, ts = %ts,
+                        "Replay attack detected: duplicate (run_id, timestamp) pair for run_id={} ts={}",
+                        run_id_for_check, ts,
+                    );
+                    send_login_error(
+                        stream,
+                        "replay attack detected: duplicate timestamp".into(),
+                        v2,
+                    )
+                    .await;
+                    return Err(());
+                }
+                // Clean old entries: split_off (O(log n)) is faster than a full
+                // retain scan (O(n)) and avoids holding the lock for a linear scan.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let threshold = now - auth_cfg.authentication_timeout;
+                let kept = used.split_off(&threshold);
+                *used = kept;
+            }
+        }
+
+        None
+    };
+
+    Ok((oidc_subject, stream))
 }
 
 #[cfg(test)]
@@ -215,7 +419,7 @@ mod auth_signal_tests {
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 pub(crate) async fn authenticate(
-    mut stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
+    stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
     login: &msg::Login,
     state: Arc<AppState>,
     peer: Option<SocketAddr>,
@@ -242,173 +446,27 @@ pub(crate) async fn authenticate(
     // and the reconnect backoff on the client side.
 
     // --- Authenticate ---
-    // Internal connections (SSH gateway) with AlwaysAuthPass bypass all auth.
-    // always_auth_pass is Option<Option<bool>>: outer Option is ClientSpec presence
-    // (Go clients never send ClientSpec; only internal/Rust connections do).
-    // Inner Option<bool> defaults to false. Only Some(Some(true)) triggers bypass.
-    let is_auth_bypass = internal
-        && login
-            .client_spec
-            .as_ref()
-            .and_then(|cs| cs.always_auth_pass)
-            .unwrap_or(false);
-    if is_auth_bypass {
-        info!(
-            peer = ?peer,
-            run_id = ?login.run_id,
-            "Internal connection with AlwaysAuthPass, bypassing authentication",
-        );
-    }
-
-    let oidc_subject: Option<String> = if is_auth_bypass {
-        None
-    } else if let Some(ref verifier) = state.oidc.verifier {
-        let token = login.privilege_key.as_deref().unwrap_or("");
-        match verifier.verify_login(token).await {
-            Ok(oidc_token) => {
-                if oidc_token.subject.trim().is_empty() {
-                    warn!(peer = ?peer, "OIDC auth failed: subject claim is empty");
-                    return Err(());
-                }
-                // jti replay protection: same jti + same subject is allowed
-                // (frpc reconnects reuse the cached token); same jti +
-                // different subject is rejected as a cross-identity replay.
-                if let Err(e) = verifier.check_replay(
-                    oidc_token.jti.as_deref(),
-                    &oidc_token.subject,
-                    oidc_token.expiry,
-                ) {
-                    warn!(peer = ?peer, error = %e, "OIDC login rejected: {}", e);
-                    let (_, mut writer) = tokio::io::split(stream);
-                    let resp = FrpMessage::LoginResp(msg::LoginResp {
-                        version: Some(frp_core::VERSION.into()),
-                        run_id: None,
-                        error: Some(err_msg(
-                            state.detailed_errors_to_client,
-                            format!("OIDC authentication failed: {e}"),
-                            "OIDC authentication failed",
-                        )),
-                        server_additional_auth_scopes: None,
-                    });
-                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-                    return Err(());
-                }
-                info!(subject = %oidc_token.subject, "OIDC login verified: subject={}", oidc_token.subject);
-                Some(oidc_token.subject)
-            }
-            Err(e) => {
-                warn!(peer = ?peer, error = %e, "OIDC auth failed for {:?}: {}", peer, e);
-                let (_, mut writer) = tokio::io::split(stream);
-                let resp = FrpMessage::LoginResp(msg::LoginResp {
-                    version: Some(frp_core::VERSION.into()),
-                    run_id: None,
-                    error: Some(err_msg(
-                        state.detailed_errors_to_client,
-                        format!("OIDC authentication failed: {e}"),
-                        "OIDC authentication failed",
-                    )),
-                    server_additional_auth_scopes: None,
-                });
-                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-                return Err(());
-            }
-        }
-    } else {
-        let auth_cfg = state.reloadable.read_ok().auth_cfg.clone();
-        let login_auth = auth_cfg.resolve_token().and_then(|token| {
-            auth_cfg.validate_login_with_token(
-                &token,
-                login.privilege_key.as_deref(),
-                login.timestamp,
-            )
-        });
-        if let Err(e) = login_auth {
-            warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
-            // Emit WebSocket event for dashboard subscribers
-            #[cfg(feature = "dashboard")]
-            {
-                let _ = state.event_tx.send(crate::event::ServerEvent::Error {
-                    message: format!("Authentication failed for {:?}", peer),
-                    context: Some("login".into()),
-                });
-            }
-            let (_, mut writer) = tokio::io::split(stream);
-            let resp = FrpMessage::LoginResp(msg::LoginResp {
-                version: Some(frp_core::VERSION.into()),
-                run_id: None,
-                error: Some(err_msg(
-                    state.detailed_errors_to_client,
-                    e,
-                    "token authentication failed",
-                )),
-                server_additional_auth_scopes: None,
-            });
-            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-            return Err(());
-        }
-
-        // --- Replay protection: timestamp freshness + duplicate detection ---
-        if auth_cfg.token_auth_timeout && auth_cfg.authentication_timeout > 0 {
-            if let Some(ts) = login.timestamp {
-                if let Err(e) = frp_core::auth::validate_timestamp_freshness(
-                    ts,
-                    auth_cfg.authentication_timeout,
-                ) {
-                    warn!(peer = ?peer, error = %e, "Login timestamp outside acceptable window: {}", e);
-                    let (_, mut writer) = tokio::io::split(stream);
-                    let resp = FrpMessage::LoginResp(msg::LoginResp {
-                        version: Some(frp_core::VERSION.into()),
-                        run_id: None,
-                        error: Some(e),
-                        server_additional_auth_scopes: None,
-                    });
-                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-                    return Err(());
-                }
-                // Use client-provided run_id for duplicate detection.
-                // When the client doesn't send one (old/Rust clients or tests),
-                // generate a unique UUID so concurrent logins within the same
-                // second don't collide. Replay protection is weaker without
-                // a client-provided run_id (attacker could replay within the
-                // timestamp freshness window), but the login throttle and
-                // timestamp freshness check provide layered defense.
-                let run_id_for_check = login
-                    .run_id
-                    .clone()
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let mut used = state.used_timestamps.lock().await;
-                let entry = used.entry(ts).or_default();
-                if !entry.insert(run_id_for_check.clone()) {
-                    warn!(
-                        peer = ?peer, run_id = %run_id_for_check, ts = %ts,
-                        "Replay attack detected: duplicate (run_id, timestamp) pair for run_id={} ts={}",
-                        run_id_for_check, ts,
-                    );
-                    let (_, mut writer) = tokio::io::split(stream);
-                    let resp = FrpMessage::LoginResp(msg::LoginResp {
-                        version: Some(frp_core::VERSION.into()),
-                        run_id: None,
-                        error: Some("replay attack detected: duplicate timestamp".into()),
-                        server_additional_auth_scopes: None,
-                    });
-                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-                    return Err(());
-                }
-                // Clean old entries: split_off (O(log n)) is faster than a full
-                // retain scan (O(n)) and avoids holding the lock for a linear scan.
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                let threshold = now - auth_cfg.authentication_timeout;
-                let kept = used.split_off(&threshold);
-                *used = kept;
-            }
-        }
-
-        None
-    };
+    // Split into its own state machine (OIDC/token verification + timestamp
+    // replay protection) so this function and the auth phase are each much
+    // smaller than the previous single 45 KiB future.
+    //
+    // The auth future is polled through a `dyn Future` vtable: `#[inline(never)]`
+    // does not stop LLVM from inlining an async fn's poll into its single
+    // caller, which would merge the two state machines back into one giant
+    // function. One vtable call per connection is irrelevant (auth runs once).
+    type AuthFuture<'a> = dyn Future<
+            Output = Result<
+                (
+                    Option<String>,
+                    Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
+                ),
+                (),
+            >,
+        > + Send
+        + 'a;
+    let auth_fut: Pin<Box<AuthFuture<'_>>> =
+        Box::pin(verify_login_auth(stream, login, &state, peer, v2, internal));
+    let (oidc_subject, mut stream) = auth_fut.await?;
 
     let reloadable = state.reloadable.read_ok().clone();
     let authenticated_user = authenticated_user(login.user.as_deref(), oidc_subject.as_deref());
@@ -434,14 +492,7 @@ pub(crate) async fn authenticate(
         });
         if let Err(reason) = state.plugin_manager.notify("login", login_content).await {
             warn!(run_id = %run_id, reason = %reason, "Login for run_id {} rejected by server plugin: {}", run_id, reason);
-            let (_, mut writer) = tokio::io::split(stream);
-            let resp = FrpMessage::LoginResp(msg::LoginResp {
-                version: Some(frp_core::VERSION.into()),
-                run_id: None,
-                error: Some(reason),
-                server_additional_auth_scopes: None,
-            });
-            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+            send_login_error(stream, reason, v2).await;
             return Err(());
         }
     }
