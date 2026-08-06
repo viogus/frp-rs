@@ -325,138 +325,6 @@ async fn rollback_udp_bind_failure(
     state.proxy_manager.remove(proxy_name).await;
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod unregister_generation_tests {
-    use super::*;
-    use std::time::Duration;
-
-    fn test_state() -> Arc<AppState> {
-        let cfg = frp_core::config::ServerConfig::default();
-        Arc::new(AppState::new(
-            frp_core::auth::AuthConfig::with_token("test-token"),
-            "127.0.0.1".into(),
-            frp_core::encryption::derive_key("test-token"),
-            vec![frp_core::config::PortsRange {
-                start: 1,
-                end: u16::MAX,
-                single: 0,
-            }],
-            String::new(),
-            true,
-            30,
-            7200,
-            90,
-            1500,
-            false,
-            None,
-            0,
-            60,
-            10,
-            false,
-            String::new(),
-            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
-            0,
-            168,
-            true,
-            0,
-            0,
-            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
-        ))
-    }
-
-    async fn insert_control(state: &Arc<AppState>, run_id: &str, control_id: u64) {
-        let _rx = insert_control_rx(state, run_id, control_id).await;
-    }
-
-    async fn insert_control_rx(
-        state: &Arc<AppState>,
-        run_id: &str,
-        control_id: u64,
-    ) -> mpsc::Receiver<InternalMsg> {
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let mut map = state.run_id_to_ctl_tx.write().await;
-        map.insert(
-            run_id.to_string(),
-            crate::state::ControlTx {
-                tx,
-                client_addr: None,
-                login_time: std::time::Instant::now(),
-                login_time_unix: 0,
-                pool_stats: Arc::new(crate::state::PoolStats::default()),
-                user: String::new(),
-                control_id,
-            },
-        );
-        rx
-    }
-
-    #[tokio::test]
-    async fn stale_failure_cannot_unregister_superseding_control() {
-        let state = test_state();
-        insert_control(&state, "run-1", 7).await;
-
-        // An older failing control (generation 3) must not delete the
-        // replacement's routing entry.
-        unregister_control(&state, "run-1", 3, false).await;
-        assert!(state.run_id_to_ctl_tx.read().await.contains_key("run-1"));
-
-        // The replacement itself may still clean up its own generation.
-        unregister_control(&state, "run-1", 7, false).await;
-        assert!(!state.run_id_to_ctl_tx.read().await.contains_key("run-1"));
-    }
-
-    #[cfg(feature = "vnet")]
-    #[tokio::test]
-    async fn unregister_control_removes_run_id_vnet_routes_and_broadcasts_remove() {
-        let state = test_state();
-        let mut peer_rx = insert_control_rx(&state, "run-b", 2).await;
-        insert_control(&state, "run-a", 1).await;
-        {
-            let mut routes = state.vnet_routes.write().await;
-            routes.insert(
-                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
-                ("run-a".to_string(), "proxy-a".to_string()),
-            );
-            routes.insert(
-                ("vnet-a".to_string(), "2001:db8::/64".to_string()),
-                ("run-a".to_string(), "visitor-v6".to_string()),
-            );
-            routes.insert(
-                ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
-                ("run-b".to_string(), "proxy-b".to_string()),
-            );
-            // run-b also participates in vnet-a, so it is a peer of run-a's
-            // vnet-a routes and must receive the broadcast removes below.
-            routes.insert(
-                ("vnet-a".to_string(), "10.99.0.0/24".to_string()),
-                ("run-b".to_string(), "proxy-b-vnet-a".to_string()),
-            );
-        }
-
-        unregister_control(&state, "run-a", 1, false).await;
-
-        let routes = state.vnet_routes.read().await;
-        assert!(routes.iter().all(|(_, (run_id, _))| run_id != "run-a"));
-        assert!(routes.contains_key(&("vnet-b".to_string(), "10.1.0.0/24".to_string())));
-        assert!(routes.contains_key(&("vnet-a".to_string(), "10.99.0.0/24".to_string())));
-        drop(routes);
-
-        let mut removes = Vec::new();
-        for _ in 0..2 {
-            match tokio::time::timeout(Duration::from_secs(5), peer_rx.recv()).await {
-                Ok(Some(InternalMsg::VnetRouteRemoveForward { msg })) => removes.push(msg),
-                other => panic!("expected forwarded remove, got {:?}", other),
-            }
-        }
-        assert!(removes
-            .iter()
-            .any(|m| { m.proxy_name == "proxy-a" && m.virtual_net.as_deref() == Some("vnet-a") }));
-        assert!(removes.iter().any(|m| {
-            m.proxy_name == "visitor-v6" && m.virtual_net.as_deref() == Some("vnet-a")
-        }));
-    }
-}
 
 /// Pure validation of NewProxy fields. Returns Ok(()) or an error message.
 /// Checks port range, proxy_name length/control chars, custom_domains length,
@@ -1562,4 +1430,135 @@ async fn handle_tcp_group_member_registration(
         error: None,
     });
     write_resp(writer, &resp, v2).await;
+}
+#[cfg(test)]
+mod unregister_generation_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn test_state() -> Arc<AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(AppState::new(
+            frp_core::auth::AuthConfig::with_token("test-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("test-token"),
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
+            String::new(),
+            true,
+            30,
+            7200,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    async fn insert_control(state: &Arc<AppState>, run_id: &str, control_id: u64) {
+        let _rx = insert_control_rx(state, run_id, control_id).await;
+    }
+
+    async fn insert_control_rx(
+        state: &Arc<AppState>,
+        run_id: &str,
+        control_id: u64,
+    ) -> mpsc::Receiver<InternalMsg> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut map = state.run_id_to_ctl_tx.write().await;
+        map.insert(
+            run_id.to_string(),
+            crate::state::ControlTx {
+                tx,
+                client_addr: None,
+                login_time: std::time::Instant::now(),
+                login_time_unix: 0,
+                pool_stats: Arc::new(crate::state::PoolStats::default()),
+                user: String::new(),
+                control_id,
+            },
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn stale_failure_cannot_unregister_superseding_control() {
+        let state = test_state();
+        insert_control(&state, "run-1", 7).await;
+
+        // An older failing control (generation 3) must not delete the
+        // replacement's routing entry.
+        unregister_control(&state, "run-1", 3, false).await;
+        assert!(state.run_id_to_ctl_tx.read().await.contains_key("run-1"));
+
+        // The replacement itself may still clean up its own generation.
+        unregister_control(&state, "run-1", 7, false).await;
+        assert!(!state.run_id_to_ctl_tx.read().await.contains_key("run-1"));
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn unregister_control_removes_run_id_vnet_routes_and_broadcasts_remove() {
+        let state = test_state();
+        let mut peer_rx = insert_control_rx(&state, "run-b", 2).await;
+        insert_control(&state, "run-a", 1).await;
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-a".to_string(), "proxy-a".to_string()),
+            );
+            routes.insert(
+                ("vnet-a".to_string(), "2001:db8::/64".to_string()),
+                ("run-a".to_string(), "visitor-v6".to_string()),
+            );
+            routes.insert(
+                ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
+                ("run-b".to_string(), "proxy-b".to_string()),
+            );
+            // run-b also participates in vnet-a, so it is a peer of run-a's
+            // vnet-a routes and must receive the broadcast removes below.
+            routes.insert(
+                ("vnet-a".to_string(), "10.99.0.0/24".to_string()),
+                ("run-b".to_string(), "proxy-b-vnet-a".to_string()),
+            );
+        }
+
+        unregister_control(&state, "run-a", 1, false).await;
+
+        let routes = state.vnet_routes.read().await;
+        assert!(routes.iter().all(|(_, (run_id, _))| run_id != "run-a"));
+        assert!(routes.contains_key(&("vnet-b".to_string(), "10.1.0.0/24".to_string())));
+        assert!(routes.contains_key(&("vnet-a".to_string(), "10.99.0.0/24".to_string())));
+        drop(routes);
+
+        let mut removes = Vec::new();
+        for _ in 0..2 {
+            match tokio::time::timeout(Duration::from_secs(5), peer_rx.recv()).await {
+                Ok(Some(InternalMsg::VnetRouteRemoveForward { msg })) => removes.push(msg),
+                other => panic!("expected forwarded remove, got {:?}", other),
+            }
+        }
+        assert!(removes
+            .iter()
+            .any(|m| { m.proxy_name == "proxy-a" && m.virtual_net.as_deref() == Some("vnet-a") }));
+        assert!(removes.iter().any(|m| {
+            m.proxy_name == "visitor-v6" && m.virtual_net.as_deref() == Some("vnet-a")
+        }));
+    }
 }
