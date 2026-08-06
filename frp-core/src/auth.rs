@@ -368,7 +368,7 @@ mod oidc_impl {
         skip_expiry: bool,
         skip_issuer: bool,
         skip_nbf: bool,
-        http: reqwest::Client,
+        http: crate::http_client::HttpClient,
         /// Replay-protection cache: jti → (subject, deadline_unix_seconds).
         /// A jti seen with a different subject is rejected; the same jti with
         /// the same subject is allowed (frpc reconnects reuse the cached token).
@@ -386,22 +386,22 @@ mod oidc_impl {
             skip_nbf: bool,
             proxy_url: Option<String>,
         ) -> Result<Self, String> {
-            let mut client_builder =
-                reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
-            if let Some(ref url) = proxy_url.filter(|u| !u.is_empty()) {
-                let proxy = reqwest::Proxy::all(url)
-                    .map_err(|e| format!("OIDC: invalid proxy URL '{url}': {e}"))?;
-                client_builder = client_builder.proxy(proxy);
+            if proxy_url.as_ref().is_some_and(|u| !u.is_empty()) {
+                return Err(
+                    "OIDC: HTTP proxy is not supported with the hyper HTTP client. \
+                     Remove proxy_url from OIDC config or rebuild with FRP_HTTP=reqwest."
+                        .into(),
+                );
             }
-            let http = client_builder
-                .build()
-                .map_err(|e| format!("OIDC: failed to create HTTP client: {e}"))?;
+            let http = crate::http_client::HttpClientBuilder::new()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?;
 
             let config_url = format!(
                 "{}/.well-known/openid-configuration",
                 issuer.trim_end_matches('/')
             );
-            let resp = http.get(&config_url).send().await.map_err(|e| {
+            let resp = http.get(&config_url).await.map_err(|e| {
                 format!("OIDC: failed to fetch openid-configuration from {config_url}: {e}")
             })?;
 
@@ -468,7 +468,7 @@ mod oidc_impl {
 
         async fn refresh_jwks(&self) -> Result<(), String> {
             let resp =
-                self.http.get(&self.jwks_uri).send().await.map_err(|e| {
+                self.http.get(&self.jwks_uri).await.map_err(|e| {
                     format!("OIDC: failed to fetch JWKS from {}: {e}", self.jwks_uri)
                 })?;
 
@@ -817,7 +817,7 @@ mod oidc_impl {
         /// Set to true when the token endpoint omits `expires_in`.
         /// When true, get_token() bypasses the cache and always fetches a fresh token.
         non_caching: std::sync::atomic::AtomicBool,
-        http: reqwest::Client,
+        http: crate::http_client::HttpClient,
     }
 
     impl OidcClient {
@@ -842,31 +842,32 @@ mod oidc_impl {
             proxy_url: Option<String>,
             token_source: Option<crate::config::ValueSource>,
         ) -> Result<Self, String> {
-            let mut client_builder =
-                reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
-
-            if let Some(ref url) = proxy_url.filter(|u| !u.is_empty()) {
-                let proxy = reqwest::Proxy::all(url)
-                    .map_err(|e| format!("OIDC client: invalid proxy URL '{url}': {e}"))?;
-                client_builder = client_builder.proxy(proxy);
+            if proxy_url.as_ref().is_some_and(|u| !u.is_empty()) {
+                return Err(
+                    "OIDC client: HTTP proxy is not supported with the hyper HTTP client. \
+                     Remove proxy_url from OIDC client config or rebuild with FRP_HTTP=reqwest."
+                        .into(),
+                );
             }
 
-            if let Some(ca_file) = tls_trusted_ca_file.filter(|f| !f.is_empty()) {
-                let cert = std::fs::read(&ca_file)
-                    .map_err(|e| format!("OIDC client: failed to read CA cert {ca_file}: {e}"))?;
-                let cert = reqwest::Certificate::from_pem(&cert)
-                    .map_err(|e| format!("OIDC client: invalid CA cert {ca_file}: {e}"))?;
-                client_builder = client_builder.add_root_certificate(cert);
-            }
+            let ca_cert_pem = if let Some(ref ca_file) = tls_trusted_ca_file.filter(|f| !f.is_empty()) {
+                Some(
+                    std::fs::read(ca_file)
+                        .map_err(|e| format!("OIDC client: failed to read CA cert {ca_file}: {e}"))?,
+                )
+            } else {
+                None
+            };
 
             if tls_insecure_skip_verify {
                 tracing::warn!("OIDC: tls_insecure_skip_verify is enabled — TLS certificate verification is disabled. This weakens authentication security.");
-                client_builder = client_builder.danger_accept_invalid_certs(true);
             }
 
-            let http = client_builder
-                .build()
-                .map_err(|e| format!("OIDC client: failed to create HTTP client: {e}"))?;
+            let http = crate::http_client::HttpClientBuilder::new()
+                .timeout(std::time::Duration::from_secs(10))
+                .tls_ca_cert_pem(ca_cert_pem)
+                .tls_skip_verify(tls_insecure_skip_verify)
+                .build()?;
 
             let endpoint = if token_source.is_some() {
                 // Go frp v0.70.1 compat: auth.oidc.tokenSource resolves the
@@ -879,7 +880,7 @@ mod oidc_impl {
                     "{}/.well-known/openid-configuration",
                     iss.trim_end_matches('/')
                 );
-                let resp = http.get(&config_url).send().await.map_err(|e| {
+                let resp = http.get(&config_url).await.map_err(|e| {
                     format!(
                         "OIDC client: failed to fetch openid-configuration from {config_url}: {e}"
                     )
@@ -956,9 +957,7 @@ mod oidc_impl {
 
             let resp = self
                 .http
-                .post(&self.token_endpoint)
-                .form(&params)
-                .send()
+                .post_form(&self.token_endpoint, &params)
                 .await
                 .map_err(|e| {
                     format!(
@@ -1092,7 +1091,10 @@ mod oidc_impl {
                 skip_expiry: false,
                 skip_issuer: false,
                 skip_nbf: false,
-                http: reqwest::Client::new(),
+                http: crate::http_client::HttpClientBuilder::new()
+                    .tls_skip_verify(true)
+                    .build()
+                    .expect("test HTTP client"),
                 seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }

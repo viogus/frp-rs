@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use http::HeaderMap;
+use http::HeaderValue;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -62,27 +64,44 @@ pub struct HttpPluginManager {
 
 struct PluginDef {
     cfg: HttpPluginConfig,
-    /// reqwest client honoring the plugin's TLS verify setting
+    /// HTTP client honoring the plugin's TLS verify setting
     /// (Go http.go: InsecureSkipVerify: !options.TLSVerify).
-    client: reqwest::Client,
+    client: frp_core::http_client::HttpClient,
 }
 
 impl HttpPluginManager {
     /// Create a new manager from plugin configs.
     pub fn new(configs: Vec<HttpPluginConfig>) -> Self {
         // Per-plugin timeout is enforced by tokio::time::timeout below.
-        // No reqwest-level timeout — the tokio wrapper covers connect + full
+        // No client-level timeout — the tokio wrapper covers connect + full
         // request lifecycle and respects per-plugin timeout config.
-        let client = reqwest::Client::builder().build().unwrap_or_default();
+        let client = frp_core::http_client::HttpClientBuilder::new()
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to build default HTTP plugin client: {e}");
+                // Build with skip-verify as last resort (matches old
+                // reqwest::Client::builder().build().unwrap_or_default()).
+                frp_core::http_client::HttpClientBuilder::new()
+                    .tls_skip_verify(true)
+                    .build()
+                    .expect("HTTP plugin client with skip-verify")
+            });
         let plugins = configs
             .into_iter()
             .map(|cfg| {
                 let client = if cfg.url.starts_with("https://") && !cfg.tls_verify {
                     // Go compat: tlsVerify=false → InsecureSkipVerify.
-                    reqwest::Client::builder()
-                        .danger_accept_invalid_certs(true)
+                    frp_core::http_client::HttpClientBuilder::new()
+                        .tls_skip_verify(true)
                         .build()
-                        .unwrap_or_else(|_| client.clone())
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                plugin_name = %cfg.name,
+                                error = %e,
+                                "Failed to build insecure HTTP plugin client, falling back to default"
+                            );
+                            client.clone()
+                        })
                 } else {
                     client.clone()
                 };
@@ -152,15 +171,19 @@ impl HttpPluginManager {
                 "{}?version={}&op={}",
                 plugin.cfg.url, PLUGIN_API_VERSION, go_op
             );
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "X-Frp-Reqid",
+                HeaderValue::from_str(&reqid)
+                    .map_err(|e| format!("invalid reqid header: {e}"))?,
+            );
+            headers.insert(
+                "Content-Type",
+                HeaderValue::from_static("application/json"),
+            );
             let result = tokio::time::timeout(
                 timeout,
-                plugin
-                    .client
-                    .post(&url)
-                    .header("X-Frp-Reqid", &reqid)
-                    .header("Content-Type", "application/json")
-                    .body(body)
-                    .send(),
+                plugin.client.post_with_headers(&url, headers, body),
             )
             .await;
 

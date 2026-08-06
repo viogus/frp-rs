@@ -32,7 +32,6 @@ tokio-util.workspace = true
 # dashboard WebSocket is fully supplanted by v2 REST polling (target: v0.8.0).
 axum = { workspace = true, optional = true, features = ["ws"] }
 prometheus = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
 rand.workspace = true
 rand010 = { package = "rand", version = "0.10", optional = true }  # NOTE: rand 0.10 required by russh 0.61 for SSH feature. Workspace uses rand 0.8. Track russh upstream migration to unified rand version.
 ring.workspace = true
@@ -47,7 +46,7 @@ quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
 oidc = ["frp-core/oidc"]
 tls = ["frp-core/tls", "dep:tokio-rustls"]
-http-proxy = ["dep:reqwest"]
+http-proxy = ["frp-core/http-client"]
 vnet = ["frp-core/vnet", "dep:frp-vnet"]
 compression = ["frp-core/compression"]
 chacha20 = ["frp-core/chacha20"]

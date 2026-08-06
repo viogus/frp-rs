@@ -10,6 +10,8 @@ pub mod cli;
 pub mod config;
 pub mod config_store;
 pub mod crypto;
+#[cfg(feature = "http-client")]
+pub mod http_client;
 pub mod encryption;
 pub mod feature_gate;
 pub mod internal_listener;

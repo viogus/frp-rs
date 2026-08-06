@@ -38,6 +38,12 @@ rustls-platform-verifier = "0.7"
 ring = "0.17"
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+hyper = { version = "1", default-features = false, features = ["http1", "client"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
+http-body-util = "0.1"
+webpki-roots = "0.26"
+rustls-pemfile = "2"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "tracing"] }
 prometheus = "0.14"
 yamux = "0.14"

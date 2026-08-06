@@ -38,7 +38,14 @@ quinn = { workspace = true, optional = true }
 
 socket2.workspace = true
 jsonwebtoken = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-rustls = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 rcgen = { version = "0.13", optional = true, default-features = false, features = ["ring"] }
 pprof = { workspace = true, optional = true }
@@ -56,12 +63,13 @@ chacha20 = ["dep:chacha20poly1305"]
 quic = ["dep:quinn", "tls"]
 kcp = []
 websocket = ["dep:tokio-tungstenite"]
-oidc = ["dep:jsonwebtoken", "dep:reqwest"]
+oidc = ["dep:jsonwebtoken", "http-client"]
 vnet = []
 mem-profile = []
 profiling = ["dep:pprof"]
 debug-logs = []
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+http-client = ["dep:hyper", "dep:hyper-rustls", "dep:hyper-util", "dep:http-body-util", "dep:webpki-roots", "dep:rustls-pemfile", "dep:rustls", "dep:bytes", "dep:http"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
