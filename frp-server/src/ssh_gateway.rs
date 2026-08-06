@@ -245,24 +245,18 @@ impl VirtualControl {
             use tokio::io::AsyncReadExt;
             use tokio::io::AsyncWriteExt;
 
-            const V1_HDR: usize = 9;
             let mut from_ssh = from_ssh;
 
             // ---- Phase 1: consume plaintext LoginResp from raw stream ----
-            // Use read_exact so NOTHING past LoginResp is consumed: the
-            // control handler may write an encrypted ReqWorkConn immediately
-            // after LoginResp (pool_count>0), and over-reading here would
-            // desync the CFB cipher state.
-            let mut header = [0u8; V1_HDR];
-            if from_ssh.read_exact(&mut header).await.is_err() {
-                return;
-            }
-            let plen = u64::from_be_bytes(header[1..V1_HDR].try_into().unwrap()) as usize;
-            if plen > 65536 {
-                return;
-            }
-            let mut payload = vec![0u8; plen];
-            if from_ssh.read_exact(&mut payload).await.is_err() {
+            // Uses the canonical V1 frame reader (frp_core::protocol), which
+            // reads the 9-byte header + payload with read_exact, so NOTHING
+            // past LoginResp is consumed: the control handler may write an
+            // encrypted ReqWorkConn immediately after LoginResp
+            // (pool_count>0), and over-reading here would desync the CFB
+            // cipher state. read_v1_frame applies the V1_MAX_MSG_LENGTH (10
+            // KiB) cap instead of the old ad-hoc 64 KiB allowance — LoginResp
+            // is tiny either way, and the canonical cap is the V1 spec.
+            if frp_core::protocol::read_v1_frame(&mut from_ssh).await.is_err() {
                 return;
             }
             // LoginResp consumed exactly; any further bytes stay in the stream
