@@ -234,7 +234,7 @@ pub(super) fn check_strict(
                 let mut best: Option<(&str, usize)> = None;
                 for known_key in known.iter() {
                     let d = levenshtein(key, known_key);
-                    if d <= 3 && (best.is_none() || d < best.unwrap().1) {
+                    if d <= 3 && (best.is_none() || d < best.expect("best set by an earlier iteration of this loop").1) {
                         best = Some((known_key, d));
                     }
                 }

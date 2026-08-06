@@ -325,7 +325,10 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             let mut meta_map = toml::Table::new();
             for key in &meta_keys {
                 if let Some(v) = table.remove(key) {
-                    let sub_key = key.strip_prefix("meta_").unwrap().to_string();
+                    let sub_key = key
+                        .strip_prefix("meta_")
+                        .expect("key starts_with meta_ — filtered into meta_keys above")
+                        .to_string();
                     meta_map.insert(sub_key, v);
                 }
             }
@@ -483,7 +486,10 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
             let mut meta_map = toml::Table::new();
             for key in &meta_keys {
                 if let Some(v) = table.remove(key) {
-                    let sub_key = key.strip_prefix("meta_").unwrap().to_string();
+                    let sub_key = key
+                        .strip_prefix("meta_")
+                        .expect("key starts_with meta_ — filtered into meta_keys above")
+                        .to_string();
                     meta_map.insert(sub_key, v);
                 }
             }

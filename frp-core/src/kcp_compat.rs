@@ -271,7 +271,9 @@ impl Fec {
             for (byte_idx, rec_byte) in reconstructed.iter_mut().enumerate() {
                 let mut sum = 0u8;
                 for (row, &pres_idx) in selected.iter().enumerate() {
-                    let val = shards[pres_idx].as_ref().unwrap()[byte_idx];
+                    let val = shards[pres_idx]
+                        .as_ref()
+                        .expect("pres_idx drawn only from present shards")[byte_idx];
                     sum ^= gf256::mul(inv_row[row], val);
                 }
                 *rec_byte = sum;

@@ -1658,7 +1658,10 @@ impl Service {
                             Ok(FrpMessage::NewProxyResp(resp)) => {
                                 let is_error = resp.error.as_ref().is_some_and(|e| !e.is_empty());
                                 if is_error {
-                                    let err = resp.error.as_ref().unwrap();
+                                    let err = resp
+                                        .error
+                                        .as_ref()
+                                        .expect("is_some_and guard above guarantees Some");
                                     warn!(proxy_name = %resp.proxy_name, error = %err, "Proxy '{}' registration error: {}", resp.proxy_name, err);
                                     // Update phase if proxy was being retried (WaitStart -> StartErr).
                                     let mut map = self.proxy_info_map.write().await;

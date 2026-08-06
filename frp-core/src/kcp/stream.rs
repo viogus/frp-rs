@@ -343,7 +343,10 @@ impl AsyncWrite for KcpStream {
         }
 
         // Poll the oneshot — properly registers the waker (no busy-spin).
-        let mut rx = self.flush_rx.take().unwrap();
+        let mut rx = self
+            .flush_rx
+            .take()
+            .expect("flush_rx set to Some just above");
         match Pin::new(&mut rx).poll(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(_)) => {

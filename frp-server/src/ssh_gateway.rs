@@ -993,7 +993,11 @@ async fn bridge_ssh_side(
     if ssh_side.read_exact(&mut header).await.is_err() {
         return;
     }
-    let len = u64::from_be_bytes(header[1..9].try_into().unwrap());
+    let len = u64::from_be_bytes(
+        header[1..9]
+            .try_into()
+            .expect("header is a fixed 9-byte array (V1_HEADER_LEN)"),
+    );
     if len <= frp_core::protocol::V1_MAX_MSG_LENGTH as u64 {
         let mut payload = vec![0u8; len as usize];
         if ssh_side.read_exact(&mut payload).await.is_err() {

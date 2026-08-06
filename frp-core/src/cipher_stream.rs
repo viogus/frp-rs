@@ -84,7 +84,11 @@ impl CfbState {
             if self.used == 0 && n - i >= 16 {
                 // u128 single-instruction XOR on little-endian (pxor/veor).
                 let state_u128 = u128::from_le_bytes(self.keystream);
-                let data_u128 = u128::from_le_bytes(data[i..i + 16].try_into().unwrap());
+                let data_u128 = u128::from_le_bytes(
+                    data[i..i + 16]
+                        .try_into()
+                        .expect("16-byte slice guaranteed by n - i >= 16 guard above"),
+                );
                 let result = (state_u128 ^ data_u128).to_le_bytes();
                 data[i..i + 16].copy_from_slice(&result);
                 self.feedback = result;
@@ -114,7 +118,9 @@ impl CfbState {
             }
             if self.used == 0 && n - i >= 16 {
                 // feedback = ciphertext (input), then plaintext = ct ^ keystream.
-                self.feedback = data[i..i + 16].try_into().unwrap();
+                self.feedback = data[i..i + 16]
+                    .try_into()
+                    .expect("16-byte slice guaranteed by n - i >= 16 guard above");
                 // u128 single-instruction XOR on little-endian (pxor/veor).
                 let state_u128 = u128::from_le_bytes(self.keystream);
                 let data_u128 = u128::from_le_bytes(self.feedback);
@@ -348,7 +354,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
             // Encrypt into reusable scratch buffer — avoids buf.to_vec() allocation.
             this.scratch.clear();
             this.scratch.extend_from_slice(buf);
-            this.cfb.as_mut().unwrap().encrypt(&mut this.scratch);
+            this.cfb
+                .as_mut()
+                .expect("cfb set to Some on first write above")
+                .encrypt(&mut this.scratch);
             let mut output = Vec::with_capacity(16 + this.scratch.len());
             output.extend_from_slice(&iv);
             output.extend_from_slice(&this.scratch);
@@ -382,7 +391,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
                     if this.encrypted_write_pos >= pending.len() {
                         let written = pending.len(); // CFB does not expand; == original buf.len()
                                                      // Return buffer to scratch to reuse allocation on next write.
-                        this.scratch = this.encrypted_buf.take().unwrap();
+                        this.scratch = this
+                            .encrypted_buf
+                            .take()
+                            .expect("encrypted_buf is Some — checked above");
                         this.scratch.clear();
                         this.encrypted_write_pos = 0;
                         return Poll::Ready(Ok(written));
@@ -453,7 +465,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
                         // Return buffer to scratch to reuse allocation.
-                        this.scratch = this.encrypted_buf.take().unwrap();
+                        this.scratch = this
+                            .encrypted_buf
+                            .take()
+                            .expect("encrypted_buf is Some — checked above");
                         this.scratch.clear();
                         this.encrypted_write_pos = 0;
                     } else {
@@ -730,7 +745,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
             // Encrypt into reusable scratch buffer — avoids buf.to_vec() allocation.
             this.scratch.clear();
             this.scratch.extend_from_slice(buf);
-            this.write_cfb.as_mut().unwrap().encrypt(&mut this.scratch);
+            this.write_cfb
+                .as_mut()
+                .expect("write_cfb set to Some on first write above")
+                .encrypt(&mut this.scratch);
             let mut output = Vec::with_capacity(16 + this.scratch.len());
             output.extend_from_slice(&this.write_iv);
             output.extend_from_slice(&this.scratch);
@@ -764,7 +782,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
                     if this.encrypted_write_pos >= pending.len() {
                         let written = pending.len(); // CFB does not expand; == original buf.len()
                                                      // Return buffer to scratch to reuse allocation on next write.
-                        this.scratch = this.encrypted_buf.take().unwrap();
+                        this.scratch = this
+                            .encrypted_buf
+                            .take()
+                            .expect("encrypted_buf is Some — checked above");
                         this.scratch.clear();
                         this.encrypted_write_pos = 0;
                         return Poll::Ready(Ok(written));
@@ -833,7 +854,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
                         // Return buffer to scratch to reuse allocation.
-                        this.scratch = this.encrypted_buf.take().unwrap();
+                        this.scratch = this
+                            .encrypted_buf
+                            .take()
+                            .expect("encrypted_buf is Some — checked above");
                         this.scratch.clear();
                         this.encrypted_write_pos = 0;
                     } else {

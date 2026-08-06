@@ -699,8 +699,10 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     Ok(mut p2p_stream) => {
                                         info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected", visitor_name);
                                         let use_enc = use_encryption && !sk.is_empty();
-                                        let (user_r, user_w) =
-                                            user_conn.take().unwrap().into_split();
+                                        let (user_r, user_w) = user_conn
+                                            .take()
+                                            .expect("user_conn set Some above, not yet consumed")
+                                            .into_split();
                                         let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
                                         if use_enc {
                                             let key = frp_core::encryption::derive_key(&sk);

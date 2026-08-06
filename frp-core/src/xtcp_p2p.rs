@@ -249,8 +249,8 @@ pub async fn punch_udp_hole(
     // crypto.Decode on the 3-byte magic (< 16-byte AES IV).
     let go_compat = sid.is_some() && key.is_some();
     if go_compat {
-        let sid_str = sid.unwrap();
-        let enc_key = key.unwrap();
+        let sid_str = sid.expect("go_compat above requires sid.is_some()");
+        let enc_key = key.expect("go_compat above requires key.is_some()");
         let detect_msg = NatHoleDetectSid::new(sid_str, false);
         let encoded = match encode_detect_msg(&detect_msg, enc_key) {
             Ok(e) => e,

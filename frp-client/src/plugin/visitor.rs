@@ -50,7 +50,9 @@ pub async fn start_visitor_plugin(
         debug!("visitor plugin: no-bind mode (bindPort = -1), skipping listener");
         let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         return Ok(PluginHandle {
-            local_addr: "0.0.0.0:0".parse().unwrap(),
+            local_addr: "0.0.0.0:0"
+                .parse()
+                .expect("constant literal socket addr always parses"),
             _task: tokio::spawn(std::future::ready(())),
             shutdown: Some(shutdown_tx),
         });

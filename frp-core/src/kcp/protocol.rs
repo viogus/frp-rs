@@ -360,14 +360,20 @@ impl<Output> Kcp<Output> {
         while !self.rcv_buf.is_empty() {
             let nrcv_que = self.rcv_queue.len();
             {
-                let seg = self.rcv_buf.front().unwrap();
+                let seg = self
+                    .rcv_buf
+                    .front()
+                    .expect("rcv_buf non-empty — while !is_empty() loop guard");
                 if seg.sn == self.rcv_nxt && nrcv_que < self.rcv_wnd as usize {
                     self.rcv_nxt += 1;
                 } else {
                     break;
                 }
             }
-            let seg = self.rcv_buf.pop_front().unwrap();
+            let seg = self
+                .rcv_buf
+                .pop_front()
+                .expect("rcv_buf non-empty — while !is_empty() loop guard");
             self.rcv_queue.push_back(seg);
         }
     }

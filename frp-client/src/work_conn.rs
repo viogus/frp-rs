@@ -118,7 +118,11 @@ impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
         if self.stream_buf.len() < 4 {
             return Ok(None);
         }
-        let len = u32::from_le_bytes(self.stream_buf[..4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(
+            self.stream_buf[..4]
+                .try_into()
+                .expect("stream_buf.len() >= 4 checked above"),
+        ) as usize;
         if len == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
