@@ -3637,9 +3637,13 @@ fn build_tls_connector_skip_verify_inner(
     } else {
         // No CA file: skip certificate verification (InsecureSkipVerify=true).
         // Matches Go frp's default — auto-generated self-signed certs.
+        // PRODUCTION WARNING: this means TLS connections are vulnerable to
+        // man-in-the-middle attacks. Any intermediate node can intercept
+        // and decrypt the control + data-plane traffic.
         tracing::warn!(
-            "TLS certificate verification disabled (InsecureSkipVerify=true). \
-             Set tls.ca_file in config to enable verification."
+            "TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
+             All traffic is vulnerable to MITM attacks. \
+             Set tls.ca_file (frpc: tls.trusted_ca_file) in config to enable verification."
         );
         let verifier = Arc::new(InsecureSkipVerify);
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {

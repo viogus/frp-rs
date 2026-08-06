@@ -621,7 +621,10 @@ impl Handler for SshSession {
             .await;
         });
 
-        *self.authenticated_run_id.lock().unwrap() = Some(self.run_id.clone());
+        *self
+            .authenticated_run_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(self.run_id.clone());
         tracing::info!(run_id = %self.run_id, "SSH session {} authenticated", self.run_id);
 
         // Spawn the work-connection bridge: ReqWorkConn signals open a
@@ -741,7 +744,10 @@ impl Handler for SshSession {
             address,
             port
         );
-        *self.reverse_forward.lock().unwrap() = Some((address.to_string(), *port));
+        *self
+            .reverse_forward
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((address.to_string(), *port));
         Ok(true)
     }
 
@@ -826,11 +832,19 @@ impl Handler for SshSession {
         // slower than the SSH client sends (Go net.Pipe is blocking too).
         // Clone the sender under the lock, then await the send outside it so
         // the future stays Send.
-        let tx = self.reverse_data_tx.lock().unwrap().get(&channel).cloned();
+        let tx = self
+            .reverse_data_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&channel)
+            .cloned();
         if let Some(tx) = tx {
             if tx.send(data.to_vec()).await.is_err() {
                 // Bridge task exited (channel closed) — drop the entry.
-                self.reverse_data_tx.lock().unwrap().remove(&channel);
+                self.reverse_data_tx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&channel);
             }
         }
         Ok(())
@@ -876,7 +890,11 @@ async fn handle_work_conn_requests(
     reverse_data_tx: Arc<std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>>,
 ) {
     while let Some(_req) = work_rx.recv().await {
-        let Some((addr, port)) = reverse_forward.lock().unwrap().clone() else {
+        let Some((addr, port)) = reverse_forward
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
             tracing::warn!(
                 run_id = %run_id,
                 "SSH work conn requested but no -R tcpip-forward registered; dropping"
@@ -908,7 +926,10 @@ async fn handle_work_conn_requests(
         // Register the data route (SSH client → bridge read half).
         // Bounded: backpressure via the SSH data callback above.
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
-        reverse_data_tx.lock().unwrap().insert(channel_id, data_tx);
+        reverse_data_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(channel_id, data_tx);
 
         // In-memory pipe: one end is the work conn, the other is bridged
         // with the SSH channel (Go virtual client net.Pipe).
@@ -921,7 +942,10 @@ async fn handle_work_conn_requests(
         let Some(tx) = ctl_tx else {
             tracing::warn!(run_id = %run_id, "SSH: control handler gone; dropping work conn");
             let _ = handle.close(channel_id).await;
-            reverse_data_tx.lock().unwrap().remove(&channel_id);
+            reverse_data_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&channel_id);
             continue;
         };
         let work_io = frp_core::transport::IoStream::SshChannel(Box::new(work_side));
@@ -932,7 +956,10 @@ async fn handle_work_conn_requests(
         {
             tracing::debug!(run_id = %run_id, "SSH: control gone while delivering work conn");
             let _ = handle.close(channel_id).await;
-            reverse_data_tx.lock().unwrap().remove(&channel_id);
+            reverse_data_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&channel_id);
             continue;
         }
 
@@ -941,7 +968,9 @@ async fn handle_work_conn_requests(
         tokio::spawn(async move {
             bridge_ssh_side(ssh_side, data_rx, handle2.clone(), channel_id).await;
             let _ = handle2.close(channel_id).await;
-            reg.lock().unwrap().remove(&channel_id);
+            reg.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&channel_id);
         });
     }
 
@@ -1117,7 +1146,7 @@ mod tests {
         assert!(session.run_id.is_empty());
         assert!(session.frame_tx.is_none());
         assert!(!session.authenticated);
-        assert!(run_id.lock().unwrap().is_none());
+        assert!(run_id.lock().unwrap_or_else(|e| e.into_inner()).is_none());
         assert!(!*auth_rx.borrow());
     }
 
@@ -1923,7 +1952,10 @@ impl SshListener {
                     }
                     Err(_) => {
                         tracing::warn!(peer_address = %peer_addr, "SSH handshake timed out");
-                        let run_id = authenticated_run_id.lock().unwrap().clone();
+                        let run_id = authenticated_run_id
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
                         if let Some(run_id) = run_id {
                             cleanup_session(&run_id, &state).await;
                         }
@@ -1961,7 +1993,7 @@ impl SshListener {
                                     &stream_closer,
                                     SSH_DISCONNECT_GRACE,
                                 ).await;
-                                let run_id = authenticated_run_id.lock().unwrap().clone();
+                                let run_id = authenticated_run_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 if let Some(run_id) = run_id {
                                     cleanup_session(&run_id, &state).await;
                                 }
@@ -1975,7 +2007,10 @@ impl SshListener {
                     Some(result) => result,
                     None => session_task.await,
                 };
-                let run_id = authenticated_run_id.lock().unwrap().clone();
+                let run_id = authenticated_run_id
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 match result {
                     Ok(Ok(())) => {
                         tracing::info!(run_id = ?run_id, "SSH session ended normally");

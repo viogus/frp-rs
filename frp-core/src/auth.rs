@@ -1280,38 +1280,6 @@ pub fn zeroize_string(s: &mut String) {
     s.clear();
 }
 
-/// Resolve a token that may use a URL scheme for dynamic sourcing.
-///
-/// **Prefer [`resolve_dynamic_token_checked`]** — it enforces the
-/// `UnsafeFeatures` allowlist for `exec://` and `file://` sources.
-///
-/// # Deprecated
-/// Use [`resolve_dynamic_token_checked`] instead to ensure `UnsafeFeatures`
-/// gating is enforced. This function silently allows both `exec://` and
-/// `file://` without checking the unsafe features allowlist.
-///
-/// Supported schemes:
-/// - `file:///absolute/path` — reads the first line of the file
-/// - `exec://command arg1 arg2` — runs the command, reads first line of stdout
-/// - plain string — returned as-is
-///
-/// Go frp compat: file:// and exec:// token sources.
-#[deprecated(
-    since = "0.7.0",
-    note = "Use resolve_dynamic_token_checked() which enforces the UnsafeFeatures allowlist for exec:// and file:// sources. This function silently allows both without checking."
-)]
-pub fn resolve_dynamic_token(token: &str) -> String {
-    // Prefer checked variant when available; for backward compat, None
-    // means legacy mode (no enforcement).
-    match resolve_dynamic_token_inner(token, None) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
-            String::new()
-        }
-    }
-}
-
 /// Resolve a dynamic token with `UnsafeFeatures` enforcement.
 ///
 /// When the token uses `exec://`, the `TokenSourceExec` feature
@@ -1885,37 +1853,47 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn test_resolve_dynamic_token_plain() {
-        assert_eq!(resolve_dynamic_token("my-token"), "my-token");
-        assert_eq!(resolve_dynamic_token(""), "");
+        let uf = crate::unsafe_features::UnsafeFeatures::default();
+        assert_eq!(
+            resolve_dynamic_token_checked("my-token", &uf).unwrap(),
+            "my-token"
+        );
+        assert_eq!(resolve_dynamic_token_checked("", &uf).unwrap(), "");
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_resolve_dynamic_token_file() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("frp-test-token-{}.txt", std::process::id()));
         std::fs::write(&path, "file-token-value\n").unwrap();
         let url = format!("file://{}", path.display());
-        assert_eq!(resolve_dynamic_token(&url), "file-token-value");
+        let uf = crate::unsafe_features::UnsafeFeatures::default();
+        assert_eq!(
+            resolve_dynamic_token_checked(&url, &uf).unwrap(),
+            "file-token-value"
+        );
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_resolve_dynamic_token_file_multiline() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("frp-test-token-multi-{}.txt", std::process::id()));
         std::fs::write(&path, "first-line\nsecond-line\n").unwrap();
         let url = format!("file://{}", path.display());
-        assert_eq!(resolve_dynamic_token(&url), "first-line");
+        let uf = crate::unsafe_features::UnsafeFeatures::default();
+        assert_eq!(
+            resolve_dynamic_token_checked(&url, &uf).unwrap(),
+            "first-line"
+        );
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_resolve_dynamic_token_file_missing() {
-        let result = resolve_dynamic_token("file:///nonexistent/path/token.txt");
-        assert!(result.is_empty());
+        let uf = crate::unsafe_features::UnsafeFeatures::default();
+        let result = resolve_dynamic_token_checked("file:///nonexistent/path/token.txt", &uf);
+        assert!(result.is_err());
     }
 
     #[test]

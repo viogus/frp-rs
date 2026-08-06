@@ -150,7 +150,7 @@ async fn verify_login_auth(
                         stream,
                         err_msg(
                             state.detailed_errors_to_client,
-                            format!("OIDC authentication failed: {e}"),
+                            "OIDC authentication failed".to_string(),
                             "OIDC authentication failed",
                         ),
                         v2,
@@ -167,7 +167,7 @@ async fn verify_login_auth(
                     stream,
                     err_msg(
                         state.detailed_errors_to_client,
-                        format!("OIDC authentication failed: {e}"),
+                        "OIDC authentication failed".to_string(),
                         "OIDC authentication failed",
                     ),
                     v2,
