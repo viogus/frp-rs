@@ -16,8 +16,6 @@ mod format;
 
 mod strict;
 
-#[cfg(test)]
-
 /// Load server configs from a directory, merging all `.toml` files.
 #[cfg(test)]
 mod tests;
