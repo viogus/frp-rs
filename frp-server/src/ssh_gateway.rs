@@ -552,10 +552,17 @@ impl Handler for SshSession {
     }
 
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
-        // Go compat (gateway.go:74): NoClientAuth when no authorized_keys
-        // file is configured. With an empty key list there is nothing to
-        // verify, so anonymous SSH is accepted like Go.
-        if self.authorized_keys.is_empty() {
+        // Reject auth_none unless both authorized_keys AND server_token are
+        // empty (no auth configured at all).  When a token is set the client
+        // must authenticate via password; when keys are set it must
+        // authenticate via publickey.  Accepting auth_none with a token
+        // configured would let any SSH client bypass authentication
+        // (OpenSSH always sends the "none" probe first).
+        //
+        // Go compat note: Go frp's gateway.go:74 does NoClientAuth when
+        // authorizedKeysFile is empty *and* no password auth is configured.
+        // Our equivalent: both fields empty.
+        if self.authorized_keys.is_empty() && self.server_token.is_empty() {
             Ok(Auth::Accept)
         } else {
             Ok(Auth::Reject {
@@ -1123,6 +1130,56 @@ mod tests {
         assert!(matches!(result, Auth::Accept));
         assert!(session.run_id.is_empty());
         assert!(session.frame_tx.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auth_none_rejected_when_token_is_set() {
+        // Regression: auth_none must NOT accept when server_token is
+        // configured even if authorized_keys is empty — otherwise any
+        // SSH client can bypass token auth (OpenSSH sends "none" first).
+        let (mut session, _auth_rx, _run_id) = pre_auth_session();
+        let result = session.auth_none("v0").await.unwrap();
+        assert!(matches!(result, Auth::Reject { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_auth_none_accepted_when_no_auth_configured() {
+        let (auth_tx, _auth_rx) = tokio::sync::watch::channel(false);
+        let run_id_arc = Arc::new(std::sync::Mutex::new(None));
+        let mut session = SshSession::new(
+            String::new(), // empty token
+            Vec::new(),    // empty authorized_keys
+            test_state(1),
+            "127.0.0.1:2200".parse().unwrap(),
+            auth_tx,
+            run_id_arc,
+            tokio::time::Instant::now() + SSH_AUTH_DEADLINE,
+        );
+        let result = session.auth_none("v0").await.unwrap();
+        assert!(matches!(result, Auth::Accept));
+    }
+
+    #[tokio::test]
+    async fn test_auth_none_rejected_when_only_keys_configured() {
+        // When authorized_keys is set but token is empty, auth_none must
+        // still reject — client must use pubkey auth, not anonymous.
+        let (auth_tx, _auth_rx) = tokio::sync::watch::channel(false);
+        let run_id_arc = Arc::new(std::sync::Mutex::new(None));
+        let key =
+            russh::keys::PrivateKey::random(&mut rand010::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let pubkey = key.public_key().clone();
+        let mut session = SshSession::new(
+            String::new(),
+            vec![pubkey],
+            test_state(1),
+            "127.0.0.1:2200".parse().unwrap(),
+            auth_tx,
+            run_id_arc,
+            tokio::time::Instant::now() + SSH_AUTH_DEADLINE,
+        );
+        let result = session.auth_none("v0").await.unwrap();
+        assert!(matches!(result, Auth::Reject { .. }));
     }
 
     #[test]
