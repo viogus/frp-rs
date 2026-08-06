@@ -1,7 +1,9 @@
 use std::path::Path;
 
+use super::file::process_includes;
+use super::format::{detect_format, parse_to_toml_value};
 use super::loader::ConfigPresence;
-use super::{detect_format, parse_to_toml_value, process_includes, run_strict_check};
+use super::run_strict_check;
 
 /// Convert a toml::Value to a serde_json::Value for deserialization.
 /// This is needed because toml::Value can't be directly deserialized into
