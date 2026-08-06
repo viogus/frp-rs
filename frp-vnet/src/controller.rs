@@ -615,10 +615,7 @@ mod tests {
         match msg {
             frp_core::msg::FrpMessage::VnetPacket(vpkt) => {
                 assert_eq!(vpkt.proxy_name, "v6-target");
-                assert_eq!(
-                    frp_core::base64::decode(&vpkt.data).unwrap(),
-                    packet
-                );
+                assert_eq!(frp_core::base64::decode(&vpkt.data).unwrap(), packet);
             }
             other => panic!("expected VnetPacket, got type {}", other.v1_type_byte()),
         }

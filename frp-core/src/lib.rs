@@ -2,8 +2,8 @@
 pub mod admin_auth;
 pub mod auth;
 pub mod backoff;
-pub mod base64;
 pub mod bandwidth;
+pub mod base64;
 pub mod bridge;
 pub mod buffer_pool;
 pub mod cipher_stream;
@@ -64,9 +64,7 @@ pub mod stun {
     ) -> Result<String, String> {
         Err("STUN feature not compiled".into())
     }
-    pub async fn stun_binding_with_socket(
-        _stun_addr: &str,
-    ) -> Result<(UdpSocket, String), String> {
+    pub async fn stun_binding_with_socket(_stun_addr: &str) -> Result<(UdpSocket, String), String> {
         Err("STUN feature not compiled".into())
     }
     pub async fn stun_binding_with_details(
@@ -74,7 +72,10 @@ pub mod stun {
     ) -> Result<(UdpSocket, StunResult), String> {
         Err("STUN feature not compiled".into())
     }
-    pub fn parse_binding_response(_data: &[u8], _expected_tx_id: &[u8; 12]) -> Result<String, String> {
+    pub fn parse_binding_response(
+        _data: &[u8],
+        _expected_tx_id: &[u8; 12],
+    ) -> Result<String, String> {
         Err("STUN feature not compiled".into())
     }
     pub fn parse_binding_response_full(

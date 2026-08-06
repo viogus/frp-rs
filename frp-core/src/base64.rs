@@ -11,8 +11,7 @@
 
 use std::fmt;
 
-const ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Decode failures for [`decode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,10 +27,9 @@ pub enum Base64Error {
 impl fmt::Display for Base64Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Base64Error::InvalidLength(len) => write!(
-                f,
-                "invalid base64 length: {len} (must be a multiple of 4)"
-            ),
+            Base64Error::InvalidLength(len) => {
+                write!(f, "invalid base64 length: {len} (must be a multiple of 4)")
+            }
             Base64Error::InvalidChar(pos) => {
                 write!(f, "invalid base64 character at byte {pos}")
             }
@@ -91,7 +89,7 @@ fn decode_char(c: u8, pos: usize) -> Result<u8, Base64Error> {
 /// [`encode`] and by Go's `base64.StdEncoding`).
 pub fn decode(input: &str) -> Result<Vec<u8>, Base64Error> {
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(Base64Error::InvalidLength(bytes.len()));
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -160,6 +158,6 @@ mod tests {
         assert_eq!(decode("a=d="), Err(Base64Error::InvalidChar(1)));
         assert!(decode("====").is_err());
         assert_eq!(decode("aGVsbG8=").unwrap(), b"hello");
-        assert_eq!(decode("aGVsbG8").is_err(), true); // wrong length
+        assert!(decode("aGVsbG8").is_err()); // wrong length
     }
 }

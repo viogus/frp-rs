@@ -255,7 +255,10 @@ impl VirtualControl {
             // cipher state. read_v1_frame applies the V1_MAX_MSG_LENGTH (10
             // KiB) cap instead of the old ad-hoc 64 KiB allowance — LoginResp
             // is tiny either way, and the canonical cap is the V1 spec.
-            if frp_core::protocol::read_v1_frame(&mut from_ssh).await.is_err() {
+            if frp_core::protocol::read_v1_frame(&mut from_ssh)
+                .await
+                .is_err()
+            {
                 return;
             }
             // LoginResp consumed exactly; any further bytes stay in the stream

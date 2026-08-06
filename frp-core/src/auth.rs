@@ -1367,7 +1367,9 @@ async fn exec_token_command_async(parts: &[&str]) -> std::io::Result<std::proces
 
 /// Synchronous fallback used when no multi-thread tokio runtime is available.
 fn exec_token_command_sync(parts: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(parts[0]).args(&parts[1..]).output()
+    std::process::Command::new(parts[0])
+        .args(&parts[1..])
+        .output()
 }
 
 /// Shared post-processing for both exec paths: check exit status, take the
