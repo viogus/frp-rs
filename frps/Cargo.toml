@@ -33,7 +33,7 @@ debug-logs = ["frp-core/debug-logs"]
 # - opentelemetry-otlp: OTLP/HTTP exporter — no alternative
 # - tracing-opentelemetry: bridge from tracing spans to OTel — no alternative
 # All optional; zero binary size impact when `otel` feature disabled.
-# Estimated binary size impact with otel: +2-3 MB (http-proto only, no tonic).
+# Measured binary size impact with otel: ~0.1 MB over dashboard-only (~8.3→8.4M).
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "frp-core/otel"]
 # Measurement-only counting global allocator. OFF in all shipped builds.
 mem-profile = ["frp-server/mem-profile"]
@@ -46,9 +46,9 @@ mimalloc = ["dep:mimalloc"]
 frp-core = { path = "../frp-core", default-features = false }
 frp-server = { path = "../frp-server", default-features = false }
 opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", optional = true, features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", optional = true, features = ["http-proto"] }
-tracing-opentelemetry = { version = "0.28", optional = true }
+opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", optional = true, default-features = false, features = ["http-proto"] }
+tracing-opentelemetry = { version = "0.28", optional = true, default-features = false }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

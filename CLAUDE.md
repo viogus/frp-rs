@@ -36,15 +36,15 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 ```bash
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~8.9MB), frpc (~8.0MB)
+# → frps (~7.7MB), frpc (~6.7MB)
 
 # Full (all features; dashboard is the only opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~9.7MB), frpc (~8.0MB)
+# → frps (~8.3MB), frpc (~6.7MB)
 
 # Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~5.4MB), frpc-tiny (~4.9MB)
+# → frps-tiny (~4.6MB), frpc-tiny (~4.4MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
@@ -57,7 +57,7 @@ Feature flags across crates:
 | `quic` | frp-core | QUIC transport (quinn) — **default ON** (was opt-in) |
 | `kcp` | frp-core | KCP transport (in-tree, kcp-go v5.6.13 aligned) |
 | `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
-| `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
+| `oidc` | frp-core | OIDC auth (jsonwebtoken, hyper) |
 | `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
 | `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
 | `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots) |
@@ -104,7 +104,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 804 passed, 0 failed |
-| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~8.9MB/frpc ~8.0MB default; ~9.7/8.0 full; frps-tiny ~5.4MB/frpc-tiny ~4.9MB; frps-micro ~3.5MB/frpc-micro ~3.3MB — measured 2026-08-05; the earlier ~5.1MB record was stale/inaccurate) |
+| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~7.7MB/frpc ~6.7MB default; ~8.3/6.7 full; frps-tiny ~4.6MB/frpc-tiny ~4.4MB; frps-micro ~3.5MB/frpc-micro ~3.3MB — measured 2026-08-06; reqwest→hyper + otel/prometheus default-features pruning) |
 | `compat-test.sh` (Go frp v0.70.1) | 72 run_test scenarios + 17 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 9 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |

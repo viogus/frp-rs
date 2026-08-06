@@ -50,9 +50,9 @@ chacha20poly1305 = { workspace = true, optional = true }
 rcgen = { version = "0.13", optional = true, default-features = false, features = ["ring"] }
 pprof = { workspace = true, optional = true }
 opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", optional = true, features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", optional = true, features = ["http-proto"] }
-tracing-opentelemetry = { version = "0.28", optional = true }
+opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", optional = true, default-features = false, features = ["http-proto"] }
+tracing-opentelemetry = { version = "0.28", optional = true, default-features = false }
 [features]
 default = ["kcp", "quic", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux"]
 tcp-mux = ["dep:yamux"]
