@@ -38,7 +38,7 @@ ring.workspace = true
 md-5.workspace = true
 
 [features]
-default = ["websocket", "kcp", "quic", "oidc", "tls", "http-proxy", "vnet", "compression", "chacha20", "tcp-mux", "ssh"]
+default = ["websocket", "kcp", "quic", "oidc", "tls", "http-proxy", "compression", "chacha20", "tcp-mux", "ssh"]
 ssh = ["dep:russh", "dep:rand010"]
 dashboard = ["dep:prometheus", "dep:axum", "frp-core/admin-auth"]
 websocket = ["dep:tokio-tungstenite", "frp-core/websocket"]
