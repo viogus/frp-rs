@@ -349,7 +349,7 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
         if let Some(key) = enc_key {
             let key = *key;
             let local_io = IoStream::Tcp(local);
-            frp_core::bridge::bridge_encrypted_io(
+            if let Err(e) = frp_core::bridge::bridge_encrypted_io(
                 local_io,
                 work,
                 &key,
@@ -360,7 +360,10 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
                 Some(proxy_metrics.clone()),
                 None,
             )
-            .await;
+            .await
+            {
+                debug!(name = %name, error = %e, "Proxy {} encrypted bridge could not split streams", name);
+            }
             debug!(name = %name, "Proxy {} encrypted bridge closed", name);
             return;
         }

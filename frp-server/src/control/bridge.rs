@@ -231,7 +231,13 @@ async fn run_udp_work_conn(
     // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
     // frames in flight without flush.
     let no_flush = matches!(work_conn, IoStream::Tcp(_));
-    let (w_r, mut w_w) = work_conn.into_split().unwrap();
+    let (w_r, mut w_w) = match split_work_conn_halves(work_conn) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            warn!("{msg}");
+            return;
+        }
+    };
     // Buffer the frame reads: read_msg_v1/v2 issue two read_exact calls per
     // packet (header + payload), so BufReader amortizes them into one
     // syscall per packet — and one syscall for several small packets. The
@@ -549,7 +555,7 @@ type BoxedWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
 /// `Tcp`/`Tls`/`Kcp`/`WS`/`Yamux`/`SshChannel`/empty-`PreRead`/consumed-
 /// `BufferedRead` (all split identically to the old code), so the reachable
 /// behavior is unchanged.
-fn split_work_conn_halves(
+pub(crate) fn split_work_conn_halves(
     work_conn: IoStream,
 ) -> Result<(BoxedReadHalf, BoxedWriteHalf), &'static str> {
     Ok(match work_conn {
@@ -589,10 +595,10 @@ fn split_work_conn_halves(
             let (r, w) = tokio::io::split(work);
             (Box::new(r), Box::new(w))
         }
-        IoStream::BufferedRead(_, _, inner) => {
-            let (r, w) = inner.into_split().unwrap();
-            (Box::new(r), Box::new(w))
-        }
+        IoStream::BufferedRead(_, _, inner) => match inner.into_split() {
+            Ok((r, w)) => (Box::new(r), Box::new(w)),
+            Err(_) => return Err("BufferedRead with unconsumed bytes in server bridge"),
+        },
         IoStream::Cipher(_) => return Err("Cipher stream unexpected in server bridge"),
         IoStream::Aead(_) => return Err("Aead stream unexpected in server bridge"),
         // Reachable when frp-core's quic feature is enabled through a
@@ -669,7 +675,13 @@ async fn run_work_bridge(
     // which writes them through the CipherWriter (matching Go frp streaming CFB).
     if use_enc {
         let key = encryption_key;
-        let (u_r, u_w) = req.user_conn.into_split().unwrap();
+        let (u_r, u_w) = match split_work_conn_halves(req.user_conn) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                warn!("{msg}");
+                return;
+            }
+        };
         // One boxed split for every IoStream variant — a single
         // monomorphization of bridge_encrypted instead of one per variant.
         let (w_r, w_w) = match split_work_conn_halves(work_conn) {
@@ -752,8 +764,20 @@ async fn run_work_bridge(
             }
         } else if read_lim.is_some() || write_lim.is_some() {
             // Bandwidth limiting active: use rate-limited plain bridge.
-            let (u_r, u_w) = req.user_conn.into_split().unwrap();
-            let (w_r, w_w) = work_conn.into_split().unwrap();
+            let (u_r, u_w) = match split_work_conn_halves(req.user_conn) {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    warn!("{msg}");
+                    return;
+                }
+            };
+            let (w_r, w_w) = match split_work_conn_halves(work_conn) {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    warn!("{msg}");
+                    return;
+                }
+            };
             if let Some(headers) = injector_headers {
                 let injector = ResponseHeaderInjector::new(w_r, headers);
                 frp_core::bridge::bridge_plain_rate_limited(
@@ -791,8 +815,20 @@ async fn run_work_bridge(
             relay_plain_fast(req.user_conn, work_conn, &metrics).await;
         } else {
             // Slow path: compression, VHost pre-read, or header injection.
-            let (u_r, u_w) = req.user_conn.into_split().unwrap();
-            let (w_r, w_w) = work_conn.into_split().unwrap();
+            let (u_r, u_w) = match split_work_conn_halves(req.user_conn) {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    warn!("{msg}");
+                    return;
+                }
+            };
+            let (w_r, w_w) = match split_work_conn_halves(work_conn) {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    warn!("{msg}");
+                    return;
+                }
+            };
             if let Some(headers) = injector_headers {
                 let injector = ResponseHeaderInjector::new(w_r, headers);
                 frp_core::bridge::bridge_plain(

@@ -9,6 +9,7 @@ use frp_core::protocol::write_msg;
 use frp_core::transport::IoStream;
 
 use crate::control;
+use crate::control::bridge::split_work_conn_halves;
 use crate::lock::RwLockExt;
 use crate::nathole::controller as nathole_ctrl;
 use crate::nathole::{classify, NAT_HOLE_TIMEOUT};
@@ -270,7 +271,10 @@ pub(crate) async fn handle_nat_hole_visitor(
         Some(info) => info,
         None => {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' not found", proxy_name);
-            let mut writer = stream.into_split().unwrap().1;
+            let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+                return;
+            };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("proxy not found".into()),
@@ -287,7 +291,10 @@ pub(crate) async fn handle_nat_hole_visitor(
         Some(id) => id,
         None => {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: no run_id found for proxy '{}'", proxy_name);
-            let mut writer = stream.into_split().unwrap().1;
+            let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+                return;
+            };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider offline".into()),
@@ -307,7 +314,10 @@ pub(crate) async fn handle_nat_hole_visitor(
         Some(ctl) => ctl,
         None => {
             warn!(run_id = %run_id, "No provider control handler for run_id {}", run_id);
-            let mut writer = stream.into_split().unwrap().1;
+            let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+                return;
+            };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider disconnected".into()),
@@ -334,7 +344,10 @@ pub(crate) async fn handle_nat_hole_visitor(
                 "NatHoleVisitor pre_check for proxy '{}': denied (fresh-TCP identity '' does not match owner/allow_users)",
                 proxy_name
             );
-            let (_, mut writer) = stream.into_split().unwrap();
+            let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+                return;
+            };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("access denied: restricted to authenticated users".into()),
@@ -348,7 +361,10 @@ pub(crate) async fn handle_nat_hole_visitor(
             "NatHoleVisitor pre_check for proxy '{}': OK",
             proxy_name
         );
-        let (_, mut writer) = stream.into_split().unwrap();
+        let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+            return;
+        };
         let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),
             error: None,
@@ -373,7 +389,10 @@ pub(crate) async fn handle_nat_hole_visitor(
         // replay attacks.
         if sign_key.is_empty() {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key, rejecting");
-            let mut writer = stream.into_split().unwrap().1;
+            let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+                return;
+            };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("auth required".into()),
@@ -388,7 +407,10 @@ pub(crate) async fn handle_nat_hole_visitor(
             // XTCP proxy without a shared secret: no way to authenticate
             // visitors on fresh connections. Reject.
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has no sk configured — rejecting fresh connection");
-            let mut writer = stream.into_split().unwrap().1;
+            let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+                return;
+            };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("proxy has no shared secret".into()),
@@ -404,7 +426,10 @@ pub(crate) async fn handle_nat_hole_visitor(
             frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
         {
             warn!(proxy_name = %proxy_name, error = %freshness_err, "NatHoleVisitor: timestamp rejected for proxy '{}'", proxy_name);
-            let mut writer = stream.into_split().unwrap().1;
+            let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+                return;
+            };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some(freshness_err),
@@ -416,7 +441,10 @@ pub(crate) async fn handle_nat_hole_visitor(
 
         if !frp_core::auth::verify_token(proxy_sk, timestamp, sign_key) {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed for proxy '{}'", proxy_name);
-            let mut writer = stream.into_split().unwrap().1;
+            let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+                return;
+            };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("auth failed".into()),
@@ -434,7 +462,10 @@ pub(crate) async fn handle_nat_hole_visitor(
         // channel path (control/mod.rs NatHoleVisitor handler).
         if !visitor_user_allowed("", &proxy_info.user, &proxy_info.allow_users) {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: fresh connection identity '' denied for proxy '{}'", proxy_name);
-            let mut writer = stream.into_split().unwrap().1;
+            let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+                return;
+            };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("access denied: use control channel for user-based auth".into()),
@@ -445,14 +476,17 @@ pub(crate) async fn handle_nat_hole_visitor(
         }
     }
 
-    let (reader, writer) = stream.into_split().unwrap();
+    let Ok((reader, writer)) = split_work_conn_halves(stream) else {
+        warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
+        return;
+    };
     let sid = transaction_id.clone();
 
     // --- Step 1: Create session and notify provider ---
     let (session, report_rx) = match state
         .xtcp
         .nat_hole
-        .create_session_with_writer(sid.clone(), proxy_name.clone(), msg.clone(), writer.into())
+        .create_session_with_writer(sid.clone(), proxy_name.clone(), msg.clone(), writer)
         .await
     {
         Ok(s) => s,

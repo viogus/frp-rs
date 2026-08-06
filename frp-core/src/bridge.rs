@@ -429,10 +429,10 @@ pub async fn bridge_encrypted_io(
     write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     header_timeout: Option<Duration>,
-) {
+) -> std::io::Result<()> {
     tracing::debug!(use_compression, "bridge_encrypted_io: starting");
-    let (u_r, u_w) = user.into_split().unwrap();
-    let (w_r, w_w) = work.into_split().unwrap();
+    let (u_r, u_w) = user.into_split()?;
+    let (w_r, w_w) = work.into_split()?;
     bridge_encrypted(
         u_r,
         u_w,
@@ -447,6 +447,7 @@ pub async fn bridge_encrypted_io(
         header_timeout,
     )
     .await;
+    Ok(())
 }
 
 /// Bridge data between user and work connections over an encrypted+compressed channel.
