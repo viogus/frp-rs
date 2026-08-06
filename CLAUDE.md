@@ -109,6 +109,7 @@ Every feature, fix, and test change follows three rules:
 | `unsafe` blocks | 9 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
+| `data-encoding` crate | removed — inline `frp_core::base64` (encode/decode, standard alphabet) + existing `hex_encode` for the one HEXLOWER log site |
 | `let _ =` error discards | all commented (`vhost.rs`, `tcpmux.rs`) |
 | `exec://` token source | always blocked by `UnsafeFeatures::default()` |
 | Security audit | `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` + `cargo deny check` before release |
@@ -281,7 +282,7 @@ Known areas lacking e2e cross-compat test coverage:
 **No new dependencies without explicit justification.** Every new crate added to the workspace must have a documented reason covering:
 
 1. **Why it's needed** — what problem it solves that existing deps cannot
-2. **Why the alternative was rejected** — why an existing dep can't be used (e.g., ring for crypto, data_encoding for encoding)
+2. **Why the alternative was rejected** — why an existing dep can't be used (e.g., ring for crypto, `frp_core::base64`/`hex_encode` for encoding)
 3. **Binary size impact** — approximate cost to frps/frpc release binary
 
 Pre-approved tech stack. Use these unless strong reason to deviate:
@@ -299,7 +300,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | HTTP client | `reqwest` | rustls-tls only (no json, no socks features) |
 | HTTP server | `axum` | dashboard, admin auth |
 | WebSocket | `tokio-tungstenite` | |
-| Encoding | `data_encoding` | BASE64 |
+| Encoding | inline `frp_core::base64` (encode/decode) + `frp_core::hex_encode` | standard base64 alphabet + `=` padding, wire-compatible with Go `base64.StdEncoding` |
 | Compression | `snap` | Snappy, pure Rust |
 | QUIC | `quinn` | |
 | TcpMux | `yamux` | |
@@ -312,7 +313,8 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 **Removed and banned** (do not reintroduce without approval):
 - `aws-lc-sys` / `aws-lc-rs` — replaced by ring (russh default → ring feature)
 - `hmac` — dead dependency, ring covers HMAC
-- `base64` — replaced by data_encoding
+- `base64` — replaced by inline `frp_core::base64`
+- `data-encoding` — replaced by inline `frp_core::base64` (2026-08-06; was ~47KB .text in frps)
 - `sha2` — replaced by ring
 - `aes-gcm` — replaced by ring (AES-256-GCM)
 - `hkdf` — replaced by ring (HKDF-SHA256)
