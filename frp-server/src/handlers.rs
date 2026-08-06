@@ -2485,6 +2485,10 @@ pub(crate) fn is_v2_magic(buf: &[u8]) -> bool {
     buf.len() >= 7 && buf[..7] == frp_core::protocol::V2_MAGIC_BYTES
 }
 
+/// Check if a byte could be a V1 protocol type byte.
+/// All V1 type bytes are ASCII alphanumeric (e.g., 'o'=Login, '1'=LoginResp,
+/// 'w'=NewWorkConn, 'h'=Ping). Used to distinguish raw V1 data from yamux
+/// headers (which start with 0x00).
 #[inline]
 #[allow(dead_code)] // only used in TLS/WS/KCP accept paths, not in every feature set
 pub(crate) fn is_v1_type_byte(b: u8) -> bool {
@@ -2498,14 +2502,12 @@ pub(crate) const QUIC_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const QUIC_PREAUTH_STREAM_LIMIT: usize = 32;
 
 #[cfg(feature = "quic")]
-pub(crate) fn new_quic_preauth_stream_limiter() -> Arc<tokio::sync::Semaphore> {
+fn new_quic_preauth_stream_limiter() -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(QUIC_PREAUTH_STREAM_LIMIT))
 }
 
 #[cfg(feature = "quic")]
-pub(crate) fn new_quic_authenticated_stream_limiter(
-    configured: usize,
-) -> Arc<tokio::sync::Semaphore> {
+fn new_quic_authenticated_stream_limiter(configured: usize) -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(configured.max(1)))
 }
 
@@ -2870,5 +2872,165 @@ mod visitor_admission_tests {
         assert!(visitor_user_allowed("", "", &["*".to_string()]));
         assert!(!visitor_user_allowed("", "", &["alice".to_string()]));
         assert!(!visitor_user_allowed("", "owner", &[]));
+    }
+}
+
+#[cfg(all(test, feature = "quic"))]
+mod quic_admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn simulated_silent_first_frame(
+        limiter: Arc<tokio::sync::Semaphore>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    ) {
+        let _permit = limiter.acquire_owned().await.unwrap();
+        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+        max_active.fetch_max(now, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
+        active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_silent_streams_are_bounded_and_timeout_releases_permits() {
+        let limit = 4;
+        let limiter = Arc::new(tokio::sync::Semaphore::new(limit));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..64 {
+            tasks.spawn(simulated_silent_first_frame(
+                limiter.clone(),
+                active.clone(),
+                max_active.clone(),
+            ));
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(max_active.load(Ordering::SeqCst), limit);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.available_permits(), limit);
+    }
+
+    #[tokio::test]
+    async fn drain_preauth_limiter_bounds_concurrent_first_frame_waits() {
+        // Mirrors the drain loop: the stream is already accepted, then the
+        // preauth permit is acquired before the first-frame read. The
+        // limiter must cap concurrent waits at QUIC_PREAUTH_STREAM_LIMIT.
+        let limiter = new_quic_preauth_stream_limiter();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..(QUIC_PREAUTH_STREAM_LIMIT * 4) {
+            let limiter = limiter.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            tasks.spawn(async move {
+                let _permit = limiter.acquire_owned().await.unwrap();
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(max_active.load(Ordering::SeqCst), QUIC_PREAUTH_STREAM_LIMIT);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.available_permits(), QUIC_PREAUTH_STREAM_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn preauth_stream_admission_uses_small_safety_cap() {
+        let limiter = new_quic_preauth_stream_limiter();
+        let mut permits = Vec::new();
+        for _ in 0..QUIC_PREAUTH_STREAM_LIMIT {
+            permits.push(limiter.clone().try_acquire_owned().unwrap());
+        }
+        assert!(limiter.clone().try_acquire_owned().is_err());
+        drop(permits.pop());
+        assert!(limiter.clone().try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn authenticated_stream_admission_preserves_configured_boundary_above_256() {
+        let configured = 1_024usize;
+        let limiter = new_quic_authenticated_stream_limiter(configured);
+        let mut permits = Vec::new();
+        for _ in 0..configured {
+            permits.push(limiter.clone().try_acquire_owned().unwrap());
+        }
+        assert!(limiter.clone().try_acquire_owned().is_err());
+        drop(permits.pop());
+        assert!(limiter.clone().try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_control_accept_obeys_absolute_preauth_deadline() {
+        let cancel = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let result = await_quic_preauth(std::future::pending::<()>(), deadline, &cancel).await;
+        assert!(matches!(result, Err(QuicPreauthError::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn real_quic_connection_without_first_stream_times_out() {
+        let tls = frp_core::transport::generate_self_signed_tls_config().unwrap();
+        let listener = frp_core::quic::QuicListener::new_with_tls_config(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            frp_core::quic::QuicTransportParams::default(),
+        )
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            frp_core::quic::dial_quic_connection_with_params(
+                &address.to_string(),
+                "localhost",
+                None,
+                None,
+                None,
+                frp_core::quic::QuicTransportParams::default(),
+                None,
+            )
+            .await
+            .unwrap()
+        });
+        let server = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("server should complete QUIC handshake")
+            .unwrap();
+        let _client = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("client should complete QUIC handshake")
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        let result = await_quic_preauth(server.accept_bi(), deadline, &cancel).await;
+        assert!(matches!(result, Err(QuicPreauthError::TimedOut)));
+        server.close(b"test timeout");
+    }
+
+    #[tokio::test]
+    async fn cancelling_stream_tasks_reclaims_all_admission_permits() {
+        let limit = 8;
+        let limiter = Arc::new(tokio::sync::Semaphore::new(limit));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..limit {
+            let permit = limiter.clone().acquire_owned().await.unwrap();
+            tasks.spawn(async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            });
+        }
+        assert_eq!(limiter.available_permits(), 0);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(limiter.available_permits(), limit);
     }
 }
