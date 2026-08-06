@@ -318,7 +318,11 @@ async fn handle_visitor_conn(
     let (mut u_r, mut u_w) = tokio::io::split(user_conn);
     let (mut s_r, mut s_w) = match frp_core::transport::split_work_conn_halves(server_stream) {
         Ok(pair) => pair,
-        Err(e) => return Err(format!("visitor plugin: could not split server stream: {e}")),
+        Err(e) => {
+            return Err(format!(
+                "visitor plugin: could not split server stream: {e}"
+            ))
+        }
     };
 
     let a = tokio::spawn(async move {

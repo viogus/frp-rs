@@ -1722,9 +1722,14 @@ impl IoStream {
 /// `Tcp`/`Tls`/`Kcp`/`WS`/`Yamux`/`SshChannel`/empty-`PreRead`/consumed-
 /// `BufferedRead` (all split identically to the old code), so the reachable
 /// behavior is unchanged.
+/// Type-erased read half of a bridged connection.
+pub type BoxedReadHalf = Box<dyn AsyncRead + Unpin + Send>;
+/// Type-erased write half of a bridged connection.
+pub type BoxedWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
+
 pub fn split_work_conn_halves(
     work_conn: IoStream,
-) -> Result<(Box<dyn AsyncRead + Unpin + Send>, Box<dyn AsyncWrite + Unpin + Send>), &'static str> {
+) -> Result<(BoxedReadHalf, BoxedWriteHalf), &'static str> {
     Ok(match work_conn {
         IoStream::Tcp(work) => {
             let (r, w) = tokio::io::split(work);
