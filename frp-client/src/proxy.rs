@@ -10,7 +10,7 @@ use frp_core::bandwidth::BandwidthLimiter;
 use frp_core::bridge;
 use frp_core::metrics::{ConnGuard, ProxyMetricsRegistry};
 use frp_core::msg::{self, FrpMessage};
-use frp_core::transport::IoStream;
+use frp_core::transport::{split_work_conn_halves, IoStream};
 
 use crate::util::opt_if_empty;
 
@@ -374,7 +374,13 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
     // is active, otherwise use the fast copy_bidirectional path.
     if use_compression || read_lim.is_some() || write_lim.is_some() {
         let (l_r, l_w) = tokio::io::split(local);
-        let (w_r, w_w) = work.into_split().unwrap();
+        let (w_r, w_w) = match split_work_conn_halves(work) {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(name = %name, error = e, "Proxy {} bridge could not split work conn: {}", name, e);
+                return;
+            }
+        };
         bridge::bridge_plain_rate_limited(
             l_r,
             l_w,

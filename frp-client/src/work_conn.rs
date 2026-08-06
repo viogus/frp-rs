@@ -19,7 +19,7 @@ use frp_core::mux::YamuxSession;
 use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
-use frp_core::transport::{dial_server, DialOptions, IoStream};
+use frp_core::transport::{dial_server, split_work_conn_halves, DialOptions, IoStream};
 
 use crate::proxy;
 use crate::proxy_runtime::ProxyRuntimeInfo;
@@ -376,7 +376,13 @@ async fn run_udp_work_conn(
     udp_packet_size: usize,
     proxy_protocol_version: String,
 ) {
-    let (w_r, mut w_w) = work.into_split().unwrap();
+    let (w_r, mut w_w) = match split_work_conn_halves(work) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(proxy_name = %proxy_name, error = e, "UDP work conn '{}' could not be split: {}", proxy_name, e);
+            return;
+        }
+    };
     // Buffer the frame reads: read_msg_v1/v2 issue two read_exact calls per
     // packet (header + payload), so BufReader amortizes them into one
     // syscall per packet — and one syscall for several small packets. The

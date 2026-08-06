@@ -11,7 +11,7 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
 #[cfg(feature = "vnet")]
 use frp_core::transport::IoStream;
-use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
+use frp_core::transport::{dial_server, split_work_conn_halves, DialOptions, TransportProtocol};
 
 #[cfg(feature = "vnet")]
 type VnetTunTxMap = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
@@ -835,7 +835,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 
                         let user = user_conn;
                         let (user_r, user_w) = user.into_split();
-                        let (srv_r, srv_w) = server_conn.into_split().unwrap();
+                        let (srv_r, srv_w) = match split_work_conn_halves(server_conn) {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                warn!(visitor_name = %visitor_name, error = e, "Visitor '{}': STCP relay could not split server conn: {}", visitor_name, e);
+                                return;
+                            }
+                        };
                         let use_enc_relay = use_encryption && !sk.is_empty();
                         if use_enc_relay {
                             let key = frp_core::encryption::derive_key(&sk);
@@ -948,7 +954,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 
                         let user = user_conn;
                         let (user_r, user_w) = user.into_split();
-                        let (srv_r, srv_w) = server_conn.into_split().unwrap();
+                        let (srv_r, srv_w) = match split_work_conn_halves(server_conn) {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                warn!(visitor_name = %visitor_name, error = e, "Visitor '{}': STCP relay could not split server conn: {}", visitor_name, e);
+                                return;
+                            }
+                        };
                         let use_enc_relay = use_encryption && !sk.is_empty();
                         if use_enc_relay {
                             let key = frp_core::encryption::derive_key(&sk);
