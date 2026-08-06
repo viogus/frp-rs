@@ -4,7 +4,7 @@ use super::client::ClientConfig;
 use super::loader::{validate_client_config, validate_server_config};
 use super::normalize::{load_config_from_file, normalize_client_config, normalize_server_config};
 use super::server::ServerConfig;
-use super::{known_client_keys, known_server_keys};
+use super::strict::{known_client_keys, known_server_keys};
 
 /// Load a server configuration from a file path, auto-detecting format by extension.
 /// When `strict_config` is true, unknown fields cause an error (Go frp default).
