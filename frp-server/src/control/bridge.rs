@@ -295,6 +295,11 @@ async fn run_udp_work_conn(
     let writer = async move {
         debug!(proxy_name = %writer_name, "UDP work conn writer task started for '{}'", writer_name);
         let mut buf = vec![0u8; udp_packet_size];
+        // local_addr is loop-invariant (comes from proxy config). Move the
+        // owned value into each packet and back out afterwards, so the
+        // Option<UdpAddr> String heap allocs happen once per bridge instead
+        // of once per packet. Single-task writer: no concurrency risk.
+        let mut local_addr = local_addr;
         loop {
             let received = tokio::select! {
                 biased;
@@ -313,7 +318,7 @@ async fn run_udp_work_conn(
                     // gain nothing here).
                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
                         content: buf[..n].to_vec(),
-                        local_addr: local_addr.clone(),
+                        local_addr: local_addr.take(),
                         remote_addr: Some(msg::UdpAddr {
                             ip: src.ip().to_string(),
                             port: src.port(),
@@ -329,6 +334,11 @@ async fn run_udp_work_conn(
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
+                    // Return the invariant value to the local for the next
+                    // packet before checking the write result.
+                    if let FrpMessage::UDPPacket(p) = pkt {
+                        local_addr = p.local_addr;
+                    }
                     if let Err(e) = result {
                         debug!(proxy_name = %writer_name, error = %e,
                             "UDP work conn write failed for '{}': {}", writer_name, e);
