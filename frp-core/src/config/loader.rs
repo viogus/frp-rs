@@ -1,6 +1,6 @@
 use super::client::{AuthClientConfig, ClientConfig, ProxyConfig, VisitorConfig};
+use super::normalize::{normalize_client_config, normalize_server_config, toml_to_json};
 use super::server::{PortsRange, ServerConfig, ValueSource};
-use super::{normalize_client_config, normalize_server_config, toml_to_json};
 use crate::feature_gate::VIRTUAL_NET;
 
 /// Parse a bandwidth limit string like "1MB", "500KB", "100KB".
