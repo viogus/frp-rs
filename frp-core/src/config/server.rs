@@ -738,7 +738,6 @@ impl Default for ServerTransportConfig {
     }
 }
 
-
 pub(super) fn default_heartbeat_timeout() -> i64 {
     90
 }
