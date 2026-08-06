@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 
-use data_encoding::BASE64;
+use frp_core::base64::encode as b64_encode;
 
 use crate::router::RouteTable;
 use crate::tun::TunDevice;
@@ -131,7 +131,7 @@ impl VnetController {
                         if let Some(target) = target {
                             let vnet_pkt = frp_core::msg::VnetPacket {
                                 proxy_name: target,
-                                data: BASE64.encode(packet),
+                                data: b64_encode(packet),
                             };
                             let msg = frp_core::msg::FrpMessage::VnetPacket(vnet_pkt);
                             let mut writer = ctl_writer.lock().await;
@@ -230,7 +230,10 @@ impl ClientVnetController {
     /// Remove a `virtual_net` visitor route and its delivery channel.
     pub async fn unregister_visitor_route(&self, name: &str) {
         self.routes.write().await.remove("", name);
-        self.visitor_txs.lock().unwrap().remove(name);
+        self.visitor_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
         tracing::info!(visitor_name = %name, "virtual_net visitor route removed");
     }
 
@@ -241,7 +244,7 @@ impl ClientVnetController {
     /// when no visitor is registered for `name` or its channel is closed — the
     /// caller then handles the packet itself (e.g. via a TUN delivery channel).
     pub fn deliver_visitor_packet(&self, name: &str, packet: Vec<u8>) -> Result<(), Vec<u8>> {
-        let mut txs = self.visitor_txs.lock().unwrap();
+        let mut txs = self.visitor_txs.lock().unwrap_or_else(|e| e.into_inner());
         let Some(tx) = txs.get(name) else {
             return Err(packet);
         };
@@ -267,13 +270,19 @@ impl ClientVnetController {
     /// IP equals `src_ip` (the remote host's source IP learned from the
     /// tunnel). Mirrors Go frp `serverRouter.registerSrcIP`.
     pub fn register_server_conn(&self, src_ip: IpAddr, packet_tx: mpsc::Sender<Vec<u8>>) {
-        self.server_conns.lock().unwrap().insert(src_ip, packet_tx);
+        self.server_conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(src_ip, packet_tx);
         tracing::debug!(%src_ip, "vnet server conn registered");
     }
 
     /// Remove a provider-side work connection mapping.
     pub fn unregister_server_conn(&self, src_ip: &IpAddr) {
-        self.server_conns.lock().unwrap().remove(src_ip);
+        self.server_conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(src_ip);
         tracing::debug!(%src_ip, "vnet server conn unregistered");
     }
 
@@ -284,7 +293,7 @@ impl ClientVnetController {
         src_ip: &IpAddr,
         packet_tx: &mpsc::Sender<Vec<u8>>,
     ) {
-        let mut conns = self.server_conns.lock().unwrap();
+        let mut conns = self.server_conns.lock().unwrap_or_else(|e| e.into_inner());
         if conns
             .get(src_ip)
             .is_some_and(|tx| tx.same_channel(packet_tx))
@@ -295,7 +304,11 @@ impl ClientVnetController {
 
     /// Return the work-conn channel registered for `dst_ip`, if any.
     pub fn server_conn_sender(&self, dst_ip: &IpAddr) -> Option<mpsc::Sender<Vec<u8>>> {
-        self.server_conns.lock().unwrap().get(dst_ip).cloned()
+        self.server_conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(dst_ip)
+            .cloned()
     }
 
     /// IPv4-only convenience wrapper for [`Self::register_server_conn`].
@@ -615,10 +628,7 @@ mod tests {
         match msg {
             frp_core::msg::FrpMessage::VnetPacket(vpkt) => {
                 assert_eq!(vpkt.proxy_name, "v6-target");
-                assert_eq!(
-                    data_encoding::BASE64.decode(vpkt.data.as_bytes()).unwrap(),
-                    packet
-                );
+                assert_eq!(frp_core::base64::decode(&vpkt.data).unwrap(), packet);
             }
             other => panic!("expected VnetPacket, got type {}", other.v1_type_byte()),
         }

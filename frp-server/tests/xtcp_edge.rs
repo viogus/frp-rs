@@ -39,13 +39,9 @@ fn xtcp_proxy(name: &str, sk: &str, local_str: &str) -> NewProxy {
         multiplexer: None,
         virtual_net: None,
         proxy_protocol_version: None,
-        #[cfg(feature = "vnet")]
         advertise_subnet: None,
-        #[cfg(feature = "vnet")]
         vnet_ip: None,
-        #[cfg(feature = "vnet")]
         vnet_netmask: None,
-        #[cfg(feature = "vnet")]
         vnet_mtu: None,
     }
 }

@@ -265,152 +265,6 @@ async fn verify_login_auth(
     Ok((oidc_subject, stream))
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod auth_signal_tests {
-    use std::io;
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll};
-
-    use tokio::io::AsyncWrite;
-
-    use super::flush_login_response_and_signal;
-
-    fn test_state() -> Arc<crate::state::AppState> {
-        let cfg = frp_core::config::ServerConfig::default();
-        Arc::new(crate::state::AppState::new(
-            frp_core::auth::AuthConfig::with_token("expected-token"),
-            "127.0.0.1".into(),
-            frp_core::encryption::derive_key("expected-token"),
-            vec![frp_core::config::PortsRange {
-                start: 1,
-                end: u16::MAX,
-                single: 0,
-            }],
-            String::new(),
-            true,
-            30,
-            7200,
-            90,
-            1500,
-            false,
-            None,
-            0,
-            60,
-            10,
-            false,
-            String::new(),
-            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
-            0,
-            168,
-            true,
-            0,
-            0,
-            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
-        ))
-    }
-
-    struct FlushWriter {
-        fail_flush: bool,
-    }
-
-    impl AsyncWrite for FlushWriter {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            if self.fail_flush {
-                Poll::Ready(Err(io::Error::other("injected flush failure")))
-            } else {
-                Poll::Ready(Ok(()))
-            }
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn successful_flush_signals_before_blocked_prewarm_work() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut writer = FlushWriter { fail_flush: false };
-
-        let task = tokio::spawn(async move {
-            flush_login_response_and_signal(&mut writer, Some(tx))
-                .await
-                .unwrap();
-            std::future::pending::<()>().await;
-        });
-
-        tokio::time::timeout(std::time::Duration::from_millis(100), rx)
-            .await
-            .expect("auth signal must not wait for prewarm")
-            .expect("successful flush must signal");
-        task.abort();
-    }
-
-    #[tokio::test]
-    async fn flush_failure_returns_error_without_auth_signal() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut writer = FlushWriter { fail_flush: true };
-
-        assert!(flush_login_response_and_signal(&mut writer, Some(tx))
-            .await
-            .is_err());
-        assert!(
-            rx.await.is_err(),
-            "flush failure must drop the unsent signal"
-        );
-    }
-
-    #[tokio::test]
-    async fn bad_token_returns_without_auth_signal() {
-        let (server, mut client) = tokio::io::duplex(4096);
-        let drain = tokio::spawn(async move {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut client, &mut Vec::new()).await;
-        });
-        let login = frp_core::msg::Login {
-            version: None,
-            hostname: None,
-            os: None,
-            arch: None,
-            user: None,
-            run_id: None,
-            client_id: None,
-            pool_count: None,
-            timestamp: None,
-            privilege_key: Some("bad-token".into()),
-            metas: None,
-            client_spec: None,
-            multiplexer: None,
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let result = super::authenticate(
-            Box::new(server),
-            &login,
-            test_state(),
-            Some("127.0.0.1:12345".parse().unwrap()),
-            None,
-            false,
-            None,
-            false,
-            Some(tx),
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(rx.await.is_err(), "bad token must drop the unsent signal");
-        drain.abort();
-    }
-}
-
 /// Authenticate a new control connection and set up per-client state.
 /// On success returns all state needed by the main select! loop.
 /// On failure sends LoginResp with an error and returns `Err(())`.
@@ -865,4 +719,148 @@ pub(crate) async fn authenticate(
         writer,
         incoming,
     ))
+}
+#[cfg(test)]
+mod auth_signal_tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use tokio::io::AsyncWrite;
+
+    use super::flush_login_response_and_signal;
+
+    fn test_state() -> Arc<crate::state::AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(crate::state::AppState::new(
+            frp_core::auth::AuthConfig::with_token("expected-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("expected-token"),
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
+            String::new(),
+            true,
+            30,
+            7200,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    struct FlushWriter {
+        fail_flush: bool,
+    }
+
+    impl AsyncWrite for FlushWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_flush {
+                Poll::Ready(Err(io::Error::other("injected flush failure")))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_flush_signals_before_blocked_prewarm_work() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut writer = FlushWriter { fail_flush: false };
+
+        let task = tokio::spawn(async move {
+            flush_login_response_and_signal(&mut writer, Some(tx))
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx)
+            .await
+            .expect("auth signal must not wait for prewarm")
+            .expect("successful flush must signal");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn flush_failure_returns_error_without_auth_signal() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut writer = FlushWriter { fail_flush: true };
+
+        assert!(flush_login_response_and_signal(&mut writer, Some(tx))
+            .await
+            .is_err());
+        assert!(
+            rx.await.is_err(),
+            "flush failure must drop the unsent signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_token_returns_without_auth_signal() {
+        let (server, mut client) = tokio::io::duplex(4096);
+        let drain = tokio::spawn(async move {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut client, &mut Vec::new()).await;
+        });
+        let login = frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: None,
+            timestamp: None,
+            privilege_key: Some("bad-token".into()),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let result = super::authenticate(
+            Box::new(server),
+            &login,
+            test_state(),
+            Some("127.0.0.1:12345".parse().unwrap()),
+            None,
+            false,
+            None,
+            false,
+            Some(tx),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(rx.await.is_err(), "bad token must drop the unsent signal");
+        drain.abort();
+    }
 }

@@ -40,7 +40,7 @@ where
     let expected = if enabled {
         format!(
             "Basic {}",
-            data_encoding::BASE64.encode(format!("{}:{}", user, password).as_bytes())
+            crate::base64::encode(format!("{}:{}", user, password).as_bytes())
         )
     } else {
         String::new()
@@ -139,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_accepts_valid() {
         let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "admin", "secret");
-        let creds = data_encoding::BASE64.encode(b"admin:secret");
+        let creds = crate::base64::encode(b"admin:secret");
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -156,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_rejects_wrong_password() {
         let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "admin", "secret");
-        let creds = data_encoding::BASE64.encode(b"admin:wrong");
+        let creds = crate::base64::encode(b"admin:wrong");
         let resp = app
             .oneshot(
                 axum::http::Request::builder()

@@ -74,9 +74,9 @@ Feature flags across crates:
 | `otel` | frp-core/server/client | OpenTelemetry tracing + OTLP export (~+2-3MB) |
 | `debug-logs` | frp-core | debug/trace logging (dev only) |
 
-Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, vnet, compression, chacha20, tcp-mux, ssh; frpc = websocket, kcp, quic, oidc, tls, vnet, admin, compression, chacha20, tcp-mux. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
+Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compression, chacha20, tcp-mux, ssh; frpc = websocket, kcp, quic, oidc, tls, admin, compression, chacha20, tcp-mux. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
 
-**Opt-in (NOT default):** `dashboard`, `mimalloc`, `otel`, `debug-logs`, `profiling`, `mem-profile` (frps/frpc); `http-proxy` is a server-side opt-in (the client http_proxy plugin compiles unconditionally). `mem-profile` installs a `CountingAlloc` global allocator + a 1 Hz `MEMPROFILE` stderr emitter and is mutually exclusive with `mimalloc` (the `#[global_allocator]` guards are cfg-exclusive — with both enabled neither allocator is installed and the emitter does not run). Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
+**Opt-in (NOT default):** `dashboard`, `mimalloc`, `otel`, `debug-logs`, `profiling`, `mem-profile`, `vnet` (frps/frpc — L3 VPN/TUN routing, drops frp-vnet from default binaries); `http-proxy` is a server-side opt-in (the client http_proxy plugin compiles unconditionally). `mem-profile` installs a `CountingAlloc` global allocator + a 1 Hz `MEMPROFILE` stderr emitter and is mutually exclusive with `mimalloc` (the `#[global_allocator]` guards are cfg-exclusive — with both enabled neither allocator is installed and the emitter does not run). Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
 
 - No `cargo check` variation needed for day-to-day work — `cargo build` covers the full workspace; ci.yml additionally gates the size tiers with `cargo check --no-default-features --features tiny|micro`.
 - Unit tests live inline (`#[cfg(test)] mod tests`); integration tests live in per-crate `tests/` dirs (`frp-server/tests/`, `frp-client/tests/`, `frp-core/tests/`).
@@ -109,6 +109,7 @@ Every feature, fix, and test change follows three rules:
 | `unsafe` blocks | 9 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
+| `data-encoding` crate | removed — inline `frp_core::base64` (encode/decode, standard alphabet) + existing `hex_encode` for the one HEXLOWER log site |
 | `let _ =` error discards | all commented (`vhost.rs`, `tcpmux.rs`) |
 | `exec://` token source | always blocked by `UnsafeFeatures::default()` |
 | Security audit | `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` + `cargo deny check` before release |
@@ -281,7 +282,7 @@ Known areas lacking e2e cross-compat test coverage:
 **No new dependencies without explicit justification.** Every new crate added to the workspace must have a documented reason covering:
 
 1. **Why it's needed** — what problem it solves that existing deps cannot
-2. **Why the alternative was rejected** — why an existing dep can't be used (e.g., ring for crypto, data_encoding for encoding)
+2. **Why the alternative was rejected** — why an existing dep can't be used (e.g., ring for crypto, `frp_core::base64`/`hex_encode` for encoding)
 3. **Binary size impact** — approximate cost to frps/frpc release binary
 
 Pre-approved tech stack. Use these unless strong reason to deviate:
@@ -299,7 +300,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | HTTP client | `reqwest` | rustls-tls only (no json, no socks features) |
 | HTTP server | `axum` | dashboard, admin auth |
 | WebSocket | `tokio-tungstenite` | |
-| Encoding | `data_encoding` | BASE64 |
+| Encoding | inline `frp_core::base64` (encode/decode) + `frp_core::hex_encode` | standard base64 alphabet + `=` padding, wire-compatible with Go `base64.StdEncoding` |
 | Compression | `snap` | Snappy, pure Rust |
 | QUIC | `quinn` | |
 | TcpMux | `yamux` | |
@@ -312,7 +313,8 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 **Removed and banned** (do not reintroduce without approval):
 - `aws-lc-sys` / `aws-lc-rs` — replaced by ring (russh default → ring feature)
 - `hmac` — dead dependency, ring covers HMAC
-- `base64` — replaced by data_encoding
+- `base64` — replaced by inline `frp_core::base64`
+- `data-encoding` — replaced by inline `frp_core::base64` (2026-08-06; was ~47KB .text in frps)
 - `sha2` — replaced by ring
 - `aes-gcm` — replaced by ring (AES-256-GCM)
 - `hkdf` — replaced by ring (HKDF-SHA256)

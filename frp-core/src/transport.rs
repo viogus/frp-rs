@@ -359,11 +359,12 @@ impl WsByteStream {
     }
 
     /// Consume the adapter and return the underlying WebSocket stream.
-    /// Panics if called on a Raw variant.
-    pub fn into_inner(self) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+    /// Returns `None` if this was created from a raw stream (`from_raw`),
+    /// which stores a type-erased `Box<dyn AsyncReadWrite>` instead.
+    pub fn into_inner(self) -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         match self.inner {
-            WsInner::Tungstenite(ws) => *Pin::into_inner(ws),
-            WsInner::Raw(_) => panic!("into_inner called on Raw variant — Raw stores Box<dyn AsyncReadWrite>, not WebSocketStream"),
+            WsInner::Tungstenite(ws) => Some(*Pin::into_inner(ws)),
+            WsInner::Raw(_) => None,
         }
     }
 }
@@ -3935,7 +3936,7 @@ mod tests {
 
         let mut ca_file = tempfile::NamedTempFile::new().expect("create CA tempfile");
         let ca_der = ca_cert.der();
-        let ca_b64 = data_encoding::BASE64.encode(ca_der.as_ref());
+        let ca_b64 = crate::base64::encode(ca_der.as_ref());
         let mut ca_pem = String::from("-----BEGIN CERTIFICATE-----\n");
         for chunk in ca_b64.as_bytes().chunks(64) {
             ca_pem.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));

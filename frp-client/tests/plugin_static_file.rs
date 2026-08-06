@@ -34,7 +34,7 @@ fn temp_dir_with_index(content: &str) -> PathBuf {
 }
 
 fn b64(s: &str) -> String {
-    data_encoding::BASE64.encode(s.as_bytes())
+    frp_core::base64::encode(s.as_bytes())
 }
 
 /// Send a raw HTTP GET and return (status_code, body).

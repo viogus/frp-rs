@@ -341,7 +341,7 @@ fn extract_proxy_auth(request: &str) -> Option<(String, String)> {
     } else {
         return None;
     };
-    let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
+    let decoded = frp_core::base64::decode(encoded).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;
     Some((user.to_string(), pwd.to_string()))

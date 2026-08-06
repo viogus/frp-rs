@@ -21,7 +21,6 @@ uuid.workspace = true
 tokio-tungstenite = { workspace = true, optional = true }
 sha1.workspace = true
 md-5.workspace = true
-data-encoding.workspace = true
 aes.workspace = true
 cfb-mode.workspace = true
 pbkdf2.workspace = true
@@ -53,7 +52,7 @@ opentelemetry_sdk = { version = "0.27", optional = true, default-features = fals
 opentelemetry-otlp = { version = "0.27", optional = true, default-features = false, features = ["http-proto"] }
 tracing-opentelemetry = { version = "0.28", optional = true, default-features = false }
 [features]
-default = ["kcp", "quic", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux"]
+default = ["kcp", "quic", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux", "stun"]
 tcp-mux = ["dep:yamux"]
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-platform-verifier", "dep:rcgen"]
 admin-auth = ["dep:axum"]
@@ -64,6 +63,12 @@ kcp = []
 websocket = ["dep:tokio-tungstenite"]
 oidc = ["dep:jsonwebtoken", "http-client"]
 vnet = []
+# STUN binding helpers (`stun.rs`): client-only NAT traversal (XTCP/STCP),
+# ~900 lines never linked into frp-server. Default on so existing builds are
+# unchanged; frp-client forwards `frp-core/stun` from its `kcp`/`vnet`
+# features so XTCP builds keep it, while micro/tiny (`--no-default-features`)
+# builds drop it.
+stun = []
 mem-profile = []
 profiling = ["dep:pprof"]
 debug-logs = []

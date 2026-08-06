@@ -184,13 +184,9 @@ async fn test_v2_tcp_proxy() {
         multiplexer: None,
         virtual_net: None,
         proxy_protocol_version: None,
-        #[cfg(feature = "vnet")]
         advertise_subnet: None,
-        #[cfg(feature = "vnet")]
         vnet_ip: None,
-        #[cfg(feature = "vnet")]
         vnet_netmask: None,
-        #[cfg(feature = "vnet")]
         vnet_mtu: None,
     }));
     control.write_v2_frame(&np).await.expect("send NewProxy");

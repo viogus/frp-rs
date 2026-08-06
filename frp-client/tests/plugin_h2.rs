@@ -34,7 +34,7 @@ fn write_plugin_cert(dir: &tempfile::TempDir) -> (PathBuf, PathBuf, Vec<u8>) {
     let cert = params.self_signed(&key_pair).expect("self-signed cert");
 
     let wrap_pem = |label: &str, der: &[u8]| -> String {
-        let b64 = data_encoding::BASE64.encode(der);
+        let b64 = frp_core::base64::encode(der);
         let mut out = format!("-----BEGIN {label}-----\n");
         for chunk in b64.as_bytes().chunks(64) {
             out.push_str(std::str::from_utf8(chunk).unwrap());

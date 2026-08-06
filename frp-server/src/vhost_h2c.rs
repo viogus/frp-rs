@@ -373,7 +373,7 @@ fn build_http1_request_head(request: &http::Request<RecvStream>) -> Vec<u8> {
 fn extract_basic_auth_headers(headers: &http::HeaderMap) -> Option<(String, String)> {
     let value = headers.get("authorization")?.to_str().ok()?;
     let encoded = value.strip_prefix("Basic ")?.trim();
-    let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
+    let decoded = frp_core::base64::decode(encoded).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;
     Some((user.to_string(), pwd.to_string()))
@@ -386,11 +386,30 @@ async fn send_h2_error(
     extra: &[(&str, &str)],
     body: Bytes,
 ) -> Result<(), h2::Error> {
-    let mut resp = http::Response::builder().status(status).body(()).unwrap();
+    let mut resp = match http::Response::builder().status(status).body(()) {
+        Ok(resp) => resp,
+        Err(_) => {
+            // Callers pass internal constants, but an invalid status must not
+            // panic the request-serving task; fall back to 500.
+            tracing::warn!("invalid status code {status} for h2 error response, using 500");
+            http::Response::builder()
+                .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(())
+                .expect("500 is a valid status code")
+        }
+    };
     for &(k, v) in extra {
-        let name = http::header::HeaderName::from_bytes(k.as_bytes()).unwrap();
-        resp.headers_mut()
-            .insert(name, http::HeaderValue::from_str(v).unwrap());
+        match (
+            http::header::HeaderName::from_bytes(k.as_bytes()),
+            http::HeaderValue::from_str(v),
+        ) {
+            (Ok(name), Ok(value)) => {
+                resp.headers_mut().insert(name, value);
+            }
+            _ => {
+                tracing::warn!("skipping invalid h2 error header {k:?}: {v:?}");
+            }
+        }
     }
     if body.is_empty() {
         respond.send_response(resp, true)?;
@@ -681,7 +700,17 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         body_offset,
     } = parsed;
 
-    let mut resp = http::Response::builder().status(status).body(()).unwrap();
+    let mut resp = match http::Response::builder().status(status).body(()) {
+        Ok(resp) => resp,
+        Err(_) => {
+            // The status comes from the backend head; a broken/malicious
+            // backend can send a value the builder rejects (e.g. 0 or >999).
+            // Degrade to 502 like the other malformed-head cases instead of
+            // panicking the request-serving task.
+            tracing::debug!("h2c backend sent invalid status code {status}, sending 502");
+            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        }
+    };
     for (n, v) in &headers {
         if is_hop_by_hop(n.as_str()) {
             continue;

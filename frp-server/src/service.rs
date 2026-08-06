@@ -2021,7 +2021,10 @@ impl Service {
                                     continue;
                                 }
                                 let rate_wait = if rate_limiter_enabled {
-                                    let mut rl = state.accept_rate_limiter.lock().unwrap();
+                                    let mut rl = state
+                                        .accept_rate_limiter
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
                                     rl.try_acquire().err()
                                 } else {
                                     None
@@ -2675,7 +2678,7 @@ impl Service {
                                                             }
                                                         }
                                                         None => {
-                                                            tracing::warn!(peer = %peer, scan_len, scan_hex = %data_encoding::HEXLOWER.encode(&scan_data[..scan_len.min(128)]), "KCP TLS: no valid V1 header found in {} bytes", scan_len);
+                                                            tracing::warn!(peer = %peer, scan_len, scan_hex = %frp_core::hex_encode(&scan_data[..scan_len.min(128)]), "KCP TLS: no valid V1 header found in {} bytes", scan_len);
                                                         }
                                                     }
                                                 }
@@ -3427,7 +3430,10 @@ impl Service {
                     // (max_accept_rate == 0) skip the lock entirely — the
                     // limiter is a no-op.
                     let rate_wait = if rate_limiter_enabled {
-                        let mut rl = state.accept_rate_limiter.lock().unwrap();
+                        let mut rl = state
+                            .accept_rate_limiter
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         rl.try_acquire().err()
                     } else {
                         None

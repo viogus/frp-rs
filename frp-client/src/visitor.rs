@@ -618,7 +618,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 // (both sides get the same sid from the server).
                                 let sid = resp.sid.clone().unwrap_or_default();
                                 let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
-                                #[allow(clippy::default_constructed_unit_structs)]
                                 let kcp_cfg = frp_core::kcp::default_kcp_config();
                                 // Go v0.70 compat: NatHoleSid detect + yamux client.
                                 let p2p_key = if !sk.is_empty() {
@@ -1201,7 +1200,7 @@ async fn deliver_tunnel_ingress(
     // Take the tokio lock first so the std Mutex guard never spans an await
     // point (the guarded section below is fully synchronous).
     let subnets = tun_subnets.lock().await;
-    let txs = vnet_tun_tx.lock().unwrap();
+    let txs = vnet_tun_tx.lock().unwrap_or_else(|e| e.into_inner());
     let dst = frp_vnet::router::packet_dst_ip(&packet);
     let mut delivered = false;
     for (proxy, tx) in txs.iter() {

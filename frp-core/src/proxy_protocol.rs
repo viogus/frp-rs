@@ -73,7 +73,8 @@ pub fn build_proxy_protocol_v2(
             buf.extend_from_slice(&s6.octets());
             buf.extend_from_slice(&d6.octets());
         }
-        _ => unreachable!(),
+        // Guarded by the family check above; never panic on pub API input.
+        _ => return Err("v2 PROXY: mismatched address families (IPv4/IPv6)".into()),
     }
     buf.extend_from_slice(&src_port.to_be_bytes());
     buf.extend_from_slice(&dst_port.to_be_bytes());

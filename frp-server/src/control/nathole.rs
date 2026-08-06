@@ -5,7 +5,7 @@
 //! NatHoleReport, NatHoleVisitor, NewVisitorConn) plus VNet route management.
 
 use std::sync::atomic::Ordering;
-#[cfg(any(feature = "vnet", test))]
+#[cfg(feature = "vnet")]
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;

@@ -9,40 +9,40 @@ use crate::proxy_runtime::ProxyRuntimeInfo;
 
 /// Build a config snapshot string for reload change detection.
 /// Includes all fields that matter for proxy registration and plugin config.
-#[allow(clippy::vec_init_then_push)]
 pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
     // Sort and serialize key fields deterministically
-    let mut fields: Vec<(&str, String)> = Vec::new();
-    fields.push(("type", p.proxy_type.clone()));
-    fields.push(("local_ip", p.local_ip.clone()));
-    fields.push(("local_port", p.local_port.to_string()));
-    fields.push(("remote_port", p.remote_port.to_string()));
-    fields.push(("use_encryption", p.use_encryption.to_string()));
-    fields.push(("use_compression", p.use_compression.to_string()));
     // Hash sk for change detection — never include plaintext secret in snapshot.
     let sk_hash = if p.sk.is_empty() {
         String::new()
     } else {
         frp_core::auth::generate_token(&p.sk, 0)
     };
-    fields.push(("sk", sk_hash));
-    fields.push(("custom_domains", format!("{:?}", p.custom_domains)));
-    fields.push(("subdomain", p.subdomain.clone()));
-    fields.push(("http_user", p.http_user.clone()));
-    fields.push(("http_pwd", p.http_pwd.clone()));
-    fields.push(("host_header_rewrite", p.host_header_rewrite.clone()));
-    fields.push(("locations", format!("{:?}", p.locations)));
-    fields.push(("bandwidth_limit", p.bandwidth_limit.clone()));
-    fields.push(("bandwidth_limit_mode", p.bandwidth_limit_mode.clone()));
-    fields.push(("group", p.group.clone()));
-    fields.push(("group_key", p.group_key.clone()));
-    fields.push(("multiplexer", p.multiplexer.clone()));
-    fields.push(("proxy_protocol_version", p.proxy_protocol_version.clone()));
-    fields.push(("vnet_ip", p.vnet_ip.clone()));
-    fields.push(("vnet_netmask", p.vnet_netmask.clone()));
-    fields.push(("vnet_mtu", p.vnet_mtu.to_string()));
-    fields.push(("advertise_subnet", p.advertise_subnet.clone()));
-    fields.push(("virtual_net", p.virtual_net.clone()));
+    let mut fields: Vec<(&str, String)> = vec![
+        ("type", p.proxy_type.clone()),
+        ("local_ip", p.local_ip.clone()),
+        ("local_port", p.local_port.to_string()),
+        ("remote_port", p.remote_port.to_string()),
+        ("use_encryption", p.use_encryption.to_string()),
+        ("use_compression", p.use_compression.to_string()),
+        ("sk", sk_hash),
+        ("custom_domains", format!("{:?}", p.custom_domains)),
+        ("subdomain", p.subdomain.clone()),
+        ("http_user", p.http_user.clone()),
+        ("http_pwd", p.http_pwd.clone()),
+        ("host_header_rewrite", p.host_header_rewrite.clone()),
+        ("locations", format!("{:?}", p.locations)),
+        ("bandwidth_limit", p.bandwidth_limit.clone()),
+        ("bandwidth_limit_mode", p.bandwidth_limit_mode.clone()),
+        ("group", p.group.clone()),
+        ("group_key", p.group_key.clone()),
+        ("multiplexer", p.multiplexer.clone()),
+        ("proxy_protocol_version", p.proxy_protocol_version.clone()),
+        ("vnet_ip", p.vnet_ip.clone()),
+        ("vnet_netmask", p.vnet_netmask.clone()),
+        ("vnet_mtu", p.vnet_mtu.to_string()),
+        ("advertise_subnet", p.advertise_subnet.clone()),
+        ("virtual_net", p.virtual_net.clone()),
+    ];
 
     // Plugin fields — needed for detecting plugin config changes during reload
     if let Some(ref pl) = p.plugin {

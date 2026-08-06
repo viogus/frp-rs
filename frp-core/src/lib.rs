@@ -3,6 +3,7 @@ pub mod admin_auth;
 pub mod auth;
 pub mod backoff;
 pub mod bandwidth;
+pub mod base64;
 pub mod bridge;
 pub mod buffer_pool;
 pub mod cipher_stream;
@@ -33,7 +34,57 @@ pub mod proxy_protocol;
 pub mod quic;
 #[cfg(target_os = "linux")]
 pub mod splice;
+/// STUN RFC 3489/5389 binding helpers, used only by frp-client XTCP/STCP NAT
+/// traversal (never by frp-server). Gated behind the `stun` feature (default
+/// on) so `--no-default-features` micro/tiny builds drop the ~900 lines.
+#[cfg(feature = "stun")]
 pub mod stun;
+/// Stub mirror of the real `stun` module (same convention as the `xtcp_p2p`
+/// stub below) so frp-client's unconditional XTCP/STCP call sites still
+/// compile without the feature; those paths fail with a clear error at
+/// runtime, which they never reach in feature-less builds.
+#[cfg(not(feature = "stun"))]
+pub mod stun {
+    use tokio::net::UdpSocket;
+
+    /// Mirror of the real [`crate::stun::StunResult`] for call sites compiled
+    /// without the `stun` feature.
+    #[derive(Debug)]
+    pub struct StunResult {
+        pub mapped_addr: String,
+        pub other_addr: Option<String>,
+    }
+
+    pub async fn stun_binding(_stun_addr: &str) -> Result<String, String> {
+        Err("STUN feature not compiled".into())
+    }
+    pub async fn stun_binding_on_socket(
+        _socket: &UdpSocket,
+        _stun_addr: &str,
+    ) -> Result<String, String> {
+        Err("STUN feature not compiled".into())
+    }
+    pub async fn stun_binding_with_socket(_stun_addr: &str) -> Result<(UdpSocket, String), String> {
+        Err("STUN feature not compiled".into())
+    }
+    pub async fn stun_binding_with_details(
+        _stun_addr: &str,
+    ) -> Result<(UdpSocket, StunResult), String> {
+        Err("STUN feature not compiled".into())
+    }
+    pub fn parse_binding_response(
+        _data: &[u8],
+        _expected_tx_id: &[u8; 12],
+    ) -> Result<String, String> {
+        Err("STUN feature not compiled".into())
+    }
+    pub fn parse_binding_response_full(
+        _data: &[u8],
+        _expected_tx_id: &[u8; 12],
+    ) -> Result<StunResult, String> {
+        Err("STUN feature not compiled".into())
+    }
+}
 pub mod system;
 pub mod transport;
 pub mod unsafe_features;

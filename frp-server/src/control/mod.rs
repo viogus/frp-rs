@@ -1,4 +1,4 @@
-mod bridge;
+pub(crate) mod bridge;
 mod dispatch;
 mod login;
 mod nathole;

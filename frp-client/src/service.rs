@@ -1729,7 +1729,7 @@ impl Service {
                             }
                             #[cfg(feature = "vnet")]
                             Ok(FrpMessage::VnetPacket(vpkt)) => {
-                                match data_encoding::BASE64.decode(vpkt.data.as_bytes()) {
+                                match frp_core::base64::decode(&vpkt.data) {
                                     Ok(packet) => {
                                         // Virtual_net visitors first: deliver into
                                         // the visitor's STCP/XTCP tunnel. TUN-backed
@@ -1742,7 +1742,10 @@ impl Service {
                                         {
                                             Ok(()) => {}
                                             Err(packet) => {
-                                                let txs = self.vnet_tun_tx.lock().unwrap();
+                                                let txs = self
+                                                    .vnet_tun_tx
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
                                                 if let Some(tx) = txs.get(&vpkt.proxy_name) {
                                                     if tx.try_send(packet).is_err() {
                                                         warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
@@ -2354,7 +2357,6 @@ impl Service {
         tokio::spawn(async move {
             let candidates = vec![visitor_addr];
             let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
-            #[allow(clippy::default_constructed_unit_structs)]
             let kcp_cfg = frp_core::kcp::default_kcp_config();
             let p2p_key = if !xtcp_sk.is_empty() {
                 Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
@@ -2605,7 +2607,6 @@ impl Service {
 
             // UDP hole punch + KCP data plane (Go v0.70 compat).
             let conv = frp_core::xtcp_p2p::conv_from_sid(&sid_clone);
-            #[allow(clippy::default_constructed_unit_structs)]
             let kcp_cfg = frp_core::kcp::default_kcp_config();
             let p2p_key = if !xtcp_sk.is_empty() {
                 Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
@@ -3465,7 +3466,10 @@ async fn remove_vnet_tun(
         let _ = cancel.send(true);
     }
     vnet_tuns.lock().await.remove(proxy_name);
-    vnet_tun_tx.lock().unwrap().remove(proxy_name);
+    vnet_tun_tx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(proxy_name);
     let tun_name = vnet_tun_names.lock().await.remove(proxy_name);
     // Remove the OS route for the local TUN subnet (the kernel also cleans it
     // up on TUN teardown, but explicit removal keeps add/remove symmetric).
