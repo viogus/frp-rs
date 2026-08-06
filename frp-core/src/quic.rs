@@ -199,7 +199,7 @@ fn build_quic_transport_config(params: &QuicTransportParams) -> quinn::Transport
     transport.max_idle_timeout(Some(
         std::time::Duration::from_secs(params.max_idle_timeout_secs as u64)
             .try_into()
-            .unwrap(),
+            .expect("idle timeout in seconds always fits quinn VarInt"),
     ));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(
         params.keepalive_period_secs as u64,

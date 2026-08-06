@@ -91,8 +91,12 @@ async fn handle_socks5_conn(
 
     // Step 2: Username/password auth (if selected)
     if chosen_method == AUTH_USER_PASS {
-        let u = user.as_deref().unwrap();
-        let p = pass.as_deref().unwrap();
+        let u = user
+            .as_deref()
+            .expect("AUTH_USER_PASS chosen only when user is Some");
+        let p = pass
+            .as_deref()
+            .expect("AUTH_USER_PASS chosen only when pass is Some");
 
         client
             .read_exact(&mut buf[..2])

@@ -294,11 +294,17 @@ async fn send_h2_error(
     extra: &[(&str, &str)],
     body: Bytes,
 ) -> Result<(), h2::Error> {
-    let mut resp = http::Response::builder().status(status).body(()).unwrap();
+    let mut resp = http::Response::builder()
+        .status(status)
+        .body(())
+        .expect("h2 plugin status code (502) is a valid HTTP status");
     for &(k, v) in extra {
-        let name = http::header::HeaderName::from_bytes(k.as_bytes()).unwrap();
-        resp.headers_mut()
-            .insert(name, http::HeaderValue::from_str(v).unwrap());
+        let name = http::header::HeaderName::from_bytes(k.as_bytes())
+            .expect("h2 plugin extra header name must be valid");
+        resp.headers_mut().insert(
+            name,
+            http::HeaderValue::from_str(v).expect("h2 plugin extra header value must be valid"),
+        );
     }
     if body.is_empty() {
         respond.send_response(resp, true)?;
@@ -571,7 +577,10 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         body_offset,
     } = parsed;
 
-    let mut resp = http::Response::builder().status(status).body(()).unwrap();
+    let mut resp = http::Response::builder()
+        .status(status)
+        .body(())
+        .expect("parsed backend status is a valid HTTP status");
     for (n, v) in &headers {
         if is_hop_by_hop(n.as_str()) {
             continue;
