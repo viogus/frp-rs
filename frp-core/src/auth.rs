@@ -388,8 +388,7 @@ mod oidc_impl {
         ) -> Result<Self, String> {
             if proxy_url.as_ref().is_some_and(|u| !u.is_empty()) {
                 return Err(
-                    "OIDC: HTTP proxy is not supported with the hyper HTTP client. \
-                     Remove proxy_url from OIDC config or rebuild with FRP_HTTP=reqwest."
+                    "OIDC: HTTP proxy is not yet supported. Remove proxy_url from OIDC config."
                         .into(),
                 );
             }
@@ -844,20 +843,19 @@ mod oidc_impl {
         ) -> Result<Self, String> {
             if proxy_url.as_ref().is_some_and(|u| !u.is_empty()) {
                 return Err(
-                    "OIDC client: HTTP proxy is not supported with the hyper HTTP client. \
-                     Remove proxy_url from OIDC client config or rebuild with FRP_HTTP=reqwest."
+                    "OIDC client: HTTP proxy is not yet supported. Remove proxy_url from OIDC client config."
                         .into(),
                 );
             }
 
-            let ca_cert_pem = if let Some(ref ca_file) = tls_trusted_ca_file.filter(|f| !f.is_empty()) {
-                Some(
-                    std::fs::read(ca_file)
-                        .map_err(|e| format!("OIDC client: failed to read CA cert {ca_file}: {e}"))?,
-                )
-            } else {
-                None
-            };
+            let ca_cert_pem =
+                if let Some(ref ca_file) = tls_trusted_ca_file.filter(|f| !f.is_empty()) {
+                    Some(std::fs::read(ca_file).map_err(|e| {
+                        format!("OIDC client: failed to read CA cert {ca_file}: {e}")
+                    })?)
+                } else {
+                    None
+                };
 
             if tls_insecure_skip_verify {
                 tracing::warn!("OIDC: tls_insecure_skip_verify is enabled — TLS certificate verification is disabled. This weakens authentication security.");

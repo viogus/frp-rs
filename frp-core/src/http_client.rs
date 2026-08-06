@@ -14,10 +14,10 @@ use bytes::Bytes;
 use http::header::{CONTENT_TYPE, LOCATION};
 use http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use hyper_rustls::HttpsConnector;
 use rustls::pki_types::CertificateDer;
 
 /// Default timeout for OIDC HTTP requests (10 seconds).
@@ -105,6 +105,11 @@ fn build_tls_config(
         let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
             .collect::<Result<Vec<CertificateDer<'_>>, _>>()
             .map_err(|e| format!("OIDC: failed to parse CA certificate PEM: {e}"))?;
+        if certs.is_empty() {
+            return Err("OIDC: no certificates found in CA certificate PEM — \
+                 check the file format (expecting PEM-encoded X.509)"
+                .into());
+        }
         for cert in certs {
             root_store
                 .add(cert)
@@ -128,14 +133,12 @@ fn build_tls_config(
 pub struct HttpClient {
     inner: HttpsClient,
     timeout: Duration,
-    follow_redirects: bool,
 }
 
 impl std::fmt::Debug for HttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpClient")
             .field("timeout", &self.timeout)
-            .field("follow_redirects", &self.follow_redirects)
             .finish_non_exhaustive()
     }
 }
@@ -145,7 +148,6 @@ impl Clone for HttpClient {
         Self {
             inner: self.inner.clone(),
             timeout: self.timeout,
-            follow_redirects: self.follow_redirects,
         }
     }
 }
@@ -166,7 +168,8 @@ impl HttpClientBuilder {
         }
     }
 
-    /// Set the per-request timeout (applied via `tokio::time::timeout`).
+    /// Set the per-request timeout. Applies to connect + send + body read
+    /// (equivalent to reqwest's total-request deadline semantics).
     pub fn timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
         self
@@ -201,7 +204,6 @@ impl HttpClientBuilder {
         Ok(HttpClient {
             inner: client,
             timeout: self.timeout,
-            follow_redirects: true,
         })
     }
 }
@@ -242,7 +244,7 @@ impl HttpResponse {
 
 impl HttpClient {
     /// Send a GET request and return the response.
-    /// Follows up to `MAX_REDIRECTS` redirects if `follow_redirects` is set.
+    /// Follows up to `MAX_REDIRECTS` redirects.
     pub async fn get(&self, url: &str) -> Result<HttpResponse, String> {
         let uri: Uri = url
             .parse()
@@ -287,7 +289,35 @@ impl HttpClient {
     }
 
     /// Low-level request with redirect following and timeout.
+    ///
+    /// The timeout covers the full request lifecycle: connect, send headers,
+    /// body read, and redirects (matching reqwest's total-deadline semantics).
+    /// A zero timeout disables the deadline entirely; the plugin path uses
+    /// this and wraps the call in its own `tokio::time::timeout`.
     async fn request(
+        &self,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Full<Bytes>,
+    ) -> Result<HttpResponse, String> {
+        let deadline = self.timeout;
+
+        // Wrap the entire request+redirect loop in a timeout so body reads
+        // and redirect hops are covered, matching reqwest's total-deadline
+        // semantics.
+        let fut = self.request_inner(method, uri, headers, body);
+        match deadline {
+            d if d.is_zero() => fut.await,
+            d => tokio::time::timeout(d, fut)
+                .await
+                .unwrap_or_else(|_| Err("HTTP request timed out".into())),
+        }
+    }
+
+    /// Inner request loop — body reads and redirect hops are included in
+    /// the caller's timeout.
+    async fn request_inner(
         &self,
         method: Method,
         uri: Uri,
@@ -307,24 +337,13 @@ impl HttpClient {
                 .map_err(|e| format!("failed to build request: {e}"))?;
             *req.headers_mut() = current_headers;
 
-            let fut = self.inner.request(req);
-            let resp_result = match self.timeout {
-                t if t.is_zero() => fut.await,
-                t => match tokio::time::timeout(t, fut).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        return Err(format!(
-                            "HTTP request to {current_uri} timed out after {}s",
-                            t.as_secs()
-                        ));
-                    }
-                },
-            };
-            let resp = resp_result.map_err(|e| {
-                format!("HTTP request to {current_uri} failed: {e}")
-            })?;
+            let resp = self
+                .inner
+                .request(req)
+                .await
+                .map_err(|e| format!("HTTP request to {current_uri} failed: {e}"))?;
 
-            if !self.follow_redirects || !is_redirect(resp.status()) {
+            if !is_redirect(resp.status()) {
                 let status = resp.status();
                 let body = resp
                     .collect()
@@ -334,29 +353,24 @@ impl HttpClient {
                 return Ok(HttpResponse { status, body });
             }
 
-            // Follow redirect: read the Location header (clone to decouple
-            // from resp lifetime so we can drain the body below).
+            // Follow redirect: read the Location header.
             let loc = resp
                 .headers()
                 .get(LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    format!("redirect without Location header at {current_uri}")
-                })?
-                .to_string();
+                .ok_or_else(|| format!("redirect without Location header at {current_uri}"))?
+                .to_owned();
 
             // Drain the redirect response body before following.
             let _ = resp.collect().await;
 
-            // Build next URI. Assume absolute redirects from OIDC providers
-            // (well-known endpoints don't typically use relative redirects).
-            current_uri = loc
-                .parse()
-                .map_err(|e| format!("invalid redirect Location '{loc}': {e}"))?;
+            // Resolve relative Location against the current URI.
+            current_uri = resolve_uri(&current_uri, &loc)?;
 
             // Switch to GET after any redirect. OIDC / plugin paths never
             // POST to endpoints that redirect, so preserving the POST body
-            // across redirects is unnecessary.
+            // across redirects is unnecessary. This also prevents credential
+            // replay across hosts (security improvement over reqwest).
             current_method = Method::GET;
             current_headers = HeaderMap::new();
             current_body = Full::new(Bytes::new());
@@ -368,11 +382,52 @@ impl HttpClient {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
+// ── Redirect helpers ────────────────────────────────────────────────────
 
+/// Follow 301, 302, 303, 307, 308. Pass through 300, 304, 305, 306
+/// (matching reqwest's redirect policy).
 fn is_redirect(status: StatusCode) -> bool {
-    status.is_redirection()
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }
+
+/// Resolve a redirect `Location` against the current URI.
+/// If `location` is absolute it is used directly; otherwise it is
+/// resolved relative to `current` (base URI).
+fn resolve_uri(current: &Uri, location: &str) -> Result<Uri, String> {
+    // Try absolute first.
+    if let Ok(uri) = location.parse::<Uri>() {
+        if uri.scheme().is_some() {
+            return Ok(uri);
+        }
+    }
+
+    // Relative redirect — resolve against current.
+    let scheme = current.scheme_str().unwrap_or("https");
+    let authority = current
+        .authority()
+        .map(|a| a.as_str())
+        .unwrap_or("localhost");
+
+    // If location starts with '/', it's path-absolute; otherwise it's
+    // relative to the current path.
+    let resolved = if location.starts_with('/') {
+        format!("{scheme}://{authority}{location}")
+    } else {
+        // Relative to current path: strip the last path segment.
+        let base_path = current.path();
+        let base_dir = match base_path.rfind('/') {
+            Some(pos) => &base_path[..=pos],
+            None => "/",
+        };
+        format!("{scheme}://{authority}{base_dir}{location}")
+    };
+
+    resolved
+        .parse()
+        .map_err(|e| format!("invalid redirect Location '{location}': {e}"))
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Manual `application/x-www-form-urlencoded` encoding.
 /// Avoids pulling in `url` / `form_urlencoded` crates for a single call site
@@ -437,5 +492,51 @@ mod tests {
     fn urlencode_single() {
         let encoded = urlencode(&[("key", "value")]);
         assert_eq!(encoded, "key=value");
+    }
+
+    #[test]
+    fn is_redirect_only_follows_301_302_303_307_308() {
+        assert!(is_redirect(StatusCode::MOVED_PERMANENTLY)); // 301
+        assert!(is_redirect(StatusCode::FOUND)); // 302
+        assert!(is_redirect(StatusCode::SEE_OTHER)); // 303
+        assert!(is_redirect(StatusCode::TEMPORARY_REDIRECT)); // 307
+        assert!(is_redirect(StatusCode::PERMANENT_REDIRECT)); // 308
+        assert!(!is_redirect(StatusCode::MULTIPLE_CHOICES)); // 300
+        assert!(!is_redirect(StatusCode::NOT_MODIFIED)); // 304
+        assert!(!is_redirect(StatusCode::USE_PROXY)); // 305
+        assert!(!is_redirect(StatusCode::OK)); // 200
+    }
+
+    #[test]
+    fn resolve_absolute_location() {
+        let current: Uri = "https://example.com/.well-known/openid-configuration"
+            .parse()
+            .unwrap();
+        let resolved = resolve_uri(&current, "https://other.example.com/jwks").unwrap();
+        assert_eq!(resolved.scheme_str().unwrap(), "https");
+        assert_eq!(resolved.authority().unwrap().as_str(), "other.example.com");
+        assert_eq!(resolved.path(), "/jwks");
+    }
+
+    #[test]
+    fn resolve_path_absolute_location() {
+        let current: Uri = "https://example.com/.well-known/openid-configuration"
+            .parse()
+            .unwrap();
+        let resolved = resolve_uri(&current, "/jwks").unwrap();
+        assert_eq!(resolved.scheme_str().unwrap(), "https");
+        assert_eq!(resolved.authority().unwrap().as_str(), "example.com");
+        assert_eq!(resolved.path(), "/jwks");
+    }
+
+    #[test]
+    fn resolve_path_relative_location() {
+        let current: Uri = "https://example.com/.well-known/openid-configuration"
+            .parse()
+            .unwrap();
+        let resolved = resolve_uri(&current, "jwks").unwrap();
+        assert_eq!(resolved.scheme_str().unwrap(), "https");
+        assert_eq!(resolved.authority().unwrap().as_str(), "example.com");
+        assert_eq!(resolved.path(), "/.well-known/jwks");
     }
 }

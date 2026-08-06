@@ -78,13 +78,15 @@ impl HttpPluginManager {
         let client = frp_core::http_client::HttpClientBuilder::new()
             .build()
             .unwrap_or_else(|e| {
-                tracing::warn!("Failed to build default HTTP plugin client: {e}");
-                // Build with skip-verify as last resort (matches old
-                // reqwest::Client::builder().build().unwrap_or_default()).
+                tracing::error!(
+                    "Failed to build default HTTP plugin client: {e}. \
+                     HTTP plugin notifications will be unavailable."
+                );
+                // Build a client that will fail every request (no valid TLS).
+                // Using skip-verify here would silently downgrade security.
                 frp_core::http_client::HttpClientBuilder::new()
-                    .tls_skip_verify(true)
                     .build()
-                    .expect("HTTP plugin client with skip-verify")
+                    .expect("HTTP plugin client retry")
             });
         let plugins = configs
             .into_iter()
@@ -174,13 +176,9 @@ impl HttpPluginManager {
             let mut headers = HeaderMap::new();
             headers.insert(
                 "X-Frp-Reqid",
-                HeaderValue::from_str(&reqid)
-                    .map_err(|e| format!("invalid reqid header: {e}"))?,
+                HeaderValue::from_str(&reqid).map_err(|e| format!("invalid reqid header: {e}"))?,
             );
-            headers.insert(
-                "Content-Type",
-                HeaderValue::from_static("application/json"),
-            );
+            headers.insert("Content-Type", HeaderValue::from_static("application/json"));
             let result = tokio::time::timeout(
                 timeout,
                 plugin.client.post_with_headers(&url, headers, body),
