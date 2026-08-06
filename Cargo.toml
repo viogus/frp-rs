@@ -25,7 +25,6 @@ uuid = { version = "1", features = ["v4"] }
 tokio-tungstenite = "0.29"
 sha1 = "0.10"
 md-5 = "0.10"
-data-encoding = "2"
 aes = "0.9"
 cfb-mode = "0.9"
 pbkdf2 = "0.12"

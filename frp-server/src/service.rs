@@ -2678,7 +2678,7 @@ impl Service {
                                                             }
                                                         }
                                                         None => {
-                                                            tracing::warn!(peer = %peer, scan_len, scan_hex = %data_encoding::HEXLOWER.encode(&scan_data[..scan_len.min(128)]), "KCP TLS: no valid V1 header found in {} bytes", scan_len);
+                                                            tracing::warn!(peer = %peer, scan_len, scan_hex = %frp_core::hex_encode(&scan_data[..scan_len.min(128)]), "KCP TLS: no valid V1 header found in {} bytes", scan_len);
                                                         }
                                                     }
                                                 }

@@ -2,6 +2,7 @@
 pub mod admin_auth;
 pub mod auth;
 pub mod backoff;
+pub mod base64;
 pub mod bandwidth;
 pub mod bridge;
 pub mod buffer_pool;

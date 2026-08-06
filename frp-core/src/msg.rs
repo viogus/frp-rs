@@ -73,14 +73,12 @@ pub const V2_TYPE_VNET_ROUTE_REMOVE: u16 = 44;
 // ---------------------------------------------------------------
 
 fn b64_ser<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&data_encoding::BASE64.encode(data))
+    s.serialize_str(&crate::base64::encode(data))
 }
 
 fn b64_de<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
     let s: String = Deserialize::deserialize(d)?;
-    data_encoding::BASE64
-        .decode(s.as_bytes())
-        .map_err(serde::de::Error::custom)
+    crate::base64::decode(&s).map_err(serde::de::Error::custom)
 }
 
 // ---------------------------------------------------------------

@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::str::FromStr;
 use std::time::Duration;
 
-use data_encoding::BASE64;
+use crate::base64::{decode as b64_decode, encode as b64_encode};
 use rand::RngCore;
 use ring::digest;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -45,7 +45,7 @@ const CRYPTO_TRANSCRIPT_LABEL: &str = "frp wire v2 crypto transcript";
 fn base64_serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
     match bytes {
         Some(b) => {
-            let encoded = BASE64.encode(b);
+            let encoded = b64_encode(b);
             s.serialize_some(&encoded)
         }
         None => s.serialize_none(),
@@ -56,9 +56,7 @@ fn base64_deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>
     let opt: Option<String> = Option::deserialize(d)?;
     match opt {
         Some(s) => {
-            let bytes = BASE64
-                .decode(s.as_bytes())
-                .map_err(serde::de::Error::custom)?;
+            let bytes = b64_decode(&s).map_err(serde::de::Error::custom)?;
             Ok(Some(bytes))
         }
         None => Ok(None),
@@ -66,15 +64,13 @@ fn base64_deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>
 }
 
 fn base64_serialize_non_null<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-    let encoded = BASE64.encode(bytes);
+    let encoded = b64_encode(bytes);
     s.serialize_str(&encoded)
 }
 
 fn base64_deserialize_non_null<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
     let s: String = String::deserialize(d)?;
-    BASE64
-        .decode(s.as_bytes())
-        .map_err(serde::de::Error::custom)
+    b64_decode(&s).map_err(serde::de::Error::custom)
 }
 
 // ---------------------------------------------------------------------------

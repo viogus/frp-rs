@@ -1729,7 +1729,7 @@ impl Service {
                             }
                             #[cfg(feature = "vnet")]
                             Ok(FrpMessage::VnetPacket(vpkt)) => {
-                                match data_encoding::BASE64.decode(vpkt.data.as_bytes()) {
+                                match frp_core::base64::decode(&vpkt.data) {
                                     Ok(packet) => {
                                         // Virtual_net visitors first: deliver into
                                         // the visitor's STCP/XTCP tunnel. TUN-backed

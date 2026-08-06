@@ -373,7 +373,7 @@ fn build_http1_request_head(request: &http::Request<RecvStream>) -> Vec<u8> {
 fn extract_basic_auth_headers(headers: &http::HeaderMap) -> Option<(String, String)> {
     let value = headers.get("authorization")?.to_str().ok()?;
     let encoded = value.strip_prefix("Basic ")?.trim();
-    let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
+    let decoded = frp_core::base64::decode(encoded).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;
     Some((user.to_string(), pwd.to_string()))

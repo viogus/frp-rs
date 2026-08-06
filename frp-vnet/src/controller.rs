@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 
-use data_encoding::BASE64;
+use frp_core::base64::encode as b64_encode;
 
 use crate::router::RouteTable;
 use crate::tun::TunDevice;
@@ -131,7 +131,7 @@ impl VnetController {
                         if let Some(target) = target {
                             let vnet_pkt = frp_core::msg::VnetPacket {
                                 proxy_name: target,
-                                data: BASE64.encode(packet),
+                                data: b64_encode(packet),
                             };
                             let msg = frp_core::msg::FrpMessage::VnetPacket(vnet_pkt);
                             let mut writer = ctl_writer.lock().await;
@@ -616,7 +616,7 @@ mod tests {
             frp_core::msg::FrpMessage::VnetPacket(vpkt) => {
                 assert_eq!(vpkt.proxy_name, "v6-target");
                 assert_eq!(
-                    data_encoding::BASE64.decode(vpkt.data.as_bytes()).unwrap(),
+                    frp_core::base64::decode(&vpkt.data).unwrap(),
                     packet
                 );
             }

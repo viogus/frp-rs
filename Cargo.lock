@@ -1132,7 +1132,6 @@ dependencies = [
  "anyhow",
  "axum 0.8.9",
  "bytes",
- "data-encoding",
  "frp-core",
  "frp-server",
  "frp-vnet",
@@ -1169,7 +1168,6 @@ dependencies = [
  "cfb-mode",
  "chacha20poly1305",
  "criterion",
- "data-encoding",
  "futures-util",
  "http",
  "http-body-util",
@@ -1221,7 +1219,6 @@ dependencies = [
  "axum 0.8.9",
  "bytes",
  "criterion",
- "data-encoding",
  "frp-core",
  "frp-vnet",
  "h2",
@@ -1253,7 +1250,6 @@ name = "frp-vnet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "data-encoding",
  "frp-core",
  "libc",
  "serde",
@@ -1268,7 +1264,6 @@ name = "frpc"
 version = "0.7.1"
 dependencies = [
  "anyhow",
- "data-encoding",
  "frp-client",
  "frp-core",
  "mimalloc",

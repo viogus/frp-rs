@@ -3936,7 +3936,7 @@ mod tests {
 
         let mut ca_file = tempfile::NamedTempFile::new().expect("create CA tempfile");
         let ca_der = ca_cert.der();
-        let ca_b64 = data_encoding::BASE64.encode(ca_der.as_ref());
+        let ca_b64 = crate::base64::encode(ca_der.as_ref());
         let mut ca_pem = String::from("-----BEGIN CERTIFICATE-----\n");
         for chunk in ca_b64.as_bytes().chunks(64) {
             ca_pem.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));

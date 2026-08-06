@@ -15,7 +15,7 @@ use frp_core::logging;
 use frp_core::unsafe_features::UnsafeFeatures;
 use frp_core::{EXIT_AUTH, EXIT_BIND, EXIT_CONFIG, EXIT_RUNTIME};
 
-use data_encoding::BASE64;
+use frp_core::base64::encode as base64_encode;
 
 // ── Admin HTTP client (raw TCP, zero deps) ─────────────────────────────────────
 
@@ -67,7 +67,7 @@ fn basic_auth_header(user: &str, password: &str) -> String {
     let creds = format!("{user}:{password}");
     format!(
         "Authorization: Basic {}\r\n",
-        BASE64.encode(creds.as_bytes())
+        base64_encode(creds.as_bytes())
     )
 }
 

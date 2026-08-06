@@ -1,5 +1,5 @@
 use axum::{extract::State, routing::get, Json, Router};
-use data_encoding::BASE64;
+use frp_core::base64::encode as base64_encode;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -47,7 +47,7 @@ impl MockOidcProvider {
         let issuer = format!("http://127.0.0.1:{}", port);
         let secret = uuid::Uuid::new_v4().to_string();
         let kid = uuid::Uuid::new_v4().to_string();
-        let encoded_secret = BASE64.encode(secret.as_bytes());
+        let encoded_secret = base64_encode(secret.as_bytes());
 
         let jwks = serde_json::json!({
             "keys": [{

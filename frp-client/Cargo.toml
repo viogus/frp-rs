@@ -8,7 +8,6 @@ license = "MIT"
 frp-server = { path = "../frp-server" }
 tracing-subscriber.workspace = true
 md-5.workspace = true
-data-encoding.workspace = true
 tower = "0.5"
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 tempfile = "3"
@@ -32,7 +31,6 @@ h2 = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 rand.workspace = true
-data-encoding.workspace = true
 
 [features]
 default = ["tls", "kcp", "quic", "websocket", "oidc", "admin", "compression", "chacha20", "tcp-mux"]

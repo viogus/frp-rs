@@ -56,7 +56,6 @@ toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mimalloc = { workspace = true, optional = true }
-data-encoding.workspace = true
 
 [[bin]]
 name = "frpc"

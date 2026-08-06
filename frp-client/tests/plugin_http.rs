@@ -175,9 +175,8 @@ async fn test_https2https_accepts_self_signed_backend() {
     let key_pair = rcgen::KeyPair::generate().expect("keypair");
     let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("cert params");
     let cert = params.self_signed(&key_pair).expect("self-signed cert");
-    use data_encoding::BASE64;
     let wrap_pem = |label: &str, der: &[u8]| -> String {
-        let b64 = BASE64.encode(der);
+        let b64 = frp_core::base64::encode(der);
         let mut out = format!("-----BEGIN {label}-----\n");
         for chunk in b64.as_bytes().chunks(64) {
             out.push_str(std::str::from_utf8(chunk).unwrap());
