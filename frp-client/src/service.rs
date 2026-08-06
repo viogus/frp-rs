@@ -706,7 +706,7 @@ impl Service {
         let mut health_rx = self
             .health_rx
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("health_rx already taken — run() called twice?");
 
@@ -725,19 +725,19 @@ impl Service {
         let mut reload_rx = self
             .reload_rx
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("reload_rx already taken — run() called twice?");
         let mut xtcp_rx = self
             .xtcp_rx
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("xtcp_rx already taken — run() called twice?");
         let mut visitor_rx = self
             .visitor_rx
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("visitor_rx already taken — run() called twice?");
         let xtcp_tx = self.xtcp_tx.clone();
@@ -3023,7 +3023,7 @@ impl Service {
                         plugin_addrs.insert(name.clone(), addr);
                         self.plugin_handles
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|e| e.into_inner())
                             .insert(name.clone(), handle);
                     }
                     // If plugin start fails, plugin_addrs won't have an entry;
@@ -3384,7 +3384,7 @@ async fn spawn_vnet_tun_controller(
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
     vnet_tun_tx
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(proxy_name.to_string(), tun_tx);
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     vnet_tun_cancels

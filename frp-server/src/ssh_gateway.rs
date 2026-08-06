@@ -858,7 +858,7 @@ impl Handler for SshSession {
         if self
             .reverse_data_tx
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&channel)
             .is_some()
         {

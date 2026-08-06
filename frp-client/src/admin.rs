@@ -533,7 +533,7 @@ impl axum::serve::Listener for TlsListener {
             let tls_acceptor = self
                 .acceptor
                 .read()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .clone()
                 .expect("TLS acceptor not initialized");
             match tls_acceptor.accept(stream).await {
