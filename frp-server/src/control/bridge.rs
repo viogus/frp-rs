@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, warn};
 
 use frp_core::bandwidth::BandwidthLimiter;
@@ -10,7 +10,7 @@ use frp_core::buffer_pool::BUFFER_SIZE;
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
-use frp_core::transport::IoStream;
+use frp_core::transport::{split_work_conn_halves, IoStream};
 
 use crate::service::AppState;
 
@@ -542,82 +542,6 @@ fn parse_bandwidth_config(
 
 /// Type-erased bridge halves: erasing the per-transport types lets
 /// `bridge_encrypted` & friends share one monomorphization.
-type BoxedReadHalf = Box<dyn AsyncRead + Unpin + Send>;
-type BoxedWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
-
-/// Split a work `IoStream` into boxed read/write halves.
-///
-/// The bridge helpers (`bridge_encrypted` & friends) are generic over their
-/// stream types, so the old per-variant `match` on the work conn
-/// monomorphized `bridge_encrypted` once per IoStream variant (~10 copies,
-/// each several KiB). Boxing the halves erases the types so a single
-/// monomorphization is shared by every transport.
-///
-/// Splits exactly like the per-variant arms did (the same `tokio::io::split`
-/// / `into_split` per variant), so the halves wrap the same streams.
-/// Returns an `Err` with a log message for variants that cannot be bridged.
-///
-/// Reachability note: on the old encrypted+injector path the work conn was
-/// split with `into_split().unwrap()` — panicking on `PreRead`/`BufferedRead`
-/// carrying unconsumed buffered bytes, and silently splitting `Cipher`/`Aead`
-/// into a broken double-encrypted bridge. Here those cases degrade to an `Err`
-/// warn or a plain split instead. Reachable work conns arrive as
-/// `Tcp`/`Tls`/`Kcp`/`WS`/`Yamux`/`SshChannel`/empty-`PreRead`/consumed-
-/// `BufferedRead` (all split identically to the old code), so the reachable
-/// behavior is unchanged.
-pub(crate) fn split_work_conn_halves(
-    work_conn: IoStream,
-) -> Result<(BoxedReadHalf, BoxedWriteHalf), &'static str> {
-    Ok(match work_conn {
-        IoStream::Tcp(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        #[cfg(feature = "tls")]
-        IoStream::Tls(work, _) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        #[cfg(feature = "kcp")]
-        IoStream::Kcp(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        #[cfg(feature = "websocket")]
-        IoStream::WebSocket(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        #[cfg(feature = "quic")]
-        IoStream::Quic(work) => {
-            let (r, w) = work.into_split();
-            (Box::new(r), Box::new(w))
-        }
-        IoStream::Yamux(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        IoStream::SshChannel(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        IoStream::PreRead(_, work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        IoStream::BufferedRead(_, _, inner) => match inner.into_split() {
-            Ok((r, w)) => (Box::new(r), Box::new(w)),
-            Err(_) => return Err("BufferedRead with unconsumed bytes in server bridge"),
-        },
-        IoStream::Cipher(_) => return Err("Cipher stream unexpected in server bridge"),
-        IoStream::Aead(_) => return Err("Aead stream unexpected in server bridge"),
-        // Reachable when frp-core's quic feature is enabled through a
-        // dev-dependency while frp-server's own quic feature is off.
-        #[allow(unreachable_patterns)]
-        _ => return Err("unsupported IoStream variant in encrypted server bridge"),
-    })
-}
-
 /// Bridge a user connection to a work connection for one proxy.
 ///
 /// Runs inside the spawned bridge task. Extracted from `assign_work_to_proxy`

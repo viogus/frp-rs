@@ -1703,6 +1703,79 @@ impl IoStream {
     }
 }
 
+/// Split an `IoStream` into boxed read/write halves for bridging.
+///
+/// The bridge helpers (`bridge_encrypted` & friends) are generic over their
+/// stream types, so splitting per-variant would monomorphize each bridge once
+/// per `IoStream` variant (~10 copies, each several KiB). Boxing the halves
+/// erases the types so a single monomorphization is shared by every transport.
+///
+/// Splits exactly like [`IoStream::into_split`] per variant, so the halves
+/// wrap the same streams. Returns an `Err` with a log message for variants
+/// that cannot be bridged.
+///
+/// Reachability note: on the old encrypted+injector path the work conn was
+/// split with `into_split().unwrap()` — panicking on `PreRead`/`BufferedRead`
+/// carrying unconsumed buffered bytes, and silently splitting `Cipher`/`Aead`
+/// into a broken double-encrypted bridge. Here those cases degrade to an `Err`
+/// warn or a plain split instead. Reachable work conns arrive as
+/// `Tcp`/`Tls`/`Kcp`/`WS`/`Yamux`/`SshChannel`/empty-`PreRead`/consumed-
+/// `BufferedRead` (all split identically to the old code), so the reachable
+/// behavior is unchanged.
+pub fn split_work_conn_halves(
+    work_conn: IoStream,
+) -> Result<(Box<dyn AsyncRead + Unpin + Send>, Box<dyn AsyncWrite + Unpin + Send>), &'static str> {
+    Ok(match work_conn {
+        IoStream::Tcp(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        #[cfg(feature = "tls")]
+        IoStream::Tls(work, _) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        #[cfg(feature = "kcp")]
+        IoStream::Kcp(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        #[cfg(feature = "websocket")]
+        IoStream::WebSocket(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        #[cfg(feature = "quic")]
+        IoStream::Quic(work) => {
+            let (r, w) = work.into_split();
+            (Box::new(r), Box::new(w))
+        }
+        IoStream::Yamux(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        IoStream::SshChannel(work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        IoStream::PreRead(_, work) => {
+            let (r, w) = tokio::io::split(work);
+            (Box::new(r), Box::new(w))
+        }
+        IoStream::BufferedRead(_, _, inner) => match inner.into_split() {
+            Ok((r, w)) => (Box::new(r), Box::new(w)),
+            Err(_) => return Err("BufferedRead with unconsumed bytes in bridge"),
+        },
+        IoStream::Cipher(_) => return Err("Cipher stream unexpected in bridge"),
+        IoStream::Aead(_) => return Err("Aead stream unexpected in bridge"),
+        // Unreachable in frp-core itself (all variants covered above); kept as
+        // a defensive fallback in case a downstream crate observes the enum
+        // with a mismatched feature set.
+        #[allow(unreachable_patterns)]
+        _ => return Err("unsupported IoStream variant in bridge"),
+    })
+}
+
 /// Options for dialing the server.
 #[derive(Debug, Clone)]
 pub struct DialOptions {

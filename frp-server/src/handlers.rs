@@ -6,10 +6,9 @@ use tracing::{debug, info, instrument, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg;
-use frp_core::transport::IoStream;
+use frp_core::transport::{split_work_conn_halves, IoStream};
 
 use crate::control;
-use crate::control::bridge::split_work_conn_halves;
 use crate::lock::RwLockExt;
 use crate::nathole::controller as nathole_ctrl;
 use crate::nathole::{classify, NAT_HOLE_TIMEOUT};
