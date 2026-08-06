@@ -192,7 +192,13 @@ async fn handle_socks5_conn(
         .map_err(|e| format!("write reply: {e}"))?;
 
     // Step 5: Bidirectional relay
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
+    let _ = tokio::io::copy_bidirectional_with_sizes(
+        &mut client,
+        &mut remote,
+        *frp_core::buffer_pool::BUFFER_SIZE,
+        *frp_core::buffer_pool::BUFFER_SIZE,
+    )
+    .await;
     Ok(())
 }
 

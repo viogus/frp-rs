@@ -21,7 +21,7 @@
 //!    service sees the real client IP/port — the v0.70.0 fix (it was not
 //!    written before).
 //! 5. Bridge the decrypted TLS stream and the raw TCP connection
-//!    (`tokio::io::copy_bidirectional`, Go: `libio.Join`).
+//!    (`tokio::io::copy_bidirectional_with_sizes`, Go: `libio.Join`).
 //!
 //! Config:
 //! - plugin_local_addr: local raw TCP service address
@@ -138,7 +138,13 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
             }
 
             // 5. Bridge TLS (tunnel) ↔ raw TCP (local).
-            let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut raw_conn).await;
+            let _ = tokio::io::copy_bidirectional_with_sizes(
+                &mut tls_stream,
+                &mut raw_conn,
+                *frp_core::buffer_pool::BUFFER_SIZE,
+                *frp_core::buffer_pool::BUFFER_SIZE,
+            )
+            .await;
         },
     )
     .await
