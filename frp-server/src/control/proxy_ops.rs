@@ -325,7 +325,6 @@ async fn rollback_udp_bind_failure(
     state.proxy_manager.remove(proxy_name).await;
 }
 
-
 /// Pure validation of NewProxy fields. Returns Ok(()) or an error message.
 /// Checks port range, proxy_name length/control chars, custom_domains length,
 /// and subdomain length. Extracted from the async state machine to reduce

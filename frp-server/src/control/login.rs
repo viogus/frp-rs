@@ -265,7 +265,6 @@ async fn verify_login_auth(
     Ok((oidc_subject, stream))
 }
 
-
 /// Authenticate a new control connection and set up per-client state.
 /// On success returns all state needed by the main select! loop.
 /// On failure sends LoginResp with an error and returns `Err(())`.
