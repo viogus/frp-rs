@@ -68,13 +68,9 @@ async fn test_xtcp_nat_hole_message_routing() {
         multiplexer: None,
         virtual_net: None,
         proxy_protocol_version: None,
-        #[cfg(feature = "vnet")]
         advertise_subnet: None,
-        #[cfg(feature = "vnet")]
         vnet_ip: None,
-        #[cfg(feature = "vnet")]
         vnet_netmask: None,
-        #[cfg(feature = "vnet")]
         vnet_mtu: None,
     }));
     write_msg_v1(&mut provider_ctl, &np)
@@ -333,13 +329,9 @@ async fn test_xtcp_nat_hole_message_routing() {
         multiplexer: None,
         virtual_net: None,
         proxy_protocol_version: None,
-        #[cfg(feature = "vnet")]
         advertise_subnet: None,
-        #[cfg(feature = "vnet")]
         vnet_ip: None,
-        #[cfg(feature = "vnet")]
         vnet_netmask: None,
-        #[cfg(feature = "vnet")]
         vnet_mtu: None,
     }));
     write_msg_v1(&mut provider_ctl, &np2)
@@ -410,13 +402,9 @@ async fn test_xtcp_ignore_nat_hole_client_no_sid() {
         multiplexer: None,
         virtual_net: None,
         proxy_protocol_version: None,
-        #[cfg(feature = "vnet")]
         advertise_subnet: None,
-        #[cfg(feature = "vnet")]
         vnet_ip: None,
-        #[cfg(feature = "vnet")]
         vnet_netmask: None,
-        #[cfg(feature = "vnet")]
         vnet_mtu: None,
     }));
     write_msg_v1(&mut provider_ctl, &np)
@@ -470,13 +458,9 @@ async fn test_xtcp_ignore_nat_hole_client_no_sid() {
         multiplexer: None,
         virtual_net: None,
         proxy_protocol_version: None,
-        #[cfg(feature = "vnet")]
         advertise_subnet: None,
-        #[cfg(feature = "vnet")]
         vnet_ip: None,
-        #[cfg(feature = "vnet")]
         vnet_netmask: None,
-        #[cfg(feature = "vnet")]
         vnet_mtu: None,
     }));
     write_msg_v1(&mut provider_ctl, &np2)

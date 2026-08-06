@@ -1433,6 +1433,7 @@ async fn handle_tcp_group_member_registration(
 #[cfg(test)]
 mod unregister_generation_tests {
     use super::*;
+    #[cfg(feature = "vnet")]
     use std::time::Duration;
 
     fn test_state() -> Arc<AppState> {
