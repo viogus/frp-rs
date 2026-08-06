@@ -242,7 +242,6 @@ impl VirtualControl {
         // the plaintext LoginResp from the raw stream BEFORE wrapping our side
         // in CipherStream.
         tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
             use tokio::io::AsyncWriteExt;
 
             let mut from_ssh = from_ssh;
