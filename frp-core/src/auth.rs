@@ -1406,60 +1406,85 @@ impl crate::config::ValueSource {
                     .map(|content| content.trim().to_string())
                     .map_err(|e| format!("failed to read file {path}: {e}"))
             }
-            "exec" => {
-                let exec = self.exec.as_ref().expect("validated");
-                let mut cmd = std::process::Command::new(&exec.command);
-                cmd.args(&exec.args);
-                for env in &exec.env {
-                    cmd.env(&env.name, &env.value);
-                }
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
-                const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-                let child = cmd
-                    .spawn()
-                    .map_err(|e| format!("failed to execute command {}: {e}", exec.command))?;
-                let pid = child.id();
-                let (tx, rx) = std::sync::mpsc::channel();
-                let waiter = std::thread::spawn(move || {
-                    let output = child.wait_with_output();
-                    let _ = tx.send(output);
-                });
-                let output = match rx.recv_timeout(EXEC_TIMEOUT) {
-                    Ok(Ok(output)) => {
-                        let _ = waiter.join();
-                        output
-                    }
-                    Ok(Err(e)) => {
-                        let _ = waiter.join();
-                        return Err(format!("failed to execute command {}: {e}", exec.command));
-                    }
-                    Err(_) => {
-                        #[cfg(unix)]
-                        {
-                            let _ = std::process::Command::new("kill")
-                                .args(["-9", &pid.to_string()])
-                                .status();
-                        }
-                        let _ = waiter.join();
-                        return Err(format!(
-                            "failed to execute command {}: timed out after {}s",
-                            exec.command,
-                            EXEC_TIMEOUT.as_secs()
-                        ));
-                    }
-                };
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(format!(
-                        "failed to execute command {}: {} ({})",
-                        exec.command,
-                        output.status,
-                        stderr.trim()
-                    ));
-                }
-                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-            }
+	        "exec" => {
+	            let exec = self.exec.as_ref().expect("validated");
+	            const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+	            // On tokio multi-thread: block_in_place + Handle::block_on so the
+	            // child-process wait parks the driver, not a worker.
+	            if tokio::runtime::Handle::try_current()
+	                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+	            {
+	                return tokio::task::block_in_place(|| {
+	                    let rt = tokio::runtime::Handle::current();
+	                    let _guard = rt.enter();
+	                    let output = rt.block_on(async {
+	                        tokio::time::timeout(EXEC_TIMEOUT, async {
+	                            let child = tokio::process::Command::new(&exec.command)
+	                                .args(&exec.args)
+	                                .envs(exec.env.iter().map(|e| (&e.name, &e.value)))
+	                                .stdout(std::process::Stdio::piped())
+	                                .stderr(std::process::Stdio::piped())
+	                                .kill_on_drop(true)
+	                                .spawn()
+	                                .map_err(|e| format!("failed to execute command {}: {e}", exec.command))?;
+	                            child
+	                                .wait_with_output()
+	                                .await
+	                                .map_err(|e| format!("failed to execute command {}: {e}", exec.command))
+	                        })
+	                        .await
+	                    });
+	                    match output {
+	                        Ok(Ok(o)) => finish_exec_output(&exec.command, o),
+	                        Ok(Err(e)) => Err(e),
+	                        Err(_elapsed) => Err(format!(
+	                            "failed to execute command {}: timed out after {}s",
+	                            exec.command,
+	                            EXEC_TIMEOUT.as_secs()
+	                        )),
+	                    }
+	                });
+	            }
+	            // Sync fallback for no-runtime / current-thread runtime contexts.
+	            let child = std::process::Command::new(&exec.command)
+	                .args(&exec.args)
+	                .envs(exec.env.iter().map(|e| (&e.name, &e.value)))
+	                .stdout(std::process::Stdio::piped())
+	                .stderr(std::process::Stdio::piped())
+	                .spawn()
+	                .map_err(|e| format!("failed to execute command {}: {e}", exec.command))?;
+	            let pid = child.id();
+            let (tx, rx) = std::sync::mpsc::channel();
+	            let waiter = std::thread::spawn(move || {
+	                let output = child.wait_with_output();
+	                let _ = tx.send(output);
+	            });
+	            let output = match rx.recv_timeout(EXEC_TIMEOUT) {
+	                Ok(Ok(o)) => {
+	                    let _ = waiter.join();
+	                    o
+	                }
+	                Ok(Err(e)) => {
+	                    let _ = waiter.join();
+	                    return Err(format!("failed to execute command {}: {e}", exec.command));
+	                }
+	                Err(_) => {
+	                    #[cfg(unix)]
+	                    {
+	                        let _ = std::process::Command::new("kill")
+	                            .args(["-9", &pid.to_string()])
+	                            .status();
+	                    }
+	                    let _ = waiter.join();
+	                    return Err(format!(
+	                        "failed to execute command {}: timed out after {}s",
+	                        exec.command,
+	                        EXEC_TIMEOUT.as_secs()
+	                    ));
+	                }
+	            };
+	            finish_exec_output(&exec.command, output)
+	        }
             other => Err(format!("unsupported value source type: {other}")),
         }
     }
