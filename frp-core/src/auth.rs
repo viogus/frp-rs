@@ -1329,27 +1329,22 @@ fn resolve_dynamic_token_inner(
         if parts.is_empty() {
             return Err("Dynamic token exec:// with empty command".into());
         }
-        match std::process::Command::new(parts[0])
-            .args(&parts[1..])
-            .output()
-        {
-            Ok(o) => {
-                if !o.status.success() {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    return Err(format!(
-                        "Dynamic token exec command '{}' exited with {}: {}",
-                        cmd,
-                        o.status,
-                        stderr.trim()
-                    ));
-                }
-                Ok(String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string())
+        // Prefer the async path (tokio::process::Command) when running on a
+        // multi-thread tokio runtime so no worker thread is parked on
+        // child-process wait. `block_in_place` hands the current worker back
+        // to the runtime, then `Handle::block_on` drives the async spawn on
+        // this thread (the pattern tokio documents for re-entering the async
+        // context of a multi-thread runtime). The synchronous spawn remains
+        // as a fallback for callers outside any runtime (unit tests) and for
+        // current-thread runtimes, where `block_in_place` would panic.
+        let output = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(exec_token_command_async(&parts)))
             }
+            _ => exec_token_command_sync(&parts),
+        };
+        match output {
+            Ok(o) => finish_exec_output(cmd, o),
             Err(e) => Err(format!(
                 "Failed to exec dynamic token command '{}': {}",
                 cmd, e
@@ -1358,6 +1353,41 @@ fn resolve_dynamic_token_inner(
     } else {
         Ok(token.to_string())
     }
+}
+
+/// Run the exec:// token command via `tokio::process`, so `wait_with_output`
+/// parks the runtime's process driver instead of a worker thread. Returns a
+/// `std::process::Output` so both paths share `finish_exec_output`.
+async fn exec_token_command_async(parts: &[&str]) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new(parts[0])
+        .args(&parts[1..])
+        .output()
+        .await
+}
+
+/// Synchronous fallback used when no multi-thread tokio runtime is available.
+fn exec_token_command_sync(parts: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(parts[0]).args(&parts[1..]).output()
+}
+
+/// Shared post-processing for both exec paths: check exit status, take the
+/// first stdout line and trim it (Go frp `getFirstLine` semantics).
+fn finish_exec_output(cmd: &str, o: std::process::Output) -> Result<String, String> {
+    if !o.status.success() {
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        return Err(format!(
+            "Dynamic token exec command '{}' exited with {}: {}",
+            cmd,
+            o.status,
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string())
 }
 
 impl crate::config::ValueSource {
@@ -1904,6 +1934,22 @@ mod tests {
         );
         let result = resolve_dynamic_token_checked("exec:///bin/echo dynamic-token-value", &uf);
         assert_eq!(result.unwrap(), "dynamic-token-value");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_resolve_dynamic_token_exec_on_runtime() {
+        // Executed from inside a spawned worker task (not the block_on entry
+        // point) so the `block_in_place` + `Handle::block_on` async path is
+        // exercised: the exec must resolve without blocking the worker.
+        let uf = crate::unsafe_features::UnsafeFeatures::new(
+            crate::unsafe_features::CLIENT_UNSAFE_FEATURES,
+        );
+        let result = tokio::spawn(async move {
+            resolve_dynamic_token_checked("exec:///bin/echo runtime-token-value", &uf)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), "runtime-token-value");
     }
 
     #[test]
