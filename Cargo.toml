@@ -43,7 +43,6 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 http-body-util = "0.1"
 webpki-roots = "0.26"
-rustls-pemfile = "2"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "tracing"] }
 prometheus = { version = "0.14", default-features = false }
 yamux = "0.14"

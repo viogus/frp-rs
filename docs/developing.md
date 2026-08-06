@@ -768,9 +768,9 @@ The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be 
 | Crypto (general) | `ring` 0.17 |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` |
-| TLS | `rustls` + `tokio-rustls` + `rustls-pemfile` + `rustls-platform-verifier` |
+| TLS | `rustls` + `tokio-rustls` + `rustls-pki-types` (PEM via `PemObject`) + `rustls-platform-verifier` |
 | SSH | `russh` (ring backend, NOT aws-lc-rs) |
-| HTTP client | `reqwest` (rustls-tls only) |
+| HTTP client | `hyper` + `hyper-rustls` + `hyper-util` (OIDC/plugin), `reqwest` (HTTP proxy plugin, rustls-tls only) |
 | HTTP server | `axum` |
 | WebSocket | `tokio-tungstenite` |
 | Encoding | `data_encoding` |

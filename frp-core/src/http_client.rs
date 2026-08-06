@@ -102,7 +102,7 @@ fn build_tls_config(
     // If a custom CA cert was provided, add it (extends the store; does not
     // replace it — matching reqwest's add_root_certificate semantics).
     if let Some(pem) = ca_cert_pem {
-        let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
+        let certs = rustls::pki_types::pem::PemObject::pem_slice_iter(pem)
             .collect::<Result<Vec<CertificateDer<'_>>, _>>()
             .map_err(|e| format!("OIDC: failed to parse CA certificate PEM: {e}"))?;
         if certs.is_empty() {
