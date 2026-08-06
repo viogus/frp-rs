@@ -633,83 +633,84 @@ impl FrpMessage {
         }
     }
 
-    // Accessor helpers
-    pub fn as_login(&self) -> &Login {
+    // Accessor helpers — return None on variant mismatch instead of panicking
+    // (pub API, so wrong-variant calls must not be a footgun).
+    pub fn as_login(&self) -> Option<&Login> {
         match self {
-            FrpMessage::Login(v) => v,
-            _ => panic!("not a Login"),
+            FrpMessage::Login(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_login_resp(&self) -> &LoginResp {
+    pub fn as_login_resp(&self) -> Option<&LoginResp> {
         match self {
-            FrpMessage::LoginResp(v) => v,
-            _ => panic!("not a LoginResp"),
+            FrpMessage::LoginResp(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_new_proxy(&self) -> &NewProxy {
+    pub fn as_new_proxy(&self) -> Option<&NewProxy> {
         match self {
-            FrpMessage::NewProxy(v) => v,
-            _ => panic!("not a NewProxy"),
+            FrpMessage::NewProxy(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_new_proxy_resp(&self) -> &NewProxyResp {
+    pub fn as_new_proxy_resp(&self) -> Option<&NewProxyResp> {
         match self {
-            FrpMessage::NewProxyResp(v) => v,
-            _ => panic!("not a NewProxyResp"),
+            FrpMessage::NewProxyResp(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_close_proxy(&self) -> &CloseProxy {
+    pub fn as_close_proxy(&self) -> Option<&CloseProxy> {
         match self {
-            FrpMessage::CloseProxy(v) => v,
-            _ => panic!("not a CloseProxy"),
+            FrpMessage::CloseProxy(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_new_work_conn(&self) -> &NewWorkConn {
+    pub fn as_new_work_conn(&self) -> Option<&NewWorkConn> {
         match self {
-            FrpMessage::NewWorkConn(v) => v,
-            _ => panic!("not a NewWorkConn"),
+            FrpMessage::NewWorkConn(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_start_work_conn(&self) -> &StartWorkConn {
+    pub fn as_start_work_conn(&self) -> Option<&StartWorkConn> {
         match self {
-            FrpMessage::StartWorkConn(v) => v,
-            _ => panic!("not a StartWorkConn"),
+            FrpMessage::StartWorkConn(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_ping(&self) -> &Ping {
+    pub fn as_ping(&self) -> Option<&Ping> {
         match self {
-            FrpMessage::Ping(v) => v,
-            _ => panic!("not a Ping"),
+            FrpMessage::Ping(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_new_visitor_conn(&self) -> &NewVisitorConn {
+    pub fn as_new_visitor_conn(&self) -> Option<&NewVisitorConn> {
         match self {
-            FrpMessage::NewVisitorConn(v) => v,
-            _ => panic!("not a NewVisitorConn"),
+            FrpMessage::NewVisitorConn(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_new_visitor_conn_resp(&self) -> &NewVisitorConnResp {
+    pub fn as_new_visitor_conn_resp(&self) -> Option<&NewVisitorConnResp> {
         match self {
-            FrpMessage::NewVisitorConnResp(v) => v,
-            _ => panic!("not a NewVisitorConnResp"),
+            FrpMessage::NewVisitorConnResp(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_close_proxy_resp(&self) -> &CloseProxyResp {
+    pub fn as_close_proxy_resp(&self) -> Option<&CloseProxyResp> {
         match self {
-            FrpMessage::CloseProxyResp(v) => v,
-            _ => panic!("not a CloseProxyResp"),
+            FrpMessage::CloseProxyResp(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_pong(&self) -> &Pong {
+    pub fn as_pong(&self) -> Option<&Pong> {
         match self {
-            FrpMessage::Pong(v) => v,
-            _ => panic!("not a Pong"),
+            FrpMessage::Pong(v) => Some(v),
+            _ => None,
         }
     }
-    pub fn as_error(&self) -> &Error {
+    pub fn as_error(&self) -> Option<&Error> {
         match self {
-            FrpMessage::Error(v) => v,
-            _ => panic!("not an Error"),
+            FrpMessage::Error(v) => Some(v),
+            _ => None,
         }
     }
 

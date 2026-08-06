@@ -359,11 +359,12 @@ impl WsByteStream {
     }
 
     /// Consume the adapter and return the underlying WebSocket stream.
-    /// Panics if called on a Raw variant.
-    pub fn into_inner(self) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+    /// Returns `None` if this was created from a raw stream (`from_raw`),
+    /// which stores a type-erased `Box<dyn AsyncReadWrite>` instead.
+    pub fn into_inner(self) -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         match self.inner {
-            WsInner::Tungstenite(ws) => *Pin::into_inner(ws),
-            WsInner::Raw(_) => panic!("into_inner called on Raw variant — Raw stores Box<dyn AsyncReadWrite>, not WebSocketStream"),
+            WsInner::Tungstenite(ws) => Some(*Pin::into_inner(ws)),
+            WsInner::Raw(_) => None,
         }
     }
 }
