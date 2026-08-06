@@ -1742,7 +1742,10 @@ impl Service {
                                         {
                                             Ok(()) => {}
                                             Err(packet) => {
-                                                let txs = self.vnet_tun_tx.lock().unwrap();
+                                                let txs = self
+                                                    .vnet_tun_tx
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
                                                 if let Some(tx) = txs.get(&vpkt.proxy_name) {
                                                     if tx.try_send(packet).is_err() {
                                                         warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
@@ -3465,7 +3468,10 @@ async fn remove_vnet_tun(
         let _ = cancel.send(true);
     }
     vnet_tuns.lock().await.remove(proxy_name);
-    vnet_tun_tx.lock().unwrap().remove(proxy_name);
+    vnet_tun_tx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(proxy_name);
     let tun_name = vnet_tun_names.lock().await.remove(proxy_name);
     // Remove the OS route for the local TUN subnet (the kernel also cleans it
     // up on TUN teardown, but explicit removal keeps add/remove symmetric).

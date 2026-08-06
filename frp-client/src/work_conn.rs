@@ -420,7 +420,7 @@ async fn run_udp_work_conn(
                         Ok(FrpMessage::UDPPacket(up)) => {
                             if let Some(ref ra) = up.remote_addr {
                                 if let Ok(ip) = ra.ip.parse::<std::net::IpAddr>() {
-                                    *last_remote_r.lock().unwrap() =
+                                    *last_remote_r.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some(std::net::SocketAddr::new(ip, ra.port));
                                 } else {
                                     warn!(ip = %ra.ip, port = ra.port,
@@ -446,7 +446,9 @@ async fn run_udp_work_conn(
                             // Prepend PROXY header on the first packet of the
                             // session (Go: first packet of each remote conn).
                             if first_packet && !pp_version.is_empty() {
-                                if let Some(remote) = *last_remote_r.lock().unwrap() {
+                                if let Some(remote) =
+                                    *last_remote_r.lock().unwrap_or_else(|e| e.into_inner())
+                                {
                                     if let Ok(header) =
                                         frp_core::proxy_protocol::build_proxy_protocol_header(
                                             &remote.ip().to_string(),
@@ -542,7 +544,10 @@ async fn run_udp_work_conn(
                             {
                                 std::mem::swap(&mut payload, &mut scratch_d);
                             }
-                            let remote_addr = last_remote_w.lock().unwrap().map(|sa| msg::UdpAddr {
+                            let remote_addr = last_remote_w
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .map(|sa| msg::UdpAddr {
                                 ip: sa.ip().to_string(),
                                 port: sa.port(),
                                 zone: String::new(),
@@ -625,7 +630,7 @@ async fn run_virtual_net_plugin_work_conn(
     enc_key: [u8; 16],
 ) {
     let tun_tx = {
-        let txs = vnet_tun_tx.lock().unwrap();
+        let txs = vnet_tun_tx.lock().unwrap_or_else(|e| e.into_inner());
         txs.get(&proxy_name).cloned()
     };
     let Some(tun_tx) = tun_tx else {

@@ -1201,7 +1201,7 @@ async fn deliver_tunnel_ingress(
     // Take the tokio lock first so the std Mutex guard never spans an await
     // point (the guarded section below is fully synchronous).
     let subnets = tun_subnets.lock().await;
-    let txs = vnet_tun_tx.lock().unwrap();
+    let txs = vnet_tun_tx.lock().unwrap_or_else(|e| e.into_inner());
     let dst = frp_vnet::router::packet_dst_ip(&packet);
     let mut delivered = false;
     for (proxy, tx) in txs.iter() {
