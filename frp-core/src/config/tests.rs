@@ -2489,7 +2489,7 @@ auth:
 #[test]
 fn test_collect_config_files_includes_yaml_and_yml() {
     let dir = tempfile::tempdir().unwrap();
-    for name in ["a.toml", "b.yaml", "c.yml", "d.json", "notes.txt"] {
+    for name in ["a.toml", "b.yaml", "c.yml", "d.json", "notes.txt", "CONFIG.YAML"] {
         std::fs::write(dir.path().join(name), "").unwrap();
     }
     std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -2500,7 +2500,7 @@ fn test_collect_config_files_includes_yaml_and_yml() {
         .iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    for expected in ["a.toml", "b.yaml", "c.yml", "d.json", "e.yaml", "f.ini"] {
+    for expected in ["a.toml", "b.yaml", "c.yml", "d.json", "e.yaml", "f.ini", "CONFIG.YAML"] {
         assert!(
             names.contains(&expected.to_string()),
             "missing {expected}: {names:?}"
