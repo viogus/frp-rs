@@ -734,6 +734,21 @@ impl Service {
             for p in &proxies {
                 if p.proxy_type == "udp" || p.proxy_type == "sudp" {
                     let local_addr = format!("{}:{}", p.local_ip, p.local_port);
+                    let enc = (p.use_encryption, p.use_compression);
+                    {
+                        let mut cfg = udp_enc_cfg.lock().await;
+                        cfg.insert(local_addr.clone(), enc);
+                        cfg.insert(wire_proxy_name(&cfg_local.user, &p.name), enc);
+                    }
+                    if p.proxy_type == "sudp" {
+                        // SUDP work conns create their own local socket per
+                        // work conn (see work_conn.rs): no shared socket here.
+                        // The shared map is only for plain udp proxies.
+                        info!(proxy_name = %p.name, local_addr = %local_addr,
+                            "SUDP proxy '{}' ready (per-work-conn UDP socket to {})",
+                            p.name, local_addr);
+                        continue;
+                    }
                     let bind_addr = format!("{}:0", p.local_ip);
                     let socket = match UdpSocket::bind(&bind_addr).await {
                         Ok(s) => Arc::new(s),
@@ -752,18 +767,12 @@ impl Service {
                         // {user}. prefix), matching work_conn's lookup key
                         // (swc.proxy_name) and proxy_info_map. The previous
                         // `p.name` (unprefixed) key missed whenever the client
-                        // has a non-empty `user` configured, leaving UDP/SUDP
+                        // has a non-empty `user` configured, leaving UDP
                         // work conns without their local socket.
                         let wire_name = wire_proxy_name(&cfg_local.user, &p.name);
                         let mut map = udp_sockets.lock().await;
                         map.insert(local_addr.clone(), socket.clone());
                         map.insert(wire_name.clone(), socket);
-                    }
-                    {
-                        let mut cfg = udp_enc_cfg.lock().await;
-                        let enc = (p.use_encryption, p.use_compression);
-                        cfg.insert(local_addr.clone(), enc);
-                        cfg.insert(wire_proxy_name(&cfg_local.user, &p.name), enc);
                     }
                     let enc_label = if p.use_encryption {
                         "encrypted"

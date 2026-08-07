@@ -293,21 +293,29 @@ async fn rollback_port_allocation(
     // Exclude nothing here: this rollback runs after a *failed* register,
     // so we are not in the registry — and if the failure was a same-name
     // conflict, the live proxy holding the port must count as an owner.
-    if is_udp_type && !udp_port_has_other_owner(state, port, "").await {
+    if is_udp_type
+        && !udp_port_has_other_owner(state, port, &std::collections::HashSet::new()).await
+    {
         state.used_udp_ports.write().await.remove(&port);
     }
 }
 
-/// True if a live UDP/SUDP proxy other than `exclude` still holds `port`.
+/// True if a live UDP/SUDP proxy not in `exclude` still holds `port`.
 ///
 /// SUDP proxies can share a single server UDP port (the frp-rs shared-port
 /// extension) across proxies and run_ids, so UDP-port bookkeeping must not
-/// be torn down while another owner remains.
-async fn udp_port_has_other_owner(state: &Arc<AppState>, port: u16, exclude: &str) -> bool {
+/// be torn down while another owner remains. `exclude` is the set of names
+/// being removed *by this caller*: during teardown the proxies being
+/// deleted are still in the registry, so they must not count as owners.
+async fn udp_port_has_other_owner(
+    state: &Arc<AppState>,
+    port: u16,
+    exclude: &std::collections::HashSet<String>,
+) -> bool {
     state.proxy_manager.list().await.into_iter().any(|info| {
         info.remote_port == Some(port)
             && (info.proxy_type == "udp" || info.proxy_type == "sudp")
-            && info.name != exclude
+            && !exclude.contains(&info.name)
     })
 }
 
@@ -1177,6 +1185,11 @@ pub(crate) async fn unregister_control(
     // released only when no OTHER live udp/sudp proxy still occupies it.
     // Query the registry BEFORE taking the UDP-port lock (avoids awaiting a
     // different lock while holding it).
+    // The whole batch being removed counts as "not owners": the proxies are
+    // still in the registry during teardown, so same-batch SUDP proxies
+    // sharing one port must not be treated as live owners of each other.
+    let removing: std::collections::HashSet<String> =
+        proxies.iter().map(|p| p.name.clone()).collect();
     let mut udp_port_shared: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
     for p in &proxies {
@@ -1184,7 +1197,7 @@ pub(crate) async fn unregister_control(
             if let Some(port) = p.remote_port {
                 udp_port_shared.insert(
                     p.name.clone(),
-                    udp_port_has_other_owner(state, port, &p.name).await,
+                    udp_port_has_other_owner(state, port, &removing).await,
                 );
             }
         }
