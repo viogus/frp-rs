@@ -14,17 +14,23 @@ use tokio::net::TcpStream;
 use frp_core::config::PluginConfig;
 
 /// Unique socket path per test (process id + timestamp) so parallel tests
-/// never collide on `/tmp`.
+/// never collide on the temp dir.
 fn unique_socket_path(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "frp-rs-plugin-unix-{tag}-{}-{}",
-        std::process::id(),
-        nanos
-    ))
+    let name = format!("frp-rs-{tag}-{}-{}", std::process::id(), nanos);
+    // Unix socket paths are capped at SUN_LEN (104 bytes on macOS, 108 on
+    // Linux). Sandboxes sometimes set TMPDIR to a very long path, which would
+    // make the bind fail with "path must be shorter than SUN_LEN" — fall back
+    // to /tmp in that case (cfg(unix), so /tmp always exists).
+    let path = std::env::temp_dir().join(&name);
+    if path.to_str().is_some_and(|s| s.len() < 100) {
+        path
+    } else {
+        PathBuf::from("/tmp").join(&name)
+    }
 }
 
 /// Start an echo server on a Unix domain socket.
