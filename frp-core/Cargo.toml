@@ -8,6 +8,11 @@ license = "MIT"
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# YAML config support; justification recorded at the workspace dependency
+# ([workspace.dependencies].serde_yaml_ng). Non-optional because config
+# loading is compiled into both frps and frpc (+~250KB to each release
+# binary).
+serde_yaml_ng.workspace = true
 bpaf.workspace = true
 toml.workspace = true
 anyhow.workspace = true

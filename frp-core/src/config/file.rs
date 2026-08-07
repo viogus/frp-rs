@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use super::client::ClientConfig;
+use super::format::{detect_format, parse_to_toml_value};
 use super::loader::{validate_client_config, validate_server_config};
 use super::normalize::{load_config_from_file, normalize_client_config, normalize_server_config};
 use super::server::ServerConfig;
@@ -45,9 +46,11 @@ pub fn load_client_config(
     Ok(cfg)
 }
 
-/// Process `includes` directives in a TOML config: for each glob pattern,
-/// find matching files relative to `base_dir`, parse each, and deep-merge
-/// into the main config. Removes the `includes` key after processing.
+/// Process `includes` directives in a config: for each glob pattern,
+/// find matching files relative to `base_dir`, parse each (with format
+/// detection, so `.yaml`/`.yml`/`.json`/`.ini` include files work too), and
+/// deep-merge into the main config. Removes the `includes` key after
+/// processing.
 pub(super) fn process_includes(
     value: &mut toml::Value,
     base_dir: &Path,
@@ -96,7 +99,11 @@ pub(super) fn process_includes(
                     continue;
                 }
             };
-            let inc_value: Value = match toml::from_str(&content) {
+            // Parse the include file with format detection (extension-based),
+            // so `.yaml`/`.yml` include files go through the same
+            // YAML→TOML→merge pipeline as the main config.
+            let format = detect_format(path.to_string_lossy().as_ref());
+            let inc_value: Value = match parse_to_toml_value(&content, format) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "Include file {}: parse error: {}", path.display(), e);
@@ -225,7 +232,14 @@ fn collect_config_files_inner(
             collect_config_files_inner(&path, files)?;
         } else if path
             .extension()
-            .is_some_and(|ext| ext == "toml" || ext == "ini" || ext == "json")
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                // Case-insensitive, matching `detect_format` (e.g. `CONFIG.YAML`).
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "toml" | "ini" | "json" | "yaml" | "yml"
+                )
+            })
         {
             files.push(path);
         }

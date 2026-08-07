@@ -2284,3 +2284,230 @@ max_pool_count = 10
     assert_eq!(cfg.transport.heartbeat_timeout, 120);
     assert_eq!(cfg.transport.max_pool_count, 10);
 }
+
+// ─── YAML config support (Go frp v0.70.1 Viper parity) ──────────────
+
+/// Parse a YAML server config through the full pipeline (YAML → toml::Value
+/// → normalize → deserialize), mirroring `load_server_config_from_str` for
+/// TOML.
+fn load_server_config_from_yaml(yaml: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
+    normalize_server_config(&mut value);
+    let presence = super::loader::ConfigPresence::from_normalized_value(&value);
+    let json_value = super::normalize::toml_to_json(value);
+    let mut cfg: ServerConfig =
+        serde_json::from_value(json_value).map_err(|e| format!("config validation error: {e}"))?;
+    super::loader::validate_server_config(&cfg)?;
+    cfg.transport
+        .complete_with_heartbeat_timeout_set(presence.server_heartbeat_timeout_set);
+    cfg.complete();
+    Ok(cfg)
+}
+
+/// Parse a YAML client config through the full pipeline, mirroring
+/// `load_client_config_from_str` for TOML.
+fn load_client_config_from_yaml(yaml: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
+    normalize_client_config(&mut value);
+    let presence = super::loader::ConfigPresence::from_normalized_value(&value);
+    let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
+        .map_err(|e| format!("config validation error: {e}"))?;
+    super::loader::validate_client_config(&cfg)?;
+    cfg.complete_with_heartbeat_set(
+        presence.client_heartbeat_interval_set,
+        presence.client_heartbeat_timeout_set,
+    );
+    Ok(cfg)
+}
+
+#[test]
+fn test_detect_format_yaml_extensions() {
+    use super::format::{detect_format, ConfigFormat};
+    assert_eq!(detect_format("frps.yaml"), ConfigFormat::Yaml);
+    assert_eq!(detect_format("frpc.yml"), ConfigFormat::Yaml);
+    assert_eq!(
+        detect_format("frps.YAML"),
+        ConfigFormat::Yaml,
+        "case-insensitive"
+    );
+    assert_eq!(detect_format("frps.toml"), ConfigFormat::Toml);
+}
+
+#[test]
+fn test_server_yaml_equivalent_to_toml() {
+    let toml = r#"
+bind_addr = "0.0.0.0"
+bind_port = 7000
+
+[auth]
+method = "token"
+token = "my-token"
+
+[log]
+level = "info"
+"#;
+    let yaml = r#"
+bind_addr: "0.0.0.0"
+bind_port: 7000
+auth:
+  method: token
+  token: my-token
+log:
+  level: info
+"#;
+    let toml_cfg = super::load_server_config_from_str(toml).unwrap();
+    let yaml_cfg = load_server_config_from_yaml(yaml).unwrap();
+    assert_eq!(toml_cfg.bind_addr, yaml_cfg.bind_addr);
+    assert_eq!(toml_cfg.bind_port, yaml_cfg.bind_port);
+    assert_eq!(toml_cfg.auth.method, yaml_cfg.auth.method);
+    assert_eq!(toml_cfg.auth.token, yaml_cfg.auth.token);
+    assert_eq!(toml_cfg.log.level, yaml_cfg.log.level);
+}
+
+#[test]
+fn test_client_yaml_equivalent_to_toml() {
+    let toml = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "client-token"
+
+[[proxies]]
+name = "web"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 8080
+remote_port = 7001
+"#;
+    let yaml = r#"
+server_addr: "127.0.0.1"
+server_port: 7000
+token: client-token
+proxies:
+  - name: web
+    type: tcp
+    local_ip: "127.0.0.1"
+    local_port: 8080
+    remote_port: 7001
+"#;
+    let toml_cfg = super::load_client_config_from_str(toml).unwrap();
+    let yaml_cfg = load_client_config_from_yaml(yaml).unwrap();
+    assert_eq!(toml_cfg.server_addr, yaml_cfg.server_addr);
+    assert_eq!(toml_cfg.server_port, yaml_cfg.server_port);
+    assert_eq!(toml_cfg.token, yaml_cfg.token);
+    assert_eq!(toml_cfg.proxies.len(), yaml_cfg.proxies.len());
+    let (tp, yp) = (&toml_cfg.proxies[0], &yaml_cfg.proxies[0]);
+    assert_eq!(tp.name, yp.name);
+    assert_eq!(tp.proxy_type, yp.proxy_type);
+    assert_eq!(tp.local_ip, yp.local_ip);
+    assert_eq!(tp.local_port, yp.local_port);
+    assert_eq!(tp.remote_port, yp.remote_port);
+}
+
+#[test]
+fn test_yaml_merge_key_applied_at_parse_time() {
+    let yaml = r#"
+defaults: &defaults
+  a: 1
+  b: 2
+merged:
+  <<: *defaults
+  b: 3
+"#;
+    let value =
+        super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml).unwrap();
+    let merged = value.get("merged").expect("merged table");
+    assert_eq!(
+        merged.get("a").and_then(toml::Value::as_integer),
+        Some(1),
+        "inherited key from <<"
+    );
+    assert_eq!(
+        merged.get("b").and_then(toml::Value::as_integer),
+        Some(3),
+        "explicit key wins over merge"
+    );
+    assert!(merged.get("<<").is_none(), "merge key must be consumed");
+}
+
+#[test]
+fn test_yaml_merge_key_merges_anchor_fields() {
+    let yaml = r#"
+server_addr: "127.0.0.1"
+server_port: 7000
+proxies:
+  - &base
+    name: base
+    type: tcp
+    local_ip: "127.0.0.1"
+    use_encryption: true
+  - <<: *base
+    name: merged
+    local_port: 8080
+    remote_port: 7001
+"#;
+    let cfg = load_client_config_from_yaml(yaml).unwrap();
+    assert_eq!(cfg.proxies.len(), 2);
+    let merged = cfg.proxies.iter().find(|p| p.name == "merged").unwrap();
+    assert_eq!(merged.local_ip, "127.0.0.1", "<< merged local_ip");
+    assert!(merged.use_encryption, "<< merged use_encryption");
+    assert_eq!(merged.local_port, 8080, "explicit field wins over merge");
+    assert_eq!(merged.remote_port, 7001);
+}
+
+#[test]
+fn test_yaml_include_file_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("frps.toml");
+    std::fs::write(
+        &main_path,
+        r#"
+bind_addr = "0.0.0.0"
+bind_port = 7000
+includes = ["extra.yaml"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("extra.yaml"),
+        r#"
+auth:
+  method: token
+  token: "yaml-token"
+"#,
+    )
+    .unwrap();
+    let cfg = super::load_server_config(main_path.to_str().unwrap(), false).unwrap();
+    assert_eq!(cfg.bind_addr, "0.0.0.0");
+    assert_eq!(cfg.bind_port, 7000);
+    assert_eq!(cfg.auth.method, "token");
+    assert_eq!(
+        cfg.auth.token, "yaml-token",
+        "include .yaml should merge auth.token"
+    );
+}
+
+#[test]
+fn test_collect_config_files_includes_yaml_and_yml() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.toml", "b.yaml", "c.yml", "d.json", "notes.txt"] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("e.yaml"), "").unwrap();
+    std::fs::write(dir.path().join("sub").join("f.ini"), "").unwrap();
+    let files = super::collect_config_files(dir.path()).unwrap();
+    let names: Vec<String> = files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    for expected in ["a.toml", "b.yaml", "c.yml", "d.json", "e.yaml", "f.ini"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing {expected}: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n == "notes.txt"),
+        "non-config file collected: {names:?}"
+    );
+}
