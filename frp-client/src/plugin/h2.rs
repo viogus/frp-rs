@@ -580,7 +580,14 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     let mut resp = http::Response::builder()
         .status(status)
         .body(())
-        .expect("parsed backend status is a valid HTTP status");
+        .map_err(|e| {
+            debug!(
+                error = %e,
+                backend_status = status,
+                "https plugin backend sent an invalid HTTP status code"
+            );
+            h2::Error::from(h2::Reason::INTERNAL_ERROR)
+        })?;
     for (n, v) in &headers {
         if is_hop_by_hop(n.as_str()) {
             continue;

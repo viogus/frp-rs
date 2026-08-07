@@ -145,7 +145,6 @@ fn match_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
             Box::pin(super::proxy::handle_close_proxy(ctx, ctl, writer, m))
         }
         FrpMessage::Ping(m) => Box::pin(super::proxy::handle_ping(ctx, ctl, writer, m)),
-        FrpMessage::UDPPacket(m) => Box::pin(super::proxy::handle_udp_packet(ctx, ctl, writer, m)),
         FrpMessage::NatHoleClient(m) => Box::pin(async move {
             super::nathole::handle_nat_hole_client(ctx, ctl, writer, *m).await;
             Ok(())

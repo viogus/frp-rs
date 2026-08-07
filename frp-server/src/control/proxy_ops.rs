@@ -547,7 +547,6 @@ async fn setup_proxy_listeners(
     bind_addr: &str,
     itx: &mpsc::Sender<InternalMsg>,
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
-    udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
     listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     writer: &mut (impl AsyncWriteExt + Unpin),
     v2: bool,
@@ -624,12 +623,6 @@ async fn setup_proxy_listeners(
             }
         };
         udp_sockets.insert(np.proxy_name.clone(), socket);
-        // Build reverse lookup: local_addr → proxy_name for routing UDPPacket responses
-        if let Some(ref local_str) = np.local_str {
-            if !local_str.is_empty() {
-                udp_local_to_proxy.insert(local_str.clone(), np.proxy_name.clone());
-            }
-        }
         // For SUDP sharing existing socket, don't spawn duplicate listener
         let should_spawn = !is_sudp
             || !udp_sockets.iter().any(|(n, _)| {
@@ -730,7 +723,7 @@ async fn setup_proxy_listeners(
 
 /// Register a new proxy and start listening on its assigned port.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(state, writer, internal_tx, listener_handles, udp_sockets, udp_local_to_proxy), fields(proxy_name = %np.proxy_name, proxy_type = %np.proxy_type, run_id = %run_id))]
+#[instrument(skip(state, writer, internal_tx, listener_handles, udp_sockets), fields(proxy_name = %np.proxy_name, proxy_type = %np.proxy_type, run_id = %run_id))]
 pub(crate) async fn handle_new_proxy(
     np: msg::NewProxy,
     run_id: &str,
@@ -739,7 +732,6 @@ pub(crate) async fn handle_new_proxy(
     internal_tx: &mpsc::Sender<InternalMsg>,
     listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
-    udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
     v2: bool,
 ) {
     if let Err(e) = validate_new_proxy(&np) {
@@ -841,7 +833,6 @@ pub(crate) async fn handle_new_proxy(
                 internal_tx,
                 listener_handles,
                 udp_sockets,
-                udp_local_to_proxy,
                 v2,
                 allocated_port,
                 false,
@@ -982,7 +973,6 @@ pub(crate) async fn handle_new_proxy(
                 &state.proxy_bind_addr,
                 internal_tx,
                 udp_sockets,
-                udp_local_to_proxy,
                 listener_handles,
                 writer,
                 v2,
@@ -1360,7 +1350,6 @@ async fn handle_tcp_group_member_registration(
     _internal_tx: &mpsc::Sender<InternalMsg>,
     _listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     _udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
-    _udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
     v2: bool,
     allocated_port: Option<u16>,
     _tcp_group_created: bool,
@@ -1430,6 +1419,60 @@ async fn handle_tcp_group_member_registration(
     });
     write_resp(writer, &resp, v2).await;
 }
+
+// ---- Port reservation periodic cleanup ----
+
+impl AppState {
+    /// Prune port reservations whose 24h expiry has passed (Go frp
+    /// `cleanReservedPortsWorker`). Reservations are otherwise only reclaimed
+    /// lazily when a proxy re-registers under the same name, so a churned fleet
+    /// would accumulate stale entries that block port reuse — and let a name be
+    /// squatted to hold a port reservation indefinitely. The server loop calls
+    /// this on an interval via [`AppState::spawn_port_reservation_pruner`].
+    ///
+    /// Returns the number of expired entries removed.
+    pub async fn prune_expired_reservations(&self) -> usize {
+        let now = std::time::Instant::now();
+        let mut reservations = self.port_reservations.write().await;
+        let before = reservations.len();
+        reservations.retain(|_, &mut (_, _, reserved_at)| {
+            now.duration_since(reserved_at) < std::time::Duration::from_secs(24 * 3600)
+        });
+        before - reservations.len()
+    }
+
+    /// Spawn the periodic port-reservation pruner: sweeps expired 24h
+    /// reservations every 60 seconds, stopping when `shutdown_token` is
+    /// cancelled. Call once from the server lifecycle (e.g. alongside the NAT
+    /// hole cleanup task in `Service::run`).
+    pub fn spawn_port_reservation_pruner(
+        self: Arc<Self>,
+        shutdown_token: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // Skip the first tick (fires immediately), matching the TLS
+            // hot-reload task, so the first sweep runs one full interval after
+            // startup.
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let removed = self.prune_expired_reservations().await;
+                        if removed > 0 {
+                            debug!(removed = %removed, "Port reservation pruner removed {} expired entries", removed);
+                        }
+                    }
+                    _ = shutdown_token.cancelled() => {
+                        debug!("Port reservation pruner: shutdown requested, stopping");
+                        break;
+                    }
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod unregister_generation_tests {
     use super::*;

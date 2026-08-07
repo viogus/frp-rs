@@ -107,6 +107,10 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     let (read_tx, read_rx) = mpsc::channel(256);
     let session = KcpSession::new(conv, remote, config.clone(), read_tx);
     let alive_handle = session.alive_handle();
+    // Share the session's send-queue backlog counter with the stream so
+    // poll_write can gate on a stalled peer (window 0) instead of letting
+    // snd_queue grow without bound.
+    let (snd_backlog, snd_notify) = session.snd_backlog_handle();
 
     // Register session BEFORE spawning driver so the driver can route
     // incoming FEC packets to the correct session from the start.
@@ -126,6 +130,8 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
         read_rx,
         handle.write_backlog.clone(),
         handle.write_notify.clone(),
+        snd_backlog,
+        snd_notify,
         alive_handle,
     ))
 }

@@ -995,8 +995,19 @@ async fn connect_via_proxy(
             }
 
             if auth_resp[1] == 0x02 {
-                // RFC 1929 username/password sub-negotiation.
-                let (user, pass) = auth.expect("method 0x02 requires userinfo");
+                // RFC 1929 username/password sub-negotiation. The server
+                // demanded credentials we never offered (no userinfo in the
+                // proxy URL) — a broken or malicious proxy. Fail the dial
+                // instead of panicking on remote input.
+                let (user, pass) = match auth {
+                    Some(creds) => creds,
+                    None => {
+                        return Err(crate::Error::Transport(
+                            "SOCKS5 auth rejected: server requires username/password but none configured"
+                                .into(),
+                        ));
+                    }
+                };
                 let mut auth_msg = Vec::with_capacity(3 + user.len() + pass.len());
                 auth_msg.push(0x01);
                 auth_msg.push(user.len() as u8);

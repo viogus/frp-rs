@@ -1400,6 +1400,12 @@ impl Service {
             }
         });
 
+        // Periodic port-reservation pruner: sweep 24h-expired entries so stale
+        // reservations don't block port reuse. Same 60s cadence as NAT cleanup.
+        self.state
+            .clone()
+            .spawn_port_reservation_pruner(self.state.shutdown_token.clone());
+
         // Periodic TLS certificate hot-reload: stat cert/key files every 60 seconds.
         // When mtimes change (e.g., certbot/cert-manager renews in-place), rebuild
         // the acceptor and atomically swap so new connections use the new cert

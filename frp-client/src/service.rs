@@ -1418,6 +1418,19 @@ impl Service {
                 String,
                 oneshot::Sender<Result<msg::NatHoleResp, String>>,
             > = std::collections::HashMap::new();
+            // STUN discovery runs off the control loop (two STUN round-trips can
+            // stall up to ~10s). The finished NatHoleClient is sent back here so
+            // the write + pending_xtcp bookkeeping stay on the loop, preserving
+            // the write-before-NatHoleResp ordering. A separate cleanup channel
+            // lets a timeout task reclaim stale xtcp_sockets/pending_xtcp entries
+            // when the server never sends NatHoleResp.
+            struct StunResult {
+                sid: String,
+                proxy_name: String,
+                msg: FrpMessage,
+            }
+            let (stun_result_tx, mut stun_result_rx) = mpsc::channel::<StunResult>(64);
+            let (xtcp_cleanup_tx, mut xtcp_cleanup_rx) = mpsc::channel::<String>(64);
             let mut ping_interval = if cfg_local.heartbeat_interval > 0 {
                 let secs = cfg_local.heartbeat_interval as u64;
                 info!(interval = %secs, "Heartbeat interval: {}s", secs);
@@ -1785,83 +1798,138 @@ impl Service {
                     Some(xtcp_notif) = xtcp_rx.recv() => {
                         let XtcpNotification { sid, proxy_name } = xtcp_notif;
                         info!(proxy_name = %proxy_name, "XTCP provider: received NatHoleSid for '{}'", proxy_name);
-                        // 1. Do STUN discovery on a persistent UDP socket.
-                        //    Go frps needs ≥2 mapped addresses for NAT classification.
-                        let mut mapped_addrs = Vec::new();
-                        let stun_socket = match frp_core::stun::stun_binding_with_details(&nat_hole_stun_server).await {
-                            Ok((sock, result1)) => {
-                                let addr1 = result1.mapped_addr;
-                                debug!(addr = %addr1, "XTCP STUN #1: {}", addr1);
-                                mapped_addrs.push(addr1);
-                                // Use OTHER-ADDRESS as second STUN target if available
-                                // (Go frp v0.70 discovery.go:137 dual-server probing).
-                                // This gives the server a second mapped address for NAT
-                                // classification (RFC 5780, detects endpoint-independent
-                                // vs address-dependent mapping).
-                                let second_target =
-                                    result1.other_addr.as_deref().unwrap_or(&nat_hole_stun_server);
-                                match frp_core::stun::stun_binding_on_socket(&sock, second_target).await {
-                                    Ok(addr2) => {
-                                        debug!(addr = %addr2, "XTCP STUN #2 from '{}': {}", second_target, addr2);
-                                        // Go frps NAT classifier needs ≥2 addresses.
-                                        // Always push — Go frp doesn't dedup.
-                                        mapped_addrs.push(addr2);
+                        // STUN discovery runs off the control loop: two STUN
+                        // round-trips can stall up to ~10s and would block the
+                        // message loop (heartbeats, work conns, reloads). The
+                        // spawned task does the STUN, persists the socket, and
+                        // hands the finished NatHoleClient back for the loop to
+                        // write + bookkeep, preserving the write-before-NatHoleResp
+                        // ordering.
+                        let stun_server = nat_hole_stun_server.clone();
+                        let stun_sockets = Arc::clone(&xtcp_sockets);
+                        let stun_tx = stun_result_tx.clone();
+                        tokio::spawn(async move {
+                            // 1. Do STUN discovery on a persistent UDP socket.
+                            //    Go frps needs ≥2 mapped addresses for NAT classification.
+                            let mut mapped_addrs = Vec::new();
+                            let stun_socket = match frp_core::stun::stun_binding_with_details(&stun_server).await {
+                                Ok((sock, result1)) => {
+                                    let addr1 = result1.mapped_addr;
+                                    debug!(addr = %addr1, "XTCP STUN #1: {}", addr1);
+                                    mapped_addrs.push(addr1);
+                                    // Use OTHER-ADDRESS as second STUN target if available
+                                    // (Go frp v0.70 discovery.go:137 dual-server probing).
+                                    // This gives the server a second mapped address for NAT
+                                    // classification (RFC 5780, detects endpoint-independent
+                                    // vs address-dependent mapping).
+                                    let second_target =
+                                        result1.other_addr.as_deref().unwrap_or(&stun_server);
+                                    match frp_core::stun::stun_binding_on_socket(&sock, second_target).await {
+                                        Ok(addr2) => {
+                                            debug!(addr = %addr2, "XTCP STUN #2 from '{}': {}", second_target, addr2);
+                                            // Go frps NAT classifier needs ≥2 addresses.
+                                            // Always push — Go frp doesn't dedup.
+                                            mapped_addrs.push(addr2);
+                                        }
+                                        Err(e) => warn!(error = %e, "XTCP STUN #2 failed: {}", e),
                                     }
-                                    Err(e) => warn!(error = %e, "XTCP STUN #2 failed: {}", e),
+                                    Some(sock)
                                 }
-                                Some(sock)
+                                Err(e) => {
+                                    warn!(error = %e, "XTCP STUN failed: {}", e);
+                                    None
+                                }
+                            };
+                            // Get the local port from the STUN socket for assisted_addrs.
+                            // Go frp compat: assisted_addrs = local IPs + STUN port, NOT STUN
+                            // mapped addresses. The server uses assisted_addrs as localIPs
+                            // parameter to ClassifyNATFeature — STUN addresses would never
+                            // match local interfaces, causing misclassification.
+                            let local_port = stun_socket
+                                .as_ref()
+                                .and_then(|sock| sock.local_addr().ok())
+                                .map(|addr| addr.port());
+                            // Save socket for later UDP+KCP hole punch.
+                            if let Some(sock) = stun_socket {
+                                stun_sockets
+                                    .lock()
+                                    .await
+                                    .insert(sid.clone(), std::sync::Arc::new(sock));
                             }
-                            Err(e) => {
-                                warn!(error = %e, "XTCP STUN failed: {}", e);
-                                None
-                            }
-                        };
-                        // Get the local port from the STUN socket for assisted_addrs.
-                        // Go frp compat: assisted_addrs = local IPs + STUN port, NOT STUN
-                        // mapped addresses. The server uses assisted_addrs as localIPs
-                        // parameter to ClassifyNATFeature — STUN addresses would never
-                        // match local interfaces, causing misclassification.
-                        let local_port = stun_socket
-                            .as_ref()
-                            .and_then(|sock| sock.local_addr().ok())
-                            .map(|addr| addr.port());
-                        // Save socket for later UDP+KCP hole punch.
-                        if let Some(sock) = stun_socket {
-                            xtcp_sockets.lock().await.insert(sid.clone(), std::sync::Arc::new(sock));
-                        }
-                        // Build assisted_addrs from local IPs + STUN port.
-                        // Go frp v0.69.1: ListLocalIPsForNatHole returns non-loopback
-                        // IPv4 addresses filtered from all network interfaces.
-                        let assisted_addrs: Option<Vec<String>> = local_port.and_then(|port| {
-                            let local_ips = crate::nat_hole::list_local_ips_for_nat_hole(10);
-                            if local_ips.is_empty() {
-                                None
-                            } else {
-                                Some(
-                                    local_ips
-                                        .iter()
-                                        .map(|ip| format!("{}:{}", ip, port))
-                                        .collect(),
-                                )
+                            // Build assisted_addrs from local IPs + STUN port.
+                            // Go frp v0.69.1: ListLocalIPsForNatHole returns non-loopback
+                            // IPv4 addresses filtered from all network interfaces.
+                            let assisted_addrs: Option<Vec<String>> = local_port.and_then(|port| {
+                                let local_ips = crate::nat_hole::list_local_ips_for_nat_hole(10);
+                                if local_ips.is_empty() {
+                                    None
+                                } else {
+                                    Some(
+                                        local_ips
+                                            .iter()
+                                            .map(|ip| format!("{}:{}", ip, port))
+                                            .collect(),
+                                    )
+                                }
+                            });
+                            // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
+                            // Use a unique transaction_id per request (Go frp compat: UUID).
+                            let txn_id = uuid::Uuid::new_v4().to_string();
+                            let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
+                                transaction_id: txn_id.clone(),
+                                proxy_name: proxy_name.clone(),
+                                sid: Some(sid.clone()),
+                                protocol: Some("kcp".to_string()),
+                                mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
+                                assisted_addrs,
+                                visitor_addr: None,
+                            }));
+                            // Hand the finished message back to the control loop.
+                            if stun_tx
+                                .send(StunResult { sid, proxy_name, msg: client_msg })
+                                .await
+                                .is_err()
+                            {
+                                warn!("XTCP: control loop dropped STUN result channel");
                             }
                         });
-                        // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
-                        // Use a unique transaction_id per request (Go frp compat: UUID).
-                        let txn_id = uuid::Uuid::new_v4().to_string();
-                        let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
-                            transaction_id: txn_id.clone(),
-                            proxy_name: proxy_name.clone(),
-                            sid: Some(sid.clone()),
-                            protocol: Some("kcp".to_string()),
-                            mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
-                            assisted_addrs,
-                            visitor_addr: None,
-                        }));
-                        if let Err(e) = write_msg(&mut *writer.lock().await, &client_msg, v2).await {
+                    }
+
+                    // STUN finished off-loop: write NatHoleClient on the control
+                    // connection and track sid→proxy_name for NatHoleResp routing.
+                    Some(stun_result) = stun_result_rx.recv() => {
+                        let StunResult { sid, proxy_name, msg } = stun_result;
+                        if let Err(e) = write_msg(&mut *writer.lock().await, &msg, v2).await {
                             warn!(error = %e, "XTCP: failed to send NatHoleClient: {}", e);
+                            // The STUN socket was stored in xtcp_sockets but no
+                            // pending_xtcp entry was created; reclaim it now so it
+                            // does not sit until control-loop teardown.
+                            xtcp_sockets.lock().await.remove(&sid);
                         } else {
-                            // Track sid→proxy_name for NatHoleResp routing
-                            pending_xtcp.insert(sid, proxy_name);
+                            pending_xtcp.insert(sid.clone(), proxy_name);
+                            // Defensive cleanup: if the server never sends
+                            // NatHoleResp for this sid, the socket + pending_xtcp
+                            // entry would leak until the control loop tears down.
+                            // Reclaim them after the server's NAT session window
+                            // (NAT_HOLE_TIMEOUT = 10s) plus margin. If NatHoleResp
+                            // arrives in time, handle_nat_hole_resp already removed
+                            // both entries and these removes are no-ops.
+                            let cleanup_sockets = Arc::clone(&xtcp_sockets);
+                            let cleanup_tx = xtcp_cleanup_tx.clone();
+                            let cleanup_sid = sid.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(15)).await;
+                                cleanup_sockets.lock().await.remove(&cleanup_sid);
+                                let _ = cleanup_tx.send(cleanup_sid).await;
+                            });
+                        }
+                    }
+
+                    // A NatHoleResp never arrived within the timeout window:
+                    // drop the pending provider-side entry (socket already removed).
+                    Some(cleanup_sid) = xtcp_cleanup_rx.recv() => {
+                        if pending_xtcp.remove(&cleanup_sid).is_some() {
+                            debug!(sid = %cleanup_sid, "XTCP: reclaimed stale NatHoleClient entry for '{}'", cleanup_sid);
                         }
                     }
 
@@ -2208,30 +2276,13 @@ impl Service {
 
         let v2 = delta.new_config.v2;
 
-        // Step 1: Cancel health checks and drop old PluginHandles for removed
-        // and changed proxies. Health check tasks hold Arc<AtomicBool> cancel
-        // flags — setting them to true stops the health check loop. PluginHandle::Drop
-        // sends a oneshot shutdown signal to the plugin task.
-        {
-            let mut cancels = self.health_cancels.lock().await;
-            for name in delta.removed.iter().chain(delta.changed.iter()) {
-                if let Some(cancel) = cancels.get(name) {
-                    cancel.store(true, Ordering::Relaxed);
-                }
-                cancels.remove(name);
-            }
-        }
-        {
-            let mut handles = self
-                .plugin_handles
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for name in delta.removed.iter().chain(delta.changed.iter()) {
-                if handles.remove(name).is_some() {
-                    debug!(proxy_name = %name, "Dropped old plugin handle for '{}'", name);
-                }
-            }
-        }
+        // Phase A — perform only reversible side effects, then send the protocol
+        // messages. A write failure mid-way must not leave the process half-applied
+        // (old plugins killed / new plugin addresses not yet in proxy_info_map would
+        // register dead addresses on the next reconnect). The plugin kills/starts are
+        // therefore deferred until AFTER the send succeeds; the only pre-send side
+        // effect besides the messages is starting the new plugins, whose handles are
+        // held locally and dropped on failure (vnet TUN state is refreshed on reconnect).
 
         // Drop TUN state for removed and changed proxies before recreating it.
         // Changed proxies must get a fresh TUN and a fresh delivery channel.
@@ -2264,8 +2315,12 @@ impl Service {
             .await;
         }
 
-        // Step 2: Start new plugins for added and changed proxies that have plugin config.
+        // Start new plugins for added and changed proxies that have plugin config.
         // Collect actual bound addresses for use in NewProxy messages and map updates.
+        // Handles are kept in a local map (not yet committed to self.plugin_handles)
+        // so a failed send below can drop them and leave the old plugin set running
+        // untouched.
+        let mut new_plugin_handles: HashMap<String, PluginHandle> = HashMap::new();
         let mut plugin_addrs: HashMap<String, String> = HashMap::new();
         for name in delta.added.iter().chain(delta.changed.iter()) {
             if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
@@ -2273,10 +2328,7 @@ impl Service {
                     if let Some(handle) = self.start_plugin(name, plugin_cfg).await {
                         let addr = handle.local_addr.to_string();
                         plugin_addrs.insert(name.clone(), addr);
-                        self.plugin_handles
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(name.clone(), handle);
+                        new_plugin_handles.insert(name.clone(), handle);
                     }
                     // If plugin start fails, plugin_addrs won't have an entry;
                     // the proxy uses configured local_ip:local_port as fallback.
@@ -2311,8 +2363,8 @@ impl Service {
             }
         }
 
-        // Step 3: Collect all messages, then send them atomically while
-        // holding the writer lock (no other .await work between writes).
+        // Collect all messages, then send them atomically while holding the
+        // writer lock (no other .await work between writes).
         // NOTICE: Do NOT hold the writer lock across any non-write .await.
         let mut changes: Vec<String> = Vec::new();
 
@@ -2370,13 +2422,52 @@ impl Service {
 
         // Acquire writer lock once and send all messages in a tight loop.
         // Lock is dropped after the last write — no other .await happens
-        // between lock acquisition and drop.
+        // between lock acquisition and drop. On a write failure the reload is
+        // aborted before any commit: drop the not-yet-committed plugin handles
+        // (killing the fresh plugins) so the old plugin set, health checks,
+        // proxy_info_map, and cfg all remain untouched and consistent.
         {
             let mut w = writer.lock().await;
             for rm in &msgs {
-                write_msg(&mut *w, &rm.msg, v2)
-                    .await
-                    .map_err(|e| format!("{}: {e}", rm.label))?;
+                if let Err(e) = write_msg(&mut *w, &rm.msg, v2).await {
+                    drop(new_plugin_handles);
+                    return Err(format!("{}: {e}", rm.label));
+                }
+            }
+        }
+
+        // Commit point — every remaining operation is infallible, so the reload
+        // can no longer fail part-way. Apply the plugin lifecycle changes that
+        // were deferred until the server accepted the new proxy set.
+
+        // Cancel health checks and drop old PluginHandles for removed
+        // and changed proxies. Health check tasks hold Arc<AtomicBool> cancel
+        // flags — setting them to true stops the health check loop. PluginHandle::Drop
+        // sends a oneshot shutdown signal to the plugin task.
+        {
+            let mut cancels = self.health_cancels.lock().await;
+            for name in delta.removed.iter().chain(delta.changed.iter()) {
+                if let Some(cancel) = cancels.get(name) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                cancels.remove(name);
+            }
+        }
+        {
+            let mut handles = self
+                .plugin_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for name in delta.removed.iter().chain(delta.changed.iter()) {
+                if handles.remove(name).is_some() {
+                    debug!(proxy_name = %name, "Dropped old plugin handle for '{}'", name);
+                }
+            }
+            // Commit the freshly started plugin handles for added/changed proxies
+            // now that the server accepted the new proxy set. For a changed proxy
+            // this replaces the handle removed just above.
+            for (name, handle) in new_plugin_handles {
+                handles.insert(name, handle);
             }
         }
 
