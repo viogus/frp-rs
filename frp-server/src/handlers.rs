@@ -2478,7 +2478,7 @@ pub(crate) async fn handle_v1_connection(
 
 /// Check if a 7-byte buffer matches the V2 protocol magic bytes.
 /// This check is repeated across all transport paths (TCP, KCP, QUIC, WS,
-/// with/without TLS, with/without yamux) — ~16 locations total.
+/// with/without TLS, with/without yamux).
 /// See V2_MAGIC_BYTES in frp_core::protocol.
 #[inline]
 pub(crate) fn is_v2_magic(buf: &[u8]) -> bool {

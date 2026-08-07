@@ -42,9 +42,11 @@ iterations=64, keylen=16)`. Go frp v0.69.1 pre-built binary uses salt `"frp"`
 (NOT `"crypto"` — the golib source says `"crypto"` but the binary was compiled
 with `"frp"`).
 
-**Transport**: `IoStream` unifies all stream types into a single enum.
-`IoStream::into_split()` returns `std::io::Result<(ReadHalf, WriteHalf)>`
-— static enum halves, not boxed trait objects — for the bridge layer.
+**Transport**: `IoStream` is a newtype over `Box<dyn Transport>`. Each transport
+variant (Tcp, Tls, Kcp, Quic, WebSocket, Yamux, Cipher, Aead, SshChannel,
+PreRead, BufferedRead) implements the `Transport` trait in its own file under
+`src/transport/`. `IoStream::into_split()` returns `(BoxedReadHalf, BoxedWriteHalf)`
+— boxed trait objects for the bridge layer.
 
 **Feature flags**: `tls`, `kcp`, `quic`, `websocket`, `compression`, `chacha20`,
 `oidc`, `vnet`, `tcp-mux`. All default ON. Disable to shrink binary size.

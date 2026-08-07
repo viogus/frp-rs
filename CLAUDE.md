@@ -103,7 +103,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 804 passed, 0 failed |
+| `cargo test --workspace --all-features` | 844 passed, 0 failed |
 | `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~7.7MB/frpc ~6.7MB default; ~8.3/6.7 full; frps-tiny ~4.6MB/frpc-tiny ~4.4MB; frps-micro ~3.5MB/frpc-micro ~3.3MB — measured 2026-08-06; reqwest→hyper + otel/prometheus default-features pruning) |
 | `compat-test.sh` (Go frp v0.70.1) | 72 run_test scenarios + 17 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 9 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
