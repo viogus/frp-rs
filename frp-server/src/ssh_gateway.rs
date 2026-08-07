@@ -1131,6 +1131,7 @@ mod tests {
             host_key,
             authorized_keys: Vec::new(),
             auth_deadline,
+            ssh_session_idle_timeout: 0,
         };
         let task = tokio::spawn(async move {
             listener.run().await.unwrap();
@@ -1807,6 +1808,10 @@ pub struct SshListener {
     host_key: russh::keys::PrivateKey,
     authorized_keys: Vec<russh::keys::PublicKey>,
     auth_deadline: std::time::Duration,
+    /// Authenticated-session idle timeout in seconds. 0 = disabled (default,
+    /// Go frp parity — Go has no SSH idle timeout). Wired from
+    /// `SshTunnelGatewayConfig.ssh_session_idle_timeout`.
+    ssh_session_idle_timeout: u64,
 }
 
 impl SshListener {
@@ -1853,6 +1858,17 @@ impl SshListener {
             Vec::new()
         };
 
+        // SECURITY WARNING: when neither authorized_keys nor server_token is
+        // configured, auth_none accepts every connection (Go frp NoClientAuth
+        // compat). That is a legitimate deployment mode for trusted networks,
+        // but a user who enables the gateway without credentials must see the
+        // exposure loudly — once at startup, not once per connection.
+        if authorized_keys.is_empty() && server_token.is_empty() {
+            tracing::warn!(
+                "SSH gateway: no authorized_keys and no server_token configured — ANY SSH client can connect without authentication and register proxies"
+            );
+        }
+
         Ok(Some(Self {
             bind_addr: ssh_cfg.bind_addr.clone(),
             bind_port: ssh_cfg.bind_port,
@@ -1861,6 +1877,7 @@ impl SshListener {
             host_key,
             authorized_keys,
             auth_deadline: SSH_AUTH_DEADLINE,
+            ssh_session_idle_timeout: ssh_cfg.ssh_session_idle_timeout,
         }))
     }
 
@@ -1904,6 +1921,7 @@ impl SshListener {
             let server_token = self.server_token.clone();
             let authorized_keys = self.authorized_keys.clone();
             let russh_config = russh_config.clone();
+            let ssh_session_idle_timeout = self.ssh_session_idle_timeout;
             let auth_deadline = tokio::time::Instant::now() + auth_timeout;
             let ssh_permit = match ssh_connections.clone().try_acquire_owned() {
                 Ok(permit) => permit,
@@ -2005,7 +2023,41 @@ impl SshListener {
 
                 let result = match pre_auth_result {
                     Some(result) => result,
-                    None => session_task.await,
+                    None => {
+                        // Idle timeout: bound the authenticated-session wait
+                        // so an idle session cannot hold its conn_semaphore
+                        // permit / task / fd forever. 0 = disabled (Go frp
+                        // parity — Go has no SSH idle timeout).
+                        if ssh_session_idle_timeout > 0 {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(ssh_session_idle_timeout),
+                                &mut session_task,
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    let run_id = authenticated_run_id
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .clone();
+                                    tracing::warn!(
+                                        run_id = ?run_id,
+                                        idle_timeout_secs = ssh_session_idle_timeout,
+                                        "SSH session idle timeout ({}s), closing",
+                                        ssh_session_idle_timeout
+                                    );
+                                    session_task.abort();
+                                    if let Some(run_id) = run_id {
+                                        cleanup_session(&run_id, &state).await;
+                                    }
+                                    return;
+                                }
+                            }
+                        } else {
+                            session_task.await
+                        }
+                    }
                 };
                 let run_id = authenticated_run_id
                     .lock()
