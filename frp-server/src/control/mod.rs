@@ -381,6 +381,7 @@ async fn handle_control_inner<S>(
     // semaphore permit and fd, and every reconnect for the same run_id
     // collides with the same stuck barrier.
     if ctl.shutdown_done.is_none() {
+        let mut dropped_internal: usize = 0;
         while let Ok(msg) = internal_rx.try_recv() {
             if let InternalMsg::Shutdown { done } = msg {
                 ctl.shutting_down = true;
@@ -389,6 +390,11 @@ async fn handle_control_inner<S>(
             }
             // Other queued internal messages are dropped: the control
             // connection is already gone, so dispatching them would fail.
+            dropped_internal += 1;
+        }
+        if dropped_internal > 0 {
+            debug!(run_id = %run_id, dropped = dropped_internal,
+                "Supersession handoff: dropped {dropped_internal} buffered internal message(s) (control connection already gone) — operator can correlate with lost work/visitor conns");
         }
     }
 

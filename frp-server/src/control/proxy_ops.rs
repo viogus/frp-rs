@@ -1133,7 +1133,14 @@ pub(crate) async fn unregister_control(
     } else {
         None
     };
-    // Release allocated ports and clean up sk/vhost entries for this client
+    // Release allocated ports and clean up sk/vhost entries for this client.
+    // KNOWN LIMITATION: proxies are removed by run_id only (ProxyInfo has no
+    // control_id). In the normal handoff path the old handler's cleanup
+    // finishes before the new login proceeds (barrier), so this is safe. If
+    // the 10s handoff-barrier timeout fires (old handler stuck), the new
+    // control may have already re-registered proxies for the same run_id and
+    // a delayed cleanup could remove them. Extremely unlikely (cleanup is
+    // short and the timeout is generous); tracked in PR #227 review.
     let proxies = state.proxy_manager.list_client(run_id).await;
     // TCP port cleanup
     let mut ports = state.used_ports.write().await;
