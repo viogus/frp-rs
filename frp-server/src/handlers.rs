@@ -58,39 +58,53 @@ pub(crate) async fn handle_visitor_conn_inner(
     let timestamp = msg.timestamp.unwrap_or(0);
 
     // Validate timestamp freshness to prevent replay attacks.
-    // Uses the same authentication_timeout as control-channel Login
-    // (Go frp compat: authentication_timeout config).
+    // A missing timestamp (0) is treated as "not provided" and skips the
+    // freshness window — same semantics as the control-channel Login path —
+    // so legacy/Go clients that omit it are not rejected once the server
+    // enables authenticationTimeout.
     let auth_timeout = state.reloadable.read_ok().auth_cfg.authentication_timeout;
-    let ts_valid = frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout);
+    let ts_valid = if timestamp == 0 {
+        Ok(())
+    } else {
+        frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
+    };
 
     // --- Mode 1: Go-compatible — lookup by proxy_name, validate MD5(sk + timestamp) ---
-    // Look up proxy BEFORE rejecting empty sign_key: a proxy with no sk
-    // allows unauthenticated access (Rust↔Rust STCP with useEncryption=false).
     let proxy_name = if let Some(proxy_info) = state.proxy_manager.get(&msg.proxy_name).await {
-        if let Some(ref sk) = proxy_info.sk {
-            if !sk.is_empty() {
+        match proxy_info.sk.as_deref().filter(|s| !s.is_empty()) {
+            Some(sk) => {
+                // Verify the token first, freshness second: an unauthenticated
+                // caller must not learn whether the timestamp window was
+                // exceeded, and the freshness check runs on attacker-controlled
+                // input.
                 if sign_key.is_empty() {
                     warn!(proxy_name = %msg.proxy_name, "STCP visitor: missing sign_key for protected proxy '{}'", msg.proxy_name);
+                    None
+                } else if !frp_core::auth::verify_token(sk, timestamp, &sign_key) {
+                    warn!(proxy_name = %msg.proxy_name, "STCP visitor MD5 auth mismatch for proxy '{}'", msg.proxy_name);
                     None
                 } else if let Err(e) = &ts_valid {
                     warn!(proxy_name = %msg.proxy_name, error = %e, "STCP visitor: timestamp rejected for proxy '{}'", msg.proxy_name);
                     None
-                } else if frp_core::auth::verify_token(sk, timestamp, &sign_key) {
+                } else {
                     debug!(proxy_name = %msg.proxy_name, "STCP visitor auth OK (Go-compat MD5, constant-time) for proxy '{}'", msg.proxy_name);
                     Some(msg.proxy_name.clone())
-                } else {
-                    warn!(proxy_name = %msg.proxy_name, "STCP visitor MD5 auth mismatch for proxy '{}'", msg.proxy_name);
-                    None
                 }
-            } else {
-                // Proxy has no sk — no auth required (allow)
-                debug!(proxy_name = %msg.proxy_name, "STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
+            }
+            None => {
+                // No sk configured — no cryptographic proof of access.
+                // Go frp parity: admit the visitor (the owner/allow_users
+                // check above still applies; empty allow_users is owner-only).
+                // A no-sk proxy with no allow_users and an empty owner user
+                // is open to any anonymous frps client — surface that loudly
+                // per connection so operators configure an sk or allow_users.
+                if proxy_info.allow_users.is_empty() && proxy_info.user.is_empty() {
+                    warn!(proxy_name = %msg.proxy_name, "STCP visitor: proxy '{}' has no sk and no visitor authorization — anyone with frps access can connect (configure secret_key or allow_users)", msg.proxy_name);
+                } else {
+                    debug!(proxy_name = %msg.proxy_name, "STCP visitor: proxy '{}' has no sk, relying on visitor authorization", msg.proxy_name);
+                }
                 Some(msg.proxy_name.clone())
             }
-        } else {
-            // Proxy has no sk — no auth required (allow)
-            debug!(proxy_name = %msg.proxy_name, "STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
-            Some(msg.proxy_name.clone())
         }
     } else {
         None

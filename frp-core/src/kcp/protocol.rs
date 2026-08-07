@@ -442,7 +442,9 @@ impl<Output> Kcp<Output> {
     /// Send bytes into the buffer. In stream mode a trailing partial segment
     /// is extended when possible; in message mode the data is split into
     /// `MSS`-sized segments chained by the `frg` field.
-    pub fn send(&mut self, mut buf: &[u8]) -> Result<usize> {
+    /// Takes ownership of `buf` so segmentation can split by moving
+    /// (`Vec::split_off`, O(1)) instead of copying each segment.
+    pub fn send(&mut self, mut buf: Vec<u8>) -> Result<usize> {
         let mut sent_size = 0;
 
         assert!(self.mss > 0, "mss must be positive");
@@ -454,10 +456,9 @@ impl<Output> Kcp<Output> {
                 if l < self.mss {
                     let capacity = self.mss - l;
                     let extend = cmp::min(buf.len(), capacity);
-
-                    let (lf, rt) = buf.split_at(extend);
-                    old.data.extend_from_slice(lf);
-                    buf = rt;
+                    let tail = buf.split_off(extend); // buf = [..extend], tail = [extend..]
+                    old.data.extend_from_slice(&buf);
+                    buf = tail;
 
                     old.frg = 0;
                     sent_size += extend;
@@ -483,10 +484,12 @@ impl<Output> Kcp<Output> {
 
         for i in 0..count {
             let size = cmp::min(self.mss, buf.len());
-
-            let (lf, rt) = buf.split_at(size);
-            let mut new_segment = KcpSegment::new_with_data(lf.to_vec());
-            buf = rt;
+            // Move the tail out (O(1) pointer move) instead of split_at +
+            // to_vec (a full copy per segment): the send path now copies the
+            // caller's buffer exactly once, into the first segment.
+            let tail = buf.split_off(size); // buf = [..size], tail = [size..]
+            let mut new_segment = KcpSegment::new_with_data(buf);
+            buf = tail;
 
             new_segment.frg = if self.stream {
                 0
@@ -529,6 +532,16 @@ impl<Output> Kcp<Output> {
     fn parse_ack(&mut self, sn: u32) {
         if timediff(sn, self.snd_una) < 0 || timediff(sn, self.snd_nxt) >= 0 {
             return;
+        }
+
+        // Fast path: ACKs normally target the oldest unacked segment
+        // (snd_una). pop_front is O(1); the linear scan below is only for
+        // out-of-order ACKs.
+        if let Some(front) = self.snd_buf.front() {
+            if front.sn == sn {
+                self.snd_buf.pop_front();
+                return;
+            }
         }
 
         let mut i = 0usize;
@@ -1325,7 +1338,7 @@ mod tests {
     /// Drive a fresh Kcp through two updates so queued data actually flushes
     /// (the congestion window starts at 0, so the first flush only arms it).
     fn send_and_flush(kcp: &mut Kcp<PacketWriter>, data: &[u8]) {
-        kcp.send(data).unwrap();
+        kcp.send(data.to_vec()).unwrap();
         // Default interval is 100ms, so the flush at update(100) moves the
         // queued segment into snd_buf and writes it to the output.
         kcp.update(0).unwrap();
@@ -1338,7 +1351,7 @@ mod tests {
     fn header_encode_little_endian() {
         let mut a = Kcp::new(0x1122_3344, PacketWriter::default());
         a.set_nodelay(true, 10, 2, true); // nocwnd: first flush sends data
-        a.send(b"hello").unwrap();
+        a.send(b"hello".to_vec()).unwrap();
         a.update(0).unwrap();
 
         let out = a.output_mut().drain();
@@ -1481,7 +1494,7 @@ mod tests {
 
         // mss = 1400 - 24 = 1376, so 3000 bytes split into 3 fragments.
         let big = vec![0xabu8; 3000];
-        a.send(&big).unwrap();
+        a.send(big.clone()).unwrap();
         a.update(0).unwrap();
 
         let out = a.output_mut().drain();
@@ -1514,8 +1527,8 @@ mod tests {
         a.set_nodelay(true, 10, 2, true);
 
         // Two small sends merge into the trailing segment.
-        a.send(b"ab").unwrap();
-        a.send(b"cde").unwrap();
+        a.send(b"ab".to_vec()).unwrap();
+        a.send(b"cde".to_vec()).unwrap();
         a.update(0).unwrap();
 
         let out = a.output_mut().drain();
@@ -1539,7 +1552,7 @@ mod tests {
         // In stream mode every fragment carries frg=0; the receiver drains
         // them one recv at a time (byte-stream semantics).
         let big: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
-        a.send(&big).unwrap();
+        a.send(big.clone()).unwrap();
         a.update(0).unwrap();
 
         let out = a.output_mut().drain();
@@ -1574,7 +1587,7 @@ mod tests {
         let mut a = Kcp::new(1, PacketWriter::default());
         // mss=1376; KCP_WND_RCV=128 => max message ~ 128 * 1376.
         let too_big = vec![0u8; 128 * 1376];
-        assert!(matches!(a.send(&too_big), Err(Error::UserBufTooBig)));
+        assert!(matches!(a.send(too_big.clone()), Err(Error::UserBufTooBig)));
     }
 
     // ── 5. kcp-go v5.6.13 compat patches ─────────────────────────────────
@@ -1586,7 +1599,7 @@ mod tests {
     fn rto_linear_backoff_nodelay() {
         let mut a = Kcp::new(0x1122_3344, PacketWriter::default());
         a.set_nodelay(true, 10, 2, true); // nodelay + nc
-        a.send(b"data").unwrap();
+        a.send(b"data".to_vec()).unwrap();
 
         // update(0) arms the window and flushes the segment (nocwnd).
         a.update(0).unwrap();
@@ -1621,8 +1634,8 @@ mod tests {
         b.set_nodelay(true, 10, 2, true);
 
         // Two segments in flight; sn=1 is delivered, sn=0 is lost.
-        a.send(&vec![0x11u8; 1000]).unwrap();
-        a.send(&vec![0x22u8; 1000]).unwrap();
+        a.send(vec![0x11u8; 1000]).unwrap();
+        a.send(vec![0x22u8; 1000]).unwrap();
         a.update(0).unwrap(); // nocwnd -> both segments flushed now
 
         let out = a.output_mut().drain();
@@ -1676,8 +1689,8 @@ mod tests {
         a.set_nodelay(true, 10, 1, true); // fastresend=1, nc
         b.set_nodelay(true, 10, 1, true);
 
-        a.send(&vec![0x11u8; 1000]).unwrap();
-        a.send(&vec![0x22u8; 1000]).unwrap();
+        a.send(vec![0x11u8; 1000]).unwrap();
+        a.send(vec![0x22u8; 1000]).unwrap();
         a.update(0).unwrap();
 
         let out = a.output_mut().drain();
@@ -1714,7 +1727,7 @@ mod tests {
     fn window_probe_sends_wask() {
         let mut a = Kcp::new(0x1122_3344, PacketWriter::default());
         a.set_nodelay(true, 10, 2, true);
-        a.send(b"x").unwrap();
+        a.send(b"x".to_vec()).unwrap();
         a.update(0).unwrap(); // flush sn=0
         let _dropped = a.output_mut().drain();
 
@@ -1968,7 +1981,7 @@ mod tests {
                 let mut msg = Vec::with_capacity(8);
                 msg.extend_from_slice(&index.to_le_bytes());
                 msg.extend_from_slice(&current.to_le_bytes());
-                kcp1.send(&msg).unwrap();
+                kcp1.send(msg.clone()).unwrap();
                 index += 1;
                 slap += 20;
             }
@@ -1996,7 +2009,7 @@ mod tests {
                 match kcp2.recv(&mut buf) {
                     Err(..) => break,
                     Ok(n) => {
-                        kcp2.send(&buf[..n]).unwrap();
+                        kcp2.send(buf[..n].to_vec()).unwrap();
                     }
                 }
             }
@@ -2202,7 +2215,7 @@ mod tests {
 
                 for (i, payload) in payloads.iter().enumerate() {
                     // Sender: one message per round, flushed immediately.
-                    a.send(payload).unwrap();
+                    a.send(payload.to_vec()).unwrap();
                     a.update(t).unwrap();
                     let pushes = a.output_mut().drain();
 

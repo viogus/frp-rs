@@ -701,6 +701,42 @@ async fn handle_store_proxy_create(
     Ok(Json(serde_json::json!({"status": "created", "name": name})))
 }
 
+/// Clean up server-side port allocation for a deleted proxy, mirroring the
+/// client CloseProxy path (`control/proxy.rs`): TCP group ports are only
+/// released for the last group member (the shared listener still owns the
+/// port otherwise), the group listener is stopped for the final member, and
+/// the per-client port count is decremented. The dashboard delete paths used
+/// to skip all three — leaking port quota (`max_ports_per_client`) and
+/// leaving zombie group listeners holding ports until frps restarts.
+async fn cleanup_deleted_proxy_port(state: &Arc<AppState>, proxy: &crate::proxy::ProxyInfo) {
+    let is_tcp_group = proxy.proxy_type == "tcp"
+        && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some();
+    let group_name = proxy.group.clone().unwrap_or_default();
+    let last_group_member =
+        is_tcp_group && state.proxy_manager.group_len(&group_name).await <= 1;
+    if let Some(port) = proxy.remote_port {
+        if proxy.proxy_type == "udp" || proxy.proxy_type == "sudp" {
+            state.used_udp_ports.write().await.remove(&port);
+        } else if !is_tcp_group || last_group_member {
+            state.used_ports.write().await.remove(&port);
+        }
+        // Decrement per-client port count (matching Go frp's portsUsedNum).
+        let run_id = &proxy.run_id;
+        let mut port_counts = state.client_ports_used.write().await;
+        if let Some(count) = port_counts.get_mut(run_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                port_counts.remove(run_id);
+            }
+        }
+    }
+    // Stop the shared TCP group listener when the last member closes so it
+    // doesn't linger as a zombie holding the group port.
+    if last_group_member {
+        state.tcp_group_ctl.remove_group(&group_name).await;
+    }
+}
+
 /// DELETE /api/store/proxy/:name — remove a proxy (cleans up server-side state
 /// and notifies the client via CloseProxy so it stops forwarding).
 async fn handle_store_proxy_delete(
@@ -716,14 +752,9 @@ async fn handle_store_proxy_delete(
 
     let run_id = proxy.run_id.clone();
 
-    // Clean up port (TCP or UDP manager — Go frp compat)
-    if let Some(port) = proxy.remote_port {
-        if proxy.proxy_type == "udp" || proxy.proxy_type == "sudp" {
-            state.used_udp_ports.write().await.remove(&port);
-        } else {
-            state.used_ports.write().await.remove(&port);
-        }
-    }
+    // Clean up port (TCP/UDP manager, TCP group last-member semantics and
+    // per-client port quota — same lifecycle as the client CloseProxy path).
+    cleanup_deleted_proxy_port(&state, &proxy).await;
     // Clean up sk_index (indexed by proxy_name)
     if let Some(key) = proxy.sk_index_key() {
         state.xtcp.sk_index.write().await.remove(key);
@@ -773,13 +804,9 @@ async fn handle_proxies_delete(
     let mut deleted = Vec::new();
     for name in &body.proxies {
         if let Some(proxy) = state.proxy_manager.get(name).await {
-            if let Some(port) = proxy.remote_port {
-                if proxy.proxy_type == "udp" || proxy.proxy_type == "sudp" {
-                    state.used_udp_ports.write().await.remove(&port);
-                } else {
-                    state.used_ports.write().await.remove(&port);
-                }
-            }
+            // Clean up port (TCP/UDP manager, TCP group last-member semantics
+            // and per-client port quota — same lifecycle as CloseProxy).
+            cleanup_deleted_proxy_port(&state, &proxy).await;
             if let Some(key) = proxy.sk_index_key() {
                 state.xtcp.sk_index.write().await.remove(key);
             }

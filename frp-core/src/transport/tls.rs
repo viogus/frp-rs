@@ -619,10 +619,12 @@ fn build_tls_connector_skip_verify_inner(
         // PRODUCTION WARNING: this means TLS connections are vulnerable to
         // man-in-the-middle attacks. Any intermediate node can intercept
         // and decrypt the control + data-plane traffic.
-        tracing::warn!(
+        tracing::error!(
             "TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
-             All traffic is vulnerable to MITM attacks. \
-             Set tls.ca_file (frpc: tls.trusted_ca_file) in config to enable verification."
+             All control and data-plane traffic is vulnerable to MITM attacks and \
+             authentication credentials can be captured and replayed. \
+             For production, set tls.ca_file (frpc: tls.trusted_ca_file) to a CA \
+             that signed the server certificate to enable verification."
         );
         let verifier = Arc::new(InsecureSkipVerify);
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {

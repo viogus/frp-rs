@@ -45,6 +45,7 @@ async fn write_ctl_msg<W: AsyncWriteExt + Unpin>(
 use frp_core::transport::IoStream;
 
 use crate::service::AppState;
+use crate::state::InternalMsg;
 
 // ---- State containers for handle_control ----
 
@@ -368,6 +369,26 @@ async fn handle_control_inner<S>(
                 info!(run_id = %run_id, "Graceful shutdown: draining control handler for {}", run_id);
                 break;
             }
+        }
+    }
+
+    // Supersession handoff: the old handler MUST release the new login
+    // waiting on the handoff barrier no matter why this loop exited. If a
+    // Shutdown was queued (via try_send) but never dispatched — the loop can
+    // break on a client read error before the select consumes it — extract
+    // its `done` sender here so cleanup signals the barrier. Without this,
+    // the new login's `barrier.await` hangs forever, leaking its connection
+    // semaphore permit and fd, and every reconnect for the same run_id
+    // collides with the same stuck barrier.
+    if ctl.shutdown_done.is_none() {
+        while let Ok(msg) = internal_rx.try_recv() {
+            if let InternalMsg::Shutdown { done } = msg {
+                ctl.shutting_down = true;
+                ctl.shutdown_done = Some(done);
+                break;
+            }
+            // Other queued internal messages are dropped: the control
+            // connection is already gone, so dispatching them would fail.
         }
     }
 

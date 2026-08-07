@@ -477,13 +477,29 @@ async fn handle_put_config(
     let _ = frp_core::config::load_client_config_from_str(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid config: {e}")))?;
 
-    std::fs::write(path, &body).map_err(|e| {
-        tracing::error!(path = %path, error = %e, "Failed to write config file: {}", e);
+    // Atomic write: write to a temp file in the same directory then rename,
+    // so a crash mid-write cannot leave the config file truncated/corrupted
+    // (plain fs::write would truncate in place first).
+    let tmp_path = {
+        let mut tmp = std::path::Path::new(path).as_os_str().to_os_string();
+        tmp.push(".admin.tmp");
+        std::path::PathBuf::from(tmp)
+    };
+    std::fs::write(&tmp_path, &body).map_err(|e| {
+        tracing::error!(path = %tmp_path.display(), error = %e, "Failed to write config temp file: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to write config file".into(),
         )
     })?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        tracing::error!(path = %path, error = %e, "Failed to atomically replace config file: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to write config file".into(),
+        ));
+    }
     // Trigger reload after config update
     reload_and_wait(&state, true)
         .await
@@ -623,8 +639,23 @@ pub async fn run_admin_server(
         addr.clone()
     } else if !addr.starts_with("0.0.0.0:") && !addr.starts_with("[::]:") && !addr.starts_with("::")
     {
-        // Non-loopback, non-wildcard address explicitly configured — use as-is.
-        addr.clone()
+        // Non-loopback, non-wildcard address explicitly configured. Allow it
+        // ONLY when admin auth is configured — without auth, every API
+        // endpoint (/api/config read incl. token, PUT config, /api/stop,
+        // store CRUD) is open to anyone who can reach the address. Force
+        // loopback instead so the exposure cannot happen by misconfiguration.
+        if auth_user.is_empty() || auth_password.is_empty() {
+            tracing::error!(
+                original = %addr,
+                bind = %localhost_addr,
+                "frpc admin: no admin auth configured — refusing to bind admin API to non-loopback address {}; binding {} (localhost only). Set admin_user and admin_password to bind externally.",
+                addr,
+                localhost_addr
+            );
+            localhost_addr
+        } else {
+            addr.clone()
+        }
     } else {
         // Wildcard (0.0.0.0 or [::]) or unspecified — force localhost.
         if auth_user.is_empty() || auth_password.is_empty() {

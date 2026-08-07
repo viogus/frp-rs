@@ -315,9 +315,10 @@ impl KcpSession {
         self.fec_encode_output(output)
     }
 
-    /// Enqueue data to send via KCP.
-    pub fn send(&mut self, data: &[u8]) -> io::Result<usize> {
-        let n = self.kcp.send(data).map_err(io::Error::other)?;
+    /// Enqueue data to send via KCP. Takes ownership of `data` so the KCP
+    /// segmentation can split by moving instead of copying.
+    pub fn send(&mut self, data: Vec<u8>) -> io::Result<usize> {
+        let n = self.kcp.send(data.to_vec()).map_err(io::Error::other)?;
         // send() grew snd_queue; refresh the shared backlog counter so a
         // poll_write blocked on it can re-evaluate.
         self.reconcile_snd_backlog();
@@ -733,10 +734,9 @@ mod tests {
         // out of snd_queue, so wait_snd() grows past the threshold and the
         // shared counter follows (poll_write will then return Pending).
         let mss = session.kcp.mss();
-        let chunk = vec![0u8; mss];
         let mut sends = 0;
         while session.kcp.wait_snd() < KCP_SND_BACKLOG_THRESHOLD {
-            session.send(&chunk).unwrap();
+            session.send(vec![0u8; mss]).unwrap();
             sends += 1;
             assert!(
                 sends < 100_000,
@@ -768,10 +768,9 @@ mod tests {
 
         // Fill snd_queue past the threshold.
         let mss = s1.kcp.mss();
-        let chunk = vec![0u8; mss];
         let mut sends = 0;
         while s1.kcp.wait_snd() < KCP_SND_BACKLOG_THRESHOLD {
-            s1.send(&chunk).unwrap();
+            s1.send(vec![0u8; mss]).unwrap();
             sends += 1;
             assert!(sends < 100_000);
         }
@@ -821,7 +820,7 @@ mod tests {
         let (read_tx2, mut read_rx2) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let mut s2 = KcpSession::new(1, "127.0.0.1:9000".parse().unwrap(), config, read_tx2);
 
-        s1.send(b"hello kcp").unwrap();
+        s1.send(b"hello kcp".to_vec()).unwrap();
 
         let mut now_ms = 0u32;
         for _ in 0..20 {
@@ -847,7 +846,7 @@ mod tests {
         let (read_tx, _) = tokio::sync::mpsc::channel(16);
         let mut session = KcpSession::new(42, "127.0.0.1:9999".parse().unwrap(), config, read_tx);
 
-        session.send(b"test data").unwrap();
+        session.send(b"test data".to_vec()).unwrap();
 
         let mut got_packets = false;
         for tick in 0..10 {
@@ -899,7 +898,7 @@ mod tests {
         let (tx2, mut rx2) = tokio::sync::mpsc::channel(16);
         let mut receiver = KcpSession::new(1, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 
-        sender.send(b"hello fec").unwrap();
+        sender.send(b"hello fec".to_vec()).unwrap();
 
         let mut now_ms = 0u32;
         for _ in 0..50 {
@@ -930,11 +929,11 @@ mod tests {
 
         // Send 3 packets interleaved with update to force KCP to produce
         // separate output packets (stream mode would otherwise coalesce).
-        sender.send(b"pkt1").unwrap();
+        sender.send(b"pkt1".to_vec()).unwrap();
         let _ = sender.update(10).unwrap();
-        sender.send(b"pkt2").unwrap();
+        sender.send(b"pkt2".to_vec()).unwrap();
         let _ = sender.update(20).unwrap();
-        sender.send(b"pkt3").unwrap();
+        sender.send(b"pkt3".to_vec()).unwrap();
 
         let mut received = Vec::new();
         let mut now_ms = 30u32;
@@ -971,7 +970,7 @@ mod tests {
         // Data ending with zero bytes. SIZE field protects against
         // trailing-zero corruption (SIZE tells exact payload length).
         let data = b"hello\0\0\0\x01\x00";
-        sender.send(data).unwrap();
+        sender.send(data.to_vec()).unwrap();
 
         let mut now_ms = 0u32;
         for _ in 0..50 {
@@ -1003,17 +1002,17 @@ mod tests {
         let mut all_packets = Vec::new();
         let mut now_ms = 0u32;
 
-        sender.send(b"parity test payload").unwrap();
+        sender.send(b"parity test payload".to_vec()).unwrap();
         for _ in 0..10 {
             now_ms += 10;
             all_packets.extend(sender.update(now_ms).unwrap());
         }
-        sender.send(b"filler-a").unwrap();
+        sender.send(b"filler-a".to_vec()).unwrap();
         for _ in 0..10 {
             now_ms += 10;
             all_packets.extend(sender.update(now_ms).unwrap());
         }
-        sender.send(b"filler-b").unwrap();
+        sender.send(b"filler-b".to_vec()).unwrap();
         for _ in 0..20 {
             now_ms += 10;
             all_packets.extend(sender.update(now_ms).unwrap());
@@ -1083,11 +1082,11 @@ mod tests {
 
         // Send 3 packets interleaved with update to force KCP to produce
         // separate output packets (stream mode coalesces otherwise).
-        sender.send(b"a").unwrap();
+        sender.send(b"a".to_vec()).unwrap();
         let packets1 = sender.update(10).unwrap();
-        sender.send(b"b").unwrap();
+        sender.send(b"b".to_vec()).unwrap();
         let packets2 = sender.update(20).unwrap();
-        sender.send(b"c").unwrap();
+        sender.send(b"c".to_vec()).unwrap();
         let packets3 = sender.update(30).unwrap();
 
         let all_packets: Vec<&Vec<u8>> = packets1
@@ -1180,9 +1179,9 @@ mod tests {
 
         // Produce one complete FEC group and feed only 2 of its 3 data shards,
         // so the group never completes.
-        sender.send(b"one").unwrap();
-        sender.send(b"two").unwrap();
-        sender.send(b"three").unwrap();
+        sender.send(b"one".to_vec()).unwrap();
+        sender.send(b"two".to_vec()).unwrap();
+        sender.send(b"three".to_vec()).unwrap();
         let mut packets = Vec::new();
         for tick in 0..30 {
             packets.extend(sender.update(10 + tick * 10).unwrap());
@@ -1293,10 +1292,9 @@ mod tests {
         s1.input(&make_header_pkt(89, 0x54, 0)).unwrap();
         assert_eq!(s1.kcp.rmt_wnd(), 0);
         let mss = s1.kcp.mss();
-        let chunk = vec![0u8; mss];
         let mut sends = 0;
         while s1.kcp.wait_snd() < KCP_SND_BACKLOG_THRESHOLD {
-            s1.send(&chunk).unwrap();
+            s1.send(vec![0u8; mss]).unwrap();
             sends += 1;
             assert!(sends < 100_000);
         }

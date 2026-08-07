@@ -618,17 +618,14 @@ impl AppState {
         const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
         throttle.retain(|_, (_, window_start)| now.duration_since(*window_start) < CLEANUP_TIMEOUT);
 
-        // Cap: refuse new entries when the map is full. Check BEFORE
-        // calling entry() to avoid a borrow conflict with the mutable ref.
-        // Table full and this IP is not tracked: refuse instead of silently
-        // allowing an untracked IP to bypass the limit — 512 pre-registered
-        // IPs would otherwise open an unlimited brute-force window for any
-        // new IP. The caller (login failure path) treats `false` as throttled.
-        // Trade-off: while full, new IPs are rejected for up to 90s; 512+
-        // distinct failed IPs within that window is abnormal, so brief
-        // collateral rejection of legit new IPs is acceptable.
+        // Cap: when the table is full, fall back to allowing untracked IPs
+        // rather than rejecting them — refusing every new IP for up to 90s
+        // turns a distributed login flood into a denial of service against
+        // legitimate new clients (they cannot even retry). The throttle
+        // degrades gracefully (untracked IPs are not rate-limited) while
+        // expired entries drain via the cleanup above.
         if !throttle.contains_key(&ip) && throttle.len() >= MAX_THROTTLE_ENTRIES {
-            return false;
+            return true;
         }
 
         let (count, window_start) = throttle.entry(ip).or_insert((0, now));

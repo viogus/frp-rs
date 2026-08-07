@@ -212,7 +212,12 @@ fn default_graceful_timeout() -> u64 {
     30
 }
 pub(super) fn default_authentication_timeout() -> i64 {
-    0
+    // Default 90s (Go frp upstream defaults to 0 = replay protection off).
+    // With 0, timestamp freshness and duplicate-(run_id, ts) detection are
+    // both skipped, so a sniffed Login frame can be replayed for the token's
+    // lifetime. Deliberate divergence from Go for a safer default; set
+    // `authenticationTimeout = 0` explicitly to restore Go behaviour.
+    90
 }
 pub(super) fn default_token_auth_timeout() -> bool {
     true
@@ -363,6 +368,14 @@ pub struct SshTunnelGatewayConfig {
     /// disconnected so it cannot hold a connection slot forever.
     #[serde(default, alias = "sshSessionIdleTimeout")]
     pub ssh_session_idle_timeout: u64,
+
+    /// Allow the SSH gateway to start with NO credentials (no
+    /// authorized_keys file and no server_token), accepting every SSH
+    /// connection without authentication. Default false: with no credentials
+    /// the gateway fails closed at startup with a clear error. Set true only
+    /// for trusted networks, matching Go frp's NoClientAuth mode.
+    #[serde(default, alias = "allowNoneAuth")]
+    pub allow_none_auth: bool,
 }
 
 fn default_autogen_ssh_key_path() -> String {
@@ -378,6 +391,7 @@ impl Default for SshTunnelGatewayConfig {
             auto_gen_private_key_path: default_autogen_ssh_key_path(),
             authorized_keys_file: String::new(),
             ssh_session_idle_timeout: 0,
+            allow_none_auth: false,
         }
     }
 }

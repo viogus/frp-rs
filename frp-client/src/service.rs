@@ -135,6 +135,49 @@ pub struct Service {
 }
 
 impl Service {
+    /// Wait briefly for visitor listener tasks to exit gracefully, then
+    /// force-abort any still blocked in `accept()` so their listeners drop
+    /// and the bind ports are released immediately. Without the abort, an
+    /// idle visitor listener (no inbound traffic) never wakes from `accept()`,
+    /// the dropped `JoinHandle` does NOT cancel the task, and the next
+    /// session's `bind()` fails with AddrInUse — permanently killing the
+    /// visitor (STCP/XTCP) until frpc restarts.
+    async fn shutdown_visitor_tasks(&self, mut handles: Vec<tokio::task::JoinHandle<()>>) {
+        // &mut JoinHandle implements Future (tokio); &JoinHandle does not.
+        let graceful = tokio::time::timeout(
+            Duration::from_millis(500),
+            futures_util::future::join_all(handles.iter_mut()),
+        )
+        .await;
+        if graceful.is_err() {
+            tracing::warn!(
+                count = handles.len(),
+                "Visitor shutdown timed out after 500ms; aborting stuck listener task(s) to release bind ports"
+            );
+            for h in &handles {
+                h.abort();
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        }
+    }
+
+    /// CloseProxy must use the ORIGINAL registered wire name (old user
+    /// prefix). After a `user` config change, rebuilding the name from the
+    /// new user misses the server-side proxy and leaves it orphaned (its
+    /// port/domains stay allocated). Look up the registered key from
+    /// proxy_info_map: when old/new users differ, do_reload's strip_prefix
+    /// fails and the delta name IS the full registered key.
+    async fn close_wire_name_for_reload(&self, name: &str, user: &str) -> String {
+        let map = self.proxy_info_map.read().await;
+        if map.contains_key(name) {
+            name.to_string()
+        } else {
+            wire_proxy_name(user, name)
+        }
+    }
+
     /// Create a new client Service with default unsafe features (all blocked).
     pub async fn new(
         cfg: ClientConfig,
@@ -580,6 +623,12 @@ impl Service {
         let mut did_login_once = false;
         let mut consecutive_err_count: u32 = 0;
         let mut fast_retry_timestamps: Vec<Instant> = Vec::new();
+        // When a session runs healthily for a long time, the consecutive
+        // error count is reset so an occasional blip doesn't reconnect with
+        // the backoff cap already reached (Go frp's FastBackoffManager only
+        // counts consecutive failures).
+        #[allow(unused_assignments)] // initial None is overwritten before first read
+        let mut session_started_at: Option<Instant> = None;
         // Track visitor listener tasks so they can be cancelled on reconnect.
         let mut visitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         // Carry over run_id across reconnections (Go frp compat: previousRunID).
@@ -708,6 +757,8 @@ impl Service {
             #[cfg(feature = "quic")]
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             previous_run_id = run_id.clone();
+            // Session established — mark its start for backoff reset.
+            session_started_at = Some(Instant::now());
             let v2 = cfg_local.v2;
             info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
 
@@ -1221,15 +1272,11 @@ impl Service {
             // visitors to exit, instead of aborting them (Go frp compat:
             // visitor_manager.Close() closes each visitor cleanly). The
             // previous session's visitor_shutdown was already set when the
-            // session ended; tasks should exit on their own. join_all waits on
-            // all tasks in parallel — per-task sequential 500ms timeouts would
-            // multiply the reconnect delay by the number of stuck visitors.
-            // Dropped (still-running) tasks poll the shutdown flag and exit.
-            let _ = tokio::time::timeout(
-                Duration::from_millis(500),
-                futures_util::future::join_all(visitor_handles.drain(..)),
-            )
-            .await;
+            // session ended; tasks should exit on their own. Any listener
+            // still stuck in accept() after the grace period is force-aborted
+            // so the bind port is released for the new session.
+            self.shutdown_visitor_tasks(std::mem::take(&mut visitor_handles))
+                .await;
 
             // Spawn STCP/XTCP visitor listeners
             let session_visitors = self.cfg.read().await.visitors.clone();
@@ -1676,7 +1723,7 @@ impl Service {
                                 let ts = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
-                                    .as_secs() as i64;
+                                    .as_millis() as i64;
                                 match self.auth_cfg.try_generate_login_key(ts) {
                                     Ok(key) => {
                                         ping_msg.privilege_key = Some(key);
@@ -2056,14 +2103,10 @@ impl Service {
 
             // Wait briefly for visitor tasks to notice the shutdown signal and
             // exit gracefully (timeout so we never block reconnection).
-            // join_all waits on all tasks in parallel — sequential per-task
-            // 500ms timeouts would cost N×500ms for N stuck visitors, twice per
-            // reconnect. Dropped (still-running) tasks poll the shutdown flag.
-            let _ = tokio::time::timeout(
-                Duration::from_millis(500),
-                futures_util::future::join_all(visitor_handles.drain(..)),
-            )
-            .await;
+            // Any listener still blocked in accept() after the grace period is
+            // force-aborted so the bind port is released for the next session.
+            self.shutdown_visitor_tasks(std::mem::take(&mut visitor_handles))
+                .await;
 
             // Check if admin stop was requested
             if shutdown_flag.load(Ordering::SeqCst) {
@@ -2073,6 +2116,14 @@ impl Service {
 
             // Session dropped — reconnect with Go frp dev two-phase fast-backoff.
             // login_fail_exit only applies to initial login, not session drops.
+            // Reset the consecutive-error count when the previous session was
+            // healthy for ≥5 minutes, so a stable connection followed by an
+            // occasional blip reconnects from Phase 1 instead of the 20s cap.
+            if let Some(started) = session_started_at {
+                if started.elapsed() > Duration::from_secs(300) {
+                    consecutive_err_count = 0;
+                }
+            }
             let delay = crate::backoff::reconnect_delay_after_session(
                 &mut consecutive_err_count,
                 &mut fast_retry_timestamps,
@@ -2354,9 +2405,25 @@ impl Service {
                         let addr = handle.local_addr.to_string();
                         plugin_addrs.insert(name.clone(), addr);
                         new_plugin_handles.insert(name.clone(), handle);
+                    } else if delta.changed.contains(name) {
+                        // A CHANGED proxy whose plugin failed to restart must
+                        // not silently fall back to local_ip:local_port — the
+                        // commit phase would then kill the OLD plugin and leave
+                        // the proxy pointing at a dead address while reload
+                        // reports success. Abort the whole reload: drop the
+                        // freshly started plugins (if any), keep the old
+                        // plugin set and the server-side old proxy untouched.
+                        for (_, h) in new_plugin_handles.drain() {
+                            drop(h);
+                        }
+                        return Err(format!(
+                            "plugin '{}' failed to restart for changed proxy '{}'; reload aborted, old plugin kept running",
+                            plugin_cfg.plugin_type, name
+                        ));
                     }
-                    // If plugin start fails, plugin_addrs won't have an entry;
-                    // the proxy uses configured local_ip:local_port as fallback.
+                    // Added proxy: a plugin start failure falls back to
+                    // local_ip:local_port with an error recorded on the proxy
+                    // (see the proxy_info_map err field below).
                 }
             }
         }
@@ -2402,7 +2469,7 @@ impl Service {
         // CloseProxy for removed proxies
         let user = delta.new_config.user.clone();
         for name in &delta.removed {
-            let wn = wire_proxy_name(&user, name);
+            let wn = self.close_wire_name_for_reload(name, &user).await;
             msgs.push(ReloadMsg {
                 label: format!("send CloseProxy for '{name}'"),
                 msg: FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: wn }),
@@ -2413,7 +2480,7 @@ impl Service {
         // CloseProxy + NewProxy for changed proxies
         for name in &delta.changed {
             if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
-                let wn = wire_proxy_name(&user, name);
+                let wn = self.close_wire_name_for_reload(name, &user).await;
                 let local_addr = plugin_addrs
                     .get(name)
                     .cloned()

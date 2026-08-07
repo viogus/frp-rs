@@ -259,6 +259,29 @@ async fn verify_login_auth(
                 // (token-reachable OOM). Legitimate clients hitting the cap
                 // are rejected for this second and retry on the next timestamp.
                 const MAX_ENTRIES_PER_TIMESTAMP: usize = 100;
+                // Global bound on the whole table (defense-in-depth): with a
+                // large authenticationTimeout the per-second cap alone allows
+                // ~2*timeout*100 entries, and future-dated keys only expire
+                // once the clock passes them. A token-reachable attacker could
+                // otherwise grow this map's memory without bound. Computed
+                // before `entry` so the immutable borrow does not overlap the
+                // mutable entry borrow.
+                const MAX_TOTAL_REPLAY_ENTRIES: usize = 100_000;
+                let total: usize = used.values().map(|s| s.len()).sum();
+                if total >= MAX_TOTAL_REPLAY_ENTRIES {
+                    warn!(
+                        peer = ?peer, ts = ts,
+                        "Login rejected: replay-detection table full ({} entries, cap {})",
+                        total, MAX_TOTAL_REPLAY_ENTRIES,
+                    );
+                    send_login_error(
+                        stream,
+                        "login rejected: too many login attempts".into(),
+                        v2,
+                    )
+                    .await;
+                    return Err(());
+                }
                 let entry = used.entry(ts).or_default();
                 if entry.len() >= MAX_ENTRIES_PER_TIMESTAMP {
                     warn!(
@@ -288,15 +311,27 @@ async fn verify_login_auth(
                     .await;
                     return Err(());
                 }
-                // Clean old entries: split_off (O(log n)) is faster than a full
-                // retain scan (O(n)) and avoids holding the lock for a linear scan.
-                let now = std::time::SystemTime::now()
+                // Clean old entries. Keys are now milliseconds (frpc) or
+                // seconds (Go frpc): prune BOTH precisions. With seconds-only
+                // pruning, ms keys (~1.75e12) would never be < the seconds
+                // threshold and the table would grow unbounded until the
+                // 100k global cap rejected every login.
+                let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs() as i64;
-                let threshold = now - auth_cfg.authentication_timeout;
-                let kept = used.split_off(&threshold);
-                *used = kept;
+                    .as_millis() as i64;
+                let timeout_ms = auth_cfg.authentication_timeout.saturating_mul(1000);
+                let threshold_ms = now_ms.saturating_sub(timeout_ms);
+                let threshold_s = (now_ms / 1000).saturating_sub(auth_cfg.authentication_timeout);
+                // Keys < 1e12 are seconds-precision (Go frpc); >= 1e12 are ms.
+                const MS_EPOCH: i64 = 1_000_000_000_000;
+                used.retain(|k, _| {
+                    if *k >= MS_EPOCH {
+                        *k >= threshold_ms
+                    } else {
+                        *k >= threshold_s
+                    }
+                });
             }
         }
 
@@ -474,7 +509,12 @@ pub(crate) async fn authenticate(
 
     if let Some(barrier) = handoff_barrier {
         info!(run_id = %run_id, "Waiting for old control handler shutdown...");
-        let _ = barrier.await;
+        // Defense-in-depth timeout: if the old handler exits via a client
+        // read error before consuming the queued Shutdown, its `done` may
+        // never be signaled. Cleanup is idempotent and control_id-guarded
+        // (unregister_control skips entries owned by a newer control), so
+        // proceeding after the timeout is safe — never block reconnects.
+        let _ = tokio::time::timeout(Duration::from_secs(10), barrier).await;
         info!(run_id = %run_id, "Old control handler shutdown complete");
     }
 

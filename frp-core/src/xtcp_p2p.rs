@@ -484,7 +484,7 @@ impl XtcpP2pStream {
         let was_full = self.pending_send.len() >= PENDING_SEND_HIGH_WATER;
         if !self.pending_send.is_empty() {
             let data = std::mem::take(&mut self.pending_send);
-            self.session.send(&data)?;
+            self.session.send(data)?;
             // Wake write pollers that were blocked on the high-water mark.
             // notify_one() stores a permit if no waiters exist, preventing
             // the lost-wake race between poll_write's notified_owned() and
@@ -703,7 +703,7 @@ impl AsyncWrite for XtcpP2pStream {
         let pending_drain_len = self.pending_send.len();
         if !self.pending_send.is_empty() {
             let data = std::mem::take(&mut self.pending_send);
-            let _ = self.session.send(&data);
+            let _ = self.session.send(data);
         }
 
         // Force-flush: update KCP and send all output immediately.

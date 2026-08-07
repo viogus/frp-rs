@@ -354,14 +354,20 @@ pub(crate) async fn handle_new_visitor_conn<W: AsyncWriteExt + Unpin>(
     let sign_key = nvc.sign_key.unwrap_or_default();
     let timestamp = nvc.timestamp.unwrap_or(0);
 
-    // Validate timestamp freshness (replay attack prevention).
+    // Validate timestamp freshness (replay attack prevention). A missing
+    // timestamp (0) skips the window — same semantics as control Login —
+    // so legacy/Go clients that omit it are not rejected.
     let auth_timeout = ctx
         .state
         .reloadable
         .read_ok()
         .auth_cfg
         .authentication_timeout;
-    let ts_fresh = frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout);
+    let ts_fresh = if timestamp == 0 {
+        Ok(())
+    } else {
+        frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
+    };
 
     // Validate proxy exists and sign_key matches.
     // Uses constant-time comparison (verify_token) instead of
@@ -379,17 +385,32 @@ pub(crate) async fn handle_new_visitor_conn<W: AsyncWriteExt + Unpin>(
         if !user_ok {
             warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn on ctl: user denied for proxy '{}'", nvc.proxy_name);
             false
-        } else if let Some(ref sk) = proxy_info.sk {
-            if sk.is_empty() {
-                true // No sk — allow without auth
-            } else if ts_fresh.is_err() {
-                warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn on ctl: timestamp stale for proxy '{}'", nvc.proxy_name);
-                false
-            } else {
-                frp_core::auth::verify_token(sk, timestamp, &sign_key)
-            }
         } else {
-            true // No sk configured
+            match proxy_info.sk.as_deref().filter(|s| !s.is_empty()) {
+                Some(sk) => {
+                    // Verify the token first, freshness second: an
+                    // unauthenticated caller must not learn whether the
+                    // timestamp window was exceeded.
+                    if !frp_core::auth::verify_token(sk, timestamp, &sign_key) {
+                        warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn on ctl: auth mismatch for proxy '{}'", nvc.proxy_name);
+                        false
+                    } else if let Err(e) = &ts_fresh {
+                        warn!(proxy_name = %nvc.proxy_name, error = %e, "NewVisitorConn on ctl: timestamp stale for proxy '{}'", nvc.proxy_name);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => {
+                    // No sk configured — Go frp parity: admit the visitor;
+                    // the owner/allow_users check above still applies. Warn
+                    // when the proxy is open to anonymous frps clients.
+                    if proxy_info.allow_users.is_empty() && proxy_info.user.is_empty() {
+                        warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn on ctl: proxy '{}' has no sk and no visitor authorization — anyone with frps access can connect (configure secret_key or allow_users)", nvc.proxy_name);
+                    }
+                    true
+                }
+            }
         }
     } else {
         // Without ProxyInfo the owner/allow_users policy is unknown. A shared
@@ -490,34 +511,18 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     // Verify sign_key if the proxy has a shared secret.
     // Uses constant-time comparison (verify_token) and timestamp
     // freshness check to prevent timing side-channel and replay attacks.
+    // Token is verified before freshness so an unauthenticated caller cannot
+    // probe the freshness window, and a missing timestamp (0) skips the
+    // window entirely (legacy/Go clients may omit it).
     let sign_key = nhv.sign_key.as_deref().unwrap_or("");
     let timestamp = nhv.timestamp.unwrap_or(0);
-    if let Some(ref sk) = proxy_info.sk {
-        if !sk.is_empty() {
+    match proxy_info.sk.as_deref().filter(|s| !s.is_empty()) {
+        Some(sk) => {
             if sign_key.is_empty() {
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key for protected proxy '{}'", proxy_name);
                 let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                     transaction_id: transaction_id.clone(),
                     error: Some("auth required".into()),
-                    ..Default::default()
-                }));
-                let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
-                return Ok(());
-            }
-            // Validate timestamp freshness (replay attack prevention).
-            let auth_timeout = ctx
-                .state
-                .reloadable
-                .read_ok()
-                .auth_cfg
-                .authentication_timeout;
-            if let Err(freshness_err) =
-                frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
-            {
-                warn!(proxy_name = %proxy_name, error = %freshness_err, "NatHoleVisitor on ctl: timestamp stale for proxy '{}'", proxy_name);
-                let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
-                    transaction_id: transaction_id.clone(),
-                    error: Some(freshness_err),
                     ..Default::default()
                 }));
                 let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
@@ -533,7 +538,35 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
                 return Ok(());
             }
+            if timestamp != 0 {
+                let auth_timeout = ctx
+                    .state
+                    .reloadable
+                    .read_ok()
+                    .auth_cfg
+                    .authentication_timeout;
+                if let Err(freshness_err) =
+                    frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
+                {
+                    warn!(proxy_name = %proxy_name, error = %freshness_err, "NatHoleVisitor on ctl: timestamp stale for proxy '{}'", proxy_name);
+                    let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
+                        transaction_id: transaction_id.clone(),
+                        error: Some(freshness_err),
+                        ..Default::default()
+                    }));
+                    let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
+                    return Ok(());
+                }
+            }
             debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK (constant-time) on ctl for proxy '{}'", proxy_name);
+        }
+        None => {
+            // No sk configured — Go frp parity: admit the visitor (the
+            // owner/allow_users check above already ran). Warn when the
+            // proxy is open to anonymous frps clients.
+            if proxy_info.allow_users.is_empty() && proxy_info.user.is_empty() {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' has no sk and no visitor authorization — anyone with frps access can connect (configure secret_key or allow_users)", proxy_name);
+            }
         }
     }
 

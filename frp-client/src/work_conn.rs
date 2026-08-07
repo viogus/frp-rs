@@ -291,10 +291,20 @@ struct WorkConnDialConfig<'a> {
     dial_timeout_secs: u64,
 }
 
+/// Bind a fresh UDP socket connected to the local service address (Go frp
+/// compat: each wrapper binds its own socket). Used both at session start
+/// and to rebuild the socket after a hot reload changes the target address.
+async fn bind_udp_proxy_socket(local_addr: &str) -> Option<std::sync::Arc<UdpSocket>> {
+    let ip = local_addr.rsplit_once(':')?.0;
+    let bind_addr = format!("{ip}:0");
+    let socket = UdpSocket::bind(&bind_addr).await.ok()?;
+    socket.connect(local_addr).await.ok()?;
+    Some(std::sync::Arc::new(socket))
+}
+
 /// Shared yamux-or-dial path for work connection transport acquisition.
 /// Used by both QUIC and non-QUIC branches.
-async fn connect_yamux_or_dial(cfg: &WorkConnDialConfig<'_>) -> Option<IoStream> {
-    if let Some(ref yamux) = *cfg.yamux {
+async fn connect_yamux_or_dial(cfg: &WorkConnDialConfig<'_>) -> Option<IoStream> {    if let Some(ref yamux) = *cfg.yamux {
         match yamux.open_stream().await {
             Some(stream) => {
                 debug!(label = %cfg.label, "Work conn {} opened yamux stream", cfg.label);
@@ -934,7 +944,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     let timestamp = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_secs() as i64;
+                        .as_millis() as i64;
                     match auth_cfg.try_generate_login_key(timestamp) {
                         Ok(key) => {
                             nwc_msg.privilege_key = Some(key);
@@ -1201,23 +1211,42 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 }
 
                 if info.proxy_type == "udp" {
-                    // UDP proxy: bridge work conn ↔ local UDP socket
-                    let sock = {
+                    // UDP proxy: bridge work conn ↔ local UDP socket. The
+                    // socket is bound once per session; after a hot reload
+                    // changes local_addr/local_port (or encryption settings),
+                    // the cached socket still points at the stale target —
+                    // rebuild it on demand so the reload takes effect
+                    // (previously the stale socket was used silently forever).
+                    let want_addr = info.local_addr.clone();
+                    let want_enc = (info.use_encryption, info.use_compression);
+                    let need_rebind = {
                         let map = udp_sockets.lock().await;
-                        map.get(&proxy_name).cloned()
-                    };
-                    let sock = match sock {
-                        Some(s) => s,
-                        None => {
-                            warn!(label = %label, proxy_name = %proxy_name, "Work conn {}: no UDP socket for proxy '{}'", label, proxy_name);
-                            return;
+                        match map.get(&proxy_name) {
+                            Some(s) => s
+                                .peer_addr()
+                                .map(|p| p.to_string() != want_addr)
+                                .unwrap_or(true),
+                            None => true,
                         }
                     };
-                    let enc_cfg = {
-                        let cfg = udp_enc_cfg.lock().await;
-                        cfg.get(&proxy_name).copied().unwrap_or((false, false))
+                    let sock = if need_rebind {
+                        udp_sockets.lock().await.remove(&proxy_name);
+                        match bind_udp_proxy_socket(&want_addr).await {
+                            Some(s) => {
+                                udp_sockets.lock().await.insert(proxy_name.clone(), s.clone());
+                                s
+                            }
+                            None => {
+                                warn!(label = %label, proxy_name = %proxy_name, "Work conn {}: failed to rebind UDP socket for '{}'", label, proxy_name);
+                                return;
+                            }
+                        }
+                    } else {
+                        udp_sockets.lock().await.get(&proxy_name).cloned().unwrap()
                     };
-                    let (use_enc, use_comp) = enc_cfg;
+                    // Encryption settings follow the proxy's current config.
+                    udp_enc_cfg.lock().await.insert(proxy_name.clone(), want_enc);
+                    let (use_enc, use_comp) = want_enc;
 
                     info!(label = %label, proxy_name = %proxy_name, use_enc = %use_enc, use_comp = %use_comp,
                         "Work conn {} bridging UDP for '{}' (enc={}, comp={})",

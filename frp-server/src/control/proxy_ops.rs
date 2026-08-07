@@ -341,10 +341,10 @@ fn validate_new_proxy(np: &msg::NewProxy) -> Result<(), String> {
     if np.proxy_name.len() > 255 {
         return Err("proxy_name exceeds 255 characters".into());
     }
-    if np
-        .proxy_name
-        .contains(|c: char| c.is_control() && c != '\n' && c != '\r')
-    {
+    // Reject ALL control characters (including CR/LF, which previously slipped
+    // through) — proxy_name flows into vhost keys, sk_index, logs, dashboard
+    // events and wire messages.
+    if np.proxy_name.contains(|c: char| c.is_control()) {
         return Err("proxy_name contains invalid control characters".into());
     }
     if let Some(ref domains) = np.custom_domains {
@@ -355,12 +355,42 @@ fn validate_new_proxy(np: &msg::NewProxy) -> Result<(), String> {
                     domain
                 ));
             }
+            // Character whitelist + structure: only DNS-ish names are
+            // routable vhost keys. Reject wildcards (`*` catch-all would let
+            // a tenant hijack every host on a shared vhost deployment),
+            // whitespace, CR/LF, and empty labels.
+            if domain.is_empty()
+                || !domain
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                || domain.starts_with('.')
+                || domain.ends_with('.')
+                || domain.contains("..")
+                || domain.contains('*')
+                || domain.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(format!(
+                    "custom_domain '{}' contains invalid characters or structure (letters, digits, '.', '-' only; no wildcards)",
+                    domain
+                ));
+            }
         }
     }
     if let Some(ref subdomain) = np.subdomain {
-        if subdomain.len() > 63 {
+        // Single DNS label: letters/digits/'-', no '.', not starting/ending
+        // with '-'. Without this, a subdomain containing '.' could register
+        // arbitrary-depth names under the vhost root (Go frp applies the same
+        // RFC 1123 label rules).
+        let valid = !subdomain.is_empty()
+            && subdomain.len() <= 63
+            && subdomain
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !subdomain.starts_with('-')
+            && !subdomain.ends_with('-');
+        if !valid {
             return Err(format!(
-                "subdomain '{}' exceeds 63 characters (RFC 1035 label limit)",
+                "subdomain '{}' is not a valid RFC 1123 DNS label (letters, digits, '-'; no leading/trailing '-' or '.')",
                 subdomain
             ));
         }

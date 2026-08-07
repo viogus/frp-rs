@@ -1,6 +1,6 @@
 //! KCP socket driver — UDP event loop shared across all sessions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -96,6 +96,11 @@ pub(crate) struct KcpSocket {
     write_backlog: Arc<AtomicUsize>,
     write_notify: Arc<Notify>,
     start: Instant,
+    /// UDP packets that could not be sent immediately because the socket
+    /// send buffer was full (try_send_to). Drained on the next tick — keeps
+    /// the driver from blocking on `send_to().await` (head-of-line stall
+    /// for every other session on this socket).
+    pending_udp: VecDeque<(SocketAddr, Vec<u8>)>,
     /// Pre-allocated Vec for session removal during tick (avoids per-tick allocation).
     to_remove: Vec<(u32, SocketAddr)>,
     /// Pre-allocated Vec for expired unaccepted sessions cleanup during tick.
@@ -135,6 +140,7 @@ impl KcpSocket {
             write_backlog: write_backlog.clone(),
             write_notify: write_notify.clone(),
             start: Instant::now(),
+            pending_udp: VecDeque::new(),
             to_remove: Vec::with_capacity(16),
             expired: Vec::with_capacity(16),
             peer_addr_index: HashMap::new(),
@@ -167,14 +173,19 @@ impl KcpSocket {
             tokio::select! {
                 _ = tick.tick() => {
                     let now_ms = self.start.elapsed().as_millis() as u32;
+                    // Re-send packets queued by a full send buffer.
+                    self.drain_pending_udp();
                     self.to_remove.clear();
                     for (key, session) in &mut self.sessions {
                         match session.update(now_ms) {
                             Ok(packets) => {
                                 for pkt in packets {
-                                    if let Err(e) = self.socket.send_to(&pkt, key.1).await {
-                                        tracing::debug!(conv = key.0, peer = %key.1, error = %e, "KCP UDP send error");
-                                    }
+                                    Self::send_udp_packet(
+                                        &self.socket,
+                                        &mut self.pending_udp,
+                                        pkt,
+                                        key.1,
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -246,7 +257,7 @@ impl KcpSocket {
                             let addr = self.conv_index.get(&conv).copied();
                             let _result = addr
                                 .and_then(|a| self.sessions.get_mut(&(conv, a)))
-                                .map(|s| s.send(&data))
+                                .map(|s| s.send(data))
                                 .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
                             if let Err(ref e) = _result {
                                 tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed — session not found");
@@ -500,12 +511,59 @@ impl KcpSocket {
         }
     }
 
+    /// Send a UDP packet best-effort: `try_send_to` never blocks the driver.
+    /// On a full kernel send buffer the packet is queued for the next tick;
+    /// when the queue is full the packet is dropped (KCP retransmission will
+    /// resend it, so dropping is safe). Prevents a slow receiver from
+    /// stalling UDP receives and every other session on this socket.
+    ///
+    /// An associated function taking fields explicitly so it can be called
+    /// while `self.sessions` is mutably borrowed (field-level borrows).
+    fn send_udp_packet(
+        socket: &UdpSocket,
+        pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
+        pkt: Vec<u8>,
+        peer: SocketAddr,
+    ) {
+        match socket.try_send_to(&pkt, peer) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if pending_udp.len() < 2048 {
+                    pending_udp.push_back((peer, pkt));
+                }
+            }
+            Err(e) => {
+                tracing::debug!(peer = %peer, error = %e, "KCP UDP send error");
+            }
+        }
+    }
+
+    /// Re-send packets queued by a previous full send buffer (FIFO).
+    fn drain_pending_udp(&mut self) {
+        let mut still_pending = VecDeque::new();
+        while let Some((pa, pkt)) = self.pending_udp.pop_front() {
+            match self.socket.try_send_to(&pkt, pa) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    still_pending.push_back((pa, pkt));
+                }
+                Err(e) => {
+                    tracing::debug!(peer = %pa, error = %e, "KCP UDP pending send error");
+                }
+            }
+        }
+        self.pending_udp = still_pending;
+    }
+
     /// Flush a session's pending KCP output to the wire immediately.
     /// Shared by the Data handler (flush-on-write, matching kcp-go's
     /// flush-on-every-Write behavior) and the Flush handler (StartWorkConn
     /// ordering guarantee). No-op when the session is gone. Returns the
     /// number of output packets force_flush produced.
     async fn flush_session_output(&mut self, conv: u32, peer_addr: SocketAddr) -> usize {
+        // Drain the pending queue first so delayed packets keep ordering
+        // relative to newly flushed ones.
+        self.drain_pending_udp();
         let packets = if let Some(session) = self.sessions.get_mut(&(conv, peer_addr)) {
             let now_ms = self.start.elapsed().as_millis() as u32;
             match session.force_flush(now_ms) {
@@ -518,13 +576,11 @@ impl KcpSocket {
         } else {
             Vec::new()
         };
-        // Send all output packets immediately.
-        for pkt in &packets {
-            if let Err(e) = self.socket.send_to(pkt, peer_addr).await {
-                tracing::debug!(conv, peer = %peer_addr, error = %e, "KCP SOCKET: flush send error");
-            }
+        let n = packets.len();
+        for pkt in packets {
+            Self::send_udp_packet(&self.socket, &mut self.pending_udp, pkt, peer_addr);
         }
-        packets.len()
+        n
     }
 
     /// Extract (conv, peer_addr) key from a raw UDP packet.

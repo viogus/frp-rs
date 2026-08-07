@@ -139,8 +139,22 @@ impl WsInner {
             }
             let mask: [u8; 4] = rand::random();
             frame.extend_from_slice(&mask);
-            for i in 0..len {
-                frame.push(buf[i] ^ mask[i % 4]);
+            // XOR the payload with the mask key (RFC 6455 §5.3). Chunk the
+            // aligned prefix as u32 words instead of a byte-by-byte loop with
+            // per-byte modulo — ~4x fewer ops on the 32 KiB bridge chunks.
+            let start = frame.len();
+            frame.extend_from_slice(buf);
+            let chunk = &mut frame[start..];
+            let mask_u32 = u32::from_ne_bytes(mask);
+            let mut i = 0;
+            while i + 4 <= len {
+                let word = u32::from_ne_bytes([chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]]);
+                chunk[i..i + 4].copy_from_slice(&(word ^ mask_u32).to_ne_bytes());
+                i += 4;
+            }
+            while i < len {
+                chunk[i] ^= mask[i % 4];
+                i += 1;
             }
         } else {
             // Server MUST NOT mask frames per RFC 6455 §5.1

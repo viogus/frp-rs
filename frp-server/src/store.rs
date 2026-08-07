@@ -102,6 +102,21 @@ pub fn save_store(path: &Path, configs: &HashMap<String, ProxyConfig>) {
             "failed to atomically rename store file");
         // Clean up the temp file on failure
         let _ = std::fs::remove_file(&tmp_path);
+    } else {
+        // rename() preserves the DESTINATION's existing permissions when it
+        // overwrites a file — a pre-existing frps_store.json with loose
+        // permissions (manual chmod, older version) would keep them. Re-apply
+        // 0600 on the final path so the credentials file is never
+        // world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            {
+                error!(path = %path.display(), error = %e, "failed to set 0600 on store file");
+            }
+        }
     }
 }
 

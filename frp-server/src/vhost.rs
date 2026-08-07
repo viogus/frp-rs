@@ -577,6 +577,17 @@ async fn handle_http1_request<S>(
         pre_read.extend_from_slice(&buf[..m]);
     }
 
+    // The head is capped at 4096 bytes. If the cap fills without the
+    // \r\n\r\n terminator, respond 431 Request Header Fields Too Large
+    // instead of forwarding a truncated head — forwarding it makes the
+    // backend block waiting for the rest of the head, tying up a work-conn
+    // slot (limited DoS on shared vhosts).
+    if pre_read.len() >= 4096 && !pre_read.windows(4).any(|w| w == b"\r\n\r\n") {
+        let resp = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(resp).await;
+        return;
+    }
+
     // Parse the head text once, borrowing from the pre-read bytes (no full
     // copy — `into_owned()` would duplicate up to 4096 bytes per request).
     // `host`/`path` must still be owned Strings: `pre_read` is moved by
@@ -1099,11 +1110,19 @@ fn inject_vhost_request_headers(
     out.extend_from_slice(b"X-Forwarded-For: ");
     out.extend_from_slice(&xff);
     out.extend_from_slice(b"\r\n");
-    // Configured request headers.
+    // Configured request headers. Sanitize names/values against CR/LF to
+    // prevent HTTP header injection / request smuggling — same filter as the
+    // response-header path in bridge.rs and the Host rewrite above. A header
+    // whose name is empty after sanitization is dropped.
     for (k, v) in request_headers {
-        out.extend_from_slice(k.as_bytes());
+        let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
+        let safe_v: String = v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+        if safe_k.is_empty() {
+            continue;
+        }
+        out.extend_from_slice(safe_k.as_bytes());
         out.extend_from_slice(b": ");
-        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(safe_v.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
