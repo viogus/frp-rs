@@ -2734,3 +2734,254 @@ token = "a${}b"
         "${{}} expands to empty string"
     );
 }
+
+// ─── Template function expansion (Go frp `{{ parseNumberRange ... }}`) ──
+
+/// Expand `{{ parseNumberRange ... }}` in a single string through the
+/// `expand_template_functions` pass (the toml::Value tree entry point).
+fn expand_template_in_str(s: &str) -> String {
+    let mut value = toml::Value::String(s.to_string());
+    super::normalize::expand_template_functions(&mut value);
+    value.as_str().unwrap().to_string()
+}
+
+#[test]
+fn test_parse_number_range_basic() {
+    assert_eq!(
+        expand_template_in_str(r#"{{ parseNumberRange "7000-7003" }}"#),
+        "7000,7001,7002,7003"
+    );
+    assert_eq!(
+        expand_template_in_str(r#"{{ parseNumberRange "7000" }}"#),
+        "7000",
+        "single number"
+    );
+}
+
+#[test]
+fn test_parse_number_range_mixed_segments() {
+    assert_eq!(
+        expand_template_in_str(r#"{{ parseNumberRange "7000-7001,7005" }}"#),
+        "7000,7001,7005",
+        "range and single numbers mixed in one expression"
+    );
+    assert_eq!(
+        expand_template_in_str(r#"{{ parseNumberRange "7000 , 7003-7004" }}"#),
+        "7000,7003,7004",
+        "whitespace around components is trimmed (Go TrimSpace semantics)"
+    );
+}
+
+#[test]
+fn test_parse_number_range_embedded_in_longer_string() {
+    assert_eq!(
+        expand_template_in_str(r#"8080,{{ parseNumberRange "9000-9001" }}"#),
+        "8080,9000,9001",
+        "expansion concatenated with surrounding text"
+    );
+    assert_eq!(
+        expand_template_in_str(r#"http://127.0.0.1:{{ parseNumberRange "8000-8001" }}/path"#),
+        "http://127.0.0.1:8000,8001/path",
+        "expansion inside a URL-like string"
+    );
+}
+
+#[test]
+fn test_parse_number_range_multiple_calls_in_one_string() {
+    assert_eq!(
+        expand_template_in_str(
+            r#"{{ parseNumberRange "7000-7001" }}|{{ parseNumberRange "9000" }}"#
+        ),
+        "7000,7001|9000",
+        "several calls each expand in place"
+    );
+}
+
+#[test]
+fn test_parse_number_range_whitespace_variants() {
+    assert_eq!(
+        expand_template_in_str(r#"{{  parseNumberRange  "7000"  }}"#),
+        "7000",
+        "whitespace after {{ and before }} is allowed"
+    );
+    assert_eq!(
+        expand_template_in_str(r#"{{parseNumberRange "7000"}}"#),
+        "7000",
+        "no whitespace at all is also accepted"
+    );
+    assert_eq!(
+        expand_template_in_str("{{\n\tparseNumberRange\t\"7000\"\n}}"),
+        "7000",
+        "newline/tab whitespace is allowed"
+    );
+}
+
+#[test]
+fn test_parse_number_range_invalid_kept_verbatim() {
+    let invalid = r#"{{ parseNumberRange "abc" }}"#;
+    assert_eq!(
+        expand_template_in_str(invalid),
+        invalid,
+        "non-numeric expression kept verbatim"
+    );
+    let reversed = r#"{{ parseNumberRange "5-2" }}"#;
+    assert_eq!(
+        expand_template_in_str(reversed),
+        reversed,
+        "N > M range kept verbatim"
+    );
+    let multi_dash = r#"{{ parseNumberRange "1-2-3" }}"#;
+    assert_eq!(
+        expand_template_in_str(multi_dash),
+        multi_dash,
+        "segment with more than one '-' kept verbatim"
+    );
+    let empty = r#"{{ parseNumberRange "" }}"#;
+    assert_eq!(
+        expand_template_in_str(empty),
+        empty,
+        "empty expression kept verbatim"
+    );
+}
+
+#[test]
+fn test_parse_number_range_out_of_port_range_kept_verbatim() {
+    let over = r#"{{ parseNumberRange "70000" }}"#;
+    assert_eq!(
+        expand_template_in_str(over),
+        over,
+        "port above 65535 kept verbatim"
+    );
+    let range_over = r#"{{ parseNumberRange "60000-70000" }}"#;
+    assert_eq!(
+        expand_template_in_str(range_over),
+        range_over,
+        "range reaching above 65535 kept verbatim"
+    );
+    let negative = r#"{{ parseNumberRange "-1" }}"#;
+    assert_eq!(
+        expand_template_in_str(negative),
+        negative,
+        "negative port kept verbatim"
+    );
+}
+
+#[test]
+fn test_parse_number_range_non_call_templates_kept_verbatim() {
+    // Other `{{ ... }}` text is NOT template syntax for us — only the exact
+    // parseNumberRange call form is expanded (deliberate subset).
+    let other = "{{ .Envs.X }}";
+    assert_eq!(
+        expand_template_in_str(other),
+        other,
+        "non-parseNumberRange template text kept verbatim"
+    );
+    let mixed = "a{{ parseNumberRange \"7000\" }}b{{ .Envs.X }}c";
+    assert_eq!(
+        expand_template_in_str(mixed),
+        "a7000b{{ .Envs.X }}c",
+        "only the parseNumberRange call is expanded"
+    );
+}
+
+#[test]
+fn test_parse_number_range_env_then_template() {
+    // Env expansion runs first (env → template), so a ${VAR} inside the
+    // template argument is expanded before parseNumberRange sees it.
+    // RAII guard: removes the var even if the loader panics.
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+    std::env::remove_var("FRP_RS_TEST_ENV_RANGE");
+    let _guard = EnvGuard("FRP_RS_TEST_ENV_RANGE");
+    std::env::set_var("FRP_RS_TEST_ENV_RANGE", "7000-7002");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = '{{ parseNumberRange "${FRP_RS_TEST_ENV_RANGE}" }}'
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.auth.as_ref().unwrap().token,
+        "7000,7001,7002",
+        "env var inside the template argument expanded first"
+    );
+}
+
+#[test]
+fn test_parse_number_range_full_pipeline_allow_ports() {
+    // Server pipeline end-to-end: allow_ports is a comma-separated port-list
+    // string, so the expansion result feeds straight into its validator.
+    let cfg: ServerConfig = load_server_config_from_str(
+        r#"
+bind_port = 7000
+allow_ports = '{{ parseNumberRange "7100-7102,7105" }}'
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.allow_ports, "7100,7101,7102,7105");
+}
+
+#[test]
+fn test_parse_number_range_array_and_table_positions() {
+    let mut value: toml::Value = toml::from_str(
+        r#"
+port = '{{ parseNumberRange "7100-7101" }}'
+list = ['{{ parseNumberRange "7200-7201" }}', 'x-{{ parseNumberRange "7300" }}-y']
+[deep.nested]
+range = '{{ parseNumberRange "7400-7402" }}'
+"#,
+    )
+    .unwrap();
+    super::normalize::expand_template_functions(&mut value);
+    assert_eq!(
+        value.get("port").and_then(toml::Value::as_str),
+        Some("7100,7101"),
+        "top-level string value"
+    );
+    let list = value.get("list").and_then(toml::Value::as_array).unwrap();
+    assert_eq!(list[0].as_str(), Some("7200,7201"), "array element");
+    assert_eq!(
+        list[1].as_str(),
+        Some("x-7300-y"),
+        "embedded in array element"
+    );
+    assert_eq!(
+        value
+            .get("deep")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("nested"))
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("range"))
+            .and_then(toml::Value::as_str),
+        Some("7400,7401,7402"),
+        "nested table value"
+    );
+}
+
+#[test]
+fn test_parse_number_range_edge_inputs_kept_verbatim() {
+    // Edge inputs that Go's ParseRangeNumbers rejects (or that fall outside
+    // our minimal subset) must be kept verbatim, never half-expanded.
+    let cases = [
+        // trailing comma -> empty segment
+        "{{ parseNumberRange \"7000,\" }}",
+        // unclosed quote -> not a call
+        "{{ parseNumberRange \"7000 }}",
+        // u64-overflowing number -> no panic, kept verbatim
+        "{{ parseNumberRange \"99999999999999999999\" }}",
+        // escaped quote inside argument -> outside subset, kept verbatim
+        "{{ parseNumberRange \"a\\\"b\" }}",
+    ];
+    for (i, input) in cases.iter().enumerate() {
+        let mut value: toml::Value = toml::from_str(&format!("token = '{input}'")).unwrap();
+        super::normalize::expand_template_functions(&mut value);
+        let token = value.get("token").unwrap().as_str().unwrap();
+        assert_eq!(token, *input, "case {i}: kept verbatim");
+    }
+}

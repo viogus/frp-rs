@@ -110,6 +110,185 @@ fn expand_env_vars_in_str(s: &str) -> String {
     out
 }
 
+/// Expand `{{ parseNumberRange "..." }}` template calls in every string value
+/// of a `toml::Value` tree, mirroring the Go frp template function of the
+/// same name (`pkg/config/template.go`).
+///
+/// Go semantics (v0.70.1, confirmed against
+/// https://github.com/fatedier/frp/blob/v0.70.1/pkg/config/template.go and
+/// `util.ParseRangeNumbers` in pkg/util/util/util.go):
+/// - The argument is a comma-separated list of segments; each segment is
+///   either a single number `N` or an inclusive range `N-M` (step 1,
+///   N <= M). Whitespace around the whole expression and around each
+///   component is trimmed.
+/// - A segment with more than one `-`, a non-numeric component, or N > M
+///   makes the whole call an error (Go then fails the entire template
+///   render, which aborts config loading).
+/// - Output is a list of numbers; Go's text/template renders the returned
+///   `[]int64` in its default `fmt` form, i.e. `[7000 7001 7002]`.
+///
+/// frp-rs differences (deliberate, see the subset note below): we emit a
+/// comma-separated, space-free number string — the form Go frp itself
+/// consumes for multi-port settings like `allow_ports` — keep invalid
+/// expressions verbatim with a warning instead of failing the whole config,
+/// and constrain values to the TCP/UDP port range 0..=65535.
+///
+/// Pipeline position: this runs **after** `expand_env_vars` so an argument
+/// like `{{ parseNumberRange "${PORT_RANGE}" }}` has its env reference
+/// expanded first (env first, template second — see `load_config_from_file`).
+///
+/// Deliberate minimal subset (frp-rs has a zero-new-dependency policy and
+/// does not embed a template engine):
+/// - Only the exact call form `{{ parseNumberRange "expr" }}` is recognized,
+///   with optional ASCII whitespace after `{{`, around the function name and
+///   before `}}`. No other template syntax (variables, control flow, other
+///   functions) is processed — anything that does not match is left verbatim.
+/// - A single string may contain several calls; each is expanded in place
+///   and the surrounding text is preserved.
+/// - Invalid expressions (non-numeric, N > M, out of 0..=65535) are kept
+///   verbatim and a `tracing::warn` is emitted.
+pub(super) fn expand_template_functions(value: &mut toml::Value) {
+    match value {
+        toml::Value::String(s) => *s = expand_template_functions_in_str(s),
+        toml::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                expand_template_functions(v);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_, v) in table.iter_mut() {
+                expand_template_functions(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Expand `{{ parseNumberRange "..." }}` calls in a single string.
+/// See [`expand_template_functions`] for the exact recognized subset.
+fn expand_template_functions_in_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find("{{") {
+        match try_parse_template_call(&rest[pos..]) {
+            Some((consumed, replacement)) => {
+                out.push_str(&rest[..pos]);
+                out.push_str(&replacement);
+                rest = &rest[pos + consumed..];
+            }
+            None => {
+                // Not a recognized parseNumberRange call — keep `{{`
+                // verbatim and keep scanning for the next call.
+                out.push_str(&rest[..pos + 2]);
+                rest = &rest[pos + 2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Try to parse one `{{ parseNumberRange "expr" }}` call at the start of `s`
+/// (which must begin with `{{`). On success returns the number of bytes
+/// consumed (the whole call) and the replacement text — the expanded list,
+/// or the original call verbatim when the expression is invalid (after a
+/// warning). Returns `None` when the text is not a well-formed
+/// parseNumberRange call at all (kept verbatim by the caller).
+fn try_parse_template_call(s: &str) -> Option<(usize, String)> {
+    let bytes = s.as_bytes();
+    debug_assert!(bytes.starts_with(b"{{"));
+    let mut i = skip_ws(bytes, 2);
+    if !bytes.get(i..)?.starts_with(b"parseNumberRange") {
+        return None;
+    }
+    i += b"parseNumberRange".len();
+    i = skip_ws(bytes, i);
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    i += 1;
+    let expr_start = i;
+    let expr_end = bytes[i..].iter().position(|&b| b == b'"').map(|p| i + p)?; // Unclosed quote — not a call.
+    let expr = &s[expr_start..expr_end];
+    i = expr_end + 1;
+    i = skip_ws(bytes, i);
+    if !bytes.get(i..)?.starts_with(b"}}") {
+        return None;
+    }
+    i += 2;
+    let original = &s[..i];
+    match expand_number_range_expr(expr) {
+        Some(expansion) => Some((i, expansion)),
+        None => {
+            tracing::warn!(
+                original = %original,
+                expr,
+                "invalid {{ parseNumberRange ... }} expression in config; leaving it verbatim"
+            );
+            Some((i, original.to_string()))
+        }
+    }
+}
+
+/// Skip ASCII whitespace (space, tab, CR, LF) starting at byte offset `i`.
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while let Some(&b) = bytes.get(i) {
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// Expand a Go-style range expression (`"7000-7003"`, `"7000,7005"`) into a
+/// comma-separated list of numbers, following `util.ParseRangeNumbers`:
+/// split on `,`; each segment is a single number or an inclusive `N-M`
+/// range (step 1, N <= M). Returns `None` for any invalid segment.
+fn expand_number_range_expr(expr: &str) -> Option<String> {
+    let mut numbers: Vec<u32> = Vec::new();
+    for segment in expr.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            return None;
+        }
+        let parts: Vec<&str> = segment.split('-').collect();
+        match parts.as_slice() {
+            [single] => numbers.push(parse_port_num(single)?),
+            [start, end] => {
+                let start = parse_port_num(start)?;
+                let end = parse_port_num(end)?;
+                if start > end {
+                    return None;
+                }
+                numbers.extend(start..=end);
+            }
+            // More than one `-` in a segment (e.g. "1-2-3") — invalid.
+            _ => return None,
+        }
+    }
+    Some(
+        numbers
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// Parse a decimal port number in the valid range 0..=65535.
+/// Values outside that range (including negatives) are rejected — a frp-rs
+/// constraint on top of Go's unbounded int64 arithmetic, since range
+/// expansion is only meaningful for ports here.
+fn parse_port_num(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u32>().ok().filter(|&n| n <= 65535)
+}
+
 /// Move matching top-level keys into a sub-table, optionally stripping known prefixes.
 /// e.g. `flatten_to_table(t, &["log_file","log_level"], "log", &["log_"])`
 fn flatten_to_table(table: &mut toml::Table, keys: &[&str], target: &str, strip_prefixes: &[&str]) {
@@ -155,6 +334,10 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     // (so include-file values are covered) and before normalization (which
     // renames/restructures keys). See `expand_env_vars` for the exact subset.
     expand_env_vars(&mut value);
+    // Expand `{{ parseNumberRange "..." }}` template calls after env expansion
+    // (so an argument like "${PORT_RANGE}" is expanded first) and before
+    // normalization. See `expand_template_functions` for the exact subset.
+    expand_template_functions(&mut value);
     normalize(&mut value);
     let presence = ConfigPresence::from_normalized_value(&value);
     if strict_config {
