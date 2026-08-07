@@ -252,7 +252,28 @@ async fn verify_login_auth(
                     .filter(|id| !id.is_empty())
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let mut used = state.used_timestamps.lock().await;
+                // Bound the per-timestamp duplicate-detection set: a single
+                // timestamp key must not grow without bound. An attacker that
+                // can pass token auth can otherwise inject unique run_ids
+                // within one second and grow this map indefinitely
+                // (token-reachable OOM). Legitimate clients hitting the cap
+                // are rejected for this second and retry on the next timestamp.
+                const MAX_ENTRIES_PER_TIMESTAMP: usize = 100;
                 let entry = used.entry(ts).or_default();
+                if entry.len() >= MAX_ENTRIES_PER_TIMESTAMP {
+                    warn!(
+                        peer = ?peer, ts = ts,
+                        "Login rejected: too many unique run_ids for timestamp {} (cap {})",
+                        ts, MAX_ENTRIES_PER_TIMESTAMP,
+                    );
+                    send_login_error(
+                        stream,
+                        "login rejected: too many login attempts for this timestamp".into(),
+                        v2,
+                    )
+                    .await;
+                    return Err(());
+                }
                 if !entry.insert(run_id_for_check.clone()) {
                     warn!(
                         peer = ?peer, run_id = %run_id_for_check, ts = %ts,

@@ -53,7 +53,15 @@ impl HttpProxyAuth {
                 if let Some(credentials) = header.strip_prefix("Basic ") {
                     if let Ok(decoded) = base64_decode(credentials) {
                         if let Some((user, pass)) = decoded.split_once(':') {
-                            return user == expected_user && pass == expected_pass;
+                            // Constant-time comparison (parity with
+                            // control/admin/SSH auth): the short-circuit `==`
+                            // above leaks whether the username matched via
+                            // timing. Both comparisons must run — bitwise `&`
+                            // (not `&&`) so a mismatched username cannot skip
+                            // the password comparison.
+                            let user_ok = frp_core::auth::constant_time_eq_str(user, expected_user);
+                            let pass_ok = frp_core::auth::constant_time_eq_str(pass, expected_pass);
+                            return user_ok & pass_ok;
                         }
                     }
                 }
