@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 #[cfg(all(feature = "vnet", test))]
 use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -776,47 +775,6 @@ impl Service {
                 .unwrap_or_default();
             let server_scopes = self.server_auth_scopes.read().await.clone();
             // Bind local UDP sockets for UDP proxies.
-            // UDP data flows over work connections (Go frp v0.69.1 compat).
-            // Sockets are shared with work conn tasks via Arc.
-            let udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>> =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let udp_enc_cfg: Arc<tokio::sync::Mutex<HashMap<String, (bool, bool)>>> =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            for p in &proxies {
-                if p.proxy_type == "udp" || p.proxy_type == "sudp" {
-                    let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                    let bind_addr = format!("{}:0", p.local_ip);
-                    let socket = match UdpSocket::bind(&bind_addr).await {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            warn!(proxy_name = %p.name, error = %e, "UDP proxy '{}': bind failed: {}", p.name, e);
-                            continue;
-                        }
-                    };
-                    // Connect to local UDP service for send/recv
-                    if let Err(e) = socket.connect(&local_addr).await {
-                        warn!(proxy_name = %p.name, local_addr = %local_addr, error = %e, "UDP proxy '{}': connect to local {} failed: {}", p.name, local_addr, e);
-                        continue;
-                    }
-                    {
-                        let mut map = udp_sockets.lock().await;
-                        map.insert(local_addr.clone(), socket.clone());
-                        map.insert(p.name.clone(), socket);
-                    }
-                    {
-                        let mut cfg = udp_enc_cfg.lock().await;
-                        let enc = (p.use_encryption, p.use_compression);
-                        cfg.insert(local_addr.clone(), enc);
-                        cfg.insert(p.name.clone(), enc);
-                    }
-                    let enc_label = if p.use_encryption {
-                        "encrypted"
-                    } else {
-                        "plain"
-                    };
-                    info!(proxy_name = %p.name, local_addr = %local_addr, enc_label = %enc_label, "UDP proxy '{}' ready, bridging to {} ({})", p.name, local_addr, enc_label);
-                }
-            }
             macro_rules! work_conn_config {
                 ($pool_id:expr) => {{
                     #[cfg(feature = "quic")]
@@ -842,8 +800,6 @@ impl Service {
                         quic_conn: quic_arg,
                         v2,
                         oidc_client: self.oidc_client.clone(),
-                        udp_sockets: udp_sockets.clone(),
-                        udp_enc_cfg: udp_enc_cfg.clone(),
                         udp_packet_size: cfg_local.udp_packet_size.max(0) as usize,
                         proxy_metrics: self.proxy_metrics.clone(),
                         client_auth_scopes: client_scopes.clone(),

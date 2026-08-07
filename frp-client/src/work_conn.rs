@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "vnet")]
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, RwLock};
+#[cfg(feature = "vnet")]
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
@@ -246,8 +249,6 @@ pub(crate) struct WorkConnConfig {
     pub quic_conn: QuicConnOpt,
     pub v2: bool,
     pub oidc_client: Option<Arc<OidcClient>>,
-    pub udp_sockets: Arc<Mutex<HashMap<String, Arc<UdpSocket>>>>,
-    pub udp_enc_cfg: Arc<Mutex<HashMap<String, (bool, bool)>>>,
     /// UDP read buffer size. Go frp compat: clientCfg.UDPPacketSize.
     pub udp_packet_size: usize,
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
@@ -294,14 +295,6 @@ struct WorkConnDialConfig<'a> {
 /// Bind a fresh UDP socket connected to the local service address (Go frp
 /// compat: each wrapper binds its own socket). Used both at session start
 /// and to rebuild the socket after a hot reload changes the target address.
-async fn bind_udp_proxy_socket(local_addr: &str) -> Option<std::sync::Arc<UdpSocket>> {
-    let ip = local_addr.rsplit_once(':')?.0;
-    let bind_addr = format!("{ip}:0");
-    let socket = UdpSocket::bind(&bind_addr).await.ok()?;
-    socket.connect(local_addr).await.ok()?;
-    Some(std::sync::Arc::new(socket))
-}
-
 /// Shared yamux-or-dial path for work connection transport acquisition.
 /// Used by both QUIC and non-QUIC branches.
 async fn connect_yamux_or_dial(cfg: &WorkConnDialConfig<'_>) -> Option<IoStream> {    if let Some(ref yamux) = *cfg.yamux {
@@ -377,9 +370,105 @@ async fn read_start_work_conn_with_timeout(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Per-remote UDP session: receives replies from the local service on its
+/// dedicated socket and forwards them to the work-conn writer channel.
+/// Exits after `UDP_SESSION_IDLE_TIMEOUT` of no traffic and removes itself
+/// from the session table so its ephemeral port is released.
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One remote visitor's UDP session: its own local socket (bound to a fresh
+/// ephemeral port on the local IP) plus bookkeeping.
+struct UdpSession {
+    socket: Arc<UdpSocket>,
+    last_active: Instant,
+    first_packet: bool,
+}
+
+async fn run_udp_session(
+    socket: Arc<UdpSocket>,
+    remote: SocketAddr,
+    tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    session_alive: Arc<AtomicBool>,
+    udp_packet_size: usize,
+    sessions: Arc<std::sync::Mutex<HashMap<SocketAddr, UdpSession>>>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut buf = vec![0u8; udp_packet_size.max(1)];
+    let mut idle = tokio::time::interval(Duration::from_secs(1));
+    idle.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() { break; }
+            }
+            res = socket.recv_from(&mut buf) => {
+                match res {
+                    Ok((n, _src)) => {
+                        // Refresh the shared entry's activity so inbound-heavy
+                        // remotes (rare/no replies) are not reaped.
+                        if let Some(entry) = sessions
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_mut(&remote)
+                        {
+                            entry.last_active = Instant::now();
+                        }
+                        let payload = buf[..n].to_vec();
+                        if tx.send((remote, payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(remote = %remote, error = %e, "UDP session recv error");
+                        break;
+                    }
+                }
+            }
+            _ = idle.tick() => {
+                // Reap only when BOTH directions have been idle: the entry's
+                // last_active is refreshed by the reader on inbound remote
+                // packets and by us on local replies.
+                let idle_for = {
+                    let map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    map.get(&remote)
+                        .map(|e| e.last_active.elapsed())
+                        .unwrap_or(UDP_SESSION_IDLE_TIMEOUT)
+                };
+                if idle_for > UDP_SESSION_IDLE_TIMEOUT {
+                    debug!(remote = %remote, "UDP session idle for >60s, closing");
+                    break;
+                }
+                if !session_alive.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        }
+    }
+    // Remove self from the session table (only if it still refers to us).
+    let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get(&remote) {
+        if Arc::ptr_eq(&entry.socket, &socket) {
+            map.remove(&remote);
+        }
+    }
+}
+
+/// Go frp v0.70.1 compat (client/proxy/udp.go + pkg/proto/udp/udp.go):
+/// each distinct remote visitor gets its OWN local UDP socket bound to a
+/// fresh ephemeral port on the local IP. The local service therefore sees a
+/// different source address per remote and replies to the right one. A
+/// single shared socket + single `last_remote` (the old model) misrouted
+/// responses when multiple remotes were active concurrently — every reply
+/// went to whoever sent last.
+///
+/// Layout:
+///   work-conn read loop   -> per-remote socket (keyed by UDPPacket.remote_addr)
+///   per-remote socket     -> work-conn write loop (mpsc; single writer)
+///   idle sessions         -> closed after UDP_SESSION_IDLE_TIMEOUT
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_work_conn(
     work: IoStream,
-    sock: Arc<UdpSocket>,
     proxy_name: String,
     local_addr_str: String,
     enc_key: [u8; 16],
@@ -390,6 +479,14 @@ async fn run_udp_work_conn(
     udp_packet_size: usize,
     proxy_protocol_version: String,
 ) {
+    let local_addr = match local_addr_str.parse::<SocketAddr>() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(proxy_name = %proxy_name, local_addr = %local_addr_str, error = %e,
+                "UDP work conn '{}': invalid local_addr '{}': {}", proxy_name, local_addr_str, e);
+            return;
+        }
+    };
     let (w_r, mut w_w) = match split_work_conn_halves(work) {
         Ok(pair) => pair,
         Err(e) => {
@@ -405,25 +502,21 @@ async fn run_udp_work_conn(
     // applied per-packet to the payload), so exact-read framing is safe.
     let mut w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let last_remote: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
-    let sock_r = sock.clone();
+    // Remote-visitor session table. std Mutex (short critical sections,
+    // never held across an await — bind() happens outside the lock).
+    let sessions: Arc<std::sync::Mutex<HashMap<SocketAddr, UdpSession>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // Per-session socket -> single writer aggregation channel.
+    let (write_tx, mut write_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(64);
+
+    // ---- Reader: work conn -> per-remote sockets ----
     let pn_r = proxy_name.clone();
-    let last_remote_r = last_remote.clone();
     let session_alive_r = session_alive.clone();
-    // Reader needs its own copy; the writer moves the original.
     let local_addr_str_r = local_addr_str.clone();
     let mut reader_cancel = cancel_rx.clone();
-    // Go frp compat (pkg/proto/udp/udp.go Forwarder): when
-    // proxyProtocolVersion is set, the PROXY header is prepended to the first
-    // packet written to the local UDP backend. Rust's bridge uses one socket
-    // per work conn (Go uses one per remote), so a single first-packet flag
-    // covers the common single-remote case.
-    let pp_version = proxy_protocol_version.clone();
     let reader = async move {
         debug!(proxy_name = %pn_r, "UDP reader '{}' started", pn_r);
-        let mut first_packet = true;
         // Ping-pong scratch for the decrypt/decompress chain (per-session).
         let mut scratch_a: Vec<u8> = Vec::new();
         let mut scratch_b: Vec<u8> = Vec::new();
@@ -438,20 +531,23 @@ async fn run_udp_work_conn(
                 } => {
                     match result {
                         Ok(FrpMessage::UDPPacket(up)) => {
-                            if let Some(ref ra) = up.remote_addr {
-                                if let Ok(ip) = ra.ip.parse::<std::net::IpAddr>() {
-                                    *last_remote_r.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        Some(std::net::SocketAddr::new(ip, ra.port));
-                                } else {
-                                    warn!(ip = %ra.ip, port = ra.port,
-                                        "UDP packet: unparseable remote IP, keeping previous last_remote");
+                            let remote = match up.remote_addr {
+                                Some(ref ra) => match ra.ip.parse::<IpAddr>() {
+                                    Ok(ip) => SocketAddr::new(ip, ra.port),
+                                    Err(_) => {
+                                        warn!(ip = %ra.ip, port = ra.port,
+                                            "UDP packet: unparseable remote IP, dropping");
+                                        continue;
+                                    }
+                                },
+                                None => {
+                                    debug!(proxy_name = %pn_r, "UDP packet without remote_addr; dropping");
+                                    continue;
                                 }
-                            }
-                            let n = up.content.len();
+                            };
                             let mut payload = up.content;
                             // Ping-pong scratch buffers (per-session) so the
-                            // decrypt/decompress chain reuses allocations
-                            // instead of allocating per packet.
+                            // decrypt/decompress chain reuses allocations.
                             if use_enc
                                 && encryption::decrypt_into(&payload, &enc_key, &mut scratch_a)
                                     .is_ok()
@@ -463,39 +559,93 @@ async fn run_udp_work_conn(
                             {
                                 std::mem::swap(&mut payload, &mut scratch_b);
                             }
-                            // Prepend PROXY header on the first packet of the
-                            // session (Go: first packet of each remote conn).
-                            if first_packet && !pp_version.is_empty() {
-                                if let Some(remote) =
-                                    *last_remote_r.lock().unwrap_or_else(|e| e.into_inner())
-                                {
-                                    if let Ok(header) =
-                                        frp_core::proxy_protocol::build_proxy_protocol_header(
-                                            &remote.ip().to_string(),
-                                            local_addr_str_r
-                                                .split(':')
-                                                .next()
-                                                .unwrap_or("127.0.0.1"),
-                                            remote.port(),
-                                            local_addr_str_r
-                                                .rsplit_once(':')
-                                                .and_then(|(_, p)| p.parse().ok())
-                                                .unwrap_or(0),
-                                            &pp_version,
-                                        )
-                                    {
-                                        let mut final_buf =
-                                            Vec::with_capacity(header.len() + payload.len());
-                                        final_buf.extend_from_slice(&header);
-                                        final_buf.extend_from_slice(&payload);
-                                        payload = final_buf;
+                            // Session lookup / create. The std Mutex guard is
+                            // never held across an await: if the session is
+                            // missing we drop the lock, bind outside, then
+                            // re-lock and insert (the only concurrent actor is
+                            // a session task's self-removal, which the
+                            // Arc::ptr_eq guard in run_udp_session protects
+                            // against clobbering a live replacement).
+                            let entry = {
+                                let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                                map.get_mut(&remote).map(|entry| {
+                                    entry.last_active = Instant::now();
+                                    (entry.socket.clone(), entry.first_packet)
+                                })
+                            };
+                            let entry = match entry {
+                                Some(e) => e,
+                                None => {
+                                    let bind = SocketAddr::new(local_addr.ip(), 0);
+                                    let sock = match UdpSocket::bind(bind).await {
+                                        Ok(s) => Arc::new(s),
+                                        Err(e) => {
+                                            warn!(proxy_name = %pn_r, remote = %remote, error = %e,
+                                                "UDP: failed to bind per-remote socket");
+                                            continue;
+                                        }
+                                    };
+                                    let mut map =
+                                        sessions.lock().unwrap_or_else(|e| e.into_inner());
+                                    match map.get(&remote) {
+                                        Some(entry) => (entry.socket.clone(), entry.first_packet),
+                                        None => {
+                                            let stx = write_tx.clone();
+                                            let s_alive = session_alive_r.clone();
+                                            let sessions_for_task = sessions.clone();
+                                            tokio::spawn(run_udp_session(
+                                                sock.clone(),
+                                                remote,
+                                                stx,
+                                                s_alive,
+                                                udp_packet_size,
+                                                sessions_for_task,
+                                                reader_cancel.clone(),
+                                            ));
+                                            map.insert(
+                                                remote,
+                                                UdpSession {
+                                                    socket: sock.clone(),
+                                                    last_active: Instant::now(),
+                                                    first_packet: true,
+                                                },
+                                            );
+                                            (sock, true)
+                                        }
                                     }
                                 }
-                                first_packet = false;
+                            };
+                            let (sock, first_packet) = entry;
+                            // PROXY header on the first packet of each remote
+                            // session (Go: first packet of each remote conn).
+                            let mut final_payload = payload;
+                            if first_packet && !proxy_protocol_version.is_empty() {
+                                if let Ok(header) =
+                                    frp_core::proxy_protocol::build_proxy_protocol_header(
+                                        &remote.ip().to_string(),
+                                        local_addr_str_r.split(':').next().unwrap_or("127.0.0.1"),
+                                        remote.port(),
+                                        local_addr.port(),
+                                        &proxy_protocol_version,
+                                    )
+                                {
+                                    let mut buf =
+                                        Vec::with_capacity(header.len() + final_payload.len());
+                                    buf.extend_from_slice(&header);
+                                    buf.extend_from_slice(&final_payload);
+                                    final_payload = buf;
+                                }
                             }
-                            debug!(proxy_name = %pn_r, byte_count = n,
-                                "UDP reader '{}': forwarding {} bytes to local", pn_r, n);
-                            if let Err(e) = sock_r.send(&payload).await {
+                            if let Some(entry) = sessions
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_mut(&remote)
+                            {
+                                entry.first_packet = false;
+                            }
+                            debug!(proxy_name = %pn_r, byte_count = final_payload.len(),
+                                "UDP reader '{}': forwarding {} bytes to local", pn_r, final_payload.len());
+                            if let Err(e) = sock.send_to(&final_payload, local_addr).await {
                                 debug!(proxy_name = %pn_r, error = %e,
                                     "UDP '{}' send to local failed: {}", pn_r, e);
                                 break;
@@ -523,19 +673,14 @@ async fn run_udp_work_conn(
         }
     };
 
+    // ---- Writer: per-session channel -> work conn (single writer) ----
     let bridge_name = proxy_name.clone();
     let pn_w = proxy_name;
-    let last_remote_w = last_remote;
     let session_alive_w = session_alive;
     let mut writer_cancel = cancel_rx;
-    // Go frp compat: the UDP read buffer is sized by udp_packet_size
-    // (Go pkg/proto/udp/udp.go: pool.GetBuf(bufSize) with
-    // clientCfg.UDPPacketSize), not a hardcoded 65535.
-    let buf_size = udp_packet_size.max(1);
     let writer = async move {
         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
-        let mut buf = vec![0u8; buf_size];
-        let mut payload = Vec::with_capacity(buf_size);
+        let mut payload = Vec::with_capacity(udp_packet_size.max(1));
         // Ping-pong scratch for the compress/encrypt chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
         let mut scratch_d: Vec<u8> = Vec::new();
@@ -547,52 +692,38 @@ async fn run_udp_work_conn(
                 changed = writer_cancel.changed() => {
                     if changed.is_err() || *writer_cancel.borrow() { break; }
                 }
-                result = sock.recv_from(&mut buf) => {
-                    match result {
-                        Ok((n, src)) => {
-                            debug!(proxy_name = %pn_w, byte_count = n, src_addr = %src,
-                                "UDP writer '{}': recv'd {} bytes from local {}", pn_w, n, src);
-                            payload.clear();
-                            payload.extend_from_slice(&buf[..n]);
-                            if use_comp && encryption::compress_into(&payload, &mut scratch_c).is_ok()
-                            {
-                                std::mem::swap(&mut payload, &mut scratch_c);
-                            }
-                            if use_enc
-                                && encryption::encrypt_into(&payload, &enc_key, &mut scratch_d)
-                                    .is_ok()
-                            {
-                                std::mem::swap(&mut payload, &mut scratch_d);
-                            }
-                            let remote_addr = last_remote_w
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .map(|sa| msg::UdpAddr {
-                                ip: sa.ip().to_string(),
-                                port: sa.port(),
-                                zone: String::new(),
-                            });
-                            let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                                content: std::mem::take(&mut payload),
-                                local_addr: msg::UdpAddr::from_string(&local_addr_str),
-                                remote_addr,
-                            });
-                            let result = if v2 {
-                                write_msg_v2(&mut w_w, &pkt).await
-                            } else {
-                                write_msg_v1(&mut w_w, &pkt).await
-                            };
-                            if let Err(e) = result {
-                                debug!(proxy_name = %pn_w, error = %e,
-                                    "UDP '{}' send to work conn failed: {}", pn_w, e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            debug!(proxy_name = %pn_w, error = %e,
-                                "UDP '{}' recv from local failed: {}", pn_w, e);
-                            break;
-                        }
+                Some((remote, data)) = write_rx.recv() => {
+                    payload.clear();
+                    payload.extend_from_slice(&data);
+                    if use_comp && encryption::compress_into(&payload, &mut scratch_c).is_ok()
+                    {
+                        std::mem::swap(&mut payload, &mut scratch_c);
+                    }
+                    if use_enc
+                        && encryption::encrypt_into(&payload, &enc_key, &mut scratch_d).is_ok()
+                    {
+                        std::mem::swap(&mut payload, &mut scratch_d);
+                    }
+                    // Each reply is tagged with its own remote — no shared
+                    // last_remote, so concurrent remotes never cross wires.
+                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+                        content: std::mem::take(&mut payload),
+                        local_addr: msg::UdpAddr::from_string(&local_addr_str),
+                        remote_addr: Some(msg::UdpAddr {
+                            ip: remote.ip().to_string(),
+                            port: remote.port(),
+                            zone: String::new(),
+                        }),
+                    });
+                    let result = if v2 {
+                        write_msg_v2(&mut w_w, &pkt).await
+                    } else {
+                        write_msg_v1(&mut w_w, &pkt).await
+                    };
+                    if let Err(e) = result {
+                        debug!(proxy_name = %pn_w, error = %e,
+                            "UDP '{}' send to work conn failed: {}", pn_w, e);
+                        break;
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
@@ -833,8 +964,6 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             quic_conn: _quic_conn,
             v2,
             oidc_client,
-            udp_sockets,
-            udp_enc_cfg,
             udp_packet_size,
             proxy_metrics,
             client_auth_scopes: client_scopes,
@@ -1211,42 +1340,14 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 }
 
                 if info.proxy_type == "udp" {
-                    // UDP proxy: bridge work conn ↔ local UDP socket. The
-                    // socket is bound once per session; after a hot reload
-                    // changes local_addr/local_port (or encryption settings),
-                    // the cached socket still points at the stale target —
-                    // rebuild it on demand so the reload takes effect
-                    // (previously the stale socket was used silently forever).
-                    let want_addr = info.local_addr.clone();
-                    let want_enc = (info.use_encryption, info.use_compression);
-                    let need_rebind = {
-                        let map = udp_sockets.lock().await;
-                        match map.get(&proxy_name) {
-                            Some(s) => s
-                                .peer_addr()
-                                .map(|p| p.to_string() != want_addr)
-                                .unwrap_or(true),
-                            None => true,
-                        }
-                    };
-                    let sock = if need_rebind {
-                        udp_sockets.lock().await.remove(&proxy_name);
-                        match bind_udp_proxy_socket(&want_addr).await {
-                            Some(s) => {
-                                udp_sockets.lock().await.insert(proxy_name.clone(), s.clone());
-                                s
-                            }
-                            None => {
-                                warn!(label = %label, proxy_name = %proxy_name, "Work conn {}: failed to rebind UDP socket for '{}'", label, proxy_name);
-                                return;
-                            }
-                        }
-                    } else {
-                        udp_sockets.lock().await.get(&proxy_name).cloned().unwrap()
-                    };
-                    // Encryption settings follow the proxy's current config.
-                    udp_enc_cfg.lock().await.insert(proxy_name.clone(), want_enc);
-                    let (use_enc, use_comp) = want_enc;
+                    // UDP proxy: bridge work conn ↔ local UDP service. Each
+                    // distinct remote visitor gets its own ephemeral local
+                    // socket inside run_udp_work_conn (Go frp per-remote
+                    // semantics), so no session-scoped shared socket is
+                    // needed here — reload changes to local_addr/encryption
+                    // apply naturally on the next work conn.
+                    let use_enc = info.use_encryption;
+                    let use_comp = info.use_compression;
 
                     info!(label = %label, proxy_name = %proxy_name, use_enc = %use_enc, use_comp = %use_comp,
                         "Work conn {} bridging UDP for '{}' (enc={}, comp={})",
@@ -1254,7 +1355,6 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
 
                     run_udp_work_conn(
                         work,
-                        sock,
                         proxy_name.clone(),
                         info.local_addr.clone(),
                         enc_key,
@@ -1358,48 +1458,6 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
 mod tests {
     use super::*;
 
-    /// Work stream whose reads block forever and whose writes fail
-    /// deterministically. Used to test writer-error cancellation without
-    /// depending on platform TCP shutdown/RST timing.
-    struct FailingWorkStream;
-
-    impl tokio::io::AsyncRead for FailingWorkStream {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Pending
-        }
-    }
-
-    impl tokio::io::AsyncWrite for FailingWorkStream {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "injected writer failure",
-            )))
-        }
-
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
     async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1438,8 +1496,6 @@ mod tests {
             quic_conn,
             v2: false,
             oidc_client: None,
-            udp_sockets: Arc::new(Mutex::new(HashMap::new())),
-            udp_enc_cfg: Arc::new(Mutex::new(HashMap::new())),
             udp_packet_size: 65535,
             proxy_metrics: Arc::new(frp_core::metrics::ProxyMetricsRegistry::new()),
             client_auth_scopes: Vec::new(),
@@ -1515,16 +1571,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_work_reader_eof_cancels_blocked_local_writer() {
+    async fn udp_work_reader_eof_cancels_blocked_writer() {
         let (work, peer) = tcp_pair().await;
-        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let socket_addr = socket.local_addr().unwrap();
-        let retained_socket = socket.clone();
         let session_alive = Arc::new(AtomicBool::new(true));
 
         let bridge = tokio::spawn(run_udp_work_conn(
             IoStream::Tcp(work),
-            socket,
             "udp-test".to_string(),
             "127.0.0.1:9".to_string(),
             [0; 16],
@@ -1539,33 +1591,27 @@ mod tests {
 
         tokio::time::timeout(Duration::from_millis(200), bridge)
             .await
-            .expect("reader EOF must cancel the sibling blocked on UDP recv")
+            .expect("reader EOF must cancel the sibling blocked on the write channel")
             .unwrap();
-
-        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender.send_to(b"after-stop", socket_addr).await.unwrap();
-        let mut buf = [0; 32];
-        let (n, _) = tokio::time::timeout(
-            Duration::from_millis(200),
-            retained_socket.recv_from(&mut buf),
-        )
-        .await
-        .expect("stopped writer must not consume a later datagram")
-        .unwrap();
-        assert_eq!(&buf[..n], b"after-stop");
     }
 
     #[tokio::test]
     async fn udp_work_writer_error_cancels_blocked_work_reader() {
-        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let socket_addr = socket.local_addr().unwrap();
-
+        // Establish a per-remote session first, then sever the work conn so
+        // the writer's next write fails — the writer must cancel the reader
+        // blocked on the work read.
+        let (work, peer) = tcp_pair().await;
+        let mut peer = IoStream::Tcp(peer);
+        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = msg::UdpAddr {
+            ip: "203.0.113.7".to_string(),
+            port: 4242,
+            zone: String::new(),
+        };
         let bridge = tokio::spawn(run_udp_work_conn(
-            IoStream::SshChannel(Box::new(FailingWorkStream)),
-            socket,
+            IoStream::Tcp(work),
             "udp-test".to_string(),
-            "127.0.0.1:9".to_string(),
+            local.local_addr().unwrap().to_string(),
             [0; 16],
             false,
             false,
@@ -1574,7 +1620,22 @@ mod tests {
             65535,
             String::new(),
         ));
-        sender.send_to(b"force-write", socket_addr).await.unwrap();
+
+        // Establish the session: reader creates the per-remote socket and
+        // forwards the first datagram to the local service.
+        peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
+            content: b"req".to_vec(),
+            local_addr: None,
+            remote_addr: Some(remote.clone()),
+        }))
+        .await
+        .unwrap();
+        let mut buf = [0u8; 32];
+        let (_n, proxy_addr) = local.recv_from(&mut buf).await.unwrap();
+
+        // Sever the work conn; the reply write must then fail.
+        drop(peer);
+        local.send_to(b"force-write", proxy_addr).await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), bridge)
             .await
@@ -1586,9 +1647,7 @@ mod tests {
     async fn udp_work_forwards_packets_and_preserves_remote_address() {
         let (work, peer) = tcp_pair().await;
         let mut peer = IoStream::Tcp(peer);
-        let local = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        socket.connect(local.local_addr().unwrap()).await.unwrap();
+        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let remote = msg::UdpAddr {
             ip: "203.0.113.7".to_string(),
             port: 4242,
@@ -1596,7 +1655,6 @@ mod tests {
         };
         let bridge = tokio::spawn(run_udp_work_conn(
             IoStream::Tcp(work),
-            socket,
             "udp-test".to_string(),
             local.local_addr().unwrap().to_string(),
             [0; 16],
@@ -1628,6 +1686,101 @@ mod tests {
             }
             other => panic!("expected UDPPacket, got type {}", other.v1_type_byte()),
         }
+
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), bridge)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_work_two_remotes_route_replies_correctly() {
+        // The headline fix: with two concurrent remotes, each gets its own
+        // ephemeral local socket (distinct source ports), and replies are
+        // routed back to the visitor they belong to — the old single
+        // last_remote model sent both replies to whoever sent last.
+        let (work, peer) = tcp_pair().await;
+        let mut peer = IoStream::Tcp(peer);
+        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_a = msg::UdpAddr {
+            ip: "203.0.113.7".to_string(),
+            port: 4242,
+            zone: String::new(),
+        };
+        let remote_b = msg::UdpAddr {
+            ip: "198.51.100.9".to_string(),
+            port: 5353,
+            zone: String::new(),
+        };
+        let bridge = tokio::spawn(run_udp_work_conn(
+            IoStream::Tcp(work),
+            "udp-test".to_string(),
+            local.local_addr().unwrap().to_string(),
+            [0; 16],
+            false,
+            false,
+            false,
+            Arc::new(AtomicBool::new(true)),
+            65535,
+            String::new(),
+        ));
+
+        // Interleaved requests from two distinct remotes.
+        peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
+            content: b"req-a".to_vec(),
+            local_addr: None,
+            remote_addr: Some(remote_a.clone()),
+        }))
+        .await
+        .unwrap();
+        peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
+            content: b"req-b".to_vec(),
+            local_addr: None,
+            remote_addr: Some(remote_b.clone()),
+        }))
+        .await
+        .unwrap();
+
+        // The local service must see them from DISTINCT source ports.
+        let mut buf = [0u8; 32];
+        let (n1, src_a) = local.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n1], b"req-a");
+        let (n2, src_b) = local.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n2], b"req-b");
+        assert_ne!(
+            src_a.port(),
+            src_b.port(),
+            "per-remote sockets must use distinct source ports"
+        );
+
+        // Replies must be routed back to their own remotes.
+        local.send_to(b"resp-a", src_a).await.unwrap();
+        local.send_to(b"resp-b", src_b).await.unwrap();
+
+        let r1 = peer.read_v1_frame().await.unwrap();
+        let r2 = peer.read_v1_frame().await.unwrap();
+        let mut got: Vec<(String, String)> = Vec::new();
+        for r in [r1, r2] {
+            match r {
+                FrpMessage::UDPPacket(p) => got.push((
+                    String::from_utf8_lossy(&p.content).to_string(),
+                    p.remote_addr.unwrap().to_string(),
+                )),
+                other => panic!("expected UDPPacket, got type {}", other.v1_type_byte()),
+            }
+        }
+        // Reply order is not guaranteed (concurrent session tasks); check
+        // set membership and that the two remotes are distinct.
+        assert!(
+            got.iter().any(|(c, r)| c == "resp-a" && *r == remote_a.to_string()),
+            "resp-a must be routed to remote A, got {got:?}"
+        );
+        assert!(
+            got.iter().any(|(c, r)| c == "resp-b" && *r == remote_b.to_string()),
+            "resp-b must be routed to remote B, got {got:?}"
+        );
+        assert_ne!(got[0].1, got[1].1);
 
         drop(peer);
         tokio::time::timeout(Duration::from_secs(1), bridge)

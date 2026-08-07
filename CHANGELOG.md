@@ -4,8 +4,21 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **UDP proxy per-remote sessions (Go frp parity)**: each distinct remote
+  visitor now gets its own ephemeral local UDP socket (bound on the local
+  IP), so the local service sees a different source address per remote and
+  replies to the right one — the old single shared socket + single
+  `last_remote` misrouted responses when multiple remotes were active
+  concurrently. PROXY protocol headers are prepended per remote session
+  (first packet), idle sessions are reaped after 60 s, and the session
+  aggregation keeps a single work-conn writer. The session-scoped shared
+  socket map (`udp_sockets`/`udp_enc_cfg`) and its reload-rebind logic are
+  gone — reload changes to local_addr/encryption apply on the next work conn
+  naturally.
+
 - **Audit round fixes (2026-08)**: full review-driven hardening across
   frp-core / frp-server / frp-client —
+
   - *Reliability*: supersession handoff barrier can no longer hang forever
     (old handler always extracts a queued `Shutdown`'s `done` on exit; the
     new login's barrier has a 10 s defense-in-depth timeout); idle STCP/XTCP
@@ -15,11 +28,10 @@ All notable changes to frp-rs.
     backoff resets after a ≥5 min healthy session; plugin restart failure on
     reload now aborts the reload (old plugin keeps running) instead of
     silently killing the old plugin and falling back to a dead address;
-    UDP proxies rebuild their local socket after reload changes
-    local_addr/encryption; CloseProxy during reload uses the original
-    registered wire name (changing `user` no longer orphans the server-side
-    proxy); health-check events use `try_send` so a reconnecting control loop
-    cannot stall probing.
+    CloseProxy during reload uses the original registered wire name
+    (changing `user` no longer orphans the server-side proxy); health-check
+    events use `try_send` so a reconnecting control loop cannot stall
+    probing.
   - *Security*: `authenticationTimeout` default is now 90 s (replay
     protection on by default; set `authenticationTimeout = 0` to restore Go
     behaviour); timestamp freshness accepts seconds or milliseconds (frpc now
