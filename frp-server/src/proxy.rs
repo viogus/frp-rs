@@ -640,30 +640,34 @@ mod tests {
     fn test_allocate_port_multi_explicit_empty_ranges_always_allowed() {
         // When ranges is empty (no allow_ports configured), all ports are allowed
         let mut used = std::collections::HashSet::new();
-        let result = allocate_port_multi(&mut used, 51993, &[], "127.0.0.1");
+        let result = allocate_port_multi(&mut used, 24013, &[], "127.0.0.1");
         // Should succeed if port is bindable
         assert!(
             result.is_some(),
             "port should be allocatable with empty ranges"
         );
-        assert_eq!(result, Some(51993));
+        assert_eq!(result, Some(24013));
     }
 
     #[test]
     fn test_allocate_port_multi_explicit_available() {
         // Allocate a port that's not in used_ports and verify it succeeds.
         // "0.0.0.0" with port 0 is invalid, so use a specific port that's
-        // very likely available (above the ephemeral range).
+        // very likely available. All the fixed ports in this test module live
+        // in the 24000 block: below the Linux ephemeral port range
+        // (32768-60999) so a concurrent test binding port 0 can never be
+        // handed one of them (CI regression: 51990 was inside the ephemeral
+        // range and randomly collided with a parallel test's `:0` bind).
         let mut used = std::collections::HashSet::new();
-        let result = allocate_port_multi(&mut used, 51999, &[], "127.0.0.1");
+        let result = allocate_port_multi(&mut used, 24019, &[], "127.0.0.1");
         assert_eq!(
             result,
-            Some(51999),
+            Some(24019),
             "port not in used_ports must be allocatable"
         );
         // Second allocation of same port should fail
         assert_eq!(
-            allocate_port_multi(&mut used, 51999, &[], "127.0.0.1"),
+            allocate_port_multi(&mut used, 24019, &[], "127.0.0.1"),
             None,
             "same port cannot be allocated twice"
         );
@@ -673,19 +677,19 @@ mod tests {
     fn test_allocate_port_multi_range_scan() {
         let mut used = std::collections::HashSet::new();
         // Pre-fill one port in the range
-        used.insert(62002);
+        used.insert(24002);
         let ranges = [frp_core::config::PortsRange {
-            start: 62001,
-            end: 62005,
+            start: 24001,
+            end: 24005,
             single: 0,
         }];
-        // Should skip 62001 (bindable), then 62002 (in set), then
-        // find 62003 (bindable).
+        // Should skip 24001 (bindable), then 24002 (in set), then
+        // find 24003 (bindable).
         let result = allocate_port_multi(&mut used, 0, &ranges, "127.0.0.1");
         assert!(result.is_some(), "should allocate a port from the range");
         let p = result.unwrap();
-        assert!((62001..=62005).contains(&p), "port must be in range");
-        assert_ne!(p, 62002, "should not allocate port already in used_ports");
+        assert!((24001..=24005).contains(&p), "port must be in range");
+        assert_ne!(p, 24002, "should not allocate port already in used_ports");
     }
 
     #[test]
@@ -706,27 +710,27 @@ mod tests {
             &mut used,
             0,
             &[frp_core::config::PortsRange {
-                start: 51990,
-                end: 51990,
+                start: 24010,
+                end: 24010,
                 single: 0,
             }],
             "127.0.0.1",
         );
-        assert_eq!(result, Some(51990), "explicit port 0 should scan ranges");
+        assert_eq!(result, Some(24010), "explicit port 0 should scan ranges");
     }
 
     #[test]
     fn test_allocate_port_multi_empty_bind_addr_defaults() {
         let mut used = std::collections::HashSet::new();
-        let result = allocate_port_multi(&mut used, 51991, &[], "");
+        let result = allocate_port_multi(&mut used, 24011, &[], "");
         // Empty bind_addr defaults to 0.0.0.0 — should work on any machine
-        assert_eq!(result, Some(51991), "empty bind_addr defaults to 0.0.0.0");
+        assert_eq!(result, Some(24011), "empty bind_addr defaults to 0.0.0.0");
     }
 
     #[test]
     fn test_is_port_bindable_free_port() {
         assert!(
-            is_port_bindable("127.0.0.1", 51992),
+            is_port_bindable("127.0.0.1", 24012),
             "free port should be bindable"
         );
     }
