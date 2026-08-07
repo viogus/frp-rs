@@ -41,9 +41,17 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
         cli.log_file.clone(),
         cfg.map(|c| c.log.file.as_str()).unwrap_or(""),
     );
+    let max_days = cli
+        .log_max_days
+        .or(cfg.map(|c| c.log.max_days))
+        .unwrap_or(3);
+    let format = logging::resolve_log_format(
+        cli.log_format.clone(),
+        cfg.map(|c| c.log.format.as_str()).unwrap_or("text"),
+    );
     let ansi = logging::resolve_ansi(cli.disable_log_color);
     #[cfg(not(feature = "otel"))]
-    logging::init_tracing(&level, file, ansi, "frps.log");
+    logging::init_tracing(&level, file, max_days, &format, ansi, "frps.log");
     #[cfg(feature = "otel")]
     {
         let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -66,7 +74,16 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
                 }
             })
             .unwrap_or_else(|| "frps".to_string());
-        logging::init_tracing_otel(&level, file, ansi, &svc_name, otlp_endpoint, "frps.log");
+        logging::init_tracing_otel(
+            &level,
+            file,
+            max_days,
+            &format,
+            ansi,
+            &svc_name,
+            otlp_endpoint,
+            "frps.log",
+        );
     }
 }
 async fn run(mut cli: FrpsArgs) {

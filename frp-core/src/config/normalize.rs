@@ -422,7 +422,7 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
         );
         flatten_to_table(
             table,
-            &["log_file", "log_level", "log_max_days"],
+            &["log_file", "log_level", "log_max_days", "log_format"],
             "log",
             &["log_"],
         );
@@ -729,7 +729,7 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
         // Flatten log_* fields into log table (client side)
         flatten_to_table(
             table,
-            &["log_file", "log_level", "log_max_days"],
+            &["log_file", "log_level", "log_max_days", "log_format"],
             "log",
             &["log_"],
         );

@@ -36,6 +36,7 @@ pub struct FrpsArgs {
     pub log_file: Option<String>,
     pub log_level: Option<String>,
     pub log_max_days: Option<i32>,
+    pub log_format: Option<String>,
     pub kcp_bind_port: Option<u16>,
     pub quic_bind_port: Option<u16>,
     pub max_ports_per_client: Option<u64>,
@@ -84,6 +85,7 @@ struct SvrLog {
     log_file: Option<String>,
     log_level: Option<String>,
     log_max_days: Option<i32>,
+    log_format: Option<String>,
     disable_log_color: bool,
 }
 
@@ -131,6 +133,7 @@ impl From<FrpsBuild> for FrpsArgs {
             log_file: b.log.log_file,
             log_level: b.log.log_level,
             log_max_days: b.log.log_max_days,
+            log_format: b.log.log_format,
             disable_log_color: b.log.disable_log_color,
             kcp_bind_port: b.transport.kcp_bind_port,
             quic_bind_port: b.transport.quic_bind_port,
@@ -267,11 +270,16 @@ fn svr_log() -> impl Parser<SvrLog> {
         .long("log_max_days")
         .argument::<i32>("DAYS")
         .optional();
+    let log_format = long("log-format")
+        .long("log_format")
+        .argument::<String>("FORMAT")
+        .optional();
     let disable_log_color = long("disable-log-color").long("disable_log_color").switch();
     construct!(SvrLog {
         log_file,
         log_level,
         log_max_days,
+        log_format,
         disable_log_color
     })
 }
@@ -396,6 +404,8 @@ pub struct FrpcRunArgs {
     pub show_version: bool,
     pub log_file: Option<String>,
     pub log_level: Option<String>,
+    pub log_max_days: Option<i32>,
+    pub log_format: Option<String>,
     pub disable_log_color: bool,
 }
 
@@ -554,6 +564,14 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         .short('L')
         .argument::<String>("LEVEL")
         .optional();
+    let log_max_days = long("log-max-days")
+        .long("log_max_days")
+        .argument::<i32>("DAYS")
+        .optional();
+    let log_format = long("log-format")
+        .long("log_format")
+        .argument::<String>("FORMAT")
+        .optional();
     let disable_log_color = long("disable-log-color").long("disable_log_color").switch();
     construct!(FrpcRunArgs {
         config,
@@ -563,6 +581,8 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         show_version,
         log_file,
         log_level,
+        log_max_days,
+        log_format,
         disable_log_color
     })
 }
@@ -1072,6 +1092,9 @@ impl FrpsArgs {
         }
         if let Some(v) = self.log_max_days {
             cfg.log.max_days = v;
+        }
+        if let Some(ref v) = self.log_format {
+            cfg.log.format = v.clone();
         }
 
         // Transport / ports

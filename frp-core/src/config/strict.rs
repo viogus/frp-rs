@@ -56,6 +56,7 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "log_file",
         "log_level",
         "log_max_days",
+        "log_format",
         "web_server_addr",
         "web_server_port",
         "web_server_user",
@@ -146,6 +147,7 @@ pub(super) fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "log_file",
         "log_level",
         "log_max_days",
+        "log_format",
         "observability",
         // Go frp v0.70.1 compat — new fields
         "quic",

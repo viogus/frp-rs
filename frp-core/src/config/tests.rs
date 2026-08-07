@@ -2216,6 +2216,29 @@ fn log_to_alias_works() {
     assert_eq!(cfg.file, "/var/log/frps.log");
 }
 
+// ── MEDIUM-3b: LogConfig `format` field ────────────────────────────
+
+#[test]
+fn log_format_defaults_to_text() {
+    let cfg = super::LogConfig::default();
+    assert_eq!(cfg.format, "text");
+}
+
+#[test]
+fn log_format_parses_json() {
+    let toml = "level = \"info\"\nformat = \"json\"\nmax_days = 0\n";
+    let cfg: super::LogConfig = toml::from_str(toml).unwrap();
+    assert_eq!(cfg.format, "json");
+}
+
+#[test]
+fn log_format_preserved_when_absent() {
+    // A config without `format` must still deserialize (serde default).
+    let toml = "level = \"debug\"\n";
+    let cfg: super::LogConfig = toml::from_str(toml).unwrap();
+    assert_eq!(cfg.format, "text");
+}
+
 // ── MEDIUM-4: WebServer addr default ────────────────────────────────
 
 #[test]

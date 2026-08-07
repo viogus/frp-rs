@@ -546,6 +546,10 @@ pub struct LogConfig {
     pub file: String,
     #[serde(default = "default_max_days", alias = "maxDays")]
     pub max_days: i32,
+    /// Log output format: "text" or "json" (any other value falls back to
+    /// "text"). Go frp `log.format` compat.
+    #[serde(default = "default_log_format")]
+    pub format: String,
     #[serde(default, alias = "disablePrintColor")]
     pub disable_print_color: bool,
 }
@@ -556,6 +560,7 @@ impl Default for LogConfig {
             level: default_log_level(),
             file: default_log_file(),
             max_days: default_max_days(),
+            format: default_log_format(),
             disable_print_color: false,
         }
     }
@@ -570,6 +575,10 @@ fn default_log_file() -> String {
 
 fn default_max_days() -> i32 {
     3
+}
+
+fn default_log_format() -> String {
+    "text".into()
 }
 
 /// OpenTelemetry / observability configuration.
