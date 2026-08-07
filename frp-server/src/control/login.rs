@@ -259,63 +259,13 @@ async fn verify_login_auth(
                 // (token-reachable OOM). Legitimate clients hitting the cap
                 // are rejected for this second and retry on the next timestamp.
                 const MAX_ENTRIES_PER_TIMESTAMP: usize = 100;
-                // Global bound on the whole table (defense-in-depth): with a
-                // large authenticationTimeout the per-second cap alone allows
-                // ~2*timeout*100 entries, and future-dated keys only expire
-                // once the clock passes them. A token-reachable attacker could
-                // otherwise grow this map's memory without bound. Computed
-                // before `entry` so the immutable borrow does not overlap the
-                // mutable entry borrow.
-                const MAX_TOTAL_REPLAY_ENTRIES: usize = 100_000;
-                let total: usize = used.values().map(|s| s.len()).sum();
-                if total >= MAX_TOTAL_REPLAY_ENTRIES {
-                    warn!(
-                        peer = ?peer, ts = ts,
-                        "Login rejected: replay-detection table full ({} entries, cap {})",
-                        total, MAX_TOTAL_REPLAY_ENTRIES,
-                    );
-                    send_login_error(
-                        stream,
-                        "login rejected: too many login attempts".into(),
-                        v2,
-                    )
-                    .await;
-                    return Err(());
-                }
-                let entry = used.entry(ts).or_default();
-                if entry.len() >= MAX_ENTRIES_PER_TIMESTAMP {
-                    warn!(
-                        peer = ?peer, ts = ts,
-                        "Login rejected: too many unique run_ids for timestamp {} (cap {})",
-                        ts, MAX_ENTRIES_PER_TIMESTAMP,
-                    );
-                    send_login_error(
-                        stream,
-                        "login rejected: too many login attempts for this timestamp".into(),
-                        v2,
-                    )
-                    .await;
-                    return Err(());
-                }
-                if !entry.insert(run_id_for_check.clone()) {
-                    warn!(
-                        peer = ?peer, run_id = %run_id_for_check, ts = %ts,
-                        "Replay attack detected: duplicate (run_id, timestamp) pair for run_id={} ts={}",
-                        run_id_for_check, ts,
-                    );
-                    send_login_error(
-                        stream,
-                        "replay attack detected: duplicate timestamp".into(),
-                        v2,
-                    )
-                    .await;
-                    return Err(());
-                }
-                // Clean old entries. Keys are now milliseconds (frpc) or
-                // seconds (Go frpc): prune BOTH precisions. With seconds-only
-                // pruning, ms keys (~1.75e12) would never be < the seconds
-                // threshold and the table would grow unbounded until the
-                // 100k global cap rejected every login.
+                // Prune FIRST (both precisions): keys are milliseconds (frpc)
+                // or seconds (Go frpc). With seconds-only pruning, ms keys
+                // (~1.75e12) would never be < the seconds threshold and the
+                // table would grow unbounded. Running the prune before the
+                // cap check also means a full table drains stale entries and
+                // reopens — the cap check itself must never become a
+                // permanent login lockout.
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -332,6 +282,68 @@ async fn verify_login_auth(
                         *k >= threshold_s
                     }
                 });
+                // Global bound on the whole table (defense-in-depth): with a
+                // large authenticationTimeout the per-second cap alone allows
+                // ~2*timeout*100 entries. If the table is STILL full after
+                // pruning (sustained attack), degrade to freshness-only
+                // duplicate detection (matching Go frps, which has no
+                // duplicate table) instead of rejecting every login — a
+                // reject-here would lock out all legitimate clients until
+                // frps restarts.
+                const MAX_TOTAL_REPLAY_ENTRIES: usize = 100_000;
+                let total: usize = used.values().map(|s| s.len()).sum();
+                if total >= MAX_TOTAL_REPLAY_ENTRIES {
+                    warn!(
+                        peer = ?peer,
+                        "Login: replay-detection table full ({} entries, cap {}); degraded to freshness-only duplicate detection",
+                        total, MAX_TOTAL_REPLAY_ENTRIES,
+                    );
+                } else {
+                    let entry = used.entry(ts).or_default();
+                    if entry.len() >= MAX_ENTRIES_PER_TIMESTAMP {
+                        warn!(
+                            peer = ?peer, ts = ts,
+                            "Login rejected: too many unique run_ids for timestamp {} (cap {})",
+                            ts, MAX_ENTRIES_PER_TIMESTAMP,
+                        );
+                        send_login_error(
+                            stream,
+                            "login rejected: too many login attempts for this timestamp".into(),
+                            v2,
+                        )
+                        .await;
+                        return Err(());
+                    }
+                    if !entry.insert(run_id_for_check.clone()) {
+                        // Duplicate (run_id, ts). Rust frpc sends
+                        // MILLISECONDS keys — a genuine replay reuses an
+                        // identical ms stamp, so reject. Go frpc reuses its
+                        // run_id and sends SECONDS keys: a reconnect landing
+                        // in the same wall-clock second collides with the
+                        // previous login and is indistinguishable from a
+                        // replay; admit it (the freshness window still
+                        // bounds real replays).
+                        if ts < MS_EPOCH {
+                            debug!(
+                                peer = ?peer, run_id = %run_id_for_check, ts = %ts,
+                                "Login: duplicate seconds-precision (run_id, ts) — treating as same-second Go frpc reconnect"
+                            );
+                        } else {
+                            warn!(
+                                peer = ?peer, run_id = %run_id_for_check, ts = %ts,
+                                "Replay attack detected: duplicate (run_id, timestamp) pair for run_id={} ts={}",
+                                run_id_for_check, ts,
+                            );
+                            send_login_error(
+                                stream,
+                                "replay attack detected: duplicate timestamp".into(),
+                                v2,
+                            )
+                            .await;
+                            return Err(());
+                        }
+                    }
+                }
             }
         }
 

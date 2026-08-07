@@ -436,6 +436,12 @@ pub struct AppState {
     pub login_throttle: Arc<
         tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
     >,
+    /// Coarse-grained per-IP counter used when `login_throttle` is full:
+    /// untracked IPs are still rate-limited (not unlimited) while the main
+    /// table drains. Same (count, window_start) shape as `login_throttle`.
+    pub login_throttle_overflow: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+    >,
     /// Timestamp-indexed run_id set for replay attack detection.
     ///
     /// Key: Unix timestamp (seconds). Value: set of run_ids that logged in
@@ -575,6 +581,9 @@ impl AppState {
             },
             accept_rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new(max_accept_rate))),
             login_throttle: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            login_throttle_overflow: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             used_timestamps: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(feature = "tls")]
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
@@ -618,13 +627,30 @@ impl AppState {
         const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
         throttle.retain(|_, (_, window_start)| now.duration_since(*window_start) < CLEANUP_TIMEOUT);
 
-        // Cap: when the table is full, fall back to allowing untracked IPs
-        // rather than rejecting them — refusing every new IP for up to 90s
-        // turns a distributed login flood into a denial of service against
-        // legitimate new clients (they cannot even retry). The throttle
-        // degrades gracefully (untracked IPs are not rate-limited) while
-        // expired entries drain via the cleanup above.
+        // Cap: when the main table is full, fall back to a COARSE per-IP
+        // counter for untracked IPs instead of either (a) rejecting every
+        // new IP for up to 90s (distributed flood -> DoS of legit new
+        // clients) or (b) allowing them completely unlimited (brute-force
+        // bypass). The overflow bucket keeps a generous per-IP cap so a
+        // distributed attacker cannot brute-force the token with zero rate
+        // limiting while the table drains.
         if !throttle.contains_key(&ip) && throttle.len() >= MAX_THROTTLE_ENTRIES {
+            const OVERFLOW_MAX_PER_IP: u32 = 50;
+            let mut overflow = self.login_throttle_overflow.lock().await;
+            // Cleanup mirrors the main table (90s).
+            overflow
+                .retain(|_, (_, window_start)| now.duration_since(*window_start) < CLEANUP_TIMEOUT);
+            let (count, window_start) = overflow.entry(ip).or_insert((0, now));
+            if now.duration_since(*window_start) > std::time::Duration::from_secs(60) {
+                *count = 1;
+                *window_start = now;
+                return true;
+            }
+            if *count >= OVERFLOW_MAX_PER_IP {
+                tracing::warn!(ip = %ip, "Login throttle overflow cap hit for {} (50 attempts); throttling", ip);
+                return false; // Coarse-throttled
+            }
+            *count += 1;
             return true;
         }
 

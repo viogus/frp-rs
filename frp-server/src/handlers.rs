@@ -58,12 +58,12 @@ pub(crate) async fn handle_visitor_conn_inner(
     let timestamp = msg.timestamp.unwrap_or(0);
 
     // Validate timestamp freshness to prevent replay attacks.
-    // A missing timestamp (0) is treated as "not provided" and skips the
-    // freshness window — same semantics as the control-channel Login path —
-    // so legacy/Go clients that omit it are not rejected once the server
-    // enables authenticationTimeout.
+    // A MISSING timestamp skips the freshness window — same semantics as the
+    // control-channel Login path — so legacy/Go clients that omit it are not
+    // rejected once the server enables authenticationTimeout. A PRESENT ts=0
+    // is still validated (and rejected as stale), like Login.
     let auth_timeout = state.reloadable.read_ok().auth_cfg.authentication_timeout;
-    let ts_valid = if timestamp == 0 {
+    let ts_valid = if msg.timestamp.is_none() {
         Ok(())
     } else {
         frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)

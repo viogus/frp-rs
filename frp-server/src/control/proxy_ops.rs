@@ -362,7 +362,7 @@ fn validate_new_proxy(np: &msg::NewProxy) -> Result<(), String> {
             if domain.is_empty()
                 || !domain
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
                 || domain.starts_with('.')
                 || domain.ends_with('.')
                 || domain.contains("..")
@@ -370,7 +370,7 @@ fn validate_new_proxy(np: &msg::NewProxy) -> Result<(), String> {
                 || domain.chars().any(|c| c.is_control() || c.is_whitespace())
             {
                 return Err(format!(
-                    "custom_domain '{}' contains invalid characters or structure (letters, digits, '.', '-' only; no wildcards)",
+                    "custom_domain '{}' contains invalid characters or structure (letters, digits, '.', '-', '_' only; no wildcards)",
                     domain
                 ));
             }

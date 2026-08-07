@@ -354,16 +354,17 @@ pub(crate) async fn handle_new_visitor_conn<W: AsyncWriteExt + Unpin>(
     let sign_key = nvc.sign_key.unwrap_or_default();
     let timestamp = nvc.timestamp.unwrap_or(0);
 
-    // Validate timestamp freshness (replay attack prevention). A missing
-    // timestamp (0) skips the window — same semantics as control Login —
-    // so legacy/Go clients that omit it are not rejected.
+    // Validate timestamp freshness (replay attack prevention). A MISSING
+    // timestamp skips the window — same semantics as control Login — so
+    // legacy/Go clients that omit it are not rejected. A present ts=0 is
+    // still validated (and rejected as stale).
     let auth_timeout = ctx
         .state
         .reloadable
         .read_ok()
         .auth_cfg
         .authentication_timeout;
-    let ts_fresh = if timestamp == 0 {
+    let ts_fresh = if nvc.timestamp.is_none() {
         Ok(())
     } else {
         frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
@@ -538,7 +539,10 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
                 return Ok(());
             }
-            if timestamp != 0 {
+            // Freshness only when the client sent a timestamp (a MISSING
+            // timestamp skips the window for legacy/Go parity; a present
+            // ts=0 is validated and rejected as stale).
+            if nhv.timestamp.is_some() {
                 let auth_timeout = ctx
                     .state
                     .reloadable

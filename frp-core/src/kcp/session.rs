@@ -318,7 +318,7 @@ impl KcpSession {
     /// Enqueue data to send via KCP. Takes ownership of `data` so the KCP
     /// segmentation can split by moving instead of copying.
     pub fn send(&mut self, data: Vec<u8>) -> io::Result<usize> {
-        let n = self.kcp.send(data.to_vec()).map_err(io::Error::other)?;
+        let n = self.kcp.send(data).map_err(io::Error::other)?;
         // send() grew snd_queue; refresh the shared backlog counter so a
         // poll_write blocked on it can re-evaluate.
         self.reconcile_snd_backlog();

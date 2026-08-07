@@ -578,13 +578,25 @@ async fn run_udp_work_conn(
                                 None => {
                                     let bind = SocketAddr::new(local_addr.ip(), 0);
                                     let sock = match UdpSocket::bind(bind).await {
-                                        Ok(s) => Arc::new(s),
+                                        Ok(s) => s,
                                         Err(e) => {
                                             warn!(proxy_name = %pn_r, remote = %remote, error = %e,
                                                 "UDP: failed to bind per-remote socket");
                                             continue;
                                         }
                                     };
+                                    // Connect to the local service so replies
+                                    // can only arrive from it (source
+                                    // filtering — a local process can no
+                                    // longer inject datagrams tagged as this
+                                    // remote). Requests still go out via
+                                    // send_to(local_addr), the connect addr.
+                                    if let Err(e) = sock.connect(local_addr).await {
+                                        warn!(proxy_name = %pn_r, remote = %remote, error = %e,
+                                            "UDP: failed to connect per-remote socket to local service");
+                                        continue;
+                                    }
+                                    let sock = Arc::new(sock);
                                     let mut map =
                                         sessions.lock().unwrap_or_else(|e| e.into_inner());
                                     match map.get(&remote) {
