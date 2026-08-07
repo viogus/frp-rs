@@ -15,4 +15,6 @@ pub mod service;
 pub mod store;
 pub(crate) mod util;
 pub mod visitor;
+#[cfg(feature = "vnet")]
+pub mod vnet;
 pub mod work_conn;
