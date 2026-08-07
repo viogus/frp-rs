@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Notify};
 
-use super::socket::{WriteRequest, KCP_WRITE_BACKLOG_THRESHOLD};
+use super::socket::{WriteRequest, KCP_SND_BACKLOG_THRESHOLD, KCP_WRITE_BACKLOG_THRESHOLD};
 
 static KCP_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 #[cfg(debug_assertions)]
@@ -37,17 +37,27 @@ pub struct KcpStream {
     write_backlog: Arc<AtomicUsize>,
     /// Woken by KcpSocket when backlog drains below threshold (via notify_one).
     write_notify: Arc<Notify>,
-    /// Pending backpressure wait future. Created when write backlog is full;
-    /// resolved when KcpSocket drains enough backlog and calls notify_waiters().
+    /// Pending backpressure wait future. Created when the write-channel backlog
+    /// or the KCP send-queue backlog is full; resolved when KcpSocket drains
+    /// enough backlog and notifies (via write_notify or snd_notify).
     /// Uses OwnedNotified (not Notified<'_>) so the future holds its own
     /// Arc<Notify> reference — no transmute, no field ordering dependency.
     backpressure_fut: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
+    /// Shared send-queue backlog counter with KcpSession. Mirrors
+    /// `Kcp::wait_snd()` (snd_buf + snd_queue segment count). poll_write gates
+    /// on this so a stalled peer (remote window 0) cannot make the KCP send
+    /// queue grow without bound.
+    snd_backlog: Arc<AtomicUsize>,
+    /// Woken by KcpSession::reconcile_snd_backlog when snd_backlog drains below
+    /// KCP_SND_BACKLOG_THRESHOLD (or by mark_dead when the session is removed).
+    snd_notify: Arc<Notify>,
     /// Shared with KcpSession. Set to false when the session is removed from
     /// the driver, so poll_write/poll_read can fail fast.
     session_alive: Arc<AtomicBool>,
 }
 
 impl KcpStream {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         conv: u32,
         peer_addr: SocketAddr,
@@ -55,6 +65,8 @@ impl KcpStream {
         read_rx: mpsc::Receiver<Vec<u8>>,
         write_backlog: Arc<AtomicUsize>,
         write_notify: Arc<Notify>,
+        snd_backlog: Arc<AtomicUsize>,
+        snd_notify: Arc<Notify>,
         session_alive: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -71,6 +83,8 @@ impl KcpStream {
             write_backlog,
             write_notify,
             backpressure_fut: None,
+            snd_backlog,
+            snd_notify,
             session_alive,
         }
     }
@@ -223,6 +237,29 @@ impl AsyncWrite for KcpStream {
                     Poll::Ready(()) => {
                         self.backpressure_fut = None;
                         // Backlog drained between check and notify registration.
+                        // Fall through to send.
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+
+        // Gate: if the KCP session's send queue (snd_buf + snd_queue, via
+        // wait_snd()) is too deep, apply backpressure. This bounds memory when
+        // the remote window is 0 — the peer stops ACKing, flush() cannot move
+        // segments out of snd_queue, and without this gate snd_queue would grow
+        // without limit. KcpSession reconciles the counter and notifies via
+        // snd_notify once ACKs (or session teardown) drain it below the
+        // threshold. Same OwnedNotified pattern as the write-backlog gate.
+        let snd_backlog = self.snd_backlog.load(Ordering::Relaxed);
+        if snd_backlog >= KCP_SND_BACKLOG_THRESHOLD {
+            let notified = self.snd_notify.clone().notified_owned();
+            self.backpressure_fut = Some(Box::pin(notified));
+            if let Some(ref mut fut) = self.backpressure_fut {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        self.backpressure_fut = None;
+                        // Queue drained between check and notify registration.
                         // Fall through to send.
                     }
                     Poll::Pending => return Poll::Pending,

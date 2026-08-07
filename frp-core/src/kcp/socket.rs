@@ -23,6 +23,18 @@ use super::stream::KcpStream;
 /// the try_send-Full lost-wake race in poll_write and poll_flush.
 pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 200;
 
+/// Max KCP segments pending send (`snd_buf + snd_queue`, via `wait_snd()`) before
+/// KcpStream::poll_write applies backpressure (returns Poll::Pending). Bounds
+/// memory when a stalled peer (remote window 0, never ACKing) would otherwise
+/// let the KCP send queue grow without limit.
+/// Roughly 2x the default 1024-segment send window: with the default MSS of
+/// ~1350 bytes this caps un-acked + queued data at ~2.7 MiB per session, far
+/// above the healthy steady-state occupancy (snd_buf drains to the window,
+/// snd_queue drains every flush), so normal full-window throughput is untouched.
+/// Keep it below a single `Kcp`'s practical ceiling; it is a memory bound, not
+/// a flow-control signal (KCP's own window remains the flow-control authority).
+pub(crate) const KCP_SND_BACKLOG_THRESHOLD: usize = 2048;
+
 /// Hard limit on total KCP sessions. Prevents an attacker from exhausting
 /// server memory by sending UDP packets with random conv values.
 const MAX_SESSIONS: usize = 1024;
@@ -367,12 +379,18 @@ impl KcpSocket {
                                         tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
                                         continue;
                                     }
+                                    // Share the session's send-queue backlog counter with the
+                                    // stream so poll_write can gate on a stalled peer (window 0)
+                                    // instead of letting snd_queue grow without bound.
+                                    let (snd_backlog, snd_notify) = session.snd_backlog_handle();
                                     let stream = KcpStream::new(
                                         key.0, src,
                                         self.write_tx.clone(),
                                         read_rx,
                                         self.write_backlog.clone(),
                                         self.write_notify.clone(),
+                                        snd_backlog,
+                                        snd_notify,
                                         session.alive_handle(),
                                     );
                                     if let Err(mpsc::error::TrySendError::Full(_)) =

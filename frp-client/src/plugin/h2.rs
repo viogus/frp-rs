@@ -580,7 +580,14 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     let mut resp = http::Response::builder()
         .status(status)
         .body(())
-        .expect("parsed backend status is a valid HTTP status");
+        .map_err(|e| {
+            debug!(
+                error = %e,
+                backend_status = status,
+                "https plugin backend sent an invalid HTTP status code"
+            );
+            h2::Error::from(h2::Reason::INTERNAL_ERROR)
+        })?;
     for (n, v) in &headers {
         if is_hop_by_hop(n.as_str()) {
             continue;
@@ -634,4 +641,54 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     }
     send.send_data(Bytes::new(), true)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_response_head;
+
+    #[test]
+    fn parse_response_head_parses_normal_head() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nbody";
+        let parsed = parse_response_head(head).expect("normal head should parse");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.headers.len(), 1);
+        assert!(
+            parsed.headers[0]
+                .0
+                .as_str()
+                .eq_ignore_ascii_case("content-length"),
+            "expected content-length header, got {}",
+            parsed.headers[0].0
+        );
+        assert_eq!(parsed.headers[0].1.to_str().unwrap(), "5");
+        // body_offset points at the start of "body" (right after "\r\n\r\n").
+        assert_eq!(&head[parsed.body_offset..], b"body");
+    }
+
+    #[test]
+    fn parse_response_head_accepts_any_u16_status_but_builder_rejects_invalid() {
+        // 1000 is outside the valid HTTP status range (100..=999): the parser
+        // accepts any u16, but http's builder rejects it — production code
+        // maps that rejection to Err (h2::Error) instead of panicking.
+        let head = b"HTTP/1.1 1000 Weird\r\n\r\n";
+        let parsed = parse_response_head(head).expect("1000 parses as a u16 status");
+        assert_eq!(parsed.status, 1000);
+
+        // Locks in the fix contract: production code maps the builder error to
+        // Err (h2::Error) instead of panicking with expect. If someone reverts
+        // `map_err` to `expect`, this test fails.
+        assert!(http::Response::builder()
+            .status(1000u16)
+            .body(())
+            .map_err(|_| h2::Error::from(h2::Reason::INTERNAL_ERROR))
+            .is_err());
+    }
+
+    #[test]
+    fn parse_response_head_malformed_returns_none() {
+        // No "\r\n\r\n" terminator and an empty head both yield None.
+        assert!(parse_response_head(b"garbage\r\n\r\n").is_none());
+        assert!(parse_response_head(b"").is_none());
+    }
 }

@@ -249,11 +249,20 @@ impl Service {
             if let Some(ref sid) = resp.sid {
                 pending_xtcp.remove(sid);
             }
+            // Close the STUN UDP socket cached for this sid (and drop its map
+            // entry). Without this, every failed hole punch leaks one UDP
+            // socket + one map entry until the control loop is torn down.
+            xtcp_sockets.lock().await.remove(&sid);
             return;
         }
         let proxy_name = pending_xtcp.remove(&sid).unwrap_or_default();
         if proxy_name.is_empty() {
             warn!(sid = %sid, "XTCP NatHoleResp: unknown sid '{}'", sid);
+            // The STUN socket may still be cached under this sid (e.g. when the
+            // NatHoleClient write failed before `pending_xtcp` was populated,
+            // leaving an orphaned socket). Drop it here so an unknown sid
+            // cannot leak a UDP socket + map entry.
+            xtcp_sockets.lock().await.remove(&sid);
             return;
         }
         let candidate_addrs = resp.candidate_addrs.unwrap_or_default();

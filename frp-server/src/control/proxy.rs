@@ -1,109 +1,15 @@
-//! Proxy lifecycle, ping, and UDP packet handlers for the control connection
+//! Proxy lifecycle, ping, and cleanup handlers for the control connection
 //! select! loop, plus the post-loop cleanup routine.
 
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 
 use super::proxy_ops;
 use super::{write_ctl_msg, ControlContext, ControlState};
 
 // ── FrpMessage handlers ────────────────────────────────────────────
-
-/// Forward a UDP packet from the frpc client through the proxy's UDP socket.
-/// Handles decrypt/decompress, local-addr→proxy-name caching, and bidirectional NAT.
-pub(crate) async fn handle_udp_packet<W: AsyncWriteExt + Unpin>(
-    ctx: &mut ControlContext,
-    ctl: &mut ControlState,
-    _writer: &mut W,
-    up: msg::UDPPacket,
-) -> Result<(), ()> {
-    debug!(byte_count = %up.content.len(), remote_addr = ?up.remote_addr, "UDPPacket from client: {} bytes to {:?}", up.content.len(), up.remote_addr);
-    // Forward via the proxy's UDP socket (bidirectional NAT, Go frp compat).
-    let local_addr_str = up
-        .local_addr
-        .as_ref()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    let proxy_name = ctl.udp_local_to_proxy.get(&local_addr_str).cloned();
-    // Cache local_addr → proxy_name mapping from incoming packets
-    if !local_addr_str.is_empty() && !ctl.udp_local_to_proxy.contains_key(&local_addr_str) {
-        let fallback_pn = proxy_name
-            .clone()
-            .or_else(|| {
-                let first = ctl.udp_sockets.keys().next().cloned();
-                if first.is_some() {
-                    tracing::debug!(
-                        local_addr = %local_addr_str,
-                        "UDP packet local_addr→proxy_name not cached, falling back to first available socket"
-                    );
-                }
-                first
-            });
-        if let Some(ref pn) = fallback_pn {
-            ctl.udp_local_to_proxy
-                .insert(local_addr_str.clone(), pn.clone());
-        }
-    }
-    // Decrypt/decompress if the proxy requires it. Move the content in (no
-    // clone); decrypt/decompress replace it with a fresh Vec when they succeed.
-    let orig_len = up.content.len();
-    let mut payload = up.content;
-    if let Some(ref pn) = proxy_name {
-        // Cached flags (per-control, ControlState) avoid a per-packet
-        // proxy_manager.get() (async RwLock). Never hold the cache lock
-        // across an .await: probe, then fill on miss.
-        let cached = ctl.udp_proxy_flags.get(pn.as_str()).copied();
-        let flags = match cached {
-            Some(f) => f,
-            None => match ctx.state.proxy_manager.get(pn.as_str()).await {
-                Some(info) => {
-                    let f = (info.use_encryption, info.use_compression);
-                    ctl.udp_proxy_flags.insert(pn.clone(), f);
-                    f
-                }
-                // Proxy not (yet) registered: don't cache, so a later packet
-                // after registration picks up the real flags.
-                None => (false, false),
-            },
-        };
-        if flags.0
-            && encryption::decrypt_into(
-                &payload,
-                &ctx.reloadable.encryption_key,
-                &mut ctl.udp_dec_scratch,
-            )
-            .is_ok()
-        {
-            std::mem::swap(&mut payload, &mut ctl.udp_dec_scratch);
-        }
-        if flags.1 && encryption::decompress_into(&payload, &mut ctl.udp_decomp_scratch).is_ok() {
-            std::mem::swap(&mut payload, &mut ctl.udp_decomp_scratch);
-        }
-    }
-    let sock_opt = proxy_name
-        .as_ref()
-        .and_then(|pn| ctl.udp_sockets.get(pn.as_str()))
-        .or_else(|| ctl.udp_sockets.iter().next().map(|(_, s)| s));
-    if let Some(sock) = sock_opt {
-        let sock = sock.clone();
-        let content = payload;
-        if let Some(ref remote) = up.remote_addr {
-            let remote_str = remote.to_string();
-            tokio::spawn(async move {
-                let _ = sock.send_to(&content, &remote_str).await;
-            });
-        }
-    } else {
-        warn!(
-            byte_count = orig_len,
-            "No UDP socket for proxy, dropping {} bytes", orig_len
-        );
-    }
-    Ok(())
-}
 
 /// Register a new proxy and start listening on its assigned port.
 pub(crate) async fn handle_new_proxy<W: AsyncWriteExt + Unpin>(
@@ -121,7 +27,6 @@ pub(crate) async fn handle_new_proxy<W: AsyncWriteExt + Unpin>(
         &ctx.internal_tx,
         &mut ctl.listener_handles,
         &mut ctl.udp_sockets,
-        &mut ctl.udp_local_to_proxy,
         ctx.v2,
     )
     .await;
@@ -146,12 +51,30 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         );
         return Ok(());
     }
-    let is_https = if let Some(info) = ctx.state.proxy_manager.get(&cp.proxy_name).await {
+    let info = ctx.state.proxy_manager.get(&cp.proxy_name).await;
+    // TCP group proxies share one port + a shared listener across members
+    // (Go frp dev compat). When the last member closes, the shared listener
+    // must be stopped too — otherwise it outlives the group as a zombie still
+    // holding the port. Mirror the lifecycle in `unregister_control`
+    // (proxy_ops.rs): only release the group port and stop the listener for
+    // the final member.
+    let is_tcp_group = info.as_ref().is_some_and(|i| {
+        i.proxy_type == "tcp" && i.group.as_deref().filter(|g| !g.is_empty()).is_some()
+    });
+    let group_name = info
+        .as_ref()
+        .and_then(|i| i.group.clone())
+        .unwrap_or_default();
+    let last_group_member =
+        is_tcp_group && ctx.state.proxy_manager.group_len(&group_name).await <= 1;
+    let is_https = if let Some(info) = info {
         if let Some(port) = info.remote_port {
             // Clean up the appropriate port manager (TCP or UDP — Go frp compat).
+            // For a TCP group member that is not the last member, the shared
+            // group listener still owns the port — leave it allocated.
             if info.proxy_type == "udp" || info.proxy_type == "sudp" {
                 ctx.state.used_udp_ports.write().await.remove(&port);
-            } else {
+            } else if !is_tcp_group || last_group_member {
                 ctx.state.used_ports.write().await.remove(&port);
             }
             // Decrement per-client port count (matching Go frp's portsUsedNum).
@@ -193,9 +116,18 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     if ctx.state.proxy_manager.remove(&cp.proxy_name).await && is_https {
         ctx.state.dec_https_proxy_count();
     }
-    // Drop cached UDP encryption/compression flags for this proxy so a later
-    // re-registration with different flags picks up the new values.
-    ctl.udp_proxy_flags.remove(&cp.proxy_name);
+    // Stop the shared TCP group listener when the last member closes so it
+    // doesn't linger as a zombie holding the group port (remove_group cancels
+    // the listener's token — same shutdown signal as `unregister_control`).
+    if last_group_member {
+        ctx.state.tcp_group_ctl.remove_group(&group_name).await;
+        info!(
+            proxy_name = %cp.proxy_name,
+            group = %group_name,
+            "TCP group '{}' shared listener stopped after last member '{}' closed",
+            group_name, cp.proxy_name
+        );
+    }
     // Drop this proxy's UDP socket from ctl (Go frp closeUDP parity). The
     // bridge task may still hold a clone via its spawned Arc; the socket is
     // fully closed once that task exits.
@@ -415,7 +347,6 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
         if ctx.state.proxy_manager.remove(name).await && is_https {
             ctx.state.dec_https_proxy_count();
         }
-        ctl.udp_proxy_flags.remove(name);
     }
     info!(run_id = %ctx.run_id, "Control connection {} removed", ctx.run_id);
 }

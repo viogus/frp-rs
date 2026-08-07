@@ -648,7 +648,18 @@ async fn run_virtual_net_plugin_work_conn(
         return;
     };
 
-    let (work_r, work_w) = work.into_split().expect("work conn split");
+    let (work_r, work_w) = match work.into_split() {
+        Ok(halves) => halves,
+        Err(e) => {
+            warn!(
+                proxy_name = %proxy_name,
+                error = %e,
+                "virtual_net plugin work conn split failed: {}",
+                e
+            );
+            return;
+        }
+    };
     // into_split already returns boxed halves — only the encrypted branch
     // re-boxes (the CipherReader wrapper).
     let work_r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if use_encryption {

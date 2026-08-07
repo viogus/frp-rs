@@ -875,6 +875,20 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
 // ── VNet FrpMessage handlers ────────────────────────────────────────
 
 /// Store a VNet route advertisement.
+///
+/// Ownership guard, liveness-aware: the first run_id to advertise a
+/// `(virtual_net, subnet)` key owns that route. A different run_id claiming the
+/// same key while the original owner is still online must not silently
+/// overwrite it (one live client hijacking another client's subnet routing) —
+/// refuse the takeover, warn, and leave the route and peers untouched. But if
+/// the owner's control connection is gone (its run_id is absent from
+/// `run_id_to_ctl_tx`), the owner is dead and its stale route must not lock out
+/// a restarted client: run_id persists only within a process, so a crashed
+/// client restarts with a fresh run_id and re-advertises its subnet once at
+/// startup — it would be refused until the dead route is reaped. Allow that
+/// takeover: log it, then insert + broadcast normally. Same run_id
+/// re-advertising (clients carry run_id over reconnects, Go frp `previousRunID`)
+/// is a normal update and always proceeds.
 #[cfg(feature = "vnet")]
 pub(crate) async fn handle_vnet_route_advertise(
     ctx: &ControlContext,
@@ -884,11 +898,45 @@ pub(crate) async fn handle_vnet_route_advertise(
 ) {
     let vn = adv.virtual_net.clone().unwrap_or_default();
     let key = (vn.clone(), adv.subnet.clone());
-    ctx.state
-        .vnet_routes
-        .write()
-        .await
-        .insert(key, (ctx.run_id.clone(), adv.proxy_name.clone()));
+    {
+        let mut routes = ctx.state.vnet_routes.write().await;
+        if let Some((owner_run_id, owner_proxy)) = routes.get(&key) {
+            if owner_run_id != &ctx.run_id {
+                // Liveness check: a route is only "owned" while its owner's
+                // control connection is alive. A dead owner (crashed client that
+                // restarted with a fresh run_id) must not block the reclaiming of
+                // its stale route — allow the takeover instead.
+                let owner_alive = ctx
+                    .state
+                    .run_id_to_ctl_tx
+                    .read()
+                    .await
+                    .contains_key(owner_run_id.as_str());
+                if owner_alive {
+                    warn!(
+                        run_id = %ctx.run_id,
+                        virtual_net = %vn,
+                        subnet = %adv.subnet,
+                        proxy_name = %adv.proxy_name,
+                        owner_run_id = %owner_run_id,
+                        owner_proxy = %owner_proxy,
+                        "vnet route advertise refused: subnet already owned by a live run_id"
+                    );
+                    return;
+                }
+                warn!(
+                    run_id = %ctx.run_id,
+                    virtual_net = %vn,
+                    subnet = %adv.subnet,
+                    proxy_name = %adv.proxy_name,
+                    owner_run_id = %owner_run_id,
+                    owner_proxy = %owner_proxy,
+                    "vnet route advertise: taking over subnet from dead run_id"
+                );
+            }
+        }
+        routes.insert(key, (ctx.run_id.clone(), adv.proxy_name.clone()));
+    }
     info!(
         proxy_name = %adv.proxy_name,
         subnet = %adv.subnet,
@@ -1279,10 +1327,6 @@ mod vnet_route_tests {
             pending_nat_hole_sids: VecDeque::new(),
             listener_handles: HashMap::new(),
             udp_sockets: HashMap::new(),
-            udp_local_to_proxy: HashMap::new(),
-            udp_proxy_flags: HashMap::new(),
-            udp_dec_scratch: Vec::new(),
-            udp_decomp_scratch: Vec::new(),
             last_ping: Instant::now(),
         };
         (ctx, ctl)
@@ -1339,6 +1383,114 @@ mod vnet_route_tests {
             other => panic!("expected forwarded advertise, got {:?}", other),
         }
         assert!(sender_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn advertise_from_different_run_id_cannot_take_over_subnet() {
+        let state = test_state();
+        let mut owner_rx = insert_control(&state, "run-a").await;
+        let mut hijack_rx = insert_control(&state, "run-b").await;
+        // Pre-seed the (vnet, subnet) route as owned by run-a.
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-a".to_string(), "owner-proxy".to_string()),
+            );
+        }
+        let (ctx, mut ctl) = test_context(&state, "run-b");
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "hijack-proxy".to_string(),
+            subnet: "10.0.0.0/24".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv).await;
+
+        // The original owner's route must survive; the takeover is refused.
+        let routes = state.vnet_routes.read().await;
+        assert_eq!(
+            routes.get(&("vnet-a".to_string(), "10.0.0.0/24".to_string())),
+            Some(&("run-a".to_string(), "owner-proxy".to_string()))
+        );
+        drop(routes);
+
+        // Refused takeovers are not broadcast: neither the owner nor the
+        // hijacker sees a forwarded advertise.
+        assert!(owner_rx.try_recv().is_err());
+        assert!(hijack_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn advertise_takes_over_route_whose_owner_is_dead() {
+        let state = test_state();
+        // run-a owns the route but has NO live control connection (its run_id
+        // is absent from run_id_to_ctl_tx — a crashed client's stale route).
+        let mut peer_rx = insert_control(&state, "run-c").await;
+        // Pre-seed the (vnet, subnet) route as owned by dead run-a, plus a
+        // vnet-a route for run-c so the broadcast has a same-vnet peer to reach.
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-a".to_string(), "dead-owner".to_string()),
+            );
+            routes.insert(
+                ("vnet-a".to_string(), "2001:db8::/64".to_string()),
+                ("run-c".to_string(), "peer-c".to_string()),
+            );
+        }
+        let (ctx, mut ctl) = test_context(&state, "run-b");
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "new-owner".to_string(),
+            subnet: "10.0.0.0/24".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv.clone())
+            .await;
+
+        // The dead owner's route is taken over by the advertiser.
+        let routes = state.vnet_routes.read().await;
+        assert_eq!(
+            routes.get(&("vnet-a".to_string(), "10.0.0.0/24".to_string())),
+            Some(&("run-b".to_string(), "new-owner".to_string()))
+        );
+        drop(routes);
+
+        // A takeover is a normal advertise: broadcast to same-vnet peers.
+        match tokio::time::timeout(Duration::from_secs(5), peer_rx.recv()).await {
+            Ok(Some(InternalMsg::VnetRouteAdvertiseForward { msg })) => {
+                assert_advertise_eq(&msg, &adv);
+            }
+            other => panic!("expected forwarded advertise, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn advertise_from_same_run_id_updates_route() {
+        let state = test_state();
+        let (ctx, mut ctl) = test_context(&state, "run-a");
+        let adv1 = msg::VnetRouteAdvertise {
+            proxy_name: "vnet-visitor".to_string(),
+            subnet: "10.0.0.0/24".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv1).await;
+        // Re-advertising the same subnet from the same run_id (a reconnect
+        // carries run_id over, Go frp previousRunID) is a normal update.
+        let adv2 = msg::VnetRouteAdvertise {
+            proxy_name: "vnet-visitor-v2".to_string(),
+            subnet: "10.0.0.0/24".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv2).await;
+
+        let routes = state.vnet_routes.read().await;
+        assert_eq!(
+            routes.get(&("vnet-a".to_string(), "10.0.0.0/24".to_string())),
+            Some(&("run-a".to_string(), "vnet-visitor-v2".to_string()))
+        );
     }
 
     #[tokio::test]

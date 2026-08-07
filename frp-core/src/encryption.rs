@@ -27,6 +27,20 @@ use rand::RngCore;
 type Aes128CfbEnc = cfb_mode::Encryptor<aes::Aes128>;
 type Aes128CfbDec = cfb_mode::Decryptor<aes::Aes128>;
 
+/// Maximum total decompressed bytes accepted by [`decompress_into`] /
+/// [`decompress`].
+///
+/// Rationale: the input to `decompress_into` is a single on-wire message,
+/// bounded by `V1_MAX_MSG_LENGTH` (10 KiB) on V1 or `V2_MAX_FRAME_PAYLOAD`
+/// (64 KiB) on V2. Without a cap, a small compressed payload can expand
+/// without bound — each ~9-byte snappy chunk can declare up to 64 KiB of
+/// output, so a 64 KiB frame can turn into ~450 MiB of allocations, an OOM /
+/// decompression-bomb amplification. 1 MiB is ~16× the largest legitimate
+/// frame (the only non-test callers are UDP-packet paths, whose datagrams are
+/// bounded by `udp_packet_size`, default 1500 / max 65535) while capping any
+/// bomb at a single 1 MiB allocation.
+const MAX_DECOMPRESSED_OUTPUT: usize = 1024 * 1024;
+
 /// Derive an AES-128 key from a token using PBKDF2-SHA1.
 /// Matches Go frp v0.69.1 binary: pbkdf2.Key(token, "frp", 64, 16, sha1.New)
 ///
@@ -201,15 +215,33 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 /// Output identical to [`decompress`]. On error the buffer may hold partial
 /// output — callers must only use it after `Ok` (the UDP ping-pong callers
 /// swap only on `is_ok()`).
+///
+/// The total decompressed output is capped at [`MAX_DECOMPRESSED_OUTPUT`] to
+/// prevent decompression-bomb / OOM amplification. When the cap is exceeded
+/// an error is returned and the buffer is left at a bounded size.
 #[cfg(feature = "compression")]
 pub fn decompress_into(data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     use snap::read::FrameDecoder;
     use std::io::Read;
     let mut decoder = FrameDecoder::new(data);
     out.clear();
-    decoder
-        .read_to_end(out)
-        .map_err(|e| format!("snappy decompress: {e}"))?;
+    // Read in bounded chunks and compare the running total at each chunk
+    // boundary — one length check per 8 KiB of output, no per-byte cost.
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|e| format!("snappy decompress: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        if out.len() > MAX_DECOMPRESSED_OUTPUT {
+            return Err(format!(
+                "snappy decompress: output exceeds {MAX_DECOMPRESSED_OUTPUT} byte limit (possible decompression bomb)"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1017,5 +1049,40 @@ mod tests {
         assert_eq!(out, data);
         let out_plain = decompress(&plain).unwrap();
         assert_eq!(out_plain, out);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn decompress_rejects_output_above_cap() {
+        // A tiny, highly-compressible input that expands past the cap must
+        // fail cleanly instead of allocating unbounded memory. 1 MiB of
+        // zeros compresses to a few hundred bytes, so this exercises the real
+        // bomb path: small input, huge declared output.
+        let bomb = vec![0u8; MAX_DECOMPRESSED_OUTPUT + 1];
+        let compressed = compress(&bomb).unwrap();
+        assert!(
+            compressed.len() < 64 * 1024,
+            "test expects strong compression (got {} bytes)",
+            compressed.len()
+        );
+        let mut out = Vec::new();
+        let err = decompress_into(&compressed, &mut out).unwrap_err();
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+        assert!(
+            out.len() <= MAX_DECOMPRESSED_OUTPUT + 8192,
+            "buffer must stay bounded on error, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn decompress_accepts_output_up_to_cap() {
+        // Output exactly at the cap is legitimate (a datagram at the bound).
+        let data = vec![0x5a; MAX_DECOMPRESSED_OUTPUT];
+        let compressed = compress(&data).unwrap();
+        let mut out = Vec::new();
+        decompress_into(&compressed, &mut out).unwrap();
+        assert_eq!(out.len(), MAX_DECOMPRESSED_OUTPUT);
     }
 }

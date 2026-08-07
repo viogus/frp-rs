@@ -678,8 +678,6 @@ pub(crate) async fn authenticate(
     // mechanism (UdpNeedsWorkConn → ReqWorkConn → assign_udp_work_conn).
     let listener_handles: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let udp_sockets: HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = HashMap::new();
-    // Reverse mapping: local_addr → proxy_name for routing UDPPacket responses
-    let udp_local_to_proxy: HashMap<String, String> = HashMap::new();
     let shutting_down = false;
     let last_ping = Instant::now();
 
@@ -707,10 +705,6 @@ pub(crate) async fn authenticate(
             pending_nat_hole_sids,
             listener_handles,
             udp_sockets,
-            udp_local_to_proxy,
-            udp_proxy_flags: std::collections::HashMap::new(),
-            udp_dec_scratch: Vec::new(),
-            udp_decomp_scratch: Vec::new(),
             last_ping,
         },
         internal_tx,

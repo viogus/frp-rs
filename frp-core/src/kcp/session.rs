@@ -15,13 +15,14 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use super::config::KcpConfig;
 use super::protocol::{Error as KcpError, Kcp};
+use super::socket::KCP_SND_BACKLOG_THRESHOLD;
 use crate::kcp_compat::Fec;
 
 const FEC_HEADER_SIZE: usize = 6;
@@ -112,6 +113,18 @@ pub struct KcpSession {
     /// KcpStream checks this on poll_write/poll_read to fail fast instead of
     /// silently dropping data.
     alive: Arc<AtomicBool>,
+    /// Shared with KcpStream. Mirrors `Kcp::wait_snd()` (snd_buf + snd_queue
+    /// segment count). Poll_write gates on this so a stalled peer (remote
+    /// window 0, never ACKing) cannot make the send queue grow without bound.
+    /// Reconciliated after every send/input/update/force_flush (single-threaded
+    /// driver, so store is safe); on crossing the threshold downward, waiters
+    /// blocked in poll_write are woken via `snd_notify` (notify_one).
+    snd_backlog: Arc<AtomicUsize>,
+    /// Woken by reconcile_snd_backlog when snd_backlog drains below
+    /// KCP_SND_BACKLOG_THRESHOLD, and by mark_dead when the session is
+    /// removed. Shares the KcpStream::backpressure_fut slot with the
+    /// write-channel backlog Notify.
+    snd_notify: Arc<Notify>,
     /// Reusable output packet Vec. Pre-allocated with PACKET_POOL_CAPACITY,
     /// cleared and filled each update/force_flush call to avoid per-call allocation.
     packets: Vec<Vec<u8>>,
@@ -170,7 +183,39 @@ impl KcpSession {
             pending_shards: Vec::new(),
             pending_max_size: 0,
             alive,
+            snd_backlog: Arc::new(AtomicUsize::new(0)),
+            snd_notify: Arc::new(Notify::new()),
             packets: Vec::with_capacity(PACKET_POOL_CAPACITY),
+        }
+    }
+
+    /// Handles for KcpStream: the shared send-queue backlog counter and the
+    /// Notify that wakes a poll_write task blocked on it. The stream gates on
+    /// `snd_backlog >= KCP_SND_BACKLOG_THRESHOLD` and waits on `snd_notify`.
+    pub fn snd_backlog_handle(&self) -> (Arc<AtomicUsize>, Arc<Notify>) {
+        (self.snd_backlog.clone(), self.snd_notify.clone())
+    }
+
+    /// Refresh the shared send-queue backlog counter from `Kcp::wait_snd()`.
+    /// Called after every operation that can change `snd_buf`/`snd_queue`
+    /// (send adds, input ACKs remove; flush just moves between the two).
+    /// Notifies a blocked poll_write only on the over→under crossing. Uses
+    /// `notify_one()` rather than `notify_waiters()` to close the lost-wakeup
+    /// race: poll_write may load `snd_backlog >= threshold`, then the driver
+    /// crosses below the threshold and notifies before poll_write registers
+    /// its waiter via `notified_owned()` — `notify_waiters()` does not store a
+    /// permit, so that notification is lost and the writer stays parked even
+    /// though the queue has drained. `notify_one()` stores a permit when no
+    /// waiter is registered, which the just-registered waiter consumes
+    /// immediately. There is no busy-loop risk: we only notify on the crossing
+    /// (at which point the queue is already under the threshold, so a stored
+    /// permit merely makes poll_write re-check the gate once and proceed);
+    /// while the queue stays full there is no crossing and no notification.
+    fn reconcile_snd_backlog(&mut self) {
+        let len = self.kcp.wait_snd();
+        let prev = self.snd_backlog.swap(len, Ordering::Relaxed);
+        if prev >= KCP_SND_BACKLOG_THRESHOLD && len < KCP_SND_BACKLOG_THRESHOLD {
+            self.snd_notify.notify_one();
         }
     }
 
@@ -248,6 +293,9 @@ impl KcpSession {
             return Ok(Vec::new());
         }
         self.kcp.update(now_ms).map_err(io::Error::other)?;
+        // flush() may have drained snd_queue into snd_buf (or, under window 0,
+        // left it untouched); keep the shared backlog counter in sync.
+        self.reconcile_snd_backlog();
 
         let output = self.kcp.output_mut().drain();
         if output.is_empty() {
@@ -266,7 +314,11 @@ impl KcpSession {
 
     /// Enqueue data to send via KCP.
     pub fn send(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.kcp.send(data).map_err(io::Error::other)
+        let n = self.kcp.send(data).map_err(io::Error::other)?;
+        // send() grew snd_queue; refresh the shared backlog counter so a
+        // poll_write blocked on it can re-evaluate.
+        self.reconcile_snd_backlog();
+        Ok(n)
     }
 
     /// Force KCP to flush pending data and produce output packets immediately.
@@ -280,6 +332,7 @@ impl KcpSession {
         // poll_flush is called between ticks (e.g. StartWorkConn → flush →
         // bridge data sequence).
         self.kcp.flush().map_err(io::Error::other)?;
+        self.reconcile_snd_backlog();
         let output = self.kcp.output_mut().drain();
         if output.is_empty() {
             return Ok(Vec::new());
@@ -320,6 +373,8 @@ impl KcpSession {
                     data.len()
                 );
                 self.kcp.input(data).map_err(io::Error::other)?;
+                // ACKs parsed here shrink snd_buf; refresh the shared backlog.
+                self.reconcile_snd_backlog();
                 return Ok(());
             }
 
@@ -381,6 +436,8 @@ impl KcpSession {
                     .all(|s| s.is_some())
                 {
                     self.shard_groups.remove(&shard_begin);
+                    // Data shards fed above may carry ACKs; keep counter in sync.
+                    self.reconcile_snd_backlog();
                     return Ok(());
                 }
 
@@ -439,6 +496,10 @@ impl KcpSession {
         } else {
             self.kcp.input(data).map_err(io::Error::other)?;
         }
+
+        // ACKs parsed in input() shrink snd_buf; refresh the shared backlog so
+        // a poll_write blocked on a full send queue can resume promptly.
+        self.reconcile_snd_backlog();
 
         Ok(())
     }
@@ -550,6 +611,14 @@ impl KcpSession {
     /// Mark the session as dead -- called by KcpSocket when removing.
     pub fn mark_dead(&self) {
         self.alive.store(false, Ordering::Release);
+        // Wake any poll_write task blocked on send-queue backpressure so it
+        // observes the dead session (poll_write checks alive first). Uses
+        // notify_one(): after the session is dead there will never be another
+        // over→under crossing to trigger a wakeup, so a lost notification
+        // would leave a just-registered waiter parked forever. notify_one()
+        // stores a permit when no waiter is registered yet, guaranteeing the
+        // wakeup arrives once the waiter registers.
+        self.snd_notify.notify_one();
     }
 
     /// Mark session for shutdown. Driver will remove it on next tick.
@@ -627,6 +696,113 @@ mod tests {
         );
         assert_eq!(session.conv(), 12345);
         assert!(!session.is_dead_link());
+    }
+
+    /// Build a bare KCP header segment (24 bytes) with the given command and
+    /// advertised window. No payload.
+    fn make_header_pkt(conv: u32, cmd: u8, wnd: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 24];
+        pkt[0..4].copy_from_slice(&conv.to_le_bytes());
+        pkt[4] = cmd;
+        pkt[6..8].copy_from_slice(&wnd.to_le_bytes());
+        pkt
+    }
+
+    #[test]
+    fn test_snd_backlog_bounded_when_remote_window_zero() {
+        // A peer advertising window 0 never ACKs; without a bound the KCP send
+        // queue grows without limit. Verify the shared snd_backlog counter
+        // (the value KcpStream::poll_write gates on) tracks wait_snd() past
+        // KCP_SND_BACKLOG_THRESHOLD.
+        let (read_tx, _read_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let mut session = KcpSession::new(
+            77,
+            "127.0.0.1:9999".parse().unwrap(),
+            test_config(),
+            read_tx,
+        );
+
+        // Tell the sender the remote receive window is 0 (WINS cmd, wnd=0).
+        session.input(&make_header_pkt(77, 0x54, 0)).unwrap();
+        assert_eq!(session.kcp.rmt_wnd(), 0);
+
+        // Send 1-segment chunks. With rmt_wnd=0, flush() cannot move segments
+        // out of snd_queue, so wait_snd() grows past the threshold and the
+        // shared counter follows (poll_write will then return Pending).
+        let mss = session.kcp.mss();
+        let chunk = vec![0u8; mss];
+        let mut sends = 0;
+        while session.kcp.wait_snd() < KCP_SND_BACKLOG_THRESHOLD {
+            session.send(&chunk).unwrap();
+            sends += 1;
+            assert!(
+                sends < 100_000,
+                "snd_queue should grow but remain observable/bounded"
+            );
+        }
+
+        assert_eq!(
+            session.snd_backlog.load(Ordering::Relaxed),
+            session.kcp.wait_snd()
+        );
+        assert!(session.snd_backlog.load(Ordering::Relaxed) >= KCP_SND_BACKLOG_THRESHOLD);
+    }
+
+    #[test]
+    fn test_snd_backlog_recovers_when_window_reopens() {
+        // Security scenario + recovery: fill snd_queue past the threshold with
+        // the peer window closed, then reopen the window and confirm ACKs drain
+        // the shared backlog below the threshold (so poll_write resumes instead
+        // of deadlocking).
+        let (tx1, _rx1) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        let mut s1 = KcpSession::new(88, "127.0.0.1:9001".parse().unwrap(), test_config(), tx1);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        let mut s2 = KcpSession::new(88, "127.0.0.1:9000".parse().unwrap(), test_config(), tx2);
+
+        // Close the peer's window.
+        s1.input(&make_header_pkt(88, 0x54, 0)).unwrap();
+        assert_eq!(s1.kcp.rmt_wnd(), 0);
+
+        // Fill snd_queue past the threshold.
+        let mss = s1.kcp.mss();
+        let chunk = vec![0u8; mss];
+        let mut sends = 0;
+        while s1.kcp.wait_snd() < KCP_SND_BACKLOG_THRESHOLD {
+            s1.send(&chunk).unwrap();
+            sends += 1;
+            assert!(sends < 100_000);
+        }
+        assert!(s1.snd_backlog.load(Ordering::Relaxed) >= KCP_SND_BACKLOG_THRESHOLD);
+
+        // Reopen the peer's window.
+        s1.input(&make_header_pkt(88, 0x54, 128)).unwrap();
+        assert_eq!(s1.kcp.rmt_wnd(), 128);
+
+        // Pump both directions until s1's backlog drains below the threshold.
+        let mut now_ms = 0u32;
+        let mut rounds = 0;
+        while s1.snd_backlog.load(Ordering::Relaxed) >= KCP_SND_BACKLOG_THRESHOLD {
+            now_ms += 10;
+            let pkts1 = s1.update(now_ms).unwrap();
+            for p in &pkts1 {
+                s2.input(p).unwrap();
+            }
+            s2.recv_and_push().unwrap();
+            let pkts2 = s2.update(now_ms).unwrap();
+            for p in &pkts2 {
+                s1.input(p).unwrap();
+            }
+            s1.recv_and_push().unwrap();
+            while rx2.try_recv().is_ok() {
+                // Keep s2's receive window open by draining delivered data.
+            }
+            rounds += 1;
+            assert!(
+                rounds < 1000,
+                "snd_backlog should drain below threshold after window reopens"
+            );
+        }
+        assert!(s1.snd_backlog.load(Ordering::Relaxed) < KCP_SND_BACKLOG_THRESHOLD);
     }
 
     #[test]
@@ -1093,5 +1269,107 @@ mod tests {
             frames.push(d);
         }
         assert_eq!(frames, vec![b"tail".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn test_snd_backlog_crossing_wakes_parked_writer() {
+        // Regression test for the snd_notify notification path. The existing
+        // counter-only tests prove snd_backlog drains below the threshold, but
+        // never check that a poll_write already parked on the snd_notify waiter
+        // is actually woken. When snd_backlog crosses below
+        // KCP_SND_BACKLOG_THRESHOLD, reconcile_snd_backlog must notify_one()
+        // (which fires a registered waiter); if it used notify_waiters with no
+        // stored-permit fallback the parked writer would sleep forever even
+        // though the queue drained.
+        let (tx1, _rx1) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        let mut s1 = KcpSession::new(89, "127.0.0.1:9001".parse().unwrap(), test_config(), tx1);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        let mut s2 = KcpSession::new(89, "127.0.0.1:9000".parse().unwrap(), test_config(), tx2);
+
+        // Close the peer's window and fill snd_queue past the threshold.
+        s1.input(&make_header_pkt(89, 0x54, 0)).unwrap();
+        assert_eq!(s1.kcp.rmt_wnd(), 0);
+        let mss = s1.kcp.mss();
+        let chunk = vec![0u8; mss];
+        let mut sends = 0;
+        while s1.kcp.wait_snd() < KCP_SND_BACKLOG_THRESHOLD {
+            s1.send(&chunk).unwrap();
+            sends += 1;
+            assert!(sends < 100_000);
+        }
+        assert!(s1.snd_backlog.load(Ordering::Relaxed) >= KCP_SND_BACKLOG_THRESHOLD);
+
+        // Simulate a poll_write that has parked on snd_notify: register the
+        // waiter and confirm it is pending (not yet woken).
+        let (_, notify) = s1.snd_backlog_handle();
+        let mut notified = Box::pin(notify.clone().notified_owned());
+        assert!(futures_util::poll!(&mut notified).is_pending());
+
+        // Reopen the peer's window and pump both directions until the backlog
+        // drains below the threshold — the crossing fires notify_one() and must
+        // wake the parked waiter above.
+        s1.input(&make_header_pkt(89, 0x54, 128)).unwrap();
+        let mut now_ms = 0u32;
+        let mut rounds = 0;
+        while s1.snd_backlog.load(Ordering::Relaxed) >= KCP_SND_BACKLOG_THRESHOLD {
+            now_ms += 10;
+            let pkts1 = s1.update(now_ms).unwrap();
+            for p in &pkts1 {
+                s2.input(p).unwrap();
+            }
+            s2.recv_and_push().unwrap();
+            let pkts2 = s2.update(now_ms).unwrap();
+            for p in &pkts2 {
+                s1.input(p).unwrap();
+            }
+            s1.recv_and_push().unwrap();
+            while rx2.try_recv().is_ok() {
+                // Keep s2's receive window open by draining delivered data.
+            }
+            rounds += 1;
+            assert!(
+                rounds < 1000,
+                "snd_backlog should drain below threshold after window reopens"
+            );
+        }
+        assert!(s1.snd_backlog.load(Ordering::Relaxed) < KCP_SND_BACKLOG_THRESHOLD);
+        // The parked writer must have been woken by the crossing notification.
+        assert!(
+            futures_util::poll!(&mut notified).is_ready(),
+            "parked poll_write must be woken once snd_backlog crosses below the threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snd_notify_stores_permit_for_late_writer() {
+        // Locks in the stored-permit contract of snd_notify. reconcile_snd_backlog
+        // and mark_dead use notify_one() (NOT notify_waiters()) so a notification
+        // fired before poll_write registers its waiter is not lost.
+        //
+        // This is the exact lost-wakeup window: the driver crosses the backlog
+        // threshold downward while poll_write sits between its gate check and
+        // waiter registration. notify_one() stores a permit when no waiter is
+        // registered, which the just-registered notified_owned() consumes
+        // immediately. notify_waiters() stores NO permit in this scenario, so the
+        // late waiter would stay Pending and the writer would sleep forever — this
+        // test pins the implementation to notify_one().
+        let (read_tx, _read_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let session = KcpSession::new(
+            90,
+            "127.0.0.1:9999".parse().unwrap(),
+            test_config(),
+            read_tx,
+        );
+        let (_, notify) = session.snd_backlog_handle();
+
+        // Driver finishes the crossing notification before any waiter registered.
+        notify.notify_one();
+
+        // A late-arriving writer must consume the stored permit right away.
+        let mut n = Box::pin(notify.notified_owned());
+        assert!(
+            futures_util::poll!(&mut n).is_ready(),
+            "notify_one must store a permit that a late waiter consumes immediately"
+        );
     }
 }
