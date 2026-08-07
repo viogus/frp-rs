@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::kcp::KcpStream;
 #[cfg(feature = "quic")]
 use crate::quic::QuicStream;
-#[cfg(any(feature = "tls", feature = "websocket"))]
+#[cfg(feature = "websocket")]
 use crate::TransportError;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
