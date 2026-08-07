@@ -272,6 +272,9 @@ password = "secret"
 [auth.oidc]
 skipExpiryCheck = true
 skipIssuerCheck = true
+skipAudience = true
+additionalAudience = ["api-prod", "api-staging"]
+trustedCaFile = "/etc/ssl/custom-ca.pem"
 
 [[httpPlugins]]
 name = "hook"
@@ -294,6 +297,12 @@ VirtualNet = true
     assert_eq!(cfg.http_plugins.len(), 1);
     assert!(cfg.auth.oidc_skip_expiry);
     assert!(cfg.auth.oidc_skip_issuer);
+    assert!(cfg.auth.oidc_skip_audience);
+    assert_eq!(
+        cfg.auth.oidc_additional_audience,
+        vec!["api-prod", "api-staging"]
+    );
+    assert_eq!(cfg.auth.oidc_tls_trusted_ca_file, "/etc/ssl/custom-ca.pem");
     assert_eq!(cfg.feature.gates.get("VirtualNet"), Some(&true));
 }
 

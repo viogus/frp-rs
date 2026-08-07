@@ -84,6 +84,16 @@ pub struct AuthConfig {
     pub oidc_skip_expiry: bool,
     pub oidc_skip_issuer: bool,
     pub oidc_skip_nbf: bool,
+    /// Skip "aud" claim validation entirely.
+    /// Go frp compat: when `oidc_audience` is empty, Go skips client-ID
+    /// verification; this is the explicit frp-rs form.
+    pub oidc_skip_audience: bool,
+    /// Additional accepted audiences, unioned with `oidc_audience`.
+    /// A token is accepted when its "aud" claim matches any of them.
+    pub oidc_additional_audience: Vec<String>,
+    /// Path to a custom CA certificate PEM file for verifying the OIDC
+    /// provider's TLS certificate (server side, for discovery + JWKS fetches).
+    pub oidc_tls_trusted_ca_file: String,
     pub additional_data: Option<String>,
     /// HTTP/SOCKS5 proxy URL for OIDC HTTP client connections.
     /// Go frp compat: oidcProxyURL.
@@ -131,6 +141,9 @@ impl AuthConfig {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             oidc_skip_nbf: false,
+            oidc_skip_audience: false,
+            oidc_additional_audience: Vec::new(),
+            oidc_tls_trusted_ca_file: String::new(),
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
@@ -152,6 +165,9 @@ impl Default for AuthConfig {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             oidc_skip_nbf: false,
+            oidc_skip_audience: false,
+            oidc_additional_audience: Vec::new(),
+            oidc_tls_trusted_ca_file: String::new(),
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
@@ -288,11 +304,24 @@ impl AuthConfig {
                         .into(),
                 );
             }
-            if self.oidc_audience.is_empty() {
+            if !self.oidc_skip_audience
+                && self.oidc_audience.is_empty()
+                && self.oidc_additional_audience.iter().all(|a| a.is_empty())
+            {
                 return Err(
-                    "CRITICAL: [auth].oidc_audience is empty with OIDC auth method. \
-                     Set oidc_audience to the expected audience claim."
+                    "CRITICAL: [auth].oidc_audience is empty (and no oidc_additional_audience \
+                     entries) with OIDC auth method. Set oidc_audience to the expected \
+                     audience claim (or oidc_additional_audience), or set \
+                     oidc_skip_audience = true to disable audience validation."
                         .into(),
+                );
+            }
+            if self.oidc_skip_audience {
+                tracing::warn!(
+                    "SECURITY WARNING: oidc_skip_audience is true — the token's 'aud' \
+                     claim is NOT validated. Any validly-signed JWT will be accepted \
+                     regardless of audience. This should only be used in development \
+                     environments."
                 );
             }
             if self.oidc_skip_expiry && self.oidc_skip_issuer {
@@ -362,12 +391,14 @@ mod oidc_impl {
     /// and enforces subject binding for ping/NewWorkConn.
     pub struct OidcVerifier {
         audience: String,
+        additional_audience: Vec<String>,
         issuer: String,
         jwks_uri: String,
         jwks: tokio::sync::RwLock<Option<CachedJwks>>,
         skip_expiry: bool,
         skip_issuer: bool,
         skip_nbf: bool,
+        skip_audience: bool,
         http: crate::http_client::HttpClient,
         /// Replay-protection cache: jti → (subject, deadline_unix_seconds).
         /// A jti seen with a different subject is rejected; the same jti with
@@ -375,15 +406,51 @@ mod oidc_impl {
         seen_jtis: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
     }
 
+    /// Decide the audience-validation mode for a verifier.
+    ///
+    /// Returns `Some(audiences)` when the token's "aud" claim must match one
+    /// of the returned audiences; `None` when audience validation is skipped
+    /// (either `skip_audience` is set, or no audience was configured at all —
+    /// matching Go frp's behavior of skipping client-ID verification when the
+    /// audience is empty). Empty strings are filtered from the list.
+    pub(super) fn audience_validation<'a>(
+        skip_audience: bool,
+        audience: &'a str,
+        additional_audience: &'a [String],
+    ) -> Option<Vec<&'a str>> {
+        if skip_audience {
+            return None;
+        }
+        let mut audiences: Vec<&str> = Vec::new();
+        if !audience.is_empty() {
+            audiences.push(audience);
+        }
+        audiences.extend(
+            additional_audience
+                .iter()
+                .map(String::as_str)
+                .filter(|s| !s.is_empty()),
+        );
+        if audiences.is_empty() {
+            None
+        } else {
+            Some(audiences)
+        }
+    }
+
     impl OidcVerifier {
         /// Create new OidcVerifier. Discovers JWKS URI from issuer's
         /// .well-known/openid-configuration and fetches initial keys.
+        #[allow(clippy::too_many_arguments)]
         pub async fn new(
             issuer: String,
             audience: String,
             skip_expiry: bool,
             skip_issuer: bool,
             skip_nbf: bool,
+            skip_audience: bool,
+            additional_audience: Vec<String>,
+            tls_ca_file: Option<String>,
             proxy_url: Option<String>,
         ) -> Result<Self, String> {
             if proxy_url.as_ref().is_some_and(|u| !u.is_empty()) {
@@ -392,8 +459,22 @@ mod oidc_impl {
                         .into(),
                 );
             }
+
+            // Go frp v0.70.1 compat: a custom CA certificate PEM file for the
+            // OIDC provider's TLS (openid-configuration / JWKS fetches). Mirrors
+            // the client-side OidcClient behavior.
+            let ca_cert_pem = if let Some(ref ca_file) = tls_ca_file.filter(|f| !f.is_empty()) {
+                Some(
+                    std::fs::read(ca_file)
+                        .map_err(|e| format!("OIDC: failed to read CA cert {ca_file}: {e}"))?,
+                )
+            } else {
+                None
+            };
+
             let http = crate::http_client::HttpClientBuilder::new()
                 .timeout(std::time::Duration::from_secs(10))
+                .tls_ca_cert_pem(ca_cert_pem)
                 .build()?;
 
             let config_url = format!(
@@ -425,12 +506,14 @@ mod oidc_impl {
 
             let verifier = Self {
                 audience,
+                additional_audience,
                 issuer: issuer.trim_end_matches('/').to_string(),
                 jwks_uri,
                 jwks: tokio::sync::RwLock::new(None),
                 skip_expiry,
                 skip_issuer,
                 skip_nbf,
+                skip_audience,
                 http,
                 seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
             };
@@ -443,6 +526,9 @@ mod oidc_impl {
             }
             if verifier.skip_nbf {
                 tracing::warn!("OIDC: skip_nbf is enabled — tokens issued in the future will be accepted. This weakens authentication security.");
+            }
+            if verifier.skip_audience {
+                tracing::warn!("OIDC: skip_audience is enabled — tokens with any audience will be accepted. This weakens authentication security.");
             }
 
             verifier.refresh_jwks().await?;
@@ -594,7 +680,19 @@ mod oidc_impl {
             if !self.skip_issuer {
                 validation.set_issuer(&[&self.issuer]);
             }
-            validation.set_audience(&[&self.audience]);
+            // Audience ("aud" claim) validation: skipped when oidc_skip_audience
+            // is set or no audience is configured; otherwise the token's aud
+            // (String or Vec<String>) must match oidc_audience OR any entry of
+            // oidc_additional_audience (jsonwebtoken's set_audience checks all
+            // entries against both forms of the aud claim).
+            match audience_validation(
+                self.skip_audience,
+                &self.audience,
+                &self.additional_audience,
+            ) {
+                Some(expected) => validation.set_audience(&expected),
+                None => validation.validate_aud = false,
+            }
             // Require the "sub" (subject) claim in OIDC tokens. Without this,
             // a JWT that omits "sub" would be accepted with an empty subject,
             // potentially bypassing subject-based proxy routing.
@@ -1083,12 +1181,14 @@ mod oidc_impl {
         fn test_verifier() -> OidcVerifier {
             OidcVerifier {
                 audience: String::new(),
+                additional_audience: Vec::new(),
                 issuer: String::new(),
                 jwks_uri: String::new(),
                 jwks: tokio::sync::RwLock::new(None),
                 skip_expiry: false,
                 skip_issuer: false,
                 skip_nbf: false,
+                skip_audience: false,
                 http: crate::http_client::HttpClientBuilder::new()
                     .tls_skip_verify(true)
                     .build()
@@ -1723,6 +1823,9 @@ mod tests {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             oidc_skip_nbf: false,
+            oidc_skip_audience: false,
+            oidc_additional_audience: Vec::new(),
+            oidc_tls_trusted_ca_file: String::new(),
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
@@ -1863,6 +1966,109 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "oidc")]
+    fn test_audience_validation_decision_matrix() {
+        use super::oidc_impl::audience_validation;
+        let add = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // skip_audience → None (audience check disabled) regardless of config.
+        assert!(audience_validation(true, "api-prod", &add(&["api-staging"])).is_none());
+        assert!(audience_validation(true, "", &add(&[])).is_none());
+
+        // Primary audience only.
+        assert_eq!(
+            audience_validation(false, "api-prod", &add(&[])),
+            Some(vec!["api-prod"])
+        );
+
+        // Primary + additional audiences, union order preserved.
+        assert_eq!(
+            audience_validation(false, "api-prod", &add(&["api-staging", "api-dev"])),
+            Some(vec!["api-prod", "api-staging", "api-dev"])
+        );
+
+        // Additional-only (primary audience empty) still validates.
+        assert_eq!(
+            audience_validation(false, "", &add(&["api-staging"])),
+            Some(vec!["api-staging"])
+        );
+
+        // Empty strings are filtered out.
+        assert_eq!(
+            audience_validation(false, "", &add(&["", "api-dev", ""])),
+            Some(vec!["api-dev"])
+        );
+
+        // All-empty audience list → None (Go frp skips client-ID verification
+        // when the audience is empty).
+        assert!(audience_validation(false, "", &add(&[])).is_none());
+        assert!(audience_validation(false, "", &add(&[""])).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "oidc")]
+    fn test_oidc_audience_check_semantics() {
+        // Verify the integration with jsonwebtoken: a token whose "aud" claim
+        // is a single string or an array of strings is accepted when ANY
+        // configured audience matches, and rejected otherwise. This is the
+        // exact mechanism OidcVerifier::verify_login wires up via
+        // `audience_validation` + `Validation::set_audience`.
+        use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+
+        let encode_token = |claims: &serde_json::Value| {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                claims,
+                &EncodingKey::from_secret(b"oidc-test-secret"),
+            )
+            .expect("encode token")
+        };
+        let decode_with = |token: &str, expected: &[&str], validate_aud: bool| {
+            let mut v = Validation::new(Algorithm::HS256);
+            v.validate_exp = false;
+            // Mirror audience_validation()/verify_login: validate_aud=false
+            // disables the claim check entirely (jsonwebtoken's Validation
+            // defaults to validate_aud=true with an empty set, which rejects
+            // any token carrying an "aud" claim).
+            v.validate_aud = validate_aud;
+            if validate_aud {
+                v.set_audience(expected);
+            }
+            jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &DecodingKey::from_secret(b"oidc-test-secret"),
+                &v,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        };
+
+        let future_exp = 4_102_444_800_u64;
+        // Array-form "aud" claim (OIDC allows Vec<String>).
+        let array_aud = encode_token(&serde_json::json!({
+            "sub": "user-1", "aud": ["api-prod", "api-staging"], "exp": future_exp
+        }));
+        // Single-string "aud" claim.
+        let single_aud = encode_token(&serde_json::json!({
+            "sub": "user-1", "aud": "api-prod", "exp": future_exp
+        }));
+
+        // Main audience matches (both aud forms).
+        assert!(decode_with(&array_aud, &["api-prod"], true).is_ok());
+        assert!(decode_with(&single_aud, &["api-prod"], true).is_ok());
+        // Non-matching audience is rejected.
+        assert!(decode_with(&array_aud, &["api-other"], true).is_err());
+        assert!(decode_with(&single_aud, &["api-other"], true).is_err());
+        // Additional audience alone matches the array entry.
+        assert!(decode_with(&array_aud, &["api-staging"], true).is_ok());
+        // Union list (main + additional) accepts via the additional entry.
+        assert!(decode_with(&array_aud, &["api-other", "api-staging"], true).is_ok());
+        // Skip audience (validate_aud = false): accepted regardless of "aud".
+        assert!(decode_with(&array_aud, &[], false).is_ok());
+        assert!(decode_with(&single_aud, &[], false).is_ok());
+    }
+
+    #[test]
     fn test_auth_config_default() {
         let cfg = AuthConfig::default();
         assert!(matches!(cfg.method, AuthMethod::Token));
@@ -1890,6 +2096,9 @@ mod tests {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             oidc_skip_nbf: false,
+            oidc_skip_audience: false,
+            oidc_additional_audience: Vec::new(),
+            oidc_tls_trusted_ca_file: String::new(),
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
