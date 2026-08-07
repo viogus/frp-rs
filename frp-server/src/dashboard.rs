@@ -1760,6 +1760,10 @@ mod v2 {
             || req.custom_domains.is_some()
             || req.use_encryption.is_some()
             || req.use_compression.is_some();
+        // Note: provider-field and empty-body checks run BEFORE the 404
+        // pre-check below, so an update against an unknown proxy with
+        // provider fields yields 400 (shape error) rather than 404 — a
+        // deliberate asymmetry from the bandwidth-validation path.
         if provider_field {
             return Err(err(
                 StatusCode::BAD_REQUEST,

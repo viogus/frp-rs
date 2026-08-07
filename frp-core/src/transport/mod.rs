@@ -2355,9 +2355,10 @@ fn test_parse_dns_response_malformed_never_panics() {
     resp.extend_from_slice(b"com");
     resp.push(0); // root
     resp.extend_from_slice(&[0, 1, 0, 1]); // QTYPE=A QCLASS=IN
-                                           // Answer: NAME claims a 63-byte label but only 39 bytes remain in the
-                                           // packet — the loop-top check passes (pos+10 <= 39) but skip_dns_name
-                                           // overruns to 89; the post-skip re-check must return Err, not panic.
+
+    // Answer: NAME claims a 63-byte label but the buffer ends before the
+    // claimed label body — the loop-top check passes but skip_dns_name
+    // overruns; the post-skip re-check must return Err, not panic.
     resp.extend_from_slice(&[63]);
     resp.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 4]); // 10B fake answer hdr
     let err = parse_dns_response(&resp, 0x1234, DNS_QTYPE_A).unwrap_err();
