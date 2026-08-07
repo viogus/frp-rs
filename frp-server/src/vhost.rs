@@ -582,19 +582,28 @@ async fn handle_http1_request<S>(
     // `host`/`path` must still be owned Strings: `pre_read` is moved by
     // value into `resolve_vhost_request` below, so we cannot keep references
     // into it across that call.
-    let request_text = String::from_utf8_lossy(&pre_read);
-    let host = match extract_host_header(&request_text) {
+    // Strict UTF-8: HTTP request heads are ASCII; a non-UTF-8 head is malformed
+    // and rejected with 400 instead of being lossy-replaced (also avoids the
+    // Cow allocation branch).
+    let request_text = match std::str::from_utf8(&pre_read) {
+        Ok(t) => t,
+        Err(_) => {
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            return;
+        }
+    };
+    let host = match extract_host_header(request_text) {
         Some(h) => h.to_string(),
         None => {
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
             return;
         }
     };
-    let path = extract_path(&request_text).unwrap_or("/").to_string();
+    let path = extract_path(request_text).unwrap_or("/").to_string();
 
     // Parse Basic Auth once — reused for route matching, auth check,
     // and per-user routing (Go frp compat: getByRoute(host, path, username)).
-    let http_auth = extract_basic_auth(&request_text);
+    let http_auth = extract_basic_auth(request_text);
     let http_user = http_auth
         .as_ref()
         .map(|(u, _)| u.as_str())
@@ -1028,6 +1037,17 @@ fn inject_vhost_request_headers(
     // the peer appended).
     let mut lines: Vec<&[u8]> = Vec::new();
     let mut existing_xff: Vec<u8> = Vec::new();
+    // Precompute override prefixes once (case-insensitive ASCII set semantics):
+    // `format!("{}:", ...)` + `to_lowercase()` per header line per request is
+    // wasted allocation — header names are ASCII.
+    let override_prefixes: Vec<Vec<u8>> = request_headers
+        .iter()
+        .map(|(k, _)| {
+            let mut p = k.as_bytes().to_ascii_lowercase();
+            p.push(b':');
+            p
+        })
+        .collect();
     for line in head.split_inclusive(|&b| b == b'\n') {
         let trimmed = line
             .strip_suffix(b"\n")
@@ -1037,14 +1057,19 @@ fn inject_vhost_request_headers(
         if trimmed.is_empty() {
             continue;
         }
-        let lower = String::from_utf8_lossy(trimmed).to_lowercase();
-        let is_override = request_headers
+        // Case-insensitive ASCII compare against the precomputed prefixes;
+        // `[u8]::eq_ignore_ascii_case` is equivalent to lowercasing for
+        // ASCII header names and avoids the per-line allocations.
+        let is_override = override_prefixes
             .iter()
-            .any(|(k, _)| lower.starts_with(&format!("{}:", k.to_lowercase())));
+            .any(|p| trimmed.len() >= p.len() && trimmed[..p.len()].eq_ignore_ascii_case(p));
         if is_override {
             continue;
         }
-        if lower.starts_with("x-forwarded-for:") {
+        if trimmed
+            .get(..16)
+            .is_some_and(|t| t.eq_ignore_ascii_case(b"x-forwarded-for:"))
+        {
             let value = match trimmed.iter().position(|&b| b == b':') {
                 Some(i) => &trimmed[i + 1..],
                 None => trimmed,
