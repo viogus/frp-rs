@@ -1270,4 +1270,106 @@ mod tests {
         }
         assert_eq!(frames, vec![b"tail".to_vec()]);
     }
+
+    #[tokio::test]
+    async fn test_snd_backlog_crossing_wakes_parked_writer() {
+        // Regression test for the snd_notify notification path. The existing
+        // counter-only tests prove snd_backlog drains below the threshold, but
+        // never check that a poll_write already parked on the snd_notify waiter
+        // is actually woken. When snd_backlog crosses below
+        // KCP_SND_BACKLOG_THRESHOLD, reconcile_snd_backlog must notify_one()
+        // (which fires a registered waiter); if it used notify_waiters with no
+        // stored-permit fallback the parked writer would sleep forever even
+        // though the queue drained.
+        let (tx1, _rx1) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        let mut s1 = KcpSession::new(89, "127.0.0.1:9001".parse().unwrap(), test_config(), tx1);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        let mut s2 = KcpSession::new(89, "127.0.0.1:9000".parse().unwrap(), test_config(), tx2);
+
+        // Close the peer's window and fill snd_queue past the threshold.
+        s1.input(&make_header_pkt(89, 0x54, 0)).unwrap();
+        assert_eq!(s1.kcp.rmt_wnd(), 0);
+        let mss = s1.kcp.mss();
+        let chunk = vec![0u8; mss];
+        let mut sends = 0;
+        while s1.kcp.wait_snd() < KCP_SND_BACKLOG_THRESHOLD {
+            s1.send(&chunk).unwrap();
+            sends += 1;
+            assert!(sends < 100_000);
+        }
+        assert!(s1.snd_backlog.load(Ordering::Relaxed) >= KCP_SND_BACKLOG_THRESHOLD);
+
+        // Simulate a poll_write that has parked on snd_notify: register the
+        // waiter and confirm it is pending (not yet woken).
+        let (_, notify) = s1.snd_backlog_handle();
+        let mut notified = Box::pin(notify.clone().notified_owned());
+        assert!(futures_util::poll!(&mut notified).is_pending());
+
+        // Reopen the peer's window and pump both directions until the backlog
+        // drains below the threshold — the crossing fires notify_one() and must
+        // wake the parked waiter above.
+        s1.input(&make_header_pkt(89, 0x54, 128)).unwrap();
+        let mut now_ms = 0u32;
+        let mut rounds = 0;
+        while s1.snd_backlog.load(Ordering::Relaxed) >= KCP_SND_BACKLOG_THRESHOLD {
+            now_ms += 10;
+            let pkts1 = s1.update(now_ms).unwrap();
+            for p in &pkts1 {
+                s2.input(p).unwrap();
+            }
+            s2.recv_and_push().unwrap();
+            let pkts2 = s2.update(now_ms).unwrap();
+            for p in &pkts2 {
+                s1.input(p).unwrap();
+            }
+            s1.recv_and_push().unwrap();
+            while rx2.try_recv().is_ok() {
+                // Keep s2's receive window open by draining delivered data.
+            }
+            rounds += 1;
+            assert!(
+                rounds < 1000,
+                "snd_backlog should drain below threshold after window reopens"
+            );
+        }
+        assert!(s1.snd_backlog.load(Ordering::Relaxed) < KCP_SND_BACKLOG_THRESHOLD);
+        // The parked writer must have been woken by the crossing notification.
+        assert!(
+            futures_util::poll!(&mut notified).is_ready(),
+            "parked poll_write must be woken once snd_backlog crosses below the threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snd_notify_stores_permit_for_late_writer() {
+        // Locks in the stored-permit contract of snd_notify. reconcile_snd_backlog
+        // and mark_dead use notify_one() (NOT notify_waiters()) so a notification
+        // fired before poll_write registers its waiter is not lost.
+        //
+        // This is the exact lost-wakeup window: the driver crosses the backlog
+        // threshold downward while poll_write sits between its gate check and
+        // waiter registration. notify_one() stores a permit when no waiter is
+        // registered, which the just-registered notified_owned() consumes
+        // immediately. notify_waiters() stores NO permit in this scenario, so the
+        // late waiter would stay Pending and the writer would sleep forever — this
+        // test pins the implementation to notify_one().
+        let (read_tx, _read_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let session = KcpSession::new(
+            90,
+            "127.0.0.1:9999".parse().unwrap(),
+            test_config(),
+            read_tx,
+        );
+        let (_, notify) = session.snd_backlog_handle();
+
+        // Driver finishes the crossing notification before any waiter registered.
+        notify.notify_one();
+
+        // A late-arriving writer must consume the stored permit right away.
+        let mut n = Box::pin(notify.notified_owned());
+        assert!(
+            futures_util::poll!(&mut n).is_ready(),
+            "notify_one must store a permit that a late waiter consumes immediately"
+        );
+    }
 }

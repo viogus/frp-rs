@@ -1929,17 +1929,11 @@ impl Service {
                     // reclaim the pending provider-side entry (socket already
                     // removed) and any residual visitor-side sender. `cleanup_sid`
                     // carries either a provider sid or a visitor txn_id; the two
-                    // maps are independent, so removing from both is always safe.
+                    // namespaces are independent, so reclaiming from both is
+                    // always safe (see reclaim_stale_xtcp_entry).
                     Some(cleanup_sid) = xtcp_cleanup_rx.recv() => {
-                        if pending_xtcp.remove(&cleanup_sid).is_some() {
-                            debug!(sid = %cleanup_sid, "XTCP: reclaimed stale NatHoleClient entry for '{}'", cleanup_sid);
-                        }
-                        if let Some(tx) = visitor_pending.remove(&cleanup_sid) {
-                            // Usually a no-op (the visitor already timed out at
-                            // 15s and dropped the receiver), but covers the
-                            // window where the visitor has not timed out yet.
-                            let _ = tx.send(Err("NatHoleResp timeout: server did not respond".into()));
-                            debug!(sid = %cleanup_sid, "XTCP: reclaimed stale visitor NatHoleResp entry for '{}'", cleanup_sid);
+                        if reclaim_stale_xtcp_entry(&mut pending_xtcp, &mut visitor_pending, &cleanup_sid) {
+                            debug!(sid = %cleanup_sid, "XTCP: reclaimed stale entry for '{}'", cleanup_sid);
                         }
                     }
 
@@ -2622,6 +2616,30 @@ impl Service {
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);
         Ok(format!("reload success: {summary}"))
     }
+}
+/// Reclaim a stale XTCP entry whose NatHoleResp never arrived in time.
+///
+/// `key` carries two independent namespaces: it is a provider-side NAT session
+/// id (`sid`) in `pending_xtcp`, and a visitor transaction id (`txn_id`) in
+/// `visitor_pending`. Because the two maps are independent, attempting to
+/// remove the key from both is always safe — whichever map actually held the
+/// entry is cleaned, the other remove is a no-op. If a residual visitor sender
+/// is found, it is notified with a timeout error; this is usually a no-op too,
+/// since the visitor already timed out at 15s and dropped its receiver, but it
+/// covers the window where the visitor has not timed out yet.
+///
+/// Returns true if any entry was removed from either map.
+pub(crate) fn reclaim_stale_xtcp_entry(
+    pending_xtcp: &mut HashMap<String, String>,
+    visitor_pending: &mut HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>>,
+    key: &str,
+) -> bool {
+    let mut removed = pending_xtcp.remove(key).is_some();
+    if let Some(tx) = visitor_pending.remove(key) {
+        let _ = tx.send(Err("NatHoleResp timeout: server did not respond".into()));
+        removed = true;
+    }
+    removed
 }
 /// Apply the client `start` allowlist and `enabled` flag to a proxy list.
 /// Store-backed proxies go through the same filter as config-file proxies.
@@ -3342,5 +3360,51 @@ mod tests {
             "default-net proxies and virtual_net visitors join the default vnet"
         );
         assert!(!vnets.contains("other-net"));
+    }
+
+    #[tokio::test]
+    async fn xtcp_reclaim_clears_both_maps_and_notifies_visitor() {
+        // Provider-side namespace: sid -> proxy_name.
+        let mut pending_xtcp: HashMap<String, String> = HashMap::new();
+        // Visitor-side namespace: txn_id -> oneshot sender.
+        let mut visitor_pending: HashMap<
+            String,
+            oneshot::Sender<Result<msg::NatHoleResp, String>>,
+        > = HashMap::new();
+
+        pending_xtcp.insert("sid-1".into(), "pxy-a".into());
+        let (tx, rx) = oneshot::channel::<Result<msg::NatHoleResp, String>>();
+        visitor_pending.insert("txn-1".into(), tx);
+
+        // The provider sid lives only in pending_xtcp: reclaiming it clears
+        // that map and leaves the visitor map (different namespace) untouched.
+        assert!(reclaim_stale_xtcp_entry(
+            &mut pending_xtcp,
+            &mut visitor_pending,
+            "sid-1"
+        ));
+        assert!(pending_xtcp.is_empty());
+        assert!(visitor_pending.contains_key("txn-1"));
+
+        // The txn id lives only in visitor_pending: the residual sender is
+        // notified with a timeout error and the entry is removed.
+        assert!(reclaim_stale_xtcp_entry(
+            &mut pending_xtcp,
+            &mut visitor_pending,
+            "txn-1"
+        ));
+        assert!(visitor_pending.is_empty());
+        let notified = rx.await.expect("visitor sender must be notified");
+        match notified {
+            Err(e) => assert!(e.contains("timeout"), "error should mention timeout: {e}"),
+            Ok(_) => panic!("visitor must receive an Err on timeout reclaim"),
+        }
+
+        // Unknown keys are a no-op in both maps.
+        assert!(!reclaim_stale_xtcp_entry(
+            &mut pending_xtcp,
+            &mut visitor_pending,
+            "nope"
+        ));
     }
 }

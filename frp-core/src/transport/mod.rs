@@ -1983,3 +1983,86 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn test_socks5_auth_required_without_credentials_returns_error() {
+        // Regression test: a proxy that demands RFC 1929 user/pass auth
+        // (method 0x02) while the proxy URL carries no userinfo must fail the
+        // dial with an error — NOT panic on remote input (the pre-fix behavior).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // No userinfo in the proxy URL, so the client offers the no-auth
+            // greeting [0x05, 0x01, 0x00] — exactly 3 bytes (one method), not
+            // 4. Reading 4 bytes here would deadlock: the client blocks on the
+            // auth response after its 3-byte greeting.
+            let mut greeting = [0u8; 3];
+            sock.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 0x05, "SOCKS5 greeting version");
+            assert_eq!(greeting[1], 0x01, "client must offer no-auth method");
+            // Demand username/password (method 0x02) even though the client
+            // never offered it — a broken/malicious proxy.
+            sock.write_all(&[0x05, 0x02]).await.unwrap();
+            // The client must bail out here without sending a CONNECT request;
+            // dropping the socket closes the connection once it returns Err.
+        });
+
+        let err = connect_via_proxy(&format!("socks5://{addr}"), "127.0.0.1", 80, 5, 0)
+            .await
+            .expect_err("auth-demanding proxy with no credentials in URL must fail");
+        assert!(
+            err.to_string().contains("username/password"),
+            "error should explain missing credentials, got: {err}"
+        );
+
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_no_auth_connect_succeeds() {
+        // Sanity check that the plain no-auth handshake path is not broken by
+        // the auth-required fix: greeting → no-auth method selection →
+        // CONNECT request → success response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Greeting: VER + single no-auth method.
+            let mut greeting = [0u8; 3];
+            sock.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x00], "no-auth greeting");
+            // Accept no-auth.
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+            // CONNECT request: VER CMD RSV ATYP DST.ADDR DST.PORT.
+            // Plain socks5 resolves locally → target "127.0.0.1" is an IP → ATYP=1.
+            let mut req = [0u8; 10];
+            sock.read_exact(&mut req).await.unwrap();
+            assert_eq!(req[0], 0x05, "VER");
+            assert_eq!(req[1], 0x01, "CMD=CONNECT");
+            assert_eq!(req[2], 0x00, "RSV");
+            assert_eq!(req[3], 0x01, "ATYP=IPv4");
+            assert_eq!(&req[4..8], &[127, 0, 0, 1], "DST.ADDR=127.0.0.1");
+            assert_eq!(u16::from_be_bytes([req[8], req[9]]), 12345, "DST.PORT");
+            // Success reply: VER REP RSV ATYP BND.ADDR BND.PORT.
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            // Dropping the socket closes the tunnel once the test drops the stream.
+        });
+
+        match connect_via_proxy(&format!("socks5://{addr}"), "127.0.0.1", 12345, 5, 0).await {
+            Ok(_) => {}
+            Err(e) => panic!("no-auth SOCKS5 handshake should succeed, got: {e}"),
+        }
+
+        srv.await.unwrap();
+    }
+}

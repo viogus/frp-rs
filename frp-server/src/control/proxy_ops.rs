@@ -1422,6 +1422,20 @@ async fn handle_tcp_group_member_registration(
 
 // ---- Port reservation periodic cleanup ----
 
+/// Pure sweep of 24h-expired port reservations; extracted from
+/// [`AppState::prune_expired_reservations`] for testability. Returns the
+/// number of expired entries removed.
+fn prune_expired_reservations_inner(
+    reservations: &mut crate::state::PortReservationMap,
+    now: std::time::Instant,
+) -> usize {
+    let before = reservations.len();
+    reservations.retain(|_, &mut (_, _, reserved_at)| {
+        now.duration_since(reserved_at) < std::time::Duration::from_secs(24 * 3600)
+    });
+    before - reservations.len()
+}
+
 impl AppState {
     /// Prune port reservations whose 24h expiry has passed (Go frp
     /// `cleanReservedPortsWorker`). Reservations are otherwise only reclaimed
@@ -1433,12 +1447,7 @@ impl AppState {
     /// Returns the number of expired entries removed.
     pub async fn prune_expired_reservations(&self) -> usize {
         let now = std::time::Instant::now();
-        let mut reservations = self.port_reservations.write().await;
-        let before = reservations.len();
-        reservations.retain(|_, &mut (_, _, reserved_at)| {
-            now.duration_since(reserved_at) < std::time::Duration::from_secs(24 * 3600)
-        });
-        before - reservations.len()
+        prune_expired_reservations_inner(&mut *self.port_reservations.write().await, now)
     }
 
     /// Spawn the periodic port-reservation pruner: sweeps expired 24h
@@ -1476,8 +1485,7 @@ impl AppState {
 #[cfg(test)]
 mod unregister_generation_tests {
     use super::*;
-    #[cfg(feature = "vnet")]
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn test_state() -> Arc<AppState> {
         let cfg = frp_core::config::ServerConfig::default();
@@ -1603,5 +1611,48 @@ mod unregister_generation_tests {
         assert!(removes.iter().any(|m| {
             m.proxy_name == "visitor-v6" && m.virtual_net.as_deref() == Some("vnet-a")
         }));
+    }
+
+    #[test]
+    fn prune_removes_expired_keeps_fresh() {
+        let now = Instant::now();
+        let mut map = crate::state::PortReservationMap::new();
+        map.insert(
+            "fresh".to_string(),
+            (8080, true, now - Duration::from_secs(3600)),
+        );
+        map.insert(
+            "expired".to_string(),
+            (8081, false, now - Duration::from_secs(25 * 3600)),
+        );
+
+        assert_eq!(prune_expired_reservations_inner(&mut map, now), 1);
+        assert!(map.contains_key("fresh"));
+        assert!(!map.contains_key("expired"));
+    }
+
+    #[test]
+    fn prune_empty_map_is_noop() {
+        let now = Instant::now();
+        let mut map = crate::state::PortReservationMap::new();
+        assert_eq!(prune_expired_reservations_inner(&mut map, now), 0);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn prune_boundary_just_under_24h_is_kept() {
+        // Strictly-less-than semantics: a reservation younger than 24h is
+        // kept. (An exactly-24h boundary is not testable with Instant —
+        // `now - 24h` then `now.duration_since(..)` includes nanosecond
+        // overhead, so it would nondeterministically count as expired.)
+        let now = Instant::now();
+        let mut map = crate::state::PortReservationMap::new();
+        map.insert(
+            "boundary".to_string(),
+            (8082, true, now - Duration::from_secs(24 * 3600 - 1)),
+        );
+
+        assert_eq!(prune_expired_reservations_inner(&mut map, now), 0);
+        assert!(map.contains_key("boundary"));
     }
 }
