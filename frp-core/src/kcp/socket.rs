@@ -460,10 +460,13 @@ impl KcpSocket {
                                             tracing::warn!(conv = key.0, peer = %src, "KCP: per-IP session-creation rate limit reached ({MAX_SESSION_CREATES_PER_IP_PER_WINDOW}/{SESSION_CREATE_WINDOW_MS}ms), dropping new conv={}", key.0);
                                             continue;
                                         }
-                                        log.push_back(now_ms);
+                                        // NOTE: the rate counters are NOT incremented
+                                        // here — they are charged only after the
+                                        // session is actually created and queued
+                                        // (below), so garbage packets that fail
+                                        // input() or a saturated accept queue cannot
+                                        // consume quota and starve legitimate peers.
                                     }
-                                    self.session_create_log.push_back(now_ms);
-
                                     // Create session and validate the first packet.
                                     // If input() fails on the very first packet, the
                                     // data is garbage — don't create a permanent session.
@@ -521,6 +524,15 @@ impl KcpSocket {
                                     *self.peer_session_counts.entry(src.ip()).or_default() += 1;
                                     let now_ms = self.start.elapsed().as_millis() as u32;
                                     self.session_created_at.insert(key, now_ms);
+                                    // Charge the rate counters only now that the
+                                    // session is actually created and queued — the
+                                    // early-return paths above (input() failure,
+                                    // accept queue full) must not consume quota.
+                                    self.session_create_log.push_back(now_ms);
+                                    self.ip_session_create_log
+                                        .entry(ip)
+                                        .or_default()
+                                        .push_back(now_ms);
                                 }
                             }
                         }
