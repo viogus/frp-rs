@@ -748,15 +748,22 @@ impl Service {
                         continue;
                     }
                     {
+                        // Key the socket lookup by the wire proxy name (with
+                        // {user}. prefix), matching work_conn's lookup key
+                        // (swc.proxy_name) and proxy_info_map. The previous
+                        // `p.name` (unprefixed) key missed whenever the client
+                        // has a non-empty `user` configured, leaving UDP/SUDP
+                        // work conns without their local socket.
+                        let wire_name = wire_proxy_name(&cfg_local.user, &p.name);
                         let mut map = udp_sockets.lock().await;
                         map.insert(local_addr.clone(), socket.clone());
-                        map.insert(p.name.clone(), socket);
+                        map.insert(wire_name.clone(), socket);
                     }
                     {
                         let mut cfg = udp_enc_cfg.lock().await;
                         let enc = (p.use_encryption, p.use_compression);
                         cfg.insert(local_addr.clone(), enc);
-                        cfg.insert(p.name.clone(), enc);
+                        cfg.insert(wire_proxy_name(&cfg_local.user, &p.name), enc);
                     }
                     let enc_label = if p.use_encryption {
                         "encrypted"

@@ -366,6 +366,23 @@ async fn read_start_work_conn_with_timeout(
     .map_err(std::io::Error::other)
 }
 
+/// Bind a fresh local UDP socket and connect it to `local_addr` ("ip:port").
+///
+/// Used by SUDP work conns, which must NOT share the per-proxy socket (see
+/// the SUDP branch in the work-conn dispatch): each work conn gets its own
+/// socket so return datagrams cannot be stolen by a sibling work conn's
+/// writer racing on `recv_from`.
+async fn create_udp_socket_for_local(
+    local_addr: &str,
+) -> std::io::Result<std::sync::Arc<tokio::net::UdpSocket>> {
+    let addr: std::net::SocketAddr = local_addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let socket = tokio::net::UdpSocket::bind((addr.ip(), 0)).await?;
+    socket.connect(addr).await?;
+    Ok(std::sync::Arc::new(socket))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_udp_work_conn(
     work: IoStream,
@@ -1200,17 +1217,36 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     return;
                 }
 
-                if info.proxy_type == "udp" {
-                    // UDP proxy: bridge work conn ↔ local UDP socket
-                    let sock = {
+                if info.proxy_type == "udp" || info.proxy_type == "sudp" {
+                    // UDP/SUDP proxy: bridge work conn ↔ local UDP socket
+                    // (SUDP shares the UDPPacket data plane — the server
+                    // bridges the visitor tunnel to this work conn unchanged).
+                    let sock = if info.proxy_type == "sudp" {
+                        // SUDP work conns get a DEDICATED socket instead of the
+                        // shared per-proxy one: the server may concurrently hold
+                        // several work conns for one SUDP proxy (the shared-port
+                        // model + visitor tunnels), and two writers recv_from-ing
+                        // the same socket race for return datagrams — replies
+                        // picked up by the wrong work conn are lost. One socket
+                        // per work conn mirrors Go frp's udp.Forwarder (one
+                        // DialUDP per remote, owned by the work conn).
+                        match create_udp_socket_for_local(&info.local_addr).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(label = %label, proxy_name = %proxy_name, error = %e,
+                                    "Work conn {}: SUDP proxy '{}': create local socket failed: {}",
+                                    label, proxy_name, e);
+                                return;
+                            }
+                        }
+                    } else {
                         let map = udp_sockets.lock().await;
-                        map.get(&proxy_name).cloned()
-                    };
-                    let sock = match sock {
-                        Some(s) => s,
-                        None => {
-                            warn!(label = %label, proxy_name = %proxy_name, "Work conn {}: no UDP socket for proxy '{}'", label, proxy_name);
-                            return;
+                        match map.get(&proxy_name).cloned() {
+                            Some(s) => s,
+                            None => {
+                                warn!(label = %label, proxy_name = %proxy_name, "Work conn {}: no UDP socket for proxy '{}'", label, proxy_name);
+                                return;
+                            }
                         }
                     };
                     let enc_cfg = {
