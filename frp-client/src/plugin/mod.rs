@@ -17,6 +17,10 @@ use std::net::SocketAddr;
 
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+use tracing::{info, warn};
+
+use crate::service::Service;
+use crate::util::opt_if_empty;
 
 mod context;
 #[cfg(feature = "tls")]
@@ -119,6 +123,102 @@ where
         _task: task,
         shutdown: Some(shutdown_tx),
     })
+}
+
+/// Dispatch to the correct plugin start function based on plugin_type.
+/// For `visitor_plugin`, `plugin_ctx` must be `Some`; for all other types,
+/// `plugin_ctx` is ignored.
+pub(crate) async fn dispatch_plugin_start(
+    plugin_cfg: &frp_core::config::PluginConfig,
+    plugin_ctx: Option<PluginContext>,
+) -> Result<PluginHandle, frp_core::Error> {
+    match plugin_cfg.plugin_type.as_str() {
+        "http_proxy" => start_http_proxy(plugin_cfg).await,
+        "socks5" => start_socks5_proxy(plugin_cfg).await,
+        "static_file" => start_static_file_proxy(plugin_cfg).await,
+        "unix_domain_socket" => start_unix_socket_plugin(plugin_cfg).await,
+        "tls2raw" => start_tls2raw_plugin(plugin_cfg).await,
+        "http2http" => start_http2http_plugin(plugin_cfg).await,
+        "http2https" => start_http2https_plugin(plugin_cfg).await,
+        "https2http" => start_https2http_plugin(plugin_cfg).await,
+        "https2https" => start_https2https_plugin(plugin_cfg).await,
+        "visitor_plugin" => {
+            let ctx = plugin_ctx.ok_or_else(|| {
+                frp_core::Error::Config("visitor_plugin requires PluginContext".into())
+            })?;
+            start_visitor_plugin(plugin_cfg, ctx).await
+        }
+        other => Err(frp_core::Error::Config(
+            format!("unknown plugin type: {other}").into(),
+        )),
+    }
+}
+
+impl Service {
+    /// Start a single plugin and return its handle with resolved bound address.
+    /// Used during reload to restart plugins with updated config.
+    /// Returns None if plugin_type is unknown or start fails (logged internally).
+    pub(crate) async fn start_plugin(
+        &self,
+        proxy_name: &str,
+        plugin_cfg: &frp_core::config::PluginConfig,
+    ) -> Option<PluginHandle> {
+        if plugin_cfg.plugin_type == "virtual_net" {
+            return None;
+        }
+        let result = if plugin_cfg.plugin_type == "visitor_plugin" {
+            let current_cfg = self.cfg.read().await.clone();
+            let ctx = PluginContext {
+                server_addr: current_cfg.server_addr.clone(),
+                server_port: current_cfg.server_port,
+                transport_protocol: current_cfg.transport_protocol.clone(),
+                tls_enable: current_cfg.tls_enable,
+                tls_server_name: current_cfg.tls_server_name.clone(),
+                tls_ca_file: opt_if_empty!(current_cfg.tls_ca_file),
+                use_encryption: true,
+                use_compression: false,
+                token: self.auth_cfg.token.clone(),
+                oidc_client: self.oidc_client.clone(),
+                tcp_mux: current_cfg.tcp_mux,
+                tcp_mux_keepalive_interval: current_cfg.tcp_mux_keepalive_interval,
+                proxy_url: opt_if_empty!(current_cfg.proxy_url.clone()),
+                dns_server: opt_if_empty!(current_cfg.dns_server.clone()),
+                dial_timeout_secs: current_cfg.dial_server_timeout.max(1) as u64,
+                keepalive_secs: current_cfg.dial_server_keepalive.max(0) as u64,
+                connect_bind_addr: opt_if_empty!(current_cfg.connect_server_local_ip.clone()),
+                disable_custom_tls_first_byte: current_cfg.disable_custom_tls_first_byte,
+                tls_cert_file: opt_if_empty!(current_cfg.tls_cert_file.clone()),
+                tls_key_file: opt_if_empty!(current_cfg.tls_key_file.clone()),
+                v2: current_cfg.v2,
+            };
+            dispatch_plugin_start(plugin_cfg, Some(ctx)).await
+        } else {
+            dispatch_plugin_start(plugin_cfg, None).await
+        };
+
+        match result {
+            Ok(handle) => {
+                info!(
+                    plugin_type = %plugin_cfg.plugin_type,
+                    proxy_name = %proxy_name,
+                    addr = %handle.local_addr,
+                    "{} plugin for '{}' restarted on {}",
+                    plugin_cfg.plugin_type, proxy_name, handle.local_addr
+                );
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(
+                    plugin_type = %plugin_cfg.plugin_type,
+                    proxy_name = %proxy_name,
+                    error = %e,
+                    "Failed to restart {} plugin for '{}': {}",
+                    plugin_cfg.plugin_type, proxy_name, e
+                );
+                None
+            }
+        }
+    }
 }
 
 /// Simple base64 decode (no external dep needed for this).

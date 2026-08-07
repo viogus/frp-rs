@@ -112,49 +112,20 @@ async fn advertise_vnet_visitor_route(
     }
 }
 
-/// Dispatch to the correct plugin start function based on plugin_type.
-/// For `visitor_plugin`, `plugin_ctx` must be `Some`; for all other types,
-/// `plugin_ctx` is ignored.
-async fn dispatch_plugin_start(
-    plugin_cfg: &frp_core::config::PluginConfig,
-    plugin_ctx: Option<PluginContext>,
-) -> Result<PluginHandle, frp_core::Error> {
-    match plugin_cfg.plugin_type.as_str() {
-        "http_proxy" => plugin::start_http_proxy(plugin_cfg).await,
-        "socks5" => plugin::start_socks5_proxy(plugin_cfg).await,
-        "static_file" => plugin::start_static_file_proxy(plugin_cfg).await,
-        "unix_domain_socket" => plugin::start_unix_socket_plugin(plugin_cfg).await,
-        "tls2raw" => plugin::start_tls2raw_plugin(plugin_cfg).await,
-        "http2http" => plugin::start_http2http_plugin(plugin_cfg).await,
-        "http2https" => plugin::start_http2https_plugin(plugin_cfg).await,
-        "https2http" => plugin::start_https2http_plugin(plugin_cfg).await,
-        "https2https" => plugin::start_https2https_plugin(plugin_cfg).await,
-        "visitor_plugin" => {
-            let ctx = plugin_ctx.ok_or_else(|| {
-                frp_core::Error::Config("visitor_plugin requires PluginContext".into())
-            })?;
-            plugin::start_visitor_plugin(plugin_cfg, ctx).await
-        }
-        other => Err(frp_core::Error::Config(
-            format!("unknown plugin type: {other}").into(),
-        )),
-    }
-}
-
 /// The main frpc service.
 pub struct Service {
-    cfg: Arc<RwLock<ClientConfig>>,
+    pub(crate) cfg: Arc<RwLock<ClientConfig>>,
     proxies: Arc<RwLock<Arc<Vec<frp_core::config::ProxyConfig>>>>,
     /// Optional file-backed store shared with the admin API.
     store_source: Option<Arc<StoreSource>>,
-    auth_cfg: Arc<AuthConfig>,
+    pub(crate) auth_cfg: Arc<AuthConfig>,
     encryption_key: [u8; 16],
     /// Map proxy_name -> runtime info for looking up where to connect
     proxy_info_map: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
     /// Plugin handles keyed by proxy name. Drop removes the plugin task.
     plugin_handles: Arc<std::sync::Mutex<HashMap<String, PluginHandle>>>,
     /// OIDC client for fetching access tokens (None when auth method is Token).
-    oidc_client: Option<Arc<OidcClient>>,
+    pub(crate) oidc_client: Option<Arc<OidcClient>>,
     /// Server-side auth scopes from LoginResp, used for Ping/NewWorkConn gating.
     server_auth_scopes: tokio::sync::RwLock<Vec<String>>,
     /// Per-proxy traffic metrics for admin API.
@@ -436,9 +407,9 @@ impl Service {
                         tls_key_file: opt_if_empty!(cfg.tls_key_file.clone()),
                         v2: cfg.v2,
                     };
-                    dispatch_plugin_start(plugin_cfg, Some(plugin_ctx)).await
+                    plugin::dispatch_plugin_start(plugin_cfg, Some(plugin_ctx)).await
                 } else {
-                    dispatch_plugin_start(plugin_cfg, None).await
+                    plugin::dispatch_plugin_start(plugin_cfg, None).await
                 };
                 record_plugin(
                     &plugin_cfg.plugin_type,
@@ -2710,71 +2681,6 @@ impl Service {
                 .insert(proxy.name.clone(), cidr);
         }
         Ok(())
-    }
-
-    /// Start a single plugin and return its handle with resolved bound address.
-    /// Used during reload to restart plugins with updated config.
-    /// Returns None if plugin_type is unknown or start fails (logged internally).
-    async fn start_plugin(
-        &self,
-        proxy_name: &str,
-        plugin_cfg: &frp_core::config::PluginConfig,
-    ) -> Option<PluginHandle> {
-        if plugin_cfg.plugin_type == "virtual_net" {
-            return None;
-        }
-        let result = if plugin_cfg.plugin_type == "visitor_plugin" {
-            let current_cfg = self.cfg.read().await.clone();
-            let ctx = PluginContext {
-                server_addr: current_cfg.server_addr.clone(),
-                server_port: current_cfg.server_port,
-                transport_protocol: current_cfg.transport_protocol.clone(),
-                tls_enable: current_cfg.tls_enable,
-                tls_server_name: current_cfg.tls_server_name.clone(),
-                tls_ca_file: opt_if_empty!(current_cfg.tls_ca_file),
-                use_encryption: true,
-                use_compression: false,
-                token: self.auth_cfg.token.clone(),
-                oidc_client: self.oidc_client.clone(),
-                tcp_mux: current_cfg.tcp_mux,
-                tcp_mux_keepalive_interval: current_cfg.tcp_mux_keepalive_interval,
-                proxy_url: opt_if_empty!(current_cfg.proxy_url.clone()),
-                dns_server: opt_if_empty!(current_cfg.dns_server.clone()),
-                dial_timeout_secs: current_cfg.dial_server_timeout.max(1) as u64,
-                keepalive_secs: current_cfg.dial_server_keepalive.max(0) as u64,
-                connect_bind_addr: opt_if_empty!(current_cfg.connect_server_local_ip.clone()),
-                disable_custom_tls_first_byte: current_cfg.disable_custom_tls_first_byte,
-                tls_cert_file: opt_if_empty!(current_cfg.tls_cert_file.clone()),
-                tls_key_file: opt_if_empty!(current_cfg.tls_key_file.clone()),
-                v2: current_cfg.v2,
-            };
-            dispatch_plugin_start(plugin_cfg, Some(ctx)).await
-        } else {
-            dispatch_plugin_start(plugin_cfg, None).await
-        };
-
-        match result {
-            Ok(handle) => {
-                info!(
-                    plugin_type = %plugin_cfg.plugin_type,
-                    proxy_name = %proxy_name,
-                    addr = %handle.local_addr,
-                    "{} plugin for '{}' restarted on {}",
-                    plugin_cfg.plugin_type, proxy_name, handle.local_addr
-                );
-                Some(handle)
-            }
-            Err(e) => {
-                warn!(
-                    plugin_type = %plugin_cfg.plugin_type,
-                    proxy_name = %proxy_name,
-                    error = %e,
-                    "Failed to restart {} plugin for '{}': {}",
-                    plugin_cfg.plugin_type, proxy_name, e
-                );
-                None
-            }
-        }
     }
 
     /// Reload configuration from file. Used by admin API and SIGUSR1.
