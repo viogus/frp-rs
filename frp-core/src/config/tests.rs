@@ -1,4 +1,4 @@
-use super::normalize::{normalize_client_config, normalize_server_config};
+use super::normalize::{expand_env_vars, normalize_client_config, normalize_server_config};
 use super::strict::{check_strict, levenshtein};
 use super::*;
 use crate::feature_gate::VIRTUAL_NET;
@@ -2292,6 +2292,7 @@ max_pool_count = 10
 /// TOML.
 fn load_server_config_from_yaml(yaml: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
+    expand_env_vars(&mut value);
     normalize_server_config(&mut value);
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let json_value = super::normalize::toml_to_json(value);
@@ -2308,6 +2309,7 @@ fn load_server_config_from_yaml(yaml: &str) -> Result<ServerConfig, Box<dyn std:
 /// `load_client_config_from_str` for TOML.
 fn load_client_config_from_yaml(yaml: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
+    expand_env_vars(&mut value);
     normalize_client_config(&mut value);
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
@@ -2489,7 +2491,14 @@ auth:
 #[test]
 fn test_collect_config_files_includes_yaml_and_yml() {
     let dir = tempfile::tempdir().unwrap();
-    for name in ["a.toml", "b.yaml", "c.yml", "d.json", "notes.txt", "CONFIG.YAML"] {
+    for name in [
+        "a.toml",
+        "b.yaml",
+        "c.yml",
+        "d.json",
+        "notes.txt",
+        "CONFIG.YAML",
+    ] {
         std::fs::write(dir.path().join(name), "").unwrap();
     }
     std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -2500,7 +2509,15 @@ fn test_collect_config_files_includes_yaml_and_yml() {
         .iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    for expected in ["a.toml", "b.yaml", "c.yml", "d.json", "e.yaml", "f.ini", "CONFIG.YAML"] {
+    for expected in [
+        "a.toml",
+        "b.yaml",
+        "c.yml",
+        "d.json",
+        "e.yaml",
+        "f.ini",
+        "CONFIG.YAML",
+    ] {
         assert!(
             names.contains(&expected.to_string()),
             "missing {expected}: {names:?}"
@@ -2509,5 +2526,211 @@ fn test_collect_config_files_includes_yaml_and_yml() {
     assert!(
         !names.iter().any(|n| n == "notes.txt"),
         "non-config file collected: {names:?}"
+    );
+}
+
+// ─── Env var expansion (Go frp Viper `${ENV_VAR}` parity) ───────────
+//
+// All variable names use the unique `FRP_RS_TEST_ENV_` prefix. Tests run in
+// parallel in one process, so each test touches only its own variable name.
+
+#[test]
+fn test_env_var_expansion_basic() {
+    std::env::set_var("FRP_RS_TEST_ENV_SERVER", "10.0.0.1");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "${FRP_RS_TEST_ENV_SERVER}"
+server_port = 7000
+token = "pre-${FRP_RS_TEST_ENV_SERVER}-post"
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_SERVER");
+    assert_eq!(cfg.server_addr, "10.0.0.1", "basic ${{VAR}} expansion");
+    assert_eq!(
+        cfg.token, "pre-10.0.0.1-post",
+        "multiple/embedded ${{VAR}} expansion in one string"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_undefined_becomes_empty() {
+    // Guarantee the variable is unset in this process.
+    std::env::remove_var("FRP_RS_TEST_ENV_UNSET");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+token = "x${FRP_RS_TEST_ENV_UNSET}y"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.token, "xy",
+        "undefined ${{VAR}} expands to the empty string (Go Viper parity)"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_nested_positions() {
+    std::env::set_var("FRP_RS_TEST_ENV_NESTED_IP", "192.168.1.5");
+    std::env::set_var("FRP_RS_TEST_ENV_NESTED_NAME", "env-proxy");
+    std::env::set_var("FRP_RS_TEST_ENV_NESTED_TOKEN", "secret-token");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "${FRP_RS_TEST_ENV_NESTED_TOKEN}"
+
+[[proxies]]
+name = "${FRP_RS_TEST_ENV_NESTED_NAME}"
+type = "tcp"
+local_ip = "${FRP_RS_TEST_ENV_NESTED_IP}"
+local_port = 8080
+remote_port = 7001
+
+[store]
+path = "/tmp/${FRP_RS_TEST_ENV_NESTED_NAME}.json"
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_NESTED_IP");
+    std::env::remove_var("FRP_RS_TEST_ENV_NESTED_NAME");
+    std::env::remove_var("FRP_RS_TEST_ENV_NESTED_TOKEN");
+    assert_eq!(cfg.token, "secret-token");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].name, "env-proxy");
+    assert_eq!(cfg.proxies[0].local_ip, "192.168.1.5");
+    assert_eq!(
+        cfg.store.as_ref().unwrap().path,
+        "/tmp/env-proxy.json",
+        "nested [store] table value expanded"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_double_dollar_to_literal() {
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+token = "a$$b"
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.token, "a$b", "$$ collapses to a literal $");
+}
+
+#[test]
+fn test_env_var_expansion_escaped_brace_is_literal() {
+    std::env::set_var("FRP_RS_TEST_ENV_ESCAPED", "SHOULD_NOT_APPEAR");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+token = "$${FRP_RS_TEST_ENV_ESCAPED}"
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_ESCAPED");
+    assert_eq!(
+        cfg.token, "${FRP_RS_TEST_ENV_ESCAPED}",
+        "$${{VAR}} stays a literal ${{VAR}} (escape hatch)"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_ignores_bare_dollar() {
+    std::env::set_var("FRP_RS_TEST_ENV_NOBRACE", "nope");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+token = "$FRP_RS_TEST_ENV_NOBRACE"
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_NOBRACE");
+    assert_eq!(
+        cfg.token, "$FRP_RS_TEST_ENV_NOBRACE",
+        "bare $VAR (no braces) is not expanded"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_yaml_format() {
+    std::env::set_var("FRP_RS_TEST_ENV_YAML_SERVER", "yaml-host");
+    let cfg = load_client_config_from_yaml(
+        r#"
+server_addr: ${FRP_RS_TEST_ENV_YAML_SERVER}
+server_port: 7000
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_YAML_SERVER");
+    assert_eq!(
+        cfg.server_addr, "yaml-host",
+        "env expansion applies to all formats' toml::Value output"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_in_include_file() {
+    std::env::set_var("FRP_RS_TEST_ENV_INCLUDE_TOKEN", "inc-token");
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("frps.toml");
+    std::fs::write(
+        &main_path,
+        r#"
+bind_addr = "0.0.0.0"
+bind_port = 7000
+includes = ["extra.toml"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("extra.toml"),
+        r#"
+token = "${FRP_RS_TEST_ENV_INCLUDE_TOKEN}"
+"#,
+    )
+    .unwrap();
+    let cfg = super::load_server_config(main_path.to_str().unwrap(), false).unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_INCLUDE_TOKEN");
+    assert_eq!(
+        cfg.auth.token, "inc-token",
+        "include file values are env-expanded (expansion runs after includes merge)"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_unclosed_brace_kept_verbatim() {
+    // `${` with no closing `}` stays literal (no panic, no expansion).
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "abc-${UNCLOSED"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.auth.as_ref().unwrap().token,
+        "abc-${UNCLOSED",
+        "unclosed dollar-brace kept verbatim"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_empty_name() {
+    // `${}` (empty name) expands to the empty string.
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "a${}b"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.auth.as_ref().unwrap().token,
+        "ab",
+        "${{}} expands to empty string"
     );
 }

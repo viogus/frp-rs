@@ -35,6 +35,81 @@ pub(super) fn toml_to_json(v: toml::Value) -> serde_json::Value {
     }
 }
 
+/// Expand `${ENV_VAR}` references in every string value of a `toml::Value`
+/// tree, matching Go frp's Viper-based env expansion (`os.ExpandEnv`):
+/// an undefined variable expands to the empty string.
+///
+/// Pipeline position (see `load_config_from_file`): this runs **after**
+/// `process_includes` — so values merged in from include files are expanded
+/// too — and **before** `normalize_*_config`, which renames/restructures the
+/// tree. Expanding first keeps the canonical shape and lets `ConfigPresence`
+/// and the strict key check see the expanded values.
+///
+/// Deliberately a minimal subset of shell-style expansion, mirroring the
+/// `${...}` form Go frp actually honors:
+/// - Only `${VAR}` is expanded; a bare `$VAR` is left untouched, so strings
+///   that legitimately contain `$` (passwords, shell snippets) are safe.
+/// - `${VAR:-default}` is **not** supported — Go's `os.ExpandEnv` has no
+///   shell default-value semantics, so neither do we.
+/// - `$$` expands to a literal `$` — a frp-rs extension (NOT Go
+///   `os.ExpandEnv` semantics: Go has no `$$` escape, it would expand
+///   `$${VAR}` to `$` + VAR's value). This is the escape hatch:
+///   `$${VAR}` becomes the literal text `${VAR}`.
+/// - An unclosed `${` (no closing `}`) is kept verbatim; `${}` (empty
+///   name) expands to the empty string.
+pub(super) fn expand_env_vars(value: &mut toml::Value) {
+    match value {
+        toml::Value::String(s) => *s = expand_env_vars_in_str(s),
+        toml::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                expand_env_vars(v);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_, v) in table.iter_mut() {
+                expand_env_vars(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Expand `${VAR}` / `$$` in a single string. Undefined variables become the
+/// empty string. See [`expand_env_vars`] for the exact subset.
+fn expand_env_vars_in_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('$') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        if let Some(rest_after) = after.strip_prefix('$') {
+            // `$$` → literal `$`.
+            out.push('$');
+            rest = rest_after;
+        } else if let Some(inner) = after.strip_prefix('{') {
+            // `${NAME}` → env value (empty string when unset).
+            match inner.find('}') {
+                Some(end) => {
+                    let name = &inner[..end];
+                    out.push_str(&std::env::var(name).unwrap_or_default());
+                    rest = &inner[end + 1..];
+                }
+                None => {
+                    // Unclosed `${` — keep it verbatim.
+                    out.push_str(&rest[pos..]);
+                    rest = "";
+                }
+            }
+        } else {
+            // Bare `$` not followed by `$` or `{` — keep it verbatim.
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Move matching top-level keys into a sub-table, optionally stripping known prefixes.
 /// e.g. `flatten_to_table(t, &["log_file","log_level"], "log", &["log_"])`
 fn flatten_to_table(table: &mut toml::Table, keys: &[&str], target: &str, strip_prefixes: &[&str]) {
@@ -76,6 +151,10 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
         parse_to_toml_value(&content, format).map_err(|e| format!("{path}: parse error: {e}"))?;
     let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
     process_includes(&mut value, base_dir)?;
+    // Expand `${ENV_VAR}` references here, after includes are deep-merged
+    // (so include-file values are covered) and before normalization (which
+    // renames/restructures keys). See `expand_env_vars` for the exact subset.
+    expand_env_vars(&mut value);
     normalize(&mut value);
     let presence = ConfigPresence::from_normalized_value(&value);
     if strict_config {
