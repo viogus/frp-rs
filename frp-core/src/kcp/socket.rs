@@ -297,14 +297,19 @@ impl KcpSocket {
                 recv_result = self.socket.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((n, src)) => {
-                            let data = buf[..n].to_vec();
-                            let key = Self::resolve_key(&data, src);
+                            // Borrow the receive buffer directly instead of
+                            // copying with to_vec(): every use below (resolve_key,
+                            // is_fec check, session.input) takes `data` by
+                            // reference, and this arm contains no `.await`, so
+                            // the borrow is dropped before `buf` is reused.
+                            let data: &[u8] = &buf[..n];
+                            let key = Self::resolve_key(data, src);
                             let is_fec = data.len() >= 6
                                 && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
                                     || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
                             tracing::trace!(conv = key.0, peer = %src, n, is_fec, "KCP SOCKET: recv {} bytes conv={} fec={}", n, key.0, is_fec);
                             if let Some(session) = self.sessions.get_mut(&key) {
-                                if let Err(e) = session.input(&data) {
+                                if let Err(e) = session.input(data) {
                                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");
                                 } else {
                                     // Deliver received data to the stream
@@ -332,7 +337,7 @@ impl KcpSocket {
                                 };
                                 if let Some(fk) = fec_key {
                                     if let Some(session) = self.sessions.get_mut(&fk) {
-                                        if let Err(e) = session.input(&data) {
+                                        if let Err(e) = session.input(data) {
                                             tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback input error");
                                         } else if let Err(e) = session.recv_and_push() {
                                             // Same immediate-delivery path as
@@ -375,7 +380,7 @@ impl KcpSocket {
                                     let mut session = KcpSession::new(
                                         key.0, src, self.config.clone(), read_tx,
                                     );
-                                    if let Err(e) = session.input(&data) {
+                                    if let Err(e) = session.input(data) {
                                         tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
                                         continue;
                                     }

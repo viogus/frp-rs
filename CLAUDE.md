@@ -37,6 +37,11 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
 # → frps (~7.7MB), frpc (~6.7MB)
+#   (NOTE: these baselines were measured with `lto=false, opt-level=2` — the
+#   local `.cargo/config.toml` override and CI both disable LTO for build
+#   speed. Release artifacts built from the declared profile (fat-LTO +
+#   opt-level=z, see [profile.release] in Cargo.toml) are ~10-20% smaller.
+#   Local measurements do not reflect release artifacts.)
 
 # Full (all features; dashboard is the only opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
@@ -104,7 +109,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 844 passed, 0 failed |
-| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~7.7MB/frpc ~6.7MB default; ~8.3/6.7 full; frps-tiny ~4.6MB/frpc-tiny ~4.4MB; frps-micro ~3.5MB/frpc-micro ~3.3MB — measured 2026-08-06; reqwest→hyper + otel/prometheus default-features pruning) |
+| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~7.7MB/frpc ~6.7MB default; ~8.3/6.7 full; frps-tiny ~4.6MB/frpc-tiny ~4.4MB; frps-micro ~3.5MB/frpc-micro ~3.3MB — measured 2026-08-06 with `lto=false, opt-level=2` (local `.cargo/config.toml` + CI override LTO off for build speed); declared-profile release artifacts (fat-LTO + opt-z) are ~10-20% smaller, so local/CI measurements do not reflect release artifacts; reqwest→hyper + otel/prometheus default-features pruning) |
 | `compat-test.sh` (Go frp v0.70.1) | 72 run_test scenarios + 17 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 9 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |

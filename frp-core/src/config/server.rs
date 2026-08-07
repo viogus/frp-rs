@@ -356,6 +356,13 @@ pub struct SshTunnelGatewayConfig {
     /// Empty = password auth only.
     #[serde(default, alias = "authorizedKeysFile")]
     pub authorized_keys_file: String,
+
+    /// Authenticated-session idle timeout in seconds. 0 = disabled (default,
+    /// Go frp parity — Go has no SSH idle timeout). When enabled, an
+    /// authenticated SSH session that stays idle for this long is
+    /// disconnected so it cannot hold a connection slot forever.
+    #[serde(default, alias = "sshSessionIdleTimeout")]
+    pub ssh_session_idle_timeout: u64,
 }
 
 fn default_autogen_ssh_key_path() -> String {
@@ -370,6 +377,7 @@ impl Default for SshTunnelGatewayConfig {
             private_key_file: String::new(),
             auto_gen_private_key_path: default_autogen_ssh_key_path(),
             authorized_keys_file: String::new(),
+            ssh_session_idle_timeout: 0,
         }
     }
 }

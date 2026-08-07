@@ -116,6 +116,7 @@ path is supported.
 | `private_key_file` | `string` | `""` | `sshTunnelGateway.privateKeyFile` | Path to SSH host private key file. Auto-generated if empty and `auto_gen_private_key_path` does not exist. |
 | `auto_gen_private_key_path` | `string` | `"./.autogen_ssh_key"` | `sshTunnelGateway.autoGenPrivateKeyPath` | Path where auto-generated SSH host key is written. |
 | `authorized_keys_file` | `string` | `""` | `sshTunnelGateway.authorizedKeysFile` | Path to SSH `authorized_keys` for optional public key auth. Empty = password auth only. |
+| `ssh_session_idle_timeout` | `u64` | `0` | — (frp-rs extension) | Authenticated-session idle timeout in seconds. 0 = disabled (Go frp parity). When enabled, an idle authenticated session is disconnected so it cannot hold a connection slot forever. |
 
 ### `[[http_plugins]]` Section (Array)
 

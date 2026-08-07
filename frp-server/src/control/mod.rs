@@ -195,7 +195,16 @@ async fn handle_control_inner<S>(
 
     // --- Main select loop ---
     // Cache heartbeat timeout duration (never changes during the loop).
-    let hb_timeout = Duration::from_secs(state.heartbeat_timeout as u64);
+    // Clamp non-positive values (0 = disabled, Go frp's -1) to zero: the
+    // select guard `if state.heartbeat_timeout > 0` gates the branch, but
+    // tokio::select! evaluates the branch expression (including this
+    // arithmetic) before the guard, so a raw `-1i64 as u64` here would
+    // overflow `last_ping + hb_timeout` and panic.
+    let hb_timeout = if state.heartbeat_timeout > 0 {
+        Duration::from_secs(state.heartbeat_timeout as u64)
+    } else {
+        Duration::ZERO
+    };
     loop {
         // Expire stale pending requests
         while let Some(req) = ctl.pending_requests.pop_front() {
@@ -245,6 +254,17 @@ async fn handle_control_inner<S>(
         }
 
         tokio::select! {
+            // Heartbeat watchdog: an idle control connection must not hold
+            // its conn_semaphore permit / task / fd forever. The check above
+            // only runs after select returns, so without this branch a silent
+            // client would never be disconnected. tokio::select re-evaluates
+            // the sleep target on every iteration, so last_ping updates are
+            // picked up automatically.
+            _ = tokio::time::sleep_until(ctl.last_ping + hb_timeout), if state.heartbeat_timeout > 0 => {
+                warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
+                break;
+            }
+
             // Keep selection fair: an always-ready internal queue must not
             // starve control reads (including heartbeat pings) or shutdown.
             internal = internal_rx.recv() => {

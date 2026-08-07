@@ -263,10 +263,13 @@ impl KcpSession {
                     let n = self.pending_shards.len();
                     let mut shard_refs: Vec<&[u8]> = Vec::with_capacity(n);
                     shard_refs.extend(self.pending_shards.iter().map(Vec::as_slice));
-                    let all_shards = fec.encode(&shard_refs[..n]);
+                    // Compute only parity shards — data shard wire packets were
+                    // already emitted above, so the data-shard copies that
+                    // `encode` would produce are discarded immediately.
+                    let parity_shards = fec.encode_parity(&shard_refs[..n]);
 
-                    // Output parity shards (skip data shards, already sent).
-                    for parity in &all_shards[self.config.data_shards..] {
+                    // Output parity shards (data shards already sent).
+                    for parity in &parity_shards {
                         let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
                         packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
                         packet.extend_from_slice(&TYPE_PARITY.to_le_bytes());

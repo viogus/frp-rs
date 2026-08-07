@@ -187,6 +187,26 @@ async fn verify_login_auth(
         });
         if let Err(e) = login_auth {
             warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
+            // Rate-limit failed logins per IP (Go frp LoginThrottle parity).
+            // Only failures consume a slot — successful logins are not counted.
+            let throttled = match peer {
+                Some(addr) => !state.check_login_throttle(addr).await,
+                None => false, // no peer address → cannot throttle
+            };
+            if throttled {
+                warn!(peer = ?peer, "Login throttled for {:?} (too many failed attempts)", peer);
+                send_login_error(
+                    stream,
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        "login throttled: too many failed attempts".to_string(),
+                        "login throttled",
+                    ),
+                    v2,
+                )
+                .await;
+                return Err(());
+            }
             // Emit WebSocket event for dashboard subscribers
             #[cfg(feature = "dashboard")]
             {

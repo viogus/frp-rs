@@ -194,6 +194,32 @@ impl Fec {
         output
     }
 
+    /// Compute only the parity shards for `input` (which must have exactly
+    /// `data_shards` rows, each `block_size` bytes). Unlike [`encode`], the data
+    /// shards are not copied — callers that only need the FEC parity rows (the
+    /// KCP send path) avoid one full copy + N allocations per batch.
+    pub fn encode_parity(&self, input: &[&[u8]]) -> Vec<Vec<u8>> {
+        assert_eq!(
+            input.len(),
+            self.data_shards,
+            "input must equal data_shards"
+        );
+        let block_size = input[0].len();
+        let mut parity_shards = Vec::with_capacity(self.parity_shards);
+        for i in 0..self.parity_shards {
+            let mut parity = vec![0u8; block_size];
+            for (byte_idx, parity_byte) in parity.iter_mut().enumerate() {
+                let mut sum = 0u8;
+                for (data_idx, inp) in input.iter().enumerate() {
+                    sum ^= gf256::mul(self.encode_matrix[i][data_idx], inp[byte_idx]);
+                }
+                *parity_byte = sum;
+            }
+            parity_shards.push(parity);
+        }
+        parity_shards
+    }
+
     /// Decode: reconstruct missing shards from available ones.
     ///
     /// `shards`: `total_shards` entries, Some(data) if present, None if missing.
