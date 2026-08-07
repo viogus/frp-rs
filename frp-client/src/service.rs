@@ -66,10 +66,6 @@ use crate::work_conn::XtcpNotification;
 /// Go frp v0.70.1 visitor plugin type for virtual-net host routes.
 const VISITOR_PLUGIN_VIRTUAL_NET: &str = "virtual_net";
 
-fn heartbeat_requires_auth(client_scopes: &[String], server_scopes: &[String]) -> bool {
-    crate::work_conn::scope_requires_auth(client_scopes, server_scopes, "HeartBeats")
-}
-
 /// Build a VnetRouteAdvertise for a `virtual_net` visitor, advertising its
 /// destinationIP as a host route through the frp vnet routing path.
 ///
@@ -114,16 +110,6 @@ async fn advertise_vnet_visitor_route(
             info!(visitor_name = %v.name, "vnet route advertised for visitor '{}'", v.name);
         }
     }
-}
-
-fn reconnect_delay_after_session(
-    consecutive_err_count: &mut u32,
-    fast_retry_timestamps: &mut Vec<Instant>,
-) -> Duration {
-    *consecutive_err_count += 1;
-    fast_retry_timestamps.push(Instant::now());
-    let window_count = Service::prune_fast_retry_count(fast_retry_timestamps);
-    Service::fast_backoff_delay(*consecutive_err_count, window_count)
 }
 
 /// Dispatch to the correct plugin start function based on plugin_type.
@@ -580,85 +566,6 @@ impl Service {
         })
     }
 
-    /// Count errors in the 60s fast-retry sliding window, pruning expired timestamps.
-    /// Matches Go frp dev FastBackoffManager.FastRetryWindow = time.Minute.
-    fn prune_fast_retry_count(timestamps: &mut Vec<Instant>) -> u32 {
-        let now = Instant::now();
-        let cutoff = now - Duration::from_secs(60);
-        timestamps.retain(|ts| *ts >= cutoff);
-        timestamps.len() as u32
-    }
-
-    /// Compute reconnect delay with the Go frp dev two-phase fast-backoff.
-    /// Phase 1 (first 3 retries within 60s window): 200ms base × full jitter
-    /// (0.5-1.5), no cap.
-    /// Phase 2 (after that): 1s base, 2x factor, full jitter (0.5-1.5), cap 20s.
-    ///
-    /// Matches Go frp dev wait.FastBackoffManager:
-    ///   FastBackoffOptions{
-    ///       Duration:        time.Second,
-    ///       Factor:          2,
-    ///       Jitter:          0.1,
-    ///       MaxDuration:     20 * time.Second,
-    ///       FastRetryCount:  3,
-    ///       FastRetryDelay:  200 * time.Millisecond,
-    ///       FastRetryJitter: 0.5,
-    ///       FastRetryWindow: time.Minute,
-    ///   }
-    ///
-    /// # Architectural Note (Fix 10)
-    /// Go frp uses a **nested** backoff architecture: `loopLoginUntilSuccess` contains
-    /// its own `BackoffUntil` with a basic exponential (Duration=1s, Factor=2, MaxDuration=10s/20s),
-    /// while `keepControllerWorking` wraps it in an outer `BackoffUntil` with the full
-    /// two-phase FastBackoffManager. This means:
-    ///   - Initial login: inner loop retries forever with 10s cap.
-    ///   - Reconnection: outer loop adds fast-retry (200ms) and exponential (20s cap) BETWEEN
-    ///     inner-loop invocations, while each inner-loop invocation itself has exponential backoff.
-    ///
-    /// Rust's implementation uses a **combined** approach: a single reconnection loop with
-    /// the full two-phase backoff applied to each reconnect attempt. This is functionally
-    /// equivalent because Go's inner loop (loopLoginUntilSuccess) guarantees it returns
-    /// only on success, and the outer loop provides the error-aware backoff between retries.
-    fn fast_backoff_delay(
-        consecutive_err_count: u32,
-        counts_in_fast_retry_window: u32,
-    ) -> Duration {
-        let mut rng = rand::thread_rng();
-
-        // Phase 1: fast retries
-        if counts_in_fast_retry_window <= 3 {
-            // Full jitter: 200ms × random(0.5, 1.5) → 100-300ms (mean 200ms).
-            // Multiplicative jitter de-synchronizes clients restarting
-            // together: additive jitter confined everyone to a 100ms-wide
-            // window that re-clustered on every restart (thundering herd).
-            let ms = 200.0 * rng.gen_range(0.5..=1.5);
-            return Duration::from_millis(ms as u64);
-        }
-
-        // Phase 2: exponential backoff
-        // Go frp: InitDurationIfFail(1s) * Factor(2) → 2s on first error, then compounds.
-        // Matches Go frp dev wait.FastBackoffImpl.Backoff():
-        //   consecutiveErrCount=1 → InitDurationIfFail(1s) * Factor(2) = 2s + jitter
-        //   consecutiveErrCount=2 → previousDuration(2s) * Factor(2) = 4s + jitter
-        //   etc.
-        let mut duration_ms = 1000u64; // InitDurationIfFail = 1 second base
-        for _ in 0..consecutive_err_count {
-            duration_ms = duration_ms.saturating_mul(2);
-            if duration_ms >= 20_000 {
-                duration_ms = 20_000;
-                break;
-            }
-        }
-        // Full jitter: base × random(0.5, 1.5), capped at 20s. The phase-1
-        // mean dropped slightly (250ms → 200ms) but the order of magnitude
-        // and phase structure are unchanged; the spread replaces the old
-        // ±10% additive band — at the 20s cap clients no longer all fire
-        // within the same 20-22s window.
-        let duration_ms = ((duration_ms as f64 * rng.gen_range(0.5..=1.5)) as u64).min(20_000);
-
-        Duration::from_millis(duration_ms)
-    }
-
     /// Request a config reload. Safe to call from signal handler.
     /// Returns immediately; actual reload happens asynchronously in run().
     /// Logs a warning if the reload channel is full or closed — the reload
@@ -856,8 +763,9 @@ impl Service {
                     let delay = if did_login_once {
                         // Session reconnect: full fast-backoff with Phase 1 (200ms) + Phase 2 (exponential).
                         fast_retry_timestamps.push(Instant::now());
-                        let window_count = Self::prune_fast_retry_count(&mut fast_retry_timestamps);
-                        Self::fast_backoff_delay(consecutive_err_count, window_count)
+                        let window_count =
+                            crate::backoff::prune_fast_retry_count(&mut fast_retry_timestamps);
+                        crate::backoff::fast_backoff_delay(consecutive_err_count, window_count)
                     } else {
                         // Initial login: pure exponential, no fast retry phase.
                         // Matches Go frp's loopLoginUntilSuccess (FastBackoffOptions
@@ -1826,7 +1734,10 @@ impl Service {
                         // (pkg/auth/token.go:44-51); Go has no
                         // serverAdditionalAuthScopes field in LoginResp, so the
                         // server side of this union is ignored by Go peers.
-                        let send_auth = heartbeat_requires_auth(&client_scopes, &server_scopes);
+                        let send_auth = crate::backoff::heartbeat_requires_auth(
+                            &client_scopes,
+                            &server_scopes,
+                        );
                         if send_auth {
                             if let Some(ref oidc) = self.oidc_client {
                                 if let Err(e) = oidc.set_ping(&mut ping_msg).await {
@@ -2154,7 +2065,7 @@ impl Service {
 
             // Session dropped — reconnect with Go frp dev two-phase fast-backoff.
             // login_fail_exit only applies to initial login, not session drops.
-            let delay = reconnect_delay_after_session(
+            let delay = crate::backoff::reconnect_delay_after_session(
                 &mut consecutive_err_count,
                 &mut fast_retry_timestamps,
             );
@@ -3775,10 +3686,10 @@ mod tests {
         let heartbeat = vec!["HeartBeats".to_string()];
         let unrelated = vec!["NewWorkConns".to_string()];
 
-        assert!(heartbeat_requires_auth(&heartbeat, &[]));
-        assert!(heartbeat_requires_auth(&[], &heartbeat));
-        assert!(!heartbeat_requires_auth(&unrelated, &[]));
-        assert!(!heartbeat_requires_auth(&[], &unrelated));
+        assert!(crate::backoff::heartbeat_requires_auth(&heartbeat, &[]));
+        assert!(crate::backoff::heartbeat_requires_auth(&[], &heartbeat));
+        assert!(!crate::backoff::heartbeat_requires_auth(&unrelated, &[]));
+        assert!(!crate::backoff::heartbeat_requires_auth(&[], &unrelated));
     }
 
     #[cfg(feature = "vnet")]
@@ -3857,7 +3768,7 @@ mod tests {
         let mut errors = 0;
         let mut retries = Vec::new();
         let fast_delays = (0..3)
-            .map(|_| reconnect_delay_after_session(&mut errors, &mut retries))
+            .map(|_| crate::backoff::reconnect_delay_after_session(&mut errors, &mut retries))
             .collect::<Vec<_>>();
         // Phase 1 stays sub-second (100-300ms).
         assert!(fast_delays
@@ -3865,7 +3776,7 @@ mod tests {
             .all(|delay| *delay < Duration::from_secs(1)));
         fn mean_level(consecutive: u32, window: u32) -> f64 {
             (0..200)
-                .map(|_| Service::fast_backoff_delay(consecutive, window).as_millis() as f64)
+                .map(|_| crate::backoff::fast_backoff_delay(consecutive, window).as_millis() as f64)
                 .sum::<f64>()
                 / 200.0
         }
@@ -3881,7 +3792,7 @@ mod tests {
         // 200ms × full jitter (0.5-1.5) → 100ms-300ms.
         for i in 1..=3u32 {
             for _ in 0..100 {
-                let delay = Service::fast_backoff_delay(i, i);
+                let delay = crate::backoff::fast_backoff_delay(i, i);
                 let ms = delay.as_millis();
                 assert!(ms >= 100, "delay {ms}ms too low for fast retry {i}");
                 assert!(ms <= 300, "delay {ms}ms too high for fast retry {i}");
@@ -3895,7 +3806,7 @@ mod tests {
         // Go frp: InitDurationIfFail(1s) * Factor(2) = 2s × full jitter (0.5-1.5)
         // -> 1000-3000ms
         for _ in 0..100 {
-            let delay = Service::fast_backoff_delay(1, 4);
+            let delay = crate::backoff::fast_backoff_delay(1, 4);
             let ms = delay.as_millis();
             assert!(ms >= 1000, "delay {ms}ms below 1s for phase2 first");
             assert!(ms <= 3000, "delay {ms}ms above 3s for phase2 first");
@@ -3907,7 +3818,7 @@ mod tests {
         // consecutive_err_count=4, counts_in_fast_retry_window=5 -> 1s*2^4=16s
         // × full jitter (0.5-1.5) -> 8000-24000ms, capped at 20000ms
         for _ in 0..100 {
-            let delay = Service::fast_backoff_delay(4, 5);
+            let delay = crate::backoff::fast_backoff_delay(4, 5);
             let ms = delay.as_millis();
             assert!(ms >= 8000, "delay {ms}ms below 8s for err=4");
             assert!(ms <= 20000, "delay {ms}ms above 20s cap for err=4");
@@ -3919,7 +3830,7 @@ mod tests {
         // High consecutive_err_count caps the base at 20s; full jitter then
         // spreads it to 10-20s (never above the cap).
         for _ in 0..100 {
-            let delay = Service::fast_backoff_delay(20, 20);
+            let delay = crate::backoff::fast_backoff_delay(20, 20);
             let ms = delay.as_millis();
             assert!(ms >= 10000, "delay {ms}ms below 10s at the 20s cap");
             assert!(ms <= 20000, "delay {ms}ms above 20s cap");
@@ -3931,7 +3842,7 @@ mod tests {
         // Mean delay should increase with consecutive_err_count
         fn mean_delay(consecutive: u32, window: u32) -> f64 {
             (0..50)
-                .map(|_| Service::fast_backoff_delay(consecutive, window).as_millis() as f64)
+                .map(|_| crate::backoff::fast_backoff_delay(consecutive, window).as_millis() as f64)
                 .sum::<f64>()
                 / 50.0
         }

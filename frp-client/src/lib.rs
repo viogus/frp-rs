@@ -3,6 +3,7 @@
 
 #[cfg(feature = "admin")]
 pub mod admin;
+pub mod backoff;
 pub mod control;
 pub mod health;
 pub mod plugin;
