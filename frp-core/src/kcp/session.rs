@@ -118,11 +118,12 @@ pub struct KcpSession {
     /// window 0, never ACKing) cannot make the send queue grow without bound.
     /// Reconciliated after every send/input/update/force_flush (single-threaded
     /// driver, so store is safe); on crossing the threshold downward, waiters
-    /// blocked in poll_write are woken via `snd_notify`.
+    /// blocked in poll_write are woken via `snd_notify` (notify_one).
     snd_backlog: Arc<AtomicUsize>,
     /// Woken by reconcile_snd_backlog when snd_backlog drains below
-    /// KCP_SND_BACKLOG_THRESHOLD. Shares the KcpStream::backpressure_fut slot
-    /// with the write-channel backlog Notify.
+    /// KCP_SND_BACKLOG_THRESHOLD, and by mark_dead when the session is
+    /// removed. Shares the KcpStream::backpressure_fut slot with the
+    /// write-channel backlog Notify.
     snd_notify: Arc<Notify>,
     /// Reusable output packet Vec. Pre-allocated with PACKET_POOL_CAPACITY,
     /// cleared and filled each update/force_flush call to avoid per-call allocation.
@@ -198,14 +199,23 @@ impl KcpSession {
     /// Refresh the shared send-queue backlog counter from `Kcp::wait_snd()`.
     /// Called after every operation that can change `snd_buf`/`snd_queue`
     /// (send adds, input ACKs remove; flush just moves between the two).
-    /// Notifies a blocked poll_write only on the over→under crossing so the
-    /// Notify does not store a spurious permit that would busy-loop poll_write
-    /// while the queue stays full.
+    /// Notifies a blocked poll_write only on the over→under crossing. Uses
+    /// `notify_one()` rather than `notify_waiters()` to close the lost-wakeup
+    /// race: poll_write may load `snd_backlog >= threshold`, then the driver
+    /// crosses below the threshold and notifies before poll_write registers
+    /// its waiter via `notified_owned()` — `notify_waiters()` does not store a
+    /// permit, so that notification is lost and the writer stays parked even
+    /// though the queue has drained. `notify_one()` stores a permit when no
+    /// waiter is registered, which the just-registered waiter consumes
+    /// immediately. There is no busy-loop risk: we only notify on the crossing
+    /// (at which point the queue is already under the threshold, so a stored
+    /// permit merely makes poll_write re-check the gate once and proceed);
+    /// while the queue stays full there is no crossing and no notification.
     fn reconcile_snd_backlog(&mut self) {
         let len = self.kcp.wait_snd();
         let prev = self.snd_backlog.swap(len, Ordering::Relaxed);
         if prev >= KCP_SND_BACKLOG_THRESHOLD && len < KCP_SND_BACKLOG_THRESHOLD {
-            self.snd_notify.notify_waiters();
+            self.snd_notify.notify_one();
         }
     }
 
@@ -602,8 +612,13 @@ impl KcpSession {
     pub fn mark_dead(&self) {
         self.alive.store(false, Ordering::Release);
         // Wake any poll_write task blocked on send-queue backpressure so it
-        // observes the dead session (poll_write checks alive first).
-        self.snd_notify.notify_waiters();
+        // observes the dead session (poll_write checks alive first). Uses
+        // notify_one(): after the session is dead there will never be another
+        // over→under crossing to trigger a wakeup, so a lost notification
+        // would leave a just-registered waiter parked forever. notify_one()
+        // stores a permit when no waiter is registered yet, guaranteeing the
+        // wakeup arrives once the waiter registers.
+        self.snd_notify.notify_one();
     }
 
     /// Mark session for shutdown. Driver will remove it on next tick.

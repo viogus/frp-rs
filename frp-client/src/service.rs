@@ -1926,10 +1926,20 @@ impl Service {
                     }
 
                     // A NatHoleResp never arrived within the timeout window:
-                    // drop the pending provider-side entry (socket already removed).
+                    // reclaim the pending provider-side entry (socket already
+                    // removed) and any residual visitor-side sender. `cleanup_sid`
+                    // carries either a provider sid or a visitor txn_id; the two
+                    // maps are independent, so removing from both is always safe.
                     Some(cleanup_sid) = xtcp_cleanup_rx.recv() => {
                         if pending_xtcp.remove(&cleanup_sid).is_some() {
                             debug!(sid = %cleanup_sid, "XTCP: reclaimed stale NatHoleClient entry for '{}'", cleanup_sid);
+                        }
+                        if let Some(tx) = visitor_pending.remove(&cleanup_sid) {
+                            // Usually a no-op (the visitor already timed out at
+                            // 15s and dropped the receiver), but covers the
+                            // window where the visitor has not timed out yet.
+                            let _ = tx.send(Err("NatHoleResp timeout: server did not respond".into()));
+                            debug!(sid = %cleanup_sid, "XTCP: reclaimed stale visitor NatHoleResp entry for '{}'", cleanup_sid);
                         }
                     }
 
@@ -1942,7 +1952,28 @@ impl Service {
                         match write_msg(&mut *writer.lock().await, &nhv, v2).await {
                             Ok(()) => {
                                 debug!(sid = %txn_id, "Visitor: sent NatHoleVisitor on control, sid={}", txn_id);
-                                visitor_pending.insert(txn_id, vreq.reply);
+                                visitor_pending.insert(txn_id.clone(), vreq.reply);
+                                // Defensive cleanup: if the server never sends a
+                                // NatHoleResp for this txn, the visitor_pending
+                                // entry would otherwise sit until control-loop
+                                // teardown. Reclaim it after 20s. Why 20s: the
+                                // visitor side gives up after its own 15s timeout
+                                // (visitor.rs), so by the time we run the
+                                // receiver is already dropped and the entry is
+                                // only reclaimed after the visitor stopped
+                                // waiting — we never preempt a slow-but-valid
+                                // response. The server's NAT session window is
+                                // 10s plus network latency, well under 20s. If
+                                // NatHoleResp arrives in time,
+                                // handle_nat_hole_resp already removed the entry
+                                // and this is a no-op.
+                                let cleanup_tx = xtcp_cleanup_tx.clone();
+                                let cleanup_key = txn_id.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_secs(20)).await;
+                                    // Channel closed (control loop exited) — ignore.
+                                    let _ = cleanup_tx.send(cleanup_key).await;
+                                });
                             }
                             Err(e) => {
                                 warn!(error = %e, "Visitor: failed to send NatHoleVisitor on control: {}", e);
