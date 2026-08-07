@@ -41,13 +41,9 @@ async fn handshake_v2(
     // V2 over yamux (default tcp_mux=true): yamux wraps the TCP stream BEFORE
     // the handshake, matching Go frp / frp-rs flow, then V2 magic is written
     // on the yamux control stream.
-    let tcp_stream = match raw_stream {
-        IoStream::Tcp(s) => s,
-        other => panic!(
-            "expected IoStream::Tcp after V2 dial, got {:?}",
-            std::mem::discriminant(&other)
-        ),
-    };
+    let tcp_stream = raw_stream
+        .into_tcp()
+        .expect("expected IoStream::Tcp after V2 dial");
     let (control_yamux, yamux_session) = mux::client_mux(tcp_stream, &mux::TcpMuxConfig::default())
         .await
         .expect("yamux client init");

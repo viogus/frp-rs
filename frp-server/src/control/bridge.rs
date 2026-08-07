@@ -230,7 +230,7 @@ async fn run_udp_work_conn(
     // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
     // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
     // frames in flight without flush.
-    let no_flush = matches!(work_conn, IoStream::Tcp(_));
+    let no_flush = work_conn.try_tcp().is_some();
     let (w_r, mut w_w) = match split_work_conn_halves(work_conn) {
         Ok(pair) => pair,
         Err(msg) => {
@@ -459,37 +459,42 @@ async fn relay_plain_fast_inner(
     work_conn: IoStream,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
-    // Use a two-arm match so Rust knows the arms are exclusive —
-    // the Tcp arm consumes the streams, the other arm binds new mutable
-    // variables for the copy_bidirectional fallthrough.
-    match (user_conn, work_conn) {
-        (IoStream::Tcp(user), IoStream::Tcp(work)) => {
-            match frp_core::splice::bridge_splice(user, work).await {
-                Ok((a, b)) => {
-                    metrics.record_traffic(a, b);
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "splice bridge closed: {}", e);
-                }
+    // Two-arm dispatch so the Tcp arm consumes the streams while the other
+    // arm binds new mutable variables for the copy_bidirectional fallthrough.
+    // try_tcp() (borrow check) then into_tcp() (owned) — no await between,
+    // so the transport cannot change.
+    if user_conn.try_tcp().is_some() && work_conn.try_tcp().is_some() {
+        let user = user_conn
+            .into_tcp()
+            .expect("try_tcp confirmed raw TCP above");
+        let work = work_conn
+            .into_tcp()
+            .expect("try_tcp confirmed raw TCP above");
+        match frp_core::splice::bridge_splice(user, work).await {
+            Ok((a, b)) => {
+                metrics.record_traffic(a, b);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "splice bridge closed: {}", e);
             }
         }
-        (mut user_conn, mut work_conn) => {
-            // Sized buffers so FRP_BRIDGE_BUF_KB governs the plain path too
-            // (copy_bidirectional would otherwise use tokio's 8 KiB default).
-            match tokio::io::copy_bidirectional_with_sizes(
-                &mut user_conn,
-                &mut work_conn,
-                *BUFFER_SIZE,
-                *BUFFER_SIZE,
-            )
-            .await
-            {
-                Ok((a, b)) => {
-                    metrics.record_traffic(a, b);
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "plain fast-path bridge closed: {}", e);
-                }
+    } else {
+        let (mut user_conn, mut work_conn) = (user_conn, work_conn);
+        // Sized buffers so FRP_BRIDGE_BUF_KB governs the plain path too
+        // (copy_bidirectional would otherwise use tokio's 8 KiB default).
+        match tokio::io::copy_bidirectional_with_sizes(
+            &mut user_conn,
+            &mut work_conn,
+            *BUFFER_SIZE,
+            *BUFFER_SIZE,
+        )
+        .await
+        {
+            Ok((a, b)) => {
+                metrics.record_traffic(a, b);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "plain fast-path bridge closed: {}", e);
             }
         }
     }
@@ -802,14 +807,12 @@ pub(crate) async fn assign_work_to_proxy(
     v2: bool,
 ) {
     // Extract peer address from user connection for PROXY protocol support
-    let (src_addr, src_port) = match &req.user_conn {
-        IoStream::Tcp(s) => s
-            .peer_addr()
-            .map(|a| (a.ip().to_string(), a.port() as i32))
-            .ok(),
-        _ => None,
-    }
-    .map_or((String::new(), 0), |(ip, port)| (ip, port));
+    let (src_addr, src_port) = req
+        .user_conn
+        .try_tcp()
+        .and_then(|s| s.peer_addr().ok())
+        .map(|a| (a.ip().to_string(), a.port() as i32))
+        .map_or((String::new(), 0), |(ip, port)| (ip, port));
 
     // Proxy metadata is carried in the request (fetched once by the
     // dispatcher). When the snapshot is None — the STCP/XTCP

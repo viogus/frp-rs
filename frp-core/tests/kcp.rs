@@ -64,7 +64,7 @@ async fn test_kcp_dial_send_recv() {
 #[cfg(feature = "tls")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_kcp_tls_round_trip() {
-    use frp_core::transport::{dial_server, DialOptions, IoStream};
+    use frp_core::transport::{dial_server, DialOptions};
     use tokio::io::AsyncReadExt;
 
     // dial_server uses default_kcp_client_config (FEC 10,3); the listener
@@ -121,16 +121,14 @@ async fn test_kcp_tls_round_trip() {
         .await
         .expect("dial timeout")
         .expect("dial_server");
-    match io {
-        IoStream::Tls(mut tls_io, _peer) => {
-            use tokio::io::AsyncWriteExt;
-            tls_io
-                .write_all(b"hello over kcp+tls")
-                .await
-                .expect("tls write");
-            tls_io.flush().await.expect("tls flush");
-        }
-        _other => panic!("expected IoStream::Tls for KCP+TLS, got variant"),
+    let mut tls_io = io.into_tls().expect("expected IoStream::Tls for KCP+TLS");
+    {
+        use tokio::io::AsyncWriteExt;
+        tls_io
+            .write_all(b"hello over kcp+tls")
+            .await
+            .expect("tls write");
+        tls_io.flush().await.expect("tls flush");
     }
 
     server_handle.await.expect("server task");

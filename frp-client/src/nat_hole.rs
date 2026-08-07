@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg;
-use frp_core::transport::WriteHalf;
+use frp_core::transport::BoxedWriteHalf;
 
 use crate::service::Service;
 
@@ -30,7 +30,7 @@ impl Service {
     pub(crate) async fn handle_nat_hole_client(
         &self,
         nhc: msg::NatHoleClient,
-        writer: &Arc<Mutex<WriteHalf>>,
+        writer: &Arc<Mutex<BoxedWriteHalf>>,
         v2: bool,
     ) {
         debug!(proxy_name = %nhc.proxy_name, "Received NatHoleClient for proxy '{}'", nhc.proxy_name);
@@ -201,7 +201,7 @@ impl Service {
     /// Build and send a NatHoleReport for `sid`; log at debug on failure.
     /// `reason` labels the failure context in the log line.
     pub(crate) async fn send_nat_hole_report(
-        writer: &Arc<Mutex<WriteHalf>>,
+        writer: &Arc<Mutex<BoxedWriteHalf>>,
         v2: bool,
         sid: String,
         success: bool,
@@ -231,7 +231,7 @@ impl Service {
                 std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
             >,
         >,
-        writer: &Arc<Mutex<WriteHalf>>,
+        writer: &Arc<Mutex<BoxedWriteHalf>>,
     ) {
         // Route to waiting visitor first (Go frps compat path).
         let txn_id = resp.transaction_id.clone();

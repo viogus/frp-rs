@@ -73,7 +73,7 @@ impl VnetController {
     pub async fn run(
         &self,
         mut tun: Box<dyn TunDevice>,
-        ctl_writer: Arc<tokio::sync::Mutex<frp_core::transport::WriteHalf>>,
+        ctl_writer: Arc<tokio::sync::Mutex<frp_core::transport::BoxedWriteHalf>>,
         mut tun_packet_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let mtu = tun.mtu() as usize;
@@ -515,7 +515,7 @@ mod tests {
             Box::new(tokio::io::duplex(4096).0);
         let (_, ctl_w) = tokio::io::split(ctl_stream);
         let writer = Arc::new(tokio::sync::Mutex::new(
-            frp_core::transport::WriteHalf::SshChannel(ctl_w),
+            Box::new(ctl_w) as frp_core::transport::BoxedWriteHalf
         ));
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let ctrl = VnetController::new(
@@ -560,7 +560,7 @@ mod tests {
             Box::new(tokio::io::duplex(4096).0);
         let (_, ctl_w) = tokio::io::split(ctl_stream);
         let writer = Arc::new(tokio::sync::Mutex::new(
-            frp_core::transport::WriteHalf::SshChannel(ctl_w),
+            Box::new(ctl_w) as frp_core::transport::BoxedWriteHalf
         ));
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let ctrl = VnetController::new(
@@ -604,7 +604,7 @@ mod tests {
         let (mut ctl_peer, _) = tokio::io::split(ctl_peer_stream);
         let (_, ctl_w) = tokio::io::split(ctl_writer_stream);
         let writer = Arc::new(tokio::sync::Mutex::new(
-            frp_core::transport::WriteHalf::SshChannel(ctl_w),
+            Box::new(ctl_w) as frp_core::transport::BoxedWriteHalf
         ));
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let ctrl = VnetController::new(

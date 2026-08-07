@@ -212,10 +212,12 @@ async fn run_virtual_net_tunnel_io(
             return;
         }
     };
+    // into_split already returns boxed halves — only the encrypted branch
+    // re-boxes (the CipherReader wrapper).
     let server_r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if use_encryption {
         Box::new(frp_core::cipher_stream::CipherReader::new(server_r, key))
     } else {
-        Box::new(server_r)
+        server_r
     };
     let mut packet_reader = crate::work_conn::TunnelPacketReader::new(server_r, use_compression);
     let mut packet_writer = if use_encryption {

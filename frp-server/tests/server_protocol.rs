@@ -8,7 +8,7 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use common::{
     allocate_port, login_with_test_token, raw_login_resp, start_test_server, test_auth_cfg,
 };
-use frp_core::transport::{dial_server, DialOptions, IoStream, TransportProtocol};
+use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
 use frp_server::service::Service;
 use std::path::PathBuf;
 
@@ -587,10 +587,7 @@ async fn test_login_via_websocket() {
     let mut io = dial_server(&opts).await.expect("WS dial");
 
     // Verify we got a WebSocket stream
-    match &io {
-        IoStream::WebSocket(_) => {} // expected
-        other => panic!("expected IoStream::WebSocket, got: {:?}", other),
-    }
+    assert_eq!(io.debug_name(), "IoStream::WebSocket");
 
     // Send login
     let ts = std::time::SystemTime::now()
@@ -661,10 +658,7 @@ async fn test_login_via_tls() {
     let mut io = dial_server(&opts).await.expect("TLS dial");
 
     // Verify we got a TLS stream
-    match &io {
-        IoStream::Tls(..) => {} // expected
-        other => panic!("expected IoStream::Tls, got: {:?}", other),
-    }
+    assert_eq!(io.debug_name(), "IoStream::Tls");
 
     // Send login
     let ts = std::time::SystemTime::now()

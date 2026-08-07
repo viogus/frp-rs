@@ -55,38 +55,16 @@ pub(crate) async fn wrap_client_mux(
         keepalive_interval: Duration::from_secs(keepalive_interval.max(1) as u64),
         max_stream_window_size: 6 * 1024 * 1024,
     };
-    match raw_stream {
-        IoStream::Tcp(tcp_stream) => {
-            let (control_stream, session) = mux::client_mux(tcp_stream, &mux_cfg).await?;
-            info!("Yamux session established");
-            Ok((IoStream::Yamux(control_stream), Some(session)))
-        }
-        #[cfg(feature = "kcp")]
-        IoStream::Kcp(kcp_stream) => {
-            let (control_stream, session) = mux::client_mux(kcp_stream, &mux_cfg).await?;
-            info!("Yamux session established over KCP");
-            Ok((IoStream::Yamux(control_stream), Some(session)))
-        }
-        #[cfg(feature = "tls")]
-        IoStream::Tls(tls_stream, _) => {
-            let (control_stream, session) = mux::client_mux(tls_stream, &mux_cfg).await?;
-            info!("Yamux session established over TLS");
-            Ok((IoStream::Yamux(control_stream), Some(session)))
-        }
-        #[cfg(feature = "websocket")]
-        IoStream::WebSocket(ws_stream) => {
-            let (control_stream, session) = mux::client_mux(ws_stream, &mux_cfg).await?;
-            info!("Yamux session established over WebSocket");
-            Ok((IoStream::Yamux(control_stream), Some(session)))
-        }
-        other => {
-            warn!(
-                transport = ?std::mem::discriminant(&other),
-                "Unexpected transport {:?} for mux proposal — yamux not applied",
-                std::mem::discriminant(&other)
-            );
-            Ok((other, None))
-        }
+    // Go frp v0.70.1 wraps every non-QUIC transport in yamux; QUIC never
+    // gets wrapped (the QUIC connection itself multiplexes streams).
+    let transport_name = raw_stream.debug_name();
+    if raw_stream.is_yamux_wrappable() {
+        let (control_stream, session) = mux::client_mux(raw_stream.into_boxed(), &mux_cfg).await?;
+        info!(transport = %transport_name, "Yamux session established over {}", transport_name);
+        Ok((IoStream::Yamux(control_stream), Some(session)))
+    } else {
+        warn!(transport = %transport_name, "Unexpected transport for mux proposal — yamux not applied");
+        Ok((raw_stream, None))
     }
 }
 

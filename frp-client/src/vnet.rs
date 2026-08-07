@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg;
-use frp_core::transport::{IoStream, WriteHalf};
+use frp_core::transport::{BoxedWriteHalf, IoStream};
 
 use crate::service::{Service, VISITOR_PLUGIN_VIRTUAL_NET};
 
@@ -229,7 +229,7 @@ pub(crate) async fn spawn_vnet_tun_controller(
     vnet_controller: &Arc<frp_vnet::controller::ClientVnetController>,
     proxy_name: &str,
     vnet: &str,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &Arc<Mutex<BoxedWriteHalf>>,
     v2: bool,
 ) -> Option<()> {
     let tun = {
@@ -271,7 +271,7 @@ pub(crate) async fn spawn_vnet_tun_controller(
 
 /// Send a VnetRouteAdvertise for a `type = vnet` proxy that owns a subnet.
 pub(crate) async fn send_vnet_route_advertise(
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &Arc<Mutex<BoxedWriteHalf>>,
     v2: bool,
     p: &frp_core::config::ProxyConfig,
 ) {
@@ -310,7 +310,7 @@ pub(crate) async fn remove_vnet_tun(
     vnet_tun_subnets: &Arc<Mutex<HashMap<String, String>>>,
     route_table: &Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
     vnet_peer_routes: &Arc<Mutex<HashMap<String, VnetPeerRoute>>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &Arc<Mutex<BoxedWriteHalf>>,
     v2: bool,
     proxy_name: &str,
     vnet: &str,

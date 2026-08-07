@@ -1,5 +1,4 @@
 use std::io;
-#[allow(unused_imports)] // unused in the micro (no-feature) build
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
@@ -27,6 +26,8 @@ use tokio_rustls::TlsAcceptor;
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
+use crate::cipher_stream::CipherStream;
+use crate::crypto::AeadStream;
 use crate::mux::YamuxStream;
 
 #[cfg(feature = "tls")]
@@ -101,7 +102,6 @@ impl std::str::FromStr for TransportProtocol {
 
 // ---------------------------------------------------------------
 // WsByteStream — WebSocket-to-byte-stream adapter
-// Defined BEFORE IoStream so IoStream can hold it as a variant.
 // ---------------------------------------------------------------
 
 /// A WebSocket-to-byte-stream adapter that implements AsyncRead/AsyncWrite.
@@ -881,11 +881,11 @@ impl AsyncWrite for WsByteStream {
 }
 
 // ---------------------------------------------------------------
-// IoStream — unified stream type over TCP, TLS, KCP, WebSocket
+// IoStream — unified transport over TCP, TLS, KCP, WebSocket, ...
 // ---------------------------------------------------------------
 
 /// Helper trait bundling AsyncRead + AsyncWrite + Unpin + Send for
-/// use as a dyn-compatible trait object in IoStream::Tls.
+/// use as a dyn-compatible trait object (Tls/SshChannel erasure).
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
@@ -939,784 +939,764 @@ impl AsyncWrite for PrependStream {
     }
 }
 
-/// Unified stream type for TCP, TLS, KCP, and WebSocket.
-/// WebSocket variant wraps a WsByteStream adapter so all variants
-/// transparently support AsyncRead/AsyncWrite and V1 frame I/O.
-pub enum IoStream {
-    Tcp(TcpStream),
-    /// Boxed TLS stream — type-erased to accept any TLS-wrapped transport
-    /// (e.g. TlsStream<TcpStream> or TlsStream<PreReadStream<TcpStream>>).
-    /// Stores the peer `SocketAddr` alongside the stream so `peer_addr()`
-    /// can return it — unlike the boxed trait object which has no such method.
-    #[cfg(feature = "tls")]
-    Tls(Box<dyn AsyncReadWrite>, SocketAddr),
-    #[cfg(feature = "kcp")]
-    Kcp(KcpStream),
-    #[cfg(feature = "quic")]
-    Quic(QuicStream),
-    #[cfg(feature = "websocket")]
-    WebSocket(WsByteStream),
-    Yamux(YamuxStream),
-    /// AES-128-CFB encrypted control stream.
-    /// Created after login by wrapping the inner IoStream.
-    Cipher(Box<crate::cipher_stream::CipherStream<IoStream>>),
-    /// AEAD encrypted V2 control stream (AES-256-GCM or XChaCha20-Poly1305).
-    /// Created after V2 handshake with crypto negotiation.
-    Aead(Box<crate::crypto::AeadStream>),
-    /// SSH reverse-forward channel (type-erased).
-    SshChannel(Box<dyn AsyncReadWrite>),
-    /// Pre-read bytes followed by a TCP stream.
-    /// Used after connection type detection when bytes have been consumed
-    /// but need to be replayed (e.g., V1 type byte in non-V2 connections).
-    PreRead(Vec<u8>, TcpStream),
-    /// Buffered bytes followed by an inner IoStream.
-    /// Used when V2 magic is detected on a yamux stream: if the bytes
-    /// are NOT V2 magic, they're buffered and replayed for V1 processing.
-    /// The usize tracks the current read position into the buffer.
-    BufferedRead(Vec<u8>, usize, Box<IoStream>),
-}
-
 // -----------------------------------------------------------------
-// ReadHalf / WriteHalf — static-dispatch halves of IoStream::into_split()
+// Transport trait — type-erased transport abstraction
 // -----------------------------------------------------------------
 
-/// Read half of an [`IoStream`] after [`IoStream::into_split`].
+/// Type-erased read half of a split [`IoStream`].
+pub type BoxedReadHalf = Box<dyn AsyncRead + Unpin + Send>;
+/// Type-erased write half of a split [`IoStream`].
+pub type BoxedWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// Common trait for every transport layer: raw TCP, TLS, KCP, QUIC,
+/// WebSocket, yamux, the AES-128-CFB and AEAD cipher streams, SSH reverse
+/// channels, and the PreRead/BufferedRead byte-replay wrappers.
 ///
-/// Each variant wraps the corresponding split-half for its inner stream
-/// type. Enum dispatch replaces the old `Box<dyn AsyncRead>` — zero heap
-/// allocation, match-based static dispatch instead of vtable.
-pub enum ReadHalf {
-    Tcp(tokio::io::ReadHalf<tokio::net::TcpStream>),
+/// [`IoStream`] is a type-erased `Box<dyn Transport>`: each implementor is
+/// one of the old enum variants, and the consuming methods (`into_encrypted`,
+/// `into_split`, `into_tcp`, `into_parts`) replace the per-variant match
+/// dispatch.
+pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    /// Variant name for logging / Debug, e.g. `"IoStream::Tcp"`.
+    fn debug_name(&self) -> &'static str;
+
+    /// Get the peer address of this stream, if available.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+
+    /// Return a reference to the underlying `TcpStream` if this transport is
+    /// raw TCP. Useful for zero-copy fast paths (e.g. `splice(2)`) that only
+    /// work with raw kernel TCP sockets.
+    fn try_tcp(&self) -> Option<&TcpStream> {
+        None
+    }
+
+    /// Mutable variant of [`Transport::try_tcp`].
+    fn try_tcp_mut(&mut self) -> Option<&mut TcpStream> {
+        None
+    }
+
+    /// Consume and return the underlying `TcpStream` if this transport is raw
+    /// TCP. Owned counterpart of [`Transport::try_tcp`] — lets the splice(2)
+    /// fast path take ownership of both sockets.
+    fn into_tcp(self: Box<Self>) -> Option<TcpStream> {
+        None
+    }
+
+    /// Consume and return the yamux stream if this is a yamux transport.
+    fn into_yamux(self: Box<Self>) -> Option<YamuxStream> {
+        None
+    }
+
+    /// Wrap this transport in AES-128-CFB encryption for control messages.
+    /// Must be called after login (the Login message is NOT encrypted).
+    ///
+    /// The default wraps in [`CipherStream`]; [`AeadStream`] (already
+    /// AEAD-encrypted) and the BufferedRead wrapper override it. `Self` may be
+    /// unsized (trait object), so the wrap operates on the box.
+    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> Box<dyn Transport> {
+        Box::new(CipherStream::new(self, key))
+    }
+
+    /// Split the transport into owned boxed read and write halves.
+    ///
+    /// The default uses `tokio::io::split`; QUIC overrides with quinn's native
+    /// stream halves. The byte-replay wrappers error when unconsumed buffered
+    /// bytes remain (mirroring the old `IoStream::into_split` semantics).
+    fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
+        let (r, w) = tokio::io::split(self);
+        Ok((Box::new(r), Box::new(w)))
+    }
+
+    /// Peel the PreRead byte-replay layer: returns the buffered bytes (minus
+    /// any already consumed) and the inner transport. Only
+    /// [`PreReadTransport`] overrides this; everything else returns `None`.
+    fn into_parts(self: Box<Self>) -> Option<(Vec<u8>, Box<dyn Transport>)> {
+        None
+    }
+
+    /// Whether Go frp would wrap this transport in yamux (every non-QUIC
+    /// transport). QUIC never gets yamux-wrapped — the QUIC connection itself
+    /// multiplexes streams.
+    fn is_yamux_wrappable(&self) -> bool {
+        true
+    }
+
+    /// Reason this transport must not be split for bridging, if any.
+    /// Encrypted control streams (`Cipher`/`Aead`) are never bridgeable —
+    /// splitting them would produce a broken double-encrypted bridge.
+    fn bridge_split_err(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Consume and return the TLS wrapper if this is a TLS transport.
     #[cfg(feature = "tls")]
-    Tls(tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>),
-    #[cfg(feature = "kcp")]
-    Kcp(tokio::io::ReadHalf<crate::kcp::KcpStream>),
-    #[cfg(feature = "quic")]
-    Quic(quinn::RecvStream),
-    #[cfg(feature = "websocket")]
-    WebSocket(tokio::io::ReadHalf<WsByteStream>),
-    Yamux(tokio::io::ReadHalf<YamuxStream>),
-    Cipher(tokio::io::ReadHalf<Box<crate::cipher_stream::CipherStream<IoStream>>>),
-    Aead(tokio::io::ReadHalf<Box<crate::crypto::AeadStream>>),
-    SshChannel(tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>),
-}
-
-impl ReadHalf {
-    // NOTE: into_boxed() removed after PR #161. Use `From` impl below for
-    // cold-path conversions (NAT hole session storage, auth).
-}
-
-impl From<ReadHalf> for Box<dyn tokio::io::AsyncRead + Unpin + Send> {
-    fn from(r: ReadHalf) -> Self {
-        match r {
-            ReadHalf::Tcp(r) => Box::new(r),
-            #[cfg(feature = "tls")]
-            ReadHalf::Tls(r) => Box::new(r),
-            #[cfg(feature = "kcp")]
-            ReadHalf::Kcp(r) => Box::new(r),
-            #[cfg(feature = "quic")]
-            ReadHalf::Quic(r) => Box::new(r),
-            #[cfg(feature = "websocket")]
-            ReadHalf::WebSocket(r) => Box::new(r),
-            ReadHalf::Yamux(r) => Box::new(r),
-            ReadHalf::Cipher(r) => Box::new(r),
-            ReadHalf::Aead(r) => Box::new(r),
-            ReadHalf::SshChannel(r) => Box::new(r),
-        }
+    fn into_tls(self: Box<Self>) -> Option<TlsTransport> {
+        None
     }
 }
 
-/// Write half of an [`IoStream`] after [`IoStream::into_split`].
-pub enum WriteHalf {
-    Tcp(tokio::io::WriteHalf<tokio::net::TcpStream>),
-    #[cfg(feature = "tls")]
-    Tls(tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>),
-    #[cfg(feature = "kcp")]
-    Kcp(tokio::io::WriteHalf<crate::kcp::KcpStream>),
-    #[cfg(feature = "quic")]
-    Quic(quinn::SendStream),
-    #[cfg(feature = "websocket")]
-    WebSocket(tokio::io::WriteHalf<WsByteStream>),
-    Yamux(tokio::io::WriteHalf<YamuxStream>),
-    Cipher(tokio::io::WriteHalf<Box<crate::cipher_stream::CipherStream<IoStream>>>),
-    Aead(tokio::io::WriteHalf<Box<crate::crypto::AeadStream>>),
-    SshChannel(tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>),
-}
-
-impl WriteHalf {
-    // NOTE: into_boxed() removed after PR #161. Use `From` impl below for
-    // cold-path conversions (NAT hole session storage).
-}
-
-impl From<WriteHalf> for Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
-    fn from(w: WriteHalf) -> Self {
-        match w {
-            WriteHalf::Tcp(w) => Box::new(w),
-            #[cfg(feature = "tls")]
-            WriteHalf::Tls(w) => Box::new(w),
-            #[cfg(feature = "kcp")]
-            WriteHalf::Kcp(w) => Box::new(w),
-            #[cfg(feature = "quic")]
-            WriteHalf::Quic(w) => Box::new(w),
-            #[cfg(feature = "websocket")]
-            WriteHalf::WebSocket(w) => Box::new(w),
-            WriteHalf::Yamux(w) => Box::new(w),
-            WriteHalf::Cipher(w) => Box::new(w),
-            WriteHalf::Aead(w) => Box::new(w),
-            WriteHalf::SshChannel(w) => Box::new(w),
-        }
-    }
-}
-
-impl std::fmt::Debug for ReadHalf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadHalf::Tcp(_) => f.debug_struct("ReadHalf::Tcp").finish_non_exhaustive(),
-            #[cfg(feature = "tls")]
-            ReadHalf::Tls(_) => f.debug_struct("ReadHalf::Tls").finish_non_exhaustive(),
-            #[cfg(feature = "kcp")]
-            ReadHalf::Kcp(_) => f.debug_struct("ReadHalf::Kcp").finish_non_exhaustive(),
-            #[cfg(feature = "quic")]
-            ReadHalf::Quic(_) => f.debug_struct("ReadHalf::Quic").finish_non_exhaustive(),
-            #[cfg(feature = "websocket")]
-            ReadHalf::WebSocket(_) => f
-                .debug_struct("ReadHalf::WebSocket")
-                .finish_non_exhaustive(),
-            ReadHalf::Yamux(_) => f.debug_struct("ReadHalf::Yamux").finish_non_exhaustive(),
-            ReadHalf::Cipher(_) => f.debug_struct("ReadHalf::Cipher").finish_non_exhaustive(),
-            ReadHalf::Aead(_) => f.debug_struct("ReadHalf::Aead").finish_non_exhaustive(),
-            ReadHalf::SshChannel(_) => f
-                .debug_struct("ReadHalf::SshChannel")
-                .finish_non_exhaustive(),
-        }
-    }
-}
-
-impl std::fmt::Debug for WriteHalf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WriteHalf::Tcp(_) => f.debug_struct("WriteHalf::Tcp").finish_non_exhaustive(),
-            #[cfg(feature = "tls")]
-            WriteHalf::Tls(_) => f.debug_struct("WriteHalf::Tls").finish_non_exhaustive(),
-            #[cfg(feature = "kcp")]
-            WriteHalf::Kcp(_) => f.debug_struct("WriteHalf::Kcp").finish_non_exhaustive(),
-            #[cfg(feature = "quic")]
-            WriteHalf::Quic(_) => f.debug_struct("WriteHalf::Quic").finish_non_exhaustive(),
-            #[cfg(feature = "websocket")]
-            WriteHalf::WebSocket(_) => f
-                .debug_struct("WriteHalf::WebSocket")
-                .finish_non_exhaustive(),
-            WriteHalf::Yamux(_) => f.debug_struct("WriteHalf::Yamux").finish_non_exhaustive(),
-            WriteHalf::Cipher(_) => f.debug_struct("WriteHalf::Cipher").finish_non_exhaustive(),
-            WriteHalf::Aead(_) => f.debug_struct("WriteHalf::Aead").finish_non_exhaustive(),
-            WriteHalf::SshChannel(_) => f
-                .debug_struct("WriteHalf::SshChannel")
-                .finish_non_exhaustive(),
-        }
-    }
-}
-
-impl tokio::io::AsyncRead for ReadHalf {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match &mut *self {
-            ReadHalf::Tcp(r) => Pin::new(r).poll_read(cx, buf),
-            #[cfg(feature = "tls")]
-            ReadHalf::Tls(r) => Pin::new(r).poll_read(cx, buf),
-            #[cfg(feature = "kcp")]
-            ReadHalf::Kcp(r) => Pin::new(r).poll_read(cx, buf),
-            #[cfg(feature = "quic")]
-            ReadHalf::Quic(r) => Pin::new(r).poll_read(cx, buf),
-            #[cfg(feature = "websocket")]
-            ReadHalf::WebSocket(r) => Pin::new(r).poll_read(cx, buf),
-            ReadHalf::Yamux(r) => Pin::new(r).poll_read(cx, buf),
-            ReadHalf::Cipher(r) => Pin::new(r).poll_read(cx, buf),
-            ReadHalf::Aead(r) => Pin::new(r).poll_read(cx, buf),
-            ReadHalf::SshChannel(r) => Pin::new(r).poll_read(cx, buf),
-        }
-    }
-}
-
-impl tokio::io::AsyncWrite for WriteHalf {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match &mut *self {
-            WriteHalf::Tcp(w) => Pin::new(w).poll_write(cx, buf),
-            #[cfg(feature = "tls")]
-            WriteHalf::Tls(w) => Pin::new(w).poll_write(cx, buf),
-            #[cfg(feature = "kcp")]
-            WriteHalf::Kcp(w) => Pin::new(w).poll_write(cx, buf),
-            #[cfg(feature = "quic")]
-            WriteHalf::Quic(w) => Pin::new(w)
-                .poll_write(cx, buf)
-                .map_err(std::io::Error::other),
-            #[cfg(feature = "websocket")]
-            WriteHalf::WebSocket(w) => Pin::new(w).poll_write(cx, buf),
-            WriteHalf::Yamux(w) => Pin::new(w).poll_write(cx, buf),
-            WriteHalf::Cipher(w) => Pin::new(w).poll_write(cx, buf),
-            WriteHalf::Aead(w) => Pin::new(w).poll_write(cx, buf),
-            WriteHalf::SshChannel(w) => Pin::new(w).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match &mut *self {
-            WriteHalf::Tcp(w) => Pin::new(w).poll_flush(cx),
-            #[cfg(feature = "tls")]
-            WriteHalf::Tls(w) => Pin::new(w).poll_flush(cx),
-            #[cfg(feature = "kcp")]
-            WriteHalf::Kcp(w) => Pin::new(w).poll_flush(cx),
-            #[cfg(feature = "quic")]
-            WriteHalf::Quic(w) => Pin::new(w).poll_flush(cx).map_err(std::io::Error::other),
-            #[cfg(feature = "websocket")]
-            WriteHalf::WebSocket(w) => Pin::new(w).poll_flush(cx),
-            WriteHalf::Yamux(w) => Pin::new(w).poll_flush(cx),
-            WriteHalf::Cipher(w) => Pin::new(w).poll_flush(cx),
-            WriteHalf::Aead(w) => Pin::new(w).poll_flush(cx),
-            WriteHalf::SshChannel(w) => Pin::new(w).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match &mut *self {
-            WriteHalf::Tcp(w) => Pin::new(w).poll_shutdown(cx),
-            #[cfg(feature = "tls")]
-            WriteHalf::Tls(w) => Pin::new(w).poll_shutdown(cx),
-            #[cfg(feature = "kcp")]
-            WriteHalf::Kcp(w) => Pin::new(w).poll_shutdown(cx),
-            #[cfg(feature = "quic")]
-            WriteHalf::Quic(w) => Pin::new(w).poll_shutdown(cx),
-            #[cfg(feature = "websocket")]
-            WriteHalf::WebSocket(w) => Pin::new(w).poll_shutdown(cx),
-            WriteHalf::Yamux(w) => Pin::new(w).poll_shutdown(cx),
-            WriteHalf::Cipher(w) => Pin::new(w).poll_shutdown(cx),
-            WriteHalf::Aead(w) => Pin::new(w).poll_shutdown(cx),
-            WriteHalf::SshChannel(w) => Pin::new(w).poll_shutdown(cx),
-        }
-    }
-}
-
-impl std::fmt::Debug for IoStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
-            #[cfg(feature = "tls")]
-            IoStream::Tls(..) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
-            #[cfg(feature = "quic")]
-            IoStream::Quic(_) => f.debug_struct("IoStream::Quic").finish_non_exhaustive(),
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(_) => f
-                .debug_struct("IoStream::WebSocket")
-                .finish_non_exhaustive(),
-            IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
-            IoStream::Cipher(_) => f.debug_struct("IoStream::Cipher").finish_non_exhaustive(),
-            IoStream::Aead(_) => f.debug_struct("IoStream::Aead").finish_non_exhaustive(),
-            IoStream::SshChannel(_) => f
-                .debug_struct("IoStream::SshChannel")
-                .finish_non_exhaustive(),
-            IoStream::PreRead(..) => f.debug_struct("IoStream::PreRead").finish_non_exhaustive(),
-            IoStream::BufferedRead(..) => f
-                .debug_struct("IoStream::BufferedRead")
-                .finish_non_exhaustive(),
-        }
-    }
-}
-
-// All inner types (TcpStream, TlsStream, DuplexStream, WsByteStream) are Unpin.
-impl tokio::io::AsyncRead for IoStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        // BufferedRead: replay buffered bytes first, then delegate to inner IoStream.
-        if let IoStream::BufferedRead(buffered_data, pos, inner) = this {
-            if *pos < buffered_data.len() {
-                let remaining = &buffered_data[*pos..];
-                let n = remaining.len().min(buf.remaining());
-                buf.put_slice(&remaining[..n]);
-                *pos += n;
-                return Poll::Ready(Ok(()));
-            }
-            return Pin::new(inner.as_mut()).poll_read(cx, buf);
-        }
-        // PreRead: replay buffered bytes first, then delegate to inner TcpStream.
-        if let IoStream::PreRead(pre_read, tcp) = this {
-            if !pre_read.is_empty() {
-                let n = pre_read.len().min(buf.remaining());
-                buf.put_slice(&pre_read[..n]);
-                pre_read.drain(..n);
-                return Poll::Ready(Ok(()));
-            }
-            return Pin::new(tcp).poll_read(cx, buf);
-        }
-        match this {
-            IoStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => Pin::new(s).poll_read(cx, buf),
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => Pin::new(s).poll_read(cx, buf),
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => Pin::new(s).poll_read(cx, buf),
-            IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
-            IoStream::Cipher(s) => Pin::new(s).poll_read(cx, buf),
-            IoStream::Aead(s) => Pin::new(s).poll_read(cx, buf),
-            IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
-            IoStream::PreRead(_, _) | IoStream::BufferedRead(..) => {
-                // PreRead/BufferedRead are ephemeral — they only exist to carry
-                // pre-consumed bytes after detect_and_strip_magic. By the time
-                // poll_read is called they should have been unwrapped.
-                Poll::Ready(Err(io::Error::other(
-                    "IoStream::PreRead/BufferedRead is ephemeral — stream was not unwrapped before use",
-                )))
-            }
-        }
-    }
-}
-
-// Shared by poll_flush/poll_shutdown — dispatch over 11 IoStream variants.
-macro_rules! io_stream_dispatch_poll {
-    ($self:expr, $cx:expr, $method:ident) => {
-        match $self.get_mut() {
-            IoStream::Tcp(s) => Pin::new(s).$method($cx),
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => Pin::new(s).$method($cx),
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => Pin::new(s).$method($cx),
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => Pin::new(s).$method($cx),
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => Pin::new(s).$method($cx),
-            IoStream::Yamux(s) => Pin::new(s).$method($cx),
-            IoStream::Cipher(s) => Pin::new(s).$method($cx),
-            IoStream::Aead(s) => Pin::new(s).$method($cx),
-            IoStream::SshChannel(s) => Pin::new(s.as_mut()).$method($cx),
-            IoStream::PreRead(_, s) => Pin::new(s).$method($cx),
-            IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).$method($cx),
-        }
-    };
-}
-
-impl tokio::io::AsyncWrite for IoStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            IoStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => Pin::new(s).poll_write(cx, buf),
-            IoStream::Yamux(s) => Pin::new(s).poll_write(cx, buf),
-            IoStream::Cipher(s) => Pin::new(s).poll_write(cx, buf),
-            IoStream::Aead(s) => Pin::new(s).poll_write(cx, buf),
-            IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
-            IoStream::PreRead(_, s) => Pin::new(s).poll_write(cx, buf),
-            IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        io_stream_dispatch_poll!(self, cx, poll_flush)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        io_stream_dispatch_poll!(self, cx, poll_shutdown)
-    }
-}
+/// Unified transport type for TCP, TLS, KCP, QUIC, WebSocket, yamux, the
+/// AES-128-CFB / AEAD cipher streams, SSH channels, and the PreRead /
+/// BufferedRead byte-replay wrappers.
+///
+/// A type-erased `Box<dyn Transport>`: each old `IoStream` enum variant is now
+/// a [`Transport`] implementor, and the consuming methods (`into_encrypted`,
+/// `into_split`, `into_tcp`, `into_parts`) replace the per-variant match
+/// dispatch. Constructors are named after the old variants so construction
+/// sites read identically.
+pub struct IoStream(Box<dyn Transport>);
 
 impl IoStream {
+    // ---------------------------------------------------------------
+    // Constructors — named after the old enum variants
+    // ---------------------------------------------------------------
+
+    /// Raw TCP stream.
+    #[allow(non_snake_case)]
+    pub fn Tcp(stream: TcpStream) -> Self {
+        Self(Box::new(stream))
+    }
+
+    /// TLS-wrapped stream — type-erased to accept any TLS-wrapped transport
+    /// (e.g. TlsStream<TcpStream> or TlsStream<PreReadStream<..>>). Stores
+    /// the peer `SocketAddr` alongside the stream so `peer_addr()` can return
+    /// it — unlike the boxed trait object which has no such method.
+    #[cfg(feature = "tls")]
+    #[allow(non_snake_case)]
+    pub fn Tls(stream: Box<dyn AsyncReadWrite>, peer_addr: SocketAddr) -> Self {
+        Self(Box::new(TlsTransport::new(stream, peer_addr)))
+    }
+
+    /// KCP stream.
+    #[cfg(feature = "kcp")]
+    #[allow(non_snake_case)]
+    pub fn Kcp(stream: KcpStream) -> Self {
+        Self(Box::new(stream))
+    }
+
+    /// QUIC stream.
+    #[cfg(feature = "quic")]
+    #[allow(non_snake_case)]
+    pub fn Quic(stream: QuicStream) -> Self {
+        Self(Box::new(stream))
+    }
+
+    /// WebSocket stream (WsByteStream adapter).
+    #[cfg(feature = "websocket")]
+    #[allow(non_snake_case)]
+    pub fn WebSocket(ws: WsByteStream) -> Self {
+        Self(Box::new(ws))
+    }
+
+    /// Yamux stream.
+    #[allow(non_snake_case)]
+    pub fn Yamux(stream: YamuxStream) -> Self {
+        Self(Box::new(stream))
+    }
+
+    /// AEAD encrypted V2 control stream (AES-256-GCM or XChaCha20-Poly1305).
+    /// Created after V2 handshake with crypto negotiation.
+    #[allow(non_snake_case)]
+    pub fn Aead(inner: Box<AeadStream>) -> Self {
+        Self(Box::new(*inner))
+    }
+
+    /// SSH reverse-forward channel (type-erased).
+    #[allow(non_snake_case)]
+    pub fn SshChannel(inner: Box<dyn AsyncReadWrite>) -> Self {
+        Self(Box::new(SshChannelTransport(inner)))
+    }
+
+    /// Pre-read bytes followed by an inner transport.
+    /// Used after connection type detection when bytes have been consumed
+    /// but need to be replayed (e.g., V1 type byte in non-V2 connections).
+    #[allow(non_snake_case)]
+    pub fn PreRead(bytes: Vec<u8>, inner: Box<dyn Transport>) -> Self {
+        Self(Box::new(PreReadTransport::new(bytes, inner)))
+    }
+
+    /// Buffered bytes followed by an inner transport.
+    /// Used when V2 magic is detected on a yamux stream: if the bytes are NOT
+    /// V2 magic, they're buffered and replayed for V1 processing. The usize
+    /// tracks the current read position into the buffer.
+    #[allow(non_snake_case)]
+    pub fn BufferedRead(buf: Vec<u8>, pos: usize, inner: Box<dyn Transport>) -> Self {
+        Self(Box::new(BufferedReadTransport::new(buf, pos, inner)))
+    }
+
+    /// Consume and return the inner boxed transport.
+    pub fn into_boxed(self) -> Box<dyn Transport> {
+        self.0
+    }
+
+    // ---------------------------------------------------------------
+    // Delegated methods (one level of indirection over the trait object)
+    // ---------------------------------------------------------------
+
+    /// Variant name for logging / Debug, e.g. `"IoStream::Tcp"`.
+    pub fn debug_name(&self) -> &'static str {
+        self.0.debug_name()
+    }
+
     /// Write a V1 protocol frame to this stream.
     pub async fn write_v1_frame(
         &mut self,
         msg: &crate::msg::FrpMessage,
     ) -> Result<(), crate::Error> {
-        match self {
-            IoStream::Tcp(s) => crate::protocol::write_msg_v1(s, msg).await,
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => crate::protocol::write_msg_v1(s, msg).await,
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => crate::protocol::write_msg_v1(s, msg).await,
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => crate::protocol::write_msg_v1(s, msg).await,
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => crate::protocol::write_msg_v1(s, msg).await,
-            IoStream::Yamux(s) => crate::protocol::write_msg_v1(s, msg).await,
-            IoStream::Cipher(s) => crate::protocol::write_msg_v1(s, msg).await,
-            IoStream::Aead(s) => crate::protocol::write_msg_v1(s, msg).await,
-            IoStream::SshChannel(s) => crate::protocol::write_msg_v1(s, msg).await,
-            IoStream::PreRead(_, s) => crate::protocol::write_msg_v1(s, msg).await,
-            IoStream::BufferedRead(_, _, inner) => {
-                crate::protocol::write_msg_v1(inner.as_mut(), msg).await
-            }
-        }
+        crate::protocol::write_msg_v1(&mut self.0, msg).await
     }
 
     /// Read a V1 protocol frame from this stream.
     pub async fn read_v1_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
-        match self {
-            IoStream::Tcp(s) => crate::protocol::read_msg_v1(s).await,
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => crate::protocol::read_msg_v1(s).await,
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => crate::protocol::read_msg_v1(s).await,
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => crate::protocol::read_msg_v1(s).await,
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => crate::protocol::read_msg_v1(s).await,
-            IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
-            IoStream::Cipher(s) => crate::protocol::read_msg_v1(s).await,
-            IoStream::Aead(s) => crate::protocol::read_msg_v1(s).await,
-            IoStream::SshChannel(s) => crate::protocol::read_msg_v1(s).await,
-            IoStream::PreRead(..) => crate::protocol::read_msg_v1(self).await,
-            IoStream::BufferedRead(..) => crate::protocol::read_msg_v1(self).await,
-        }
+        crate::protocol::read_msg_v1(&mut self.0).await
     }
 
-    /// Write a V2 protocol frame (binary framing + JSON payload) to this stream.
+    /// Write a V2 protocol frame (binary framing + JSON payload) to this
+    /// stream.
     pub async fn write_v2_frame(
         &mut self,
         msg: &crate::msg::FrpMessage,
     ) -> Result<(), crate::Error> {
         use tokio::io::AsyncWriteExt;
-        match self {
-            IoStream::Tcp(s) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            IoStream::Yamux(s) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            IoStream::Cipher(s) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            IoStream::Aead(s) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            IoStream::SshChannel(s) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            IoStream::PreRead(_, s) => {
-                crate::protocol::write_msg_v2_inner(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-            IoStream::BufferedRead(_, _, inner) => {
-                crate::protocol::write_msg_v2_inner(inner.as_mut(), msg).await?;
-                inner
-                    .flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
-            }
-        }
-        Ok(())
+        crate::protocol::write_msg_v2_inner(&mut self.0, msg).await?;
+        self.0
+            .flush()
+            .await
+            .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))
     }
 
-    /// Read a V2 protocol frame (binary framing + JSON payload) from this stream.
+    /// Read a V2 protocol frame (binary framing + JSON payload) from this
+    /// stream.
     pub async fn read_v2_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
-        match self {
-            IoStream::Tcp(s) => crate::protocol::read_msg_v2(s).await,
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => crate::protocol::read_msg_v2(s).await,
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => crate::protocol::read_msg_v2(s).await,
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => crate::protocol::read_msg_v2(s).await,
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => crate::protocol::read_msg_v2(s).await,
-            IoStream::Yamux(s) => crate::protocol::read_msg_v2(s).await,
-            IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
-            IoStream::Aead(s) => crate::protocol::read_msg_v2(s).await,
-            IoStream::SshChannel(s) => crate::protocol::read_msg_v2(s).await,
-            IoStream::PreRead(..) => crate::protocol::read_msg_v2(self).await,
-            IoStream::BufferedRead(..) => crate::protocol::read_msg_v2(self).await,
-        }
+        crate::protocol::read_msg_v2(&mut self.0).await
     }
 
     /// Write a raw V2 frame (for handshake frames like ClientHello/ServerHello).
-    /// Lower-level than write_v2_frame — caller controls frame_type and raw payload bytes.
+    /// Lower-level than write_v2_frame — caller controls frame_type and raw
+    /// payload bytes.
     pub async fn write_raw_v2_frame(
         &mut self,
         frame_type: u16,
         flags: u16,
         payload: &[u8],
     ) -> Result<(), crate::Error> {
-        match self {
-            IoStream::Tcp(s) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            IoStream::Yamux(s) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            IoStream::Cipher(s) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            IoStream::Aead(s) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            IoStream::SshChannel(s) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            IoStream::PreRead(_, s) => {
-                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
-            }
-            IoStream::BufferedRead(_, _, inner) => {
-                crate::protocol::write_v2_frame_raw(inner.as_mut(), frame_type, flags, payload)
-                    .await
-            }
-        }
+        crate::protocol::write_v2_frame_raw(&mut self.0, frame_type, flags, payload).await
     }
 
-    /// Read a raw V2 frame (for handshake). Returns (frame_type, flags, payload_bytes).
+    /// Read a raw V2 frame (for handshake). Returns (frame_type, flags,
+    /// payload_bytes).
     pub async fn read_raw_v2_frame(&mut self) -> Result<(u16, u16, Vec<u8>), crate::Error> {
-        match self {
-            IoStream::Tcp(s) => crate::protocol::read_v2_frame_raw(s).await,
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => crate::protocol::read_v2_frame_raw(s).await,
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => crate::protocol::read_v2_frame_raw(s).await,
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => crate::protocol::read_v2_frame_raw(s).await,
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => crate::protocol::read_v2_frame_raw(s).await,
-            IoStream::Yamux(s) => crate::protocol::read_v2_frame_raw(s).await,
-            IoStream::Cipher(s) => crate::protocol::read_v2_frame_raw(s).await,
-            IoStream::Aead(s) => crate::protocol::read_v2_frame_raw(s).await,
-            IoStream::SshChannel(s) => crate::protocol::read_v2_frame_raw(s).await,
-            IoStream::PreRead(..) => crate::protocol::read_v2_frame_raw(self).await,
-            IoStream::BufferedRead(..) => crate::protocol::read_v2_frame_raw(self).await,
-        }
+        crate::protocol::read_v2_frame_raw(&mut self.0).await
     }
 
     /// Get the peer address of this stream, if available.
-    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        match self {
-            IoStream::Tcp(s) => s.peer_addr().ok(),
-            IoStream::PreRead(_, s) => s.peer_addr().ok(),
-            IoStream::BufferedRead(_, _, inner) => inner.peer_addr(),
-            #[cfg(feature = "tls")]
-            IoStream::Tls(_, addr) => Some(*addr),
-            IoStream::Yamux(_)
-            | IoStream::Cipher(_)
-            | IoStream::Aead(_)
-            | IoStream::SshChannel(_) => None,
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(_) => None,
-            #[cfg(feature = "quic")]
-            IoStream::Quic(_) => None,
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(_) => None,
-        }
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.0.peer_addr()
     }
 
-    /// Split the stream into owned read and write halves.
-    pub fn into_split(self) -> std::io::Result<(ReadHalf, WriteHalf)> {
-        match self {
-            IoStream::Tcp(s) => {
-                let (r, w) = tokio::io::split(s);
-                Ok((ReadHalf::Tcp(r), WriteHalf::Tcp(w)))
-            }
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s, _) => {
-                let (r, w) = tokio::io::split(s);
-                Ok((ReadHalf::Tls(r), WriteHalf::Tls(w)))
-            }
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(stream) => {
-                let (r, w) = tokio::io::split(stream);
-                Ok((ReadHalf::Kcp(r), WriteHalf::Kcp(w)))
-            }
-            #[cfg(feature = "quic")]
-            IoStream::Quic(stream) => {
-                let (r, w) = stream.into_split();
-                Ok((ReadHalf::Quic(r), WriteHalf::Quic(w)))
-            }
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(adapter) => {
-                let (r, w) = tokio::io::split(adapter);
-                Ok((ReadHalf::WebSocket(r), WriteHalf::WebSocket(w)))
-            }
-            IoStream::Yamux(stream) => {
-                let (r, w) = tokio::io::split(stream);
-                Ok((ReadHalf::Yamux(r), WriteHalf::Yamux(w)))
-            }
-            IoStream::Cipher(stream) => {
-                let (r, w) = tokio::io::split(stream);
-                Ok((ReadHalf::Cipher(r), WriteHalf::Cipher(w)))
-            }
-            IoStream::Aead(stream) => {
-                let (r, w) = tokio::io::split(stream);
-                Ok((ReadHalf::Aead(r), WriteHalf::Aead(w)))
-            }
-            IoStream::SshChannel(s) => {
-                let (r, w) = tokio::io::split(s);
-                Ok((ReadHalf::SshChannel(r), WriteHalf::SshChannel(w)))
-            }
-            IoStream::PreRead(pre_read, s) => {
-                if !pre_read.is_empty() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "into_split called with buffered bytes",
-                    ));
-                }
-                let (r, w) = tokio::io::split(s);
-                Ok((ReadHalf::Tcp(r), WriteHalf::Tcp(w)))
-            }
-            IoStream::BufferedRead(buf, pos, inner) => {
-                if pos < buf.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "into_split called with buffered bytes",
-                    ));
-                }
-                inner.into_split()
-            }
-        }
-    }
-
-    /// Return a reference to the underlying `TcpStream` if this variant is
-    /// raw TCP. Returns `None` for `PreRead` (has unconsumed bytes that
-    /// cannot be spliced), TLS, KCP, WebSocket, yamux, cipher, and other
-    /// wrapped variants.
+    /// Return a reference to the underlying `TcpStream` if this transport is
+    /// raw TCP. Returns `None` for PreRead (has unconsumed bytes that cannot
+    /// be spliced), TLS, KCP, WebSocket, yamux, cipher, and other wrapped
+    /// transports.
     ///
     /// Useful for zero-copy fast paths (e.g. `splice(2)`) that only work
     /// with raw kernel TCP sockets.
     pub fn try_tcp(&self) -> Option<&TcpStream> {
-        match self {
-            IoStream::Tcp(s) => Some(s),
-            _ => None,
-        }
+        self.0.try_tcp()
     }
 
-    /// Mutable variant of [`try_tcp`].
+    /// Mutable variant of [`IoStream::try_tcp`].
     pub fn try_tcp_mut(&mut self) -> Option<&mut TcpStream> {
-        match self {
-            IoStream::Tcp(s) => Some(s),
-            _ => None,
-        }
+        self.0.try_tcp_mut()
+    }
+
+    /// Consume and return the underlying `TcpStream` if this is raw TCP.
+    /// Owned counterpart of [`IoStream::try_tcp`].
+    pub fn into_tcp(self) -> Option<TcpStream> {
+        self.0.into_tcp()
+    }
+
+    /// Consume and return the yamux stream if this is a yamux transport.
+    pub fn into_yamux(self) -> Option<YamuxStream> {
+        self.0.into_yamux()
+    }
+
+    /// Peel the PreRead byte-replay layer: buffered bytes (minus any already
+    /// consumed) plus the inner transport. `None` for non-PreRead transports.
+    pub fn into_parts(self) -> Option<(Vec<u8>, Box<dyn Transport>)> {
+        self.0.into_parts()
+    }
+
+    /// Whether Go frp would wrap this transport in yamux (every non-QUIC
+    /// transport).
+    pub fn is_yamux_wrappable(&self) -> bool {
+        self.0.is_yamux_wrappable()
+    }
+
+    /// Consume and return the TLS wrapper if this is a TLS transport.
+    #[cfg(feature = "tls")]
+    pub fn into_tls(self) -> Option<TlsTransport> {
+        self.0.into_tls()
     }
 
     /// Wrap this stream in AES-128-CFB encryption for control messages.
     /// Must be called after login (the Login message is NOT encrypted).
     pub fn into_encrypted(self, key: [u8; 16]) -> Self {
-        match self {
-            IoStream::BufferedRead(buf, pos, inner) => {
-                // Buffered bytes are preserved inside the returned Cipher wrapper;
-                // they will be replayed before encrypted reads begin.
-                assert!(
-                    pos >= buf.len(),
-                    "into_encrypted called before buffered bytes consumed"
-                );
-                IoStream::BufferedRead(buf, pos, Box::new(inner.into_encrypted(key)))
-            }
-            IoStream::Aead(inner) => {
-                // Already AEAD-encrypted (V2 with crypto). Don't double-wrap.
-                IoStream::Aead(inner)
-            }
-            other => {
-                let c = crate::cipher_stream::CipherStream::new(other, key);
-                IoStream::Cipher(Box::new(c))
-            }
-        }
+        Self(self.0.into_encrypted(key))
+    }
+
+    /// Split the stream into owned boxed read and write halves.
+    pub fn into_split(self) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
+        self.0.into_split()
     }
 }
 
-/// Type-erased read half of a bridged connection.
-pub type BoxedReadHalf = Box<dyn AsyncRead + Unpin + Send>;
-/// Type-erased write half of a bridged connection.
-pub type BoxedWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
+impl From<Box<dyn Transport>> for IoStream {
+    fn from(inner: Box<dyn Transport>) -> Self {
+        Self(inner)
+    }
+}
+
+impl std::fmt::Debug for IoStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.debug_name())
+    }
+}
+
+// IoStream itself is a transport: lets `Box<IoStream>` nest inside the
+// PreRead/BufferedRead wrappers (and any future wrapper) without special
+// handling — the boxed IoStream delegates down to the concrete transport.
+impl Transport for IoStream {
+    fn debug_name(&self) -> &'static str {
+        self.0.debug_name()
+    }
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.0.peer_addr()
+    }
+    fn try_tcp(&self) -> Option<&TcpStream> {
+        self.0.try_tcp()
+    }
+    fn try_tcp_mut(&mut self) -> Option<&mut TcpStream> {
+        self.0.try_tcp_mut()
+    }
+    fn into_tcp(self: Box<Self>) -> Option<TcpStream> {
+        self.0.into_tcp()
+    }
+    fn into_yamux(self: Box<Self>) -> Option<YamuxStream> {
+        self.0.into_yamux()
+    }
+    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> Box<dyn Transport> {
+        self.0.into_encrypted(key)
+    }
+    fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
+        self.0.into_split()
+    }
+    fn into_parts(self: Box<Self>) -> Option<(Vec<u8>, Box<dyn Transport>)> {
+        self.0.into_parts()
+    }
+    fn is_yamux_wrappable(&self) -> bool {
+        self.0.is_yamux_wrappable()
+    }
+    fn bridge_split_err(&self) -> Option<&'static str> {
+        self.0.bridge_split_err()
+    }
+    #[cfg(feature = "tls")]
+    fn into_tls(self: Box<Self>) -> Option<TlsTransport> {
+        self.0.into_tls()
+    }
+}
+
+impl AsyncRead for IoStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for IoStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
+// ---------------------------------------------------------------
+// Per-transport Transport impls (one per old enum variant)
+// ---------------------------------------------------------------
+
+impl Transport for TcpStream {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::Tcp"
+    }
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr().ok()
+    }
+    fn try_tcp(&self) -> Option<&TcpStream> {
+        Some(self)
+    }
+    fn try_tcp_mut(&mut self) -> Option<&mut TcpStream> {
+        Some(self)
+    }
+    fn into_tcp(self: Box<Self>) -> Option<TcpStream> {
+        Some(*self)
+    }
+}
+
+/// TLS-wrapped transport. Holds a type-erased inner stream (any TLS-wrapped
+/// transport — plain TCP, PreRead, KCP) plus the peer address recorded at
+/// accept/dial time.
+#[cfg(feature = "tls")]
+pub struct TlsTransport {
+    inner: Box<dyn AsyncReadWrite>,
+    peer_addr: SocketAddr,
+}
+
+#[cfg(feature = "tls")]
+impl TlsTransport {
+    pub fn new(inner: Box<dyn AsyncReadWrite>, peer_addr: SocketAddr) -> Self {
+        Self { inner, peer_addr }
+    }
+}
+
+#[cfg(feature = "tls")]
+impl AsyncRead for TlsTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl AsyncWrite for TlsTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl Transport for TlsTransport {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::Tls"
+    }
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        Some(self.peer_addr)
+    }
+    fn into_tls(self: Box<Self>) -> Option<TlsTransport> {
+        Some(*self)
+    }
+    fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
+        let TlsTransport { inner, .. } = *self;
+        let (r, w) = tokio::io::split(inner);
+        Ok((Box::new(r), Box::new(w)))
+    }
+}
+
+#[cfg(feature = "kcp")]
+impl Transport for KcpStream {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::Kcp"
+    }
+}
+
+#[cfg(feature = "quic")]
+impl Transport for QuicStream {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::Quic"
+    }
+    fn is_yamux_wrappable(&self) -> bool {
+        false
+    }
+    fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
+        let (r, w) = QuicStream::into_split(*self);
+        Ok((Box::new(r), Box::new(w)))
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl Transport for WsByteStream {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::WebSocket"
+    }
+}
+
+// Real (tcp-mux on) and stub (tcp-mux off) YamuxStream both get the impl;
+// only one compiles at a time.
+impl Transport for YamuxStream {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::Yamux"
+    }
+    fn into_yamux(self: Box<Self>) -> Option<YamuxStream> {
+        Some(*self)
+    }
+}
+
+/// AES-128-CFB encrypted transport (the wrapped inner is any other
+/// [`Transport`]). Created by [`IoStream::into_encrypted`] after login.
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for CipherStream<S> {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::Cipher"
+    }
+    fn into_encrypted(self: Box<Self>, _key: [u8; 16]) -> Box<dyn Transport> {
+        // A Cipher stream is never re-encrypted in practice (into_encrypted
+        // runs on the freshly-dialed login stream); returning self unchanged
+        // also keeps the blanket `Transport for CipherStream<S>` from
+        // recursing through the default wrap.
+        self
+    }
+    fn bridge_split_err(&self) -> Option<&'static str> {
+        Some("Cipher stream unexpected in bridge")
+    }
+}
+
+impl Transport for AeadStream {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::Aead"
+    }
+    fn into_encrypted(self: Box<Self>, _key: [u8; 16]) -> Box<dyn Transport> {
+        // Already AEAD-encrypted (V2 with crypto). Don't double-wrap.
+        self
+    }
+    fn bridge_split_err(&self) -> Option<&'static str> {
+        Some("Aead stream unexpected in bridge")
+    }
+}
+
+/// SSH reverse-forward channel transport (type-erased byte stream).
+pub struct SshChannelTransport(Box<dyn AsyncReadWrite>);
+
+impl AsyncRead for SshChannelTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SshChannelTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+impl Transport for SshChannelTransport {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::SshChannel"
+    }
+}
+
+/// Byte-replay transport: serves `pre_read` bytes first, then delegates to
+/// the inner transport. Created by [`detect_and_strip_magic`] when the
+/// consumed magic bytes are not V2 magic, and by the TLS accept path to
+/// replay the consumed ClientHello prefix.
+pub struct PreReadTransport {
+    pre_read: Vec<u8>,
+    pos: usize,
+    inner: Box<dyn Transport>,
+}
+
+impl PreReadTransport {
+    pub fn new(pre_read: Vec<u8>, inner: Box<dyn Transport>) -> Self {
+        Self {
+            pre_read,
+            pos: 0,
+            inner,
+        }
+    }
+
+    /// Consume: return the remaining buffered bytes and the inner transport.
+    pub fn into_inner(self) -> (Vec<u8>, Box<dyn Transport>) {
+        (self.pre_read[self.pos..].to_vec(), self.inner)
+    }
+}
+
+impl AsyncRead for PreReadTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.pos < self.pre_read.len() {
+            let remaining = &self.pre_read[self.pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            self.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PreReadTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Transport for PreReadTransport {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::PreRead"
+    }
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr()
+    }
+    fn into_parts(self: Box<Self>) -> Option<(Vec<u8>, Box<dyn Transport>)> {
+        Some(self.into_inner())
+    }
+    fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
+        let (pre_read, inner) = self.into_inner();
+        if !pre_read.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "into_split called with buffered bytes",
+            ));
+        }
+        inner.into_split()
+    }
+}
+
+/// Buffered byte-replay transport: serves `buf[pos..]` first, then delegates
+/// to the inner transport. Used when V2 magic is detected on a yamux stream:
+/// if the bytes are NOT V2 magic, they're buffered and replayed for V1
+/// processing.
+pub struct BufferedReadTransport {
+    buf: Vec<u8>,
+    pos: usize,
+    inner: Box<dyn Transport>,
+}
+
+impl BufferedReadTransport {
+    pub fn new(buf: Vec<u8>, pos: usize, inner: Box<dyn Transport>) -> Self {
+        Self { buf, pos, inner }
+    }
+}
+
+impl AsyncRead for BufferedReadTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.pos < self.buf.len() {
+            let remaining = &self.buf[self.pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            self.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for BufferedReadTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Transport for BufferedReadTransport {
+    fn debug_name(&self) -> &'static str {
+        "IoStream::BufferedRead"
+    }
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr()
+    }
+    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> Box<dyn Transport> {
+        // Buffered bytes are preserved inside the returned Cipher wrapper;
+        // they will be replayed before encrypted reads begin.
+        let BufferedReadTransport { buf, pos, inner } = *self;
+        assert!(
+            pos >= buf.len(),
+            "into_encrypted called before buffered bytes consumed"
+        );
+        Box::new(BufferedReadTransport {
+            buf,
+            pos,
+            inner: inner.into_encrypted(key),
+        })
+    }
+    fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
+        let BufferedReadTransport { buf, pos, inner } = *self;
+        if pos < buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "into_split called with buffered bytes",
+            ));
+        }
+        inner.into_split()
+    }
+}
 
 /// Split an `IoStream` into boxed read/write halves for bridging.
 ///
 /// The bridge helpers (`bridge_encrypted` & friends) are generic over their
-/// stream types, so splitting per-variant would monomorphize each bridge once
-/// per `IoStream` variant (~10 copies, each several KiB). Boxing the halves
-/// erases the types so a single monomorphization is shared by every transport.
+/// stream types, so splitting per-transport would monomorphize each bridge
+/// once per `IoStream` variant (~10 copies, each several KiB). Boxing the
+/// halves erases the types so a single monomorphization is shared by every
+/// transport.
 ///
-/// Splits exactly like [`IoStream::into_split`] per variant, so the halves
-/// wrap the same streams. Returns an `Err` with a log message for variants
+/// Splits exactly like [`IoStream::into_split`] per transport, so the halves
+/// wrap the same streams. Returns an `Err` with a log message for transports
 /// that cannot be bridged.
 ///
 /// Reachability note: on the old encrypted+injector path the work conn was
@@ -1730,55 +1710,14 @@ pub type BoxedWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
 pub fn split_work_conn_halves(
     work_conn: IoStream,
 ) -> Result<(BoxedReadHalf, BoxedWriteHalf), &'static str> {
-    Ok(match work_conn {
-        IoStream::Tcp(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        #[cfg(feature = "tls")]
-        IoStream::Tls(work, _) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        #[cfg(feature = "kcp")]
-        IoStream::Kcp(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        #[cfg(feature = "websocket")]
-        IoStream::WebSocket(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        #[cfg(feature = "quic")]
-        IoStream::Quic(work) => {
-            let (r, w) = work.into_split();
-            (Box::new(r), Box::new(w))
-        }
-        IoStream::Yamux(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        IoStream::SshChannel(work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        IoStream::PreRead(_, work) => {
-            let (r, w) = tokio::io::split(work);
-            (Box::new(r), Box::new(w))
-        }
-        IoStream::BufferedRead(_, _, inner) => match inner.into_split() {
-            Ok((r, w)) => (Box::new(r), Box::new(w)),
-            Err(_) => return Err("BufferedRead with unconsumed bytes in bridge"),
-        },
-        IoStream::Cipher(_) => return Err("Cipher stream unexpected in bridge"),
-        IoStream::Aead(_) => return Err("Aead stream unexpected in bridge"),
-        // Unreachable in frp-core itself (all variants covered above); kept as
-        // a defensive fallback in case a downstream crate observes the enum
-        // with a mismatched feature set.
-        #[allow(unreachable_patterns)]
-        _ => return Err("unsupported IoStream variant in bridge"),
-    })
+    // Cipher/Aead control streams are never bridgeable (defensive guard —
+    // unreachable on the bridge path, preserved from the old match).
+    if let Some(msg) = work_conn.bridge_split_err() {
+        return Err(msg);
+    }
+    work_conn
+        .into_split()
+        .map_err(|_| "BufferedRead with unconsumed bytes in bridge")
 }
 
 /// Options for dialing the server.
@@ -2692,7 +2631,7 @@ pub async fn detect_and_strip_magic(
         b => ConnectionType::V1(b),
     };
 
-    Ok((ct, IoStream::PreRead(magic_buf.to_vec(), stream)))
+    Ok((ct, IoStream::PreRead(magic_buf.to_vec(), Box::new(stream))))
 }
 
 // consume_tls_head_byte removed — dead code. detect_and_strip_magic

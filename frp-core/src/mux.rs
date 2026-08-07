@@ -75,7 +75,7 @@ const MIN_IDLE_DEAD_TIME: Duration = Duration::from_secs(30);
 pub type YamuxStream = Compat<Stream>;
 
 /// Stub type when tcp-mux is disabled. Never constructed at runtime;
-/// only exists so IoStream::Yamux variant compiles.
+/// only exists as a type-level stub when the tcp-mux feature is disabled.
 #[cfg(not(feature = "tcp-mux"))]
 #[derive(Debug)]
 pub struct YamuxStream {
@@ -83,8 +83,8 @@ pub struct YamuxStream {
 }
 
 // SAFETY: When tcp-mux is disabled, YamuxStream is never constructed at
-// runtime — it exists only as a type-level stub so IoStream::Yamux variant
-// compiles. All trait impls return errors. Marking Send is sound because
+// runtime — it exists only as a type-level stub for the IoStream::Yamux
+// transport. All trait impls return errors. Marking Send is sound because
 // no instance of this type can exist.
 #[cfg(not(feature = "tcp-mux"))]
 unsafe impl Send for YamuxStream {}

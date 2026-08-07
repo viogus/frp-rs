@@ -37,7 +37,7 @@ use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
-use frp_core::transport::{TransportProtocol, WriteHalf};
+use frp_core::transport::{BoxedWriteHalf, TransportProtocol};
 
 use frp_core::metrics::ProxyMetricsRegistry;
 
@@ -2124,7 +2124,7 @@ impl Service {
         &self,
         config_path: &str,
         strict: bool,
-        writer: &Arc<Mutex<WriteHalf>>,
+        writer: &Arc<Mutex<BoxedWriteHalf>>,
     ) -> Result<String, String> {
         self.reload_from_sources(config_path, strict, writer).await
     }
@@ -2138,7 +2138,7 @@ impl Service {
         &self,
         config_path: &str,
         strict: bool,
-        writer: &Arc<Mutex<WriteHalf>>,
+        writer: &Arc<Mutex<BoxedWriteHalf>>,
     ) -> Result<String, String> {
         let mut new_cfg = frp_core::config::load_client_config(config_path, strict)
             .map_err(|e| format!("failed to load config: {e}"))?;
@@ -2917,9 +2917,9 @@ mod tests {
         let (_peer, writer_raw) = tokio::io::duplex(4096);
         let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
         let (_, writer_half) = tokio::io::split(writer_stream);
-        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
-            writer_half,
-        )));
+        let writer = Arc::new(Mutex::new(
+            Box::new(writer_half) as frp_core::transport::BoxedWriteHalf
+        ));
         let (tun, configured) = fake_tun();
 
         register_vnet_tun(
@@ -2983,9 +2983,9 @@ mod tests {
         let (_peer, writer_raw) = tokio::io::duplex(4096);
         let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
         let (_, writer_half) = tokio::io::split(writer_stream);
-        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
-            writer_half,
-        )));
+        let writer = Arc::new(Mutex::new(
+            Box::new(writer_half) as frp_core::transport::BoxedWriteHalf
+        ));
 
         let (tun, _) = fake_tun();
         register_vnet_tun(
@@ -3102,9 +3102,9 @@ mod tests {
         let (mut peer, writer_raw) = tokio::io::duplex(4096);
         let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
         let (_, writer_half) = tokio::io::split(writer_stream);
-        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
-            writer_half,
-        )));
+        let writer = Arc::new(Mutex::new(
+            Box::new(writer_half) as frp_core::transport::BoxedWriteHalf
+        ));
 
         // Pre-populate every map the removal path must clean up.
         names.lock().await.insert("vnet-a".into(), "tun0".into());

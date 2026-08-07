@@ -649,10 +649,12 @@ async fn run_virtual_net_plugin_work_conn(
     };
 
     let (work_r, work_w) = work.into_split().expect("work conn split");
+    // into_split already returns boxed halves — only the encrypted branch
+    // re-boxes (the CipherReader wrapper).
     let work_r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if use_encryption {
         Box::new(CipherReader::new(work_r, enc_key))
     } else {
-        Box::new(work_r)
+        work_r
     };
     let mut packet_reader = TunnelPacketReader::new(work_r, use_compression);
     let mut packet_writer = if use_encryption {

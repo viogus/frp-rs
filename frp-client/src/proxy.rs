@@ -423,10 +423,13 @@ async fn relay_plain_fast_inner(
     name: &str,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
-    // Two-arm match so the Tcp arm consumes the streams while the other
+    // Two-arm dispatch so the Tcp arm consumes the streams while the other
     // arm binds fresh mutable variables for the copy fallthrough.
-    match work {
-        IoStream::Tcp(work) => match frp_core::splice::bridge_splice(local, work).await {
+    // try_tcp() (borrow check) then into_tcp() (owned) — no await between,
+    // so the transport cannot change.
+    if work.try_tcp().is_some() {
+        let work = work.into_tcp().expect("try_tcp confirmed raw TCP above");
+        match frp_core::splice::bridge_splice(local, work).await {
             Ok((to_work, to_local)) => {
                 metrics.bytes_in.fetch_add(to_work, Ordering::Relaxed);
                 metrics.bytes_out.fetch_add(to_local, Ordering::Relaxed);
@@ -435,11 +438,11 @@ async fn relay_plain_fast_inner(
             Err(e) => {
                 debug!(name = %name, error = %e, "Proxy {} splice bridge closed: {}", name, e);
             }
-        },
-        mut work => {
-            let mut local = local;
-            copy_bidirectional_sized(&mut local, &mut work, name, metrics).await;
         }
+    } else {
+        let mut work = work;
+        let mut local = local;
+        copy_bidirectional_sized(&mut local, &mut work, name, metrics).await;
     }
 }
 

@@ -75,13 +75,9 @@ async fn test_v2_tcp_proxy() {
 
     // Extract TCP stream and wrap in yamux BEFORE handshake.
     // Server wraps in yamux on V2 detection, so client must match.
-    let tcp_stream = match raw_stream {
-        IoStream::Tcp(s) => s,
-        other => panic!(
-            "expected IoStream::Tcp after V2 dial, got {:?}",
-            std::mem::discriminant(&other)
-        ),
-    };
+    let tcp_stream = raw_stream
+        .into_tcp()
+        .expect("expected IoStream::Tcp after V2 dial");
     let (control_yamux, yamux_session) = mux::client_mux(tcp_stream, &mux::TcpMuxConfig::default())
         .await
         .expect("yamux client init");
@@ -257,10 +253,9 @@ async fn test_v2_tcp_proxy() {
     }
 
     // ---- Bridge work yamux stream ↔ echo server ----
-    let mut work_stream = match work_io {
-        IoStream::Yamux(s) => s,
-        _ => unreachable!("work_io must be IoStream::Yamux"),
-    };
+    let mut work_stream = work_io
+        .into_yamux()
+        .expect("work_io must be IoStream::Yamux");
     let mut echo = tokio::net::TcpStream::connect(format!("127.0.0.1:{echo_port}"))
         .await
         .expect("connect to echo server");
@@ -440,13 +435,7 @@ async fn test_v2_ping_pong_yamux() {
         .expect("dial server");
 
     // Wrap in yamux FIRST (matching server)
-    let tcp_stream = match raw_stream {
-        IoStream::Tcp(s) => s,
-        other => panic!(
-            "expected IoStream::Tcp, got {:?}",
-            std::mem::discriminant(&other)
-        ),
-    };
+    let tcp_stream = raw_stream.into_tcp().expect("expected IoStream::Tcp");
     let (control_yamux, _yamux_session) =
         mux::client_mux(tcp_stream, &mux::TcpMuxConfig::default())
             .await
@@ -562,13 +551,7 @@ async fn test_v2_aead_ping_pong_yamux() {
         .expect("dial server");
 
     // Wrap in yamux FIRST (matching server)
-    let tcp_stream = match raw_stream {
-        IoStream::Tcp(s) => s,
-        other => panic!(
-            "expected IoStream::Tcp, got {:?}",
-            std::mem::discriminant(&other)
-        ),
-    };
+    let tcp_stream = raw_stream.into_tcp().expect("expected IoStream::Tcp");
     let (control_yamux, _yamux_session) =
         mux::client_mux(tcp_stream, &mux::TcpMuxConfig::default())
             .await

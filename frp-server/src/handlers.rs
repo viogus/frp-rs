@@ -1121,12 +1121,12 @@ pub(crate) async fn handle_tls_connection(
     // (including plain V1/WS traffic) was pure
     // overhead on the hot accept path.
     let acceptor = state.tls_acceptor.read_ok().clone();
-    // Extract inner TcpStream and pre-read bytes.
+    // Extract inner transport and pre-read bytes.
     // detect_and_strip_magic consumed 7 bytes; replay them
     // (minus the Go frp 0x17 prefix) for TLS.
-    let (mut pre_read_bytes, mut inner_stream) = match stream_io {
-        IoStream::PreRead(buf, s) => (buf, s),
-        _ => {
+    let (mut pre_read_bytes, mut inner_stream) = match stream_io.into_parts() {
+        Some(parts) => parts,
+        None => {
             warn!(addr = %addr, "Expected PreRead for TLS connection from {}", addr);
             return;
         }
@@ -1200,7 +1200,7 @@ pub(crate) async fn handle_tls_connection(
                             .tx
                             .send(InternalMsg::ProxyUserConn {
                                 proxy_name: route.proxy_name.to_string(),
-                                user_conn: IoStream::Tcp(inner_stream),
+                                user_conn: IoStream::from(inner_stream),
                                 pre_read: sni_data,
                             })
                             .await;
@@ -1719,9 +1719,9 @@ pub(crate) async fn handle_tls_connection(
     // Go frp compat: when TLS feature is not compiled in
     // but frpc sends 0x17 prefix, fall back to V1.
     if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
-        let (mut pre_read_bytes, inner_stream) = match stream_io {
-            IoStream::PreRead(buf, s) => (buf, s),
-            _ => {
+        let (mut pre_read_bytes, inner_stream) = match stream_io.into_parts() {
+            Some(parts) => parts,
+            None => {
                 warn!(addr = %addr, "Expected PreRead for 0x17 connection from {}", addr);
                 return;
             }
@@ -2166,9 +2166,9 @@ pub(crate) async fn handle_v2_connection(
     stream_io: IoStream,
 ) {
     // Already consumed V2 magic. Extract TcpStream.
-    let inner_stream = match stream_io {
-        IoStream::Tcp(s) => s,
-        _other => {
+    let inner_stream = match stream_io.into_tcp() {
+        Some(s) => s,
+        None => {
             warn!(addr = %addr, "Expected TcpStream for V2 connection from {}, got unexpected stream type", addr);
             return;
         }
@@ -2344,12 +2344,12 @@ pub(crate) async fn handle_v1_connection(
         return;
     }
     if state.tcp_mux {
-        // Extract inner TcpStream and pre-read bytes.
+        // Extract inner transport and pre-read bytes.
         // Wrap in PreReadStream so yamux sees the full byte stream
         // (including the type byte consumed by detect_and_strip_magic).
-        let (pre_read, inner_tcp) = match stream_io {
-            IoStream::PreRead(buf, s) => (buf, s),
-            _ => {
+        let (pre_read, inner_transport) = match stream_io.into_parts() {
+            Some(parts) => parts,
+            None => {
                 warn!(addr = %addr,
                     "Expected PreRead stream after detect_and_strip_magic from {}, got unexpected stream type",
                     addr
@@ -2357,7 +2357,7 @@ pub(crate) async fn handle_v1_connection(
                 return;
             }
         };
-        let stream = PreReadStream::new(pre_read, inner_tcp);
+        let stream = PreReadStream::new(pre_read, inner_transport);
 
         let mux_cfg = mux::TcpMuxConfig {
             keepalive_interval: std::time::Duration::from_secs(
