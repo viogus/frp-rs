@@ -48,6 +48,20 @@ const MAX_SESSIONS_PER_IP: usize = 64;
 /// are cleaned up by the tick loop.
 const UNACCEPTED_SESSION_TIMEOUT_MS: u32 = 30_000; // 30 seconds
 
+/// Session-creation rate window (ms). Bursts of brand-new sessions are
+/// limited per window so a UDP packet flood cannot fill the 256-entry
+/// accept queue (or the session table) faster than legitimate handshakes.
+const SESSION_CREATE_WINDOW_MS: u32 = 10_000;
+
+/// Max new sessions the driver accepts per window across all peers.
+/// 256 (== accept queue depth) over 10 s — filling the queue now takes a
+/// sustained 10 s flood instead of one 256-packet burst.
+const MAX_SESSION_CREATES_PER_WINDOW: usize = 256;
+
+/// Max new sessions per IP per window. A single host cannot churn the
+/// session table / accept queue with new convs faster than this.
+const MAX_SESSION_CREATES_PER_IP_PER_WINDOW: usize = 32;
+
 pub(crate) enum WriteRequest {
     Data(Vec<u8>),
     Flush(tokio::sync::oneshot::Sender<()>),
@@ -86,6 +100,14 @@ pub(crate) struct KcpSocket {
     /// listener. Removed on accept (via accept_notify_rx) or on session
     /// removal (dead/error).
     session_created_at: HashMap<(u32, SocketAddr), u32>,
+    /// Rolling log of session-creation timestamps (ms) for global rate
+    /// limiting. Trimmed on every admission check; bounded by
+    /// MAX_SESSION_CREATES_PER_WINDOW.
+    session_create_log: VecDeque<u32>,
+    /// Per-IP rolling creation logs (ms) for per-source rate limiting.
+    /// Entries whose window expires are trimmed; empty logs remove the key
+    /// so a flood from many IPs does not accumulate map entries.
+    ip_session_create_log: HashMap<IpAddr, VecDeque<u32>>,
     write_tx: mpsc::Sender<(u32, WriteRequest)>,
     write_rx: mpsc::Receiver<(u32, WriteRequest)>,
     register_rx: mpsc::Receiver<(u32, SocketAddr, KcpSession)>,
@@ -132,6 +154,8 @@ impl KcpSocket {
             conv_index: HashMap::new(),
             peer_session_counts: HashMap::new(),
             session_created_at: HashMap::new(),
+            session_create_log: VecDeque::new(),
+            ip_session_create_log: HashMap::new(),
             write_tx: write_tx.clone(),
             write_rx,
             register_rx,
@@ -244,6 +268,19 @@ impl KcpSocket {
                             }
                         }
                     }
+                    // Trim per-IP session-creation logs and drop empty keys so
+                    // a many-IP flood cannot accumulate map entries after their
+                    // rate window expires.
+                    self.ip_session_create_log.retain(|_, log| {
+                        while let Some(&t) = log.front() {
+                            if now_ms.saturating_sub(t) > SESSION_CREATE_WINDOW_MS {
+                                log.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        !log.is_empty()
+                    });
                 }
 
                 Some((conv, req)) = self.write_rx.recv() => {
@@ -383,6 +420,45 @@ impl KcpSocket {
                                         tracing::warn!(conv = key.0, peer = %src, ip_sessions = ip_count, "KCP: per-IP session limit reached ({MAX_SESSIONS_PER_IP}), dropping new conv={}", key.0);
                                         continue;
                                     }
+                                    // Session-creation RATE limiting (defense
+                                    // vs the steady-state caps above): a UDP
+                                    // flood of 24-byte packets with random
+                                    // convs must not fill the 256-entry accept
+                                    // queue (or churn the session table) in
+                                    // one burst. Limits: 256 new sessions per
+                                    // 10 s globally, 32 per IP per 10 s.
+                                    let now_ms = self.start.elapsed().as_millis() as u32;
+                                    // Trim global log outside the window.
+                                    while let Some(&t) = self.session_create_log.front() {
+                                        if now_ms.saturating_sub(t) > SESSION_CREATE_WINDOW_MS {
+                                            self.session_create_log.pop_front();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    if self.session_create_log.len() >= MAX_SESSION_CREATES_PER_WINDOW
+                                    {
+                                        tracing::warn!(conv = key.0, peer = %src, "KCP: session-creation rate limit reached ({MAX_SESSION_CREATES_PER_WINDOW}/{SESSION_CREATE_WINDOW_MS}ms), dropping new conv={}", key.0);
+                                        continue;
+                                    }
+                                    // Trim per-IP log (empty keys are dropped
+                                    // by the tick cleanup).
+                                    {
+                                        let log = self.ip_session_create_log.entry(ip).or_default();
+                                        while let Some(&t) = log.front() {
+                                            if now_ms.saturating_sub(t) > SESSION_CREATE_WINDOW_MS {
+                                                log.pop_front();
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        if log.len() >= MAX_SESSION_CREATES_PER_IP_PER_WINDOW {
+                                            tracing::warn!(conv = key.0, peer = %src, "KCP: per-IP session-creation rate limit reached ({MAX_SESSION_CREATES_PER_IP_PER_WINDOW}/{SESSION_CREATE_WINDOW_MS}ms), dropping new conv={}", key.0);
+                                            continue;
+                                        }
+                                        log.push_back(now_ms);
+                                    }
+                                    self.session_create_log.push_back(now_ms);
 
                                     // Create session and validate the first packet.
                                     // If input() fails on the very first packet, the

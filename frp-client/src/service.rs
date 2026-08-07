@@ -1552,10 +1552,15 @@ impl Service {
                                     }
                                     // Inject OS route so the kernel sends matching packets
                                     // through the TUN device instead of the default gateway.
+                                    // The TUN is looked up by the proxy that advertised the
+                                    // route (vnet_tun_names is keyed by proxy_name) — the old
+                                    // code took an arbitrary TUN from the map, which could
+                                    // point the route at the wrong interface when multiple
+                                    // vnet proxies/TUNs exist.
                                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                                     {
                                         let names = self.vnet_tun_names.lock().await;
-                                        if let Some(tun_name) = names.values().next() {
+                                        if let Some(tun_name) = names.get(&adv.proxy_name) {
                                             add_os_route(&adv.subnet, tun_name);
                                             self.vnet_peer_routes.lock().await.insert(
                                                 adv.proxy_name.clone(),
@@ -1565,6 +1570,8 @@ impl Service {
                                                     vnet.clone(),
                                                 ),
                                             );
+                                        } else {
+                                            warn!(proxy_name = %adv.proxy_name, "vnet route advertise: no TUN registered for proxy '{}' — skipping OS route", adv.proxy_name);
                                         }
                                     }
                                 }
