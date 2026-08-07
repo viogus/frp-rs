@@ -484,7 +484,9 @@ where
                             {
                                 Ok(Ok(())) => {}
                                 Ok(Err(_)) => {
-                                    debug!("yamux server: incoming channel closed, stopping acceptor");
+                                    debug!(
+                                        "yamux server: incoming channel closed, stopping acceptor"
+                                    );
                                     break;
                                 }
                                 Err(_elapsed) => {

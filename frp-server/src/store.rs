@@ -111,9 +111,7 @@ pub fn save_store(path: &Path, configs: &HashMap<String, ProxyConfig>) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            {
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
                 error!(path = %path.display(), error = %e, "failed to set 0600 on store file");
             }
         }

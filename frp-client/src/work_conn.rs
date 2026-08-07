@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
 #[cfg(feature = "vnet")]
 use tokio::sync::Mutex;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
@@ -297,7 +297,8 @@ struct WorkConnDialConfig<'a> {
 /// and to rebuild the socket after a hot reload changes the target address.
 /// Shared yamux-or-dial path for work connection transport acquisition.
 /// Used by both QUIC and non-QUIC branches.
-async fn connect_yamux_or_dial(cfg: &WorkConnDialConfig<'_>) -> Option<IoStream> {    if let Some(ref yamux) = *cfg.yamux {
+async fn connect_yamux_or_dial(cfg: &WorkConnDialConfig<'_>) -> Option<IoStream> {
+    if let Some(ref yamux) = *cfg.yamux {
         match yamux.open_stream().await {
             Some(stream) => {
                 debug!(label = %cfg.label, "Work conn {} opened yamux stream", cfg.label);
@@ -1785,11 +1786,13 @@ mod tests {
         // Reply order is not guaranteed (concurrent session tasks); check
         // set membership and that the two remotes are distinct.
         assert!(
-            got.iter().any(|(c, r)| c == "resp-a" && *r == remote_a.to_string()),
+            got.iter()
+                .any(|(c, r)| c == "resp-a" && *r == remote_a.to_string()),
             "resp-a must be routed to remote A, got {got:?}"
         );
         assert!(
-            got.iter().any(|(c, r)| c == "resp-b" && *r == remote_b.to_string()),
+            got.iter()
+                .any(|(c, r)| c == "resp-b" && *r == remote_b.to_string()),
             "resp-b must be routed to remote B, got {got:?}"
         );
         assert_ne!(got[0].1, got[1].1);

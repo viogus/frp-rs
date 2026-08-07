@@ -371,10 +371,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
             // Strip CR/LF from forwarded header lines: header injection /
             // request-smuggling defense (the h2 plugin path rejects CR/LF
             // outright — mirror that policy here for the HTTP/1.0 path).
-            let safe_line: String = line
-                .chars()
-                .filter(|&c| c != '\r' && c != '\n')
-                .collect();
+            let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
             fwd.push_str(&safe_line);
             fwd.push_str("\r\n");
         }

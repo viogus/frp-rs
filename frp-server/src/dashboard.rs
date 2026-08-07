@@ -709,11 +709,10 @@ async fn handle_store_proxy_create(
 /// to skip all three — leaking port quota (`max_ports_per_client`) and
 /// leaving zombie group listeners holding ports until frps restarts.
 async fn cleanup_deleted_proxy_port(state: &Arc<AppState>, proxy: &crate::proxy::ProxyInfo) {
-    let is_tcp_group = proxy.proxy_type == "tcp"
-        && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some();
+    let is_tcp_group =
+        proxy.proxy_type == "tcp" && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some();
     let group_name = proxy.group.clone().unwrap_or_default();
-    let last_group_member =
-        is_tcp_group && state.proxy_manager.group_len(&group_name).await <= 1;
+    let last_group_member = is_tcp_group && state.proxy_manager.group_len(&group_name).await <= 1;
     if let Some(port) = proxy.remote_port {
         if proxy.proxy_type == "udp" || proxy.proxy_type == "sudp" {
             state.used_udp_ports.write().await.remove(&port);
