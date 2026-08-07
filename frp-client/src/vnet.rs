@@ -355,10 +355,34 @@ pub(crate) async fn remove_vnet_tun(
     }
 }
 
+/// Validate a CIDR/IP string before passing it to `ip route`/`route`.
+/// The subnet comes from a peer's VnetRouteAdvertise broadcast, so it must
+/// be a well-formed IP prefix — not an option-injection vector (`-...` is
+/// parsed as a global option by `ip`) or garbage that pollutes the table.
+pub(crate) fn valid_cidr(subnet: &str) -> bool {
+    if subnet.is_empty() || subnet.len() > 64 || subnet.starts_with('-') {
+        return false;
+    }
+    match subnet.split_once('/') {
+        Some((ip, prefix)) => {
+            prefix.parse::<u8>().is_ok() && ip.parse::<std::net::IpAddr>().is_ok()
+        }
+        None => subnet.parse::<std::net::IpAddr>().is_ok(),
+    }
+}
+
 /// Inject an OS-level route directing traffic for `subnet` through the
 /// given TUN interface. This makes the kernel send matching packets to
 /// the TUN device instead of the physical NIC / default gateway.
 pub(crate) fn add_os_route(subnet: &str, tun_name: &str) {
+    if !valid_cidr(subnet) {
+        tracing::warn!("refusing invalid subnet for OS route: {subnet}");
+        return;
+    }
+    if tun_name.is_empty() || tun_name.chars().any(|c| c.is_whitespace() || c == '/') {
+        tracing::warn!("refusing invalid TUN name for OS route: {tun_name:?}");
+        return;
+    }
     #[cfg(target_os = "linux")]
     {
         let _ = std::process::Command::new("ip")

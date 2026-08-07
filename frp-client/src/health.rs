@@ -95,10 +95,16 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
                 if was_failed {
                     // Service recovered. Notify control loop to re-register.
                     info!(proxy_name = %proxy_name, "Health check recovered for '{}', sending Recover event", proxy_name);
-                    let _ = health_tx
-                        .send(HealthEvent::Recover(proxy_name.clone()))
-                        .await;
-                    was_failed = false;
+                    // try_send: during a reconnect the control-loop consumer
+                    // is gone and the bounded channel may be full — blocking
+                    // here would pause health probing. On failure keep
+                    // was_failed=true so the next successful check retries.
+                    if health_tx
+                        .try_send(HealthEvent::Recover(proxy_name.clone()))
+                        .is_ok()
+                    {
+                        was_failed = false;
+                    }
                 }
                 debug!(proxy_name = %proxy_name, "Health check OK for '{}'", proxy_name);
             }
@@ -111,10 +117,17 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
         // Go frp compat: only fire Close after the proxy was ever healthy.
         // (statusOK must be true before transitioning to false triggers the callback).
         if was_healthy && failures >= max_failed as u64 && !was_failed {
-            was_failed = true;
             warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending Close event",
                 proxy_name, max_failed);
-            let _ = health_tx.send(HealthEvent::Close(proxy_name.clone())).await;
+            // try_send: during a reconnect the consumer may be gone and the
+            // channel full — never block probing. On failure keep
+            // was_failed=false; the next failed check retries the Close.
+            if health_tx
+                .try_send(HealthEvent::Close(proxy_name.clone()))
+                .is_ok()
+            {
+                was_failed = true;
+            }
             // Keep running -- monitor for recovery (Go frp compat).
         }
 

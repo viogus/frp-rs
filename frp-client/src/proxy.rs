@@ -58,7 +58,7 @@ pub fn create_visitor_conn_msg(
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
+        .as_millis() as i64;
     let sign_key = if secret_key.is_empty() {
         None
     } else {

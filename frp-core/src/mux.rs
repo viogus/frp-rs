@@ -466,28 +466,39 @@ where
             match stream {
                 Some(Ok(stream)) => {
                     let compat = stream.compat();
-                    // send() with backpressure instead of try_send: on a full
-                    // channel a freshly accepted stream must NOT be silently
-                    // dropped — the client's StartWorkConn would hang until
-                    // its timeout. The bounded (256) channel makes the
-                    // acceptor wait briefly for room instead. The wait is
-                    // itself bounded: this task is the ONLY one that drives
-                    // the yamux Connection, so a persistently full channel
-                    // must not stall inbound PING/PONG processing and
-                    // control reads/writes for the whole session (the
-                    // client's heartbeat watchdog may kill the link). On
-                    // timeout the stream is dropped, but the channel may
-                    // drain later — keep accepting.
-                    match tokio::time::timeout(Duration::from_secs(5), tx.send(compat)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => {
+                    // Prefer try_send: the common case (channel has room)
+                    // must not add a syscall/await. On a full channel, fall
+                    // back to a bounded send so a freshly accepted stream is
+                    // not silently dropped (the client's StartWorkConn would
+                    // hang until its timeout) — but cap the wait far below
+                    // 5s: this task is the ONLY one that drives the yamux
+                    // Connection, so a long stall freezes inbound PING/PONG
+                    // and control reads/writes for every active stream (the
+                    // client's heartbeat watchdog may kill the link). 500ms
+                    // bounds the stall while still draining the queue.
+                    match tx.try_send(compat) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(stream)) => {
+                            match tokio::time::timeout(Duration::from_millis(500), tx.send(stream))
+                                .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => {
+                                    debug!(
+                                        "yamux server: incoming channel closed, stopping acceptor"
+                                    );
+                                    break;
+                                }
+                                Err(_elapsed) => {
+                                    warn!(
+                                        "yamux server: incoming channel full for 500ms, dropping work stream"
+                                    );
+                                }
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
                             debug!("yamux server: incoming channel closed, stopping acceptor");
                             break;
-                        }
-                        Err(_elapsed) => {
-                            warn!(
-                                "yamux server: incoming channel full for 5s, dropping work stream"
-                            );
                         }
                     }
                 }

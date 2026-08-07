@@ -297,10 +297,14 @@ impl ControlConnection {
             client_hello_json = Some(ch_json);
         }
 
+        // Milliseconds precision: the server's duplicate-(run_id, ts) replay
+        // detection keys on this value, and frpc reuses its run_id across
+        // reconnects — a seconds-precision ts collides when a reconnect
+        // happens within the same second (false "replay attack" rejection).
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_millis() as i64;
 
         let mut login = msg::Login {
             version: Some(VERSION.into()),

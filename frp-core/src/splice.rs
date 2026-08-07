@@ -256,7 +256,14 @@ async fn splice_direction(
                 let n = ret as usize;
                 counter.fetch_add(n as u64, Ordering::Relaxed);
                 if n == 0 {
-                    return Ok(()); // EOF on dst
+                    // splice(pipe → dst) returning 0 while `remaining > 0`
+                    // means the pipe drained unexpectedly — NOT a clean EOF
+                    // on dst. Treating it as success would silently drop the
+                    // tail of the stream (the write side may have closed).
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "splice: pipe drained with data still pending",
+                    ));
                 }
                 remaining -= n;
             } else {
