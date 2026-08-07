@@ -1,0 +1,660 @@
+//! XTCP NAT hole punching — client side.
+//!
+//! Provider-side handlers for the `NatHoleClient`/`NatHoleResp` control
+//! messages (STUN discovery, UDP hole punch, KCP+yamux/QUIC data plane,
+//! bridging to the local service) plus the local-IP enumeration helper used
+//! for `assisted_addrs`.
+//!
+//! Compiled unconditionally: frp-core provides stub modules for `kcp` and
+//! `xtcp_p2p` when those features are off, so these paths also compile in
+//! tiny/micro builds (the message-loop dispatch arms stay uniform).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+use tokio::sync::{oneshot, Mutex};
+use tracing::{debug, info, warn};
+
+use frp_core::msg::{self, FrpMessage};
+use frp_core::protocol::write_msg;
+use frp_core::transport::WriteHalf;
+
+use crate::service::Service;
+
+impl Service {
+    /// Handle a NatHoleClient message from the server (XTCP provider side).
+    ///
+    /// Sends NatHoleSid to synchronize with the visitor, performs TCP simultaneous
+    /// open, connects to local service, and spawns a P2P bridge task.
+    pub(crate) async fn handle_nat_hole_client(
+        &self,
+        nhc: msg::NatHoleClient,
+        writer: &Arc<Mutex<WriteHalf>>,
+        v2: bool,
+    ) {
+        debug!(proxy_name = %nhc.proxy_name, "Received NatHoleClient for proxy '{}'", nhc.proxy_name);
+        let visitor_addr = nhc.visitor_addr.unwrap_or_default();
+        let proxy_name = nhc.proxy_name.clone();
+        let sid = nhc.transaction_id.clone();
+        let proxy_info = self.proxy_info_map.read().await.get(&proxy_name).map(|p| {
+            (
+                p.local_addr.clone(),
+                p.use_encryption,
+                p.use_compression,
+                p.sk.clone(),
+            )
+        });
+        let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
+        let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
+        let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
+        let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
+
+        if visitor_addr.is_empty() {
+            warn!(proxy_name = %proxy_name, "NatHoleClient without visitor_addr for '{}'", proxy_name);
+            Self::send_nat_hole_report(writer, v2, sid.clone(), false, "no visitor_addr").await;
+            return;
+        }
+
+        // Go v0.70 compat: UDP hole punch + KCP data plane.
+        // Bind socket FIRST (before sending NatHoleSid) so the UDP port
+        // is ready when the visitor starts sending probe packets.
+        // Go frp compat: bind UDP before sending NatHoleSid notification.
+        let is_v4 = visitor_addr
+            .parse::<std::net::SocketAddr>()
+            .map(|a| a.is_ipv4())
+            .unwrap_or(false);
+        let bind_addr = if is_v4 { "0.0.0.0:0" } else { "[::]:0" };
+        let fallback = if is_v4 { "[::]:0" } else { "0.0.0.0:0" };
+        let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(_) => match tokio::net::UdpSocket::bind(fallback).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(proxy_name = %proxy_name, error = %e, "XTCP: failed to bind UDP socket: {}", e);
+                    Self::send_nat_hole_report(writer, v2, sid, false, "bind failed").await;
+                    return;
+                }
+            },
+        };
+
+        // Send NatHoleSid now that the UDP socket is bound and ready.
+        let sid_msg = FrpMessage::NatHoleSid(msg::NatHoleSid {
+            sid: Some(sid.clone()),
+            ..Default::default()
+        });
+        if let Err(e) = write_msg(&mut *writer.lock().await, &sid_msg, v2).await {
+            warn!(error = %e, "Failed to send NatHoleSid: {}", e);
+            return;
+        }
+
+        // Spawn the blocking P2P connection + bridging into a detached task
+        // so it doesn't starve the control loop's ping/health/reload handling.
+        let w = writer.clone();
+        tokio::spawn(async move {
+            let candidates = vec![visitor_addr];
+            let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
+            let kcp_cfg = frp_core::kcp::default_kcp_config();
+            let p2p_key = if !xtcp_sk.is_empty() {
+                Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
+            } else {
+                None
+            };
+            let p2p_sid2 = if sid.is_empty() {
+                None
+            } else {
+                Some(sid.as_str())
+            };
+
+            // Legacy NatHoleClient path (no server detect_behavior): the
+            // simplified punch. candidate_addrs must be the visitor's mapped
+            // address (Go `mapped_addrs`); previously it was passed as
+            // candidates=&[]/assisted, which always failed with
+            // "no candidate addresses" — the provider never hole-punched.
+            match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                socket,
+                &candidates,
+                &[],
+                None,
+                conv,
+                kcp_cfg,
+                5000,
+                false, // yamux_client = false (provider/server)
+                p2p_sid2,
+                p2p_key.as_ref(),
+            )
+            .await
+            {
+                Ok(mut p2p_stream) => {
+                    // Send NatHoleReport with success=true after successful hole punch
+                    // (Go frp compat: provider reports hole punch result to server)
+                    Self::send_nat_hole_report(&w, v2, sid.clone(), true, "hole punch succeeded")
+                        .await;
+                    if let Some(ref local) = local_addr {
+                        match tokio::net::TcpStream::connect(local).await {
+                            Ok(local_stream) => {
+                                frp_core::transport::set_nodelay(&local_stream);
+                                let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                                let use_comp = xtcp_use_comp;
+                                let sk = xtcp_sk.clone();
+                                let pn = proxy_name.clone();
+                                tokio::spawn(async move {
+                                    let (local_r, local_w) = local_stream.into_split();
+                                    let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
+                                    if use_enc {
+                                        let key = frp_core::encryption::derive_key(&sk);
+                                        frp_core::bridge::bridge_encrypted(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            &key,
+                                            use_comp,
+                                            vec![],
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                    } else {
+                                        frp_core::bridge::bridge_plain(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            use_comp,
+                                            vec![],
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                    debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
+                                });
+                            }
+                            Err(e) => {
+                                warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
+                                Self::send_nat_hole_report(
+                                    &w,
+                                    v2,
+                                    sid,
+                                    false,
+                                    "connect local failed",
+                                )
+                                .await;
+                            }
+                        }
+                    } else {
+                        warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address", proxy_name);
+                        Self::send_nat_hole_report(&w, v2, sid, false, "no local addr").await;
+                    }
+                }
+                Err(e) => {
+                    warn!(proxy_name = %proxy_name, error = %e, "XTCP hole punch for '{}' failed: {}", proxy_name, e);
+                    Self::send_nat_hole_report(&w, v2, sid, false, "hole punch failed").await;
+                }
+            }
+        });
+    }
+
+    /// Build and send a NatHoleReport for `sid`; log at debug on failure.
+    /// `reason` labels the failure context in the log line.
+    pub(crate) async fn send_nat_hole_report(
+        writer: &Arc<Mutex<WriteHalf>>,
+        v2: bool,
+        sid: String,
+        success: bool,
+        reason: &str,
+    ) {
+        let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+            sid: Some(sid),
+            success,
+        });
+        if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+            debug!(error = %e, "Failed to send NatHoleReport ({reason})");
+        }
+    }
+
+    /// Handle a NatHoleResp message from the server (XTCP response).
+    ///
+    /// Routes to waiting visitor (by transaction_id) or spawns provider hole
+    /// punch task (by sid). Provider side iterates candidate addresses from
+    /// the server's NAT analysis.
+    pub(crate) async fn handle_nat_hole_resp(
+        &self,
+        resp: msg::NatHoleResp,
+        pending_xtcp: &mut HashMap<String, String>,
+        visitor_pending: &mut HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>>,
+        xtcp_sockets: &std::sync::Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+            >,
+        >,
+        writer: &Arc<Mutex<WriteHalf>>,
+    ) {
+        // Route to waiting visitor first (Go frps compat path).
+        let txn_id = resp.transaction_id.clone();
+        if !txn_id.is_empty() {
+            if let Some(tx) = visitor_pending.remove(&txn_id) {
+                info!(transaction_id = %txn_id, "XTCP visitor: received NatHoleResp for txn '{}'", txn_id);
+                let _ = tx.send(Ok(resp));
+                return;
+            }
+        }
+        // Fall through: route to provider by server sid
+        let sid = resp.sid.clone().unwrap_or_default();
+        if let Some(err) = resp.error {
+            warn!(error = %err, "XTCP NatHoleResp error: {}", err);
+            if let Some(ref sid) = resp.sid {
+                pending_xtcp.remove(sid);
+            }
+            return;
+        }
+        let proxy_name = pending_xtcp.remove(&sid).unwrap_or_default();
+        if proxy_name.is_empty() {
+            warn!(sid = %sid, "XTCP NatHoleResp: unknown sid '{}'", sid);
+            return;
+        }
+        let candidate_addrs = resp.candidate_addrs.unwrap_or_default();
+        let assisted_addrs = resp.assisted_addrs.unwrap_or_default();
+        let detect_behavior = resp.detect_behavior.clone();
+        let p2p_protocol = resp.protocol.clone().unwrap_or_default();
+        info!(proxy_name = %proxy_name, candidate_count = %candidate_addrs.len(), "XTCP provider '{}': received {} candidate addresses from server",
+            proxy_name, candidate_addrs.len());
+
+        // Go frp v0.69.1 compat: use ReadTimeoutMs from the server's
+        // NatHoleResp.detect_behavior as the hole-punch timeout, not a
+        // hardcoded 5000ms. The server computes this as max(SendDelayMs) + 5000
+        // (+30000 if listen_random_ports) minus the side's own send_delay.
+        // Default to 5000ms if detect_behavior is not available.
+        let hole_punch_timeout = resp
+            .detect_behavior
+            .as_ref()
+            .map(|db| db.read_timeout_ms.max(0) as u64)
+            .unwrap_or(5000);
+
+        // Spawn hole punch task (don't block control loop)
+        let proxy_info = self.proxy_info_map.read().await.get(&proxy_name).map(|p| {
+            (
+                p.local_addr.clone(),
+                p.use_encryption,
+                p.use_compression,
+                p.sk.clone(),
+            )
+        });
+        let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
+        let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
+        let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
+        let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
+        let proxy_name_clone = proxy_name.clone();
+        let sid_clone = sid.clone();
+        let xtcp_sockets_clone = xtcp_sockets.clone();
+        let hp_timeout = hole_punch_timeout;
+        let resp_writer = writer.clone();
+        let resp_v2 = self.cfg.read().await.v2;
+        tokio::spawn(async move {
+            // Retrieve the STUN socket persisted by the control loop.
+            let stun_socket = {
+                let mut map = xtcp_sockets_clone.lock().await;
+                map.remove(&sid_clone)
+            };
+
+            // Bind socket address family matching the first candidate to avoid
+            // IPv4/IPv6 mismatch (EINVAL on macOS).
+            let is_v4 = candidate_addrs
+                .first()
+                .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                .map(|a| a.is_ipv4())
+                .unwrap_or(false);
+            let bind_addr = if is_v4 { "0.0.0.0:0" } else { "[::]:0" };
+            let fallback_bind = if is_v4 { "[::]:0" } else { "0.0.0.0:0" };
+
+            let socket = if let Some(arc_sock) = stun_socket {
+                // Try to unwrap the Arc. If there are other references,
+                // bind a fresh socket (unlikely — we removed from map).
+                match std::sync::Arc::try_unwrap(arc_sock) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': STUN socket still shared, binding fresh", proxy_name_clone);
+                        match tokio::net::UdpSocket::bind(bind_addr).await {
+                            Ok(s) => s,
+                            Err(_) => match tokio::net::UdpSocket::bind(fallback_bind).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': failed to bind UDP socket", proxy_name_clone);
+                                    return;
+                                }
+                            },
+                        }
+                    }
+                }
+            } else {
+                match tokio::net::UdpSocket::bind(bind_addr).await {
+                    Ok(s) => s,
+                    Err(_) => match tokio::net::UdpSocket::bind(fallback_bind).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': failed to bind UDP socket", proxy_name_clone);
+                            return;
+                        }
+                    },
+                }
+            };
+
+            // UDP hole punch + KCP data plane (Go v0.70 compat).
+            let conv = frp_core::xtcp_p2p::conv_from_sid(&sid_clone);
+            let kcp_cfg = frp_core::kcp::default_kcp_config();
+            let p2p_key = if !xtcp_sk.is_empty() {
+                Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
+            } else {
+                None
+            };
+            let p2p_sid = if sid_clone.is_empty() {
+                None
+            } else {
+                Some(sid_clone.as_str())
+            };
+            // Data-plane protocol dispatch: the server echoes the visitor's
+            // `protocol` (NatHoleVisitor → NatHoleResp) back to both peers.
+            // Go v0.70.1 visitors default to "quic"; a Rust visitor's
+            // `protocol` config field selects it. Anything else (incl. "" or
+            // "tcp") falls through to the KCP+yamux data plane.
+            //
+            // Provider roles: yamux server (accepts the visitor's yamux
+            // stream) or QUIC server (accepts the QUIC connection + stream).
+            // Go v0.70.1 semantics: candidate_addrs = the peer's mapped addrs,
+            // assisted_addrs = the peer's assisted addrs, and the server's
+            // detect_behavior drives the MakeHole probe. (Previously these were
+            // passed as candidates=&[]/behavior=None, which made the simplified
+            // punch fail with "no candidate addresses" — the provider never
+            // actually hole-punched.)
+            let p2p_stream: Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> =
+                match p2p_protocol.as_str() {
+                    "quic" => {
+                        #[cfg(all(feature = "quic", feature = "kcp"))]
+                        {
+                            match frp_core::xtcp_p2p::xtcp_p2p_connect_quic(
+                                socket,
+                                &candidate_addrs,
+                                &assisted_addrs,
+                                detect_behavior.as_ref(),
+                                hp_timeout,
+                                p2p_sid,
+                                p2p_key.as_ref(),
+                                true, // is_server = true (provider is QUIC server)
+                            )
+                            .await
+                            {
+                                Ok(s) => Ok(Box::new(s) as Box<_>),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        #[cfg(not(all(feature = "quic", feature = "kcp")))]
+                        {
+                            warn!(proxy_name = %proxy_name_clone,
+                            "XTCP provider '{}': protocol 'quic' requested but the quic feature is disabled; refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
+                            proxy_name_clone);
+                            Err(format!(
+                                "XTCP provider '{}': protocol 'quic' requires the quic feature",
+                                proxy_name_clone
+                            ))
+                        }
+                    }
+                    _ => match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                        socket,
+                        &candidate_addrs,
+                        &assisted_addrs,
+                        detect_behavior.as_ref(),
+                        conv,
+                        kcp_cfg,
+                        hp_timeout,
+                        false, // yamux_client = false (provider/server)
+                        p2p_sid,
+                        p2p_key.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(s) => Ok(Box::new(s) as Box<_>),
+                        Err(e) => Err(e),
+                    },
+                };
+            match p2p_stream {
+                Ok(mut p2p_stream) => {
+                    // Send NatHoleReport with success=true after successful hole punch
+                    // (Go frp compat: provider reports hole punch result to server).
+                    let ok_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                        sid: Some(sid_clone.clone()),
+                        success: true,
+                    });
+                    let mut w = resp_writer.lock().await;
+                    let _ = frp_core::protocol::write_msg(&mut *w, &ok_report, resp_v2).await;
+                    drop(w);
+                    info!(proxy_name = %proxy_name_clone, protocol = %p2p_protocol, "XTCP provider '{}': P2P connected", proxy_name_clone);
+                    if let Some(ref local) = local_addr {
+                        match tokio::net::TcpStream::connect(local).await {
+                            Ok(local_conn) => {
+                                frp_core::transport::set_nodelay(&local_conn);
+                                let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                                let (local_r, local_w) = local_conn.into_split();
+                                let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
+                                if use_enc {
+                                    let key = frp_core::encryption::derive_key(&xtcp_sk);
+                                    frp_core::bridge::bridge_encrypted(
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        &key,
+                                        xtcp_use_comp,
+                                        vec![],
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                                } else {
+                                    frp_core::bridge::bridge_plain(
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        xtcp_use_comp,
+                                        vec![],
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
+                            }
+                            Err(e) => {
+                                warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': connect local failed", proxy_name_clone);
+                                let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                                    sid: Some(sid_clone.clone()),
+                                    success: false,
+                                });
+                                let mut w = resp_writer.lock().await;
+                                let _ =
+                                    frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2)
+                                        .await;
+                                drop(w);
+                            }
+                        }
+                    } else {
+                        warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': no local address", proxy_name_clone);
+                        let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                            sid: Some(sid_clone.clone()),
+                            success: false,
+                        });
+                        let mut w = resp_writer.lock().await;
+                        let _ = frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2).await;
+                        drop(w);
+                    }
+                }
+                Err(e) => {
+                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': UDP hole punch + data plane connect failed", proxy_name_clone);
+                    let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                        sid: Some(sid_clone.clone()),
+                        success: false,
+                    });
+                    let mut w = resp_writer.lock().await;
+                    let _ = frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2).await;
+                    drop(w);
+                }
+            }
+        });
+    }
+}
+
+/// List local non-loopback IPv4 addresses for NAT hole punching.
+/// Go frp v0.69.1 compat: nathole.ListLocalIPsForNatHole.
+///
+/// Enumerates local network interfaces and returns up to `max_items`
+/// non-loopback, non-link-local IPv4 addresses. On Linux, reads from
+/// /proc/net/fib_trie, with a fallback to `ip -o -4 addr show`. On
+/// macOS, uses `/sbin/ifconfig`. On other platforms (e.g. Windows),
+/// returns an empty vec.
+pub(crate) fn list_local_ips_for_nat_hole(max_items: usize) -> Vec<String> {
+    // Cache with 30s TTL: the XTCP provider path calls this once per
+    // provider session, and each call re-reads /proc/net/fib_trie (or spawns
+    // /sbin/ifconfig / `ip` subprocesses on the fallback paths). Local IPs
+    // change rarely; the refresh cadence mirrors the visitor path's 30s TTL
+    // cache in visitor.rs. Keyed on max_items so a caller asking for more
+    // entries than the cached result holds never gets a short answer.
+    static CACHE: std::sync::Mutex<Option<(usize, Vec<String>, Instant)>> =
+        std::sync::Mutex::new(None);
+    {
+        if let Ok(cache) = CACHE.lock() {
+            if let Some((ref cached_max, ref ips, ref time)) = *cache {
+                if *cached_max == max_items && time.elapsed() < std::time::Duration::from_secs(30) {
+                    return ips.clone();
+                }
+            }
+        }
+    }
+
+    let mut ips: Vec<String> = Vec::new();
+
+    // Linux: parse /proc/net/fib_trie for local IPs
+    #[cfg(target_os = "linux")]
+    {
+        if ips.len() < max_items {
+            if let Ok(content) = std::fs::read_to_string("/proc/net/fib_trie") {
+                let mut in_local = false;
+                for line in content.lines() {
+                    if ips.len() >= max_items {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed == "Local:" {
+                        in_local = true;
+                        continue;
+                    }
+                    if in_local && trimmed.is_empty() {
+                        break;
+                    }
+                    if in_local {
+                        // Lines with "|" under "Local:" section contain local IPs
+                        if let Some(ip_part) = trimmed
+                            .strip_prefix('|')
+                            .or_else(|| trimmed.strip_prefix("+-"))
+                        {
+                            for word in ip_part.split_whitespace() {
+                                if let Ok(ip) = word.parse::<std::net::Ipv4Addr>() {
+                                    if !ip.is_loopback()
+                                        && !ip.is_link_local()
+                                        && !ip.is_multicast()
+                                    {
+                                        ips.push(ip.to_string());
+                                    }
+                                    break; // first valid IP per line
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Linux fallback: `ip -o -4 addr show`
+    #[cfg(target_os = "linux")]
+    {
+        if ips.is_empty() {
+            if let Ok(output) = std::process::Command::new("ip")
+                .args(["-o", "-4", "addr", "show"])
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if ips.len() >= max_items {
+                            break;
+                        }
+                        // Format: "1: lo    inet 127.0.0.1/8 scope host lo"
+                        // We want the "inet" line with the IP address
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        for part in &parts {
+                            if let Some(ip_str) = part.split('/').next() {
+                                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                                    if !ip.is_loopback()
+                                        && !ip.is_link_local()
+                                        && !ip.is_multicast()
+                                    {
+                                        ips.push(ip.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // macOS fallback: parse ifconfig output
+    #[cfg(target_os = "macos")]
+    {
+        if ips.is_empty() {
+            if let Ok(output) = std::process::Command::new("/sbin/ifconfig").output() {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if ips.len() >= max_items {
+                            break;
+                        }
+                        let trimmed = line.trim();
+                        if let Some(ip_str) = trimmed.strip_prefix("inet ") {
+                            let fields: Vec<&str> = ip_str.split_whitespace().collect();
+                            if let Some(addr) = fields.first() {
+                                if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+                                    if !ip.is_loopback()
+                                        && !ip.is_link_local()
+                                        && !ip.is_multicast()
+                                    {
+                                        ips.push(ip.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Update cache. Empty results are NOT cached: the first call in a
+    // container where /proc/net/fib_trie is unreadable would otherwise pin
+    // an empty list for the 30s TTL, masking a later re-read that succeeds
+    // (e.g. once the `ip` fallback works or the network comes up).
+    if !ips.is_empty() {
+        if let Ok(mut cache) = CACHE.lock() {
+            *cache = Some((max_items, ips.clone(), Instant::now()));
+        }
+    }
+
+    ips
+}

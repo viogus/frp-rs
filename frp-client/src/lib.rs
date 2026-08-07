@@ -6,6 +6,7 @@ pub mod admin;
 pub mod backoff;
 pub mod control;
 pub mod health;
+pub mod nat_hole;
 pub mod plugin;
 pub mod proxy;
 pub mod proxy_runtime;
