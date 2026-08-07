@@ -582,14 +582,15 @@ async fn handle_http1_request<S>(
     // `host`/`path` must still be owned Strings: `pre_read` is moved by
     // value into `resolve_vhost_request` below, so we cannot keep references
     // into it across that call.
-    // Strict UTF-8: HTTP request heads are ASCII; a non-UTF-8 head is malformed
-    // and rejected with 400 instead of being lossy-replaced (also avoids the
-    // Cow allocation branch).
-    let request_text = match std::str::from_utf8(&pre_read) {
+    // Zero-allocation parse for the common ASCII case; fall back to lossy
+    // replacement for non-UTF-8 heads. A 400 here would diverge from Go frp,
+    // which tolerates obs-text (0x80-0xFF) bytes in header values.
+    let request_text_cow;
+    let request_text: &str = match std::str::from_utf8(&pre_read) {
         Ok(t) => t,
         Err(_) => {
-            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-            return;
+            request_text_cow = String::from_utf8_lossy(&pre_read);
+            &request_text_cow
         }
     };
     let host = match extract_host_header(request_text) {
