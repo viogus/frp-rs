@@ -17,8 +17,15 @@ use crate::cipher_stream::CipherStream;
 use crate::crypto::AeadStream;
 use crate::mux::YamuxStream;
 
+mod aead;
 mod buffered_read;
+mod cipher;
+#[cfg(feature = "kcp")]
+mod kcp;
 mod pre_read;
+#[cfg(feature = "quic")]
+mod quic;
+mod ssh_channel;
 mod tcp;
 #[cfg(feature = "tls")]
 mod tls;
@@ -28,6 +35,7 @@ mod yamux;
 
 use buffered_read::BufferedReadTransport;
 use pre_read::PreReadTransport;
+use ssh_channel::SshChannelTransport;
 #[cfg(feature = "tls")]
 pub use tls::*;
 #[cfg(feature = "websocket")]
@@ -505,94 +513,7 @@ impl AsyncWrite for IoStream {
 
 // TlsTransport and the TLS builders live in `tls.rs`.
 
-#[cfg(feature = "kcp")]
-impl Transport for KcpStream {
-    fn debug_name(&self) -> &'static str {
-        "IoStream::Kcp"
-    }
-}
-
-#[cfg(feature = "quic")]
-impl Transport for QuicStream {
-    fn debug_name(&self) -> &'static str {
-        "IoStream::Quic"
-    }
-    fn is_yamux_wrappable(&self) -> bool {
-        false
-    }
-    fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
-        let (r, w) = QuicStream::into_split(*self);
-        Ok((Box::new(r), Box::new(w)))
-    }
-}
-
 // YamuxStream's impl lives in `yamux.rs`.
-
-/// AES-128-CFB encrypted transport (the wrapped inner is any other
-/// [`Transport`]). Created by [`IoStream::into_encrypted`] after login.
-impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for CipherStream<S> {
-    fn debug_name(&self) -> &'static str {
-        "IoStream::Cipher"
-    }
-    fn into_encrypted(self: Box<Self>, _key: [u8; 16]) -> Box<dyn Transport> {
-        // A Cipher stream is never re-encrypted in practice (into_encrypted
-        // runs on the freshly-dialed login stream); returning self unchanged
-        // also keeps the blanket `Transport for CipherStream<S>` from
-        // recursing through the default wrap.
-        self
-    }
-    fn bridge_split_err(&self) -> Option<&'static str> {
-        Some("Cipher stream unexpected in bridge")
-    }
-}
-
-impl Transport for AeadStream {
-    fn debug_name(&self) -> &'static str {
-        "IoStream::Aead"
-    }
-    fn into_encrypted(self: Box<Self>, _key: [u8; 16]) -> Box<dyn Transport> {
-        // Already AEAD-encrypted (V2 with crypto). Don't double-wrap.
-        self
-    }
-    fn bridge_split_err(&self) -> Option<&'static str> {
-        Some("Aead stream unexpected in bridge")
-    }
-}
-
-/// SSH reverse-forward channel transport (type-erased byte stream).
-pub struct SshChannelTransport(Box<dyn AsyncReadWrite>);
-
-impl AsyncRead for SshChannelTransport {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for SshChannelTransport {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
-    }
-}
-
-impl Transport for SshChannelTransport {
-    fn debug_name(&self) -> &'static str {
-        "IoStream::SshChannel"
-    }
-}
 
 // PreReadTransport lives in `pre_read.rs`.
 // BufferedReadTransport lives in `buffered_read.rs`.
