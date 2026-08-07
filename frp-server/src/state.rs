@@ -620,8 +620,15 @@ impl AppState {
 
         // Cap: refuse new entries when the map is full. Check BEFORE
         // calling entry() to avoid a borrow conflict with the mutable ref.
+        // Table full and this IP is not tracked: refuse instead of silently
+        // allowing an untracked IP to bypass the limit — 512 pre-registered
+        // IPs would otherwise open an unlimited brute-force window for any
+        // new IP. The caller (login failure path) treats `false` as throttled.
+        // Trade-off: while full, new IPs are rejected for up to 90s; 512+
+        // distinct failed IPs within that window is abnormal, so brief
+        // collateral rejection of legit new IPs is acceptable.
         if !throttle.contains_key(&ip) && throttle.len() >= MAX_THROTTLE_ENTRIES {
-            return true; // Silently allow — existing entries stay throttled.
+            return false;
         }
 
         let (count, window_start) = throttle.entry(ip).or_insert((0, now));
