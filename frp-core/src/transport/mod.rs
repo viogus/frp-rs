@@ -35,6 +35,12 @@ use rustls_platform_verifier::BuilderVerifierExt;
 #[cfg(feature = "tls")]
 use rustls_platform_verifier::ConfigVerifierExt;
 
+mod buffered_read;
+mod tcp;
+mod yamux;
+
+use buffered_read::BufferedReadTransport;
+
 /// Go frp v0.69.1 FRPTLSHeadByte — sent before TLS handshake to allow
 /// mixed TLS/plaintext on the same port.
 pub const FRP_TLS_HEAD_BYTE: u8 = 0x17;
@@ -1340,23 +1346,7 @@ impl AsyncWrite for IoStream {
 // Per-transport Transport impls (one per old enum variant)
 // ---------------------------------------------------------------
 
-impl Transport for TcpStream {
-    fn debug_name(&self) -> &'static str {
-        "IoStream::Tcp"
-    }
-    fn peer_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr().ok()
-    }
-    fn try_tcp(&self) -> Option<&TcpStream> {
-        Some(self)
-    }
-    fn try_tcp_mut(&mut self) -> Option<&mut TcpStream> {
-        Some(self)
-    }
-    fn into_tcp(self: Box<Self>) -> Option<TcpStream> {
-        Some(*self)
-    }
-}
+// TcpStream's impl lives in `tcp.rs`.
 
 /// TLS-wrapped transport. Holds a type-erased inner stream (any TLS-wrapped
 /// transport — plain TCP, PreRead, KCP) plus the peer address recorded at
@@ -1448,16 +1438,7 @@ impl Transport for WsByteStream {
     }
 }
 
-// Real (tcp-mux on) and stub (tcp-mux off) YamuxStream both get the impl;
-// only one compiles at a time.
-impl Transport for YamuxStream {
-    fn debug_name(&self) -> &'static str {
-        "IoStream::Yamux"
-    }
-    fn into_yamux(self: Box<Self>) -> Option<YamuxStream> {
-        Some(*self)
-    }
-}
+// YamuxStream's impl lives in `yamux.rs`.
 
 /// AES-128-CFB encrypted transport (the wrapped inner is any other
 /// [`Transport`]). Created by [`IoStream::into_encrypted`] after login.
@@ -1605,87 +1586,7 @@ impl Transport for PreReadTransport {
     }
 }
 
-/// Buffered byte-replay transport: serves `buf[pos..]` first, then delegates
-/// to the inner transport. Used when V2 magic is detected on a yamux stream:
-/// if the bytes are NOT V2 magic, they're buffered and replayed for V1
-/// processing.
-pub struct BufferedReadTransport {
-    buf: Vec<u8>,
-    pos: usize,
-    inner: Box<dyn Transport>,
-}
-
-impl BufferedReadTransport {
-    pub fn new(buf: Vec<u8>, pos: usize, inner: Box<dyn Transport>) -> Self {
-        Self { buf, pos, inner }
-    }
-}
-
-impl AsyncRead for BufferedReadTransport {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.pos < self.buf.len() {
-            let remaining = &self.buf[self.pos..];
-            let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            self.pos += n;
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for BufferedReadTransport {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-impl Transport for BufferedReadTransport {
-    fn debug_name(&self) -> &'static str {
-        "IoStream::BufferedRead"
-    }
-    fn peer_addr(&self) -> Option<SocketAddr> {
-        self.inner.peer_addr()
-    }
-    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> Box<dyn Transport> {
-        // Buffered bytes are preserved inside the returned Cipher wrapper;
-        // they will be replayed before encrypted reads begin.
-        let BufferedReadTransport { buf, pos, inner } = *self;
-        assert!(
-            pos >= buf.len(),
-            "into_encrypted called before buffered bytes consumed"
-        );
-        Box::new(BufferedReadTransport {
-            buf,
-            pos,
-            inner: inner.into_encrypted(key),
-        })
-    }
-    fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
-        let BufferedReadTransport { buf, pos, inner } = *self;
-        if pos < buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "into_split called with buffered bytes",
-            ));
-        }
-        inner.into_split()
-    }
-}
+// BufferedReadTransport lives in `buffered_read.rs`.
 
 /// Split an `IoStream` into boxed read/write halves for bridging.
 ///
