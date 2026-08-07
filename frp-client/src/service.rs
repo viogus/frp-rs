@@ -1552,15 +1552,30 @@ impl Service {
                                     }
                                     // Inject OS route so the kernel sends matching packets
                                     // through the TUN device instead of the default gateway.
-                                    // The TUN is looked up by the proxy that advertised the
-                                    // route (vnet_tun_names is keyed by proxy_name) — the old
-                                    // code took an arbitrary TUN from the map, which could
-                                    // point the route at the wrong interface when multiple
-                                    // vnet proxies/TUNs exist.
+                                    // vnet_tun_names is keyed by *local* proxy name, while
+                                    // adv.proxy_name is the *remote* peer's name — so match
+                                    // by virtual_net (the route's isolation domain, already
+                                    // validated above) instead of by name. The local vnet
+                                    // proxy owning that virtual net is the one whose TUN must
+                                    // carry this route; with no local TUN for the net (e.g.
+                                    // this client is only a visitor) there is nothing to
+                                    // inject, which is correct — the old code grabbed an
+                                    // arbitrary TUN and silently misrouted.
                                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                                     {
+                                        let local_tun_proxy: Option<String> = {
+                                            let cfg = self.cfg.read().await;
+                                            cfg.proxies
+                                                .iter()
+                                                .find(|p| {
+                                                    p.proxy_type == "vnet" && p.virtual_net == vnet
+                                                })
+                                                .map(|p| p.name.clone())
+                                        };
                                         let names = self.vnet_tun_names.lock().await;
-                                        if let Some(tun_name) = names.get(&adv.proxy_name) {
+                                        if let Some(tun_name) =
+                                            local_tun_proxy.as_deref().and_then(|n| names.get(n))
+                                        {
                                             add_os_route(&adv.subnet, tun_name);
                                             self.vnet_peer_routes.lock().await.insert(
                                                 adv.proxy_name.clone(),
@@ -1571,7 +1586,12 @@ impl Service {
                                                 ),
                                             );
                                         } else {
-                                            warn!(proxy_name = %adv.proxy_name, "vnet route advertise: no TUN registered for proxy '{}' — skipping OS route", adv.proxy_name);
+                                            debug!(
+                                                vnet,
+                                                proxy_name = %adv.proxy_name,
+                                                "vnet route advertise: no local TUN for virtual net '{}' — skipping OS route",
+                                                vnet
+                                            );
                                         }
                                     }
                                 }

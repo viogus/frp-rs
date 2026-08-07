@@ -51,6 +51,10 @@ const UNACCEPTED_SESSION_TIMEOUT_MS: u32 = 30_000; // 30 seconds
 /// Session-creation rate window (ms). Bursts of brand-new sessions are
 /// limited per window so a UDP packet flood cannot fill the 256-entry
 /// accept queue (or the session table) faster than legitimate handshakes.
+/// Timestamps are `elapsed().as_millis() as u32`; age checks use
+/// `wrapping_sub` so the counter's 2^32-ms (~49.7-day) wrap is handled
+/// the same way as the `session_created_at` cleanup (window << wrap
+/// period, so wrapping subtraction yields the correct elapsed time).
 const SESSION_CREATE_WINDOW_MS: u32 = 10_000;
 
 /// Max new sessions the driver accepts per window across all peers.
@@ -273,7 +277,7 @@ impl KcpSocket {
                     // rate window expires.
                     self.ip_session_create_log.retain(|_, log| {
                         while let Some(&t) = log.front() {
-                            if now_ms.saturating_sub(t) > SESSION_CREATE_WINDOW_MS {
+                            if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
                                 log.pop_front();
                             } else {
                                 break;
@@ -430,7 +434,7 @@ impl KcpSocket {
                                     let now_ms = self.start.elapsed().as_millis() as u32;
                                     // Trim global log outside the window.
                                     while let Some(&t) = self.session_create_log.front() {
-                                        if now_ms.saturating_sub(t) > SESSION_CREATE_WINDOW_MS {
+                                        if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
                                             self.session_create_log.pop_front();
                                         } else {
                                             break;
@@ -446,7 +450,7 @@ impl KcpSocket {
                                     {
                                         let log = self.ip_session_create_log.entry(ip).or_default();
                                         while let Some(&t) = log.front() {
-                                            if now_ms.saturating_sub(t) > SESSION_CREATE_WINDOW_MS {
+                                            if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
                                                 log.pop_front();
                                             } else {
                                                 break;
@@ -686,5 +690,34 @@ impl KcpSocket {
             return (conv, src);
         }
         (0, src)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SESSION_CREATE_WINDOW_MS;
+
+    /// The rate-limit trim uses `now.wrapping_sub(ts) > WINDOW` (same
+    /// convention as `session_created_at` cleanup) so the u32-ms clock's
+    /// 2^32-ms (~49.7-day) wrap cannot wedge the creation logs full and
+    /// permanently reject new sessions. Verify the arithmetic both before
+    /// and after the wrap.
+    #[test]
+    fn rate_window_age_handles_u32_wrap() {
+        let window = SESSION_CREATE_WINDOW_MS;
+        // Before wrap: 5 s before wrap, timestamps recorded 3 s / 60 s earlier.
+        let now = u32::MAX - 5_000;
+        let fresh = now - 3_000; // 3 s old → inside window
+        assert!(now.wrapping_sub(fresh) <= window);
+        let old = now - 60_000; // 60 s old → outside window
+        assert!(now.wrapping_sub(old) > window);
+
+        // After wrap: clock wrapped to 5 s; ts recorded 1 s before the wrap
+        // (~6 s elapsed) and 60 s before the wrap (~65 s elapsed).
+        let now_wrapped = 5_000u32;
+        let just_before_wrap = u32::MAX - 1_000;
+        assert!(now_wrapped.wrapping_sub(just_before_wrap) <= window);
+        let long_ago = u32::MAX - 60_000;
+        assert!(now_wrapped.wrapping_sub(long_ago) > window);
     }
 }
