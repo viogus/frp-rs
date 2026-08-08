@@ -525,11 +525,11 @@ async fn run_udp_work_conn(
         // sends on `&Arc<UdpSocket>` from here instead of cloning the Arc out
         // of the shared `sessions` map (an atomic refcount inc/dec pair per
         // packet). Invariant: an entry is (re)inserted in the same bind path
-        // that (re)inserts into `sessions` and is never removed, so a
-        // shared-map hit implies a mirror hit. A reaped session may leave a
-        // stale mirror entry (an inert connected socket — never sent on or
-        // read); the next packet from that remote misses the shared map,
-        // re-creates the session, and replaces the entry.
+        // that (re)inserts into `sessions`, so a shared-map hit implies a
+        // mirror hit. A reaped session may leave a stale mirror entry until
+        // the next periodic sweep (every ~5s); the next packet from that
+        // remote misses the shared map, re-creates the session, and replaces
+        // the entry.
         let mut reader_socks: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
         loop {
             tokio::select! {
@@ -715,6 +715,18 @@ async fn run_udp_work_conn(
                     if !session_alive_r.load(Ordering::Acquire) {
                         debug!(proxy_name = %pn_r, "UDP reader '{}': session dead, stopping", pn_r);
                         break;
+                    }
+                    // Sweep stale mirror entries for sessions reaped by the
+                    // idle timeout. Without this, the per-remote connected UDP
+                    // sockets accumulate FDs and ephemeral ports for the work
+                    // conn's lifetime — bounded only by distinct remotes seen.
+                    {
+                        let map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                        reader_socks.retain(|_k, v| {
+                            // retain by value: keep only entries whose Arc
+                            // still matches a live session entry.
+                            map.values().any(|e| Arc::ptr_eq(&e.socket, v))
+                        });
                     }
                 }
             }
