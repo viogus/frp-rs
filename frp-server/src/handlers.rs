@@ -2773,7 +2773,7 @@ pub(crate) async fn handle_quic_stream(
 /// Spawn a drain task that accepts additional QUIC streams as work connections.
 /// Returns a `CancellationToken` — call `.cancel()` to stop the drain loop.
 #[cfg(feature = "quic")]
-pub(crate) fn spawn_quic_drain(
+fn spawn_quic_drain(
     conn: frp_core::quic::QuicConnection,
     state: Arc<AppState>,
     tag: &'static str,
