@@ -166,7 +166,10 @@ for each UDP proxy.
 
 ### Encryption & Compression
 
-Not supported (same as UDP).
+Encryption is supported with the Go-frp three-segment model (see the SUDP
+Visitor section below): the visitor segment is encrypted with `derive_key(sk)`,
+the provider segment with `derive_key(auth token)`. Compression is not
+supported on the SUDP data plane.
 
 ### Health Checks
 
@@ -183,6 +186,59 @@ Server-level fields (`frps.toml`):
 | Field | Description |
 |-------|-------------|
 | `sudp_port` | Port all SUDP proxies share. When set, `remote_port` on each SUDP proxy is overridden to this value. |
+
+### SUDP Visitor (frpc)
+
+A SUDP visitor (`[[visitors]]` with `type = "sudp"`) binds a local UDP port on the client and tunnels datagrams to a remote SUDP provider through the frps server. It mirrors Go frp's `client/visitor/sudp.go`:
+
+```toml
+# frpc.toml
+[[visitors]]
+name = "game-visitor"
+type = "sudp"
+server_name = "game-server-1"   # the SUDP proxy name registered by the provider
+secret_key = "shared-sk"        # must match the provider's sk
+bind_addr = "127.0.0.1"
+bind_port = 27015               # local UDP port to listen on
+```
+
+### Data Flow
+
+```
+Local client → visitor frpc:27015/UDP → [NewVisitorConn + UDPPacket on work conn] → frps → provider frpc → 10.0.0.1:27015/UDP
+```
+
+- **Lazy tunnel:** no server connection is held until the first datagram arrives; the first datagram triggers a fresh `NewVisitorConn` handshake over a dedicated connection to the server. After the tunnel closes (disconnect or 60s idle timeout) the visitor returns to the wait state and the next datagram reconnects.
+- The shared UDP socket is multiplexed by datagram source address: replies are sent back to the `UdpAddr` source, and outbound datagrams carry their own source address in `UDPPacket.remote_addr`.
+
+### Encryption & Compression
+
+The SUDP data plane is encrypted end-to-end with Go-frp's three-segment
+model: the **visitor segment** (visitor frpc ↔ frps) is AES-128-CFB stream
+encryption keyed by `derive_key(sk)`, the **provider segment** (frps ↔ provider
+frpc) by `derive_key(auth token)`, and frps joins the two decrypted streams in
+the middle. `use_encryption` is honored on both the visitor and the provider;
+`use_compression` is accepted but ignored on SUDP (Go's streaming-compression
+model for the per-packet plane is not unified here yet).
+
+Cross-compat: a Go frpc `sudp` visitor (with `transport.useEncryption = true`)
+works against a Rust frps + Rust provider, and a Rust visitor works against a
+Rust stack. The reverse direction (any visitor → Go frps) is **not supported by
+Go itself**: Go v0.70.1's server-side `UDPProxy` never registers the
+visitor-manager listener its own `sudp` visitor type requires
+("custom listener … doesn't exist"), so Go's sudp is a client-side half
+implementation — frp-rs is a superset.
+
+### Visitor Fields
+
+| Field | Description |
+|-------|-------------|
+| `type` | `"sudp"` |
+| `server_name` | **Required.** Name of the SUDP proxy to connect to (must match the provider's `name`). |
+| `secret_key` | **Required.** Must match the provider's `sk` (validated by the server against the registered proxy). |
+| `bind_addr` / `bind_port` | Local UDP address and port for the visitor socket. |
+| `use_encryption` | Encrypts the visitor segment with `derive_key(sk)` (matches the provider's `transport.useEncryption`). |
+| `use_compression` | Accepted for config compatibility but ignored on SUDP (see above). |
 
 ---
 

@@ -7,6 +7,8 @@ use tracing::{debug, warn};
 
 use frp_core::bandwidth::BandwidthLimiter;
 use frp_core::buffer_pool::BUFFER_SIZE;
+use frp_core::cipher_stream::{CipherReader, CipherWriter};
+use frp_core::encryption::derive_key;
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
@@ -218,33 +220,50 @@ async fn write_msg_v2_nof<W: AsyncWriteExt + Unpin>(
     write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_work_conn(
     work_conn: IoStream,
     sock: Arc<tokio::net::UdpSocket>,
     proxy_name: String,
     local_addr: Option<msg::UdpAddr>,
+    use_enc: bool,
+    enc_key: [u8; 16],
     v2: bool,
     udp_packet_size: usize,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
     // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
-    // frames in flight without flush.
-    let no_flush = work_conn.try_tcp().is_some();
-    let (w_r, mut w_w) = match split_work_conn_halves(work_conn) {
+    // frames in flight without flush — and a CipherWriter must flush to emit
+    // its IV.
+    let no_flush = work_conn.try_tcp().is_some() && !use_enc;
+    let (w_r, w_w) = match split_work_conn_halves(work_conn) {
         Ok(pair) => pair,
         Err(msg) => {
             warn!("{msg}");
             return;
         }
     };
+    // Provider-segment encryption (Go parity): when the UDP proxy configures
+    // use_encryption, the work conn carries a CipherStream (AES-128-CFB,
+    // derive_key(token)) with the V1/V2 frame protocol inside it — matching
+    // the client side (frp-client work_conn.rs) and Go's
+    // libio.WithEncryption(rwc, token) on the UDP proxy work conn.
+    let w_r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if use_enc {
+        Box::new(CipherReader::new(w_r, enc_key))
+    } else {
+        w_r
+    };
+    let mut w_w: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = if use_enc {
+        Box::new(CipherWriter::new(w_w, enc_key))
+    } else {
+        w_w
+    };
     // Buffer the frame reads: read_msg_v1/v2 issue two read_exact calls per
     // packet (header + payload), so BufReader amortizes them into one
     // syscall per packet — and one syscall for several small packets. The
     // write half is untouched (separate object), so no flush semantics
-    // change. Never wraps CFB/AEAD streams — UDP work conns are never
-    // Cipher-wrapped; the bridge cipher is applied per-bridge after
-    // StartWorkConn.
+    // change.
     let mut w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
@@ -380,11 +399,14 @@ async fn run_udp_work_conn(
 /// Assign a work connection to a UDP proxy for bidirectional data forwarding.
 /// Matches Go frp v0.69.1 behavior: sends StartWorkConn, then bridges
 /// UDP socket ↔ work connection via UDPPacket messages.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn assign_udp_work_conn(
     work_conn: IoStream,
     proxy_name: &str,
     udp_sockets: &std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     local_addr: Option<msg::UdpAddr>,
+    use_enc: bool,
+    enc_key: [u8; 16],
     v2: bool,
     udp_packet_size: usize,
     cancel: tokio_util::sync::CancellationToken,
@@ -414,7 +436,7 @@ pub(crate) async fn assign_udp_work_conn(
         src_port: None,
         dst_port: None,
         error: None,
-        use_encryption: None,
+        use_encryption: if use_enc { Some(true) } else { None },
         use_compression: None,
         nat_hole_sid: None,
         nat_hole_visitor_addr: None,
@@ -436,6 +458,8 @@ pub(crate) async fn assign_udp_work_conn(
         sock,
         proxy_name,
         local_addr,
+        use_enc,
+        enc_key,
         v2,
         udp_packet_size,
         cancel,
@@ -545,8 +569,75 @@ fn parse_bandwidth_config(
     (bw_rate, bw_mode)
 }
 
-/// Type-erased bridge halves: erasing the per-transport types lets
-/// `bridge_encrypted` & friends share one monomorphization.
+/// Type-erased user-side bridge halves: erasing the per-transport types lets
+/// `bridge_encrypted` & friends share one monomorphization, and lets the
+/// visitor-segment Cipher wrapper (`CipherReader`/`CipherWriter`) and the
+/// plain boxed halves be handled uniformly.
+type UserBridgeHalves = (
+    Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+);
+
+/// Split the visitor (user) conn into bridge halves, wrapping them in
+/// `CipherReader`/`CipherWriter` with `derive_key(sk)` when visitor-segment
+/// encryption is enabled (`visitor_enc_key = Some(key)`).
+///
+/// Returns `Err` (with a warn-worthy message) only when the underlying
+/// transport cannot be split (same guard as `split_work_conn_halves`).
+fn split_user_side(
+    visitor_enc_key: Option<[u8; 16]>,
+    user_conn: IoStream,
+) -> Result<UserBridgeHalves, &'static str> {
+    match visitor_enc_key {
+        Some(key) => {
+            let (u_r, u_w) = split_work_conn_halves(user_conn)?;
+            Ok((
+                Box::new(CipherReader::new(u_r, key)),
+                Box::new(CipherWriter::new(u_w, key)),
+            ))
+        }
+        None => split_work_conn_halves(user_conn),
+    }
+}
+
+/// Holds split user-side halves as one `AsyncRead`+`AsyncWrite` object so the
+/// XTCP STCP fallback can keep its `copy_bidirectional` semantics (both
+/// directions run to completion; the work side is only shut down after the
+/// full bidirectional copy — avoids the premature-FIN race that a
+/// join-of-two-halves bridge would reintroduce).
+struct UserSide<R, W> {
+    r: R,
+    w: W,
+}
+
+impl<R: AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> AsyncRead for UserSide<R, W> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.r).poll_read(cx, buf)
+    }
+}
+
+impl<R: AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite
+    for UserSide<R, W>
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.w).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.w).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.w).poll_shutdown(cx)
+    }
+}
+
 /// Bridge a user connection to a work connection for one proxy.
 ///
 /// Runs inside the spawned bridge task. Extracted from `assign_work_to_proxy`
@@ -565,21 +656,59 @@ async fn run_work_bridge(
     let _guard = ConnGuard::new(metrics.clone());
     let _drain = ActiveGuard::new(&state);
 
-    // Use encryption if the proxy config requests it (req.use_encryption
-    // comes from proxy_manager). For XTCP STCP fallback, we previously
-    // forced plain bridge to avoid a dual-CipherWriter deadlock — that
-    // deadlock is now fixed by eager IV flush in CipherWriter::poll_flush.
-    // Go frpc v0.69.1 ignores swc.use_encryption (not in its struct) and
-    // uses its own proxy config, so the server MUST match.
-    //
-    // SUDP exception: the SUDP data plane is plaintext UDPPacket v1 frames
-    // (both frpc sides force plaintext — see frp-client work_conn.rs/service.rs;
-    // the per-packet transform model is not yet unified with Go's stream
-    // encryption). Wrapping the bridge in a CipherStream here would make the
-    // provider read raw ciphertext as a V1 frame header → "invalid V1 msg
-    // length" and a broken tunnel. Force a plain bridge to match.
+    // --- Encryption decisions (Go frp three-stage model) ---
+    // Provider segment (work conn): token-based encryption from the proxy
+    // config (`req.use_encryption`). SUDP previously forced plaintext here —
+    // the per-packet transform model is now aligned with Go's stream
+    // encryption, so SUDP honors the provider-segment encryption too.
+    // (SUDP compression stays off — see `comp_key` below.)
     let is_sudp = proxy_info.as_ref().is_some_and(|p| p.proxy_type == "sudp");
-    let use_enc = req.use_encryption && !is_sudp;
+    let use_enc = req.use_encryption;
+
+    // Visitor segment (user conn): sk-based encryption when the visitor
+    // declared `use_encryption` in NewVisitorConn (Go three-stage model,
+    // stage 1). The visitor conn is wrapped in CipherReader/CipherWriter with
+    // `derive_key(sk)` and only then joined to the provider segment
+    // (token encryption or plaintext) — two nested layers, mirroring Go's
+    // three-stage model.
+    //
+    // Empty sk: Go frp would still PBKDF2 an empty string and encrypt (the
+    // key is just weak); we warn and bridge plaintext to keep the tunnel
+    // usable (robustness over exact parity).
+    let visitor_enc_key = if req.visitor_use_encryption {
+        match proxy_info
+            .as_ref()
+            .and_then(|p| p.sk.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            Some(sk) => Some(derive_key(sk)),
+            None => {
+                warn!(
+                    proxy_name = %req.proxy_name,
+                    "visitor declared use_encryption but proxy '{}' has no secret_key; bridging visitor segment in plaintext",
+                    req.proxy_name
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Whether visitor-segment encryption is on. The user conn is NOT split
+    // here — each bridge branch below calls `split_user_side(visitor_enc_key,
+    // req.user_conn)`, which wraps the halves in CipherReader/CipherWriter
+    // only when the key is present (keeping the plain IoStream available for
+    // the relay_plain_fast splice path). CipherWriter::poll_flush already
+    // sends the IV eagerly, and the first write to the user side carries it,
+    // so no manual IV flush is needed.
+    let visitor_encrypted = visitor_enc_key.is_some();
+    if visitor_encrypted {
+        debug!(
+            proxy_name = %req.proxy_name,
+            "Visitor-segment encryption on for proxy '{}' (derive_key(sk))", req.proxy_name
+        );
+    }
 
     // Create bandwidth limiters per direction.
     // Go frp dev compat: server-side bandwidth limiter only for "server" mode.
@@ -622,7 +751,7 @@ async fn run_work_bridge(
     // which writes them through the CipherWriter (matching Go frp streaming CFB).
     if use_enc {
         let key = encryption_key;
-        let (u_r, u_w) = match split_work_conn_halves(req.user_conn) {
+        let (u_r, u_w) = match split_user_side(visitor_enc_key, req.user_conn) {
             Ok(pair) => pair,
             Err(msg) => {
                 warn!("{msg}");
@@ -638,6 +767,12 @@ async fn run_work_bridge(
                 return;
             }
         };
+        // SUDP provider-segment compression stays off in BOTH bridge modes:
+        // bridge_encrypted's Snappy stream would be misread by the provider's
+        // frame reader as a V1 header (sNaPpY magic → "invalid V1 msg length").
+        // Go's streaming compression model for the per-packet SUDP plane is
+        // not unified here yet — this change is encryption-focused.
+        let comp_key = req.use_compression && !is_sudp;
         if let Some(headers) = injector_headers {
             let injector = ResponseHeaderInjector::new(w_r, headers);
             frp_core::bridge::bridge_encrypted(
@@ -646,7 +781,7 @@ async fn run_work_bridge(
                 injector,
                 w_w,
                 &key,
-                req.use_compression,
+                comp_key,
                 req.pre_read,
                 None,
                 None,
@@ -664,7 +799,7 @@ async fn run_work_bridge(
             w_r,
             w_w,
             &key,
-            req.use_compression,
+            comp_key,
             req.pre_read,
             read_lim.as_mut(),
             write_lim.as_mut(),
@@ -677,45 +812,80 @@ async fn run_work_bridge(
         // can coordinate: write pre_read first, then skip work_w shutdown
         // to let the backend response flow back to the user.
         let bridge_pre_read = req.pre_read;
-        // SUDP: compression is also forced off — bridge_plain wraps the
-        // stream in Snappy when comp_key is set, which the provider's
-        // plaintext read_msg_v1 would misread as a V1 frame header
-        // (sNaPpY magic → "invalid V1 msg length"). Match the provider.
+        // SUDP: compression stays forced off — bridge_plain wraps the stream
+        // in Snappy when comp_key is set, which the provider's plaintext
+        // read_msg_v1 would misread as a V1 frame header (sNaPpY magic →
+        // "invalid V1 msg length"). Go's streaming compression model for the
+        // per-packet SUDP plane is not unified here yet; this change is
+        // encryption-focused, so SUDP compression remains off (only the
+        // provider-segment encryption restriction was lifted above).
         let comp_key = req.use_compression && !is_sudp;
 
-        // XTCP STCP fallback (plain, no encryption): use copy_bidirectional
-        // directly instead of bridge_plain. bridge_plain's join! pattern
-        // drops the work writer (sending FIN) as soon as the user reader
-        // reaches EOF. For STCP fallback the visitor's test client
-        // half-closes after sending data, so the server sees EOF on the
-        // user side ~60ms before the provider starts its bridge. The
-        // premature FIN on the work connection races with the provider's
-        // copy_bidirectional startup and produces ECONNRESET on VPS.
-        // copy_bidirectional avoids this: both directions run to completion
-        // within the same function, and the work side is only shut down
-        // after the full bidirectional copy finishes.
+        // XTCP STCP fallback: keep copy_bidirectional semantics for both
+        // directions — bridge_plain's join! pattern drops the work writer
+        // (sending FIN) as soon as the user reader reaches EOF. For STCP
+        // fallback the visitor's test client half-closes after sending data,
+        // so the server sees EOF on the user side ~60ms before the provider
+        // starts its bridge. The premature FIN on the work connection races
+        // with the provider's copy_bidirectional startup and produces
+        // ECONNRESET on VPS. copy_bidirectional avoids this: both directions
+        // run to completion within the same function, and the work side is
+        // only shut down after the full bidirectional copy finishes.
+        //
+        // Visitor-segment encryption (if on) splits the user conn into
+        // Cipher halves, re-combined via `UserSide` for the same
+        // copy_bidirectional call.
         if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
-            let mut user_conn = req.user_conn;
             // Sized buffers so FRP_BRIDGE_BUF_KB governs the XTCP STCP
             // fallback path too.
-            match tokio::io::copy_bidirectional_with_sizes(
-                &mut user_conn,
-                &mut work_conn,
-                *BUFFER_SIZE,
-                *BUFFER_SIZE,
-            )
-            .await
-            {
-                Ok((a, b)) => {
-                    metrics.record_traffic(a, b);
+            if let Some(key) = visitor_enc_key {
+                let (u_r, u_w) = match split_work_conn_halves(req.user_conn) {
+                    Ok(pair) => pair,
+                    Err(msg) => {
+                        warn!("{msg}");
+                        return;
+                    }
+                };
+                let mut user_side = UserSide {
+                    r: CipherReader::new(u_r, key),
+                    w: CipherWriter::new(u_w, key),
+                };
+                match tokio::io::copy_bidirectional_with_sizes(
+                    &mut user_side,
+                    &mut work_conn,
+                    *BUFFER_SIZE,
+                    *BUFFER_SIZE,
+                )
+                .await
+                {
+                    Ok((a, b)) => {
+                        metrics.record_traffic(a, b);
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
+                    }
                 }
-                Err(e) => {
-                    debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
+            } else {
+                let mut user_conn = req.user_conn;
+                match tokio::io::copy_bidirectional_with_sizes(
+                    &mut user_conn,
+                    &mut work_conn,
+                    *BUFFER_SIZE,
+                    *BUFFER_SIZE,
+                )
+                .await
+                {
+                    Ok((a, b)) => {
+                        metrics.record_traffic(a, b);
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
+                    }
                 }
             }
         } else if read_lim.is_some() || write_lim.is_some() {
             // Bandwidth limiting active: use rate-limited plain bridge.
-            let (u_r, u_w) = match split_work_conn_halves(req.user_conn) {
+            let (u_r, u_w) = match split_user_side(visitor_enc_key, req.user_conn) {
                 Ok(pair) => pair,
                 Err(msg) => {
                     warn!("{msg}");
@@ -759,14 +929,21 @@ async fn run_work_bridge(
                 )
                 .await;
             }
-        } else if !comp_key && bridge_pre_read.is_empty() && injector_headers.is_none() {
+        } else if !comp_key
+            && bridge_pre_read.is_empty()
+            && injector_headers.is_none()
+            && !visitor_encrypted
+        {
             // Fast path: pure plain relay with no compression, no VHost
-            // pre-read, and no header injection. On Linux, try zero-copy
+            // pre-read, no header injection, and no visitor-segment
+            // encryption (splice needs the raw IoStream; visitor encryption
+            // already split it into Cipher halves). On Linux, try zero-copy
             // splice for Tcp-to-Tcp; otherwise use copy_bidirectional.
             relay_plain_fast(req.user_conn, work_conn, &metrics).await;
         } else {
-            // Slow path: compression, VHost pre-read, or header injection.
-            let (u_r, u_w) = match split_work_conn_halves(req.user_conn) {
+            // Slow path: compression, VHost pre-read, header injection, or
+            // visitor-segment encryption.
+            let (u_r, u_w) = match split_user_side(visitor_enc_key, req.user_conn) {
                 Ok(pair) => pair,
                 Err(msg) => {
                     warn!("{msg}");
@@ -980,6 +1157,8 @@ mod tests {
             "udp-test".to_string(),
             None,
             false,
+            [0u8; 16],
+            false,
             1500,
             tokio_util::sync::CancellationToken::new(),
         ));
@@ -1015,6 +1194,8 @@ mod tests {
             "udp-test".to_string(),
             None,
             false,
+            [0u8; 16],
+            false,
             1500,
             tokio_util::sync::CancellationToken::new(),
         ));
@@ -1043,6 +1224,8 @@ mod tests {
             socket.clone(),
             "udp-test".to_string(),
             Some(local_addr.clone()),
+            false,
+            [0u8; 16],
             false,
             1500,
             tokio_util::sync::CancellationToken::new(),
@@ -1107,6 +1290,8 @@ mod tests {
             socket,
             "udp-test".to_string(),
             None,
+            false,
+            [0u8; 16],
             false,
             1500,
             bridge_cancel,

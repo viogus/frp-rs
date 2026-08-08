@@ -37,7 +37,7 @@ Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field map
 | `tcp_mux_passthrough` | `bool` | `false` | `tcpMuxPassthrough` | When `tcp_mux` is enabled and yamux init fails, forward raw bytes to the VHost handler instead of closing the connection. |
 | `udp_packet_size` | `usize` | `1500` | `udpPacketSize` | UDP packet buffer size in bytes. Controls the receive buffer for UDP proxy datagrams. |
 | `nat_hole_analysis_data_reserve_hours` | `u64` | `168` | `natholeAnalysisDataReserveHours` | How long historical NAT behavior records are kept (in hours). Used by XTCP NAT analysis. |
-| `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional TOML/INI config files to merge. Relative to the main config file directory. |
+| `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional config files to merge (`.toml`, `.ini`, `.json`, `.yaml`, `.yml`). Relative to the main config file directory. |
 
 ### `[auth]` Section
 
@@ -53,6 +53,9 @@ Authentication configuration for control connections.
 | `oidc_token_endpoint` | `string` | `""` | `auth.oidcTokenEndpoint` | OIDC token verification endpoint URL. |
 | `oidc_skip_expiry` | `bool` | `false` | `auth.oidcSkipExpiry` | Skip OIDC token expiry validation. For development only. |
 | `oidc_skip_issuer` | `bool` | `false` | `auth.oidcSkipIssuer` | Skip OIDC issuer validation. For development only. |
+| `oidc_skip_audience` | `bool` | `false` | `auth.oidcSkipAudience` | Skip OIDC audience (`"aud"` claim) validation entirely. When true, any validly-signed JWT is accepted regardless of audience. For development only. |
+| `oidc_additional_audience` | `string[]` | `[]` | `auth.oidcAdditionalAudience` | Additional accepted audiences. A token is accepted when its `"aud"` claim matches `oidc_audience` OR any entry of this list (union). |
+| `oidc_tls_trusted_ca_file` | `string` | `""` | `auth.oidcTLSTrustedCAFile` | Path to a custom CA certificate PEM file used to verify the OIDC provider's TLS certificate (openid-configuration / JWKS fetches). Extends the default root store with the file's certificates. |
 | `oidc_proxy_url` | `string` | `""` | `auth.oidcProxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
 | `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalAuthScopes` | Extra auth scopes: `"HeartBeats"`, `"NewWorkConns"`. When listed, those message types require authentication in addition to `Login`. |
 
@@ -75,7 +78,8 @@ file.path = "/run/secrets/frp-token"
 |-------|------|---------|-------------------|-------------|
 | `level` | `string` | `"info"` | `log.level` | Log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`. Also controllable via `RUST_LOG` env var. |
 | `file` | `string` | `"console"` | `log.file` | Log output target: `"console"` (default, stderr) or a file path. Uses daily rotation for file output. |
-| `max_days` | `i32` | `3` | `log.maxDays` | Maximum days to retain rotated log files. |
+| `max_days` | `i32` | `3` | `log.maxDays` | Maximum days to retain rotated log files. Rotated files whose mtime is strictly older than `max_days` days are deleted. Cleanup runs at startup and then once a day. `max_days <= 0` disables cleanup entirely (Go frp semantics: never delete). |
+| `format` | `string` | `"text"` | `log.format` | Log output format: `"text"` or `"json"`. Any other value falls back to `"text"` with a warning. Also controllable via the `--log-format` CLI flag (CLI wins over the config file). |
 
 ### `[web_server]` Section
 
@@ -201,6 +205,9 @@ oidc_audience = ""
 oidc_token_endpoint = ""
 oidc_skip_expiry = false
 oidc_skip_issuer = false
+oidc_skip_audience = false
+oidc_additional_audience = []
+oidc_tls_trusted_ca_file = ""
 oidc_proxy_url = ""
 additional_auth_scopes = []
 
@@ -208,6 +215,7 @@ additional_auth_scopes = []
 level = "info"
 file = "/var/log/frps.log"
 max_days = 3
+format = "text"
 
 [web_server]
 addr = "0.0.0.0"
@@ -260,7 +268,7 @@ enable_control = true
 | `proxy_url` | `string` | `""` | `transport.proxyURL` | Upstream HTTP/SOCKS5 proxy for the client-to-server control connection. Supports `http://` and `socks5://` schemes. Empty = direct connection. |
 | `nat_hole_stun_server` | `string` | `"stun.easyvoip.com:3478"` | `natHoleStunServer` | Custom STUN server address for NAT traversal. Format: `"stun:host:port"`. |
 | `start` | `string[]` | `[]` | `start` | Selective proxy start list. If non-empty, only proxies with names in this list are started. Empty = start all proxies. |
-| `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional TOML/INI config files to merge. Relative to the main config file directory. |
+| `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional config files to merge (`.toml`, `.ini`, `.json`, `.yaml`, `.yml`). Relative to the main config file directory. |
 | `tls_enable` | `bool` | `true` | `tlsEnable` | Enable TLS for the connection to the server. |
 | `tls_cert_file` | `string` | `""` | `tlsCertFile` | Client TLS certificate PEM file (for mTLS). |
 | `tls_key_file` | `string` | `""` | `tlsKeyFile` | Client TLS private key PEM file (for mTLS). |
@@ -270,7 +278,7 @@ enable_control = true
 | `login_fail_exit` | `bool` | `true` | `loginFailExit` | When true, the client exits on login failure. When false, it keeps retrying. |
 | `pool_count` | `i32` | `1` | `poolCount` | Number of pre-established work connections kept in the server-side pool. Higher values reduce latency for new proxy connections. |
 | `heartbeat_interval` | `i64` | `30` | `transport.heartbeatInterval` | Ping interval in seconds. Client sends a heartbeat `Ping` at this interval. When `tcp_mux` is enabled (the default), this is normalized to `-1` (disabled — yamux keepalive covers liveness). |
-| `dns_server` | `string` | `""` | `dnsServer` | Custom DNS server address for resolving `server_addr`. Empty = system DNS. |
+| `dns_server` | `string` | `""` | `dnsServer` | Custom DNS server address for resolving `server_addr`. Empty = system DNS. Queries `A` and `AAAA` records concurrently, preferring IPv4 (an `A` answer wins even when `AAAA` also succeeds); falls back to IPv6 when only `AAAA` resolves. |
 | `dial_server_keepalive` | `i64` | `0` | `dialServerKeepalive` | TCP keepalive interval in seconds for outbound connections to the server. 0 = disabled. |
 | `connect_server_local_ip` | `string` | `""` | `connectServerLocalIP` | Local IP address to bind when dialing the frp server. Empty = system default. |
 | `tcp_mux` | `bool` | `true` | `transport.tcpMux` | Enable TCP multiplexing (yamux) for work connections. |
@@ -385,6 +393,7 @@ additional_auth_scopes = []
 level = "info"
 file = ""
 max_days = 3
+format = "text"
 
 [web_server]
 addr = "127.0.0.1"
@@ -606,13 +615,14 @@ enabled = false
 
 ## Visitor Configuration (`[[visitors]]`)
 
-Visitors are STCP/XTCP client-side listeners that accept local connections and tunnel them
-through the frps server to a remote STCP/XTCP proxy.
+Visitors are client-side listeners that accept local connections and tunnel them
+through the frps server to a remote STCP/XTCP proxy (or, with `type = "sudp"`, forward UDP
+datagrams to a remote SUDP proxy — see [SUDP Visitor](proxies.md#sudp-visitor-frpc)).
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `name` | `string` | `""` | `name` | Visitor name for logging. |
-| `type` | `string` | `""` | `type` | Visitor type: `"stcp"` or `"xtcp"`. |
+| `type` | `string` | `""` | `type` | Visitor type: `"stcp"`, `"xtcp"`, or `"sudp"`. |
 | `server_name` | `string` | `""` | `serverName` | **Required.** The STCP/XTCP proxy name to connect to (must match the proxy's `name`). |
 | `secret_key` | `string` | `""` | `sk` / `secretKey` | **Required.** Shared secret key. Must match the STCP proxy's `sk`. |
 | `server_user` | `string` | `""` | `serverUser` | Optional server-side user for auth matching. |
@@ -713,7 +723,7 @@ The `allow_ports` field accepts a comma-separated list of ranges and single port
 "1000-2000,8080,30000-40000"   # mixed ranges and single ports
 ```
 
-Each range is inclusive on both ends. Inverted ranges (e.g. `"20000-10000"`) are automatically swapped. Invalid port numbers (> 65535) are silently ignored. When `allow_ports` is empty, `allow_port_start` and `allow_port_end` define a single contiguous range.
+Each range is inclusive on both ends. Inverted ranges (e.g. `"20000-10000"`) are automatically swapped. Invalid port numbers (> 65535) are silently ignored. When `allow_ports` is empty, `allow_port_start` and `allow_port_end` define a single contiguous range. A range string can also be generated inline with the `{{ parseNumberRange ... }}` template function (see [Template Functions](#template-functions)).
 
 ---
 
@@ -727,7 +737,7 @@ includes = ["conf.d/*.toml", "secrets.toml"]
 
 - Patterns are relative to the directory containing the main config file.
 - Supports a single `*` wildcard per path component.
-- `.toml` and `.ini` extensions are supported.
+- Supported extensions: `.toml`, `.ini`, `.json`, `.yaml`, `.yml`. Each file is parsed by its extension and merged through the same pipeline.
 - Included files are deep-merged: tables merge recursively, arrays concatenate.
 - The main config file's explicit values take precedence over included files.
 
@@ -737,7 +747,60 @@ For directory-based config, use `--config-dir`:
 frps --config-dir /etc/frp/conf.d
 ```
 
-All `.toml` and `.ini` files in the directory (recursive) are loaded and merged in sorted order.
+All `.toml`, `.ini`, `.json`, `.yaml`, and `.yml` files in the directory (recursive) are loaded and merged in sorted order.
+
+### Supported Formats
+
+`frps` and `frpc` detect the config format by file extension. TOML is the default; `.ini`, `.json`, `.yaml`, and `.yml` are also accepted. Every format runs through the same pipeline — Go frp key aliases, `includes`, env expansion, template functions, and strict key checking all apply identically.
+
+YAML is parsed with `serde_yaml_ng`, preserving YAML 1.1 scalar typing (`yes`/`no`/`on`/`off` parse as booleans, unquoted numbers stay numeric). YAML merge keys (`<<`) are supported:
+
+```yaml
+# frps.yaml
+base: &base
+  bind_addr: "0.0.0.0"
+  bind_port: 7000
+
+<<: *base
+token: "my-token"
+```
+
+Non-string mapping keys are converted to their string form (YAML allows them; JSON and TOML do not).
+
+---
+
+## Environment Variable Expansion
+
+Every string value in the config is expanded for `${VAR}` references. This runs **after** `includes` are merged (values pulled in from include files are expanded too) and **before** key normalization. The subset mirrors Go frp's Viper-based `os.ExpandEnv`:
+
+- `${VAR}` expands to the value of environment variable `VAR`; an **undefined variable expands to the empty string**.
+- `$$` expands to a literal `$` — the escape hatch for writing `${VAR}` literally (a frp-rs extension; Go's `os.ExpandEnv` has no `$$` escape).
+- A bare `$VAR` (no braces) is left untouched, so `$` in passwords or shell snippets is safe.
+- An unclosed `${` (no closing `}`) is kept verbatim.
+- `${VAR:-default}` shell default-value syntax is **not** supported.
+
+```toml
+# frpc.toml
+server_addr = "${FRP_SERVER_ADDR}"
+token = "$${literal-braces-not-expanded}"
+```
+
+---
+
+## Template Functions
+
+Configuration values support a minimal Go-style template subset with a single function, `parseNumberRange`. A call has the exact form `{{ parseNumberRange "expr" }}` (optional ASCII whitespace after `{{`, around the function name, and before `}}`) and is expanded in place to a comma-separated, space-free list of numbers:
+
+```toml
+allow_ports = '{{ parseNumberRange "1000-2000" }}'
+# → "1000,1001,...,2000"
+```
+
+- The argument is a comma-separated list of segments; each segment is a single number `N` or an inclusive range `N-M` (step 1, `N <= M`). Surrounding whitespace is trimmed.
+- Values are constrained to the port range `0..=65535`.
+- Invalid expressions (non-numeric, `N > M`, more than one `-` in a segment, out of range) are kept verbatim with a warning — the config still loads (Go frp instead fails the entire template render).
+- No other template syntax (variables, control flow, other functions) is processed; anything that does not match the call form is left verbatim.
+- Environment expansion runs first, so `{{ parseNumberRange "${PORT_RANGE}" }}` works.
 
 ---
 
@@ -762,7 +825,7 @@ All other features gate only the runtime behavior. Their config fields are alway
 | Feature | Config Fields Always Present | Runtime Effect When Disabled |
 |---------|------------------------------|------------------------------|
 | `tls` | `tls_enable`, `tls_cert_file`, `tls_key_file`, `tls_ca_file`, `tls_server_name`, `tls_only`, `disable_custom_tls_first_byte` | TLS accept/dial not compiled |
-| `oidc` | `oidc_issuer`, `oidc_audience`, `oidc_token_endpoint`, `oidc_skip_expiry`, `oidc_skip_issuer`, `oidc_proxy_url` | OIDC token verification not compiled |
+| `oidc` | `oidc_issuer`, `oidc_audience`, `oidc_token_endpoint`, `oidc_skip_expiry`, `oidc_skip_issuer`, `oidc_skip_audience`, `oidc_additional_audience`, `oidc_tls_trusted_ca_file`, `oidc_proxy_url` | OIDC token verification not compiled |
 | `compression` | `use_compression` (proxy/visitor) | Snappy bridge compression not compiled |
 | `chacha20` | V2 cipher fields | XChaCha20-Poly1305 V2 cipher not compiled |
 | `ssh` | `[ssh_tunnel_gateway]` section | SSH gateway not compiled |
@@ -783,7 +846,9 @@ runtime effect: `log.disablePrintColor`, `webServer.assetsDir`,
 
 ## Environment Variables
 
-Log level can be overridden at runtime:
+Log level can be overridden at runtime via `RUST_LOG` (distinct from the
+`${VAR}` config-value expansion described in the Environment Variable
+Expansion section above):
 
 ```bash
 RUST_LOG=debug ./frps -c frps.toml

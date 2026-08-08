@@ -856,6 +856,7 @@ write_frpc_config_udp() {
             printf 'log.to = "%s/go-frpc-%s.log"\nlog.level = "debug"\n\n' "$TEST_DIR" "$name"
             printf '[[proxies]]\nname = "%s"\ntype = "udp"\nlocalIP = "127.0.0.1"\n' "$name"
             printf 'localPort = %s\nremotePort = %s\n' "$echo_port" "$proxy_port"
+            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
         } > "$out"
     else
@@ -867,6 +868,7 @@ write_frpc_config_udp() {
             printf 'login_fail_exit = true\npool_count = 1\n'
             printf '\n[[proxies]]\nname = "%s"\ntype = "udp"\nlocal_ip = "127.0.0.1"\n' "$name"
             printf 'local_port = %s\nremote_port = %s\n' "$echo_port" "$proxy_port"
+            if $has_enc; then printf 'use_encryption = true\n'; fi
             [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
         } > "$out"
     fi
@@ -3459,6 +3461,300 @@ TOML
     fi
 }
 
+# =============================================================================
+# Test: Go frpc SUDP visitor -> Rust frps (sudpPort) -> Rust frpc SUDP provider
+# NOTE: Go frp v0.70.1 SUDP is a client-side half implementation — its server
+# never registers the visitor listener ("custom listener doesn't exist") — so
+# SUDP is only testable in the go->rust direction (Go visitor + Rust frps +
+# Rust provider). rust->go-sudp is therefore skipped in this suite.
+# =============================================================================
+test_g2r_sudp() {
+    local name="go-to-rust-sudp"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local sudp_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-g2r-sudp"
+    local sk="sudp-secret-key-51"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Rust frps with SUDP port (frp-rs SUDP is a shared-port extension:
+    # providers register via sk, and sudpPort forces all SUDP proxies there)
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+sudpPort = $sudp_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Rust frpc provider (SUDP, plaintext; no remote_port needed)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+tls_enable = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "sudp-echo"
+type = "sudp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+sk = "$sk"
+TOML
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+
+    # Start Go frpc visitor (SUDP)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-visitor-$name.log"
+log.level = "debug"
+
+[[visitors]]
+name = "sudp-visitor"
+type = "sudp"
+serverName = "sudp-echo"
+secretKey = "$sk"
+bindAddr = "127.0.0.1"
+bindPort = $visitor_port
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    # SUDP visitor is a UDP listener (wait_for_port_safe only checks TCP);
+    # give registration a moment, then let send_and_expect_udp retry.
+    sleep 2
+
+    local result
+    result=$(send_and_expect_udp "$visitor_port" "sudp-plain-data" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc SUDP visitor (encrypted) -> Rust frps (sudpPort) -> Rust frpc
+#       SUDP provider (encrypted)
+# Go frp three-segment model: visitor<->frps encrypted with PBKDF2(sk) when
+# transport.useEncryption=true, provider<->frps with PBKDF2(token) when the
+# provider declares use_encryption. Only the go->rust direction is testable
+# (Go frp sudp server-side half implementation — see test_g2r_sudp).
+# =============================================================================
+test_g2r_sudp_encrypted() {
+    local name="go-to-rust-sudp-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local sudp_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-g2r-sudp-enc"
+    local sk="sudp-secret-key-enc-52"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Rust frps with SUDP port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+sudpPort = $sudp_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Rust frpc provider (SUDP, encrypted provider segment)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+tls_enable = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "sudp-echo"
+type = "sudp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+sk = "$sk"
+use_encryption = true
+TOML
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+
+    # Start Go frpc visitor (SUDP, encrypted visitor segment)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-visitor-$name.log"
+log.level = "debug"
+
+[[visitors]]
+name = "sudp-visitor"
+type = "sudp"
+serverName = "sudp-echo"
+secretKey = "$sk"
+bindAddr = "127.0.0.1"
+bindPort = $visitor_port
+transport.useEncryption = true
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    # SUDP visitor is a UDP listener; give registration a moment.
+    sleep 2
+
+    local result
+    result=$(send_and_expect_udp "$visitor_port" "sudp-enc-data" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc -> Rust frps, UDP proxy + encryption
+# =============================================================================
+test_g2r_udp_encrypted() {
+    local name="go-to-rust-udp-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-udp-enc"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Rust frps
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Go frpc with encrypted UDP proxy
+    write_frpc_config_udp go "$frps_port" "$token" "$echo_port" "$proxy_port" "udp-echo" "$TEST_DIR/$name/frpc.toml" enc
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    # UDP proxy needs a moment for work connection assignment
+    sleep 1
+
+    local result
+    result=$(send_and_expect_udp "$proxy_port" "g2r-udp-enc-data" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, UDP proxy + encryption
+# =============================================================================
+test_r2g_udp_encrypted() {
+    local name="rust-to-go-udp-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-udp-enc"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Go frps
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Start Rust frpc with encrypted UDP proxy
+    write_frpc_config_udp rust "$frps_port" "$token" "$echo_port" "$proxy_port" "udp-echo" "$TEST_DIR/$name/frpc.toml" enc
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    local result
+    result=$(send_and_expect_udp "$proxy_port" "r2g-udp-enc-data" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
 # ═══ XTCP test infrastructure ═══════════════════════════════════════════════
 
 # Generic XTCP end-to-end test runner.
@@ -4591,8 +4887,14 @@ run_test test_r2g_mux_tls_encrypt
 # Phase 4: Other proxy types
 run_test test_g2r_udp
 run_test test_r2g_udp
-# SUDP not tested cross-compat: Go frp uses server-side sudp_port with type="udp",
-# while frp-rs has type="sudp" as a distinct proxy type. SUDP logic tested via unit tests.
+run_test test_g2r_udp_encrypted
+run_test test_r2g_udp_encrypted
+# SUDP cross-compat (go->rust only): Go frp v0.70.1 sudp is a client-side half
+# implementation — its server never registers the visitor listener ("custom
+# listener doesn't exist") — so Go frps cannot serve a sudp visitor. SUDP is
+# therefore only testable as Go visitor + Rust frps + Rust provider.
+run_test test_g2r_sudp
+run_test test_g2r_sudp_encrypted
 run_test test_g2r_http
 run_test test_r2g_http
 run_test test_g2r_https

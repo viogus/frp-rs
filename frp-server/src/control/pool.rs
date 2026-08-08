@@ -60,6 +60,12 @@ pub(crate) struct PendingRequest {
     pub(crate) pre_read: Vec<u8>,
     pub(crate) use_encryption: bool,
     pub(crate) use_compression: bool,
+    /// Visitor-segment encryption (Go 三段式第 1 段): set from the visitor's
+    /// NewVisitorConn use_encryption flag. When true, `run_work_bridge` wraps
+    /// the visitor conn with `derive_key(proxy.sk)` before the provider-segment
+    /// bridge (token encryption or plaintext). `use_encryption` above stays the
+    /// provider-segment (work conn) flag from the proxy config.
+    pub(crate) visitor_use_encryption: bool,
     pub(crate) created_at: Instant,
     /// Proxy metadata fetched once by the dispatcher. `assign_work_to_proxy`
     /// reads local_addr/remote_port/bandwidth_limit/etc. from it instead of
@@ -243,18 +249,19 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
         // Check if a UDP proxy needs this work connection
         if let Some((proxy_name, _)) = ctl.pending_udp.pop_front() {
             info!(proxy_name = %proxy_name, "Assigning work conn to UDP proxy '{}'", proxy_name);
-            let local_addr = ctx
-                .state
-                .proxy_manager
-                .get(&proxy_name)
-                .await
+            let info = ctx.state.proxy_manager.get(&proxy_name).await;
+            let local_addr = info
+                .as_ref()
                 .and_then(|info| info.local_addr.clone())
                 .and_then(|s| msg::UdpAddr::from_string(&s));
+            let udp_use_enc = info.as_ref().is_some_and(|i| i.use_encryption);
             bridge::assign_udp_work_conn(
                 stream,
                 &proxy_name,
                 &ctl.udp_sockets,
                 local_addr,
+                udp_use_enc,
+                ctx.reloadable.encryption_key,
                 ctx.v2,
                 ctx.state.udp_packet_size,
                 ctl.udp_cancel.clone(),
@@ -307,6 +314,7 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     proxy_name: String,
     visitor_conn: IoStream,
+    visitor_use_encryption: bool,
 ) -> Result<(), ()> {
     // NewUserConn plugin hook — control-enabled plugins can reject.
     // Skip payload construction when no plugins are configured (the
@@ -346,6 +354,7 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
             pre_read: Vec::new(),
             use_encryption: enc,
             use_compression: comp,
+            visitor_use_encryption,
             created_at: Instant::now(),
             proxy_info,
         },
@@ -482,6 +491,9 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             pre_read,
             use_encryption: enc,
             use_compression: comp,
+            // Group load-balancing forwards a provider-side user conn (not a
+            // visitor conn), so visitor-segment encryption never applies here.
+            visitor_use_encryption: false,
             created_at: Instant::now(),
             proxy_info,
         },

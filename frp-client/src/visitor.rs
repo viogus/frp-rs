@@ -11,7 +11,8 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::{
-    dial_server, split_work_conn_halves, DialOptions, IoStream, TransportProtocol,
+    dial_server, split_work_conn_halves, BoxedReadHalf, BoxedWriteHalf, DialOptions, IoStream,
+    TransportProtocol,
 };
 
 #[cfg(feature = "vnet")]
@@ -1016,12 +1017,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 /// - on disconnect/idle timeout the worker returns to the wait state and the
 ///   next datagram reconnects
 ///
-/// ENCRYPTION TRADEOFF (first version): the data plane is plaintext-only.
-/// Go frp encrypts the whole framed stream with `sk`; the Rust provider
-/// (`run_udp_work_conn`) instead encrypts/decrypts each UDPPacket payload
-/// per packet. These two models are mutually incompatible, so until the
-/// encryption model is unified this visitor always exchanges plaintext
-/// UDPPacket messages and logs a warning when `use_encryption=true`.
+/// ENCRYPTION: the SUDP data plane uses the Go-frp three-segment model —
+/// the visitor segment (visitor frpc ↔ frps) is encrypted with
+/// `derive_key(sk)` (CipherReader/CipherWriter around the conn in
+/// `run_sudp_worker`, symmetric with the server's `split_user_side`), the
+/// provider segment (frps ↔ provider frpc) with `derive_key(auth token)`.
+/// `use_compression` on the visitor is ignored with a warning (visitor-segment
+/// compression is not implemented yet).
 pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
     let VisitorListenerConfig {
         server_addr,
@@ -1064,29 +1066,26 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         v2,
     } = config;
 
-    if use_encryption || use_compression {
+    // Go frp v0.70.1 three-stage model: the visitor segment is encrypted
+    // with `derive_key(sk)` when the visitor declares use_encryption. The
+    // server (bridge.rs `split_user_side`) wraps its user-side connection
+    // with the same key, and we wrap the data-plane stream in
+    // `run_sudp_worker` — the NewVisitorConn declaration and both ends of
+    // the visitor segment now agree. Visitor-segment compression is NOT
+    // implemented (the server also ignores NewVisitorConn use_compression),
+    // so it stays ignored with a warning.
+    if use_compression {
         warn!(
             visitor_name = %name,
-            use_encryption,
             use_compression,
-            "SUDP visitor '{}': use_encryption={} / use_compression={} are configured, but the \
-             first-version SUDP data plane is plaintext/uncompressed-only (Go frp uses \
-             stream-level encryption/compression; Rust uses per-packet payload transforms — \
-             not yet unified); continuing without encryption/compression",
+            "SUDP visitor '{}': use_compression={} is configured but visitor-segment \
+             compression is not implemented; continuing without compression",
             name,
-            use_encryption,
             use_compression
         );
     }
-
-    // Force the declaration to match the plaintext data plane. If we left
-    // use_encryption=true here, the NewVisitorConn would tell the provider
-    // (which reads its OWN proxy config and encrypts per-packet via
-    // work_conn.rs encrypt_into) that the tunnel is encrypted — it would
-    // then AES-128-CFB-encrypt the return traffic and we would ship raw
-    // ciphertext to the local UDP client: silent corruption. Both sides
-    // must agree on plaintext, so the warn above is the entire story.
-    let (use_encryption, use_compression) = (false, false);
+    // Never declare compression on the wire (nothing compresses).
+    let use_compression = false;
 
     let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
         Ok(s) => Arc::new(s),
@@ -1266,6 +1265,8 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
             read_tx.clone(),
             &name,
             &shutdown,
+            use_encryption,
+            &secret_key,
         )
         .await;
         // Worker ended (disconnect / idle timeout): back to the wait state.
@@ -1390,6 +1391,15 @@ async fn connect_sudp_visitor_stream(
 ///   `Ping` is ignored (Go sudp.go)
 /// - a 60s idle timeout closes the tunnel (Go sudp.go `connTimeout`); the
 ///   dispatcher then reconnects on the next datagram
+///
+/// When the visitor declared `use_encryption` (and `sk` is non-empty), the
+/// server-side half of the connection is wrapped in `CipherReader` /
+/// `CipherWriter` with `derive_key(sk)` — the visitor segment of Go frp's
+/// three-stage model. The V1 frame protocol then runs on top of the
+/// encrypted stream, symmetric with the server's `split_user_side` (the
+/// server decrypts the same stream with the same key). CipherWriter sends
+/// its random IV on the first write (or eager flush), so the first
+/// `UDPPacket` carries the IV.
 #[allow(clippy::too_many_arguments)]
 async fn run_sudp_worker(
     server_conn: IoStream,
@@ -1398,13 +1408,31 @@ async fn run_sudp_worker(
     read_tx: mpsc::Sender<msg::UDPPacket>,
     visitor_name: &str,
     shutdown: &Arc<AtomicBool>,
+    use_encryption: bool,
+    secret_key: &str,
 ) {
-    let (srv_r, mut srv_w) = match split_work_conn_halves(server_conn) {
+    let (srv_r, srv_w) = match split_work_conn_halves(server_conn) {
         Ok(pair) => pair,
         Err(e) => {
             warn!(visitor_name = %visitor_name, error = e, "SUDP visitor '{}': could not split server conn: {}", visitor_name, e);
             return;
         }
+    };
+    // Visitor-segment encryption: wrap both halves with derive_key(sk),
+    // symmetric with the server's split_user_side. The V1 frame protocol
+    // (read_msg_v1/write_msg_v1) then runs over the encrypted stream.
+    let use_enc = use_encryption && !secret_key.is_empty();
+    let srv_r: BoxedReadHalf = if use_enc {
+        let key = frp_core::encryption::derive_key(secret_key);
+        Box::new(frp_core::cipher_stream::CipherReader::new(srv_r, key)) as BoxedReadHalf
+    } else {
+        srv_r
+    };
+    let mut srv_w: BoxedWriteHalf = if use_enc {
+        let key = frp_core::encryption::derive_key(secret_key);
+        Box::new(frp_core::cipher_stream::CipherWriter::new(srv_w, key)) as BoxedWriteHalf
+    } else {
+        srv_w
     };
     // Buffer frame reads: read_msg_v1 issues two read_exact calls per message.
     let mut srv_r = tokio::io::BufReader::with_capacity(16 * 1024, srv_r);

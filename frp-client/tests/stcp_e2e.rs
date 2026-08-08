@@ -9,7 +9,7 @@ use frp_core::config::{ClientConfig, ProxyConfig, VisitorConfig};
 
 use common::{allocate_port, start_echo_server, start_frps, wait_for_port};
 
-/// End-to-end STCP relay test:
+/// End-to-end STCP relay test (plaintext):
 /// 1. Start echo server (provider's local service)
 /// 2. Start frps server
 /// 3. Start frpc provider (registers STCP proxy with sk)
@@ -17,6 +17,22 @@ use common::{allocate_port, start_echo_server, start_frps, wait_for_port};
 /// 5. Connect to visitor's local port, send data, verify echo
 #[tokio::test]
 async fn test_stcp_e2e_relay() {
+    run_stcp_relay(false).await;
+}
+
+/// Same relay with the Go-parity three-segment encryption enabled:
+/// the visitor segment is encrypted with sk (server decrypts via the
+/// NewVisitorConn use_encryption declaration) and the provider segment
+/// with the auth token. Regression guard for the visitor-segment
+/// encryption path (was broken — Rust↔Rust encrypted STCP did not
+/// interoperate because the server never decrypted the sk-encrypted
+/// visitor connection).
+#[tokio::test]
+async fn test_stcp_e2e_relay_encrypted() {
+    run_stcp_relay(true).await;
+}
+
+async fn run_stcp_relay(use_encryption: bool) {
     let echo_port = allocate_port();
     let server_port = allocate_port();
     let visitor_port = allocate_port();
@@ -50,7 +66,7 @@ async fn test_stcp_e2e_relay() {
             local_port: echo_port,
             remote_port: 0, // STCP doesn't use a real port (no listener)
             sk: stcp_sk.into(),
-            use_encryption: false,
+            use_encryption,
             use_compression: false,
             custom_domains: vec![],
             subdomain: String::new(),
@@ -97,7 +113,7 @@ async fn test_stcp_e2e_relay() {
             fallback_to: String::new(),
             fallback_timeout_ms: 5000,
             disable_assisted_addrs: false,
-            use_encryption: false,
+            use_encryption,
             use_compression: false,
             keep_tunnel_open: false,
             max_retries_an_hour: 0,
