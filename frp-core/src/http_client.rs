@@ -17,7 +17,6 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use rustls::pki_types::CertificateDer;
-use tokio::io::AsyncWrite;
 
 /// Default timeout for OIDC HTTP requests (10 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -75,35 +74,28 @@ impl hyper::rt::Read for TunnelStream {
 }
 
 impl hyper::rt::Write for TunnelStream {
+    // hyper's runtime Write has identical signatures to tokio's AsyncWrite;
+    // delegate instead of duplicating the Plain/Tls dispatch.
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        match self.get_mut() {
-            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_write(cx, buf),
-        }
+        tokio::io::AsyncWrite::poll_write(self, cx, buf)
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        match self.get_mut() {
-            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
-            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_flush(cx),
-        }
+        tokio::io::AsyncWrite::poll_flush(self, cx)
     }
 
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        match self.get_mut() {
-            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_shutdown(cx),
-        }
+        tokio::io::AsyncWrite::poll_shutdown(self, cx)
     }
 }
 
