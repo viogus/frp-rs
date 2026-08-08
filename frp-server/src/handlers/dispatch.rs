@@ -52,19 +52,12 @@ pub(crate) async fn handle_visitor_conn_inner(
     // Visitor-segment encryption/compression flags (Go three-segment model,
     // stage 1). `use_encryption` from the visitor's
     // `[[visitors]] transport.useEncryption` decides whether the bridge wraps
-    // the visitor conn with `derive_key(sk)`. `use_compression` is NOT
-    // implemented for the visitor segment yet — log it and ignore (the server
-    // still bridges the visitor segment plaintext when only compression is
-    // requested).
+    // the visitor conn with `derive_key(sk)`; `use_compression` from
+    // `[[visitors]] transport.useCompression` decides whether it additionally
+    // wraps the conn in a Snappy stream (snappy inner, CFB outer). Both flags
+    // are carried through to `run_work_bridge` (`split_user_side`).
     let visitor_use_encryption = msg.use_encryption.unwrap_or(false);
     let visitor_use_compression = msg.use_compression.unwrap_or(false);
-    if visitor_use_compression {
-        debug!(
-            proxy_name = %msg.proxy_name,
-            "NewVisitorConn use_compression requested by visitor for '{}' — visitor-segment compression not implemented yet, ignoring (only visitor-segment encryption is supported)",
-            msg.proxy_name
-        );
-    }
 
     // Validate timestamp freshness to prevent replay attacks.
     // A MISSING timestamp skips the freshness window — same semantics as the
@@ -249,6 +242,7 @@ pub(crate) async fn handle_visitor_conn_inner(
                     proxy_name,
                     visitor_conn: stream,
                     visitor_use_encryption,
+                    visitor_use_compression,
                 })
                 .await
                 .is_err()

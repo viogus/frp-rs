@@ -17,7 +17,7 @@ use common::{allocate_port, start_echo_server, start_frps, wait_for_port};
 /// 5. Connect to visitor's local port, send data, verify echo
 #[tokio::test]
 async fn test_stcp_e2e_relay() {
-    run_stcp_relay(false).await;
+    run_stcp_relay(false, false).await;
 }
 
 /// Same relay with the Go-parity three-segment encryption enabled:
@@ -29,10 +29,29 @@ async fn test_stcp_e2e_relay() {
 /// visitor connection).
 #[tokio::test]
 async fn test_stcp_e2e_relay_encrypted() {
-    run_stcp_relay(true).await;
+    run_stcp_relay(true, false).await;
 }
 
-async fn run_stcp_relay(use_encryption: bool) {
+/// Visitor-segment compression only (no encryption): `use_compression=true`
+/// on provider + visitor must produce a working tunnel — the server's
+/// `split_user_side` wraps the visitor conn in a Snappy stream (no CFB), and
+/// the client's STCP relay compresses the server-side half via
+/// `bridge_encrypted`'s per-chunk compressor. Both ends must agree on the
+/// framed wire format.
+#[tokio::test]
+async fn test_stcp_e2e_relay_compressed() {
+    run_stcp_relay(false, true).await;
+}
+
+/// Visitor-segment encryption + compression together (Go parity: snappy
+/// inner, CFB outer). Covers the three-stage model with both flags set on
+/// the visitor and the provider segment.
+#[tokio::test]
+async fn test_stcp_e2e_relay_encrypted_compressed() {
+    run_stcp_relay(true, true).await;
+}
+
+async fn run_stcp_relay(use_encryption: bool, use_compression: bool) {
     let echo_port = allocate_port();
     let server_port = allocate_port();
     let visitor_port = allocate_port();
@@ -67,7 +86,7 @@ async fn run_stcp_relay(use_encryption: bool) {
             remote_port: 0, // STCP doesn't use a real port (no listener)
             sk: stcp_sk.into(),
             use_encryption,
-            use_compression: false,
+            use_compression,
             custom_domains: vec![],
             subdomain: String::new(),
             http_user: String::new(),
@@ -114,7 +133,7 @@ async fn run_stcp_relay(use_encryption: bool) {
             fallback_timeout_ms: 5000,
             disable_assisted_addrs: false,
             use_encryption,
-            use_compression: false,
+            use_compression,
             keep_tunnel_open: false,
             max_retries_an_hour: 0,
             min_retry_interval: 0,

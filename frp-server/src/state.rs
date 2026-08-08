@@ -41,6 +41,13 @@ pub enum InternalMsg {
         /// to the provider work conn (which keeps its own token-based
         /// encryption or plaintext).
         visitor_use_encryption: bool,
+        /// Visitor-segment compression (Go 三段式第 1 段): whether the visitor
+        /// declared `use_compression` in NewVisitorConn (Go source:
+        /// `[[visitors]] transport.useCompression`). When true, the bridge
+        /// wraps the visitor conn in a Snappy stream (inside the CFB layer
+        /// when encryption is also on — snappy inner, CFB outer, matching Go's
+        /// `WithCompression` + `WithEncryption` order).
+        visitor_use_compression: bool,
     },
     ProxyUserConn {
         proxy_name: String,

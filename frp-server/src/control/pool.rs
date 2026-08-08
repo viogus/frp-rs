@@ -66,6 +66,11 @@ pub(crate) struct PendingRequest {
     /// bridge (token encryption or plaintext). `use_encryption` above stays the
     /// provider-segment (work conn) flag from the proxy config.
     pub(crate) visitor_use_encryption: bool,
+    /// Visitor-segment compression (Go 三段式第 1 段): set from the visitor's
+    /// NewVisitorConn use_compression flag. When true, `run_work_bridge` wraps
+    /// the visitor conn in a Snappy stream (inside the CFB layer when
+    /// visitor-segment encryption is also on — snappy inner, CFB outer).
+    pub(crate) visitor_use_compression: bool,
     pub(crate) created_at: Instant,
     /// Proxy metadata fetched once by the dispatcher. `assign_work_to_proxy`
     /// reads local_addr/remote_port/bandwidth_limit/etc. from it instead of
@@ -315,6 +320,7 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
     proxy_name: String,
     visitor_conn: IoStream,
     visitor_use_encryption: bool,
+    visitor_use_compression: bool,
 ) -> Result<(), ()> {
     // NewUserConn plugin hook — control-enabled plugins can reject.
     // Skip payload construction when no plugins are configured (the
@@ -355,6 +361,7 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
             use_encryption: enc,
             use_compression: comp,
             visitor_use_encryption,
+            visitor_use_compression,
             created_at: Instant::now(),
             proxy_info,
         },
@@ -492,8 +499,10 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             use_encryption: enc,
             use_compression: comp,
             // Group load-balancing forwards a provider-side user conn (not a
-            // visitor conn), so visitor-segment encryption never applies here.
+            // visitor conn), so visitor-segment encryption/compression never
+            // apply here.
             visitor_use_encryption: false,
+            visitor_use_compression: false,
             created_at: Instant::now(),
             proxy_info,
         },
