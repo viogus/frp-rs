@@ -635,10 +635,10 @@ async fn handle_http1_request<S>(
     .await
     {
         Ok(forward) => {
-            let internal_tx = {
-                let map = state.run_id_to_ctl_tx.read().await;
-                map.get(&forward.run_id).cloned()
-            };
+            let internal_tx = state
+                .run_id_to_ctl_tx
+                .get(&forward.run_id)
+                .map(|v| v.clone());
             if let Some(ctl_tx) = internal_tx {
                 // send().await: backpressure is correct — a full control
                 // channel must not silently drop a user connection (Go frp
@@ -883,10 +883,10 @@ pub async fn run_vhost_https_listener(
                         .lookup_combined(&sni, "/", "")
                         .await
                     {
-                        let internal_tx = {
-                            let map = state.run_id_to_ctl_tx.read().await;
-                            map.get(route.run_id.as_ref()).cloned()
-                        };
+                        let internal_tx = state
+                            .run_id_to_ctl_tx
+                            .get(route.run_id.as_ref())
+                            .map(|v| v.clone());
                         if let Some(ctl_tx) = internal_tx {
                             // send().await: same backpressure rationale as the
                             // HTTP vhost path — runs in a per-connection

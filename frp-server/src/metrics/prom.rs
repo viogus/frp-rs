@@ -156,7 +156,7 @@ pub async fn sync_from_state(state: &AppState) {
     use std::collections::HashMap;
 
     // Client counts — from active control connections
-    let client_count = state.run_id_to_ctl_tx.read().await.len() as i64;
+    let client_count = state.run_id_to_ctl_tx.len() as i64;
     CLIENT_COUNTS.set(client_count);
 
     // Reset gauge-based label metrics before rebuilding.
@@ -226,18 +226,14 @@ pub async fn sync_from_state(state: &AppState) {
 
     let total_pool_size: i64 = state
         .run_id_to_ctl_tx
-        .read()
-        .await
-        .values()
+        .iter()
         .map(|ctl| ctl.pool_stats.pool_size.load(Ordering::Relaxed))
         .sum();
     POOL_SIZE.set(total_pool_size);
 
     let total_pending: i64 = state
         .run_id_to_ctl_tx
-        .read()
-        .await
-        .values()
+        .iter()
         .map(|ctl| ctl.pool_stats.pending_requests.load(Ordering::Relaxed))
         .sum();
     POOL_PENDING.set(total_pending);

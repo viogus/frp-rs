@@ -235,10 +235,10 @@ pub async fn run_tcpmux_listener(
             };
 
             // Forward to the control handler for work connection bridging.
-            let internal_tx = {
-                let map = state.run_id_to_ctl_tx.read().await;
-                map.get(&route.run_id).cloned()
-            };
+            let internal_tx = state
+                .run_id_to_ctl_tx
+                .get(&route.run_id)
+                .map(|v| v.clone());
 
             if let Some(ctl_tx) = internal_tx {
                 // send().await: backpressure is correct — a full control

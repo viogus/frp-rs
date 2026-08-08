@@ -188,18 +188,19 @@ async fn allocate_proxy_port(
                         if used.contains(&res_port) {
                             None
                         } else {
-                            drop(used);
-                            if crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, res_port)
-                            {
-                                Some(res_port)
-                            } else {
-                                None
-                            }
+                            Some(res_port)
                         }
                     }
                 } else {
                     None
                 }
+            };
+            // Probe bindability OUTSIDE the reservations write lock: the
+            // blocking std::net::TcpListener::bind must not serialize
+            // reservation lookups (audit D3-6).
+            let res_candidate = match res_candidate {
+                Some(p) if !crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, p) => None,
+                other => other,
             };
             match res_candidate {
                 Some(p) => Some(p),
@@ -279,11 +280,14 @@ async fn build_proxy_info(
         bandwidth_limit_mode: np.bandwidth_limit_mode.clone().unwrap_or_default(),
         user: state
             .run_id_to_ctl_tx
-            .read()
-            .await
             .get(run_id)
             .map(|c| c.user.clone())
             .unwrap_or_default(),
+        user_conn_sem: (state.max_conns_per_proxy > 0).then(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                state.max_conns_per_proxy as usize,
+            ))
+        }),
     }
 }
 
@@ -924,9 +928,15 @@ pub(crate) async fn handle_new_proxy(
             // The shared group listener handles connection dispatch.
             // We still create ProxyInfo with the group's port so users
             // connect to the correct port, but no new listener is spawned.
-            let mut ports = state.used_ports.write().await;
-            ports.insert(group_port);
-            let allocated_port = Some(group_port);
+            // Scope the write lock: the callee below takes `used_ports.write()`
+            // again (on register failure it removes the port), and tokio's
+            // RwLock is NOT reentrant — holding `ports` here would
+            // self-deadlock the control select loop (audit D3-1).
+            let allocated_port = {
+                let mut ports = state.used_ports.write().await;
+                ports.insert(group_port);
+                Some(group_port)
+            };
             // Jump to proxy registration, skipping listener creation below.
             handle_tcp_group_member_registration(
                 state,
@@ -1189,15 +1199,15 @@ pub(crate) async fn unregister_control(
     skip_ctl_unregister: bool,
 ) {
     let removed_control_id = if !skip_ctl_unregister {
-        let current_control_id = {
-            let map = state.run_id_to_ctl_tx.read().await;
-            map.get(run_id).map(|c| c.control_id).unwrap_or(0)
-        };
+        let current_control_id = state
+            .run_id_to_ctl_tx
+            .get(run_id)
+            .map(|c| c.control_id)
+            .unwrap_or(0);
         if control_id != 0 && current_control_id != control_id {
             None
         } else {
-            let mut map = state.run_id_to_ctl_tx.write().await;
-            map.remove(run_id);
+            state.run_id_to_ctl_tx.remove(run_id);
             // Mark the client offline in the registry, generation-aware.
             state
                 .client_registry
@@ -1396,10 +1406,10 @@ async fn tcp_group_listener(
                             .select_group_backend_with_run_id(&group_name, "")
                             .await
                         {
-                            let ctl_tx = {
-                                let map = state.run_id_to_ctl_tx.read().await;
-                                map.get(&backend_run_id).map(|c| c.tx.clone())
-                            };
+                            let ctl_tx = state
+                                .run_id_to_ctl_tx
+                                .get(&backend_run_id)
+                                .map(|c| c.tx.clone());
                             if let Some(tx) = ctl_tx {
                                 // send().await: same backpressure rationale as
                                 // listen_and_proxy — the group accept loop
@@ -1629,6 +1639,7 @@ mod unregister_generation_tests {
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
             0,
+            0,
             168,
             true,
             0,
@@ -1647,8 +1658,7 @@ mod unregister_generation_tests {
         control_id: u64,
     ) -> mpsc::Receiver<InternalMsg> {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let mut map = state.run_id_to_ctl_tx.write().await;
-        map.insert(
+        state.run_id_to_ctl_tx.insert(
             run_id.to_string(),
             crate::state::ControlTx {
                 tx,
@@ -1671,11 +1681,11 @@ mod unregister_generation_tests {
         // An older failing control (generation 3) must not delete the
         // replacement's routing entry.
         unregister_control(&state, "run-1", 3, false).await;
-        assert!(state.run_id_to_ctl_tx.read().await.contains_key("run-1"));
+        assert!(state.run_id_to_ctl_tx.contains_key("run-1"));
 
         // The replacement itself may still clean up its own generation.
         unregister_control(&state, "run-1", 7, false).await;
-        assert!(!state.run_id_to_ctl_tx.read().await.contains_key("run-1"));
+        assert!(!state.run_id_to_ctl_tx.contains_key("run-1"));
     }
 
     #[cfg(feature = "vnet")]

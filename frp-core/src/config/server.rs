@@ -76,6 +76,12 @@ pub struct ServerConfig {
     /// exhaustion; set to 0 for unlimited. Go frp compat: maxPortsPerClient.
     #[serde(default, alias = "maxPortsPerClient")]
     pub max_ports_per_client: u64,
+    /// Maximum concurrent user connections per proxy. 0 = unlimited (Go frp
+    /// has no per-proxy cap; default). A flood of user connections to one
+    /// proxy would otherwise grow `pending_requests` + fds without bound
+    /// (audit D2-2). Go frp compat: no equivalent option.
+    #[serde(default, alias = "maxConnsPerProxy")]
+    pub max_conns_per_proxy: u64,
     /// Timeout in seconds for backend HTTP response in VHost handler.
     /// Go frp compat: VhostHTTPTimeout. Default: 60.
     #[serde(default = "default_vhost_http_timeout", alias = "vhostHTTPTimeout")]
@@ -160,6 +166,7 @@ pub struct ServerConfigSnapshot {
     pub subdomain_host: String,
     pub max_pool_count: i64,
     pub max_ports_per_client: i64,
+    pub max_conns_per_proxy: i64,
     pub heartbeat_timeout: i64,
     pub allow_ports_str: String,
     pub tls_force: bool,
@@ -182,6 +189,7 @@ impl ServerConfigSnapshot {
             subdomain_host: cfg.sub_domain_host.clone(),
             max_pool_count: cfg.transport.max_pool_count,
             max_ports_per_client: cfg.max_ports_per_client as i64,
+            max_conns_per_proxy: cfg.max_conns_per_proxy as i64,
             heartbeat_timeout: cfg.transport.heartbeat_timeout,
             allow_ports_str: cfg.allow_ports.clone(),
             tls_force: cfg.tls_only,
@@ -284,6 +292,7 @@ impl Default for ServerConfig {
             allow_port_end: default_allow_port_end(),
             allow_ports: String::new(),
             max_ports_per_client: 0,
+            max_conns_per_proxy: 0,
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,

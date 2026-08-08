@@ -126,7 +126,7 @@ but not literally 100% — see "Known limitations" below.
 | frpc binary | ~12 MB | ~4.5 MB | ~3.2 MB | ~2.2 MB |
 | Memory (idle) | ~8-12 MB | ~2-4 MB | ~1.5-3 MB | ~1-2 MB |
 
-> Binary sizes measured 2026-08-08 (macOS arm64) with the **declared release profile** (`fat-LTO`, `opt-level=z`, `strip=symbols`, `panic=abort`). Local/CI dev builds override LTO/opt (`lto=false opt-level=2` for build speed) and come out ~40% larger — they do not reflect release artifacts.
+> Binary sizes measured 2026-08-08 (macOS arm64) with the **declared release profile** (`fat-LTO`, `opt-level=z`, `strip=symbols`, `panic=abort`). Local/CI dev builds override LTO/opt (`lto=false opt-level=2` for build speed) and come out ~70% larger (measured 2026-08-09: 9.1MB vs 5.3MB) — they do not reflect release artifacts.
 
 **Build sizes via feature flags.** Trim unused protocols and features to match your deployment. `frps`'s `default` feature set already enables every transport and the SSH gateway (the Cargo `full` feature is identical to `default`); opt-in features are `dashboard`, `vnet`, `mimalloc`, `otel`, and the dev-only profiling flags:
 

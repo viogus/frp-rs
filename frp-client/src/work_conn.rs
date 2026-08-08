@@ -792,6 +792,11 @@ async fn run_udp_work_conn(
     let writer = async move {
         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
         let mut payload = Vec::with_capacity(udp_packet_size.max(1));
+        // local_addr is loop-invariant (already parsed to a SocketAddr at
+        // startup); pre-build the UdpAddr once and move it in/out per packet
+        // instead of re-parsing the string every packet (audit D1-5).
+        let mut local_udp_addr: Option<msg::UdpAddr> =
+            Some(msg::UdpAddr::from_string(&local_addr_str).expect("local_addr parsed at startup"));
         // Ping-pong scratch for the per-packet compress chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
         let mut keepalive = tokio::time::interval(Duration::from_secs(30));
@@ -816,7 +821,11 @@ async fn run_udp_work_conn(
                     // last_remote, so concurrent remotes never cross wires.
                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
                         content: std::mem::take(&mut payload),
-                        local_addr: msg::UdpAddr::from_string(&local_addr_str),
+                        local_addr: local_udp_addr.take().or_else(|| {
+                            // Unreachable after the first packet (returned
+                            // below); defensive fallback.
+                            msg::UdpAddr::from_string(&local_addr_str)
+                        }),
                         remote_addr: Some(msg::UdpAddr {
                             ip: remote.ip().to_string(),
                             port: remote.port(),
@@ -828,6 +837,10 @@ async fn run_udp_work_conn(
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
+                    // Return the invariant UdpAddr for the next packet.
+                    if let FrpMessage::UDPPacket(p) = pkt {
+                        local_udp_addr = p.local_addr;
+                    }
                     if let Err(e) = result {
                         debug!(proxy_name = %pn_w, error = %e,
                             "UDP '{}' send to work conn failed: {}", pn_w, e);

@@ -466,8 +466,7 @@ pub(crate) async fn authenticate(
     // The new handler waits for the old handler's cleanup to complete
     // before proceeding (Go frp dev control.go lifecycle).
     let handoff_barrier: Option<oneshot::Receiver<()>> = {
-        let map = state.run_id_to_ctl_tx.read().await;
-        if let Some(old_ctl) = map.get(&run_id) {
+        if let Some(old_ctl) = state.run_id_to_ctl_tx.get(&run_id).map(|c| c.clone()) {
             warn!(run_id = %run_id, "Duplicate run_id {}: shutting down old control handler for replacement", run_id);
             let (tx, rx) = oneshot::channel();
             match old_ctl.tx.try_send(InternalMsg::Shutdown { done: tx }) {
@@ -491,27 +490,24 @@ pub(crate) async fn authenticate(
     };
 
     // Insert new ControlTx while holding run_mu.
-    {
-        let mut map = state.run_id_to_ctl_tx.write().await;
-        map.insert(
-            run_id.clone(),
-            ControlTx {
-                tx: internal_tx.clone(),
-                client_addr: peer,
-                login_time: std::time::Instant::now(),
-                login_time_unix: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-                pool_stats: pool_stats.clone(),
-                // Proxy ownership/access control must use the verified OIDC
-                // subject. Proxy names and registry keys above intentionally
-                // retain the claimed user for Go wire compatibility.
-                user: authenticated_user.clone(),
-                control_id,
-            },
-        );
-    }
+    state.run_id_to_ctl_tx.insert(
+        run_id.clone(),
+        ControlTx {
+            tx: internal_tx.clone(),
+            client_addr: peer,
+            login_time: std::time::Instant::now(),
+            login_time_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            pool_stats: pool_stats.clone(),
+            // Proxy ownership/access control must use the verified OIDC
+            // subject. Proxy names and registry keys above intentionally
+            // retain the claimed user for Go wire compatibility.
+            user: authenticated_user.clone(),
+            control_id,
+        },
+    );
 
     // Release run_mu before waiting for the handoff barrier — the old
     // handler's cleanup may need to acquire run_mu (via unregister_control
@@ -843,6 +839,7 @@ mod auth_signal_tests {
             false,
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
             0,
             168,
             true,

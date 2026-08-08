@@ -320,6 +320,11 @@ async fn run_udp_work_conn(
         // Option<UdpAddr> String heap allocs happen once per bridge instead
         // of once per packet. Single-task writer: no concurrency risk.
         let mut local_addr = local_addr;
+        // Spare Vec for the packet content: the wire format base64-encodes
+        // UDPPacket.content, and the memcpy of `buf[..n]` is inherent — but
+        // the per-packet Vec *allocation* is not. take/return keeps the
+        // capacity across packets (audit D1-4).
+        let mut spare: Vec<u8> = Vec::with_capacity(udp_packet_size);
         loop {
             let received = tokio::select! {
                 biased;
@@ -332,12 +337,11 @@ async fn run_udp_work_conn(
             };
             match received {
                 Ok((n, src)) => {
-                    // UDPPacket owns its Vec and the wire format base64-encodes
-                    // it, so one allocation + copy per packet is inherent to
-                    // the message model (same as to_vec; a reused buffer would
-                    // gain nothing here).
+                    spare.clear();
+                    spare.extend_from_slice(&buf[..n]);
+                    let content = std::mem::take(&mut spare);
                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                        content: buf[..n].to_vec(),
+                        content,
                         local_addr: local_addr.take(),
                         remote_addr: Some(msg::UdpAddr {
                             ip: src.ip().to_string(),
@@ -354,10 +358,11 @@ async fn run_udp_work_conn(
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
-                    // Return the invariant value to the local for the next
-                    // packet before checking the write result.
+                    // Return the invariant values to their locals for the
+                    // next packet before checking the write result.
                     if let FrpMessage::UDPPacket(p) = pkt {
                         local_addr = p.local_addr;
+                        spare = p.content;
                     }
                     if let Err(e) = result {
                         debug!(proxy_name = %writer_name, error = %e,
@@ -500,7 +505,7 @@ async fn relay_plain_fast_inner(
                 metrics.record_traffic(a, b);
             }
             Err(e) => {
-                tracing::debug!(error = %e, "splice bridge closed: {}", e);
+                tracing::warn!(error = %e, "splice bridge closed with error: {}", e);
             }
         }
     } else {
@@ -1101,15 +1106,27 @@ pub(crate) async fn assign_work_to_proxy(
         None
     };
 
-    tokio::spawn(run_work_bridge(
-        work_conn,
-        req,
-        proxy_info,
-        encryption_key,
-        metrics,
-        header_timeout,
-        state,
-    ));
+    // Spawn the bridge; select against the server shutdown token so a
+    // graceful shutdown can interrupt half-open idle bridges instead of
+    // waiting on TCP keepalive (2h) or yamux keepalive (90s) — audit D2-4.
+    // The JoinHandle is deliberately dropped: bridges are connection-bounded
+    // and self-terminate; shutdown just accelerates teardown.
+    let shutdown = state.shutdown_token.clone();
+    let state_for_bridge = state.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = run_work_bridge(
+                work_conn,
+                req,
+                proxy_info,
+                encryption_key,
+                metrics,
+                header_timeout,
+                state_for_bridge,
+            ) => {}
+            _ = shutdown.cancelled() => {}
+        }
+    });
 }
 
 #[cfg(test)]

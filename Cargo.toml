@@ -68,6 +68,11 @@ bytes = "1"
 # connection churn must not serialize on a std Mutex. ArrayQueue is MPMC and
 # only pulls in crossbeam-utils (already in the tree via crossbeam-channel).
 crossbeam-queue = "0.3"
+# Only used by frp-server: replaces the tokio RwLock around
+# `state.run_id_to_ctl_tx` so every work-conn dispatch no longer contends on
+# one global read lock. DashMap shards the map across per-bucket locks.
+# Binary impact: ~+50KB.
+dashmap = "6"
 quinn = "0.11"
 
 frp-vnet = { path = "frp-vnet" }

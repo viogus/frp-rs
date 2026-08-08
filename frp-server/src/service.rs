@@ -250,6 +250,7 @@ impl Service {
                 cfg.http_plugins.clone(),
             )),
             cfg.max_ports_per_client,
+            cfg.max_conns_per_proxy,
             cfg.nat_hole_analysis_data_reserve_hours,
             cfg.detailed_errors_to_client,
             max_connections,

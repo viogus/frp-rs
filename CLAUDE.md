@@ -110,7 +110,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 797 passed, 0 failed |
-| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); CI dev builds override LTO/opt (`lto=false opt-level=2`, written by ci.yml on runners) for build speed and come out ~40% larger, so CI artifact sizes do not reflect release; local builds use the declared profile; hyper-based HTTP client + otel/prometheus default-features pruning) |
+| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); CI dev builds override LTO/opt (`lto=false opt-level=2`, written by ci.yml on runners) for build speed and come out ~70% larger (measured 2026-08-09: 9.1MB vs 5.3MB), so CI artifact sizes do not reflect release; local builds use the declared profile; hyper-based HTTP client + otel/prometheus default-features pruning) |
 | `compat-test.sh` (Go frp v0.70.1) | 76 run_test scenarios + 17 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 13 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
@@ -158,7 +158,7 @@ The server's core is a pattern of cross-task message passing (`frp-server/src/se
 
 ```
 AppState
-  ├── run_id_to_ctl_tx: HashMap<run_id, ControlTx>   // routes work conns to correct handler
+  ├── run_id_to_ctl_tx: DashMap<run_id, ControlTx>  // routes work conns to correct handler (lock-free reads)
   ├── proxy_manager: ProxyManager                     // global proxy registry
   ├── used_ports: HashSet<u16>                        // port allocation tracking
   ├── sk_index: HashMap<sk, proxy_name>              // STCP/XTCP secret-key → proxy lookup

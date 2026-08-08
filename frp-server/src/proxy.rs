@@ -69,6 +69,13 @@ pub struct ProxyInfo {
     pub bandwidth_limit: String,
     pub bandwidth_limit_mode: String,
     pub user: String,
+    /// Per-proxy user-connection cap (audit D2-2): a Semaphore of size
+    /// `max_conns_per_proxy` when configured (>0); None = unlimited (Go
+    /// default). Permits are held for the user conn's full lifetime (they
+    /// live in `PendingRequest` and drop when the bridge ends), bounding
+    /// per-proxy connection floods that would otherwise grow
+    /// `pending_requests` + fds without limit.
+    pub user_conn_sem: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl ProxyInfo {

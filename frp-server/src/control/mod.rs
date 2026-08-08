@@ -230,21 +230,10 @@ async fn handle_control_inner<S>(
             }
         }
 
-        // Expire idle pooled connections (if timeout configured)
-        let pool_idle_timeout = state.pool.idle_timeout;
-        if pool_idle_timeout > Duration::ZERO {
-            while let Some(entry) = ctl.work_pool.front() {
-                if entry.pooled_at.elapsed() >= pool_idle_timeout {
-                    ctl.work_pool.pop_front();
-                    pool_stats
-                        .pool_size
-                        .store(ctl.work_pool.len() as i64, Ordering::Relaxed);
-                    debug!(run_id = %run_id, idle_timeout = ?pool_idle_timeout, "Idle work conn expired after {:?}", pool_idle_timeout);
-                } else {
-                    break;
-                }
-            }
-        }
+        // NOTE: pooled work-conn idle expiry was removed (audit D2-3):
+        // `state.pool.idle_timeout` is always Duration::ZERO (never wired
+        // from config; Go frp parity keeps pooled conns alive until the
+        // control disconnect), so the old branch was dead code.
 
         // Heartbeat check: if no ping in heartbeat_timeout, disconnect.
         // When heartbeat_timeout <= 0, heartbeat checking is disabled
@@ -254,7 +243,32 @@ async fn handle_control_inner<S>(
             break;
         }
 
+        // Earliest pending-request expiry deadline. Loop-top expiry is
+        // event-driven only — with tcp_mux on (the default), heartbeat is
+        // disabled and this select has no timer arm, so a silent client
+        // could pin pending_requests entries + user fds forever. This branch
+        // wakes the select at the earliest deadline; loop-top does the
+        // cleanup (audit D2-1).
+        let pending_deadline = ctl
+            .pending_requests
+            .front()
+            .map(|r| r.created_at + pool::pending_request_timeout(state.user_conn_timeout))
+            .or_else(|| {
+                ctl.pending_udp
+                    .front()
+                    .map(|(_, ts)| *ts + pool::pending_request_timeout(state.user_conn_timeout))
+            });
+
         tokio::select! {
+            // Wake when the earliest pending request expires (loop-top
+            // cleanup handles the actual expiry).
+            _ = async {
+                match pending_deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+
             // Heartbeat watchdog: an idle control connection must not hold
             // its conn_semaphore permit / task / fd forever. The check above
             // only runs after select returns, so without this branch a silent

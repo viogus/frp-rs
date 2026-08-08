@@ -933,10 +933,7 @@ async fn handle_work_conn_requests(
         // with the SSH channel (Go virtual client net.Pipe).
         let (work_side, ssh_side) = tokio::io::duplex(64 * 1024);
 
-        let ctl_tx = {
-            let map = state.run_id_to_ctl_tx.read().await;
-            map.get(&run_id).map(|c| c.tx.clone())
-        };
+        let ctl_tx = state.run_id_to_ctl_tx.get(&run_id).map(|c| c.tx.clone());
         let Some(tx) = ctl_tx else {
             tracing::warn!(run_id = %run_id, "SSH: control handler gone; dropping work conn");
             let _ = handle.close(channel_id).await;
@@ -1083,6 +1080,7 @@ mod tests {
             false,
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
             0,
             168,
             true,
@@ -1336,7 +1334,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(state.run_id_to_ctl_tx.read().await.is_empty());
+        assert!(state.run_id_to_ctl_tx.is_empty());
         listener_task.abort();
     }
 
@@ -1356,7 +1354,7 @@ mod tests {
         assert!(auth.success());
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                if state.run_id_to_ctl_tx.read().await.len() == 1 {
+                if state.run_id_to_ctl_tx.len() == 1 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1364,7 +1362,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(state.run_id_to_ctl_tx.read().await.len(), 1);
+        assert_eq!(state.run_id_to_ctl_tx.len(), 1);
         assert_eq!(
             state.conn_semaphore.as_ref().unwrap().available_permits(),
             0
@@ -1409,7 +1407,7 @@ mod tests {
         assert!(auth.success());
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                if state.run_id_to_ctl_tx.read().await.len() == 1 {
+                if state.run_id_to_ctl_tx.len() == 1 {
                     break;
                 }
                 tokio::task::yield_now().await;

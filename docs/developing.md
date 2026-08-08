@@ -100,7 +100,7 @@ The server's core is cross-task message passing via `InternalMsg` channels. The 
 
 ```
 AppState
-  ├── run_id_to_ctl_tx: HashMap<run_id, ControlTx>   // routes work conns to correct handler
+  ├── run_id_to_ctl_tx: DashMap<run_id, ControlTx>  // routes work conns to correct handler (lock-free reads)
   ├── proxy_manager: ProxyManager                     // global proxy registry
   ├── used_ports: HashSet<u16>                        // port allocation tracking
   ├── sk_index: HashMap<sk, proxy_name>              // STCP/XTCP secret-key to proxy lookup
@@ -447,7 +447,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 > Sizes measured 2026-08-08 (macOS arm64) with the declared release profile
 > (fat-LTO, opt-level=z, strip=symbols, panic=abort). Local dev builds that
-> override `lto=false opt-level=2` (`.cargo/config.toml`) come out ~40% larger.
+> override `lto=false opt-level=2` (`.cargo/config.toml`) come out ~70% larger (measured 2026-08-09: 9.1MB vs 5.3MB).
 
 The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and `frps-micro`/`frpc-micro` respectively.
 

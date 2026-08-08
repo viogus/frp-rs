@@ -588,10 +588,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         }
     };
 
-    let provider_ctl = {
-        let map = ctx.state.run_id_to_ctl_tx.read().await;
-        map.get(&provider_run_id).cloned()
-    };
+    let provider_ctl = ctx
+        .state
+        .run_id_to_ctl_tx
+        .get(&provider_run_id)
+        .map(|v| v.clone());
     let provider_ctl = match provider_ctl {
         Some(ctl) => ctl,
         None => {
@@ -946,8 +947,6 @@ pub(crate) async fn handle_vnet_route_advertise(
                 let owner_alive = ctx
                     .state
                     .run_id_to_ctl_tx
-                    .read()
-                    .await
                     .contains_key(owner_run_id.as_str());
                 if owner_alive {
                     warn!(
@@ -1020,13 +1019,7 @@ pub(crate) async fn handle_vnet_packet(
     // — a same-named visitor in a different vnet is never chosen.
     if let Some(target_info) = ctx.state.proxy_manager.get(&pkt.proxy_name).await {
         if target_info.run_id != ctx.run_id {
-            if let Some(ctl_tx) = ctx
-                .state
-                .run_id_to_ctl_tx
-                .read()
-                .await
-                .get(&target_info.run_id)
-            {
+            if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.get(&target_info.run_id) {
                 let _ = ctl_tx.tx.try_send(InternalMsg::VnetPacketForward {
                     proxy_name: Arc::from(pkt.proxy_name.as_str()),
                     data: Arc::from(pkt.data.as_str()),
@@ -1038,7 +1031,7 @@ pub(crate) async fn handle_vnet_packet(
         if let Some(target_run_id) =
             vnet_visitor_route_target_run_id(&routes, &ctx.run_id, &pkt.proxy_name)
         {
-            if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
+            if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.get(&target_run_id) {
                 let _ = ctl_tx.tx.try_send(InternalMsg::VnetPacketForward {
                     proxy_name: Arc::from(pkt.proxy_name.as_str()),
                     data: Arc::from(pkt.data.as_str()),
@@ -1312,6 +1305,7 @@ mod vnet_route_tests {
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
             0,
+            0,
             168,
             true,
             0,
@@ -1322,8 +1316,7 @@ mod vnet_route_tests {
 
     async fn insert_control(state: &Arc<AppState>, run_id: &str) -> mpsc::Receiver<InternalMsg> {
         let (tx, rx) = mpsc::channel(16);
-        let mut map = state.run_id_to_ctl_tx.write().await;
-        map.insert(
+        state.run_id_to_ctl_tx.insert(
             run_id.to_string(),
             ControlTx {
                 tx,

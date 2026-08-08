@@ -436,7 +436,10 @@ async fn relay_plain_fast_inner(
                 debug!(name = %name, to_work = %to_work, to_local = %to_local, "Proxy {} closed: {}B to server, {}B to local", name, to_work, to_local);
             }
             Err(e) => {
-                debug!(name = %name, error = %e, "Proxy {} splice bridge closed: {}", name, e);
+                // splice(2) consumed the streams, so a fallback copy is not
+                // possible (partially-moved bytes would be lost); surface
+                // abnormal termination at warn level (audit D1-10).
+                warn!(name = %name, error = %e, "Proxy {} splice bridge closed with error: {}", name, e);
             }
         }
     } else {
