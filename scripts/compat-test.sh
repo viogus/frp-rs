@@ -1014,6 +1014,111 @@ write_frpc_config_xtcp_visitor() {
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, OIDC auth with HTTP CONNECT proxy (auth.oidc.proxyURL)
+# =============================================================================
+# The mock OIDC provider and the CONNECT proxy are only reachable on
+# 127.0.0.1, so a successful login also proves the OIDC HTTP requests were
+# routed through the proxy (proxy.log records the CONNECT), i.e. that Go
+# frp's proxyURL is honored end-to-end.
+test_g2r_oidc_proxy() {
+    local name="go-to-rust-oidc-proxy"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local oidc_port=$(random_port)
+    local proxy_port=$(random_port)
+    local oidc_issuer="http://127.0.0.1:$oidc_port"
+    local oidc_secret="mock-oidc-secret"
+    local oidc_aud="frp-test-aud"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Mock OIDC provider (discovery + token + JWKS, HS256) and CONNECT proxy
+    python3 "$SCRIPT_DIR/mock_oidc.py" "$oidc_port" "$oidc_issuer" "$oidc_secret" "$oidc_aud" \
+        > "$TEST_DIR/$name/oidc.out" 2>&1 &
+    track_pid $!
+    python3 "$SCRIPT_DIR/connect_proxy.py" "$proxy_port" "$TEST_DIR/$name/proxy.log" \
+        > "$TEST_DIR/$name/proxy.out" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$oidc_port" 3 || {
+        fail_test "$name" "OIDC provider did not start"
+        return
+    }
+    wait_for_port 127.0.0.1 "$proxy_port" 3 || {
+        fail_test "$name" "CONNECT proxy did not start"
+        return
+    }
+
+    # Rust frps with OIDC auth (verifies the token's iss/aud/exp against JWKS)
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+
+[auth]
+method = "oidc"
+
+[auth.oidc]
+issuer = "$oidc_issuer"
+audience = "$oidc_aud"
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Go frpc with OIDC auth + proxyURL pointing at the local CONNECT proxy
+    # (v0.70.1 client OIDC fields: clientID/clientSecret/tokenEndpointURL/
+    # audience/proxyURL — no "issuer"; the mock provider serves the token
+    # endpoint directly and the JWT's iss/aud are checked by Rust frps)
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+
+auth.method = "oidc"
+auth.oidc.clientID = "test-client"
+auth.oidc.clientSecret = "test-secret"
+auth.oidc.tokenEndpointURL = "$oidc_issuer/token"
+auth.oidc.audience = "$oidc_aud"
+auth.oidc.proxyURL = "http://127.0.0.1:$proxy_port"
+
+[[proxies]]
+name = "oidc-proxy-test"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 1
+remotePort = $(random_port)
+TOML
+    # Use run_go so a proxy set via HTTP_PROXY/HTTPS_PROXY in the caller's
+    # environment cannot hijack the OIDC HTTP requests away from our local
+    # proxy (run_go clears proxy env vars for Go binaries).
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    # Login must succeed AND the proxy must have seen the OIDC traffic
+    # (Go's oauth2 client uses HTTP CONNECT for https targets and
+    # absolute-form forwarding for http targets — match either).
+    local ok=false
+    for _ in $(seq 1 15); do
+        if grep -q "logged in with run_id" "$TEST_DIR/$name/frps.log" 2>/dev/null; then
+            ok=true
+            break
+        fi
+        sleep 1
+    done
+    if $ok && grep -qE "CONNECT 127\.0\.0\.1:$oidc_port|FORWARD (POST|GET) 127\.0\.0\.1:$oidc_port" "$TEST_DIR/$name/proxy.log" 2>/dev/null; then
+        pass_test "$name"
+    else
+        fail_test "$name" \
+            "login_ok=$ok frps_tail=[$(tail -3 "$TEST_DIR/$name/frps.log" 2>/dev/null | tr '\n' ' ')] proxy=[$(cat "$TEST_DIR/$name/proxy.log" 2>/dev/null | tr '\n' ' ')]"
+    fi
+}
+
+# =============================================================================
 # Test: Go frpc -> Rust frps, plain TCP
 # =============================================================================
 test_g2r_tcp_plain() {
@@ -4963,6 +5068,7 @@ if ! ${XTCP_ONLY:-false}; then
 run_test test_auth_g2r_reject
 run_test test_auth_r2g_reject
 run_test test_auth_r2g_heartbeats
+run_test test_g2r_oidc_proxy
 
 # Phase 2: Go frpc -> Rust frps TCP data plane
 run_test test_g2r_tcp_plain

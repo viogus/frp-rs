@@ -342,6 +342,8 @@ tcp_mux_keepalive_interval = 30
 | `auth.method` | `"token"` | Authentication method (token or oidc) |
 | `auth.token` | `""` | Shared authentication token |
 | `auth.authenticationTimeout` | `90` | Login timestamp freshness window in seconds (replay protection; `0` = disabled, Go frp default) |
+| `auth.oidc.issuer` | `""` | OIDC issuer URL (server side: discovery + JWKS for token verification) |
+| `auth.oidc.audience` | `""` | OIDC `aud` claim required on tokens (empty = audience check skipped) |
 | `ssh_tunnel_gateway.allowNoneAuth` | `false` | Allow the SSH gateway to start with no credentials, accepting every connection (fail-closed by default) |
 | `log.level` | `"info"` | Log level: trace, debug, info, warn, error |
 | `log.file` | `""` | Log file path (empty = stderr) |
@@ -353,6 +355,7 @@ tcp_mux_keepalive_interval = 30
 | `web_server.enable_prometheus` | `false` | Expose /metrics for Prometheus scraping |
 | `web_server.tls_cert_file` | `""` | Dashboard TLS certificate path |
 | `web_server.tls_key_file` | `""` | Dashboard TLS private key path |
+| `web_server.assets_dir` | `""` | Custom dashboard `index.html` directory (read once at startup; empty = built-in page) |
 | `transport.tcp_mux` | `true` | Enable TCP multiplexing |
 | `transport.tcp_mux_keepalive_interval` | `30` | Keepalive interval (seconds) for mux |
 | `transport.heartbeat_timeout` | `-1` | Heartbeat timeout in seconds; `-1` disables it under tcp_mux (Go v0.70.1 default) |
@@ -458,6 +461,7 @@ use_compression = false
 | `web_server.password` | `""` | Admin API Basic Auth password |
 | `heartbeat_interval` | `-1` | Ping interval in seconds; `-1` disables it under tcp_mux (Go v0.70.1 default) |
 | `proxy_url` | `""` | Upstream HTTP/SOCKS5 proxy for control connection |
+| `auth.oidc.proxyURL` | `""` | OIDC token/discovery HTTP proxy (HTTP CONNECT or SOCKS5; Go frp `proxyURL` compat) |
 | `start` | `[]` | Selective proxy start: only start proxies named in this list |
 | `includes` | `[]` | Glob patterns for additional config files to merge |
 | `store.path` | `""` | JSON file for runtime proxy/visitor store (admin API CRUD); entries overlay config-file entries |
