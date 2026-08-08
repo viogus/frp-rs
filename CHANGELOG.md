@@ -4,6 +4,38 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+### Changed
+- **frpc `admin` is now opt-in** (was in the default feature set): build with
+  `--features admin` to include the axum-based admin API (~0.5 MB smaller
+  default frpc). `frpc reload`/`status` require a running frpc built with
+  `admin` and `web_server.port > 0`.
+- WebSocket transport no longer links `tokio-tungstenite`: the tungstenite
+  variant had no callers (all paths use the manual RFC 6455 upgrade); the
+  dependency and its dead code were removed.
+- Local `.cargo/config.toml` release override (`lto=false opt-level=2`)
+  removed — local `cargo build --release` uses the declared profile
+  (fat-LTO + opt-level=z). CI still writes the override on runners for speed.
+
+### Performance
+- WebSocket raw path: per-frame payload allocation replaced with a reused
+  per-connection buffer; frame building writes into a reused `write_buf` (no
+  per-chunk alloc on the bridge hot path).
+- Bridge buffer pool: `std::sync::Mutex` → lock-free `crossbeam-queue`
+  `ArrayQueue`; pool cap raised 32 → 128 (env `FRP_BRIDGE_POOL_MAX`, cap
+  4096). Pre-sized compression/decompression buffers.
+- UDP proxy: session table sharded 8 ways (per-remote locks instead of one
+  global mutex per packet).
+- TCP port allocation: OS bind probe moved out of the `used_ports` write
+  lock (three-phase pick/probe/commit) — registrations no longer serialize
+  behind socket-bind latency.
+
+### Fixes
+- `webpki-roots` bumped to 1.0 (drops the 0.26 shim layer).
+- `frp-vnet` controller: poisoned-lock `.unwrap()` unified to recovery.
+- `mem_profile.rs`: added `// SAFETY:` documentation for the `GlobalAlloc` impl.
+
+## Unreleased
+
 - **OIDC `proxyUrl` supported (Go frp parity)**: `auth.oidcProxyUrl` on
   server and client now routes OIDC HTTP requests (well-known config, JWKS,
   token endpoint) through an HTTP CONNECT or SOCKS5 proxy — previously the

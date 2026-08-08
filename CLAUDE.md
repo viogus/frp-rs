@@ -39,9 +39,10 @@ cargo build --release -p frps -p frpc
 # → frps (~5.3MB), frpc (~4.5MB)
 #   (measured 2026-08-08 with the DECLARED release profile: fat-LTO,
 #   opt-level=z, strip=symbols, panic=abort — see [profile.release] in
-#   Cargo.toml. Local/CI dev builds override LTO/opt (`lto=false,
-#   opt-level=2` via .cargo/config.toml for build speed) and come out
-#   ~40% larger; they do not reflect release artifacts.)
+#   Cargo.toml. There is no local `.cargo/config.toml` override anymore
+#   (removed 2026-08-09); local `cargo build --release` uses the declared
+#   profile. CI workflows still write `lto=false opt-level=2` on runners
+#   for build speed, so CI artifact sizes do not reflect release.)
 
 # Full (all features; dashboard is the main opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
@@ -109,7 +110,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 797 passed, 0 failed |
-| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); local/CI dev builds override LTO/opt (`lto=false opt-level=2` via .cargo/config.toml for build speed) and come out ~40% larger, so local/CI measurements do not reflect release artifacts; hyper-based HTTP client + otel/prometheus default-features pruning) |
+| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); CI dev builds override LTO/opt (`lto=false opt-level=2`, written by ci.yml on runners) for build speed and come out ~40% larger, so CI artifact sizes do not reflect release; local builds use the declared profile; hyper-based HTTP client + otel/prometheus default-features pruning) |
 | `compat-test.sh` (Go frp v0.70.1) | 76 run_test scenarios + 17 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 13 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |

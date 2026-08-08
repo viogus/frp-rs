@@ -33,7 +33,11 @@ bytes = { workspace = true, optional = true }
 rand.workspace = true
 
 [features]
-default = ["tls", "kcp", "quic", "websocket", "oidc", "admin", "compression", "chacha20", "tcp-mux"]
+# admin is OPT-IN (was default): the axum-based admin API adds ~1 MB to the
+# default frpc. Build with `--features admin` (or `cargo build -p frpc --features admin`)
+# to enable the admin API; `frpc reload`/`status` talk to a running frpc built
+# with this feature and `web_server.port > 0` configured.
+default = ["tls", "kcp", "quic", "websocket", "oidc", "compression", "chacha20", "tcp-mux"]
 admin = ["dep:axum", "frp-core/admin-auth"]
 tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls", "dep:h2", "dep:http", "dep:bytes"]
 quic = ["frp-core/quic"]

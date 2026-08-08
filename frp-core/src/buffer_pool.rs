@@ -4,12 +4,14 @@
 //! call. Under high proxy connection churn, this creates sustained allocator
 //! pressure. This pool recycles those buffers.
 //!
-//! Thread-safe (std::sync::Mutex, not tokio — pool ops are sub-microsecond).
-//! Fixed capacity: `MAX_POOLED_BUFFERS` (32). Excess buffers are dropped.
+//! Thread-safe (crossbeam lock-free `ArrayQueue` — the bridge hot path takes
+//! one acquire + one release per chunk, and concurrent releases during
+//! connection churn must not serialize on a mutex). Fixed capacity:
+//! `MAX_POOLED_BUFFERS` (128, env-overridable via `FRP_BRIDGE_POOL_MAX`).
+//! Excess buffers are dropped.
 
-use std::collections::VecDeque;
+use crossbeam_queue::ArrayQueue;
 use std::sync::LazyLock;
-use std::sync::Mutex;
 
 /// Pooled buffer size in bytes.
 ///
@@ -31,7 +33,17 @@ pub static BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
 });
 
 /// Maximum number of buffers to retain in the pool.
-const MAX_POOLED_BUFFERS: usize = 32;
+///
+/// Default 128 (4 MiB of 32 KiB buffers); override via `FRP_BRIDGE_POOL_MAX`
+/// (capped at 4096). 32 was too small under high connection churn — excess
+/// buffers were dropped and re-allocated.
+static MAX_POOLED_BUFFERS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FRP_BRIDGE_POOL_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n <= 4096)
+        .unwrap_or(128)
+});
 
 /// A pool of reusable `Vec<u8>` buffers.
 ///
@@ -42,13 +54,13 @@ const MAX_POOLED_BUFFERS: usize = 32;
 /// BUFFER_POOL.release(buf);
 /// ```
 pub struct BufferPool {
-    inner: Mutex<VecDeque<Vec<u8>>>,
+    inner: ArrayQueue<Vec<u8>>,
 }
 
 impl Default for BufferPool {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(VecDeque::new()),
+            inner: ArrayQueue::new(*MAX_POOLED_BUFFERS),
         }
     }
 }
@@ -60,9 +72,8 @@ impl BufferPool {
     /// return at length BUFFER_SIZE (release preserves length); the miss path
     /// allocates via `Vec::with_capacity`, returning length 0.
     pub fn acquire(&self) -> Vec<u8> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner
-            .pop_front()
+        self.inner
+            .pop()
             .unwrap_or_else(|| Vec::with_capacity(*BUFFER_SIZE))
     }
 
@@ -74,11 +85,8 @@ impl BufferPool {
     /// callers always overwrite via read() before use and only read the
     /// [..n] prefix, so stale bytes are never observed.
     pub fn release(&self, buf: Vec<u8>) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.len() < MAX_POOLED_BUFFERS {
-            inner.push_back(buf);
-        }
-        // else: pool full, buf dropped
+        // ArrayQueue push returns Err(value) on overflow — buffer dropped.
+        let _ = self.inner.push(buf);
     }
 }
 
@@ -188,7 +196,7 @@ mod tests {
     #[test]
     fn test_pool_does_not_grow_unbounded() {
         let pool = BufferPool::default();
-        let bufs: Vec<Vec<u8>> = (0..MAX_POOLED_BUFFERS + 16)
+        let bufs: Vec<Vec<u8>> = (0..*MAX_POOLED_BUFFERS + 16)
             .map(|_| pool.acquire())
             .collect();
         // Release all — should not grow beyond MAX_POOLED_BUFFERS
@@ -196,8 +204,7 @@ mod tests {
             pool.release(b);
         }
         // After releasing extras, pool size should be capped
-        let inner = pool.inner.lock().unwrap();
-        assert!(inner.len() <= MAX_POOLED_BUFFERS);
+        assert!(pool.inner.len() <= *MAX_POOLED_BUFFERS);
     }
 
     #[test]

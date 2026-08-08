@@ -11,11 +11,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures_util::{sink::Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::{AsyncReadWrite, Transport};
 
@@ -30,7 +26,7 @@ const MAX_WS_FRAME_PAYLOAD: u64 = crate::protocol::V2_MAX_FRAME_PAYLOAD as u64 +
 /// Converts between WebSocket messages and a byte stream suitable
 /// for use with the V1 protocol functions.
 pub struct WsByteStream {
-    inner: WsInner,
+    inner: Box<dyn AsyncReadWrite>,
     read_buf: Vec<u8>,
     read_pos: usize,
     /// Write buffer for the Raw variant (frame bytes not yet flushed).
@@ -49,82 +45,24 @@ pub struct WsByteStream {
     raw_frame_mask_key: [u8; 4],
     /// Payload length from the last fully-read WS header (after extended length parsing).
     raw_frame_payload_len: u64,
+    /// Reused payload buffer for the Raw read path (capacity kept across
+    /// frames — avoids a fresh `vec![0u8; n]` allocation per frame).
+    raw_payload_buf: Vec<u8>,
 }
 
-enum WsInner {
-    Tungstenite(Pin<Box<WebSocketStream<MaybeTlsStream<TcpStream>>>>),
-    /// Raw stream post-upgrade. Manual WebSocket frame handling.
-    /// Type-erased to support both plain TCP and TLS-wrapped streams.
-    Raw(Box<dyn AsyncReadWrite>),
-}
-
-impl WsInner {
-    /// Poll-write logic for the Raw variant.
-    /// Takes buffer state as separate params to avoid borrow conflicts
-    /// with the outer WsByteStream struct — the match on WsInner variants
-    /// borrows self (the WsInner), not the buffer fields.
-    fn poll_write_raw(
-        raw: &mut Box<dyn AsyncReadWrite>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-        write_buf: &mut Vec<u8>,
-        write_pos: &mut usize,
-        needs_flush: &mut bool,
-        new_frame: Option<Vec<u8>>,
-    ) -> Poll<io::Result<usize>> {
-        // Build new frame if provided (pre-built before the match)
-        if let Some(frame) = new_frame {
-            match Pin::new(raw.as_mut()).poll_write(cx, &frame) {
-                Poll::Ready(Ok(n)) if n >= frame.len() => {
-                    // Full write — success
-                    return Poll::Ready(Ok(buf.len()));
-                }
-                Poll::Ready(Ok(n)) => {
-                    *write_buf = frame;
-                    *write_pos = n;
-                    *needs_flush = true;
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    *write_buf = frame;
-                    *write_pos = 0;
-                    *needs_flush = true;
-                    return Poll::Pending;
-                }
-            }
-        }
-        // Flush pending write buffer
-        if *needs_flush {
-            let remaining = &write_buf[*write_pos..];
-            match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
-                Poll::Ready(Ok(n)) => {
-                    *write_pos += n;
-                    if *write_pos >= write_buf.len() {
-                        *write_pos = 0;
-                        *needs_flush = false;
-                        Poll::Ready(Ok(buf.len()))
-                    } else {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                }
-                Poll::Ready(Err(e)) => {
-                    *needs_flush = false;
-                    Poll::Ready(Err(e))
-                }
-                Poll::Pending => Poll::Pending,
-            }
-        } else {
-            Poll::Ready(Ok(0))
-        }
-    }
-
-    /// Build a WebSocket data frame (FIN + BINARY opcode) for the Raw path.
-    fn build_frame(buf: &[u8], client_mode: bool) -> Vec<u8> {
+/// The post-upgrade stream. Manual WebSocket frame handling (RFC 6455),
+/// type-erased to support both plain TCP and TLS-wrapped streams.
+/// (The tungstenite-based variant was removed 2026-08-09: it had no callers —
+/// every production path upgrades manually via `from_raw`.)
+impl WsByteStream {
+    /// Build a WebSocket data frame (FIN + BINARY opcode) for the Raw path,
+    /// writing into `out`. The caller keeps `out` (e.g. `write_buf`) so its
+    /// capacity is reused across bridge chunks — no per-chunk frame alloc.
+    fn build_frame_into(out: &mut Vec<u8>, buf: &[u8], client_mode: bool) {
         let len = buf.len();
-        let mut frame = Vec::with_capacity(len + 14); // header + mask + payload
+        out.clear();
+        out.reserve(len + 14); // header + mask + payload
+        let frame = out;
         frame.push(0x82); // FIN + BINARY opcode
         if client_mode {
             // Client MUST mask frames per RFC 6455 §5.3
@@ -169,7 +107,6 @@ impl WsInner {
             }
             frame.extend_from_slice(buf);
         }
-        frame
     }
 }
 
@@ -246,29 +183,12 @@ fn dispatch_raw_frame(
 }
 
 impl WsByteStream {
-    pub fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
-        Self {
-            inner: WsInner::Tungstenite(Box::pin(ws)),
-            read_buf: Vec::new(),
-            read_pos: 0,
-            write_buf: Vec::new(),
-            write_pos: 0,
-            needs_flush: false,
-            client_mode: false,
-            raw_read_state: RawReadState::Idle,
-            raw_frame_opcode: 0,
-            raw_frame_masked: false,
-            raw_frame_mask_key: [0u8; 4],
-            raw_frame_payload_len: 0,
-        }
-    }
-
     /// Create from a raw stream after manual WebSocket upgrade.
     /// Used on the server accept path for Go frp compat.
     /// When `client_mode` is true, outgoing frames are masked per RFC 6455 §5.3.
     pub fn from_raw(stream: Box<dyn AsyncReadWrite>, client_mode: bool) -> Self {
         Self {
-            inner: WsInner::Raw(stream),
+            inner: stream,
             read_buf: Vec::new(),
             read_pos: 0,
             write_buf: Vec::new(),
@@ -280,16 +200,7 @@ impl WsByteStream {
             raw_frame_masked: false,
             raw_frame_mask_key: [0u8; 4],
             raw_frame_payload_len: 0,
-        }
-    }
-
-    /// Consume the adapter and return the underlying WebSocket stream.
-    /// Returns `None` if this was created from a raw stream (`from_raw`),
-    /// which stores a type-erased `Box<dyn AsyncReadWrite>` instead.
-    pub fn into_inner(self) -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        match self.inner {
-            WsInner::Tungstenite(ws) => Some(*Pin::into_inner(ws)),
-            WsInner::Raw(_) => None,
+            raw_payload_buf: Vec::new(),
         }
     }
 }
@@ -331,307 +242,69 @@ impl AsyncRead for WsByteStream {
             raw_frame_masked,
             raw_frame_mask_key,
             raw_frame_payload_len,
+            raw_payload_buf,
         } = this;
 
-        match inner {
-            WsInner::Tungstenite(inner) => loop {
-                match inner.as_mut().poll_next(cx) {
-                    Poll::Ready(Some(Ok(Message::Binary(data)))) => {
-                        let len = data.len().min(buf.remaining());
-                        buf.put_slice(&data[..len]);
-                        if len < data.len() {
-                            *read_buf = data[len..].to_vec();
-                            *read_pos = 0;
-                        }
-                        return Poll::Ready(Ok(()));
-                    }
-                    Poll::Ready(Some(Ok(Message::Text(text)))) => {
-                        // tungstenite >=0.26 wraps TEXT payloads in Utf8Bytes.
-                        let data = text.as_str().as_bytes().to_vec();
-                        let len = data.len().min(buf.remaining());
-                        buf.put_slice(&data[..len]);
-                        if len < data.len() {
-                            *read_buf = data[len..].to_vec();
-                            *read_pos = 0;
-                        }
-                        return Poll::Ready(Ok(()));
-                    }
-                    Poll::Ready(Some(Ok(Message::Ping(_)))) => continue,
-                    Poll::Ready(Some(Ok(Message::Close(_)))) => return Poll::Ready(Ok(())),
-                    Poll::Ready(Some(Ok(_))) => continue,
-                    Poll::Ready(Some(Err(e))) => {
-                        return Poll::Ready(Err(io::Error::other(e)));
-                    }
-                    Poll::Ready(None) => return Poll::Ready(Ok(())),
-                    Poll::Pending => return Poll::Pending,
+        let raw = inner;
+        loop {
+            match raw_read_state {
+                RawReadState::Idle => {
+                    *raw_read_state = RawReadState::ReadingHeader {
+                        head: [0u8; 2],
+                        filled: 0,
+                    };
+                    continue;
                 }
-            },
-            WsInner::Raw(raw) => {
-                loop {
-                    match raw_read_state {
-                        RawReadState::Idle => {
-                            *raw_read_state = RawReadState::ReadingHeader {
-                                head: [0u8; 2],
-                                filled: 0,
-                            };
-                            continue;
-                        }
-                        RawReadState::ReadingHeader {
-                            ref mut head,
-                            ref mut filled,
-                        } => {
-                            let mut frame_read_buf = ReadBuf::new(&mut head[*filled..]);
-                            match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
-                                Poll::Ready(Ok(())) => {
-                                    let n = frame_read_buf.filled().len();
-                                    if n == 0 {
-                                        return Poll::Ready(Ok(()));
-                                    }
-                                    *filled += n;
-                                    if *filled < 2 {
-                                        return Poll::Pending;
-                                    }
-                                    let opcode = head[0] & 0x0f;
-                                    let masked = (head[1] & 0x80) != 0;
-                                    let raw_len = (head[1] & 0x7f) as u64;
-                                    *raw_frame_opcode = opcode;
-                                    *raw_frame_masked = masked;
-                                    if raw_len == 126 {
-                                        *raw_read_state = RawReadState::ReadingExtendedLen2 {
-                                            ext: [0u8; 2],
-                                            filled: 0,
-                                        };
-                                    } else if raw_len == 127 {
-                                        *raw_read_state = RawReadState::ReadingExtendedLen8 {
-                                            ext: [0u8; 8],
-                                            filled: 0,
-                                        };
-                                    } else {
-                                        if raw_len > MAX_WS_FRAME_PAYLOAD {
-                                            *raw_read_state = RawReadState::Idle;
-                                            return Poll::Ready(Err(io::Error::new(
-                                                io::ErrorKind::InvalidData,
-                                                "WS frame too large",
-                                            )));
-                                        }
-                                        *raw_frame_payload_len = raw_len;
-                                        if masked {
-                                            *raw_read_state = RawReadState::ReadingMaskKey {
-                                                mask_key: [0u8; 4],
-                                                filled: 0,
-                                            };
-                                        } else if raw_len > 0 {
-                                            *raw_read_state = RawReadState::ReadingPayload {
-                                                payload: vec![0u8; raw_len as usize],
-                                                filled: 0,
-                                            };
-                                        } else {
-                                            let disp = dispatch_raw_frame(
-                                                read_buf,
-                                                read_pos,
-                                                raw_read_state,
-                                                *raw_frame_opcode,
-                                                raw,
-                                                cx,
-                                                buf,
-                                                &[],
-                                            );
-                                            if disp.is_pending() {
-                                                continue;
-                                            } else {
-                                                return disp;
-                                            }
-                                        }
-                                    }
-                                    continue;
-                                }
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => return Poll::Pending,
+                RawReadState::ReadingHeader {
+                    ref mut head,
+                    ref mut filled,
+                } => {
+                    let mut frame_read_buf = ReadBuf::new(&mut head[*filled..]);
+                    match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let n = frame_read_buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Ok(()));
                             }
-                        }
-                        RawReadState::ReadingExtendedLen2 {
-                            ref mut ext,
-                            ref mut filled,
-                        } => {
-                            let mut frame_read_buf = ReadBuf::new(&mut ext[*filled..]);
-                            match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
-                                Poll::Ready(Ok(())) => {
-                                    let n = frame_read_buf.filled().len();
-                                    if n == 0 {
-                                        return Poll::Ready(Ok(()));
-                                    }
-                                    *filled += n;
-                                    if *filled < 2 {
-                                        return Poll::Pending;
-                                    }
-                                    let payload_len = u16::from_be_bytes(*ext) as u64;
-                                    if payload_len > MAX_WS_FRAME_PAYLOAD {
-                                        *raw_read_state = RawReadState::Idle;
-                                        return Poll::Ready(Err(io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "WS frame too large",
-                                        )));
-                                    }
-                                    *raw_frame_payload_len = payload_len;
-                                    if *raw_frame_masked {
-                                        *raw_read_state = RawReadState::ReadingMaskKey {
-                                            mask_key: [0u8; 4],
-                                            filled: 0,
-                                        };
-                                    } else if payload_len > 0 {
-                                        *raw_read_state = RawReadState::ReadingPayload {
-                                            payload: vec![0u8; payload_len as usize],
-                                            filled: 0,
-                                        };
-                                    } else {
-                                        let disp = dispatch_raw_frame(
-                                            read_buf,
-                                            read_pos,
-                                            raw_read_state,
-                                            *raw_frame_opcode,
-                                            raw,
-                                            cx,
-                                            buf,
-                                            &[],
-                                        );
-                                        if disp.is_pending() {
-                                            continue;
-                                        } else {
-                                            return disp;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => return Poll::Pending,
+                            *filled += n;
+                            if *filled < 2 {
+                                return Poll::Pending;
                             }
-                        }
-                        RawReadState::ReadingExtendedLen8 {
-                            ref mut ext,
-                            ref mut filled,
-                        } => {
-                            let mut frame_read_buf = ReadBuf::new(&mut ext[*filled..]);
-                            match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
-                                Poll::Ready(Ok(())) => {
-                                    let n = frame_read_buf.filled().len();
-                                    if n == 0 {
-                                        return Poll::Ready(Ok(()));
-                                    }
-                                    *filled += n;
-                                    if *filled < 8 {
-                                        return Poll::Pending;
-                                    }
-                                    let payload_len = u64::from_be_bytes(*ext);
-                                    if payload_len > MAX_WS_FRAME_PAYLOAD {
-                                        *raw_read_state = RawReadState::Idle;
-                                        return Poll::Ready(Err(io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "WS frame too large",
-                                        )));
-                                    }
-                                    *raw_frame_payload_len = payload_len;
-                                    if *raw_frame_masked {
-                                        *raw_read_state = RawReadState::ReadingMaskKey {
-                                            mask_key: [0u8; 4],
-                                            filled: 0,
-                                        };
-                                    } else if payload_len > 0 {
-                                        *raw_read_state = RawReadState::ReadingPayload {
-                                            payload: vec![0u8; payload_len as usize],
-                                            filled: 0,
-                                        };
-                                    } else {
-                                        let disp = dispatch_raw_frame(
-                                            read_buf,
-                                            read_pos,
-                                            raw_read_state,
-                                            *raw_frame_opcode,
-                                            raw,
-                                            cx,
-                                            buf,
-                                            &[],
-                                        );
-                                        if disp.is_pending() {
-                                            continue;
-                                        } else {
-                                            return disp;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => return Poll::Pending,
-                            }
-                        }
-                        RawReadState::ReadingMaskKey {
-                            ref mut mask_key,
-                            ref mut filled,
-                        } => {
-                            let mut frame_read_buf = ReadBuf::new(&mut mask_key[*filled..]);
-                            match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
-                                Poll::Ready(Ok(())) => {
-                                    let n = frame_read_buf.filled().len();
-                                    if n == 0 {
-                                        return Poll::Ready(Ok(()));
-                                    }
-                                    *filled += n;
-                                    if *filled < 4 {
-                                        return Poll::Pending;
-                                    }
-                                    *raw_frame_mask_key = *mask_key;
-                                    let pl = *raw_frame_payload_len;
-                                    if pl > 0 {
-                                        *raw_read_state = RawReadState::ReadingPayload {
-                                            payload: vec![0u8; pl as usize],
-                                            filled: 0,
-                                        };
-                                    } else {
-                                        let disp = dispatch_raw_frame(
-                                            read_buf,
-                                            read_pos,
-                                            raw_read_state,
-                                            *raw_frame_opcode,
-                                            raw,
-                                            cx,
-                                            buf,
-                                            &[],
-                                        );
-                                        if disp.is_pending() {
-                                            continue;
-                                        } else {
-                                            return disp;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => return Poll::Pending,
-                            }
-                        }
-                        RawReadState::ReadingPayload {
-                            ref mut payload,
-                            ref mut filled,
-                        } => {
-                            let mut frame_read_buf = ReadBuf::new(&mut payload[*filled..]);
-                            match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
-                                Poll::Ready(Ok(())) => {
-                                    let n = frame_read_buf.filled().len();
-                                    if n == 0 {
-                                        return Poll::Ready(Ok(()));
-                                    }
-                                    *filled += n;
-                                    if *filled < payload.len() {
-                                        return Poll::Pending;
-                                    }
-                                    if *raw_frame_masked {
-                                        for i in 0..payload.len() {
-                                            payload[i] ^= raw_frame_mask_key[i % 4];
-                                        }
-                                    }
-                                    // Take ownership of payload and reset state before
-                                    // dispatch to avoid double-borrow on raw_read_state.
-                                    let owned_payload = std::mem::take(payload);
+                            let opcode = head[0] & 0x0f;
+                            let masked = (head[1] & 0x80) != 0;
+                            let raw_len = (head[1] & 0x7f) as u64;
+                            *raw_frame_opcode = opcode;
+                            *raw_frame_masked = masked;
+                            if raw_len == 126 {
+                                *raw_read_state = RawReadState::ReadingExtendedLen2 {
+                                    ext: [0u8; 2],
+                                    filled: 0,
+                                };
+                            } else if raw_len == 127 {
+                                *raw_read_state = RawReadState::ReadingExtendedLen8 {
+                                    ext: [0u8; 8],
+                                    filled: 0,
+                                };
+                            } else {
+                                if raw_len > MAX_WS_FRAME_PAYLOAD {
                                     *raw_read_state = RawReadState::Idle;
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "WS frame too large",
+                                    )));
+                                }
+                                *raw_frame_payload_len = raw_len;
+                                if masked {
+                                    *raw_read_state = RawReadState::ReadingMaskKey {
+                                        mask_key: [0u8; 4],
+                                        filled: 0,
+                                    };
+                                } else if raw_len > 0 {
+                                    let mut payload = std::mem::take(&mut *raw_payload_buf);
+                                    payload.resize(raw_len as usize, 0);
+                                    *raw_read_state =
+                                        RawReadState::ReadingPayload { payload, filled: 0 };
+                                } else {
                                     let disp = dispatch_raw_frame(
                                         read_buf,
                                         read_pos,
@@ -640,7 +313,7 @@ impl AsyncRead for WsByteStream {
                                         raw,
                                         cx,
                                         buf,
-                                        &owned_payload,
+                                        &[],
                                     );
                                     if disp.is_pending() {
                                         continue;
@@ -648,10 +321,219 @@ impl AsyncRead for WsByteStream {
                                         return disp;
                                     }
                                 }
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => return Poll::Pending,
+                            }
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                RawReadState::ReadingExtendedLen2 {
+                    ref mut ext,
+                    ref mut filled,
+                } => {
+                    let mut frame_read_buf = ReadBuf::new(&mut ext[*filled..]);
+                    match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let n = frame_read_buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Ok(()));
+                            }
+                            *filled += n;
+                            if *filled < 2 {
+                                return Poll::Pending;
+                            }
+                            let payload_len = u16::from_be_bytes(*ext) as u64;
+                            if payload_len > MAX_WS_FRAME_PAYLOAD {
+                                *raw_read_state = RawReadState::Idle;
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "WS frame too large",
+                                )));
+                            }
+                            *raw_frame_payload_len = payload_len;
+                            if *raw_frame_masked {
+                                *raw_read_state = RawReadState::ReadingMaskKey {
+                                    mask_key: [0u8; 4],
+                                    filled: 0,
+                                };
+                            } else if payload_len > 0 {
+                                let mut payload = std::mem::take(&mut *raw_payload_buf);
+                                payload.resize(payload_len as usize, 0);
+                                *raw_read_state =
+                                    RawReadState::ReadingPayload { payload, filled: 0 };
+                            } else {
+                                let disp = dispatch_raw_frame(
+                                    read_buf,
+                                    read_pos,
+                                    raw_read_state,
+                                    *raw_frame_opcode,
+                                    raw,
+                                    cx,
+                                    buf,
+                                    &[],
+                                );
+                                if disp.is_pending() {
+                                    continue;
+                                } else {
+                                    return disp;
+                                }
+                            }
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                RawReadState::ReadingExtendedLen8 {
+                    ref mut ext,
+                    ref mut filled,
+                } => {
+                    let mut frame_read_buf = ReadBuf::new(&mut ext[*filled..]);
+                    match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let n = frame_read_buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Ok(()));
+                            }
+                            *filled += n;
+                            if *filled < 8 {
+                                return Poll::Pending;
+                            }
+                            let payload_len = u64::from_be_bytes(*ext);
+                            if payload_len > MAX_WS_FRAME_PAYLOAD {
+                                *raw_read_state = RawReadState::Idle;
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "WS frame too large",
+                                )));
+                            }
+                            *raw_frame_payload_len = payload_len;
+                            if *raw_frame_masked {
+                                *raw_read_state = RawReadState::ReadingMaskKey {
+                                    mask_key: [0u8; 4],
+                                    filled: 0,
+                                };
+                            } else if payload_len > 0 {
+                                let mut payload = std::mem::take(&mut *raw_payload_buf);
+                                payload.resize(payload_len as usize, 0);
+                                *raw_read_state =
+                                    RawReadState::ReadingPayload { payload, filled: 0 };
+                            } else {
+                                let disp = dispatch_raw_frame(
+                                    read_buf,
+                                    read_pos,
+                                    raw_read_state,
+                                    *raw_frame_opcode,
+                                    raw,
+                                    cx,
+                                    buf,
+                                    &[],
+                                );
+                                if disp.is_pending() {
+                                    continue;
+                                } else {
+                                    return disp;
+                                }
+                            }
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                RawReadState::ReadingMaskKey {
+                    ref mut mask_key,
+                    ref mut filled,
+                } => {
+                    let mut frame_read_buf = ReadBuf::new(&mut mask_key[*filled..]);
+                    match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let n = frame_read_buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Ok(()));
+                            }
+                            *filled += n;
+                            if *filled < 4 {
+                                return Poll::Pending;
+                            }
+                            *raw_frame_mask_key = *mask_key;
+                            let pl = *raw_frame_payload_len;
+                            if pl > 0 {
+                                let mut payload = std::mem::take(&mut *raw_payload_buf);
+                                payload.resize(pl as usize, 0);
+                                *raw_read_state =
+                                    RawReadState::ReadingPayload { payload, filled: 0 };
+                            } else {
+                                let disp = dispatch_raw_frame(
+                                    read_buf,
+                                    read_pos,
+                                    raw_read_state,
+                                    *raw_frame_opcode,
+                                    raw,
+                                    cx,
+                                    buf,
+                                    &[],
+                                );
+                                if disp.is_pending() {
+                                    continue;
+                                } else {
+                                    return disp;
+                                }
+                            }
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                RawReadState::ReadingPayload {
+                    ref mut payload,
+                    ref mut filled,
+                } => {
+                    let mut frame_read_buf = ReadBuf::new(&mut payload[*filled..]);
+                    match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let n = frame_read_buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Ok(()));
+                            }
+                            *filled += n;
+                            if *filled < payload.len() {
+                                return Poll::Pending;
+                            }
+                            if *raw_frame_masked {
+                                for i in 0..payload.len() {
+                                    payload[i] ^= raw_frame_mask_key[i % 4];
+                                }
+                            }
+                            // Take ownership of payload and reset state before
+                            // dispatch to avoid double-borrow on raw_read_state.
+                            let owned_payload = std::mem::take(payload);
+                            *raw_read_state = RawReadState::Idle;
+                            let disp = dispatch_raw_frame(
+                                read_buf,
+                                read_pos,
+                                raw_read_state,
+                                *raw_frame_opcode,
+                                raw,
+                                cx,
+                                buf,
+                                &owned_payload,
+                            );
+                            // Return the payload Vec (with its capacity) to
+                            // raw_payload_buf for reuse by the next frame —
+                            // dispatch_raw_frame is synchronous, so the
+                            // borrow has ended.
+                            *raw_payload_buf = owned_payload;
+                            if disp.is_pending() {
+                                continue;
+                            } else {
+                                return disp;
                             }
                         }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
                     }
                 }
             }
@@ -676,61 +558,55 @@ impl AsyncWrite for WsByteStream {
             client_mode,
             ..
         } = this;
-        let mut needs_flush_local = *needs_flush;
 
-        // Pre-build WebSocket frame for Raw variant before the match
-        let new_frame = if !needs_flush_local && !buf.is_empty() {
-            if matches!(inner, WsInner::Raw(_)) {
-                Some(WsInner::build_frame(buf, *client_mode))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        match inner {
-            WsInner::Tungstenite(tungstenite) => {
-                if !needs_flush_local && !buf.is_empty() {
-                    match tungstenite.as_mut().poll_ready(cx) {
-                        Poll::Ready(Ok(())) => {
-                            match tungstenite
-                                .as_mut()
-                                .start_send(Message::Binary(buf.to_vec().into()))
-                            {
-                                Ok(()) => needs_flush_local = true,
-                                Err(e) => return Poll::Ready(Err(io::Error::other(e))),
-                            }
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
-                        Poll::Pending => {
-                            *needs_flush = needs_flush_local;
-                            return Poll::Pending;
-                        }
+        let raw = inner;
+        {
+            if !*needs_flush && !buf.is_empty() {
+                // Build the frame directly into write_buf (capacity reused
+                // across chunks — no per-chunk frame allocation), then try
+                // to flush it immediately.
+                WsByteStream::build_frame_into(write_buf, buf, *client_mode);
+                match Pin::new(raw.as_mut()).poll_write(cx, write_buf) {
+                    Poll::Ready(Ok(n)) if n >= write_buf.len() => {
+                        write_buf.clear(); // keep capacity for next chunk
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        *write_pos = n;
+                        *needs_flush = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Pending => {
+                        *write_pos = 0;
+                        *needs_flush = true;
+                        Poll::Pending
                     }
                 }
-                if needs_flush_local {
-                    match tungstenite.as_mut().poll_flush(cx) {
-                        Poll::Ready(Ok(())) => {
+            } else if *needs_flush {
+                // Continue writing a partially-flushed frame.
+                let remaining = &write_buf[*write_pos..];
+                match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
+                    Poll::Ready(Ok(n)) => {
+                        *write_pos += n;
+                        if *write_pos >= write_buf.len() {
+                            *write_pos = 0;
                             *needs_flush = false;
                             Poll::Ready(Ok(buf.len()))
-                        }
-                        Poll::Ready(Err(e)) => {
-                            *needs_flush = false;
-                            Poll::Ready(Err(io::Error::other(e)))
-                        }
-                        Poll::Pending => {
-                            *needs_flush = true;
+                        } else {
+                            cx.waker().wake_by_ref();
                             Poll::Pending
                         }
                     }
-                } else {
-                    *needs_flush = false;
-                    Poll::Ready(Ok(0))
+                    Poll::Ready(Err(e)) => {
+                        *needs_flush = false;
+                        Poll::Ready(Err(e))
+                    }
+                    Poll::Pending => Poll::Pending,
                 }
-            }
-            WsInner::Raw(raw) => {
-                WsInner::poll_write_raw(raw, cx, buf, write_buf, write_pos, needs_flush, new_frame)
+            } else {
+                Poll::Ready(Ok(0))
             }
         }
     }
@@ -746,63 +622,38 @@ impl AsyncWrite for WsByteStream {
             ..
         } = this;
         let needs_flush_local = *needs_flush;
-        match inner {
-            WsInner::Tungstenite(tungstenite) => {
-                if needs_flush_local {
-                    match tungstenite.as_mut().poll_flush(cx) {
-                        Poll::Ready(Ok(())) => {
-                            *needs_flush = false;
-                            Poll::Ready(Ok(()))
-                        }
-                        Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
-                        Poll::Pending => {
-                            *needs_flush = true;
-                            Poll::Pending
-                        }
+        let raw = inner;
+        if needs_flush_local {
+            let remaining = &write_buf[*write_pos..];
+            match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
+                Poll::Ready(Ok(n)) => {
+                    *write_pos += n;
+                    if *write_pos >= write_buf.len() {
+                        *write_pos = 0;
+                        *needs_flush = false;
+                        Poll::Ready(Ok(()))
+                    } else {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
                     }
-                } else {
-                    Poll::Ready(Ok(()))
                 }
-            }
-            WsInner::Raw(raw) => {
-                if needs_flush_local {
-                    let remaining = &write_buf[*write_pos..];
-                    match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
-                        Poll::Ready(Ok(n)) => {
-                            *write_pos += n;
-                            if *write_pos >= write_buf.len() {
-                                *write_pos = 0;
-                                *needs_flush = false;
-                                Poll::Ready(Ok(()))
-                            } else {
-                                cx.waker().wake_by_ref();
-                                Poll::Pending
-                            }
-                        }
-                        Poll::Ready(Err(e)) => {
-                            *needs_flush = false;
-                            Poll::Ready(Err(e))
-                        }
-                        Poll::Pending => Poll::Pending,
-                    }
-                } else {
-                    Poll::Ready(Ok(()))
+                Poll::Ready(Err(e)) => {
+                    *needs_flush = false;
+                    Poll::Ready(Err(e))
                 }
+                Poll::Pending => Poll::Pending,
             }
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match &mut self.inner {
-            WsInner::Tungstenite(inner) => inner.as_mut().poll_close(cx).map_err(io::Error::other),
-            WsInner::Raw(raw) => {
-                let _ = Pin::new(raw.as_mut()).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
-                Pin::new(raw.as_mut()).poll_shutdown(cx)
-            }
-        }
+        let raw = &mut *self.inner;
+        let _ = Pin::new(&mut *raw).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
+        Pin::new(&mut *raw).poll_shutdown(cx)
     }
 }
-
 impl Transport for WsByteStream {
     fn debug_name(&self) -> &'static str {
         "IoStream::WebSocket"

@@ -24,6 +24,16 @@ pub static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// `#[global_allocator]` in the binary crates under `mem-profile`.
 pub struct CountingAlloc;
 
+// SAFETY: `CountingAlloc` is a zero-sized marker type with no fields, no
+// Drop, and no interior state other than the process-global counters. Every
+// method delegates to the `System` allocator with the same `Layout`, so the
+// `GlobalAlloc` contract is upheld by the caller exactly as it is for
+// `System`: returned pointers are non-null and suitably aligned, dealloc
+// receives the same layout as alloc, and realloc preserves contents up to
+// `min(old, new)`. The accounting atomics are independent of the heap blocks
+// (relaxed, monotonic-ish deltas) and cannot be dereferenced as pointers, so
+// they are safe to touch from any thread at any time. Compiled only under
+// `feature = "mem-profile"` — never installed in shipped binaries.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = System.alloc(layout);

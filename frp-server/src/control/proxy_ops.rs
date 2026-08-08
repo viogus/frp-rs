@@ -11,7 +11,7 @@ use frp_core::protocol::write_msg;
 use frp_core::transport::IoStream;
 
 use crate::lock::RwLockExt;
-use crate::proxy::{allocate_port_multi, ProxyInfo};
+use crate::proxy::ProxyInfo;
 use crate::service::{AppState, InternalMsg};
 
 /// Returns full detail when detailed_errors is enabled, otherwise generic message.
@@ -166,42 +166,83 @@ async fn allocate_proxy_port(
             found
         }
     } else {
-        // TCP-type proxy (tcp): use TCP port manager with OS-level bind probe.
-        let mut ports = state.used_ports.write().await;
-        if remote_port == 0 {
+        // TCP-type proxy (tcp): three-phase port allocation. The blocking OS
+        // `TcpListener::bind` probe used to run while holding
+        // `used_ports.write()` — serializing every TCP proxy registration
+        // behind socket-bind latency. Now: pick a candidate under a brief
+        // read lock, probe bindability OUTSIDE any lock, then commit under a
+        // short write lock (re-checking to close the TOCTOU window).
+        let allow_ports = state.reloadable.read_ok().allow_ports.clone();
+        let candidate = if remote_port == 0 {
             // 24h reservation by proxy name (Go ports.Manager.Acquire).
-            let mut allocated = None;
-            {
+            let res_candidate = {
                 let mut reservations = state.port_reservations.write().await;
                 // Lazy cleanup (Go cleanReservedPortsWorker): drop expired
                 // entries so the map does not grow without bound.
                 if let Some(&(res_port, false, reserved_at)) = reservations.get(&np.proxy_name) {
                     if reserved_at.elapsed() >= std::time::Duration::from_secs(24 * 3600) {
                         reservations.remove(&np.proxy_name);
-                    } else if !ports.contains(&res_port)
-                        && crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, res_port)
-                    {
-                        ports.insert(res_port);
-                        allocated = Some(res_port);
+                        None
+                    } else {
+                        let used = state.used_ports.read().await;
+                        if used.contains(&res_port) {
+                            None
+                        } else {
+                            drop(used);
+                            if crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, res_port)
+                            {
+                                Some(res_port)
+                            } else {
+                                None
+                            }
+                        }
                     }
+                } else {
+                    None
+                }
+            };
+            match res_candidate {
+                Some(p) => Some(p),
+                None => {
+                    // Collect candidates under a brief read lock, then probe
+                    // each one OUTSIDE the lock (the blocking bind probe must
+                    // not serialize registrations). `find` continues past
+                    // occupied ports, matching the old in-lock scan.
+                    let candidates = {
+                        let used = state.used_ports.read().await;
+                        crate::proxy::pick_tcp_port_candidates(&used, 0, &allow_ports, 4096)
+                    };
+                    candidates
+                        .into_iter()
+                        .find(|p| crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, *p))
                 }
             }
-            if allocated.is_none() {
-                allocated = allocate_port_multi(
-                    &mut ports,
-                    0,
-                    &state.reloadable.read_ok().allow_ports,
-                    &state.proxy_bind_addr,
-                );
-            }
-            allocated
         } else {
-            allocate_port_multi(
-                &mut ports,
-                remote_port,
-                &state.reloadable.read_ok().allow_ports,
-                &state.proxy_bind_addr,
-            )
+            let candidates = {
+                let used = state.used_ports.read().await;
+                crate::proxy::pick_tcp_port_candidates(&used, remote_port, &allow_ports, 4096)
+            };
+            candidates
+                .into_iter()
+                .find(|p| crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, *p))
+        };
+        // Commit under write lock; re-check to close the race with a
+        // concurrent registration.
+        match candidate {
+            Some(p) => {
+                let mut ports = state.used_ports.write().await;
+                if ports.contains(&p) {
+                    tracing::warn!(
+                        port = %p,
+                        "Port {p} was taken by a concurrent registration during allocation",
+                    );
+                    None
+                } else {
+                    ports.insert(p);
+                    Some(p)
+                }
+            }
+            None => None,
         }
     }
 }

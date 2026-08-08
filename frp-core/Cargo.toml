@@ -23,7 +23,6 @@ thiserror.workspace = true
 async-trait.workspace = true
 axum = { workspace = true, optional = true }
 uuid.workspace = true
-tokio-tungstenite = { workspace = true, optional = true }
 sha1.workspace = true
 md-5.workspace = true
 aes.workspace = true
@@ -38,6 +37,7 @@ rustls-platform-verifier = { workspace = true, optional = true }
 ring = { workspace = true }
 yamux = { workspace = true, optional = true }
 tokio-util.workspace = true
+crossbeam-queue.workspace = true
 quinn = { workspace = true, optional = true }
 
 socket2.workspace = true
@@ -66,7 +66,9 @@ compression = ["dep:snap"]
 chacha20 = ["dep:chacha20poly1305"]
 quic = ["dep:quinn", "tls"]
 kcp = []
-websocket = ["dep:tokio-tungstenite"]
+# WebSocket transport: manual RFC 6455 frame handling only (the
+# tungstenite variant was removed 2026-08-09 — it had no callers).
+websocket = []
 oidc = ["dep:jsonwebtoken", "http-client"]
 vnet = []
 # STUN binding helpers (`stun.rs`): client-only NAT traversal (XTCP/STCP),

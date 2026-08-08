@@ -255,7 +255,7 @@ and the rest are default ON):
 | `http-proxy` | HTTP proxy plugin |
 | `tcp-mux` | yamux stream multiplexing (~80 KB) |
 | `vnet` | L3 VPN / TUN device routing (frp-vnet) |
-| `admin` | Admin REST API on frpc (axum) |
+| `admin` | Admin REST API on frpc (axum) — **opt-in** (was default; build `--features admin`) |
 | `mem-profile` | Counting-allocator memory profiling (off in shipped builds) |
 | `debug-logs` | Verbose debug logging for development |
 | `otel` | OpenTelemetry tracing + OTLP export |

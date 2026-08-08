@@ -31,7 +31,6 @@ thiserror = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
-tokio-tungstenite = "0.29"
 sha1 = "0.10"
 md-5 = "0.10"
 aes = "0.9"
@@ -55,7 +54,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 # is already in the tree via axum/hyper; zero additional size.
 tower-service = "0.3"
 http-body-util = "0.1"
-webpki-roots = "0.26"
+webpki-roots = "1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "tracing"] }
 prometheus = { version = "0.14", default-features = false }
 yamux = "0.14"
@@ -64,6 +63,11 @@ tokio-util = { version = "0.7", features = ["compat"] }
 h2 = "0.4"
 http = "1"
 bytes = "1"
+# Lock-free bounded queue for the bridge buffer pool: the data plane takes
+# one acquire + one release per bridge chunk, and concurrent releases during
+# connection churn must not serialize on a std Mutex. ArrayQueue is MPMC and
+# only pulls in crossbeam-utils (already in the tree via crossbeam-channel).
+crossbeam-queue = "0.3"
 quinn = "0.11"
 
 frp-vnet = { path = "frp-vnet" }
