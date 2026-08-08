@@ -23,47 +23,44 @@ pub fn init_tracing() {
 }
 
 /// Ports already handed out by this process. Parallel tests must never
-/// receive the same port twice — the probe-then-drop window in
-/// allocate_port would otherwise let a second test grab the port before
-/// the first test's server binds it (CI flake: client traffic landing on
-/// a foreign listener → connection reset).
+/// receive the same port twice — a second test would otherwise grab the
+/// port before the first test's server binds it (CI flake: client traffic
+/// landing on a foreign listener → connection reset).
 static USED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Bind to a random port, return the port number.
 /// Never returns a port already handed out by this process, and re-verifies
-/// the port is still bindable right before returning (narrows the
-/// probe-then-drop window).
+/// the port is still bindable right before returning. NOTE: the probe
+/// socket must be DROPPED before the re-bind check — re-binding a port
+/// that our own socket still holds always fails with EADDRINUSE (this was
+/// a bug that silently routed every allocation to the random fallback, the
+/// root cause of CI "echo server bind: Address already in use" flake).
 pub fn allocate_port() -> u16 {
     for _ in 0..64 {
-        let socket = match TcpSocket::new_v4() {
-            Ok(s) => s,
-            Err(_) => break,
+        let Some(port) = probe_port() else {
+            return sandbox_fallback();
         };
-        if socket.bind("127.0.0.1:0".parse().unwrap()).is_err() {
-            break;
-        }
-        let port = match socket.local_addr() {
-            Ok(a) => a.port(),
-            Err(_) => break,
-        };
-        {
-            let mut used = USED_PORTS.lock().unwrap();
-            if !used.insert(port) {
-                continue; // already handed out in this process — probe again
-            }
-            // Narrow the probe-then-drop window: confirm the port is still
-            // free before handing it out.
+        // probe_port dropped its socket: the port is free again, so a
+        // re-bind now genuinely confirms availability.
+        if USED_PORTS.lock().unwrap().insert(port) {
             if TcpSocket::new_v4()
                 .and_then(|s| s.bind(format!("127.0.0.1:{port}").parse().unwrap()))
-                .is_err()
+                .is_ok()
             {
-                used.remove(&port);
-                continue;
+                return port;
             }
+            USED_PORTS.lock().unwrap().remove(&port);
         }
-        return port;
     }
     sandbox_fallback()
+}
+
+/// Bind to an ephemeral port, return the kernel-assigned number, then drop
+/// the socket so the caller can bind the port itself.
+fn probe_port() -> Option<u16> {
+    let socket = TcpSocket::new_v4().ok()?;
+    socket.bind("127.0.0.1:0".parse().unwrap()).ok()?;
+    socket.local_addr().ok().map(|a| a.port())
 }
 
 /// Sandbox fallback: return an ephemeral port (49152-65535 range).
