@@ -50,16 +50,31 @@ pub fn verify_token(token: &str, timestamp: i64, expected_hex: &str) -> bool {
 /// Returns Ok(()) if `timeout_secs` is 0 (disabled) or if `|ts - now| <= timeout_secs`.
 /// Returns Err with a message if the timestamp is outside the window.
 ///
+/// Accepts both seconds-precision and milliseconds-precision timestamps
+/// (frpc sends milliseconds to avoid same-second reconnect collisions in the
+/// server's duplicate-detection table; Go frpc sends seconds). A timestamp is
+/// fresh if EITHER interpretation fits the window, so both clients work.
+///
 /// Go frp compat: matches the `authentication_timeout` check in `AuthConfig::validate_login`.
 pub fn validate_timestamp_freshness(timestamp: i64, timeout_secs: i64) -> Result<(), String> {
     if timeout_secs <= 0 {
         return Ok(());
     }
-    let now = std::time::SystemTime::now()
+    let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
-    if (timestamp - now).abs() > timeout_secs {
+        .as_millis() as i64;
+    let now_s = now_ms / 1000;
+    // Saturation arithmetic: `timestamp` is attacker-controlled and may be
+    // i64::MIN/MAX. Plain `(ts - now).abs()` overflows (debug panic) and the
+    // release build's wrapping semantics then depend on integer overflow
+    // behavior. saturating_sub + saturating_abs never panics and maps any
+    // extreme input to a huge elapsed time → rejected.
+    let elapsed_s = timestamp.saturating_sub(now_s).saturating_abs();
+    let elapsed_ms = timestamp.saturating_sub(now_ms).saturating_abs();
+    let fresh_s = elapsed_s <= timeout_secs;
+    let fresh_ms = elapsed_ms <= timeout_secs.saturating_mul(1000);
+    if !fresh_s && !fresh_ms {
         return Err("timestamp outside acceptable window".into());
     }
     Ok(())

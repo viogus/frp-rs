@@ -1,6 +1,6 @@
 //! KCP socket driver — UDP event loop shared across all sessions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,6 +48,24 @@ const MAX_SESSIONS_PER_IP: usize = 64;
 /// are cleaned up by the tick loop.
 const UNACCEPTED_SESSION_TIMEOUT_MS: u32 = 30_000; // 30 seconds
 
+/// Session-creation rate window (ms). Bursts of brand-new sessions are
+/// limited per window so a UDP packet flood cannot fill the 256-entry
+/// accept queue (or the session table) faster than legitimate handshakes.
+/// Timestamps are `elapsed().as_millis() as u32`; age checks use
+/// `wrapping_sub` so the counter's 2^32-ms (~49.7-day) wrap is handled
+/// the same way as the `session_created_at` cleanup (window << wrap
+/// period, so wrapping subtraction yields the correct elapsed time).
+const SESSION_CREATE_WINDOW_MS: u32 = 10_000;
+
+/// Max new sessions the driver accepts per window across all peers.
+/// 256 (== accept queue depth) over 10 s — filling the queue now takes a
+/// sustained 10 s flood instead of one 256-packet burst.
+const MAX_SESSION_CREATES_PER_WINDOW: usize = 256;
+
+/// Max new sessions per IP per window. A single host cannot churn the
+/// session table / accept queue with new convs faster than this.
+const MAX_SESSION_CREATES_PER_IP_PER_WINDOW: usize = 32;
+
 pub(crate) enum WriteRequest {
     Data(Vec<u8>),
     Flush(tokio::sync::oneshot::Sender<()>),
@@ -86,6 +104,14 @@ pub(crate) struct KcpSocket {
     /// listener. Removed on accept (via accept_notify_rx) or on session
     /// removal (dead/error).
     session_created_at: HashMap<(u32, SocketAddr), u32>,
+    /// Rolling log of session-creation timestamps (ms) for global rate
+    /// limiting. Trimmed on every admission check; bounded by
+    /// MAX_SESSION_CREATES_PER_WINDOW.
+    session_create_log: VecDeque<u32>,
+    /// Per-IP rolling creation logs (ms) for per-source rate limiting.
+    /// Entries whose window expires are trimmed; empty logs remove the key
+    /// so a flood from many IPs does not accumulate map entries.
+    ip_session_create_log: HashMap<IpAddr, VecDeque<u32>>,
     write_tx: mpsc::Sender<(u32, WriteRequest)>,
     write_rx: mpsc::Receiver<(u32, WriteRequest)>,
     register_rx: mpsc::Receiver<(u32, SocketAddr, KcpSession)>,
@@ -96,6 +122,11 @@ pub(crate) struct KcpSocket {
     write_backlog: Arc<AtomicUsize>,
     write_notify: Arc<Notify>,
     start: Instant,
+    /// UDP packets that could not be sent immediately because the socket
+    /// send buffer was full (try_send_to). Drained on the next tick — keeps
+    /// the driver from blocking on `send_to().await` (head-of-line stall
+    /// for every other session on this socket).
+    pending_udp: VecDeque<(SocketAddr, Vec<u8>)>,
     /// Pre-allocated Vec for session removal during tick (avoids per-tick allocation).
     to_remove: Vec<(u32, SocketAddr)>,
     /// Pre-allocated Vec for expired unaccepted sessions cleanup during tick.
@@ -127,6 +158,8 @@ impl KcpSocket {
             conv_index: HashMap::new(),
             peer_session_counts: HashMap::new(),
             session_created_at: HashMap::new(),
+            session_create_log: VecDeque::new(),
+            ip_session_create_log: HashMap::new(),
             write_tx: write_tx.clone(),
             write_rx,
             register_rx,
@@ -135,6 +168,7 @@ impl KcpSocket {
             write_backlog: write_backlog.clone(),
             write_notify: write_notify.clone(),
             start: Instant::now(),
+            pending_udp: VecDeque::new(),
             to_remove: Vec::with_capacity(16),
             expired: Vec::with_capacity(16),
             peer_addr_index: HashMap::new(),
@@ -167,14 +201,19 @@ impl KcpSocket {
             tokio::select! {
                 _ = tick.tick() => {
                     let now_ms = self.start.elapsed().as_millis() as u32;
+                    // Re-send packets queued by a full send buffer.
+                    self.drain_pending_udp();
                     self.to_remove.clear();
                     for (key, session) in &mut self.sessions {
                         match session.update(now_ms) {
                             Ok(packets) => {
                                 for pkt in packets {
-                                    if let Err(e) = self.socket.send_to(&pkt, key.1).await {
-                                        tracing::debug!(conv = key.0, peer = %key.1, error = %e, "KCP UDP send error");
-                                    }
+                                    Self::send_udp_packet(
+                                        &self.socket,
+                                        &mut self.pending_udp,
+                                        pkt,
+                                        key.1,
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -233,6 +272,19 @@ impl KcpSocket {
                             }
                         }
                     }
+                    // Trim per-IP session-creation logs and drop empty keys so
+                    // a many-IP flood cannot accumulate map entries after their
+                    // rate window expires.
+                    self.ip_session_create_log.retain(|_, log| {
+                        while let Some(&t) = log.front() {
+                            if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
+                                log.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        !log.is_empty()
+                    });
                 }
 
                 Some((conv, req)) = self.write_rx.recv() => {
@@ -246,7 +298,7 @@ impl KcpSocket {
                             let addr = self.conv_index.get(&conv).copied();
                             let _result = addr
                                 .and_then(|a| self.sessions.get_mut(&(conv, a)))
-                                .map(|s| s.send(&data))
+                                .map(|s| s.send(data))
                                 .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
                             if let Err(ref e) = _result {
                                 tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed — session not found");
@@ -372,7 +424,49 @@ impl KcpSocket {
                                         tracing::warn!(conv = key.0, peer = %src, ip_sessions = ip_count, "KCP: per-IP session limit reached ({MAX_SESSIONS_PER_IP}), dropping new conv={}", key.0);
                                         continue;
                                     }
-
+                                    // Session-creation RATE limiting (defense
+                                    // vs the steady-state caps above): a UDP
+                                    // flood of 24-byte packets with random
+                                    // convs must not fill the 256-entry accept
+                                    // queue (or churn the session table) in
+                                    // one burst. Limits: 256 new sessions per
+                                    // 10 s globally, 32 per IP per 10 s.
+                                    let now_ms = self.start.elapsed().as_millis() as u32;
+                                    // Trim global log outside the window.
+                                    while let Some(&t) = self.session_create_log.front() {
+                                        if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
+                                            self.session_create_log.pop_front();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    if self.session_create_log.len() >= MAX_SESSION_CREATES_PER_WINDOW
+                                    {
+                                        tracing::warn!(conv = key.0, peer = %src, "KCP: session-creation rate limit reached ({MAX_SESSION_CREATES_PER_WINDOW}/{SESSION_CREATE_WINDOW_MS}ms), dropping new conv={}", key.0);
+                                        continue;
+                                    }
+                                    // Trim per-IP log (empty keys are dropped
+                                    // by the tick cleanup).
+                                    {
+                                        let log = self.ip_session_create_log.entry(ip).or_default();
+                                        while let Some(&t) = log.front() {
+                                            if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
+                                                log.pop_front();
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        if log.len() >= MAX_SESSION_CREATES_PER_IP_PER_WINDOW {
+                                            tracing::warn!(conv = key.0, peer = %src, "KCP: per-IP session-creation rate limit reached ({MAX_SESSION_CREATES_PER_IP_PER_WINDOW}/{SESSION_CREATE_WINDOW_MS}ms), dropping new conv={}", key.0);
+                                            continue;
+                                        }
+                                        // NOTE: the rate counters are NOT incremented
+                                        // here — they are charged only after the
+                                        // session is actually created and queued
+                                        // (below), so garbage packets that fail
+                                        // input() or a saturated accept queue cannot
+                                        // consume quota and starve legitimate peers.
+                                    }
                                     // Create session and validate the first packet.
                                     // If input() fails on the very first packet, the
                                     // data is garbage — don't create a permanent session.
@@ -430,6 +524,15 @@ impl KcpSocket {
                                     *self.peer_session_counts.entry(src.ip()).or_default() += 1;
                                     let now_ms = self.start.elapsed().as_millis() as u32;
                                     self.session_created_at.insert(key, now_ms);
+                                    // Charge the rate counters only now that the
+                                    // session is actually created and queued — the
+                                    // early-return paths above (input() failure,
+                                    // accept queue full) must not consume quota.
+                                    self.session_create_log.push_back(now_ms);
+                                    self.ip_session_create_log
+                                        .entry(ip)
+                                        .or_default()
+                                        .push_back(now_ms);
                                 }
                             }
                         }
@@ -500,12 +603,59 @@ impl KcpSocket {
         }
     }
 
+    /// Send a UDP packet best-effort: `try_send_to` never blocks the driver.
+    /// On a full kernel send buffer the packet is queued for the next tick;
+    /// when the queue is full the packet is dropped (KCP retransmission will
+    /// resend it, so dropping is safe). Prevents a slow receiver from
+    /// stalling UDP receives and every other session on this socket.
+    ///
+    /// An associated function taking fields explicitly so it can be called
+    /// while `self.sessions` is mutably borrowed (field-level borrows).
+    fn send_udp_packet(
+        socket: &UdpSocket,
+        pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
+        pkt: Vec<u8>,
+        peer: SocketAddr,
+    ) {
+        match socket.try_send_to(&pkt, peer) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if pending_udp.len() < 2048 {
+                    pending_udp.push_back((peer, pkt));
+                }
+            }
+            Err(e) => {
+                tracing::debug!(peer = %peer, error = %e, "KCP UDP send error");
+            }
+        }
+    }
+
+    /// Re-send packets queued by a previous full send buffer (FIFO).
+    fn drain_pending_udp(&mut self) {
+        let mut still_pending = VecDeque::new();
+        while let Some((pa, pkt)) = self.pending_udp.pop_front() {
+            match self.socket.try_send_to(&pkt, pa) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    still_pending.push_back((pa, pkt));
+                }
+                Err(e) => {
+                    tracing::debug!(peer = %pa, error = %e, "KCP UDP pending send error");
+                }
+            }
+        }
+        self.pending_udp = still_pending;
+    }
+
     /// Flush a session's pending KCP output to the wire immediately.
     /// Shared by the Data handler (flush-on-write, matching kcp-go's
     /// flush-on-every-Write behavior) and the Flush handler (StartWorkConn
     /// ordering guarantee). No-op when the session is gone. Returns the
     /// number of output packets force_flush produced.
     async fn flush_session_output(&mut self, conv: u32, peer_addr: SocketAddr) -> usize {
+        // Drain the pending queue first so delayed packets keep ordering
+        // relative to newly flushed ones.
+        self.drain_pending_udp();
         let packets = if let Some(session) = self.sessions.get_mut(&(conv, peer_addr)) {
             let now_ms = self.start.elapsed().as_millis() as u32;
             match session.force_flush(now_ms) {
@@ -518,13 +668,11 @@ impl KcpSocket {
         } else {
             Vec::new()
         };
-        // Send all output packets immediately.
-        for pkt in &packets {
-            if let Err(e) = self.socket.send_to(pkt, peer_addr).await {
-                tracing::debug!(conv, peer = %peer_addr, error = %e, "KCP SOCKET: flush send error");
-            }
+        let n = packets.len();
+        for pkt in packets {
+            Self::send_udp_packet(&self.socket, &mut self.pending_udp, pkt, peer_addr);
         }
-        packets.len()
+        n
     }
 
     /// Extract (conv, peer_addr) key from a raw UDP packet.
@@ -554,5 +702,34 @@ impl KcpSocket {
             return (conv, src);
         }
         (0, src)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SESSION_CREATE_WINDOW_MS;
+
+    /// The rate-limit trim uses `now.wrapping_sub(ts) > WINDOW` (same
+    /// convention as `session_created_at` cleanup) so the u32-ms clock's
+    /// 2^32-ms (~49.7-day) wrap cannot wedge the creation logs full and
+    /// permanently reject new sessions. Verify the arithmetic both before
+    /// and after the wrap.
+    #[test]
+    fn rate_window_age_handles_u32_wrap() {
+        let window = SESSION_CREATE_WINDOW_MS;
+        // Before wrap: 5 s before wrap, timestamps recorded 3 s / 60 s earlier.
+        let now = u32::MAX - 5_000;
+        let fresh = now - 3_000; // 3 s old → inside window
+        assert!(now.wrapping_sub(fresh) <= window);
+        let old = now - 60_000; // 60 s old → outside window
+        assert!(now.wrapping_sub(old) > window);
+
+        // After wrap: clock wrapped to 5 s; ts recorded 1 s before the wrap
+        // (~6 s elapsed) and 60 s before the wrap (~65 s elapsed).
+        let now_wrapped = 5_000u32;
+        let just_before_wrap = u32::MAX - 1_000;
+        assert!(now_wrapped.wrapping_sub(just_before_wrap) <= window);
+        let long_ago = u32::MAX - 60_000;
+        assert!(now_wrapped.wrapping_sub(long_ago) > window);
     }
 }

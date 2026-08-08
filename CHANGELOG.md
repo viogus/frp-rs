@@ -4,6 +4,64 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **UDP proxy per-remote sessions (Go frp parity)**: each distinct remote
+  visitor now gets its own ephemeral local UDP socket (bound on the local
+  IP), so the local service sees a different source address per remote and
+  replies to the right one — the old single shared socket + single
+  `last_remote` misrouted responses when multiple remotes were active
+  concurrently. PROXY protocol headers are prepended per remote session
+  (first packet), idle sessions are reaped after 60 s, and the session
+  aggregation keeps a single work-conn writer. The session-scoped shared
+  socket map (`udp_sockets`/`udp_enc_cfg`) and its reload-rebind logic are
+  gone — reload changes to local_addr/encryption apply on the next work conn
+  naturally.
+
+- **Audit round fixes (2026-08)**: full review-driven hardening across
+  frp-core / frp-server / frp-client —
+
+  - *Reliability*: supersession handoff barrier can no longer hang forever
+    (old handler always extracts a queued `Shutdown`'s `done` on exit; the
+    new login's barrier has a 10 s defense-in-depth timeout); idle STCP/XTCP
+    visitor listeners are force-aborted after a 500 ms grace period so their
+    bind ports are released on reconnect/reload instead of failing with
+    AddrInUse forever; XTCP pre_check timeout cut 15 s → 1 s; reconnect
+    backoff resets after a ≥5 min healthy session; plugin restart failure on
+    reload now aborts the reload (old plugin keeps running) instead of
+    silently killing the old plugin and falling back to a dead address;
+    CloseProxy during reload uses the original registered wire name
+    (changing `user` no longer orphans the server-side proxy); health-check
+    events use `try_send` so a reconnecting control loop cannot stall
+    probing.
+  - *Security*: `authenticationTimeout` default is now 90 s (replay
+    protection on by default; set `authenticationTimeout = 0` to restore Go
+    behaviour); timestamp freshness accepts seconds or milliseconds (frpc now
+    sends ms so same-second reconnects don't false-positive replay
+    detection) and uses saturating arithmetic (no debug-build panic on
+    attacker-controlled timestamps); replay-detection table has a global
+    entry cap and prunes both ms and s keys; STCP/XTCP proxies with no `sk`
+    and no visitor authorization warn loudly per connection (Go frp parity
+    preserved), and token verification now precedes the freshness check (no
+    probing the timestamp window unauthenticated); SSH gateway fails closed
+    at startup without credentials unless `allowNoneAuth = true`; frpc admin
+    API refuses to bind a non-loopback address without admin auth;
+    custom_domains/subdomain validation (RFC 1123 labels, no wildcards, no
+    control chars, proxy_name rejects CR/LF); vhost request-header injection
+    and HTTP plugin header CR/LF filtering; vhost headers over 4096 B get a
+    431 response instead of a truncated forward; login throttle table falls
+    back to allowing untracked IPs when full (no 90 s DoS of new clients);
+    QUIC default max_incoming_streams 100 000 → 4096; `store.rs` re-applies
+    0600 after atomic rename; TLS/QUIC InsecureSkipVerify upgraded to a loud
+    error log.
+  - *Performance*: KCP send path takes ownership of the buffer and segments
+    via `Vec::split_off` (one copy instead of one per MSS fragment); ACK
+    parsing fast path (O(1) `pop_front` for in-order ACKs); the KCP driver no
+    longer blocks on `send_to().await` — `try_send_to` with a bounded pending
+    queue drained on the 10 ms tick; WebSocket masking is u32-chunked;
+    yamux stream accept uses `try_send` with a 500 ms bounded fallback
+    instead of a 5 s stall; dashboard proxy deletion now reuses the full
+    CloseProxy lifecycle (TCP-group last-member semantics, per-client port
+    quota decrement, group listener stop); mux/splice/backoff cleanups.
+
 - **UDP proxy zero-alloc data path**: per-packet encrypt/decrypt/compress/
   decompress now reuse session-scoped scratch buffers (frp-core `*_into`
   variants, byte-identical wire output) instead of allocating up to 4 Vecs

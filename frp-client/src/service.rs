@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 #[cfg(all(feature = "vnet", test))]
 use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -135,6 +134,49 @@ pub struct Service {
 }
 
 impl Service {
+    /// Wait briefly for visitor listener tasks to exit gracefully, then
+    /// force-abort any still blocked in `accept()` so their listeners drop
+    /// and the bind ports are released immediately. Without the abort, an
+    /// idle visitor listener (no inbound traffic) never wakes from `accept()`,
+    /// the dropped `JoinHandle` does NOT cancel the task, and the next
+    /// session's `bind()` fails with AddrInUse — permanently killing the
+    /// visitor (STCP/XTCP) until frpc restarts.
+    async fn shutdown_visitor_tasks(&self, mut handles: Vec<tokio::task::JoinHandle<()>>) {
+        // &mut JoinHandle implements Future (tokio); &JoinHandle does not.
+        let graceful = tokio::time::timeout(
+            Duration::from_millis(500),
+            futures_util::future::join_all(handles.iter_mut()),
+        )
+        .await;
+        if graceful.is_err() {
+            tracing::warn!(
+                count = handles.len(),
+                "Visitor shutdown timed out after 500ms; aborting stuck listener task(s) to release bind ports"
+            );
+            for h in &handles {
+                h.abort();
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        }
+    }
+
+    /// CloseProxy must use the ORIGINAL registered wire name (old user
+    /// prefix). After a `user` config change, rebuilding the name from the
+    /// new user misses the server-side proxy and leaves it orphaned (its
+    /// port/domains stay allocated). Look up the registered key from
+    /// proxy_info_map: when old/new users differ, do_reload's strip_prefix
+    /// fails and the delta name IS the full registered key.
+    async fn close_wire_name_for_reload(&self, name: &str, user: &str) -> String {
+        let map = self.proxy_info_map.read().await;
+        if map.contains_key(name) {
+            name.to_string()
+        } else {
+            wire_proxy_name(user, name)
+        }
+    }
+
     /// Create a new client Service with default unsafe features (all blocked).
     pub async fn new(
         cfg: ClientConfig,
@@ -583,6 +625,12 @@ impl Service {
         let mut did_login_once = false;
         let mut consecutive_err_count: u32 = 0;
         let mut fast_retry_timestamps: Vec<Instant> = Vec::new();
+        // When a session runs healthily for a long time, the consecutive
+        // error count is reset so an occasional blip doesn't reconnect with
+        // the backoff cap already reached (Go frp's FastBackoffManager only
+        // counts consecutive failures).
+        #[allow(unused_assignments)] // initial None is overwritten before first read
+        let mut session_started_at: Option<Instant> = None;
         // Track visitor listener tasks so they can be cancelled on reconnect.
         let mut visitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         // Carry over run_id across reconnections (Go frp compat: previousRunID).
@@ -711,6 +759,8 @@ impl Service {
             #[cfg(feature = "quic")]
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             previous_run_id = run_id.clone();
+            // Session established — mark its start for backoff reset.
+            session_started_at = Some(Instant::now());
             let v2 = cfg_local.v2;
             info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
 
@@ -728,74 +778,7 @@ impl Service {
                 .unwrap_or_default();
             let server_scopes = self.server_auth_scopes.read().await.clone();
             // Bind local UDP sockets for UDP proxies.
-            // UDP data flows over work connections (Go frp v0.69.1 compat).
-            // Sockets are shared with work conn tasks via Arc.
-            let udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>> =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let udp_enc_cfg: Arc<tokio::sync::Mutex<HashMap<String, (bool, bool)>>> =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            for p in &proxies {
-                if p.proxy_type == "udp" || p.proxy_type == "sudp" {
-                    let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                    // SUDP data plane is plaintext-first (visitor forces
-                    // plaintext too, see run_sudp_visitor_listener): the
-                    // per-packet AES-128-CFB transform in work_conn.rs must
-                    // NOT be applied on SUDP work conns, or the visitor's
-                    // plaintext payloads would be decrypt-encrypted into
-                    // corruption. The user-facing warning lives on the
-                    // visitor side; keep both sides in sync.
-                    let enc = if p.proxy_type == "sudp" {
-                        (false, false)
-                    } else {
-                        (p.use_encryption, p.use_compression)
-                    };
-                    {
-                        let mut cfg = udp_enc_cfg.lock().await;
-                        cfg.insert(local_addr.clone(), enc);
-                        cfg.insert(wire_proxy_name(&cfg_local.user, &p.name), enc);
-                    }
-                    if p.proxy_type == "sudp" {
-                        // SUDP work conns create their own local socket per
-                        // work conn (see work_conn.rs): no shared socket here.
-                        // The shared map is only for plain udp proxies.
-                        info!(proxy_name = %p.name, local_addr = %local_addr,
-                            "SUDP proxy '{}' ready (per-work-conn UDP socket to {})",
-                            p.name, local_addr);
-                        continue;
-                    }
-                    let bind_addr = format!("{}:0", p.local_ip);
-                    let socket = match UdpSocket::bind(&bind_addr).await {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            warn!(proxy_name = %p.name, error = %e, "UDP proxy '{}': bind failed: {}", p.name, e);
-                            continue;
-                        }
-                    };
-                    // Connect to local UDP service for send/recv
-                    if let Err(e) = socket.connect(&local_addr).await {
-                        warn!(proxy_name = %p.name, local_addr = %local_addr, error = %e, "UDP proxy '{}': connect to local {} failed: {}", p.name, local_addr, e);
-                        continue;
-                    }
-                    {
-                        // Key the socket lookup by the wire proxy name (with
-                        // {user}. prefix), matching work_conn's lookup key
-                        // (swc.proxy_name) and proxy_info_map. The previous
-                        // `p.name` (unprefixed) key missed whenever the client
-                        // has a non-empty `user` configured, leaving UDP
-                        // work conns without their local socket.
-                        let wire_name = wire_proxy_name(&cfg_local.user, &p.name);
-                        let mut map = udp_sockets.lock().await;
-                        map.insert(local_addr.clone(), socket.clone());
-                        map.insert(wire_name.clone(), socket);
-                    }
-                    let enc_label = if p.use_encryption {
-                        "encrypted"
-                    } else {
-                        "plain"
-                    };
-                    info!(proxy_name = %p.name, local_addr = %local_addr, enc_label = %enc_label, "UDP proxy '{}' ready, bridging to {} ({})", p.name, local_addr, enc_label);
-                }
-            }
+
             macro_rules! work_conn_config {
                 ($pool_id:expr) => {{
                     #[cfg(feature = "quic")]
@@ -821,8 +804,6 @@ impl Service {
                         quic_conn: quic_arg,
                         v2,
                         oidc_client: self.oidc_client.clone(),
-                        udp_sockets: udp_sockets.clone(),
-                        udp_enc_cfg: udp_enc_cfg.clone(),
                         udp_packet_size: cfg_local.udp_packet_size.max(0) as usize,
                         proxy_metrics: self.proxy_metrics.clone(),
                         client_auth_scopes: client_scopes.clone(),
@@ -1251,15 +1232,11 @@ impl Service {
             // visitors to exit, instead of aborting them (Go frp compat:
             // visitor_manager.Close() closes each visitor cleanly). The
             // previous session's visitor_shutdown was already set when the
-            // session ended; tasks should exit on their own. join_all waits on
-            // all tasks in parallel — per-task sequential 500ms timeouts would
-            // multiply the reconnect delay by the number of stuck visitors.
-            // Dropped (still-running) tasks poll the shutdown flag and exit.
-            let _ = tokio::time::timeout(
-                Duration::from_millis(500),
-                futures_util::future::join_all(visitor_handles.drain(..)),
-            )
-            .await;
+            // session ended; tasks should exit on their own. Any listener
+            // still stuck in accept() after the grace period is force-aborted
+            // so the bind port is released for the new session.
+            self.shutdown_visitor_tasks(std::mem::take(&mut visitor_handles))
+                .await;
 
             // Spawn STCP/XTCP visitor listeners
             let session_visitors = self.cfg.read().await.visitors.clone();
@@ -1579,10 +1556,30 @@ impl Service {
                                     }
                                     // Inject OS route so the kernel sends matching packets
                                     // through the TUN device instead of the default gateway.
+                                    // vnet_tun_names is keyed by *local* proxy name, while
+                                    // adv.proxy_name is the *remote* peer's name — so match
+                                    // by virtual_net (the route's isolation domain, already
+                                    // validated above) instead of by name. The local vnet
+                                    // proxy owning that virtual net is the one whose TUN must
+                                    // carry this route; with no local TUN for the net (e.g.
+                                    // this client is only a visitor) there is nothing to
+                                    // inject, which is correct — the old code grabbed an
+                                    // arbitrary TUN and silently misrouted.
                                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                                     {
+                                        let local_tun_proxy: Option<String> = {
+                                            let cfg = self.cfg.read().await;
+                                            cfg.proxies
+                                                .iter()
+                                                .find(|p| {
+                                                    p.proxy_type == "vnet" && p.virtual_net == vnet
+                                                })
+                                                .map(|p| p.name.clone())
+                                        };
                                         let names = self.vnet_tun_names.lock().await;
-                                        if let Some(tun_name) = names.values().next() {
+                                        if let Some(tun_name) =
+                                            local_tun_proxy.as_deref().and_then(|n| names.get(n))
+                                        {
                                             add_os_route(&adv.subnet, tun_name);
                                             self.vnet_peer_routes.lock().await.insert(
                                                 adv.proxy_name.clone(),
@@ -1591,6 +1588,13 @@ impl Service {
                                                     tun_name.clone(),
                                                     vnet.clone(),
                                                 ),
+                                            );
+                                        } else {
+                                            debug!(
+                                                vnet,
+                                                proxy_name = %adv.proxy_name,
+                                                "vnet route advertise: no local TUN for virtual net '{}' — skipping OS route",
+                                                vnet
                                             );
                                         }
                                     }
@@ -1706,7 +1710,7 @@ impl Service {
                                 let ts = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
-                                    .as_secs() as i64;
+                                    .as_millis() as i64;
                                 match self.auth_cfg.try_generate_login_key(ts) {
                                     Ok(key) => {
                                         ping_msg.privilege_key = Some(key);
@@ -2086,14 +2090,10 @@ impl Service {
 
             // Wait briefly for visitor tasks to notice the shutdown signal and
             // exit gracefully (timeout so we never block reconnection).
-            // join_all waits on all tasks in parallel — sequential per-task
-            // 500ms timeouts would cost N×500ms for N stuck visitors, twice per
-            // reconnect. Dropped (still-running) tasks poll the shutdown flag.
-            let _ = tokio::time::timeout(
-                Duration::from_millis(500),
-                futures_util::future::join_all(visitor_handles.drain(..)),
-            )
-            .await;
+            // Any listener still blocked in accept() after the grace period is
+            // force-aborted so the bind port is released for the next session.
+            self.shutdown_visitor_tasks(std::mem::take(&mut visitor_handles))
+                .await;
 
             // Check if admin stop was requested
             if shutdown_flag.load(Ordering::SeqCst) {
@@ -2103,6 +2103,14 @@ impl Service {
 
             // Session dropped — reconnect with Go frp dev two-phase fast-backoff.
             // login_fail_exit only applies to initial login, not session drops.
+            // Reset the consecutive-error count when the previous session was
+            // healthy for ≥5 minutes, so a stable connection followed by an
+            // occasional blip reconnects from Phase 1 instead of the 20s cap.
+            if let Some(started) = session_started_at {
+                if started.elapsed() > Duration::from_secs(300) {
+                    consecutive_err_count = 0;
+                }
+            }
             let delay = crate::backoff::reconnect_delay_after_session(
                 &mut consecutive_err_count,
                 &mut fast_retry_timestamps,
@@ -2384,9 +2392,25 @@ impl Service {
                         let addr = handle.local_addr.to_string();
                         plugin_addrs.insert(name.clone(), addr);
                         new_plugin_handles.insert(name.clone(), handle);
+                    } else if delta.changed.contains(name) {
+                        // A CHANGED proxy whose plugin failed to restart must
+                        // not silently fall back to local_ip:local_port — the
+                        // commit phase would then kill the OLD plugin and leave
+                        // the proxy pointing at a dead address while reload
+                        // reports success. Abort the whole reload: drop the
+                        // freshly started plugins (if any), keep the old
+                        // plugin set and the server-side old proxy untouched.
+                        for (_, h) in new_plugin_handles.drain() {
+                            drop(h);
+                        }
+                        return Err(format!(
+                            "plugin '{}' failed to restart for changed proxy '{}'; reload aborted, old plugin kept running",
+                            plugin_cfg.plugin_type, name
+                        ));
                     }
-                    // If plugin start fails, plugin_addrs won't have an entry;
-                    // the proxy uses configured local_ip:local_port as fallback.
+                    // Added proxy: a plugin start failure falls back to
+                    // local_ip:local_port with an error recorded on the proxy
+                    // (see the proxy_info_map err field below).
                 }
             }
         }
@@ -2432,7 +2456,7 @@ impl Service {
         // CloseProxy for removed proxies
         let user = delta.new_config.user.clone();
         for name in &delta.removed {
-            let wn = wire_proxy_name(&user, name);
+            let wn = self.close_wire_name_for_reload(name, &user).await;
             msgs.push(ReloadMsg {
                 label: format!("send CloseProxy for '{name}'"),
                 msg: FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: wn }),
@@ -2443,7 +2467,7 @@ impl Service {
         // CloseProxy + NewProxy for changed proxies
         for name in &delta.changed {
             if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
-                let wn = wire_proxy_name(&user, name);
+                let wn = self.close_wire_name_for_reload(name, &user).await;
                 let local_addr = plugin_addrs
                     .get(name)
                     .cloned()

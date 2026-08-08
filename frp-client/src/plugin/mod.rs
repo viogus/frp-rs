@@ -362,20 +362,34 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
             }
         }
         if !host_rewrite.is_empty() && lower.starts_with("host:") {
-            fwd.push_str(&format!("Host: {host_rewrite}\r\n"));
+            let safe_host: String = host_rewrite
+                .chars()
+                .filter(|&c| c != '\r' && c != '\n')
+                .collect();
+            fwd.push_str(&format!("Host: {safe_host}\r\n"));
         } else {
-            fwd.push_str(line);
+            // Strip CR/LF from forwarded header lines: header injection /
+            // request-smuggling defense (the h2 plugin path rejects CR/LF
+            // outright — mirror that policy here for the HTTP/1.0 path).
+            let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            fwd.push_str(&safe_line);
             fwd.push_str("\r\n");
         }
     }
     // Inject configured request headers (Go rewriteHTTPPluginRequest).
     // "host" is skipped: Go's req.Header.Set cannot set Host — it is
     // controlled by hostHeaderRewrite (or the original request).
+    // Names/values are sanitized against CR/LF like every other header.
     for (k, v) in request_headers {
         if k.eq_ignore_ascii_case("host") {
             continue;
         }
-        fwd.push_str(&format!("{k}: {v}\r\n"));
+        let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
+        let safe_v: String = v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+        if safe_k.is_empty() {
+            continue;
+        }
+        fwd.push_str(&format!("{safe_k}: {safe_v}\r\n"));
     }
     fwd.push_str("Connection: close\r\n\r\n");
 

@@ -1858,14 +1858,21 @@ impl SshListener {
             Vec::new()
         };
 
-        // SECURITY WARNING: when neither authorized_keys nor server_token is
+        // SECURITY: when neither authorized_keys nor server_token is
         // configured, auth_none accepts every connection (Go frp NoClientAuth
-        // compat). That is a legitimate deployment mode for trusted networks,
-        // but a user who enables the gateway without credentials must see the
-        // exposure loudly — once at startup, not once per connection.
+        // compat). Fail closed by default — refuse to start — unless the
+        // operator explicitly opts in with `allowNoneAuth = true`. A gateway
+        // that silently accepts every SSH client and lets it register proxies
+        // (ports/domains) must never come up by accident.
         if authorized_keys.is_empty() && server_token.is_empty() {
+            if !ssh_cfg.allow_none_auth {
+                return Err(
+                    "SSH gateway: no authorized_keys and no server_token configured — refusing to start with unauthenticated access. Configure ssh_tunnel_gateway.authorized_keys_file / server token, or set ssh_tunnel_gateway.allowNoneAuth = true to explicitly allow unauthenticated connections on a trusted network."
+                        .into(),
+                );
+            }
             tracing::warn!(
-                "SSH gateway: no authorized_keys and no server_token configured — ANY SSH client can connect without authentication and register proxies"
+                "SSH gateway: no authorized_keys and no server_token configured — ANY SSH client can connect without authentication and register proxies (allowNoneAuth = true)"
             );
         }
 

@@ -26,10 +26,12 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Configurable QUIC transport parameters, matching Go frp's `quic` config block.
 ///
-/// Defaults match Go frp v0.69.1 `QUICOptions.Complete()`:
-/// - keepalive_period: 10s
-/// - max_idle_timeout: 30s
-/// - max_incoming_streams: 100_000
+/// Defaults match Go frp v0.69.1 `QUICOptions.Complete()` except
+/// `max_incoming_streams`, which we cap at 4096 (Go's 100_000 default lets an
+/// unauthenticated peer open a huge number of streams on one connection after
+/// TLS handshake but before frp auth, amplifying memory). 4096 is far above
+/// any realistic frp concurrency (one control + pooled work streams) while
+/// bounding per-connection resource use.
 #[derive(Debug, Clone)]
 pub struct QuicTransportParams {
     pub max_idle_timeout_secs: u32,
@@ -42,7 +44,7 @@ impl Default for QuicTransportParams {
         Self {
             max_idle_timeout_secs: 30,
             keepalive_period_secs: 10,
-            max_incoming_streams: 100_000,
+            max_incoming_streams: 4096,
         }
     }
 }
@@ -412,6 +414,11 @@ pub async fn dial_quic_connection_with_params(
             ));
         }
         let verifier = std::sync::Arc::new(crate::transport::InsecureSkipVerify);
+        tracing::error!(
+            "QUIC TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
+             All control and data-plane traffic is vulnerable to MITM attacks. \
+             Set tls.trusted_ca_file in config to enable verification."
+        );
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
@@ -593,9 +600,12 @@ mod tests {
 
     #[test]
     fn incoming_stream_limit_preserves_public_default_and_explicit_values() {
+        // Deliberate safety divergence from Go's 100_000: cap the default at
+        // 4096 so an unauthenticated peer cannot open a huge number of
+        // streams on one connection (resource amplification).
         let params = QuicTransportParams::default();
-        assert_eq!(params.max_incoming_streams, 100_000);
-        assert_eq!(params.effective_max_incoming_streams(), 100_000);
+        assert_eq!(params.max_incoming_streams, 4096);
+        assert_eq!(params.effective_max_incoming_streams(), 4096);
 
         let custom = QuicTransportParams {
             max_incoming_streams: 1_024,
@@ -614,19 +624,19 @@ mod tests {
     }
 
     #[test]
-    fn zero_option_values_normalize_to_go_defaults() {
+    fn zero_option_values_normalize_to_defaults() {
         let params = quic_params_from_option_values(0, 0, 0);
         assert_eq!(params.keepalive_period_secs, 10);
         assert_eq!(params.max_idle_timeout_secs, 30);
-        assert_eq!(params.max_incoming_streams, 100_000);
+        assert_eq!(params.max_incoming_streams, 4096);
     }
 
     #[test]
-    fn negative_option_values_also_normalize_to_go_defaults() {
+    fn negative_option_values_also_normalize_to_defaults() {
         let params = quic_params_from_option_values(-1, -5, -100);
         assert_eq!(params.keepalive_period_secs, 10);
         assert_eq!(params.max_idle_timeout_secs, 30);
-        assert_eq!(params.max_incoming_streams, 100_000);
+        assert_eq!(params.max_incoming_streams, 4096);
     }
 
     #[test]

@@ -417,7 +417,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             let ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
-                                .as_secs() as i64;
+                                .as_millis() as i64;
                             let sign_key = if sk.is_empty() {
                                 None
                             } else {
@@ -442,7 +442,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             }
                             debug!(visitor_name = %visitor_name, sn = %sn, "Visitor '{}': sent NatHoleVisitor pre_check for '{}'", visitor_name, sn);
 
-                            match tokio::time::timeout(Duration::from_secs(15), reply_rx).await {
+                            match tokio::time::timeout(Duration::from_secs(1), reply_rx).await {
                                 Ok(Ok(Ok(resp))) => {
                                     if let Some(err) = resp.error {
                                         warn!(visitor_name = %visitor_name, error = %err, "Visitor '{}': pre_check failed: {}", visitor_name, err);
@@ -460,9 +460,12 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 }
                                 Err(_elapsed) => {
                                     // Timeout on pre_check: server may not support
-                                    // pre_check on control channel. Proceed with full
-                                    // request anyway (graceful degradation).
-                                    warn!(visitor_name = %visitor_name, "Visitor '{}': pre_check timed out after 15s, proceeding with full request", visitor_name);
+                                    // pre_check on control channel. Proceed with
+                                    // full request anyway (graceful degradation).
+                                    // Short timeout — 15s per connection stalled
+                                    // every XTCP connect against servers that
+                                    // ignore pre_check.
+                                    warn!(visitor_name = %visitor_name, "Visitor '{}': pre_check timed out after 1s, proceeding with full request", visitor_name);
                                 }
                             }
                         }
@@ -551,7 +554,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             let ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
-                                .as_secs() as i64;
+                                .as_millis() as i64;
                             let sign_key = if sk.is_empty() {
                                 None
                             } else {

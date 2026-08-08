@@ -110,9 +110,11 @@ but not literally 100% — see "Known limitations" below.
   profiles); `/healthz` and pprof are outside auth, matching Go.
 - **UDP bandwidth limiting**: Go v0.70.1's UDP forwarder has no limiter, so
   frp-rs intentionally applies none either (parity, not a gap).
-- **SSH gateway anonymity**: when no `authorized_keys` file is configured the
-  SSH tunnel gateway accepts anonymous connections (Go parity). Always set a
-  token and run frps behind a firewall, or configure `authorized_keys`.
+- **SSH gateway anonymity**: when no `authorized_keys` file and no server
+  token are configured, the SSH tunnel gateway **fails to start** by default
+  (fail-closed). Set `ssh_tunnel_gateway.allowNoneAuth = true` to explicitly
+  accept anonymous connections (Go parity) on a trusted network; otherwise
+  always set a token or `authorized_keys`.
 
 ### Why frp-rs?
 
@@ -335,6 +337,8 @@ tcp_mux_keepalive_interval = 30
 | `tls_ca_file` | `""` | CA certificate for mutual TLS |
 | `auth.method` | `"token"` | Authentication method (token or oidc) |
 | `auth.token` | `""` | Shared authentication token |
+| `auth.authenticationTimeout` | `90` | Login timestamp freshness window in seconds (replay protection; `0` = disabled, Go frp default) |
+| `ssh_tunnel_gateway.allowNoneAuth` | `false` | Allow the SSH gateway to start with no credentials, accepting every connection (fail-closed by default) |
 | `log.level` | `"info"` | Log level: trace, debug, info, warn, error |
 | `log.file` | `""` | Log file path (empty = stderr) |
 | `log.max_days` | `3` | Max days to retain log files |
