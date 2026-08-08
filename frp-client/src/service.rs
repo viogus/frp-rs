@@ -87,6 +87,11 @@ pub struct Service {
     reload_tx: mpsc::Sender<ReloadRequest>,
     /// Receiver side of reload channel — consumed by run().
     reload_rx: std::sync::Mutex<Option<mpsc::Receiver<ReloadRequest>>>,
+    /// Channel to trigger graceful shutdown from external signal (SIGTERM)
+    /// or the admin API. The receiver is consumed by run().
+    stop_tx: mpsc::Sender<()>,
+    /// Receiver side of stop channel — consumed by run().
+    stop_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
     /// STUN server address for XTCP NAT traversal.
     nat_hole_stun_server: String,
     /// Channel from work connection tasks to the control loop for XTCP (provider side).
@@ -457,6 +462,7 @@ impl Service {
         let proxy_info_map = Arc::new(RwLock::new(map));
 
         let (reload_tx, reload_rx) = mpsc::channel::<ReloadRequest>(64);
+        let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
         let (xtcp_tx, xtcp_rx) = mpsc::channel::<XtcpNotification>(64);
         let (visitor_tx, visitor_rx) = mpsc::channel::<VisitorRequest>(64);
         let (health_tx, health_rx) = mpsc::channel::<HealthEvent>(16);
@@ -507,6 +513,8 @@ impl Service {
             config_file,
             reload_tx,
             reload_rx: std::sync::Mutex::new(Some(reload_rx)),
+            stop_tx,
+            stop_rx: std::sync::Mutex::new(Some(stop_rx)),
             nat_hole_stun_server,
             xtcp_tx,
             xtcp_rx: std::sync::Mutex::new(Some(xtcp_rx)),
@@ -552,6 +560,20 @@ impl Service {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!("Config reload channel closed — reload not possible (service may be shutting down)");
+            }
+        }
+    }
+
+    /// Request a graceful shutdown. Safe to call from signal handler.
+    /// Returns immediately; the actual shutdown happens asynchronously in run().
+    pub fn request_stop(&self) {
+        match self.stop_tx.try_send(()) {
+            Ok(()) => tracing::info!("Stop requested, initiating graceful shutdown"),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("Stop channel full — a stop request is already queued");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("Stop channel closed — service already shutting down");
             }
         }
     }
@@ -617,11 +639,16 @@ impl Service {
             .expect("visitor_rx already taken — run() called twice?");
         let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
-        let (_stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let mut stop_rx = self
+            .stop_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("stop_rx already taken — run() called twice?");
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "admin")]
-        self.spawn_admin_server(&_reload_tx, &_stop_tx).await;
+        self.spawn_admin_server(&_reload_tx, &self.stop_tx).await;
 
         // Main session loop with reconnection.
         // Go frp dev two-phase fast-backoff:
@@ -2059,21 +2086,21 @@ impl Service {
                     }
 
                     Some(()) = stop_rx.recv() => {
-                        info!("Admin stop requested, shutting down");
+                        info!("Stop requested, shutting down");
                         shutdown_flag.store(true, Ordering::SeqCst);
                         break;
                     }
 
                     // Heartbeat timeout watchdog: triggers reconnect if no Pong
                     // received within heartbeat_timeout seconds (Go frp compat).
-                    // Uses sleep instead of interval so the timer is only
-                    // active when hb_timeout > 0. Explicit negative values
-                    // disable it independently of tcp_mux.
-                    _ = tokio::time::sleep(Duration::from_secs(1)), if hb_timeout > 0 => {
-                        if last_pong.elapsed() > hb_timeout_dur {
-                            warn!("Heartbeat timeout ({}s), reconnecting...", hb_timeout);
-                            break;
-                        }
+                    // Event-driven: sleeps until the deadline (last_pong +
+                    // hb_timeout_dur) instead of polling every second, so each
+                    // Pong arrival naturally reschedules the wakeup. Uses sleep
+                    // so the timer is only active when hb_timeout > 0. Explicit
+                    // negative values disable it independently of tcp_mux.
+                    _ = tokio::time::sleep(hb_timeout_dur.saturating_sub(last_pong.elapsed())), if hb_timeout > 0 => {
+                        warn!("Heartbeat timeout ({}s), reconnecting...", hb_timeout);
+                        break;
                     }
                 }
             }

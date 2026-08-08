@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 #[cfg(feature = "dashboard")]
 use tokio::sync::broadcast;
@@ -282,13 +282,27 @@ pub struct XtcpState {
 }
 
 /// Token bucket rate limiter for connection accept loops.
-/// Uses f64 token accounting — zero allocation per check.
+///
+/// Lock-free: a single `AtomicU64` packs the limiter state as
+/// `(elapsed_ms_since_process_start << 32) | tokens_fixed_point`, so
+/// concurrent accept loops CAS-refill without contending on one shared
+/// mutex (no cache-line bouncing under high connection churn). Best-effort
+/// semantics — `Ordering::Relaxed` is fine for a rate limiter. Zero
+/// allocation per check.
 pub struct RateLimiter {
-    rate: f64,   // tokens per second; 0.0 = unlimited
-    tokens: f64, // current token balance (max: burst)
-    burst: f64,  // max tokens that can accumulate
-    last_refill: Instant,
+    /// Tokens per second; 0.0 = unlimited.
+    rate: f64,
+    /// Max tokens that can accumulate (never changes after `new`).
+    burst: u32,
+    state: AtomicU64,
 }
+
+/// Fixed-point scale: 1 token = 1000 units. burst ≤ 1024 → 1,024,000 units
+/// < u32::MAX, so the low 32 bits of the packed state never overflow.
+const SCALE: u64 = 1000;
+
+/// Process-start epoch for the high-32-bit relative timestamps.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Per-run_id lifecycle mutex plus the number of live lifecycle participants.
 ///
@@ -330,11 +344,15 @@ impl RateLimiter {
     /// `max_per_sec`: 0 = unlimited. Burst = min(max_per_sec, 1024).
     pub fn new(max_per_sec: u32) -> Self {
         let rate = max_per_sec as f64;
+        let burst = if rate > 0.0 {
+            rate.min(1024.0) as u32
+        } else {
+            0
+        };
         Self {
             rate,
-            tokens: if rate > 0.0 { rate.min(1024.0) } else { 0.0 },
-            burst: rate.min(1024.0),
-            last_refill: Instant::now(),
+            burst,
+            state: AtomicU64::new(burst as u64 * SCALE),
         }
     }
 
@@ -345,21 +363,49 @@ impl RateLimiter {
 
     /// Try to consume one token. Returns `Ok(())` if allowed, or the
     /// duration to wait before a token becomes available.
-    pub fn try_acquire(&mut self) -> Result<(), Duration> {
+    ///
+    /// Lock-free CAS loop: read the packed state, compute the refilled token
+    /// balance from elapsed seconds, then CAS the updated state. On CAS
+    /// failure another thread won the race, so the loop retries with the
+    /// fresh state.
+    pub fn try_acquire(&self) -> Result<(), Duration> {
         if self.rate == 0.0 {
             return Ok(());
         }
-        let now = Instant::now();
-        let elapsed = (now - self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
-        self.last_refill = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            Ok(())
-        } else {
-            // Time until one token refills
-            let wait = Duration::from_secs_f64((1.0 - self.tokens) / self.rate);
-            Err(wait)
+        // Millisecond-resolution relative timestamp (u32). wrapping_sub treats
+        // (now, last) as a mod-2^32 ring, so the 49.7-day wrap of the ms
+        // counter is handled correctly as long as no single gap between two
+        // samples exceeds ~24.8 days (2^31 ms) — always true in practice.
+        let now_ms = EPOCH.elapsed().as_millis() as u32;
+        loop {
+            let state = self.state.load(AtomicOrdering::Relaxed);
+            let last_ms = (state >> 32) as u32;
+            let tokens = state & 0xFFFF_FFFF;
+            let elapsed_secs = now_ms.wrapping_sub(last_ms) as f64 / 1000.0;
+            let new_tokens = (tokens as f64 + elapsed_secs * self.rate * SCALE as f64)
+                .min(self.burst as f64 * SCALE as f64) as u64;
+            if new_tokens >= SCALE {
+                let next = ((now_ms as u64) << 32) | (new_tokens - SCALE);
+                if self
+                    .state
+                    .compare_exchange(
+                        state,
+                        next,
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                // CAS failed → another thread refilled; retry.
+            } else {
+                // Time until one token (SCALE units) refills.
+                let wait = Duration::from_secs_f64(
+                    (SCALE as f64 - new_tokens as f64) / (self.rate * SCALE as f64),
+                );
+                return Err(wait);
+            }
         }
     }
 }
@@ -451,7 +497,7 @@ pub struct AppState {
     pub conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     /// Token bucket rate limiter for the accept loop.
     /// Limits connections-per-second across all listeners.
-    pub accept_rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    pub accept_rate_limiter: Arc<RateLimiter>,
     /// Per-IP failed login attempt counter: IP -> (count, window_start).
     /// Window resets after 60 seconds. Max 5 failed attempts per window.
     pub login_throttle: Arc<
@@ -606,7 +652,7 @@ impl AppState {
             } else {
                 None
             },
-            accept_rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new(max_accept_rate))),
+            accept_rate_limiter: Arc::new(RateLimiter::new(max_accept_rate)),
             login_throttle: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             login_throttle_overflow: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),

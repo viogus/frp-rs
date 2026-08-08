@@ -363,12 +363,16 @@ async fn handle_visitor_conn(
 
     let a = tokio::spawn(async move {
         let n = tokio::io::copy(&mut u_r, &mut s_w).await;
-        let _ = s_w.shutdown().await;
+        if let Err(e) = s_w.shutdown().await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
         n
     });
     let b = tokio::spawn(async move {
         let n = tokio::io::copy(&mut s_r, &mut u_w).await;
-        let _ = u_w.shutdown().await;
+        if let Err(e) = u_w.shutdown().await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
         n
     });
 

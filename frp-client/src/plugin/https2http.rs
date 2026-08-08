@@ -121,7 +121,9 @@ async fn handle_conn(
         .map_err(|e| format!("write forward request: {e}"))?;
 
     // Copy response back to client
-    let _ = tokio::io::copy(&mut remote, &mut tls).await;
+    if let Err(e) = tokio::io::copy(&mut remote, &mut tls).await {
+        tracing::debug!(error = %e, "plugin relay error: {}", e);
+    }
     Ok(())
 }
 

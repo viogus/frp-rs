@@ -460,6 +460,27 @@ async fn run_normal(mut args: FrpcRunArgs) {
         })
     };
 
+    // SIGTERM → graceful shutdown (docker stop / systemctl stop send SIGTERM).
+    // request_stop() wakes run()'s stop channel; the session loop exits cleanly.
+    #[cfg(unix)]
+    {
+        let stop_svc = service.clone();
+        tokio::spawn(async move {
+            let mut sig = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "SIGTERM handler init failed: {}", e);
+                    return;
+                }
+            };
+            loop {
+                sig.recv().await;
+                tracing::info!(pid = %std::process::id(), "SIGTERM received, initiating graceful shutdown");
+                stop_svc.request_stop();
+            }
+        });
+    }
+
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frpc error: {}", e);
         process::exit(EXIT_RUNTIME);

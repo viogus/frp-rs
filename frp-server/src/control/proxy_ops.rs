@@ -838,8 +838,9 @@ async fn setup_proxy_listeners(
         // Only TCP proxies bind a per-proxy listener. HTTP/HTTPS use
         // the shared vhost listener, TCPMux the shared tcpmux
         // listener, and STCP/XTCP have no remote port.
+        let tcp_keepalive = state.tcp_keepalive;
         let handle = tokio::spawn(async move {
-            listen_and_proxy(bind_addr, port, pn, itx).await;
+            listen_and_proxy(bind_addr, port, pn, itx, tcp_keepalive).await;
         });
         listener_handles.insert(np.proxy_name.clone(), handle);
     } else {
@@ -1172,6 +1173,7 @@ pub(crate) async fn listen_and_proxy(
     port: u16,
     proxy_name: String,
     internal_tx: mpsc::Sender<InternalMsg>,
+    tcp_keepalive: i64,
 ) {
     let addr = format_socket_addr(&bind_addr, port);
     let listener = match TcpListener::bind(&addr).await {
@@ -1189,6 +1191,9 @@ pub(crate) async fn listen_and_proxy(
         match listener.accept().await {
             Ok((user_conn, _addr)) => {
                 frp_core::transport::set_nodelay(&user_conn);
+                if tcp_keepalive > 0 {
+                    frp_core::transport::set_keepalive(&user_conn, tcp_keepalive as u64);
+                }
                 // send().await: backpressure is correct — the control channel
                 // (cap 1024) can fill under a burst of user connections; Go frp
                 // blocks here and lets the TCP backlog absorb the burst. This
@@ -1422,6 +1427,9 @@ async fn tcp_group_listener(
                 match result {
                     Ok((conn, _addr)) => {
                         frp_core::transport::set_nodelay(&conn);
+                        if state.tcp_keepalive > 0 {
+                            frp_core::transport::set_keepalive(&conn, state.tcp_keepalive as u64);
+                        }
                         // Check if group still has members before dispatching
                         if state.proxy_manager.group_len(&group_name).await == 0 {
                             info!(group = %group_name, "TCP group '{}' has no members, stopping listener", group_name);

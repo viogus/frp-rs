@@ -118,9 +118,35 @@ pub async fn run_tcpmux_listener(
             result = listener.accept() => {
                 let (mut stream, peer) = result?;
         frp_core::transport::set_nodelay(&stream);
+        if state.tcp_keepalive > 0 {
+            frp_core::transport::set_keepalive(&stream, state.tcp_keepalive as u64);
+        }
+        let permit = state
+            .conn_semaphore
+            .as_ref()
+            .and_then(|s| s.clone().try_acquire_owned().ok());
+        if permit.is_none() && state.conn_semaphore.is_some() {
+            warn!(addr = %peer, "Max connections reached, rejecting from {}", peer);
+            continue;
+        }
+        let rate_wait = if state.accept_rate_limiter.rate() > 0.0 {
+            state.accept_rate_limiter.try_acquire().err()
+        } else {
+            None
+        };
+        if let Some(wait) = rate_wait {
+            warn!(addr = %peer, wait_ms = wait.as_millis(), "accept rate limit reached, delaying {}ms", wait.as_millis());
+            // Release the semaphore permit before sleeping — the connection
+            // is being delayed, not accepted, so it must not hold a
+            // connection slot while we wait.
+            drop(permit);
+            tokio::time::sleep(wait).await;
+            continue;
+        }
         let state = state.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             // Read CONNECT line + headers (up to 4KB) with 10s timeout
             let mut buf = [0u8; 4096];
             let n = match tokio::time::timeout(
@@ -141,7 +167,9 @@ pub async fn run_tcpmux_listener(
                 None => {
                     // Client disconnected or sent garbage — write failure is
                     // expected and there is no recovery path.
-                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                    if let Err(e) = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await {
+                        tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
+                    }
                     return;
                 }
             };
@@ -156,9 +184,12 @@ pub async fn run_tcpmux_listener(
                     "TCPMux: expected CONNECT, got {} from {}",
                     method, peer
                 );
-                let _ = stream
+                if let Err(e) = stream
                     .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
-                    .await;
+                    .await
+                {
+                    tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
+                }
                 return;
             }
 
@@ -167,7 +198,9 @@ pub async fn run_tcpmux_listener(
                 Some(h) => h.to_string(),
                 None => {
                     warn!(peer = %peer, "TCPMux: no Host header from {}", peer);
-                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                    if let Err(e) = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await {
+                        tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
+                    }
                     return;
                 }
             };
@@ -206,12 +239,15 @@ pub async fn run_tcpmux_listener(
                     })
                     .unwrap_or(false);
                 if !auth_ok {
-                    let _ = stream
+                    if let Err(e) = stream
                         .write_all(
                             b"HTTP/1.1 407 Proxy Authentication Required\r\n\
                           Proxy-Authenticate: Basic realm=\"frp\"\r\n\r\n",
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
+                    }
                     return;
                 }
             }
@@ -264,7 +300,9 @@ pub async fn run_tcpmux_listener(
                     "TCPMux: route for '{}' found but control handler gone",
                     host
                 );
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                if let Err(e) = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await {
+                    tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
+                }
             }
         });
             }

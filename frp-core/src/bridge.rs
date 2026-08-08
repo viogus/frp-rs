@@ -163,7 +163,9 @@ impl<W: AsyncWrite + Unpin> WorkWriter<W> {
     async fn shutdown_bridge(&mut self) -> io::Result<()> {
         match self {
             Self::Plain(w) => {
-                let _ = AsyncWriteExt::flush(w).await;
+                if let Err(e) = AsyncWriteExt::flush(w).await {
+                    tracing::debug!(error = %e, "bridge flush failed (peer disconnected)");
+                }
                 w.shutdown().await
             }
             Self::Encrypted(w) => AsyncWriteExt::shutdown(w).await,
@@ -260,7 +262,9 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
     // When pre_read bytes were forwarded (e.g. VHost), leave writer open
     // so work_to_user can receive the backend response.
     if !had_pre_read {
-        let _ = writer.shutdown_bridge().await;
+        if let Err(e) = writer.shutdown_bridge().await {
+            tracing::debug!(error = %e, "bridge shutdown failed (peer disconnected)");
+        }
     }
 }
 
@@ -297,8 +301,12 @@ async fn bridge_work_to_user(
                         tracing::debug!(
                             "bridge work_to_user: backend response header timeout, writing 504"
                         );
-                        let _ = user_w.write_all(GATEWAY_TIMEOUT_504).await;
-                        let _ = user_w.flush().await;
+                        if let Err(e) = user_w.write_all(GATEWAY_TIMEOUT_504).await {
+                            tracing::debug!(error = %e, "bridge 504 write failed (peer disconnected)");
+                        }
+                        if let Err(e) = user_w.flush().await {
+                            tracing::debug!(error = %e, "bridge flush failed (peer disconnected)");
+                        }
                         break 'read_loop;
                     }
                 }
@@ -416,7 +424,9 @@ async fn bridge_work_to_user(
     }
 
     // Symmetric shutdown: signal EOF to user side
-    let _ = user_w.flush().await;
+    if let Err(e) = user_w.flush().await {
+        tracing::debug!(error = %e, "bridge flush failed (peer disconnected)");
+    }
     if let Err(e) = user_w.shutdown().await {
         tracing::debug!(error = %e, "bridge shutdown: user_w.shutdown failed");
     }
@@ -1076,7 +1086,13 @@ mod tests {
         let out_n = u_r_test.read(&mut out).await.unwrap();
         assert_eq!(&out[..out_n], msg);
 
-        let _ = tokio::join!(u2w, w2u);
+        let (a, b) = tokio::join!(u2w, w2u);
+        if let Err(e) = a {
+            tracing::debug!(error = %e, "user->work relay error");
+        }
+        if let Err(e) = b {
+            tracing::debug!(error = %e, "work->user relay error");
+        }
     }
 
     #[test]

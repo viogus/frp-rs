@@ -66,7 +66,9 @@ struct PluginDef {
     cfg: HttpPluginConfig,
     /// HTTP client honoring the plugin's TLS verify setting
     /// (Go http.go: InsecureSkipVerify: !options.TLSVerify).
-    client: frp_core::http_client::HttpClient,
+    /// `None` when the client could not be built at all — the plugin is then
+    /// skipped on every notify (logged at debug) instead of panicking.
+    client: Option<frp_core::http_client::HttpClient>,
 }
 
 impl HttpPluginManager {
@@ -75,35 +77,37 @@ impl HttpPluginManager {
         // Per-plugin timeout is enforced by tokio::time::timeout below.
         // No client-level timeout — the tokio wrapper covers connect + full
         // request lifecycle and respects per-plugin timeout config.
-        let client = frp_core::http_client::HttpClientBuilder::new()
-            .build()
-            .unwrap_or_else(|e| {
+        let client = match frp_core::http_client::HttpClientBuilder::new().build() {
+            Ok(c) => Some(c),
+            Err(e) => {
                 tracing::error!(
                     "Failed to build default HTTP plugin client: {e}. \
                      HTTP plugin notifications will be unavailable."
                 );
-                // Build a client that will fail every request (no valid TLS).
-                // Using skip-verify here would silently downgrade security.
-                frp_core::http_client::HttpClientBuilder::new()
-                    .build()
-                    .expect("HTTP plugin client retry")
-            });
+                // Degrade instead of panicking: leave the client as None and
+                // skip every plugin notification (logged at debug on notify).
+                None
+            }
+        };
         let plugins = configs
             .into_iter()
             .map(|cfg| {
                 let client = if cfg.url.starts_with("https://") && !cfg.tls_verify {
                     // Go compat: tlsVerify=false → InsecureSkipVerify.
-                    frp_core::http_client::HttpClientBuilder::new()
+                    match frp_core::http_client::HttpClientBuilder::new()
                         .tls_skip_verify(true)
                         .build()
-                        .unwrap_or_else(|e| {
+                    {
+                        Ok(c) => Some(c),
+                        Err(e) => {
                             tracing::warn!(
                                 plugin_name = %cfg.name,
                                 error = %e,
                                 "Failed to build insecure HTTP plugin client, falling back to default"
                             );
                             client.clone()
-                        })
+                        }
+                    }
                 } else {
                     client.clone()
                 };
@@ -179,11 +183,18 @@ impl HttpPluginManager {
                 HeaderValue::from_str(&reqid).map_err(|e| format!("invalid reqid header: {e}"))?,
             );
             headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-            let result = tokio::time::timeout(
-                timeout,
-                plugin.client.post_with_headers(&url, headers, body),
-            )
-            .await;
+            // Client is None (initial build failed): skip this plugin's
+            // notify — it would fail for every request anyway. Never panic.
+            let Some(client) = &plugin.client else {
+                tracing::debug!(
+                    plugin_name = %plugin.cfg.name, op = %op,
+                    "HTTP plugin client unavailable, skipping plugin '{}' for op '{}'",
+                    plugin.cfg.name, op
+                );
+                continue;
+            };
+            let result =
+                tokio::time::timeout(timeout, client.post_with_headers(&url, headers, body)).await;
 
             let resp = match result {
                 Ok(Ok(resp)) => resp,

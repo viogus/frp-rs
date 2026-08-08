@@ -157,10 +157,16 @@ async fn handle_stream(
         }
         if !has_content_length && !end_stream {
             // Stream had an open body: terminate the chunked framing.
-            let _ = remote_w.write_all(b"0\r\n\r\n").await;
+            if let Err(e) = remote_w.write_all(b"0\r\n\r\n").await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
         }
-        let _ = remote_w.flush().await;
-        let _ = remote_w.shutdown().await;
+        if let Err(e) = remote_w.flush().await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
+        if let Err(e) = remote_w.shutdown().await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
     });
 
     // Read the backend's HTTP/1.1 response and re-encode it as h2. Once the

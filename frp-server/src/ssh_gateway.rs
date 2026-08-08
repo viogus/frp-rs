@@ -1923,6 +1923,9 @@ impl SshListener {
 
             // SSH terminal traffic is the canonical small-message workload — disable Nagle.
             frp_core::transport::set_nodelay(&stream);
+            if self.state.tcp_keepalive > 0 {
+                frp_core::transport::set_keepalive(&stream, self.state.tcp_keepalive as u64);
+            }
 
             let state = self.state.clone();
             let server_token = self.server_token.clone();
