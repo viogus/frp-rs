@@ -618,6 +618,12 @@ async fn run_udp_work_conn(
                                     let mut map =
                                         sessions.lock().unwrap_or_else(|e| e.into_inner());
                                     match map.get(&remote) {
+                                        // Defensive: unreachable today (the
+                                        // reader is the sole sessions inserter
+                                        // and held the lock across the bind
+                                        // gap), but if a future concurrent
+                                        // inserter is added, reuse its socket
+                                        // rather than silently re-create.
                                         Some(entry) => (
                                             reader_socks
                                                 .get(&remote)

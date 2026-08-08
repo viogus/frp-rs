@@ -653,9 +653,15 @@ impl Service {
             // Read guard over the config instead of cloning the whole
             // ClientConfig (all proxies/visitors/strings) per connection
             // attempt. Field reads go through the guard's Deref; the guard
-            // is dropped just before the message loop (a reload there must
-            // take the write lock), so only the fields the loop needs are
-            // copied out first (see wc_* hoists and cfg_user below).
+            // The guard is held through ctl.login().await and (on failure)
+            // the backoff sleep — 800+ lines and several await points below.
+            // This is safe because every cfg writer (try_reload / do_reload)
+            // runs in the same task and the message loop's reload arm polls
+            // internal_rx, not a blocking lock. An early drop before the
+            // backoff sleep would be cleaner but is not reachable without
+            // cloning: the guard is needed again below (v2, client_scopes,
+            // transport locals, ping interval, heartbeat timeout, cfg_user)
+            // after a successful login. The trade-off is accepted.
             let cfg_local = self.cfg.read().await;
             let all_proxies = Arc::clone(&*self.proxies.read().await);
             let proxies = filter_active_proxies(&cfg_local, &all_proxies);
