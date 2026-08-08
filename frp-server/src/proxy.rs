@@ -163,6 +163,74 @@ impl ProxyManager {
         self.proxies.read().await.get(name).cloned()
     }
 
+    /// Hot-update server-side runtime settings for a live proxy without
+    /// re-registering it or reloading the frpc side.
+    ///
+    /// Only bandwidth limits are server-side hot-applicable in frp-rs: they
+    /// are read by the bridge path on every newly established connection, so
+    /// an update takes effect for subsequent work-conns. Fields that depend
+    /// on the frpc-side provider (local_addr, remote_port, custom_domains,
+    /// use_encryption, ...) are deliberately NOT changed here — callers must
+    /// reject those with a "requires frpc reload" error.
+    ///
+    /// Implementation: the stored `Arc<ProxyInfo>` is swapped for a
+    /// cloned-and-modified one under the registry write lock. New work-conn
+    /// requests that re-fetch the proxy from this manager observe the new
+    /// settings; bridges already in flight keep their original limits.
+    ///
+    /// Returns Err if no proxy with `name` is registered.
+    pub async fn update_runtime(
+        &self,
+        name: &str,
+        bandwidth_limit: Option<String>,
+        bandwidth_limit_mode: Option<String>,
+    ) -> Result<(), String> {
+        // Validate before taking the lock: a rejected update must never
+        // observe a partially-applied state, and the write lock is held for
+        // as short a time as possible.
+        if let Some(bl) = &bandwidth_limit {
+            if !bl.is_empty() && frp_core::config::parse_bandwidth_limit(bl).is_none() {
+                return Err(format!(
+                    "invalid bandwidthLimit '{bl}' (e.g. 1MB, 2KB, 1GB)"
+                ));
+            }
+        }
+        if let Some(m) = &bandwidth_limit_mode {
+            if !matches!(m.as_str(), "server" | "client" | "") {
+                return Err(
+                    "bandwidthLimitMode must be one of server, client, or empty".to_string()
+                );
+            }
+        }
+        let mut proxies = self.proxies.write().await;
+        let current = proxies
+            .get(name)
+            .ok_or_else(|| format!("proxy '{name}' not found"))?;
+        let mut updated = (**current).clone();
+        // Read-modify-write is atomic inside the lock: `None` keeps the
+        // current value, so concurrent PUTs updating disjoint fields do not
+        // clobber each other.
+        if let Some(v) = bandwidth_limit {
+            updated.bandwidth_limit = v;
+        }
+        if let Some(v) = bandwidth_limit_mode {
+            updated.bandwidth_limit_mode = v;
+        }
+        let updated = Arc::new(updated);
+        proxies.insert(name.to_string(), updated.clone());
+        // Keep the by_client index (run_id → name → info) in sync so
+        // list_client / per-client iteration see the same updated record.
+        // Use entry().or_default() like register() so a missing run_id key
+        // (teardown race) cannot silently drop the sync.
+        self.by_client
+            .write()
+            .await
+            .entry(updated.run_id.clone())
+            .or_default()
+            .insert(name.to_string(), updated);
+        Ok(())
+    }
+
     /// Remove a proxy, returning `true` if it was actually present and removed.
     ///
     /// Callers that maintain derived counters (e.g. the SNI-sniff gate

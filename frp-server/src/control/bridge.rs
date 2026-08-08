@@ -571,7 +571,15 @@ async fn run_work_bridge(
     // deadlock is now fixed by eager IV flush in CipherWriter::poll_flush.
     // Go frpc v0.69.1 ignores swc.use_encryption (not in its struct) and
     // uses its own proxy config, so the server MUST match.
-    let use_enc = req.use_encryption;
+    //
+    // SUDP exception: the SUDP data plane is plaintext UDPPacket v1 frames
+    // (both frpc sides force plaintext — see frp-client work_conn.rs/service.rs;
+    // the per-packet transform model is not yet unified with Go's stream
+    // encryption). Wrapping the bridge in a CipherStream here would make the
+    // provider read raw ciphertext as a V1 frame header → "invalid V1 msg
+    // length" and a broken tunnel. Force a plain bridge to match.
+    let is_sudp = proxy_info.as_ref().is_some_and(|p| p.proxy_type == "sudp");
+    let use_enc = req.use_encryption && !is_sudp;
 
     // Create bandwidth limiters per direction.
     // Go frp dev compat: server-side bandwidth limiter only for "server" mode.
@@ -669,7 +677,11 @@ async fn run_work_bridge(
         // can coordinate: write pre_read first, then skip work_w shutdown
         // to let the backend response flow back to the user.
         let bridge_pre_read = req.pre_read;
-        let comp_key = req.use_compression;
+        // SUDP: compression is also forced off — bridge_plain wraps the
+        // stream in Snappy when comp_key is set, which the provider's
+        // plaintext read_msg_v1 would misread as a V1 frame header
+        // (sNaPpY magic → "invalid V1 msg length"). Match the provider.
+        let comp_key = req.use_compression && !is_sudp;
 
         // XTCP STCP fallback (plain, no encryption): use copy_bidirectional
         // directly instead of bridge_plain. bridge_plain's join! pattern

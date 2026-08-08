@@ -68,6 +68,9 @@ fn build_auth_config(
         oidc_skip_expiry: auth.oidc_skip_expiry,
         oidc_skip_issuer: auth.oidc_skip_issuer,
         oidc_skip_nbf: auth.oidc_skip_nbf,
+        oidc_skip_audience: auth.oidc_skip_audience,
+        oidc_additional_audience: auth.oidc_additional_audience.clone(),
+        oidc_tls_trusted_ca_file: auth.oidc_tls_trusted_ca_file.clone(),
         additional_data: None,
         oidc_proxy_url: auth.oidc_proxy_url.clone(),
         additional_auth_scopes: auth.additional_auth_scopes.clone(),
@@ -161,6 +164,9 @@ impl Service {
                 auth_cfg.oidc_skip_expiry,
                 auth_cfg.oidc_skip_issuer,
                 auth_cfg.oidc_skip_nbf,
+                auth_cfg.oidc_skip_audience,
+                auth_cfg.oidc_additional_audience.clone(),
+                Some(auth_cfg.oidc_tls_trusted_ca_file.clone()).filter(|s| !s.is_empty()),
                 Some(auth_cfg.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
             )
             .await
@@ -1758,6 +1764,9 @@ impl Service {
             || self.cfg.auth.oidc_audience != new_cfg.auth.oidc_audience
             || self.cfg.auth.oidc_skip_expiry != new_cfg.auth.oidc_skip_expiry
             || self.cfg.auth.oidc_skip_issuer != new_cfg.auth.oidc_skip_issuer
+            || self.cfg.auth.oidc_skip_audience != new_cfg.auth.oidc_skip_audience
+            || self.cfg.auth.oidc_additional_audience != new_cfg.auth.oidc_additional_audience
+            || self.cfg.auth.oidc_tls_trusted_ca_file != new_cfg.auth.oidc_tls_trusted_ca_file
         {
             changes.push("OIDC settings changed (restart required)".to_string());
         }

@@ -495,6 +495,21 @@ pub struct AuthServerConfig {
     pub oidc_skip_issuer: bool,
     #[serde(default, alias = "oidcSkipNbf")]
     pub oidc_skip_nbf: bool,
+    /// Skip audience ("aud" claim) validation on OIDC tokens entirely.
+    /// Go frp compat: oidc_skip_audience (when the audience is empty, Go
+    /// skips client-ID verification).
+    #[serde(default, alias = "oidcSkipAudience")]
+    pub oidc_skip_audience: bool,
+    /// Additional accepted audiences for OIDC tokens, in addition to
+    /// `oidc_audience`. A token is accepted when its "aud" claim matches
+    /// `oidc_audience` OR any entry of this list.
+    #[serde(default, alias = "oidcAdditionalAudience")]
+    pub oidc_additional_audience: Vec<String>,
+    /// Path to a custom CA certificate PEM file used to verify the OIDC
+    /// provider's TLS certificate (for openid-configuration / JWKS fetches).
+    /// Extends the default root store with the file's certificates.
+    #[serde(default, alias = "oidcTLSTrustedCAFile")]
+    pub oidc_tls_trusted_ca_file: String,
     /// HTTP/SOCKS5 proxy URL for OIDC HTTP client connections.
     /// Go frp compat: oidcProxyURL.
     #[serde(default, alias = "oidcProxyURL")]
@@ -541,6 +556,9 @@ impl Default for AuthServerConfig {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             oidc_skip_nbf: false,
+            oidc_skip_audience: false,
+            oidc_additional_audience: Vec::new(),
+            oidc_tls_trusted_ca_file: String::new(),
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 0,
@@ -560,6 +578,10 @@ pub struct LogConfig {
     pub file: String,
     #[serde(default = "default_max_days", alias = "maxDays")]
     pub max_days: i32,
+    /// Log output format: "text" or "json" (any other value falls back to
+    /// "text"). Go frp `log.format` compat.
+    #[serde(default = "default_log_format")]
+    pub format: String,
     #[serde(default, alias = "disablePrintColor")]
     pub disable_print_color: bool,
 }
@@ -570,6 +592,7 @@ impl Default for LogConfig {
             level: default_log_level(),
             file: default_log_file(),
             max_days: default_max_days(),
+            format: default_log_format(),
             disable_print_color: false,
         }
     }
@@ -584,6 +607,10 @@ fn default_log_file() -> String {
 
 fn default_max_days() -> i32 {
     3
+}
+
+fn default_log_format() -> String {
+    "text".into()
 }
 
 /// OpenTelemetry / observability configuration.

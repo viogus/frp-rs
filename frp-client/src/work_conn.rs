@@ -658,10 +658,18 @@ async fn run_udp_work_conn(
                             }
                             debug!(proxy_name = %pn_r, byte_count = final_payload.len(),
                                 "UDP reader '{}': forwarding {} bytes to local", pn_r, final_payload.len());
-                            if let Err(e) = sock.send_to(&final_payload, local_addr).await {
-                                debug!(proxy_name = %pn_r, error = %e,
-                                    "UDP '{}' send to local failed: {}", pn_r, e);
-                                break;
+                            // The session socket is connect()ed to local_addr,
+                            // so use send() — send_to() on a connected socket
+                            // returns EISCONN on macOS/BSD after the first
+                            // packet (platform divergence; Linux allows it).
+                            // A failure here (e.g. ECONNREFUSED while the
+                            // local service restarts) drops the packet but
+                            // must NOT tear down the whole work conn —
+                            // Go frp logs and skips (per-remote model means
+                            // other remotes and future packets still work).
+                            if let Err(e) = sock.send(&final_payload).await {
+                                debug!(proxy_name = %pn_r, error = %e, local = %local_addr,
+                                    "UDP '{}' send to local failed, dropping packet: {}", pn_r, e);
                             }
                         }
                         Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => continue,
@@ -1352,15 +1360,23 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     return;
                 }
 
-                if info.proxy_type == "udp" {
-                    // UDP proxy: bridge work conn ↔ local UDP service. Each
-                    // distinct remote visitor gets its own ephemeral local
-                    // socket inside run_udp_work_conn (Go frp per-remote
-                    // semantics), so no session-scoped shared socket is
-                    // needed here — reload changes to local_addr/encryption
-                    // apply naturally on the next work conn.
-                    let use_enc = info.use_encryption;
-                    let use_comp = info.use_compression;
+                if info.proxy_type == "udp" || info.proxy_type == "sudp" {
+                    // UDP/SUDP proxy: bridge work conn ↔ local UDP service.
+                    // Each distinct remote visitor gets its own ephemeral
+                    // local socket inside run_udp_work_conn (Go frp
+                    // per-remote semantics), so no session-scoped shared
+                    // socket is needed here — reload changes to
+                    // local_addr/encryption apply naturally on the next
+                    // work conn.
+                    let is_sudp = info.proxy_type == "sudp";
+                    // SUDP data plane is FIXED plaintext (not a removable
+                    // hack): the SUDP per-packet transform model is not
+                    // unified with Go's stream-level encryption, so both
+                    // frpc sides and the server bridge force plaintext —
+                    // visitor declaration (visitor.rs), provider use_enc
+                    // here, and the server bridge (bridge.rs) all agree.
+                    let use_enc = info.use_encryption && !is_sudp;
+                    let use_comp = info.use_compression && !is_sudp;
 
                     info!(label = %label, proxy_name = %proxy_name, use_enc = %use_enc, use_comp = %use_comp,
                         "Work conn {} bridging UDP for '{}' (enc={}, comp={})",

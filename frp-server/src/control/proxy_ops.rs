@@ -251,8 +251,9 @@ async fn build_proxy_info(
 /// Returns whether an index entry was inserted.
 #[inline(never)]
 async fn register_sk_index(state: &Arc<AppState>, np: &msg::NewProxy) -> bool {
-    let needs_sk_index = (np.proxy_type == "stcp" || np.proxy_type == "xtcp")
-        && np.sk.as_deref().filter(|s| !s.is_empty()).is_some();
+    let needs_sk_index =
+        (np.proxy_type == "stcp" || np.proxy_type == "xtcp" || np.proxy_type == "sudp")
+            && np.sk.as_deref().filter(|s| !s.is_empty()).is_some();
     if needs_sk_index {
         let raw = np.sk.clone().unwrap_or_default();
         let vn = np.virtual_net.as_deref().unwrap_or("");
@@ -262,7 +263,7 @@ async fn register_sk_index(state: &Arc<AppState>, np: &msg::NewProxy) -> bool {
             .write()
             .await
             .insert(np.proxy_name.clone(), raw);
-        info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP sk_index registered for '{}'{}",
+        info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP/SUDP sk_index registered for '{}'{}",
             np.proxy_name,
             if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
     }
@@ -287,9 +288,35 @@ async fn rollback_port_allocation(
     // For UDP proxies, also clean up used_udp_ports. The port
     // was allocated from the TCP set by the TCP group path
     // (TCP group proxies are always TCP, not UDP).
-    if is_udp_type {
+    // SUDP proxies share one server port across run_ids: only release the
+    // UDP-port mark if no OTHER live udp/sudp proxy still occupies it.
+    // Exclude nothing here: this rollback runs after a *failed* register,
+    // so we are not in the registry — and if the failure was a same-name
+    // conflict, the live proxy holding the port must count as an owner.
+    if is_udp_type
+        && !udp_port_has_other_owner(state, port, &std::collections::HashSet::new()).await
+    {
         state.used_udp_ports.write().await.remove(&port);
     }
+}
+
+/// True if a live UDP/SUDP proxy not in `exclude` still holds `port`.
+///
+/// SUDP proxies can share a single server UDP port (the frp-rs shared-port
+/// extension) across proxies and run_ids, so UDP-port bookkeeping must not
+/// be torn down while another owner remains. `exclude` is the set of names
+/// being removed *by this caller*: during teardown the proxies being
+/// deleted are still in the registry, so they must not count as owners.
+async fn udp_port_has_other_owner(
+    state: &Arc<AppState>,
+    port: u16,
+    exclude: &std::collections::HashSet<String>,
+) -> bool {
+    state.proxy_manager.list().await.into_iter().any(|info| {
+        info.remote_port == Some(port)
+            && (info.proxy_type == "udp" || info.proxy_type == "sudp")
+            && !exclude.contains(&info.name)
+    })
 }
 
 /// Roll back a vhost route conflict: release the port and decrement the
@@ -599,8 +626,8 @@ async fn setup_proxy_listeners(
         let bind_result = UdpSocket::bind(&addr).await;
         // For SUDP with an already-bound shared port, bind may fail with
         // EADDRINUSE — that's expected, reuse existing socket for this port.
-        let socket = match bind_result {
-            Ok(s) => std::sync::Arc::new(s),
+        let socket: Option<std::sync::Arc<UdpSocket>> = match bind_result {
+            Ok(s) => Some(std::sync::Arc::new(s)),
             Err(e) if is_sudp => {
                 // Try to find an existing socket on this port
                 let found = udp_sockets.iter().find_map(|(_, sock)| {
@@ -612,26 +639,19 @@ async fn setup_proxy_listeners(
                 match found {
                     Some(sock) => {
                         info!(proxy_name = %np.proxy_name, port = %port, "SUDP proxy '{}' sharing port {} (reusing existing socket)", np.proxy_name, port);
-                        sock
+                        Some(sock)
                     }
                     None => {
-                        tracing::error!(port = %port, error = %e, "SUDP port {} bind failed (no existing socket to share): {}", port, e);
-                        // Roll back port tracking: remove from used_udp_ports
-                        // (safe even if port was pre-existing — the bind failure
-                        // means it's unusable).
-                        rollback_udp_bind_failure(state, run_id, port, &np.proxy_name).await;
-                        reject_new_proxy(
-                            writer,
-                            &np.proxy_name,
-                            err_msg(
-                                state.detailed_errors_to_client,
-                                format!("SUDP bind failed: {e}"),
-                                "SUDP bind failed",
-                            ),
-                            v2,
-                        )
-                        .await;
-                        return Err(());
+                        // Go frp v0.70.1 has NO server-side UDP port for SUDP
+                        // (visitor model only); the shared server port is a
+                        // frp-rs extension. A bind failure (e.g. privileged
+                        // port scan colliding with another proxy) must NOT
+                        // fail registration — the visitor tunnel still works.
+                        // Log and continue without a server socket.
+                        warn!(proxy_name = %np.proxy_name, port = %port, error = %e,
+                            "SUDP proxy '{}': shared server port {} unavailable; registering visitor-only (Go frp semantics)",
+                            np.proxy_name, port);
+                        None
                     }
                 }
             }
@@ -652,17 +672,21 @@ async fn setup_proxy_listeners(
                 return Err(());
             }
         };
-        udp_sockets.insert(np.proxy_name.clone(), socket);
-        // For SUDP sharing existing socket, don't spawn duplicate listener
-        let should_spawn = !is_sudp
-            || !udp_sockets.iter().any(|(n, _)| {
-                n != &np.proxy_name && {
-                    udp_sockets
-                        .get(n)
-                        .and_then(|s| s.local_addr().ok())
-                        .is_some_and(|a| a.port() == port)
-                }
-            });
+        if let Some(ref socket) = socket {
+            udp_sockets.insert(np.proxy_name.clone(), socket.clone());
+        }
+        // For SUDP sharing existing socket, don't spawn duplicate listener.
+        // Also skip when the shared port could not be bound (visitor-only).
+        let should_spawn = socket.is_some()
+            && (!is_sudp
+                || !udp_sockets.iter().any(|(n, _)| {
+                    n != &np.proxy_name && {
+                        udp_sockets
+                            .get(n)
+                            .and_then(|s| s.local_addr().ok())
+                            .is_some_and(|a| a.port() == port)
+                    }
+                }));
         if should_spawn {
             // Go frp v0.69.1 compat: UDP data flows over work connections,
             // not the control connection. Request a work conn from the client.
@@ -685,7 +709,16 @@ async fn setup_proxy_listeners(
                     .await;
             });
         }
-        info!(is_sudp = %is_sudp, proxy_name = %np.proxy_name, port = %port, "{} proxy '{}' listening on port {}", if is_sudp { "SUDP" } else { "UDP" }, np.proxy_name, port);
+        if socket.is_none() {
+            // Shared server port could not be bound — visitor-only SUDP
+            // (Go frp semantics). The proxy is fully registered; only the
+            // frp-rs shared-port extension is unavailable.
+            info!(is_sudp = %is_sudp, proxy_name = %np.proxy_name, port = %port,
+                "SUDP proxy '{}' registered (visitor-only, no shared server port {})",
+                np.proxy_name, port);
+        } else {
+            info!(is_sudp = %is_sudp, proxy_name = %np.proxy_name, port = %port, "{} proxy '{}' listening on port {}", if is_sudp { "SUDP" } else { "UDP" }, np.proxy_name, port);
+        }
     } else if is_nat_hole {
         info!(proxy_type = %np.proxy_type, proxy_name = %np.proxy_name, "{} proxy '{}' registered (no listener, NAT hole punch)", np.proxy_type, np.proxy_name);
     } else if tcp_group_created {
@@ -1185,39 +1218,44 @@ pub(crate) async fn unregister_control(
     }
     drop(ports);
     // UDP port cleanup (Go frp compat: separate port manager for UDP)
+    // SUDP proxies can share one server port across run_ids: a port is
+    // released only when no OTHER live udp/sudp proxy still occupies it.
+    // Query the registry BEFORE taking the UDP-port lock (avoids awaiting a
+    // different lock while holding it).
+    // The whole batch being removed counts as "not owners": the proxies are
+    // still in the registry during teardown, so same-batch SUDP proxies
+    // sharing one port must not be treated as live owners of each other.
+    let removing: std::collections::HashSet<String> =
+        proxies.iter().map(|p| p.name.clone()).collect();
+    let mut udp_port_shared: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+    for p in &proxies {
+        if p.proxy_type == "sudp" {
+            if let Some(port) = p.remote_port {
+                udp_port_shared.insert(
+                    p.name.clone(),
+                    udp_port_has_other_owner(state, port, &removing).await,
+                );
+            }
+        }
+    }
     let mut udp_ports = state.used_udp_ports.write().await;
     for p in &proxies {
         if let Some(port) = p.remote_port {
             if p.proxy_type == "udp" || p.proxy_type == "sudp" {
-                // For SUDP, only release the port if no other SUDP proxy uses it
-                if p.proxy_type == "sudp" {
-                    let count = proxies
-                        .iter()
-                        .filter(|op| {
-                            op.proxy_type == "sudp"
-                                && op.remote_port == Some(port)
-                                && op.name != p.name
-                        })
-                        .count();
-                    if count == 0 {
-                        udp_ports.remove(&port);
-                        if port > 0 {
-                            state
-                                .port_reservations
-                                .write()
-                                .await
-                                .insert(p.name.clone(), (port, true, std::time::Instant::now()));
-                        }
-                    }
-                } else {
-                    udp_ports.remove(&port);
-                    if port > 0 {
-                        state
-                            .port_reservations
-                            .write()
-                            .await
-                            .insert(p.name.clone(), (port, true, std::time::Instant::now()));
-                    }
+                // For SUDP, only release the port if no other live proxy
+                // (any run_id) still shares it.
+                if p.proxy_type == "sudp" && udp_port_shared.get(&p.name).copied().unwrap_or(false)
+                {
+                    continue;
+                }
+                udp_ports.remove(&port);
+                if port > 0 {
+                    state
+                        .port_reservations
+                        .write()
+                        .await
+                        .insert(p.name.clone(), (port, true, std::time::Instant::now()));
                 }
             }
         }

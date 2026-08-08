@@ -974,16 +974,21 @@ async fn add_security_headers(req: axum::extract::Request, next: Next) -> axum::
 //   GET  /api/v2/proxies
 //   GET  /api/v2/proxies/{name}
 //   GET  /api/v2/proxies/{name}/traffic
+//   GET  /api/v2/config                (audit-specified; not in Go frp)
+//   PUT  /api/v2/proxy/{name}/update   (audit-specified; not in Go frp)
 //
 // Field names, pagination, filtering, sorting and prune semantics follow
 // Go frp v0.70.0 `server/http/controller_v2.go` + `server/http/model/v2.go`.
+// The `/api/v2/config` and `/api/v2/proxy/{name}/update` endpoints do NOT
+// exist in Go frp (v0.70.0 or dev); they follow audit-specified paths and
+// reuse the Go V2 response shapes — see the handler doc comments.
 //
 // NOTE: a pre-existing `dashboard_v2.rs` module carried an earlier, less
 // accurate v2 implementation; it was removed in the same commit that added
 // this in-place module. This module is the authoritative v2 implementation.
 mod v2 {
     use super::*;
-    use axum::routing::post;
+    use axum::routing::{post, put};
     use std::time::SystemTime;
 
     const DEFAULT_PAGE: u32 = 1;
@@ -1006,7 +1011,7 @@ mod v2 {
         items: Vec<T>,
     }
 
-    #[derive(Serialize)]
+    #[derive(Serialize, Debug)]
     struct V2Error {
         error: String,
     }
@@ -1076,6 +1081,63 @@ mod v2 {
         prune_type: String,
         cleared: usize,
         total: usize,
+    }
+
+    /// Sanitized server configuration for `GET /api/v2/config`.
+    ///
+    /// NOTE: Go frp v0.70.0 (and dev) have no `/api/v2/config` endpoint —
+    /// verified against `server/api_router.go`. This shape follows the
+    /// audit-specified fields using Go v1 config camelCase JSON names. Secret
+    /// material (auth token, dashboard password) is deliberately excluded.
+    ///
+    /// Data-source limits in frp-rs: the `AppState` keeps a
+    /// `ServerConfigSnapshot` plus the runtime dashboard settings, but does
+    /// not retain the full `ServerConfig` (bind_addr, auth sub-options,
+    /// log config). Fields with no source are omitted and documented here.
+    #[derive(Serialize)]
+    struct ConfigResp {
+        version: String,
+        /// frp-rs proxy/listen bind address (`proxyBindAddr`, falls back to
+        /// `bind_addr` at startup); the raw `bind_addr` is not retained in
+        /// AppState.
+        #[serde(rename = "bindAddr")]
+        bind_addr: String,
+        #[serde(rename = "bindPort")]
+        bind_port: u16,
+        #[serde(rename = "vhostHTTPPort")]
+        vhost_http_port: u16,
+        #[serde(rename = "vhostHTTPSPort")]
+        vhost_https_port: u16,
+        #[serde(rename = "subdomainHost")]
+        subdomain_host: String,
+        #[serde(rename = "maxPortsPerClient")]
+        max_ports_per_client: i64,
+        #[serde(rename = "heartbeatTimeout")]
+        heartbeat_timeout: i64,
+        #[serde(rename = "allowPortsStr")]
+        allow_ports_str: String,
+        #[serde(rename = "tlsForce")]
+        tls_force: bool,
+        dashboard: DashboardConfigResp,
+        /// Auth method only — the token/credentials are never returned.
+        auth: AuthConfigResp,
+    }
+
+    /// Go `model.V2SystemInfoConfigResp`-style dashboard section (sanitized:
+    /// password omitted).
+    #[derive(Serialize)]
+    struct DashboardConfigResp {
+        addr: String,
+        port: u16,
+        user: String,
+        #[serde(rename = "enablePrometheus")]
+        enable_prometheus: bool,
+    }
+
+    /// Sanitized auth section: only the method name is exposed.
+    #[derive(Serialize)]
+    struct AuthConfigResp {
+        method: String,
     }
 
     /// Go `model.V2UserResp`.
@@ -1355,6 +1417,37 @@ mod v2 {
         prune_type: Option<String>,
     }
 
+    /// Request body for `PUT /api/v2/proxy/{name}/update`.
+    ///
+    /// Only the server-side hot-applicable fields are honoured
+    /// (`bandwidthLimit` / `bandwidthLimitMode`). The remaining fields are
+    /// declared so that supplying them yields an explicit 400 ("requires frpc
+    /// reload") instead of being silently ignored.
+    #[derive(Deserialize, Default)]
+    struct UpdateProxyRequest {
+        /// Bandwidth limit (Go frp format, e.g. "1MB"). Hot-applied: enforced
+        /// on subsequently established bridges.
+        #[serde(rename = "bandwidthLimit")]
+        bandwidth_limit: Option<String>,
+        /// "server", "client" or "". Only "server" makes the server enforce
+        /// the limit (Go frp semantics).
+        #[serde(rename = "bandwidthLimitMode")]
+        bandwidth_limit_mode: Option<String>,
+        // ── Provider-dependent fields (rejected with 400) ──
+        #[serde(rename = "localIP")]
+        local_ip: Option<String>,
+        #[serde(rename = "localPort")]
+        local_port: Option<u16>,
+        #[serde(rename = "remotePort")]
+        remote_port: Option<u16>,
+        #[serde(rename = "customDomains")]
+        custom_domains: Option<Vec<String>>,
+        #[serde(rename = "useEncryption")]
+        use_encryption: Option<bool>,
+        #[serde(rename = "useCompression")]
+        use_compression: Option<bool>,
+    }
+
     // ── Pagination / filtering helpers ──
 
     /// Go `parseV2PageParams` / `parseV2PositiveInt`.
@@ -1610,6 +1703,133 @@ mod v2 {
     }
 
     // ── Handlers ──
+
+    /// GET /api/v2/config — sanitized server configuration.
+    ///
+    /// No secrets are returned: the auth section carries only the method name
+    /// and the dashboard section omits the password.
+    async fn handle_v2_config(
+        State(state): State<Arc<AppState>>,
+        dashboard_addr: String,
+        auth_user: String,
+        enable_prometheus: bool,
+    ) -> Json<ConfigResp> {
+        let snap = &state.server_config_snapshot;
+        // std::sync::RwLock (poison-tolerant read) — no await needed.
+        let method = state
+            .reloadable
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .auth_cfg
+            .method
+            .clone();
+        let method = match method {
+            frp_core::auth::AuthMethod::Token => "token",
+            #[cfg(feature = "oidc")]
+            frp_core::auth::AuthMethod::Oidc => "oidc",
+        }
+        .to_string();
+
+        let (dash_addr, dash_port) = dashboard_addr
+            .rsplit_once(':')
+            .map(|(a, p)| (a.to_string(), p.parse().unwrap_or(0)))
+            .unwrap_or_else(|| (dashboard_addr.clone(), 0));
+
+        Json(ConfigResp {
+            version: frp_core::VERSION.to_string(),
+            bind_addr: state.proxy_bind_addr.clone(),
+            bind_port: snap.bind_port,
+            vhost_http_port: snap.vhost_http_port,
+            vhost_https_port: snap.vhost_https_port,
+            subdomain_host: snap.subdomain_host.clone(),
+            max_ports_per_client: snap.max_ports_per_client,
+            heartbeat_timeout: snap.heartbeat_timeout,
+            allow_ports_str: snap.allow_ports_str.clone(),
+            tls_force: snap.tls_force,
+            dashboard: DashboardConfigResp {
+                addr: dash_addr,
+                port: dash_port,
+                user: auth_user,
+                enable_prometheus,
+            },
+            auth: AuthConfigResp { method },
+        })
+    }
+
+    /// PUT /api/v2/proxy/{name}/update — hot-update a live proxy's
+    /// server-side runtime settings.
+    ///
+    /// Path note: Go frp v0.70.0 (and dev) have NO proxy-update endpoint —
+    /// verified against `server/api_router.go`, whose v2 proxy routes use the
+    /// plural `/api/v2/proxies/{name}`. This handler follows the
+    /// audit-specified path `/api/v2/proxy/{name}/update` (singular `proxy`,
+    /// PUT) and returns the updated proxy detail in the Go `V2ProxyResp`
+    /// shape. Route ambiguity between `/api/v2/proxies` (plural) and this
+    /// route is avoided because the update path is a distinct suffix.
+    ///
+    /// Semantics: only server-side hot-applicable fields are honoured
+    /// (bandwidth limits, enforced on subsequently established bridges).
+    /// Fields that depend on the frpc-side provider (local_ip/local_port,
+    /// remote_port, custom_domains, use_encryption/use_compression) are
+    /// rejected with 400 and an explanation that an frpc config change +
+    /// reload is required.
+    async fn handle_proxy_update(
+        State(state): State<Arc<AppState>>,
+        Path(name): Path<String>,
+        Json(req): Json<UpdateProxyRequest>,
+    ) -> Result<Json<ProxyResp>, (StatusCode, Json<V2Error>)> {
+        let name = percent_decode_path(&name)?;
+
+        let provider_field = req.local_ip.is_some()
+            || req.local_port.is_some()
+            || req.remote_port.is_some()
+            || req.custom_domains.is_some()
+            || req.use_encryption.is_some()
+            || req.use_compression.is_some();
+        // Note: provider-field and empty-body checks run BEFORE the 404
+        // pre-check below, so an update against an unknown proxy with
+        // provider fields yields 400 (shape error) rather than 404 — a
+        // deliberate asymmetry from the bandwidth-validation path.
+        if provider_field {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "localIP/localPort/remotePort/customDomains/useEncryption/useCompression \
+                 depend on the frpc-side provider and cannot be hot-applied on the server; \
+                 update the frpc config and reload instead",
+            ));
+        }
+        if req.bandwidth_limit.is_none() && req.bandwidth_limit_mode.is_none() {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "no updatable fields provided (supported: bandwidthLimit, bandwidthLimitMode)",
+            ));
+        }
+
+        // 404 on unknown proxy first, so a validation error from
+        // update_runtime (400) is never masked as not-found.
+        if state.proxy_manager.get(&name).await.is_none() {
+            return Err(err(StatusCode::NOT_FOUND, "no proxy info found"));
+        }
+        // Pass the raw Options straight through: update_runtime fills the
+        // gaps from the current record inside its write lock, making the
+        // read-modify-write atomic across concurrent PUTs.
+        state
+            .proxy_manager
+            .update_runtime(
+                &name,
+                req.bandwidth_limit.clone(),
+                req.bandwidth_limit_mode.clone(),
+            )
+            .await
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+
+        let updated = state
+            .proxy_manager
+            .get(&name)
+            .await
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "no proxy info found"))?;
+        Ok(Json(build_proxy_resp(&state, &updated).await))
+    }
 
     /// GET /api/v2/system/info — Go `APIV2SystemInfo`.
     async fn handle_system_info(State(state): State<Arc<AppState>>) -> Json<SystemInfoResp> {
@@ -1924,6 +2144,36 @@ mod v2 {
         Ok(Json(paginate(items, page, size)))
     }
 
+    /// Go `buildV2ProxyResp` — build the detail response for a proxy.
+    async fn build_proxy_resp(state: &Arc<AppState>, p: &crate::proxy::ProxyInfo) -> ProxyResp {
+        let online = state.run_id_to_ctl_tx.read().await.contains_key(&p.run_id);
+        let (today_in, today_out, cur_conns) = state
+            .proxy_metrics
+            .get(&p.name)
+            .await
+            .map(|m| {
+                let s = m.snapshot();
+                let (tin, tout) = m.daily.snapshot();
+                (tin[0], tout[0], s.current_conns)
+            })
+            .unwrap_or((0, 0, 0));
+
+        ProxyResp {
+            name: p.name.clone(),
+            user: p.user.clone(),
+            client_id: resolved_client_id(state, &p.run_id),
+            spec: proxy_spec(p),
+            status: ProxyStatus {
+                phase: if online { "online" } else { "offline" }.into(),
+                today_traffic_in: today_in,
+                today_traffic_out: today_out,
+                cur_conns,
+                last_start_at: 0,
+                last_close_at: 0,
+            },
+        }
+    }
+
     /// GET /api/v2/proxies/{name} — Go `APIV2ProxyDetail`.
     async fn handle_proxy_detail(
         State(state): State<Arc<AppState>>,
@@ -1937,32 +2187,7 @@ mod v2 {
             .await
             .ok_or_else(|| err(StatusCode::NOT_FOUND, "no proxy info found"))?;
 
-        let online = state.run_id_to_ctl_tx.read().await.contains_key(&p.run_id);
-        let (today_in, today_out, cur_conns) = state
-            .proxy_metrics
-            .get(&p.name)
-            .await
-            .map(|m| {
-                let s = m.snapshot();
-                let (tin, tout) = m.daily.snapshot();
-                (tin[0], tout[0], s.current_conns)
-            })
-            .unwrap_or((0, 0, 0));
-
-        Ok(Json(ProxyResp {
-            name: p.name.clone(),
-            user: p.user.clone(),
-            client_id: resolved_client_id(&state, &p.run_id),
-            spec: proxy_spec(&p),
-            status: ProxyStatus {
-                phase: if online { "online" } else { "offline" }.into(),
-                today_traffic_in: today_in,
-                today_traffic_out: today_out,
-                cur_conns,
-                last_start_at: 0,
-                last_close_at: 0,
-            },
-        }))
+        Ok(Json(build_proxy_resp(&state, &p).await))
     }
 
     /// GET /api/v2/proxies/{name}/traffic — Go `APIV2ProxyTraffic`.
@@ -2050,8 +2275,24 @@ mod v2 {
 
     // ── Route registration ──
 
-    /// Register v2 API routes (Go frp v0.70.0 compat).
-    pub(super) fn v2_routes() -> Router<Arc<AppState>> {
+    /// Register v2 API routes (Go frp v0.70.0 compat + audit-specified
+    /// `/api/v2/config` and `/api/v2/proxy/{name}/update`).
+    ///
+    /// `dashboard_addr` / `auth_user` are the configured `[webServer]`
+    /// listen address and user, injected into `GET /api/v2/config` (they are
+    /// not stored in `AppState`).
+    pub(super) fn v2_routes(
+        dashboard_addr: String,
+        auth_user: String,
+        enable_prometheus: bool,
+    ) -> Router<Arc<AppState>> {
+        let config_handler = {
+            let addr = dashboard_addr.clone();
+            let user = auth_user.clone();
+            move |State(state): State<Arc<AppState>>| {
+                handle_v2_config(State(state), addr.clone(), user.clone(), enable_prometheus)
+            }
+        };
         Router::new()
             .route("/api/v2/system/info", get(handle_system_info))
             .route("/api/v2/system/prune", post(handle_system_prune))
@@ -2061,6 +2302,263 @@ mod v2 {
             .route("/api/v2/proxies", get(handle_proxies))
             .route("/api/v2/proxies/{name}", get(handle_proxy_detail))
             .route("/api/v2/proxies/{name}/traffic", get(handle_proxy_traffic))
+            // Audit-specified endpoints (not present in Go frp; see the
+            // handler doc comments for shape notes).
+            .route("/api/v2/config", get(config_handler))
+            .route("/api/v2/proxy/{name}/update", put(handle_proxy_update))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn test_state() -> Arc<AppState> {
+            let cfg = frp_core::config::ServerConfig::default();
+            Arc::new(AppState::new(
+                frp_core::auth::AuthConfig::with_token("test-token"),
+                "127.0.0.1".into(),
+                frp_core::encryption::derive_key("test-token"),
+                vec![frp_core::config::PortsRange {
+                    start: 1,
+                    end: u16::MAX,
+                    single: 0,
+                }],
+                String::new(),
+                true,
+                30,
+                7200,
+                90,
+                1500,
+                false,
+                None,
+                0,
+                60,
+                10,
+                false,
+                String::new(),
+                Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+                0,
+                168,
+                true,
+                0,
+                0,
+                frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+            ))
+        }
+
+        fn proxy_info(name: &str, proxy_type: &str) -> crate::proxy::ProxyInfo {
+            crate::proxy::ProxyInfo {
+                name: name.into(),
+                proxy_type: proxy_type.into(),
+                run_id: "run-1".into(),
+                remote_port: Some(10001),
+                sk: None,
+                group: None,
+                group_key: None,
+                local_addr: Some("127.0.0.1:80".into()),
+                use_encryption: false,
+                use_compression: false,
+                virtual_net: None,
+                allow_users: Vec::new(),
+                proxy_protocol_version: String::new(),
+                response_headers: HashMap::new(),
+                custom_domains: Vec::new(),
+                route_by_http_user: String::new(),
+                multiplexer: String::new(),
+                bandwidth_limit: String::new(),
+                bandwidth_limit_mode: String::new(),
+                user: String::new(),
+            }
+        }
+
+        /// Serialize a handler response to JSON for leak assertions.
+        fn to_json<T: Serialize>(v: &T) -> serde_json::Value {
+            serde_json::to_value(v).unwrap()
+        }
+
+        /// Unwrap the `Err` side of a handler result, panicking on success
+        /// (avoids a `Debug` bound on the `Ok` type for `expect_err`).
+        fn expect_err<T, E>(r: Result<T, E>, msg: &str) -> E {
+            match r {
+                Err(e) => e,
+                Ok(_) => panic!("{msg}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_v2_config_is_sanitized() {
+            let state = test_state();
+            let resp = handle_v2_config(
+                State(state.clone()),
+                "127.0.0.1:7500".to_string(),
+                "admin".to_string(),
+                true,
+            )
+            .await;
+            assert_eq!(resp.bind_port, 7000, "default bind port");
+            assert_eq!(resp.version, frp_core::VERSION);
+            assert_eq!(resp.dashboard.port, 7500);
+            assert_eq!(resp.dashboard.user, "admin");
+            assert!(resp.dashboard.enable_prometheus);
+            assert_eq!(resp.auth.method, "token");
+
+            // Secret material must never be present in the serialized config.
+            let json = to_json(&resp.0);
+            let s = serde_json::to_string(&json).unwrap().to_lowercase();
+            assert!(!s.contains("test-token"), "auth token leaked: {s}");
+            assert!(
+                !s.contains("\"token\":"),
+                "token field must not be serialized"
+            );
+            assert!(
+                !s.contains("password"),
+                "dashboard password field must not be serialized"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_proxy_update_applies_bandwidth_limit() {
+            let state = test_state();
+            state
+                .proxy_manager
+                .register("run-1".into(), proxy_info("p1", "tcp"))
+                .await
+                .unwrap();
+
+            let req = UpdateProxyRequest {
+                bandwidth_limit: Some("2MB".into()),
+                bandwidth_limit_mode: Some("server".into()),
+                ..Default::default()
+            };
+            let result =
+                handle_proxy_update(State(state.clone()), Path("p1".into()), Json(req)).await;
+            let resp = result.expect("update should succeed");
+            assert_eq!(
+                resp.0
+                    .spec
+                    .tcp
+                    .as_ref()
+                    .unwrap()
+                    .base
+                    .transport
+                    .as_ref()
+                    .unwrap()
+                    .bandwidth_limit,
+                "2MB"
+            );
+            assert_eq!(
+                resp.0
+                    .spec
+                    .tcp
+                    .as_ref()
+                    .unwrap()
+                    .base
+                    .transport
+                    .as_ref()
+                    .unwrap()
+                    .bandwidth_limit_mode,
+                "server"
+            );
+
+            // The stored record must reflect the new value (hot-applied to
+            // subsequently established bridges).
+            let stored = state.proxy_manager.get("p1").await.unwrap();
+            assert_eq!(stored.bandwidth_limit, "2MB");
+            assert_eq!(stored.bandwidth_limit_mode, "server");
+
+            // The by_client index must be in sync (list_client sees the new
+            // record, not the pre-update clone).
+            let clients = state.proxy_manager.list_client("run-1").await;
+            let client_proxy = clients
+                .into_iter()
+                .find(|p| p.name == "p1")
+                .expect("p1 present in by_client index");
+            assert_eq!(client_proxy.bandwidth_limit, "2MB");
+            assert_eq!(client_proxy.bandwidth_limit_mode, "server");
+        }
+
+        #[tokio::test]
+        async fn test_proxy_update_rejects_provider_dependent_fields() {
+            let state = test_state();
+            state
+                .proxy_manager
+                .register("run-1".into(), proxy_info("p1", "tcp"))
+                .await
+                .unwrap();
+
+            let req = UpdateProxyRequest {
+                local_port: Some(8080),
+                ..Default::default()
+            };
+            let (status, json) = expect_err(
+                handle_proxy_update(State(state.clone()), Path("p1".into()), Json(req)).await,
+                "provider-dependent fields must be rejected",
+            );
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                json.0.error.contains("frpc"),
+                "error should mention frpc reload, got: {}",
+                json.0.error
+            );
+
+            // Nothing changed.
+            let stored = state.proxy_manager.get("p1").await.unwrap();
+            assert!(stored.bandwidth_limit.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_proxy_update_rejects_invalid_bandwidth() {
+            let state = test_state();
+            state
+                .proxy_manager
+                .register("run-1".into(), proxy_info("p1", "tcp"))
+                .await
+                .unwrap();
+
+            let req = UpdateProxyRequest {
+                bandwidth_limit: Some("not-a-limit".into()),
+                ..Default::default()
+            };
+            let (status, _) = expect_err(
+                handle_proxy_update(State(state.clone()), Path("p1".into()), Json(req)).await,
+                "invalid bandwidth limit must be rejected",
+            );
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn test_proxy_update_unknown_proxy_returns_not_found() {
+            let state = test_state();
+            let req = UpdateProxyRequest {
+                bandwidth_limit: Some("1MB".into()),
+                ..Default::default()
+            };
+            let (status, _) = expect_err(
+                handle_proxy_update(State(state), Path("missing".into()), Json(req)).await,
+                "unknown proxy must 404",
+            );
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn test_proxy_update_empty_body_rejected() {
+            let state = test_state();
+            state
+                .proxy_manager
+                .register("run-1".into(), proxy_info("p1", "tcp"))
+                .await
+                .unwrap();
+            let (status, _) = expect_err(
+                handle_proxy_update(
+                    State(state),
+                    Path("p1".into()),
+                    Json(UpdateProxyRequest::default()),
+                )
+                .await,
+                "empty update body must be rejected",
+            );
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
     }
 }
 
@@ -2097,7 +2595,11 @@ pub async fn run_dashboard(
         .route("/api/store/proxy/{name}", delete(handle_store_proxy_delete))
         .route("/api/events", get(handle_events))
         // v2 API (Go frp v0.70.0 compat): paginated, filterable, searchable endpoints
-        .merge(v2::v2_routes());
+        .merge(v2::v2_routes(
+            addr.clone(),
+            auth_user.clone(),
+            enable_prometheus,
+        ));
 
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 

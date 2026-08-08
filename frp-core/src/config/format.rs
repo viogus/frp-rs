@@ -1,10 +1,12 @@
 // ─── Format detection ────────────────────────────────────────────────
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum ConfigFormat {
     Toml,
     Ini,
     Json,
+    Yaml,
 }
 
 pub(super) fn detect_format(path: &str) -> ConfigFormat {
@@ -13,6 +15,8 @@ pub(super) fn detect_format(path: &str) -> ConfigFormat {
         ConfigFormat::Ini
     } else if path_lower.ends_with(".json") {
         ConfigFormat::Json
+    } else if path_lower.ends_with(".yaml") || path_lower.ends_with(".yml") {
+        ConfigFormat::Yaml
     } else {
         ConfigFormat::Toml
     }
@@ -29,6 +33,7 @@ pub(super) fn parse_to_toml_value(
             let json_val: serde_json::Value = serde_json::from_str(content)?;
             Ok(json_to_toml(json_val))
         }
+        ConfigFormat::Yaml => yaml_to_toml(content),
     }
 }
 
@@ -54,6 +59,88 @@ fn json_to_toml(v: serde_json::Value) -> toml::Value {
             let table: toml::Table = map.into_iter().map(|(k, v)| (k, json_to_toml(v))).collect();
             toml::Value::Table(table)
         }
+    }
+}
+
+// ─── YAML parser (Go Viper-compatible, YAML 1.1 via serde_yaml_ng) ──
+
+/// Parse YAML content into a toml::Value.
+///
+/// serde_yaml_ng parses into its own `Value` tree first (so YAML 1.1 scalar
+/// typing — `yes`/`no`/`on`/`off` booleans, unquoted numbers, anchors — is
+/// preserved), then the tree is converted to `serde_json::Value` and fed
+/// through the same `json_to_toml` conversion used by the JSON path. This
+/// keeps exactly one type-inference pipeline for both formats.
+///
+/// YAML merge keys (`<<`, <https://yaml.org/type/merge.html>) are *not*
+/// applied automatically when deserializing into a `serde_yaml_ng::Value`;
+/// the crate exposes `Value::apply_merge` for the YAML 1.1 merge semantics,
+/// so we call it explicitly before converting.
+fn yaml_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
+    let mut yaml_value: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(content).map_err(|e| format!("YAML parse error: {e}"))?;
+    yaml_value
+        .apply_merge()
+        .map_err(|e| format!("YAML merge key (`<<`) error: {e}"))?;
+    Ok(json_to_toml(yaml_value_to_json(yaml_value)))
+}
+
+/// Convert a serde_yaml_ng::Value into a serde_json::Value.
+///
+/// Mapping keys are converted to their string representation when they are
+/// not already strings (YAML allows scalar keys other than strings; JSON and
+/// TOML do not).
+fn yaml_value_to_json(v: serde_yaml_ng::Value) -> serde_json::Value {
+    match v {
+        serde_yaml_ng::Value::Null => serde_json::Value::Null,
+        serde_yaml_ng::Value::Bool(b) => serde_json::Value::Bool(b),
+        serde_yaml_ng::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_json::Value::Number(i.into())
+            } else if let Some(u) = n.as_u64() {
+                serde_json::Value::Number(u.into())
+            } else if let Some(f) = n.as_f64() {
+                serde_json::Number::from_f64(f).map_or_else(
+                    || serde_json::Value::String(n.to_string()),
+                    serde_json::Value::Number,
+                )
+            } else {
+                serde_json::Value::String(n.to_string())
+            }
+        }
+        serde_yaml_ng::Value::String(s) => serde_json::Value::String(s),
+        serde_yaml_ng::Value::Sequence(seq) => {
+            serde_json::Value::Array(seq.into_iter().map(yaml_value_to_json).collect())
+        }
+        serde_yaml_ng::Value::Mapping(map) => {
+            let object: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
+                .map(|(k, v)| (yaml_key_to_string(&k), yaml_value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(object)
+        }
+        // `!Tag` values (e.g. `!Newtype 1`) carry no configuration meaning;
+        // unwrap to the tagged value itself (lossy: the tag name is dropped).
+        serde_yaml_ng::Value::Tagged(tagged) => {
+            debug!(
+                "YAML tagged value in config (tag dropped): {:?}",
+                tagged.tag
+            );
+            yaml_value_to_json(tagged.value)
+        }
+    }
+}
+
+/// Render a YAML mapping key as a string for the JSON/TOML path.
+fn yaml_key_to_string(k: &serde_yaml_ng::Value) -> String {
+    match k {
+        serde_yaml_ng::Value::String(s) => s.clone(),
+        serde_yaml_ng::Value::Number(n) => n.to_string(),
+        serde_yaml_ng::Value::Bool(b) => b.to_string(),
+        serde_yaml_ng::Value::Null => String::new(),
+        // Complex keys (sequences/mappings/tags) have no JSON/TOML
+        // equivalent; fall back to the YAML representation.
+        other => serde_yaml_ng::to_string(other).unwrap_or_else(|_| format!("{other:?}")),
     }
 }
 

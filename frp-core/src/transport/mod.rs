@@ -601,16 +601,20 @@ impl Default for DialOptions {
     }
 }
 
+/// DNS record types used by the custom resolver.
+const DNS_QTYPE_A: u16 = 1;
+const DNS_QTYPE_AAAA: u16 = 28;
+
 /// Resolve a hostname to an IP address using a specific DNS server.
 ///
-/// Sends a standard DNS A-record query over UDP. Handles name compression
-/// pointers in the response. IPv6 (AAAA) is not supported — the custom DNS
-/// server option is typically used with IPv4-only internal resolvers.
+/// Sends standard DNS A and AAAA queries over UDP concurrently and handles
+/// name compression pointers in the response. IPv4 is preferred: if the A
+/// query succeeds its address wins even when AAAA also succeeds. If A fails
+/// but AAAA succeeds, the IPv6 address is returned. When both fail, the A
+/// query's error is returned (preserving the pre-AAAA behaviour).
 pub async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, crate::Error> {
     use std::net::SocketAddr;
     use std::str::FromStr;
-    use tokio::net::UdpSocket;
-    use tokio::time::{timeout, Duration};
 
     // If host is already an IP, return it as-is
     if host.parse::<std::net::IpAddr>().is_ok() {
@@ -628,7 +632,41 @@ pub async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<Strin
         })?
     };
 
-    // Build DNS A-record query
+    // Query A and AAAA concurrently. IPv4 is preferred — an A answer wins
+    // even when AAAA also succeeds; only fall back to AAAA when A fails.
+    // The AAAA query runs in a spawned task so an A success returns
+    // immediately (join! would otherwise stall the whole resolution on the
+    // AAAA timeout, a 5s regression on every connect when AAAA is dropped).
+    let host_for_aaaa = host.to_string();
+    let aaaa_task =
+        tokio::spawn(async move { dns_query(&host_for_aaaa, dns_addr, DNS_QTYPE_AAAA).await });
+    let a_result = dns_query(host, dns_addr, DNS_QTYPE_A).await;
+    match a_result {
+        Ok(ip) => {
+            aaaa_task.abort();
+            Ok(ip)
+        }
+        Err(a_err) => match aaaa_task.await {
+            Ok(Ok(ip)) => Ok(ip),
+            _ => Err(a_err),
+        },
+    }
+}
+
+/// Send one DNS query for `qtype` (A or AAAA) to `dns_addr` over UDP and
+/// return the first matching address as a string.
+///
+/// Uses a random transaction ID and a 5s timeout, mirroring the historical
+/// single-query behaviour.
+async fn dns_query(
+    host: &str,
+    dns_addr: std::net::SocketAddr,
+    qtype: u16,
+) -> Result<String, crate::Error> {
+    use tokio::net::UdpSocket;
+    use tokio::time::{timeout, Duration};
+
+    // Build DNS query (single question, RD=1)
     let mut query = Vec::with_capacity(64);
     let txid: u16 = rand::random();
     query.extend_from_slice(&txid.to_be_bytes());
@@ -642,7 +680,7 @@ pub async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<Strin
         query.extend_from_slice(label.as_bytes());
     }
     query.push(0x00); // terminator
-    query.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+    query.extend_from_slice(&qtype.to_be_bytes()); // QTYPE = A / AAAA
     query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
 
     // Send query over UDP
@@ -652,11 +690,11 @@ pub async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<Strin
     socket
         .connect(dns_addr)
         .await
-        .map_err(|e| crate::Error::Transport(format!("DNS: connect {dns_server}: {e}").into()))?;
+        .map_err(|e| crate::Error::Transport(format!("DNS: connect {dns_addr}: {e}").into()))?;
     socket
         .send(&query)
         .await
-        .map_err(|e| crate::Error::Transport(format!("DNS: send to {dns_server}: {e}").into()))?;
+        .map_err(|e| crate::Error::Transport(format!("DNS: send to {dns_addr}: {e}").into()))?;
 
     let mut buf = [0u8; 512];
     let n = timeout(Duration::from_secs(5), socket.recv(&mut buf))
@@ -664,25 +702,40 @@ pub async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<Strin
         .map_err(|_| crate::Error::Transport("DNS: timeout".into()))?
         .map_err(|e| crate::Error::Transport(format!("DNS: recv: {e}").into()))?;
 
-    // Parse response
-    let response = &buf[..n];
+    let ips = parse_dns_response(&buf[..n], txid, qtype)
+        .map_err(|e| crate::Error::Transport(format!("DNS resolve {host}: {e}").into()))?;
+    // First matching address only (A preferred by the caller; the Vec keeps
+    // the door open for future Happy-Eyeballs style multi-address use).
+    Ok(ips[0].to_string())
+}
+
+/// Parse a DNS response, verifying the transaction ID and collecting every
+/// answer record whose type matches `qtype` (1 = A, 28 = AAAA).
+///
+/// Returns the matching IP addresses or an error string (without the
+/// "DNS resolve {host}: " prefix — callers add it) explaining why no
+/// matching record was found. Pure function: no I/O, so it is unit-testable
+/// against hand-built response bytes.
+fn parse_dns_response(
+    response: &[u8],
+    txid: u16,
+    qtype: u16,
+) -> Result<Vec<std::net::IpAddr>, String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
     if response.len() < 12 {
-        return Err(crate::Error::Transport("DNS: response too short".into()));
+        return Err("response too short".into());
     }
 
     // Verify transaction ID
     let resp_txid = u16::from_be_bytes([response[0], response[1]]);
     if resp_txid != txid {
-        return Err(crate::Error::Transport(
-            format!("DNS: txid mismatch (sent {txid}, got {resp_txid})").into(),
-        ));
+        return Err(format!("txid mismatch (sent {txid}, got {resp_txid})"));
     }
 
     let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
     if ancount == 0 {
-        return Err(crate::Error::Transport(
-            format!("DNS resolve {host}: no records found").into(),
-        ));
+        return Err("no records found".into());
     }
 
     // Skip 12-byte header + question section to reach answers
@@ -690,36 +743,54 @@ pub async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<Strin
     pos = skip_dns_name(response, pos); // QNAME
     pos += 4; // QTYPE (2) + QCLASS (2)
 
+    let mut ips: Vec<IpAddr> = Vec::new();
     // Read answers
     for _ in 0..ancount {
         if pos + 10 > response.len() {
-            return Err(crate::Error::Transport(
-                "DNS: truncated answer section".into(),
-            ));
+            return Err("truncated answer section".into());
         }
         pos = skip_dns_name(response, pos); // NAME (may be compression pointer)
-        let qtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
+                                            // skip_dns_name trusts the wire's label lengths and may advance past
+                                            // the buffer on a malformed response — re-check before indexing
+                                            // (a crafted DNS reply must never panic the resolver).
+        if pos + 10 > response.len() {
+            return Err("truncated answer section".into());
+        }
+        let rdtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
         let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
         pos += 10; // past TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
         if pos + rdlength > response.len() {
-            return Err(crate::Error::Transport("DNS: truncated RDATA".into()));
+            return Err("truncated RDATA".into());
         }
-        if qtype == 1 && rdlength == 4 {
-            // A record: 4-byte IPv4 address
-            let ip = std::net::Ipv4Addr::new(
-                response[pos],
-                response[pos + 1],
-                response[pos + 2],
-                response[pos + 3],
-            );
-            return Ok(ip.to_string());
+        if rdtype == qtype {
+            if qtype == DNS_QTYPE_A && rdlength == 4 {
+                // A record: 4-byte IPv4 address
+                ips.push(IpAddr::V4(Ipv4Addr::new(
+                    response[pos],
+                    response[pos + 1],
+                    response[pos + 2],
+                    response[pos + 3],
+                )));
+            } else if qtype == DNS_QTYPE_AAAA && rdlength == 16 {
+                // AAAA record: 16-byte IPv6 address
+                let octets: [u8; 16] = response[pos..pos + 16]
+                    .try_into()
+                    .map_err(|_| "truncated RDATA".to_string())?;
+                ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
+            }
         }
         pos += rdlength;
     }
 
-    Err(crate::Error::Transport(
-        format!("DNS resolve {host}: no A record found").into(),
-    ))
+    if ips.is_empty() {
+        return Err(match qtype {
+            DNS_QTYPE_A => "no A record found",
+            DNS_QTYPE_AAAA => "no AAAA record found",
+            _ => "no matching record found",
+        }
+        .into());
+    }
+    Ok(ips)
 }
 
 /// Skip a DNS name in the response, handling compression pointers.
@@ -2065,4 +2136,246 @@ mod tests {
 
         srv.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_resolve_host_with_dns_aaaa_fallback() {
+        // A mock DNS server that answers A queries with NXDOMAIN-style empty
+        // answers and AAAA queries with an IPv6 address. resolve_host_with_dns
+        // must fall back from A to AAAA.
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_addr = socket.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            // Answer every datagram the resolver sends (one A + one AAAA).
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+                let req = &buf[..n];
+                let txid = [req[0], req[1]];
+                // QTYPE is the 2 bytes right before the QCLASS at the end.
+                let qtype = u16::from_be_bytes([req[n - 4], req[n - 3]]);
+                let mut resp = Vec::new();
+                resp.extend_from_slice(&txid);
+                resp.extend_from_slice(&[0x81, 0x80]); // flags: response, RD, RA
+                resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+                let has_answer = qtype == DNS_QTYPE_AAAA;
+                resp.extend_from_slice(&[0x00, if has_answer { 1 } else { 0 }]); // ANCOUNT
+                resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+                resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+                                                       // Echo the question section verbatim.
+                resp.extend_from_slice(&req[12..n - 4]);
+                resp.extend_from_slice(&qtype.to_be_bytes());
+                resp.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+                if has_answer {
+                    resp.extend_from_slice(&[0xC0, 0x0C]); // pointer to QNAME
+                    resp.extend_from_slice(&qtype.to_be_bytes());
+                    resp.extend_from_slice(&[0x00, 0x01]); // CLASS = IN
+                    resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL = 60
+                    resp.extend_from_slice(&[0x00, 0x10]); // RDLENGTH = 16
+                    resp.extend_from_slice(&[
+                        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]);
+                }
+                socket.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let ip = resolve_host_with_dns("example.com", &dns_addr.to_string())
+            .await
+            .unwrap();
+        assert_eq!(ip, "2001:db8::1");
+
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_with_dns_ipv4_preferred() {
+        // When both A and AAAA succeed, the A result wins.
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_addr = socket.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+                let req = &buf[..n];
+                let txid = [req[0], req[1]];
+                let qtype = u16::from_be_bytes([req[n - 4], req[n - 3]]);
+                let mut resp = Vec::new();
+                resp.extend_from_slice(&txid);
+                resp.extend_from_slice(&[0x81, 0x80]);
+                resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+                resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT
+                resp.extend_from_slice(&[0x00, 0x00]);
+                resp.extend_from_slice(&[0x00, 0x00]);
+                resp.extend_from_slice(&req[12..n - 4]);
+                resp.extend_from_slice(&qtype.to_be_bytes());
+                resp.extend_from_slice(&[0x00, 0x01]);
+                resp.extend_from_slice(&[0xC0, 0x0C]);
+                resp.extend_from_slice(&qtype.to_be_bytes());
+                resp.extend_from_slice(&[0x00, 0x01]);
+                resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
+                match qtype {
+                    DNS_QTYPE_A => {
+                        resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH = 4
+                        resp.extend_from_slice(&[1, 2, 3, 4]);
+                    }
+                    _ => {
+                        resp.extend_from_slice(&[0x00, 0x10]); // RDLENGTH = 16
+                        resp.extend_from_slice(&[
+                            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                        ]);
+                    }
+                }
+                socket.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let ip = resolve_host_with_dns("example.com", &dns_addr.to_string())
+            .await
+            .unwrap();
+        assert_eq!(ip, "1.2.3.4");
+
+        srv.await.unwrap();
+    }
+
+    #[test]
+    fn test_parse_dns_response_a_record() {
+        // A query answered with a single A record.
+        let resp = dns_response_bytes(0x1234, &[(DNS_QTYPE_A, &[1, 2, 3, 4])]);
+        let ips = parse_dns_response(&resp, 0x1234, DNS_QTYPE_A).unwrap();
+        assert_eq!(ips, vec![std::net::IpAddr::from([1, 2, 3, 4])]);
+    }
+
+    #[test]
+    fn test_parse_dns_response_aaaa_record() {
+        let v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let resp = dns_response_bytes(0x1234, &[(DNS_QTYPE_AAAA, &v6)]);
+        let ips = parse_dns_response(&resp, 0x1234, DNS_QTYPE_AAAA).unwrap();
+        assert_eq!(
+            ips,
+            vec![std::net::IpAddr::from([
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_parse_dns_response_mixed_answers() {
+        // A response carrying both an A and an AAAA record: each qtype query
+        // only sees its own records.
+        let resp = dns_response_bytes(
+            0x1234,
+            &[
+                (DNS_QTYPE_A, &[10, 0, 0, 1]),
+                (
+                    DNS_QTYPE_AAAA,
+                    &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+                ),
+            ],
+        );
+        let a_ips = parse_dns_response(&resp, 0x1234, DNS_QTYPE_A).unwrap();
+        assert_eq!(a_ips, vec![std::net::IpAddr::from([10, 0, 0, 1])]);
+        let aaaa_ips = parse_dns_response(&resp, 0x1234, DNS_QTYPE_AAAA).unwrap();
+        assert_eq!(aaaa_ips.len(), 1);
+        assert!(aaaa_ips[0].is_ipv6());
+    }
+
+    #[test]
+    fn test_parse_dns_response_no_records() {
+        // ANCOUNT = 0.
+        let resp = dns_response_bytes(0x1234, &[]);
+        let err = parse_dns_response(&resp, 0x1234, DNS_QTYPE_A).unwrap_err();
+        assert!(err.contains("no records found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_dns_response_wrong_type() {
+        // A query but the answer is AAAA-only -> "no A record found".
+        let resp = dns_response_bytes(
+            0x1234,
+            &[(
+                DNS_QTYPE_AAAA,
+                &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            )],
+        );
+        let err = parse_dns_response(&resp, 0x1234, DNS_QTYPE_A).unwrap_err();
+        assert!(err.contains("no A record found"), "got: {err}");
+        // And the reverse for AAAA.
+        let resp = dns_response_bytes(0x1234, &[(DNS_QTYPE_A, &[1, 2, 3, 4])]);
+        let err = parse_dns_response(&resp, 0x1234, DNS_QTYPE_AAAA).unwrap_err();
+        assert!(err.contains("no AAAA record found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_dns_response_txid_mismatch() {
+        let resp = dns_response_bytes(0x1234, &[(DNS_QTYPE_A, &[1, 2, 3, 4])]);
+        let err = parse_dns_response(&resp, 0x5678, DNS_QTYPE_A).unwrap_err();
+        assert!(err.contains("txid mismatch"), "got: {err}");
+    }
+
+    /// Build a well-formed DNS response header + question ("example.com") +
+    /// the given answers, using the supplied transaction ID.
+    fn dns_response_bytes(txid: u16, answers: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&txid.to_be_bytes());
+        resp.extend_from_slice(&[0x81, 0x80]); // flags: response, RD, RA
+        resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
+        resp.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // ANCOUNT
+        resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+        resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+                                               // Question: "example.com", QTYPE=A, QCLASS=IN
+        resp.extend_from_slice(&[0x07]);
+        resp.extend_from_slice(b"example");
+        resp.extend_from_slice(&[0x03]);
+        resp.extend_from_slice(b"com");
+        resp.push(0x00);
+        resp.extend_from_slice(&DNS_QTYPE_A.to_be_bytes());
+        resp.extend_from_slice(&[0x00, 0x01]);
+        // Answers
+        for (qtype, rdata) in answers {
+            resp.extend_from_slice(&[0xC0, 0x0C]); // pointer to QNAME
+            resp.extend_from_slice(&qtype.to_be_bytes());
+            resp.extend_from_slice(&[0x00, 0x01]); // CLASS = IN
+            resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL = 60
+            resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            resp.extend_from_slice(rdata);
+        }
+        resp
+    }
+}
+
+#[test]
+fn test_parse_dns_response_malformed_never_panics() {
+    // A crafted response whose answer NAME label length overruns the
+    // buffer must produce an error, never a panic (regression guard for
+    // the post-skip bounds re-check).
+    // Header (12B): txid 0x1234, flags 0x0100, QDCOUNT=1, ANCOUNT=1.
+    let mut resp = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 0];
+    // Question: "example.com" + QTYPE/QCLASS.
+    resp.extend_from_slice(&[7]); // label len 7
+    resp.extend_from_slice(b"example");
+    resp.extend_from_slice(&[3]);
+    resp.extend_from_slice(b"com");
+    resp.push(0); // root
+    resp.extend_from_slice(&[0, 1, 0, 1]); // QTYPE=A QCLASS=IN
+
+    // Answer: NAME claims a 63-byte label but the buffer ends before the
+    // claimed label body — the loop-top check passes but skip_dns_name
+    // overruns; the post-skip re-check must return Err, not panic.
+    resp.extend_from_slice(&[63]);
+    resp.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 4]); // 10B fake answer hdr
+    let err = parse_dns_response(&resp, 0x1234, DNS_QTYPE_A).unwrap_err();
+    assert!(
+        err.contains("truncated") || err.contains("too short"),
+        "got: {err}"
+    );
+    // Also: answer NAME is a compression pointer to beyond EOF.
+    let mut resp2 = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 0];
+    resp2.extend_from_slice(&[0]); // empty QNAME
+    resp2.extend_from_slice(&[0, 1, 0, 1]); // QTYPE/QCLASS
+    resp2.extend_from_slice(&[0xC0, 0xFF]); // pointer to 255 (past EOF)
+    resp2.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 1, 2, 3, 4]); // hdr
+    let ok = parse_dns_response(&resp2, 0x1234, DNS_QTYPE_A);
+    // Compression pointers are skipped without following, so the answer
+    // below is still parsed; the pointer target is never dereferenced.
+    assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }

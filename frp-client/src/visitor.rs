@@ -9,9 +9,10 @@ use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
-#[cfg(feature = "vnet")]
-use frp_core::transport::IoStream;
-use frp_core::transport::{dial_server, split_work_conn_halves, DialOptions, TransportProtocol};
+use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::transport::{
+    dial_server, split_work_conn_halves, DialOptions, IoStream, TransportProtocol,
+};
 
 #[cfg(feature = "vnet")]
 type VnetTunTxMap = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
@@ -278,6 +279,12 @@ async fn run_virtual_net_tunnel_io(
 /// Binds a local port, accepts connections, and tunnels them
 /// through the frps server to the remote STCP proxy.
 pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
+    // SUDP visitors use a dedicated UDP-based lazy tunnel (Go frp
+    // client/visitor/sudp.go). Route them to their own listener before the
+    // TCP accept loop, so they never fall into the STCP TCP path.
+    if config.visitor_type == "sudp" {
+        return run_sudp_visitor_listener(config).await;
+    }
     let VisitorListenerConfig {
         server_addr,
         server_port,
@@ -882,24 +889,10 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             debug!(visitor_name = %visitor_name, "Visitor '{}' STCP fallback relay closed", visitor_name);
                         }
                     } else {
-                        // SUDP visitor warning: SUDP is not yet implemented as a
-                        // dedicated UDP-based visitor (Go frp has one). Falls through
-                        // to the STCP TCP-based path which will not work correctly
-                        // for UDP traffic.
-                        if vt == "sudp" {
-                            warn!(
-                                visitor_name = %visitor_name,
-                                visitor_type = %vt,
-                                "Visitor '{}': SUDP visitor type not yet implemented \
-                                 (using TCP STCP fallback which will likely fail). \
-                                 Tracked: SUDP visitor needs dedicated UDP transport.",
-                                visitor_name
-                            );
-                        }
-
                         // --- STCP relay path (TCP-based visitors) ---
-                        // Handles: stcp, and sudp (TCP fallback until dedicated
-                        // SUDP visitor is implemented).
+                        // Handles: stcp. SUDP is routed to the dedicated UDP
+                        // visitor (run_sudp_visitor_listener) before the accept
+                        // loop, so it never reaches this TCP path.
                         let raw_stream = match dial_server(&opts).await {
                             Ok(io) => io,
                             Err(e) => {
@@ -1008,6 +1001,492 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 break;
             }
         }
+    }
+}
+
+/// Run a SUDP visitor listener.
+///
+/// Binds a local UDP socket and tunnels datagrams to a remote SUDP proxy
+/// through the frps server, mirroring Go frp's `client/visitor/sudp.go`:
+/// - one shared UDP socket, multiplexed by datagram source address: inbound
+///   datagrams are answered back to their `UdpAddr` source, outbound
+///   datagrams carry their own source address in `UDPPacket.remote_addr`
+/// - lazy connection: no server connection is held until the first datagram
+///   arrives; the first datagram triggers a fresh NewVisitorConn handshake
+/// - on disconnect/idle timeout the worker returns to the wait state and the
+///   next datagram reconnects
+///
+/// ENCRYPTION TRADEOFF (first version): the data plane is plaintext-only.
+/// Go frp encrypts the whole framed stream with `sk`; the Rust provider
+/// (`run_udp_work_conn`) instead encrypts/decrypts each UDPPacket payload
+/// per packet. These two models are mutually incompatible, so until the
+/// encryption model is unified this visitor always exchanges plaintext
+/// UDPPacket messages and logs a warning when `use_encryption=true`.
+pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
+    let VisitorListenerConfig {
+        server_addr,
+        server_port,
+        protocol,
+        server_name,
+        server_user,
+        secret_key,
+        bind_addr,
+        use_encryption,
+        use_compression,
+        name,
+        tls_enable,
+        tls_server_name,
+        tls_ca_file,
+        // SUDP has no retry / NAT-traversal / fallback options; all unused.
+        visitor_type: _,
+        fallback_timeout_ms: _,
+        keep_tunnel_open: _,
+        max_retries_an_hour: _,
+        min_retry_interval: _,
+        stun_server: _,
+        p2p_protocol: _,
+        visitor_tx: _,
+        fallback_to: _,
+        disable_assisted_addrs: _,
+        shutdown,
+        user,
+        run_id,
+        tcp_mux,
+        tcp_mux_keepalive_interval,
+        proxy_url,
+        dns_server,
+        dial_timeout_secs,
+        keepalive_secs,
+        connect_bind_addr,
+        disable_custom_tls_first_byte,
+        tls_cert_file,
+        tls_key_file,
+        v2,
+    } = config;
+
+    if use_encryption || use_compression {
+        warn!(
+            visitor_name = %name,
+            use_encryption,
+            use_compression,
+            "SUDP visitor '{}': use_encryption={} / use_compression={} are configured, but the \
+             first-version SUDP data plane is plaintext/uncompressed-only (Go frp uses \
+             stream-level encryption/compression; Rust uses per-packet payload transforms — \
+             not yet unified); continuing without encryption/compression",
+            name,
+            use_encryption,
+            use_compression
+        );
+    }
+
+    // Force the declaration to match the plaintext data plane. If we left
+    // use_encryption=true here, the NewVisitorConn would tell the provider
+    // (which reads its OWN proxy config and encrypts per-packet via
+    // work_conn.rs encrypt_into) that the tunnel is encrypted — it would
+    // then AES-128-CFB-encrypt the return traffic and we would ship raw
+    // ciphertext to the local UDP client: silent corruption. Both sides
+    // must agree on plaintext, so the warn above is the entire story.
+    let (use_encryption, use_compression) = (false, false);
+
+    let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            warn!(visitor_name = %name, bind_addr = %bind_addr, error = %e, "SUDP visitor '{}': bind {} failed: {}", name, bind_addr, e);
+            return;
+        }
+    };
+    let bound = socket
+        .local_addr()
+        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+    info!(visitor_name = %name, local_addr = %bound, "SUDP visitor '{}' listening on {} (lazy tunnel: no server connection until first datagram)", name, bound);
+
+    // Go sudp.go uses capacity-1024 channels for both directions.
+    let (send_tx, mut send_rx) = mpsc::channel::<msg::UDPPacket>(1024);
+    let (read_tx, mut read_rx) = mpsc::channel::<msg::UDPPacket>(1024);
+
+    // --- Reader loop: tunnel → local UDP clients ---
+    // Datagrams coming back through the tunnel carry the originating local
+    // client address in UDPPacket.remote_addr; send them back to it.
+    // The reader/listener tasks exit on their own once the shutdown flag is
+    // set or the channels close (their senders are dropped when the dispatcher
+    // returns), so the JoinHandles are intentionally not joined.
+    let _reader_task = {
+        let socket_r = socket.clone();
+        let shutdown_r = shutdown.clone();
+        let name_r = name.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = wait_sudp_shutdown(&shutdown_r) => {
+                        info!(visitor_name = %name_r, "SUDP visitor '{}' reader shutting down", name_r);
+                        break;
+                    }
+                    pkt = read_rx.recv() => {
+                        match pkt {
+                            Some(up) => {
+                                if let Some(ref ra) = up.remote_addr {
+                                    if let Ok(addr) = format!("{}:{}", ra.ip, ra.port).parse::<std::net::SocketAddr>() {
+                                        if let Err(e) = socket_r.send_to(&up.content, addr).await {
+                                            debug!(visitor_name = %name_r, remote = %addr, error = %e, "SUDP visitor '{}': send_to local client {} failed: {}", name_r, addr, e);
+                                        }
+                                    } else {
+                                        warn!(visitor_name = %name_r, ip = %ra.ip, port = ra.port, "SUDP visitor '{}': unparseable remote address, dropping packet", name_r);
+                                    }
+                                } else {
+                                    warn!(visitor_name = %name_r, "SUDP visitor '{}': UDPPacket without remote_addr, dropping", name_r);
+                                }
+                            }
+                            None => {
+                                debug!(visitor_name = %name_r, "SUDP visitor '{}' read channel closed", name_r);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    // --- Listener loop: local UDP clients → tunnel ---
+    // Every datagram becomes a UDPPacket with its source as remote_addr.
+    // The tunnel is (re)connected lazily by the dispatcher below.
+    let _listener_task = {
+        let socket_l = socket.clone();
+        let send_tx_l = send_tx.clone();
+        let shutdown_l = shutdown.clone();
+        let name_l = name.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                // Deliberately NOT biased: under heavy local UDP traffic the
+                // recv_from branch would always be ready and starve the
+                // shutdown poll.
+                tokio::select! {
+                    _ = wait_sudp_shutdown(&shutdown_l) => {
+                        info!(visitor_name = %name_l, "SUDP visitor '{}' listener shutting down", name_l);
+                        break;
+                    }
+                    result = socket_l.recv_from(&mut buf) => {
+                        match result {
+                            Ok((n, src)) => {
+                                debug!(visitor_name = %name_l, byte_count = n, src_addr = %src, "SUDP visitor '{}': received {} bytes from local {}", name_l, n, src);
+                                let pkt = msg::UDPPacket {
+                                    content: buf[..n].to_vec(),
+                                    local_addr: None, // SUDP: local_addr is always None (Go sudp.go)
+                                    remote_addr: Some(msg::UdpAddr {
+                                        ip: src.ip().to_string(),
+                                        port: src.port(),
+                                        zone: String::new(),
+                                    }),
+                                };
+                                if send_tx_l.send(pkt).await.is_err() {
+                                    debug!(visitor_name = %name_l, "SUDP visitor '{}' send channel closed", name_l);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(visitor_name = %name_l, error = %e, "SUDP visitor '{}': recv_from failed: {}", name_l, e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    let transport = VisitorTransportConfig {
+        tcp_mux,
+        tcp_mux_keepalive_interval,
+        proxy_url,
+        dns_server,
+        dial_timeout_secs,
+        keepalive_secs,
+        connect_bind_addr,
+        disable_custom_tls_first_byte,
+        tls_cert_file,
+        tls_key_file,
+        v2,
+    };
+
+    // --- Dispatcher: lazy connect + reconnect ---
+    // Wait for the first datagram (wait state), then establish a tunnel.
+    // While the worker runs it consumes further datagrams. When the worker
+    // exits (disconnect / 60s idle timeout) we return to the wait state and
+    // the next datagram reconnects (Go sudp.go Run()/worker()).
+    let mut first_pkt = match sudp_next_datagram(&mut send_rx, &shutdown, &name).await {
+        Some(p) => p,
+        None => {
+            debug!(visitor_name = %name, "SUDP visitor '{}' send channel closed (listener exited)", name);
+            return;
+        }
+    };
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!(visitor_name = %name, "SUDP visitor '{}' shutting down", name);
+            return;
+        }
+        let server_conn = match connect_sudp_visitor_stream(
+            &server_addr,
+            server_port,
+            &protocol,
+            tls_enable,
+            &tls_server_name,
+            &tls_ca_file,
+            &transport,
+            &name,
+            &server_name,
+            &server_user,
+            &secret_key,
+            use_encryption,
+            use_compression,
+            &user,
+            &run_id,
+        )
+        .await
+        {
+            Some(conn) => conn,
+            None => {
+                warn!(visitor_name = %name, "SUDP visitor '{}': tunnel connect failed; dropping packet and waiting for the next datagram", name);
+                match sudp_next_datagram(&mut send_rx, &shutdown, &name).await {
+                    Some(p) => {
+                        first_pkt = p;
+                        continue;
+                    }
+                    None => return,
+                }
+            }
+        };
+        run_sudp_worker(
+            server_conn,
+            &mut send_rx,
+            first_pkt,
+            read_tx.clone(),
+            &name,
+            &shutdown,
+        )
+        .await;
+        // Worker ended (disconnect / idle timeout): back to the wait state.
+        debug!(visitor_name = %name, "SUDP visitor '{}': tunnel closed, waiting for the next datagram to reconnect", name);
+        match sudp_next_datagram(&mut send_rx, &shutdown, &name).await {
+            Some(p) => first_pkt = p,
+            None => return,
+        }
+    }
+}
+
+/// Wait for the next local datagram, aborting early on shutdown.
+///
+/// Every place the dispatcher blocks on `send_rx.recv()` must race it
+/// against the shutdown flag — otherwise a shutdown that arrives while the
+/// worker is exiting (or after a connect failure) leaves the dispatcher
+/// parked on `recv()` forever, holding the UDP socket Arc and leaking the
+/// bind port until process exit.
+async fn sudp_next_datagram(
+    send_rx: &mut mpsc::Receiver<msg::UDPPacket>,
+    shutdown: &Arc<AtomicBool>,
+    name: &str,
+) -> Option<msg::UDPPacket> {
+    tokio::select! {
+        biased;
+        _ = wait_sudp_shutdown(shutdown) => {
+            info!(visitor_name = %name, "SUDP visitor '{}' shutting down", name);
+            None
+        }
+        p = send_rx.recv() => p,
+    }
+}
+
+/// Dial the server and complete the NewVisitorConn handshake for a SUDP
+/// visitor tunnel. Mirrors the STCP visitor connect skeleton
+/// (`dial_server` → yamux → `NewVisitorConn` → `NewVisitorConnResp`).
+#[allow(clippy::too_many_arguments)]
+async fn connect_sudp_visitor_stream(
+    server_addr: &str,
+    server_port: u16,
+    protocol: &TransportProtocol,
+    tls_enable: bool,
+    tls_server_name: &str,
+    tls_ca_file: &Option<String>,
+    transport: &VisitorTransportConfig,
+    visitor_name: &str,
+    server_name: &str,
+    server_user: &str,
+    secret_key: &str,
+    use_encryption: bool,
+    use_compression: bool,
+    user: &str,
+    run_id: &str,
+) -> Option<IoStream> {
+    let plan = plan_visitor_dial(
+        server_addr,
+        server_port,
+        protocol,
+        tls_enable,
+        tls_server_name,
+        tls_ca_file,
+        transport,
+    );
+    let raw_stream = match dial_server(&plan.opts).await {
+        Ok(io) => io,
+        Err(e) => {
+            warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': dial server failed: {}", visitor_name, e);
+            return None;
+        }
+    };
+    let mut server_conn = if let Some(ka) = plan.yamux_keepalive_secs {
+        match crate::control::wrap_client_mux(raw_stream, ka).await {
+            Ok((io, _session)) => io,
+            Err(e) => {
+                warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': yamux wrap failed: {}", visitor_name, e);
+                return None;
+            }
+        }
+    } else {
+        raw_stream
+    };
+    let nvc = crate::proxy::create_visitor_conn_msg(
+        server_name,
+        secret_key,
+        use_encryption,
+        use_compression,
+        Some(server_user).filter(|s| !s.is_empty()),
+        Some(user).filter(|s| !s.is_empty()),
+        Some(run_id).filter(|s| !s.is_empty()),
+    );
+    if let Err(e) = server_conn.write_v1_frame(&nvc).await {
+        warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
+        return None;
+    }
+    match server_conn.read_v1_frame().await {
+        Ok(FrpMessage::NewVisitorConnResp(resp)) => {
+            if let Some(err) = resp.error {
+                warn!(visitor_name = %visitor_name, error = %err, "SUDP visitor '{}': server error: {}", visitor_name, err);
+                return None;
+            }
+            debug!(visitor_name = %visitor_name, proxy_name = %resp.proxy_name, "SUDP visitor '{}': relay ready for '{}'", visitor_name, resp.proxy_name);
+        }
+        Ok(other) => {
+            warn!(visitor_name = %visitor_name, type_byte = %other.v1_type_byte(), "SUDP visitor '{}': unexpected response type", visitor_name);
+            return None;
+        }
+        Err(e) => {
+            warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': read NewVisitorConnResp failed: {}", visitor_name, e);
+            return None;
+        }
+    }
+    Some(server_conn)
+}
+
+/// Data-plane worker for an established SUDP visitor tunnel.
+///
+/// - write side: datagrams from the local UDP socket (`send_rx`) are written
+///   to the server connection as `UDPPacket` messages (V1 framing, type 'u',
+///   matching Go frp's UDP data plane)
+/// - read side: `UDPPacket` messages from the server are forwarded to the
+///   reader loop (`read_tx`) which sends them back to the local client;
+///   `Ping` is ignored (Go sudp.go)
+/// - a 60s idle timeout closes the tunnel (Go sudp.go `connTimeout`); the
+///   dispatcher then reconnects on the next datagram
+#[allow(clippy::too_many_arguments)]
+async fn run_sudp_worker(
+    server_conn: IoStream,
+    send_rx: &mut mpsc::Receiver<msg::UDPPacket>,
+    first_pkt: msg::UDPPacket,
+    read_tx: mpsc::Sender<msg::UDPPacket>,
+    visitor_name: &str,
+    shutdown: &Arc<AtomicBool>,
+) {
+    let (srv_r, mut srv_w) = match split_work_conn_halves(server_conn) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(visitor_name = %visitor_name, error = e, "SUDP visitor '{}': could not split server conn: {}", visitor_name, e);
+            return;
+        }
+    };
+    // Buffer frame reads: read_msg_v1 issues two read_exact calls per message.
+    let mut srv_r = tokio::io::BufReader::with_capacity(16 * 1024, srv_r);
+    // The first packet (which triggered the connect) is written immediately.
+    if let Err(e) = write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(first_pkt)).await {
+        warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write first UDPPacket failed: {}", visitor_name, e);
+        return;
+    }
+    // Go sudp.go: a 60s idle tunnel (no traffic either way) tears down and
+    // the next datagram reconnects. Deadline is reset on every activity —
+    // NOT a fresh sleep() per loop iteration, which would never fire (the
+    // 100ms shutdown poll would always win the select and restart it).
+    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        // Fast-path shutdown check: the 100ms wait_sudp_shutdown poll below
+        // can be starved under sustained bidirectional traffic (unbiased
+        // select picks among ready branches), so check the flag directly on
+        // every iteration.
+        if shutdown.load(Ordering::Relaxed) {
+            info!(visitor_name = %visitor_name, "SUDP visitor '{}' shutting down", visitor_name);
+            break;
+        }
+        // Deliberately NOT biased: an always-ready send channel (local UDP
+        // flood) must not starve the read side (return traffic), and the
+        // idle/shutdown branches must stay reachable.
+        tokio::select! {
+            _ = wait_sudp_shutdown(shutdown) => {
+                info!(visitor_name = %visitor_name, "SUDP visitor '{}' shutting down", visitor_name);
+                break;
+            }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                debug!(visitor_name = %visitor_name, "SUDP visitor '{}': 60s idle timeout, closing tunnel", visitor_name);
+                break;
+            }
+            pkt = send_rx.recv() => {
+                match pkt {
+                    Some(p) => {
+                        if let Err(e) = write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(p)).await {
+                            debug!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write UDPPacket failed: {}", visitor_name, e);
+                            break;
+                        }
+                        idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                    }
+                    None => {
+                        debug!(visitor_name = %visitor_name, "SUDP visitor '{}': send channel closed", visitor_name);
+                        break;
+                    }
+                }
+            }
+            msg_result = read_msg_v1(&mut srv_r) => {
+                match msg_result {
+                    Ok(FrpMessage::UDPPacket(up)) => {
+                        idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                        if read_tx.send(up).await.is_err() {
+                            debug!(visitor_name = %visitor_name, "SUDP visitor '{}': reader loop dropped", visitor_name);
+                            break;
+                        }
+                    }
+                    Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => {
+                        // Go sudp.go ignores Ping on the data plane.
+                        continue;
+                    }
+                    Ok(other) => {
+                        debug!(visitor_name = %visitor_name, v1_type = %other.v1_type_byte(), "SUDP visitor '{}': unexpected message 0x{:02x}", visitor_name, other.v1_type_byte());
+                    }
+                    Err(e) => {
+                        debug!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': read closed: {}", visitor_name, e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Polls `shutdown` every 100ms until it is set.
+async fn wait_sudp_shutdown(shutdown: &Arc<AtomicBool>) {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

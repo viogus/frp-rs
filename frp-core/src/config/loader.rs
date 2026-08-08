@@ -1,5 +1,8 @@
 use super::client::{AuthClientConfig, ClientConfig, ProxyConfig, VisitorConfig};
-use super::normalize::{normalize_client_config, normalize_server_config, toml_to_json};
+use super::normalize::{
+    expand_env_vars, expand_template_functions, normalize_client_config, normalize_server_config,
+    toml_to_json,
+};
 use super::server::{PortsRange, ServerConfig, ValueSource};
 use crate::feature_gate::VIRTUAL_NET;
 
@@ -137,6 +140,8 @@ pub fn load_server_config_from_str(
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let mut value: toml::Value =
         toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
+    expand_env_vars(&mut value);
+    expand_template_functions(&mut value);
     normalize_server_config(&mut value);
     let presence = ConfigPresence::from_normalized_value(&value);
     let json_value = toml_to_json(value);
@@ -154,6 +159,8 @@ pub fn load_client_config_from_str(
 ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let mut value: toml::Value =
         toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
+    expand_env_vars(&mut value);
+    expand_template_functions(&mut value);
     normalize_client_config(&mut value);
     let presence = ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(toml_to_json(value))

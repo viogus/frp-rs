@@ -1,4 +1,4 @@
-use super::normalize::{normalize_client_config, normalize_server_config};
+use super::normalize::{expand_env_vars, normalize_client_config, normalize_server_config};
 use super::strict::{check_strict, levenshtein};
 use super::*;
 use crate::feature_gate::VIRTUAL_NET;
@@ -272,6 +272,9 @@ password = "secret"
 [auth.oidc]
 skipExpiryCheck = true
 skipIssuerCheck = true
+skipAudience = true
+additionalAudience = ["api-prod", "api-staging"]
+trustedCaFile = "/etc/ssl/custom-ca.pem"
 
 [[httpPlugins]]
 name = "hook"
@@ -294,6 +297,12 @@ VirtualNet = true
     assert_eq!(cfg.http_plugins.len(), 1);
     assert!(cfg.auth.oidc_skip_expiry);
     assert!(cfg.auth.oidc_skip_issuer);
+    assert!(cfg.auth.oidc_skip_audience);
+    assert_eq!(
+        cfg.auth.oidc_additional_audience,
+        vec!["api-prod", "api-staging"]
+    );
+    assert_eq!(cfg.auth.oidc_tls_trusted_ca_file, "/etc/ssl/custom-ca.pem");
     assert_eq!(cfg.feature.gates.get("VirtualNet"), Some(&true));
 }
 
@@ -2216,6 +2225,29 @@ fn log_to_alias_works() {
     assert_eq!(cfg.file, "/var/log/frps.log");
 }
 
+// ── MEDIUM-3b: LogConfig `format` field ────────────────────────────
+
+#[test]
+fn log_format_defaults_to_text() {
+    let cfg = super::LogConfig::default();
+    assert_eq!(cfg.format, "text");
+}
+
+#[test]
+fn log_format_parses_json() {
+    let toml = "level = \"info\"\nformat = \"json\"\nmax_days = 0\n";
+    let cfg: super::LogConfig = toml::from_str(toml).unwrap();
+    assert_eq!(cfg.format, "json");
+}
+
+#[test]
+fn log_format_preserved_when_absent() {
+    // A config without `format` must still deserialize (serde default).
+    let toml = "level = \"debug\"\n";
+    let cfg: super::LogConfig = toml::from_str(toml).unwrap();
+    assert_eq!(cfg.format, "text");
+}
+
 // ── MEDIUM-4: WebServer addr default ────────────────────────────────
 
 #[test]
@@ -2283,4 +2315,705 @@ max_pool_count = 10
     let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
     assert_eq!(cfg.transport.heartbeat_timeout, 120);
     assert_eq!(cfg.transport.max_pool_count, 10);
+}
+
+// ─── YAML config support (Go frp v0.70.1 Viper parity) ──────────────
+
+/// Parse a YAML server config through the full pipeline (YAML → toml::Value
+/// → normalize → deserialize), mirroring `load_server_config_from_str` for
+/// TOML.
+fn load_server_config_from_yaml(yaml: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
+    expand_env_vars(&mut value);
+    normalize_server_config(&mut value);
+    let presence = super::loader::ConfigPresence::from_normalized_value(&value);
+    let json_value = super::normalize::toml_to_json(value);
+    let mut cfg: ServerConfig =
+        serde_json::from_value(json_value).map_err(|e| format!("config validation error: {e}"))?;
+    super::loader::validate_server_config(&cfg)?;
+    cfg.transport
+        .complete_with_heartbeat_timeout_set(presence.server_heartbeat_timeout_set);
+    cfg.complete();
+    Ok(cfg)
+}
+
+/// Parse a YAML client config through the full pipeline, mirroring
+/// `load_client_config_from_str` for TOML.
+fn load_client_config_from_yaml(yaml: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
+    expand_env_vars(&mut value);
+    normalize_client_config(&mut value);
+    let presence = super::loader::ConfigPresence::from_normalized_value(&value);
+    let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
+        .map_err(|e| format!("config validation error: {e}"))?;
+    super::loader::validate_client_config(&cfg)?;
+    cfg.complete_with_heartbeat_set(
+        presence.client_heartbeat_interval_set,
+        presence.client_heartbeat_timeout_set,
+    );
+    Ok(cfg)
+}
+
+#[test]
+fn test_detect_format_yaml_extensions() {
+    use super::format::{detect_format, ConfigFormat};
+    assert_eq!(detect_format("frps.yaml"), ConfigFormat::Yaml);
+    assert_eq!(detect_format("frpc.yml"), ConfigFormat::Yaml);
+    assert_eq!(
+        detect_format("frps.YAML"),
+        ConfigFormat::Yaml,
+        "case-insensitive"
+    );
+    assert_eq!(detect_format("frps.toml"), ConfigFormat::Toml);
+}
+
+#[test]
+fn test_server_yaml_equivalent_to_toml() {
+    let toml = r#"
+bind_addr = "0.0.0.0"
+bind_port = 7000
+
+[auth]
+method = "token"
+token = "my-token"
+
+[log]
+level = "info"
+"#;
+    let yaml = r#"
+bind_addr: "0.0.0.0"
+bind_port: 7000
+auth:
+  method: token
+  token: my-token
+log:
+  level: info
+"#;
+    let toml_cfg = super::load_server_config_from_str(toml).unwrap();
+    let yaml_cfg = load_server_config_from_yaml(yaml).unwrap();
+    assert_eq!(toml_cfg.bind_addr, yaml_cfg.bind_addr);
+    assert_eq!(toml_cfg.bind_port, yaml_cfg.bind_port);
+    assert_eq!(toml_cfg.auth.method, yaml_cfg.auth.method);
+    assert_eq!(toml_cfg.auth.token, yaml_cfg.auth.token);
+    assert_eq!(toml_cfg.log.level, yaml_cfg.log.level);
+}
+
+#[test]
+fn test_client_yaml_equivalent_to_toml() {
+    let toml = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "client-token"
+
+[[proxies]]
+name = "web"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 8080
+remote_port = 7001
+"#;
+    let yaml = r#"
+server_addr: "127.0.0.1"
+server_port: 7000
+token: client-token
+proxies:
+  - name: web
+    type: tcp
+    local_ip: "127.0.0.1"
+    local_port: 8080
+    remote_port: 7001
+"#;
+    let toml_cfg = super::load_client_config_from_str(toml).unwrap();
+    let yaml_cfg = load_client_config_from_yaml(yaml).unwrap();
+    assert_eq!(toml_cfg.server_addr, yaml_cfg.server_addr);
+    assert_eq!(toml_cfg.server_port, yaml_cfg.server_port);
+    assert_eq!(toml_cfg.token, yaml_cfg.token);
+    assert_eq!(toml_cfg.proxies.len(), yaml_cfg.proxies.len());
+    let (tp, yp) = (&toml_cfg.proxies[0], &yaml_cfg.proxies[0]);
+    assert_eq!(tp.name, yp.name);
+    assert_eq!(tp.proxy_type, yp.proxy_type);
+    assert_eq!(tp.local_ip, yp.local_ip);
+    assert_eq!(tp.local_port, yp.local_port);
+    assert_eq!(tp.remote_port, yp.remote_port);
+}
+
+#[test]
+fn test_yaml_merge_key_applied_at_parse_time() {
+    let yaml = r#"
+defaults: &defaults
+  a: 1
+  b: 2
+merged:
+  <<: *defaults
+  b: 3
+"#;
+    let value =
+        super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml).unwrap();
+    let merged = value.get("merged").expect("merged table");
+    assert_eq!(
+        merged.get("a").and_then(toml::Value::as_integer),
+        Some(1),
+        "inherited key from <<"
+    );
+    assert_eq!(
+        merged.get("b").and_then(toml::Value::as_integer),
+        Some(3),
+        "explicit key wins over merge"
+    );
+    assert!(merged.get("<<").is_none(), "merge key must be consumed");
+}
+
+#[test]
+fn test_yaml_merge_key_merges_anchor_fields() {
+    let yaml = r#"
+server_addr: "127.0.0.1"
+server_port: 7000
+proxies:
+  - &base
+    name: base
+    type: tcp
+    local_ip: "127.0.0.1"
+    use_encryption: true
+  - <<: *base
+    name: merged
+    local_port: 8080
+    remote_port: 7001
+"#;
+    let cfg = load_client_config_from_yaml(yaml).unwrap();
+    assert_eq!(cfg.proxies.len(), 2);
+    let merged = cfg.proxies.iter().find(|p| p.name == "merged").unwrap();
+    assert_eq!(merged.local_ip, "127.0.0.1", "<< merged local_ip");
+    assert!(merged.use_encryption, "<< merged use_encryption");
+    assert_eq!(merged.local_port, 8080, "explicit field wins over merge");
+    assert_eq!(merged.remote_port, 7001);
+}
+
+#[test]
+fn test_yaml_include_file_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("frps.toml");
+    std::fs::write(
+        &main_path,
+        r#"
+bind_addr = "0.0.0.0"
+bind_port = 7000
+includes = ["extra.yaml"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("extra.yaml"),
+        r#"
+auth:
+  method: token
+  token: "yaml-token"
+"#,
+    )
+    .unwrap();
+    let cfg = super::load_server_config(main_path.to_str().unwrap(), false).unwrap();
+    assert_eq!(cfg.bind_addr, "0.0.0.0");
+    assert_eq!(cfg.bind_port, 7000);
+    assert_eq!(cfg.auth.method, "token");
+    assert_eq!(
+        cfg.auth.token, "yaml-token",
+        "include .yaml should merge auth.token"
+    );
+}
+
+#[test]
+fn test_collect_config_files_includes_yaml_and_yml() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        "a.toml",
+        "b.yaml",
+        "c.yml",
+        "d.json",
+        "notes.txt",
+        "CONFIG.YAML",
+    ] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("e.yaml"), "").unwrap();
+    std::fs::write(dir.path().join("sub").join("f.ini"), "").unwrap();
+    let files = super::collect_config_files(dir.path()).unwrap();
+    let names: Vec<String> = files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    for expected in [
+        "a.toml",
+        "b.yaml",
+        "c.yml",
+        "d.json",
+        "e.yaml",
+        "f.ini",
+        "CONFIG.YAML",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing {expected}: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n == "notes.txt"),
+        "non-config file collected: {names:?}"
+    );
+}
+
+// ─── Env var expansion (Go frp Viper `${ENV_VAR}` parity) ───────────
+//
+// All variable names use the unique `FRP_RS_TEST_ENV_` prefix. Tests run in
+// parallel in one process, so each test touches only its own variable name.
+
+#[test]
+fn test_env_var_expansion_basic() {
+    std::env::set_var("FRP_RS_TEST_ENV_SERVER", "10.0.0.1");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "${FRP_RS_TEST_ENV_SERVER}"
+server_port = 7000
+token = "pre-${FRP_RS_TEST_ENV_SERVER}-post"
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_SERVER");
+    assert_eq!(cfg.server_addr, "10.0.0.1", "basic ${{VAR}} expansion");
+    assert_eq!(
+        cfg.token, "pre-10.0.0.1-post",
+        "multiple/embedded ${{VAR}} expansion in one string"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_undefined_becomes_empty() {
+    // Guarantee the variable is unset in this process.
+    std::env::remove_var("FRP_RS_TEST_ENV_UNSET");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+token = "x${FRP_RS_TEST_ENV_UNSET}y"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.token, "xy",
+        "undefined ${{VAR}} expands to the empty string (Go Viper parity)"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_nested_positions() {
+    std::env::set_var("FRP_RS_TEST_ENV_NESTED_IP", "192.168.1.5");
+    std::env::set_var("FRP_RS_TEST_ENV_NESTED_NAME", "env-proxy");
+    std::env::set_var("FRP_RS_TEST_ENV_NESTED_TOKEN", "secret-token");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "${FRP_RS_TEST_ENV_NESTED_TOKEN}"
+
+[[proxies]]
+name = "${FRP_RS_TEST_ENV_NESTED_NAME}"
+type = "tcp"
+local_ip = "${FRP_RS_TEST_ENV_NESTED_IP}"
+local_port = 8080
+remote_port = 7001
+
+[store]
+path = "/tmp/${FRP_RS_TEST_ENV_NESTED_NAME}.json"
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_NESTED_IP");
+    std::env::remove_var("FRP_RS_TEST_ENV_NESTED_NAME");
+    std::env::remove_var("FRP_RS_TEST_ENV_NESTED_TOKEN");
+    assert_eq!(cfg.token, "secret-token");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].name, "env-proxy");
+    assert_eq!(cfg.proxies[0].local_ip, "192.168.1.5");
+    assert_eq!(
+        cfg.store.as_ref().unwrap().path,
+        "/tmp/env-proxy.json",
+        "nested [store] table value expanded"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_double_dollar_to_literal() {
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+token = "a$$b"
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.token, "a$b", "$$ collapses to a literal $");
+}
+
+#[test]
+fn test_env_var_expansion_escaped_brace_is_literal() {
+    std::env::set_var("FRP_RS_TEST_ENV_ESCAPED", "SHOULD_NOT_APPEAR");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+token = "$${FRP_RS_TEST_ENV_ESCAPED}"
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_ESCAPED");
+    assert_eq!(
+        cfg.token, "${FRP_RS_TEST_ENV_ESCAPED}",
+        "$${{VAR}} stays a literal ${{VAR}} (escape hatch)"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_ignores_bare_dollar() {
+    std::env::set_var("FRP_RS_TEST_ENV_NOBRACE", "nope");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+token = "$FRP_RS_TEST_ENV_NOBRACE"
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_NOBRACE");
+    assert_eq!(
+        cfg.token, "$FRP_RS_TEST_ENV_NOBRACE",
+        "bare $VAR (no braces) is not expanded"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_yaml_format() {
+    std::env::set_var("FRP_RS_TEST_ENV_YAML_SERVER", "yaml-host");
+    let cfg = load_client_config_from_yaml(
+        r#"
+server_addr: ${FRP_RS_TEST_ENV_YAML_SERVER}
+server_port: 7000
+"#,
+    )
+    .unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_YAML_SERVER");
+    assert_eq!(
+        cfg.server_addr, "yaml-host",
+        "env expansion applies to all formats' toml::Value output"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_in_include_file() {
+    std::env::set_var("FRP_RS_TEST_ENV_INCLUDE_TOKEN", "inc-token");
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("frps.toml");
+    std::fs::write(
+        &main_path,
+        r#"
+bind_addr = "0.0.0.0"
+bind_port = 7000
+includes = ["extra.toml"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("extra.toml"),
+        r#"
+token = "${FRP_RS_TEST_ENV_INCLUDE_TOKEN}"
+"#,
+    )
+    .unwrap();
+    let cfg = super::load_server_config(main_path.to_str().unwrap(), false).unwrap();
+    std::env::remove_var("FRP_RS_TEST_ENV_INCLUDE_TOKEN");
+    assert_eq!(
+        cfg.auth.token, "inc-token",
+        "include file values are env-expanded (expansion runs after includes merge)"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_unclosed_brace_kept_verbatim() {
+    // `${` with no closing `}` stays literal (no panic, no expansion).
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "abc-${UNCLOSED"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.auth.as_ref().unwrap().token,
+        "abc-${UNCLOSED",
+        "unclosed dollar-brace kept verbatim"
+    );
+}
+
+#[test]
+fn test_env_var_expansion_empty_name() {
+    // `${}` (empty name) expands to the empty string.
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "a${}b"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.auth.as_ref().unwrap().token,
+        "ab",
+        "${{}} expands to empty string"
+    );
+}
+
+// ─── Template function expansion (Go frp `{{ parseNumberRange ... }}`) ──
+
+/// Expand `{{ parseNumberRange ... }}` in a single string through the
+/// `expand_template_functions` pass (the toml::Value tree entry point).
+fn expand_template_in_str(s: &str) -> String {
+    let mut value = toml::Value::String(s.to_string());
+    super::normalize::expand_template_functions(&mut value);
+    value.as_str().unwrap().to_string()
+}
+
+#[test]
+fn test_parse_number_range_basic() {
+    assert_eq!(
+        expand_template_in_str(r#"{{ parseNumberRange "7000-7003" }}"#),
+        "7000,7001,7002,7003"
+    );
+    assert_eq!(
+        expand_template_in_str(r#"{{ parseNumberRange "7000" }}"#),
+        "7000",
+        "single number"
+    );
+}
+
+#[test]
+fn test_parse_number_range_mixed_segments() {
+    assert_eq!(
+        expand_template_in_str(r#"{{ parseNumberRange "7000-7001,7005" }}"#),
+        "7000,7001,7005",
+        "range and single numbers mixed in one expression"
+    );
+    assert_eq!(
+        expand_template_in_str(r#"{{ parseNumberRange "7000 , 7003-7004" }}"#),
+        "7000,7003,7004",
+        "whitespace around components is trimmed (Go TrimSpace semantics)"
+    );
+}
+
+#[test]
+fn test_parse_number_range_embedded_in_longer_string() {
+    assert_eq!(
+        expand_template_in_str(r#"8080,{{ parseNumberRange "9000-9001" }}"#),
+        "8080,9000,9001",
+        "expansion concatenated with surrounding text"
+    );
+    assert_eq!(
+        expand_template_in_str(r#"http://127.0.0.1:{{ parseNumberRange "8000-8001" }}/path"#),
+        "http://127.0.0.1:8000,8001/path",
+        "expansion inside a URL-like string"
+    );
+}
+
+#[test]
+fn test_parse_number_range_multiple_calls_in_one_string() {
+    assert_eq!(
+        expand_template_in_str(
+            r#"{{ parseNumberRange "7000-7001" }}|{{ parseNumberRange "9000" }}"#
+        ),
+        "7000,7001|9000",
+        "several calls each expand in place"
+    );
+}
+
+#[test]
+fn test_parse_number_range_whitespace_variants() {
+    assert_eq!(
+        expand_template_in_str(r#"{{  parseNumberRange  "7000"  }}"#),
+        "7000",
+        "whitespace after {{ and before }} is allowed"
+    );
+    assert_eq!(
+        expand_template_in_str(r#"{{parseNumberRange "7000"}}"#),
+        "7000",
+        "no whitespace at all is also accepted"
+    );
+    assert_eq!(
+        expand_template_in_str("{{\n\tparseNumberRange\t\"7000\"\n}}"),
+        "7000",
+        "newline/tab whitespace is allowed"
+    );
+}
+
+#[test]
+fn test_parse_number_range_invalid_kept_verbatim() {
+    let invalid = r#"{{ parseNumberRange "abc" }}"#;
+    assert_eq!(
+        expand_template_in_str(invalid),
+        invalid,
+        "non-numeric expression kept verbatim"
+    );
+    let reversed = r#"{{ parseNumberRange "5-2" }}"#;
+    assert_eq!(
+        expand_template_in_str(reversed),
+        reversed,
+        "N > M range kept verbatim"
+    );
+    let multi_dash = r#"{{ parseNumberRange "1-2-3" }}"#;
+    assert_eq!(
+        expand_template_in_str(multi_dash),
+        multi_dash,
+        "segment with more than one '-' kept verbatim"
+    );
+    let empty = r#"{{ parseNumberRange "" }}"#;
+    assert_eq!(
+        expand_template_in_str(empty),
+        empty,
+        "empty expression kept verbatim"
+    );
+}
+
+#[test]
+fn test_parse_number_range_out_of_port_range_kept_verbatim() {
+    let over = r#"{{ parseNumberRange "70000" }}"#;
+    assert_eq!(
+        expand_template_in_str(over),
+        over,
+        "port above 65535 kept verbatim"
+    );
+    let range_over = r#"{{ parseNumberRange "60000-70000" }}"#;
+    assert_eq!(
+        expand_template_in_str(range_over),
+        range_over,
+        "range reaching above 65535 kept verbatim"
+    );
+    let negative = r#"{{ parseNumberRange "-1" }}"#;
+    assert_eq!(
+        expand_template_in_str(negative),
+        negative,
+        "negative port kept verbatim"
+    );
+}
+
+#[test]
+fn test_parse_number_range_non_call_templates_kept_verbatim() {
+    // Other `{{ ... }}` text is NOT template syntax for us — only the exact
+    // parseNumberRange call form is expanded (deliberate subset).
+    let other = "{{ .Envs.X }}";
+    assert_eq!(
+        expand_template_in_str(other),
+        other,
+        "non-parseNumberRange template text kept verbatim"
+    );
+    let mixed = "a{{ parseNumberRange \"7000\" }}b{{ .Envs.X }}c";
+    assert_eq!(
+        expand_template_in_str(mixed),
+        "a7000b{{ .Envs.X }}c",
+        "only the parseNumberRange call is expanded"
+    );
+}
+
+#[test]
+fn test_parse_number_range_env_then_template() {
+    // Env expansion runs first (env → template), so a ${VAR} inside the
+    // template argument is expanded before parseNumberRange sees it.
+    // RAII guard: removes the var even if the loader panics.
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+    std::env::remove_var("FRP_RS_TEST_ENV_RANGE");
+    let _guard = EnvGuard("FRP_RS_TEST_ENV_RANGE");
+    std::env::set_var("FRP_RS_TEST_ENV_RANGE", "7000-7002");
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = '{{ parseNumberRange "${FRP_RS_TEST_ENV_RANGE}" }}'
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.auth.as_ref().unwrap().token,
+        "7000,7001,7002",
+        "env var inside the template argument expanded first"
+    );
+}
+
+#[test]
+fn test_parse_number_range_full_pipeline_allow_ports() {
+    // Server pipeline end-to-end: allow_ports is a comma-separated port-list
+    // string, so the expansion result feeds straight into its validator.
+    let cfg: ServerConfig = load_server_config_from_str(
+        r#"
+bind_port = 7000
+allow_ports = '{{ parseNumberRange "7100-7102,7105" }}'
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.allow_ports, "7100,7101,7102,7105");
+}
+
+#[test]
+fn test_parse_number_range_array_and_table_positions() {
+    let mut value: toml::Value = toml::from_str(
+        r#"
+port = '{{ parseNumberRange "7100-7101" }}'
+list = ['{{ parseNumberRange "7200-7201" }}', 'x-{{ parseNumberRange "7300" }}-y']
+[deep.nested]
+range = '{{ parseNumberRange "7400-7402" }}'
+"#,
+    )
+    .unwrap();
+    super::normalize::expand_template_functions(&mut value);
+    assert_eq!(
+        value.get("port").and_then(toml::Value::as_str),
+        Some("7100,7101"),
+        "top-level string value"
+    );
+    let list = value.get("list").and_then(toml::Value::as_array).unwrap();
+    assert_eq!(list[0].as_str(), Some("7200,7201"), "array element");
+    assert_eq!(
+        list[1].as_str(),
+        Some("x-7300-y"),
+        "embedded in array element"
+    );
+    assert_eq!(
+        value
+            .get("deep")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("nested"))
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("range"))
+            .and_then(toml::Value::as_str),
+        Some("7400,7401,7402"),
+        "nested table value"
+    );
+}
+
+#[test]
+fn test_parse_number_range_edge_inputs_kept_verbatim() {
+    // Edge inputs that Go's ParseRangeNumbers rejects (or that fall outside
+    // our minimal subset) must be kept verbatim, never half-expanded.
+    let cases = [
+        // trailing comma -> empty segment
+        "{{ parseNumberRange \"7000,\" }}",
+        // unclosed quote -> not a call
+        "{{ parseNumberRange \"7000 }}",
+        // u64-overflowing number -> no panic, kept verbatim
+        "{{ parseNumberRange \"99999999999999999999\" }}",
+        // escaped quote inside argument -> outside subset, kept verbatim
+        "{{ parseNumberRange \"a\\\"b\" }}",
+    ];
+    for (i, input) in cases.iter().enumerate() {
+        let mut value: toml::Value = toml::from_str(&format!("token = '{input}'")).unwrap();
+        super::normalize::expand_template_functions(&mut value);
+        let token = value.get("token").unwrap().as_str().unwrap();
+        assert_eq!(token, *input, "case {i}: kept verbatim");
+    }
 }

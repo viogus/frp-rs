@@ -276,6 +276,9 @@ impl Service {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             oidc_skip_nbf: false,
+            oidc_skip_audience: false,
+            oidc_additional_audience: Vec::new(),
+            oidc_tls_trusted_ca_file: String::new(),
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
@@ -775,6 +778,7 @@ impl Service {
                 .unwrap_or_default();
             let server_scopes = self.server_auth_scopes.read().await.clone();
             // Bind local UDP sockets for UDP proxies.
+
             macro_rules! work_conn_config {
                 ($pool_id:expr) => {{
                     #[cfg(feature = "quic")]

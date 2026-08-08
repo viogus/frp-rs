@@ -101,6 +101,57 @@ pub fn start_echo_server(port: u16) -> JoinHandle<()> {
     })
 }
 
+/// Allocate a UDP port that is bindable and not handed out to any test in
+/// this process.
+///
+/// Distinct from [`allocate_port`] (TCP): TCP and UDP port spaces are
+/// independent, so a TCP-probed port can be held by a parallel test's UDP
+/// socket. UDP-typed ports (SUDP echo servers, SUDP visitor bind ports)
+/// must come from here.
+#[allow(dead_code)] // used only by the sudp e2e target
+pub fn allocate_udp_port() -> u16 {
+    for _ in 0..64 {
+        let socket = match std::net::UdpSocket::bind("127.0.0.1:0") {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let port = match socket.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => break,
+        };
+        drop(socket);
+        {
+            let mut used = USED_PORTS.lock().unwrap();
+            if !used.insert(port) {
+                continue; // already handed out in this process — probe again
+            }
+            // Narrow the probe-then-drop window: confirm the port is still
+            // UDP-bindable before handing it out.
+            if std::net::UdpSocket::bind(format!("127.0.0.1:{port}")).is_err() {
+                used.remove(&port);
+                continue;
+            }
+        }
+        return port;
+    }
+    sandbox_fallback()
+}
+
+/// Start a simple UDP echo server on the given port.
+/// Every datagram received is sent back to its source.
+#[allow(dead_code)] // used only by the sudp e2e target
+pub fn start_udp_echo_server(port: u16) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let socket = tokio::net::UdpSocket::bind(format!("127.0.0.1:{}", port))
+            .await
+            .expect("udp echo server bind");
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(&buf[..n], src).await;
+        }
+    })
+}
+
 /// Start the frps server on the given port with an optional auth token.
 pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
     let cfg = ServerConfig {
