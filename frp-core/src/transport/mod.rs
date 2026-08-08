@@ -269,7 +269,7 @@ impl IoStream {
     /// Created after V2 handshake with crypto negotiation.
     #[allow(non_snake_case)]
     pub fn Aead(inner: Box<AeadStream>) -> Self {
-        Self(Box::new(*inner))
+        Self(inner)
     }
 
     /// SSH reverse-forward channel (type-erased).
