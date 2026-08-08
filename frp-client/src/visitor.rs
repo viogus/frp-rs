@@ -1017,12 +1017,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 /// - on disconnect/idle timeout the worker returns to the wait state and the
 ///   next datagram reconnects
 ///
-/// ENCRYPTION TRADEOFF (first version): the data plane is plaintext-only.
-/// Go frp encrypts the whole framed stream with `sk`; the Rust provider
-/// (`run_udp_work_conn`) instead encrypts/decrypts each UDPPacket payload
-/// per packet. These two models are mutually incompatible, so until the
-/// encryption model is unified this visitor always exchanges plaintext
-/// UDPPacket messages and logs a warning when `use_encryption=true`.
+/// ENCRYPTION: the SUDP data plane uses the Go-frp three-segment model —
+/// the visitor segment (visitor frpc ↔ frps) is encrypted with
+/// `derive_key(sk)` (CipherReader/CipherWriter around the conn in
+/// `run_sudp_worker`, symmetric with the server's `split_user_side`), the
+/// provider segment (frps ↔ provider frpc) with `derive_key(auth token)`.
+/// `use_compression` on the visitor is ignored with a warning (visitor-segment
+/// compression is not implemented yet).
 pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
     let VisitorListenerConfig {
         server_addr,
