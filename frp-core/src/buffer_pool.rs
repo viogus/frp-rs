@@ -41,7 +41,9 @@ static MAX_POOLED_BUFFERS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FRP_BRIDGE_POOL_MAX")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n <= 4096)
+        // Lower bound 4: a 0-capacity ArrayQueue drops every buffer and the
+        // pool degrades to per-bridge allocation.
+        .filter(|n| *n >= 4 && *n <= 4096)
         .unwrap_or(128)
 });
 

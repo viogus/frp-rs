@@ -80,6 +80,9 @@ pub struct ServerConfig {
     /// has no per-proxy cap; default). A flood of user connections to one
     /// proxy would otherwise grow `pending_requests` + fds without bound
     /// (audit D2-2). Go frp compat: no equivalent option.
+    /// Clamped to 1,048,576 (2^20) at normalization: larger values are
+    /// effectively unlimited but would overflow the `i64` normalized field
+    /// (u64::MAX -> -1) and truncate on 32-bit `usize` casts.
     #[serde(default, alias = "maxConnsPerProxy")]
     pub max_conns_per_proxy: u64,
     /// Timeout in seconds for backend HTTP response in VHost handler.
@@ -189,7 +192,7 @@ impl ServerConfigSnapshot {
             subdomain_host: cfg.sub_domain_host.clone(),
             max_pool_count: cfg.transport.max_pool_count,
             max_ports_per_client: cfg.max_ports_per_client as i64,
-            max_conns_per_proxy: cfg.max_conns_per_proxy as i64,
+            max_conns_per_proxy: cfg.max_conns_per_proxy.min(1_048_576) as i64,
             heartbeat_timeout: cfg.transport.heartbeat_timeout,
             allow_ports_str: cfg.allow_ports.clone(),
             tls_force: cfg.tls_only,

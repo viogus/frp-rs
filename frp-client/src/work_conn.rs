@@ -794,9 +794,11 @@ async fn run_udp_work_conn(
         let mut payload = Vec::with_capacity(udp_packet_size.max(1));
         // local_addr is loop-invariant (already parsed to a SocketAddr at
         // startup); pre-build the UdpAddr once and move it in/out per packet
-        // instead of re-parsing the string every packet (audit D1-5).
-        let mut local_udp_addr: Option<msg::UdpAddr> =
-            Some(msg::UdpAddr::from_string(&local_addr_str).expect("local_addr parsed at startup"));
+        // instead of re-parsing the string every packet (audit D1-5). An
+        // invalid local_addr is a recoverable config error (warned at
+        // startup, run_udp_work_conn continues) — degrade to None (the old
+        // per-packet from_string would return None too), never panic.
+        let mut local_udp_addr: Option<msg::UdpAddr> = msg::UdpAddr::from_string(&local_addr_str);
         // Ping-pong scratch for the per-packet compress chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
         let mut keepalive = tokio::time::interval(Duration::from_secs(30));

@@ -209,7 +209,7 @@ async fn handle_control_inner<S>(
     loop {
         // Expire stale pending requests
         while let Some(req) = ctl.pending_requests.pop_front() {
-            if req.created_at.elapsed() > pool::pending_request_timeout(state.user_conn_timeout) {
+            if req.created_at.elapsed() >= pool::pending_request_timeout(state.user_conn_timeout) {
                 pool_stats
                     .pending_requests
                     .store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
@@ -222,7 +222,7 @@ async fn handle_control_inner<S>(
 
         // Expire stale pending_udp entries
         while let Some((proxy_name, ts)) = ctl.pending_udp.pop_front() {
-            if ts.elapsed() > pool::pending_request_timeout(state.user_conn_timeout) {
+            if ts.elapsed() >= pool::pending_request_timeout(state.user_conn_timeout) {
                 debug!(%proxy_name, timeout = ?pool::pending_request_timeout(state.user_conn_timeout), "Pending UDP request for proxy '{}' timed out after {:?}", proxy_name, pool::pending_request_timeout(state.user_conn_timeout));
             } else {
                 ctl.pending_udp.push_front((proxy_name, ts));

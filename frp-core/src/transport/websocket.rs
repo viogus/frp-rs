@@ -2,10 +2,11 @@
 //! WebSocket messages and a byte stream suitable for the V1/V2 protocol
 //! functions, and implements [`Transport`].
 //!
-//! Two modes:
-//! - Tungstenite: client side (binary frames, RFC 6455 compliant)
-//! - Raw: server side (manual framing, tolerates text frames for
-//!   backward compatibility with Go frp < v0.70.1)
+//! Single mode — manual RFC 6455 framing (client + server, binary frames;
+//! the server tolerates text frames for backward compatibility with Go frp
+//! < v0.70.1). The previous tungstenite-based variant was removed
+//! 2026-08-09 (audit D1-1/D1-2/D1-3): it had no callers, and the manual
+//! path reuses buffers across frames (no per-frame allocation).
 
 use std::io;
 use std::pin::Pin;
@@ -569,6 +570,9 @@ impl AsyncWrite for WsByteStream {
                 match Pin::new(raw.as_mut()).poll_write(cx, write_buf) {
                     Poll::Ready(Ok(n)) if n >= write_buf.len() => {
                         write_buf.clear(); // keep capacity for next chunk
+                                           // Return the *input* bytes consumed (buf.len()), per
+                                           // the AsyncWrite contract — the WS frame overhead
+                                           // (2-14 header bytes) is not part of the stream.
                         Poll::Ready(Ok(buf.len()))
                     }
                     Poll::Ready(Ok(n)) => {
@@ -585,7 +589,12 @@ impl AsyncWrite for WsByteStream {
                     }
                 }
             } else if *needs_flush {
-                // Continue writing a partially-flushed frame.
+                // Continue writing a partially-flushed frame. When the old
+                // frame finishes, the CURRENT buf has NOT been written — it
+                // must not be reported as written (returning Ok(buf.len())
+                // here would make write_all drop it → data loss). Return
+                // Pending; the caller re-polls with the same buf, which then
+                // builds and writes a fresh frame.
                 let remaining = &write_buf[*write_pos..];
                 match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
                     Poll::Ready(Ok(n)) => {
@@ -593,11 +602,11 @@ impl AsyncWrite for WsByteStream {
                         if *write_pos >= write_buf.len() {
                             *write_pos = 0;
                             *needs_flush = false;
-                            Poll::Ready(Ok(buf.len()))
+                            cx.waker().wake_by_ref();
                         } else {
                             cx.waker().wake_by_ref();
-                            Poll::Pending
                         }
+                        Poll::Pending
                     }
                     Poll::Ready(Err(e)) => {
                         *needs_flush = false;

@@ -158,8 +158,9 @@ pub struct PoolMetrics {
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     pub drops: AtomicU64,
-    /// Idle timeout for pooled work conns. `Duration::ZERO` = disabled.
-    pub idle_timeout: Duration,
+    // (pooled-conn idle timeout was removed 2026-08-09, audit D2-3: never
+    // wired from config, Go parity keeps pooled conns alive; the field and
+    // its consumer were dead code.)
 }
 
 /// State for a TCP group's shared listener.
@@ -501,7 +502,7 @@ pub struct AppState {
     /// counter increases from new connections started just before the accept
     /// loop shut down are expected and handled.
     pub active_connections: AtomicU64,
-    /// Aggregate work-conn pool metrics (hits/misses/drops/idle_timeout).
+    /// Aggregate work-conn pool metrics (hits/misses/drops).
     /// Updated atomically from control handlers, read by Prometheus /admin API.
     pub pool: PoolMetrics,
     /// Immutable snapshot of server config fields exposed via dashboard v2 API.

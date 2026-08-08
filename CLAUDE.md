@@ -62,7 +62,7 @@ Feature flags across crates:
 |---------|-------|---------|
 | `quic` | frp-core | QUIC transport (quinn) — **default ON** (was opt-in) |
 | `kcp` | frp-core | KCP transport (in-tree, kcp-go v5.6.13 aligned) |
-| `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
+| `websocket` | frp-core/server | WebSocket transport (manual RFC 6455 framing, no tungstenite since 2026-08-09) |
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, hyper) |
 | `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
 | `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
@@ -306,7 +306,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | SSH | `russh` | ring backend (NOT aws-lc-rs), features: ring+rsa only |
 | HTTP client | inline `frp_core::http_client` | hyper + hyper-rustls direct (not reqwest — size-pruned); OIDC + http-proxy + dashboard health use it |
 | HTTP server | `axum` | dashboard, admin auth |
-| WebSocket | `tokio-tungstenite` | |
+| WebSocket | manual RFC 6455 framing (in-tree `websocket.rs`; `tokio-tungstenite` removed 2026-08-09) |
 | Encoding | inline `frp_core::base64` (encode/decode) + `frp_core::hex_encode` | standard base64 alphabet + `=` padding, wire-compatible with Go `base64.StdEncoding` |
 | Compression | `snap` | Snappy, pure Rust |
 | QUIC | `quinn` | |

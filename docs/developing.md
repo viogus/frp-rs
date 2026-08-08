@@ -457,7 +457,7 @@ The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, an
 |---------|-------|-----------------|
 | `quic` | frp-core | QUIC transport (quinn) — **default ON** (was opt-in) |
 | `kcp` | frp-core | KCP transport (in-tree, kcp-go v5.6.13 aligned) |
-| `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
+| `websocket` | frp-core/server | WebSocket transport (manual RFC 6455 framing, no tungstenite since 2026-08-09) |
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, hyper via `http-client`) |
 | `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
 | `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
@@ -776,7 +776,7 @@ The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be 
 | SSH | `russh` (ring backend, NOT aws-lc-rs) |
 | HTTP client | `hyper` + `hyper-rustls` + `hyper-util` (inline `frp_core::http_client`; OIDC/proxy/plugin — no reqwest) |
 | HTTP server | `axum` |
-| WebSocket | `tokio-tungstenite` |
+| WebSocket | manual RFC 6455 framing (in-tree `websocket.rs`; `tokio-tungstenite` removed 2026-08-09) |
 | Encoding | inline `frp_core::base64` (encode/decode) + `frp_core::hex_encode` |
 | Compression | `snap` |
 | QUIC | `quinn` |

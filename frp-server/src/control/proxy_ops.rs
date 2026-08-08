@@ -228,16 +228,43 @@ async fn allocate_proxy_port(
                 .find(|p| crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, *p))
         };
         // Commit under write lock; re-check to close the race with a
-        // concurrent registration.
+        // concurrent registration. On conflict (TOCTOU: two registrations
+        // probed the same candidate), retry once inside the lock with the
+        // next free candidate — the old in-lock scan would have continued
+        // to the next available port instead of failing the registration.
         match candidate {
             Some(p) => {
                 let mut ports = state.used_ports.write().await;
                 if ports.contains(&p) {
-                    tracing::warn!(
+                    tracing::debug!(
                         port = %p,
-                        "Port {p} was taken by a concurrent registration during allocation",
+                        "Port {p} taken by a concurrent registration during allocation, retrying in-lock",
                     );
-                    None
+                    let retry = {
+                        let used = &*ports;
+                        crate::proxy::pick_tcp_port_candidates(used, 0, &allow_ports, 64)
+                            .into_iter()
+                            .find(|c| {
+                                !ports.contains(c)
+                                    && crate::proxy::is_tcp_port_bindable(
+                                        &state.proxy_bind_addr,
+                                        *c,
+                                    )
+                            })
+                    };
+                    match retry {
+                        Some(p2) => {
+                            ports.insert(p2);
+                            Some(p2)
+                        }
+                        None => {
+                            tracing::warn!(
+                                ranges = ?allow_ports,
+                                "Port exhaustion after allocation race: no available ports",
+                            );
+                            None
+                        }
+                    }
                 } else {
                     ports.insert(p);
                     Some(p)
@@ -908,6 +935,10 @@ pub(crate) async fn handle_new_proxy(
 
     // TCP group proxy: try to join an existing group first.
     // Go frp dev compat: group members share a single port with round-robin dispatch.
+    // NOTE (review): benign TOCTOU — a concurrent deregistration can remove
+    // the group between our port insert (below) and the callee's
+    // failure-path removal; the stale reservation is lazily cleaned by the
+    // 24h expiry sweep, so no correctness issue.
     let mut tcp_group_created = false;
     if is_tcp_group {
         let group_name = np.group.as_deref().unwrap_or("");
