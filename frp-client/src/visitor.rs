@@ -1076,6 +1076,15 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         );
     }
 
+    // Force the declaration to match the plaintext data plane. If we left
+    // use_encryption=true here, the NewVisitorConn would tell the provider
+    // (which reads its OWN proxy config and encrypts per-packet via
+    // work_conn.rs encrypt_into) that the tunnel is encrypted — it would
+    // then AES-128-CFB-encrypt the return traffic and we would ship raw
+    // ciphertext to the local UDP client: silent corruption. Both sides
+    // must agree on plaintext, so the warn above is the entire story.
+    let (use_encryption, use_compression) = (false, false);
+
     let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -1147,8 +1156,10 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
+                // Deliberately NOT biased: under heavy local UDP traffic the
+                // recv_from branch would always be ready and starve the
+                // shutdown poll.
                 tokio::select! {
-                    biased;
                     _ = wait_sudp_shutdown(&shutdown_l) => {
                         info!(visitor_name = %name_l, "SUDP visitor '{}' listener shutting down", name_l);
                         break;
@@ -1399,11 +1410,30 @@ async fn run_sudp_worker(
         warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write first UDPPacket failed: {}", visitor_name, e);
         return;
     }
+    // Go sudp.go: a 60s idle tunnel (no traffic either way) tears down and
+    // the next datagram reconnects. Deadline is reset on every activity —
+    // NOT a fresh sleep() per loop iteration, which would never fire (the
+    // 100ms shutdown poll would always win the select and restart it).
+    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
+        // Fast-path shutdown check: the 100ms wait_sudp_shutdown poll below
+        // can be starved under sustained bidirectional traffic (unbiased
+        // select picks among ready branches), so check the flag directly on
+        // every iteration.
+        if shutdown.load(Ordering::Relaxed) {
+            info!(visitor_name = %visitor_name, "SUDP visitor '{}' shutting down", visitor_name);
+            break;
+        }
+        // Deliberately NOT biased: an always-ready send channel (local UDP
+        // flood) must not starve the read side (return traffic), and the
+        // idle/shutdown branches must stay reachable.
         tokio::select! {
-            biased;
             _ = wait_sudp_shutdown(shutdown) => {
                 info!(visitor_name = %visitor_name, "SUDP visitor '{}' shutting down", visitor_name);
+                break;
+            }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                debug!(visitor_name = %visitor_name, "SUDP visitor '{}': 60s idle timeout, closing tunnel", visitor_name);
                 break;
             }
             pkt = send_rx.recv() => {
@@ -1413,6 +1443,7 @@ async fn run_sudp_worker(
                             debug!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write UDPPacket failed: {}", visitor_name, e);
                             break;
                         }
+                        idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
                     }
                     None => {
                         debug!(visitor_name = %visitor_name, "SUDP visitor '{}': send channel closed", visitor_name);
@@ -1423,6 +1454,7 @@ async fn run_sudp_worker(
             msg_result = read_msg_v1(&mut srv_r) => {
                 match msg_result {
                     Ok(FrpMessage::UDPPacket(up)) => {
+                        idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
                         if read_tx.send(up).await.is_err() {
                             debug!(visitor_name = %visitor_name, "SUDP visitor '{}': reader loop dropped", visitor_name);
                             break;
@@ -1440,12 +1472,6 @@ async fn run_sudp_worker(
                         break;
                     }
                 }
-            }
-            // Go sudp.go: connTimeout of 60s with no traffic tears down the
-            // tunnel; the next datagram reconnects.
-            _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                debug!(visitor_name = %visitor_name, "SUDP visitor '{}': 60s idle timeout, closing tunnel", visitor_name);
-                break;
             }
         }
     }

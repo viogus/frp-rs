@@ -704,6 +704,8 @@ async fn dns_query(
 
     let ips = parse_dns_response(&buf[..n], txid, qtype)
         .map_err(|e| crate::Error::Transport(format!("DNS resolve {host}: {e}").into()))?;
+    // First matching address only (A preferred by the caller; the Vec keeps
+    // the door open for future Happy-Eyeballs style multi-address use).
     Ok(ips[0].to_string())
 }
 

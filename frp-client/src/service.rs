@@ -737,7 +737,18 @@ impl Service {
             for p in &proxies {
                 if p.proxy_type == "udp" || p.proxy_type == "sudp" {
                     let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                    let enc = (p.use_encryption, p.use_compression);
+                    // SUDP data plane is plaintext-first (visitor forces
+                    // plaintext too, see run_sudp_visitor_listener): the
+                    // per-packet AES-128-CFB transform in work_conn.rs must
+                    // NOT be applied on SUDP work conns, or the visitor's
+                    // plaintext payloads would be decrypt-encrypted into
+                    // corruption. The user-facing warning lives on the
+                    // visitor side; keep both sides in sync.
+                    let enc = if p.proxy_type == "sudp" {
+                        (false, false)
+                    } else {
+                        (p.use_encryption, p.use_compression)
+                    };
                     {
                         let mut cfg = udp_enc_cfg.lock().await;
                         cfg.insert(local_addr.clone(), enc);

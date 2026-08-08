@@ -142,6 +142,71 @@ async fn test_sudp_e2e_roundtrip() {
     }
 }
 
+/// Regression: `use_encryption=true` on the proxy/visitor must NOT corrupt
+/// the data plane. The SUDP data plane is plaintext-first — both sides force
+/// plaintext and the NewVisitorConn declaration must match the wire (a
+/// provider that believed the tunnel was encrypted would AES-CFB-encrypt the
+/// return traffic and we would ship ciphertext to the local UDP client).
+#[tokio::test]
+async fn test_sudp_e2e_encryption_config_declared_but_plaintext() {
+    let echo_port = allocate_udp_port();
+    let server_port = allocate_port();
+    let visitor_port = allocate_udp_port();
+
+    let _echo_handle = start_udp_echo_server(echo_port);
+    let _server_handle = start_frps(server_port, "test-token").await;
+
+    common::init_tracing();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server port ready");
+
+    // Both sides configured with use_encryption=true (and compression).
+    let mut proxy = sudp_proxy("sudp-echo", echo_port);
+    proxy.use_encryption = true;
+    proxy.use_compression = true;
+    let mut visitor = sudp_visitor("sudp-visitor", "sudp-echo", visitor_port);
+    visitor.use_encryption = true;
+    visitor.use_compression = true;
+
+    let client_cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port,
+        token: "test-token".into(),
+        login_fail_exit: false,
+        tcp_mux: false,
+        tls_enable: false,
+        pool_count: 2,
+        proxies: vec![proxy],
+        visitors: vec![visitor],
+        ..Default::default()
+    };
+    let client_service = ClientService::new(client_cfg, None)
+        .await
+        .expect("create client service");
+    tokio::spawn(async move {
+        let _ = client_service.run().await;
+    });
+
+    let visitor_addr: SocketAddr = format!("127.0.0.1:{}", visitor_port).parse().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    wait_for_udp_tunnel(&client, visitor_addr, Duration::from_secs(15))
+        .await
+        .expect("SUDP tunnel ready");
+
+    // Plaintext payload must survive the relay byte-for-byte even though the
+    // config asked for encryption (which is ignored with a warning).
+    let payload = b"encryption-config-must-not-corrupt-the-plane";
+    let reply = udp_roundtrip(&client, visitor_addr, payload).await;
+    assert_eq!(
+        &reply, payload,
+        "declared-but-plaintext data plane must not corrupt payloads"
+    );
+}
+
 /// Multiple local UDP clients (different source addresses) share the single
 /// visitor socket; each reply must be routed back to the datagram's origin.
 #[tokio::test]

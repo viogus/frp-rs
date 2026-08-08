@@ -1,4 +1,5 @@
 // ─── Format detection ────────────────────────────────────────────────
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum ConfigFormat {
@@ -119,8 +120,14 @@ fn yaml_value_to_json(v: serde_yaml_ng::Value) -> serde_json::Value {
             serde_json::Value::Object(object)
         }
         // `!Tag` values (e.g. `!Newtype 1`) carry no configuration meaning;
-        // unwrap to the tagged value itself.
-        serde_yaml_ng::Value::Tagged(tagged) => yaml_value_to_json(tagged.value),
+        // unwrap to the tagged value itself (lossy: the tag name is dropped).
+        serde_yaml_ng::Value::Tagged(tagged) => {
+            debug!(
+                "YAML tagged value in config (tag dropped): {:?}",
+                tagged.tag
+            );
+            yaml_value_to_json(tagged.value)
+        }
     }
 }
 
