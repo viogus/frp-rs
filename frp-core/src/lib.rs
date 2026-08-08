@@ -32,6 +32,7 @@ pub mod protocol;
 pub mod proxy_protocol;
 #[cfg(feature = "quic")]
 pub mod quic;
+pub mod snappy_stream;
 #[cfg(target_os = "linux")]
 pub mod splice;
 /// STUN RFC 3489/5389 binding helpers, used only by frp-client XTCP/STCP NAT

@@ -1017,13 +1017,12 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 /// - on disconnect/idle timeout the worker returns to the wait state and the
 ///   next datagram reconnects
 ///
-/// ENCRYPTION: the SUDP data plane uses the Go-frp three-segment model —
-/// the visitor segment (visitor frpc ↔ frps) is encrypted with
-/// `derive_key(sk)` (CipherReader/CipherWriter around the conn in
-/// `run_sudp_worker`, symmetric with the server's `split_user_side`), the
+/// ENCRYPTION/COMPRESSION: the SUDP data plane uses the Go-frp three-segment
+/// model — the visitor segment (visitor frpc ↔ frps) is encrypted with
+/// `derive_key(sk)` and compressed with a Snappy stream (SnappyStream +
+/// CipherReader/CipherWriter around the conn in `run_sudp_worker`, symmetric
+/// with the server's `split_user_side`, snappy inner / CFB outer), the
 /// provider segment (frps ↔ provider frpc) with `derive_key(auth token)`.
-/// `use_compression` on the visitor is ignored with a warning (visitor-segment
-/// compression is not implemented yet).
 pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
     let VisitorListenerConfig {
         server_addr,
@@ -1067,25 +1066,12 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
     } = config;
 
     // Go frp v0.70.1 three-stage model: the visitor segment is encrypted
-    // with `derive_key(sk)` when the visitor declares use_encryption. The
+    // with `derive_key(sk)` when the visitor declares use_encryption and
+    // compressed with a Snappy stream when it declares use_compression. The
     // server (bridge.rs `split_user_side`) wraps its user-side connection
-    // with the same key, and we wrap the data-plane stream in
-    // `run_sudp_worker` — the NewVisitorConn declaration and both ends of
-    // the visitor segment now agree. Visitor-segment compression is NOT
-    // implemented (the server also ignores NewVisitorConn use_compression),
-    // so it stays ignored with a warning.
-    if use_compression {
-        warn!(
-            visitor_name = %name,
-            use_compression,
-            "SUDP visitor '{}': use_compression={} is configured but visitor-segment \
-             compression is not implemented; continuing without compression",
-            name,
-            use_compression
-        );
-    }
-    // Never declare compression on the wire (nothing compresses).
-    let use_compression = false;
+    // with the same key / Snappy layer, and we wrap the data-plane stream in
+    // `run_sudp_worker` — the NewVisitorConn declaration and both ends of the
+    // visitor segment now agree (snappy inner, CFB outer, Go parity).
 
     let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
         Ok(s) => Arc::new(s),
@@ -1266,6 +1252,7 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
             &name,
             &shutdown,
             use_encryption,
+            use_compression,
             &secret_key,
         )
         .await;
@@ -1394,12 +1381,14 @@ async fn connect_sudp_visitor_stream(
 ///
 /// When the visitor declared `use_encryption` (and `sk` is non-empty), the
 /// server-side half of the connection is wrapped in `CipherReader` /
-/// `CipherWriter` with `derive_key(sk)` — the visitor segment of Go frp's
-/// three-stage model. The V1 frame protocol then runs on top of the
-/// encrypted stream, symmetric with the server's `split_user_side` (the
-/// server decrypts the same stream with the same key). CipherWriter sends
-/// its random IV on the first write (or eager flush), so the first
-/// `UDPPacket` carries the IV.
+/// `CipherWriter` with `derive_key(sk)`, and when it declared
+/// `use_compression` the halves are additionally wrapped in
+/// `SnappyStreamReader`/`SnappyStreamWriter` — the visitor segment of Go
+/// frp's three-stage model, snappy **inner** and CFB **outer** (Go
+/// `WithCompression` + `WithEncryption`). The V1 frame protocol then runs on
+/// top of the wrapped stream, symmetric with the server's `split_user_side`.
+/// CipherWriter sends its random IV on the first write (or eager flush), so
+/// the first `UDPPacket` carries the IV.
 #[allow(clippy::too_many_arguments)]
 async fn run_sudp_worker(
     server_conn: IoStream,
@@ -1409,6 +1398,7 @@ async fn run_sudp_worker(
     visitor_name: &str,
     shutdown: &Arc<AtomicBool>,
     use_encryption: bool,
+    use_compression: bool,
     secret_key: &str,
 ) {
     let (srv_r, srv_w) = match split_work_conn_halves(server_conn) {
@@ -1418,19 +1408,34 @@ async fn run_sudp_worker(
             return;
         }
     };
-    // Visitor-segment encryption: wrap both halves with derive_key(sk),
-    // symmetric with the server's split_user_side. The V1 frame protocol
-    // (read_msg_v1/write_msg_v1) then runs over the encrypted stream.
+    // Visitor-segment encryption/compression: wrap both halves symmetrically
+    // with the server's split_user_side. Wire order (Go parity): snappy is
+    // the inner layer, CFB the outer — write plaintext → snappy → CFB →
+    // socket. The V1 frame protocol (read_msg_v1/write_msg_v1) then runs over
+    // the wrapped stream.
     let use_enc = use_encryption && !secret_key.is_empty();
-    let srv_r: BoxedReadHalf = if use_enc {
-        let key = frp_core::encryption::derive_key(secret_key);
-        Box::new(frp_core::cipher_stream::CipherReader::new(srv_r, key)) as BoxedReadHalf
+    let enc_key = use_enc.then(|| frp_core::encryption::derive_key(secret_key));
+    let srv_r: BoxedReadHalf = if use_compression {
+        let inner: BoxedReadHalf = if let Some(key) = enc_key {
+            Box::new(frp_core::cipher_stream::CipherReader::new(srv_r, key))
+        } else {
+            srv_r
+        };
+        Box::new(frp_core::snappy_stream::SnappyStreamReader::new(inner))
+    } else if let Some(key) = enc_key {
+        Box::new(frp_core::cipher_stream::CipherReader::new(srv_r, key))
     } else {
         srv_r
     };
-    let mut srv_w: BoxedWriteHalf = if use_enc {
-        let key = frp_core::encryption::derive_key(secret_key);
-        Box::new(frp_core::cipher_stream::CipherWriter::new(srv_w, key)) as BoxedWriteHalf
+    let mut srv_w: BoxedWriteHalf = if use_compression {
+        let inner: BoxedWriteHalf = if let Some(key) = enc_key {
+            Box::new(frp_core::cipher_stream::CipherWriter::new(srv_w, key))
+        } else {
+            srv_w
+        };
+        Box::new(frp_core::snappy_stream::SnappyStreamWriter::new(inner))
+    } else if let Some(key) = enc_key {
+        Box::new(frp_core::cipher_stream::CipherWriter::new(srv_w, key))
     } else {
         srv_w
     };

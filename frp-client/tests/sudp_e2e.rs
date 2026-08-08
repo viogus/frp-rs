@@ -207,6 +207,71 @@ async fn test_sudp_e2e_encrypted_roundtrip() {
     );
 }
 
+/// Go-parity three-segment compression only (no encryption): `use_compression=true`
+/// on the SUDP proxy + visitor must produce a working tunnel (visitor segment
+/// compressed with a Snappy stream, provider segment with the per-packet
+/// compressor). The data plane must roundtrip byte-for-byte.
+#[tokio::test]
+async fn test_sudp_e2e_compressed_roundtrip() {
+    let echo_port = allocate_udp_port();
+    let server_port = allocate_port();
+    let visitor_port = allocate_udp_port();
+
+    let _echo_handle = start_udp_echo_server(echo_port);
+    let _server_handle = start_frps(server_port, "test-token").await;
+
+    common::init_tracing();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server port ready");
+
+    // Both sides configured with use_compression=true (no encryption).
+    let mut proxy = sudp_proxy("sudp-echo", echo_port);
+    proxy.use_compression = true;
+    let mut visitor = sudp_visitor("sudp-visitor", "sudp-echo", visitor_port);
+    visitor.use_compression = true;
+
+    let client_cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port,
+        token: "test-token".into(),
+        login_fail_exit: false,
+        tcp_mux: false,
+        tls_enable: false,
+        pool_count: 2,
+        proxies: vec![proxy],
+        visitors: vec![visitor],
+        ..Default::default()
+    };
+    let client_service = ClientService::new(client_cfg, None)
+        .await
+        .expect("create client service");
+    tokio::spawn(async move {
+        let _ = client_service.run().await;
+    });
+
+    let visitor_addr: SocketAddr = format!("127.0.0.1:{}", visitor_port).parse().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    wait_for_udp_tunnel(&client, visitor_addr, Duration::from_secs(15))
+        .await
+        .expect("SUDP tunnel ready");
+
+    // Payload must survive the relay byte-for-byte with compression enabled
+    // (a repetitive payload exercises the snappy fast path on both segments).
+    // Kept under the UDP data-plane packet limit (udpPacketSize, default
+    // 1500) — larger datagrams are truncated by the provider's recv buffer,
+    // independent of compression.
+    let payload = vec![0x41u8; 1024]; // highly compressible
+    let reply = udp_roundtrip(&client, visitor_addr, &payload).await;
+    assert_eq!(
+        &reply, &payload,
+        "compressed SUDP data plane must roundtrip without corruption"
+    );
+}
+
 /// Multiple local UDP clients (different source addresses) share the single
 /// visitor socket; each reply must be routed back to the datagram's origin.
 #[tokio::test]

@@ -8,7 +8,7 @@ use frp_core::config::PluginConfig;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
-use frp_core::transport::{self, DialOptions, TransportProtocol};
+use frp_core::transport::{self, BoxedReadHalf, BoxedWriteHalf, DialOptions, TransportProtocol};
 use frp_core::VERSION;
 
 use super::{PluginContext, PluginHandle};
@@ -319,13 +319,46 @@ async fn handle_visitor_conn(
 
     // 5. Bridge user_conn ↔ server_stream
     let (mut u_r, mut u_w) = tokio::io::split(user_conn);
-    let (mut s_r, mut s_w) = match frp_core::transport::split_work_conn_halves(server_stream) {
+    let (s_r, s_w) = match frp_core::transport::split_work_conn_halves(server_stream) {
         Ok(pair) => pair,
         Err(e) => {
             return Err(format!(
                 "visitor plugin: could not split server stream: {e}"
             ))
         }
+    };
+
+    // Visitor-segment encryption/compression, symmetric with the server's
+    // `split_user_side` (Go three-segment model stage 1): the server wraps
+    // its user-side half in CipherReader/CipherWriter (`derive_key(sk)`) and
+    // SnappyStream when the visitor declared use_encryption/use_compression,
+    // so the plugin bridge must apply the same wrappers (snappy inner, CFB
+    // outer) or the server would decrypt/decompress a plaintext stream.
+    let use_enc = use_encryption && !secret_key.is_empty();
+    let enc_key = use_enc.then(|| frp_core::encryption::derive_key(secret_key));
+    let mut s_r: BoxedReadHalf = if use_compression {
+        let inner: BoxedReadHalf = if let Some(key) = enc_key {
+            Box::new(frp_core::cipher_stream::CipherReader::new(s_r, key))
+        } else {
+            s_r
+        };
+        Box::new(frp_core::snappy_stream::SnappyStreamReader::new(inner))
+    } else if let Some(key) = enc_key {
+        Box::new(frp_core::cipher_stream::CipherReader::new(s_r, key))
+    } else {
+        s_r
+    };
+    let mut s_w: BoxedWriteHalf = if use_compression {
+        let inner: BoxedWriteHalf = if let Some(key) = enc_key {
+            Box::new(frp_core::cipher_stream::CipherWriter::new(s_w, key))
+        } else {
+            s_w
+        };
+        Box::new(frp_core::snappy_stream::SnappyStreamWriter::new(inner))
+    } else if let Some(key) = enc_key {
+        Box::new(frp_core::cipher_stream::CipherWriter::new(s_w, key))
+    } else {
+        s_w
     };
 
     let a = tokio::spawn(async move {

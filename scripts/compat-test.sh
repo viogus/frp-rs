@@ -3631,7 +3631,7 @@ TOML
         > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
     track_pid $!
 
-    # Start Go frpc visitor (SUDP, encrypted visitor segment)
+    # Start Go frpc visitor (SUDP, encrypted + compressed visitor segment)
     cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
 serverAddr = "127.0.0.1"
 serverPort = $frps_port
@@ -3649,6 +3649,7 @@ secretKey = "$sk"
 bindAddr = "127.0.0.1"
 bindPort = $visitor_port
 transport.useEncryption = true
+transport.useCompression = true
 TOML
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
         > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
@@ -3659,6 +3660,109 @@ TOML
 
     local result
     result=$(send_and_expect_udp "$visitor_port" "sudp-enc-data" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc SUDP visitor (compressed) -> Rust frps (sudpPort) -> Rust frpc
+#       SUDP provider (plaintext provider segment)
+# Go visitor transport.useCompression=true wraps the visitor segment in a
+# Snappy stream (no encryption here); Rust frps must decompress it via
+# `split_user_side`'s SnappyStreamReader and join it to the plaintext
+# provider segment. Validates Rust↔Go snappy-framed interop on the visitor
+# segment.
+# =============================================================================
+test_g2r_sudp_comp() {
+    local name="go-to-rust-sudp-comp"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local sudp_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-g2r-sudp-comp"
+    local sk="sudp-secret-key-comp-53"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Rust frps with SUDP port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+sudpPort = $sudp_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Rust frpc provider (SUDP, plaintext)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+tls_enable = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "sudp-echo"
+type = "sudp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+sk = "$sk"
+TOML
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+
+    # Start Go frpc visitor (SUDP, compressed visitor segment only)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-visitor-$name.log"
+log.level = "debug"
+
+[[visitors]]
+name = "sudp-visitor"
+type = "sudp"
+serverName = "sudp-echo"
+secretKey = "$sk"
+bindAddr = "127.0.0.1"
+bindPort = $visitor_port
+transport.useCompression = true
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    # SUDP visitor is a UDP listener; give registration a moment.
+    sleep 2
+
+    local result
+    result=$(send_and_expect_udp "$visitor_port" "sudp-comp-data" 15)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else

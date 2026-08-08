@@ -12,6 +12,7 @@ use frp_core::encryption::derive_key;
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
+use frp_core::snappy_stream::{SnappyStreamReader, SnappyStreamWriter};
 use frp_core::transport::{split_work_conn_halves, IoStream};
 
 use crate::service::AppState;
@@ -580,23 +581,43 @@ type UserBridgeHalves = (
 
 /// Split the visitor (user) conn into bridge halves, wrapping them in
 /// `CipherReader`/`CipherWriter` with `derive_key(sk)` when visitor-segment
-/// encryption is enabled (`visitor_enc_key = Some(key)`).
+/// encryption is enabled (`visitor_enc_key = Some(key)`) and in
+/// `SnappyStreamReader`/`SnappyStreamWriter` when visitor-segment compression
+/// is enabled (`visitor_comp`).
+///
+/// Wire order matches Go frp's `VisitorManager.NewConn` (`WithEncryption`
+/// outer, `WithCompression` inner): write plaintext → snappy → CFB → socket,
+/// so the enc+comp wrapper is `SnappyStreamReader::new(CipherReader::new(...))`
+/// / `SnappyStreamWriter::new(CipherWriter::new(...))`. A compression-only
+/// visitor wraps the raw halves in Snappy directly.
+///
+/// When the `compression` feature is disabled, `SnappyStream*` degrades to a
+/// transparent passthrough, so a compression-only visitor bridges plaintext
+/// (same behavior as the provider-segment `compress_chunk_into` passthrough).
 ///
 /// Returns `Err` (with a warn-worthy message) only when the underlying
 /// transport cannot be split (same guard as `split_work_conn_halves`).
 fn split_user_side(
     visitor_enc_key: Option<[u8; 16]>,
+    visitor_comp: bool,
     user_conn: IoStream,
 ) -> Result<UserBridgeHalves, &'static str> {
-    match visitor_enc_key {
-        Some(key) => {
-            let (u_r, u_w) = split_work_conn_halves(user_conn)?;
-            Ok((
-                Box::new(CipherReader::new(u_r, key)),
-                Box::new(CipherWriter::new(u_w, key)),
-            ))
-        }
-        None => split_work_conn_halves(user_conn),
+    let (u_r, u_w) = split_work_conn_halves(user_conn)?;
+    let (u_r, u_w): UserBridgeHalves = if let Some(key) = visitor_enc_key {
+        (
+            Box::new(CipherReader::new(u_r, key)),
+            Box::new(CipherWriter::new(u_w, key)),
+        )
+    } else {
+        (u_r, u_w)
+    };
+    if visitor_comp {
+        Ok((
+            Box::new(SnappyStreamReader::new(u_r)),
+            Box::new(SnappyStreamWriter::new(u_w)),
+        ))
+    } else {
+        Ok((u_r, u_w))
     }
 }
 
@@ -695,18 +716,32 @@ async fn run_work_bridge(
         None
     };
 
-    // Whether visitor-segment encryption is on. The user conn is NOT split
-    // here — each bridge branch below calls `split_user_side(visitor_enc_key,
-    // req.user_conn)`, which wraps the halves in CipherReader/CipherWriter
-    // only when the key is present (keeping the plain IoStream available for
-    // the relay_plain_fast splice path). CipherWriter::poll_flush already
-    // sends the IV eagerly, and the first write to the user side carries it,
-    // so no manual IV flush is needed.
+    // Whether visitor-segment encryption/compression is on. The user conn is
+    // NOT split here — each bridge branch below calls
+    // `split_user_side(visitor_enc_key, visitor_comp, req.user_conn)`, which
+    // wraps the halves in CipherReader/CipherWriter (when the key is present)
+    // and SnappyStreamReader/SnappyStreamWriter (when compression is on),
+    // keeping the plain IoStream available for the relay_plain_fast splice
+    // path (only taken when neither wrapping applies). CipherWriter::poll_flush
+    // already sends the IV eagerly, and the first write to the user side
+    // carries it, so no manual IV flush is needed.
     let visitor_encrypted = visitor_enc_key.is_some();
     if visitor_encrypted {
         debug!(
             proxy_name = %req.proxy_name,
             "Visitor-segment encryption on for proxy '{}' (derive_key(sk))", req.proxy_name
+        );
+    }
+
+    // Visitor-segment compression: from the visitor's NewVisitorConn
+    // use_compression declaration (`[[visitors]] transport.useCompression`),
+    // Go 三段式第 1 段. Applied in `split_user_side` below — Snappy stream
+    // inside the CFB layer when visitor-segment encryption is also on.
+    let visitor_comp = req.visitor_use_compression;
+    if visitor_comp {
+        debug!(
+            proxy_name = %req.proxy_name,
+            "Visitor-segment compression on for proxy '{}'", req.proxy_name
         );
     }
 
@@ -751,7 +786,7 @@ async fn run_work_bridge(
     // which writes them through the CipherWriter (matching Go frp streaming CFB).
     if use_enc {
         let key = encryption_key;
-        let (u_r, u_w) = match split_user_side(visitor_enc_key, req.user_conn) {
+        let (u_r, u_w) = match split_user_side(visitor_enc_key, visitor_comp, req.user_conn) {
             Ok(pair) => pair,
             Err(msg) => {
                 warn!("{msg}");
@@ -832,60 +867,38 @@ async fn run_work_bridge(
         // run to completion within the same function, and the work side is
         // only shut down after the full bidirectional copy finishes.
         //
-        // Visitor-segment encryption (if on) splits the user conn into
-        // Cipher halves, re-combined via `UserSide` for the same
-        // copy_bidirectional call.
+        // Visitor-segment encryption/compression (if on) split the user conn
+        // into wrapped halves (via `split_user_side`), re-combined via
+        // `UserSide` for the same copy_bidirectional call.
         if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
             // Sized buffers so FRP_BRIDGE_BUF_KB governs the XTCP STCP
             // fallback path too.
-            if let Some(key) = visitor_enc_key {
-                let (u_r, u_w) = match split_work_conn_halves(req.user_conn) {
-                    Ok(pair) => pair,
-                    Err(msg) => {
-                        warn!("{msg}");
-                        return;
-                    }
-                };
-                let mut user_side = UserSide {
-                    r: CipherReader::new(u_r, key),
-                    w: CipherWriter::new(u_w, key),
-                };
-                match tokio::io::copy_bidirectional_with_sizes(
-                    &mut user_side,
-                    &mut work_conn,
-                    *BUFFER_SIZE,
-                    *BUFFER_SIZE,
-                )
-                .await
-                {
-                    Ok((a, b)) => {
-                        metrics.record_traffic(a, b);
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
-                    }
+            let (u_r, u_w) = match split_user_side(visitor_enc_key, visitor_comp, req.user_conn) {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    warn!("{msg}");
+                    return;
                 }
-            } else {
-                let mut user_conn = req.user_conn;
-                match tokio::io::copy_bidirectional_with_sizes(
-                    &mut user_conn,
-                    &mut work_conn,
-                    *BUFFER_SIZE,
-                    *BUFFER_SIZE,
-                )
-                .await
-                {
-                    Ok((a, b)) => {
-                        metrics.record_traffic(a, b);
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
-                    }
+            };
+            let mut user_side = UserSide { r: u_r, w: u_w };
+            match tokio::io::copy_bidirectional_with_sizes(
+                &mut user_side,
+                &mut work_conn,
+                *BUFFER_SIZE,
+                *BUFFER_SIZE,
+            )
+            .await
+            {
+                Ok((a, b)) => {
+                    metrics.record_traffic(a, b);
+                }
+                Err(e) => {
+                    debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
                 }
             }
         } else if read_lim.is_some() || write_lim.is_some() {
             // Bandwidth limiting active: use rate-limited plain bridge.
-            let (u_r, u_w) = match split_user_side(visitor_enc_key, req.user_conn) {
+            let (u_r, u_w) = match split_user_side(visitor_enc_key, visitor_comp, req.user_conn) {
                 Ok(pair) => pair,
                 Err(msg) => {
                     warn!("{msg}");
@@ -933,17 +946,19 @@ async fn run_work_bridge(
             && bridge_pre_read.is_empty()
             && injector_headers.is_none()
             && !visitor_encrypted
+            && !visitor_comp
         {
             // Fast path: pure plain relay with no compression, no VHost
             // pre-read, no header injection, and no visitor-segment
-            // encryption (splice needs the raw IoStream; visitor encryption
-            // already split it into Cipher halves). On Linux, try zero-copy
-            // splice for Tcp-to-Tcp; otherwise use copy_bidirectional.
+            // encryption/compression (splice needs the raw IoStream; visitor
+            // wrapping already split it into wrapped halves). On Linux, try
+            // zero-copy splice for Tcp-to-Tcp; otherwise use
+            // copy_bidirectional.
             relay_plain_fast(req.user_conn, work_conn, &metrics).await;
         } else {
             // Slow path: compression, VHost pre-read, header injection, or
             // visitor-segment encryption.
-            let (u_r, u_w) = match split_user_side(visitor_enc_key, req.user_conn) {
+            let (u_r, u_w) = match split_user_side(visitor_enc_key, visitor_comp, req.user_conn) {
                 Ok(pair) => pair,
                 Err(msg) => {
                     warn!("{msg}");
