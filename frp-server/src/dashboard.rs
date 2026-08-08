@@ -533,8 +533,45 @@ async fn handle_client_detail(
     }))
 }
 
-async fn handle_root() -> Html<String> {
-    Html(include_str!("dashboard.html").replace("{version}", frp_core::VERSION))
+/// Dashboard root page. When `assets_dir` is configured, serve the
+/// `index.html` from that directory (Go frp `assetsDir` compat: custom
+/// dashboard HTML), falling back to the built-in page if the file is
+/// missing or unreadable.
+/// Load the dashboard root page. The custom `assets_dir/index.html` (Go
+/// frp `assetsDir` compat) is read once at startup and cached — Go loads
+/// its assets at startup too, and this keeps per-request file IO + warn
+/// spam out of the hot path.
+fn load_dashboard_page(assets_dir: &str) -> String {
+    let builtin = || include_str!("dashboard.html").replace("{version}", frp_core::VERSION);
+    if assets_dir.is_empty() {
+        return builtin();
+    }
+    let path = std::path::Path::new(assets_dir).join("index.html");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            tracing::info!(path = %path.display(), "dashboard: serving custom index.html from assets_dir");
+            content.replace("{version}", frp_core::VERSION)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                path = %path.display(),
+                "dashboard: assets_dir index.html not found, using built-in page"
+            );
+            builtin()
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "dashboard: failed to read assets_dir index.html, using built-in page"
+            );
+            builtin()
+        }
+    }
+}
+
+async fn handle_root(page: &str) -> Html<String> {
+    Html(page.to_string())
 }
 
 /// Go compat: `/debug/pprof` index. frp-rs has no Go-style pprof endpoints;
@@ -2564,6 +2601,8 @@ mod v2 {
 
 // --- Dashboard runner ---
 
+/// Start the dashboard web server (V1 + V2 API, metrics, UI).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_dashboard(
     addr: String,
     state: Arc<AppState>,
@@ -2572,6 +2611,7 @@ pub async fn run_dashboard(
     enable_prometheus: bool,
     tls_cert_file: Option<String>,
     tls_key_file: Option<String>,
+    assets_dir: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // API routes (auth-protected)
     let api_routes = Router::new()
@@ -2631,7 +2671,16 @@ pub async fn run_dashboard(
     }
     // Dashboard root (and any future /static assets) require auth, matching
     // Go: the web UI is only reachable with the configured credentials.
-    let protected = Router::new().route("/", get(handle_root));
+    let root_handler = {
+        // Read the custom page once at startup (Go loads assetsDir at
+        // startup too); the handler serves the cached string.
+        let page = load_dashboard_page(&assets_dir);
+        move || {
+            let page = page.clone();
+            async move { handle_root(&page).await }
+        }
+    };
+    let protected = Router::new().route("/", get(root_handler));
     let protected = apply_admin_auth(protected, &auth_user, &auth_password);
     app = app.merge(protected);
     // Spawn periodic traffic event broadcaster for WebSocket subscribers.

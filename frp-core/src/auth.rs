@@ -468,12 +468,8 @@ mod oidc_impl {
             tls_ca_file: Option<String>,
             proxy_url: Option<String>,
         ) -> Result<Self, String> {
-            if proxy_url.as_ref().is_some_and(|u| !u.is_empty()) {
-                return Err(
-                    "OIDC: HTTP proxy is not yet supported. Remove proxy_url from OIDC config."
-                        .into(),
-                );
-            }
+            // proxy_url routes OIDC HTTP requests through an HTTP CONNECT /
+            // SOCKS5 proxy (Go frp `oidcProxyUrl` compat).
 
             // Go frp v0.70.1 compat: a custom CA certificate PEM file for the
             // OIDC provider's TLS (openid-configuration / JWKS fetches). Mirrors
@@ -490,6 +486,7 @@ mod oidc_impl {
             let http = crate::http_client::HttpClientBuilder::new()
                 .timeout(std::time::Duration::from_secs(10))
                 .tls_ca_cert_pem(ca_cert_pem)
+                .proxy(proxy_url)
                 .build()?;
 
             let config_url = format!(
@@ -954,12 +951,8 @@ mod oidc_impl {
             proxy_url: Option<String>,
             token_source: Option<crate::config::ValueSource>,
         ) -> Result<Self, String> {
-            if proxy_url.as_ref().is_some_and(|u| !u.is_empty()) {
-                return Err(
-                    "OIDC client: HTTP proxy is not yet supported. Remove proxy_url from OIDC client config."
-                        .into(),
-                );
-            }
+            // proxy_url routes OIDC client HTTP requests through an HTTP
+            // CONNECT / SOCKS5 proxy (Go frp `oidcProxyUrl` compat).
 
             let ca_cert_pem =
                 if let Some(ref ca_file) = tls_trusted_ca_file.filter(|f| !f.is_empty()) {
@@ -978,6 +971,7 @@ mod oidc_impl {
                 .timeout(std::time::Duration::from_secs(10))
                 .tls_ca_cert_pem(ca_cert_pem)
                 .tls_skip_verify(tls_insecure_skip_verify)
+                .proxy(proxy_url)
                 .build()?;
 
             let endpoint = if token_source.is_some() {

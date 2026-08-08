@@ -49,6 +49,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 hyper = { version = "1", default-features = false, features = ["http1", "client"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
+# Needed for the OIDC HTTP client's custom hyper connector: hyper-util's
+# legacy `Connect` bound is `tower::Service`, which hyper 1.x does not
+# re-export (its own `service::Service` takes `&self`). tower-service 0.3
+# is already in the tree via axum/hyper; zero additional size.
+tower-service = "0.3"
 http-body-util = "0.1"
 webpki-roots = "0.26"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "tracing"] }

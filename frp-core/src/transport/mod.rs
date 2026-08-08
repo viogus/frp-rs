@@ -890,7 +890,7 @@ pub fn set_keepalive(stream: &tokio::net::TcpStream, secs: u64) {
 /// Returns an IoStream that tunnels to `target_host:target_port` — an
 /// `IoStream::BufferedRead` when the CONNECT response read-ahead captured
 /// bytes past the headers.
-async fn connect_via_proxy(
+pub(crate) async fn connect_via_proxy(
     proxy_url: &str,
     target_host: &str,
     target_port: u16,

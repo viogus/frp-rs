@@ -4,6 +4,22 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **OIDC `proxyUrl` supported (Go frp parity)**: `auth.oidcProxyUrl` on
+  server and client now routes OIDC HTTP requests (well-known config, JWKS,
+  token endpoint) through an HTTP CONNECT or SOCKS5 proxy — previously the
+  config parsed but the verifier/client rejected non-empty values at
+  startup. The OIDC HTTP client's hyper connector was rewritten to dial
+  through `transport::connect_via_proxy` (same proxy path as frpc↔frps
+  connections) when configured; direct connections are unchanged. Adds a
+  `tower-service` optional dependency (already in the tree via axum/hyper,
+  zero size) and end-to-end HTTP-CONNECT and HTTPS-in-tunnel proxy tests.
+
+- **Dashboard `assetsDir` served (Go frp parity)**: when `web_server.assetsDir`
+  is set and contains an `index.html`, the dashboard root serves that custom
+  page instead of the built-in one; missing/unreadable file falls back to
+  the built-in page with a warning. Previously the config parsed but was
+  never used.
+
 - **UDP proxy per-remote sessions (Go frp parity)**: each distinct remote
   visitor now gets its own ephemeral local UDP socket (bound on the local
   IP), so the local service sees a different source address per remote and

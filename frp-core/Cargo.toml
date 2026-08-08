@@ -45,6 +45,7 @@ jsonwebtoken = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-rustls = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
+tower-service = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
@@ -78,7 +79,7 @@ mem-profile = []
 profiling = ["dep:pprof"]
 debug-logs = []
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-http-client = ["dep:hyper", "dep:hyper-rustls", "dep:hyper-util", "dep:http-body-util", "dep:webpki-roots", "dep:rustls", "dep:bytes", "dep:http"]
+http-client = ["dep:hyper", "dep:hyper-rustls", "dep:hyper-util", "dep:http-body-util", "dep:webpki-roots", "dep:rustls", "dep:tokio-rustls", "dep:tower-service", "dep:bytes", "dep:http"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
