@@ -191,12 +191,32 @@ impl tower_service::Service<Uri> for HttpConnect {
                 });
             let is_tls = uri.scheme_str() == Some("https");
 
+            // host may be an IPv6 literal; hyper's Uri::host() strips the
+            // brackets from "[::1]" (the authority keeps them). Normalize
+            // both forms: strip brackets for SNI, re-add them for the
+            // connect address so both direct dials and proxy CONNECT
+            // targets parse.
+            let host_bare = host.trim_start_matches('[').trim_end_matches(']');
+            let connect_host = if host_bare.contains(':') {
+                format!("[{host_bare}]")
+            } else {
+                host_bare.to_string()
+            };
+            let connect_addr = format!("{connect_host}:{port}");
+
             let io = match &proxy_url {
                 Some(p) => {
-                    let timeout_secs = dial_timeout.as_secs().clamp(1, 60);
+                    // dial_timeout of 0 means "no deadline" (request() and
+                    // the plugin path rely on this); fall back to the
+                    // default rather than clamping to a 1 s dial.
+                    let timeout_secs = if dial_timeout.is_zero() {
+                        10
+                    } else {
+                        dial_timeout.as_secs().min(60)
+                    };
                     crate::transport::connect_via_proxy(
                         p,
-                        &host,
+                        &connect_host,
                         port,
                         timeout_secs,
                         0, // keepalive 0: OIDC/plugin requests are short-lived
@@ -205,16 +225,15 @@ impl tower_service::Service<Uri> for HttpConnect {
                     .map_err(std::io::Error::other)?
                 }
                 None => {
-                    let addr = format!("{host}:{port}");
-                    let tcp = tokio::net::TcpStream::connect(&addr).await?;
+                    let tcp = tokio::net::TcpStream::connect(&connect_addr).await?;
                     crate::transport::set_nodelay(&tcp);
                     crate::transport::IoStream::Tcp(tcp)
                 }
             };
 
             if is_tls {
-                let server_name =
-                    rustls::pki_types::ServerName::try_from(host).map_err(std::io::Error::other)?;
+                let server_name = rustls::pki_types::ServerName::try_from(host_bare.to_string())
+                    .map_err(std::io::Error::other)?;
                 let connector = tokio_rustls::TlsConnector::from(tls_config);
                 let tls = connector
                     .connect(server_name, io)
@@ -811,6 +830,88 @@ mod tests {
         assert_eq!(resp.text().await.unwrap(), "ok");
 
         target_task.await.unwrap();
+        proxy_task.await.unwrap();
+    }
+
+    /// HTTPS target through an HTTP CONNECT proxy: the TLS handshake must
+    /// happen *inside* the tunnel (the proxy only splices bytes), with SNI
+    /// for the target host. Uses a self-signed cert + tls_skip_verify.
+    #[tokio::test]
+    async fn https_via_proxy_tls_in_tunnel() {
+        use rcgen::{CertificateParams, KeyPair};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio_rustls::rustls::ServerConfig;
+
+        // Self-signed cert for "localhost".
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key.serialize_der()));
+
+        // Local HTTPS origin.
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = tcp_listener.local_addr().unwrap();
+        let server_cfg = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_cfg));
+        let origin_task = tokio::spawn(async move {
+            let (tcp, _) = tcp_listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.expect("TLS handshake in tunnel");
+            let mut buf = [0u8; 1024];
+            let n = tls.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("GET /secure"),
+                "expected GET /secure over TLS, got: {req:?}"
+            );
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nok!!")
+                .await
+                .unwrap();
+            // Flush + send close_notify so the client reads a clean EOF.
+            tls.flush().await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        // Local HTTP CONNECT proxy (byte splice).
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut client, _) = proxy.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = client.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("CONNECT localhost:"),
+                "expected CONNECT to localhost, got: {req:?}"
+            );
+            client
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut origin = tokio::net::TcpStream::connect(&origin_addr).await.unwrap();
+            tokio::io::copy_bidirectional(&mut client, &mut origin)
+                .await
+                .unwrap();
+        });
+
+        let http_client = HttpClientBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .tls_skip_verify(true)
+            .proxy(Some(format!("http://{proxy_addr}")))
+            .build()
+            .unwrap();
+        let resp = http_client
+            .get(&format!("https://localhost:{}/secure", origin_addr.port()))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(resp.text().await.unwrap(), "ok!!");
+
+        origin_task.await.unwrap();
         proxy_task.await.unwrap();
     }
 }

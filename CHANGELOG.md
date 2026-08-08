@@ -11,8 +11,8 @@ All notable changes to frp-rs.
   startup. The OIDC HTTP client's hyper connector was rewritten to dial
   through `transport::connect_via_proxy` (same proxy path as frpc↔frps
   connections) when configured; direct connections are unchanged. Adds a
-  `tower-service` dev dependency (already in the tree via axum/hyper, zero
-  size) and an end-to-end HTTP-CONNECT-proxy test.
+  `tower-service` optional dependency (already in the tree via axum/hyper,
+  zero size) and end-to-end HTTP-CONNECT and HTTPS-in-tunnel proxy tests.
 
 - **Dashboard `assetsDir` served (Go frp parity)**: when `web_server.assetsDir`
   is set and contains an `index.html`, the dashboard root serves that custom

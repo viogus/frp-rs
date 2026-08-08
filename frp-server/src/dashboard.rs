@@ -537,31 +537,41 @@ async fn handle_client_detail(
 /// `index.html` from that directory (Go frp `assetsDir` compat: custom
 /// dashboard HTML), falling back to the built-in page if the file is
 /// missing or unreadable.
-async fn handle_root(assets_dir: &str) -> Html<String> {
+/// Load the dashboard root page. The custom `assets_dir/index.html` (Go
+/// frp `assetsDir` compat) is read once at startup and cached — Go loads
+/// its assets at startup too, and this keeps per-request file IO + warn
+/// spam out of the hot path.
+fn load_dashboard_page(assets_dir: &str) -> String {
     let builtin = || include_str!("dashboard.html").replace("{version}", frp_core::VERSION);
-    if !assets_dir.is_empty() {
-        let path = std::path::Path::new(assets_dir).join("index.html");
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                tracing::debug!(path = %path.display(), "dashboard: serving custom index.html from assets_dir");
-                return Html(content.replace("{version}", frp_core::VERSION));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "dashboard: assets_dir index.html not found, using built-in page"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "dashboard: failed to read assets_dir index.html, using built-in page"
-                );
-            }
+    if assets_dir.is_empty() {
+        return builtin();
+    }
+    let path = std::path::Path::new(assets_dir).join("index.html");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            tracing::info!(path = %path.display(), "dashboard: serving custom index.html from assets_dir");
+            content.replace("{version}", frp_core::VERSION)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                path = %path.display(),
+                "dashboard: assets_dir index.html not found, using built-in page"
+            );
+            builtin()
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "dashboard: failed to read assets_dir index.html, using built-in page"
+            );
+            builtin()
         }
     }
-    Html(builtin())
+}
+
+async fn handle_root(page: &str) -> Html<String> {
+    Html(page.to_string())
 }
 
 /// Go compat: `/debug/pprof` index. frp-rs has no Go-style pprof endpoints;
@@ -2662,10 +2672,12 @@ pub async fn run_dashboard(
     // Dashboard root (and any future /static assets) require auth, matching
     // Go: the web UI is only reachable with the configured credentials.
     let root_handler = {
-        let assets_dir = assets_dir.clone();
+        // Read the custom page once at startup (Go loads assetsDir at
+        // startup too); the handler serves the cached string.
+        let page = load_dashboard_page(&assets_dir);
         move || {
-            let assets_dir = assets_dir.clone();
-            async move { handle_root(&assets_dir).await }
+            let page = page.clone();
+            async move { handle_root(&page).await }
         }
     };
     let protected = Router::new().route("/", get(root_handler));
