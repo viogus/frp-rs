@@ -1,0 +1,3 @@
+{"label":"steady","max_us":5248.666,"mean_us":594.1040055,"mode":"steady","msg_bytes":64,"p50_us":616.042,"p95_us":643.584,"p99_us":720.667,"samples":2000}
+{"label":"setup_cold","max_us":16931.041,"mean_us":1438.0996065,"mode":"setup","msg_bytes":64,"p50_us":1547.625,"p95_us":1857.042,"p99_us":2252.875,"samples":2000}
+{"label":"setup_warm","max_us":16622.167,"mean_us":1572.3891695,"mode":"setup","msg_bytes":64,"p50_us":1595.792,"p95_us":2151.417,"p99_us":2343.334,"samples":2000}
