@@ -836,12 +836,14 @@ mod tests {
     /// HTTPS target through an HTTP CONNECT proxy: the TLS handshake must
     /// happen *inside* the tunnel (the proxy only splices bytes), with SNI
     /// for the target host. Uses a self-signed cert + tls_skip_verify.
+    /// gated on `tls`: rcgen (cert generation) is a tls-feature dep, and
+    /// this test needs tokio-rustls server-side too.
+    #[cfg(feature = "tls")]
     #[tokio::test]
     async fn https_via_proxy_tls_in_tunnel() {
         use rcgen::{CertificateParams, KeyPair};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-        use tokio_rustls::rustls::ServerConfig;
 
         // Self-signed cert for "localhost".
         let key = KeyPair::generate().unwrap();
@@ -850,13 +852,39 @@ mod tests {
         let cert_der = CertificateDer::from(cert.der().to_vec());
         let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key.serialize_der()));
 
-        // Local HTTPS origin.
+        // Local HTTPS origin. Custom cert resolver asserts the SNI is the
+        // target hostname (guards against the connector sending the proxy
+        // address or an IP as SNI) before delegating to SNI-based lookup.
         let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_addr = tcp_listener.local_addr().unwrap();
-        let server_cfg = ServerConfig::builder()
+
+        #[derive(Debug)]
+        struct AssertSniResolver {
+            inner: tokio_rustls::rustls::server::ResolvesServerCertUsingSni,
+        }
+        impl tokio_rustls::rustls::server::ResolvesServerCert for AssertSniResolver {
+            fn resolve(
+                &self,
+                client_hello: tokio_rustls::rustls::server::ClientHello<'_>,
+            ) -> Option<std::sync::Arc<tokio_rustls::rustls::sign::CertifiedKey>> {
+                assert_eq!(
+                    client_hello.server_name(),
+                    Some("localhost"),
+                    "SNI must be the target hostname, not the proxy/IP"
+                );
+                self.inner.resolve(client_hello)
+            }
+        }
+
+        let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let certified =
+            tokio_rustls::rustls::sign::CertifiedKey::from_der(vec![cert_der], key_der, &provider)
+                .unwrap();
+        let mut sni = tokio_rustls::rustls::server::ResolvesServerCertUsingSni::new();
+        sni.add("localhost", certified).unwrap();
+        let server_cfg = tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)
-            .unwrap();
+            .with_cert_resolver(std::sync::Arc::new(AssertSniResolver { inner: sni }));
         let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_cfg));
         let origin_task = tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
