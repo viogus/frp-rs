@@ -1092,7 +1092,10 @@ localIP = "127.0.0.1"
 localPort = 1
 remotePort = $(random_port)
 TOML
-    "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+    # Use run_go so a proxy set via HTTP_PROXY/HTTPS_PROXY in the caller's
+    # environment cannot hijack the OIDC HTTP requests away from our local
+    # proxy (run_go clears proxy env vars for Go binaries).
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 

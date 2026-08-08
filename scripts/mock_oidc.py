@@ -85,7 +85,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length < 0:
+            length = 0
         form = parse_qs(self.rfile.read(length).decode())
         if self.path == "/token" and form.get("grant_type", [""])[0] == "client_credentials":
             now = int(time.time())

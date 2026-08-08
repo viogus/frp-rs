@@ -45,6 +45,12 @@ def handle(conn):
             log(f"CONNECT {host}:{port_s}")
             upstream = socket.create_connection((host, int(port_s)), timeout=10)
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            # Data already buffered after the CONNECT headers belongs to the
+            # tunnel (e.g. TLS ClientHello pipelined with the CONNECT) — push
+            # it into the upstream before the relay loops take over.
+            leftover = request.split(b"\r\n\r\n", 1)
+            if len(leftover) == 2 and leftover[1]:
+                upstream.sendall(leftover[1])
             threading.Thread(target=pipe, args=(conn, upstream), daemon=True).start()
             pipe(upstream, conn)
         elif len(parts) >= 3 and parts[1].startswith("http://"):
@@ -56,12 +62,22 @@ def handle(conn):
             port_s = str(url.port or 80)
             log(f"FORWARD {parts[0]} {host}:{port_s}{url.path}")
             upstream = socket.create_connection((host, int(port_s)), timeout=10)
-            # read any request body after the header block
+            # read any request body after the header block (loop until the
+            # full Content-Length is consumed — a single recv may return a
+            # partial body)
             body = b""
             for line in request.split(b"\r\n")[1:]:
                 if line.lower().startswith(b"content-length:"):
                     try:
-                        body = conn.recv(int(line.split(b":")[1].strip()))
+                        want = int(line.split(b":")[1].strip())
+                        if want < 0:
+                            want = 0
+                        conn.settimeout(10)
+                        while len(body) < want:
+                            part = conn.recv(want - len(body))
+                            if not part:
+                                break
+                            body += part
                     except (ValueError, OSError):
                         body = b""
                     break
