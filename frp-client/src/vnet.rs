@@ -6,7 +6,6 @@
 //! controller/remove), route advertisement/removal on the control connection,
 //! and OS route injection, plus the shared type aliases for the per-proxy
 //! TUN maps stored on `Service`.
-#![cfg(feature = "vnet")]
 
 use std::collections::HashMap;
 use std::sync::Arc;
