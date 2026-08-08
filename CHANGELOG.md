@@ -252,6 +252,33 @@ All notable changes to frp-rs.
   `detect_and_strip_magic` doc comment that wrongly claimed Go frp exposes
   `connReadTimeout` as configurable `ServerConfig.Transport.connReadTimeout`.
 
+- **Config formats & templating (Go parity)**: `.yaml`/`.yml`/`.json`/`.ini`
+  config files are now supported alongside TOML (auto-detected by extension);
+  `${ENV_VAR}` expansion and the `{{ parseNumberRange "..." }}` template
+  function in config values (Viper/Go template parity); DNS resolution for
+  control/server hosts now does concurrent A/AAAA with IPv4 preference.
+  Adds a `serde_yaml_ng` dependency.
+
+- **Dashboard v2 API + OIDC verifier options**: `GET /api/v2/config` and
+  `PUT /api/v2/proxy/{name}/update` (live bandwidthLimit/bandwidthLimitMode
+  updates); OIDC `skipAudience`/`additionalAudience` and a custom TLS CA for
+  the provider's discovery/JWKS fetches; `log.max_days` expiry cleanup and
+  `log.format = "json"` structured logs.
+
+- **SUDP visitor + three-stage data-plane encryption**: Go-compatible SUDP
+  visitor (lazy connect/reconnect, UDPPacket message plane, 60 s idle
+  timeout) and per-segment encryption matching Go frp's model — visitor↔server
+  and provider↔server UDP bridges are encrypted with `derive_key(visitor sk)`
+  / `derive_key(auth token)` respectively. Ordinary UDP proxies also gained
+  `use_encryption` (previously plaintext only).
+
+- **KCP session-creation rate limiting**: UDP flood of KCP headers can no
+  longer fill the accept queue in one burst — global 256 new sessions / 10 s
+  and 32 per IP / 10 s (on top of the existing total/per-IP caps); per-IP
+  rate-window logs are reaped so a many-IP flood cannot accumulate map
+  entries. Also fixes vnet TUN routing for multiple vnet proxies (route
+  lookup now uses the advertising proxy's TUN, not an arbitrary one).
+
 ## v0.7.1 — Go frp v0.70.1 Source-Level Compatibility Audit
 
 Full-source audit of Go frp v0.70.1 (fatedier/frp) against frp-rs. 106 findings
@@ -627,7 +654,7 @@ Full-source audit of Go frp dev branch against frp-rs, fixing 18 findings (7 CRI
 - Bridge diagnostic logs downgraded from ERROR to debug/trace/warn
 - Clippy: fix warnings for Rust 1.96.0 (manual_inspect, io_other_error, manual_div_ceil, vec_init_then_push, collapsible_if)
 - VNet: fix missing IntoRawFd import, remove stale `#[cfg(vnet)]` gates from NewProxy
-- Server `udp_packet_size`: default 1500 (erroneously matched Go's `d.DefaultUDPPacketSize` not `DefaultUDPPacketSize`) restored to 65535
+- Server `udp_packet_size`: default 1500 (matches Go's `DefaultUDPPacketSize`; earlier commits had mistakenly applied 65535)
 - Remove unused `collapsible_match` allow attributes (#163)
 - Remove dead code, replace `into_boxed()` with `From` impl
 - Support pre-built frps/frpc in integration tests (honor `FRPS_BIN`/`FRPC_BIN` env vars)

@@ -24,7 +24,7 @@ Dependencies flow **upward** through this diagram (binaries depend on logic crat
 
 | Crate | Purpose | Key Modules |
 |-------|---------|-------------|
-| **frp-core** | Shared library with no internal workspace dependencies | Protocol framing (`protocol.rs`), message types (`msg.rs`), config parsing (`config.rs`), transport abstraction (`transport.rs`), auth (`auth.rs`), encryption (`encryption.rs`), bridge (`bridge.rs`), mux (`mux.rs`), QUIC (`quic.rs`), KCP (`kcp/`), STUN (`stun.rs`), V2 handshake (`v2_handshake.rs`), cipher streams (`cipher_stream.rs`) |
+| **frp-core** | Shared library with no internal workspace dependencies | Protocol framing (`protocol.rs`), message types (`msg.rs`), config parsing (`config/`), transport abstraction (`transport/`), auth (`auth.rs`), encryption (`encryption.rs`), bridge (`bridge.rs`), mux (`mux.rs`), QUIC (`quic.rs`), KCP (`kcp/`), STUN (`stun.rs`), V2 handshake (`v2_handshake.rs`), cipher streams (`cipher_stream.rs`) |
 | **frp-server** | Server logic -- control handler, proxy registration, connection bridging | Service + accept loop (`service.rs`), control handler (`control/mod.rs`), proxy management (`proxy.rs`), bridge assignment (`control/bridge.rs`), proxy registration (`control/proxy_ops.rs`), NAT hole punching (`nathole/`), VHost routing (`vhost.rs`), dashboard + admin API (`dashboard.rs`), SSH gateway (`ssh_gateway.rs`), TCPMux (`tcpmux.rs`), config reload (SIGUSR1, `service.rs`), state (`state.rs`), handlers (`handlers.rs`) |
 | **frp-client** | Client logic -- service lifecycle, control connection, local bridging | Client service (`service.rs`), work connections (`work_conn.rs`), visitor mode (`visitor.rs`), admin API (`admin.rs`), health checks (`health.rs`), client plugins (`plugin/`) |
 | **frps** | Server binary | CLI argument parsing (`frp_core::cli`), logging setup, calls `frp_server::Service::run()` |
@@ -348,7 +348,7 @@ pub enum IoStream {
 
 `IoStream::into_split()` returns the static enum halves `ReadHalf`/`WriteHalf` — enum dispatch replaces the old `Box<dyn AsyncRead>` / `Box<dyn AsyncWrite>` (zero heap allocation, match-based static dispatch instead of vtable). The `WebSocket` variant wraps WebSocket binary messages into `AsyncRead`/`AsyncWrite` so the V1 protocol operates over WebSocket without changes.
 
-**Config normalization** (`frp-core/src/config.rs`): full Go to Rust config compatibility layer. TOML values are converted via `toml_to_json()` to `serde_json::Value`, then deserialized into config structs. Legacy fields like `[common]`, `auth_method`, `log_file`, `web_server_*` are normalized.
+**Config normalization** (`frp-core/src/config/`): full Go to Rust config compatibility layer. TOML values are converted via `toml_to_json()` to `serde_json::Value`, then deserialized into config structs. Legacy fields like `[common]`, `auth_method`, `log_file`, `web_server_*` are normalized.
 
 ### Gotchas
 
@@ -363,7 +363,7 @@ This section walks through adding a new proxy type called `myproxy`:
 
 ### Step 1: Config Parsing (if needed)
 
-If the new proxy type requires new config fields, add them to the proxy config struct in `frp-core/src/config.rs`. Existing proxy config fields are shared across all proxy types in `ProxyConfig` -- if your proxy type reuses those fields, no config changes are needed.
+If the new proxy type requires new config fields, add them to the proxy config struct in `frp-core/src/config/`. Existing proxy config fields are shared across all proxy types in `ProxyConfig` -- if your proxy type reuses those fields, no config changes are needed.
 
 ### Step 2: Register in ProxyManager
 
@@ -430,20 +430,24 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 ```bash
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~5.1MB), frpc (~4.3MB)
+# → frps (~5.3MB), frpc (~4.5MB)
 
-# Full (all features; dashboard is the only opt-in on top of default)
+# Full (all features; dashboard the main opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~5.3MB), frpc (~4.3MB)
+# → frps (~5.7MB), frpc (~4.5MB)
 
 # Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~3.0MB), frpc-tiny (~2.6MB)
+# → frps-tiny (~3.3MB), frpc-tiny (~3.2MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~1.8MB), frpc-micro (~1.9MB)
+# → frps-micro (~2.3MB), frpc-micro (~2.2MB)
 ```
+
+> Sizes measured 2026-08-08 (macOS arm64) with the declared release profile
+> (fat-LTO, opt-level=z, strip=symbols, panic=abort). Local dev builds that
+> override `lto=false opt-level=2` (`.cargo/config.toml`) come out ~40% larger.
 
 The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and `frps-micro`/`frpc-micro` respectively.
 
@@ -454,16 +458,16 @@ The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, an
 | `quic` | frp-core | QUIC transport (quinn) — **default ON** (was opt-in) |
 | `kcp` | frp-core | KCP transport (in-tree, kcp-go v5.6.13 aligned) |
 | `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
-| `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
+| `oidc` | frp-core | OIDC auth (jsonwebtoken, hyper via `http-client`) |
 | `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
 | `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
 | `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots) |
 | `compression` | frp-core | Snappy bridge compression (snap) |
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
-| `http-proxy` | frp-server | HTTP proxy plugin (reqwest) |
+| `http-proxy` | frp-server | HTTP proxy plugin (hyper/http-client) |
 | `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
 
-All features default ON except `dashboard` (opt-in). `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
+frps default ON: `websocket`, `kcp`, `quic`, `oidc`, `tls`, `http-proxy`, `compression`, `chacha20`, `tcp-mux`, `ssh`. Opt-in: `dashboard`, `vnet`, `otel`, `mimalloc`, dev-only flags. `quic` implies `tls`. `oidc` implies `http-client` (hyper). `ssh` implies `rand`.
 
 ### Release Profile
 
@@ -587,7 +591,7 @@ cargo test -- --ignored
 The compat test suite verifies Go frp <-> Rust frp interop across all proxy types and transport protocols:
 
 ```bash
-# Full suite (68 run_test scenarios, 2 of which are gated on Go frp V2)
+# Full suite (76 run_test scenarios, 2 of which are gated on Go frp V2)
 bash scripts/compat-test.sh --verbose
 
 # Filter by proxy type and direction
@@ -665,8 +669,8 @@ Monitors memory, connection counts, and throughput. Runs weekly in CI via `.gith
 ### Property & Fuzz Tests
 
 Proptest-based tests verify correctness under adversarial inputs:
-- **Config normalization** (`frp-core/src/config.rs`): 9 proptest! blocks — idempotency, flat↔nested equivalence, camelCase→snake_case
-- **Protocol fuzzing** (`frp-core/src/protocol.rs`): 6 fuzz tests + 20 regular tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
+- **Config normalization** (`frp-core/src/config/`): 9 proptest! blocks — idempotency, flat↔nested equivalence, camelCase→snake_case
+- **Protocol fuzzing** (`frp-core/src/protocol.rs`): 6 fuzz tests + 35 regular tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
 
 ## 7. Release Process
 
@@ -770,10 +774,10 @@ The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be 
 | Crypto (V2 XChaCha20) | `chacha20poly1305` |
 | TLS | `rustls` + `tokio-rustls` + `rustls-pki-types` (PEM via `PemObject`) + `rustls-platform-verifier` |
 | SSH | `russh` (ring backend, NOT aws-lc-rs) |
-| HTTP client | `hyper` + `hyper-rustls` + `hyper-util` (OIDC/plugin), `reqwest` (HTTP proxy plugin, rustls-tls only) |
+| HTTP client | `hyper` + `hyper-rustls` + `hyper-util` (inline `frp_core::http_client`; OIDC/proxy/plugin — no reqwest) |
 | HTTP server | `axum` |
 | WebSocket | `tokio-tungstenite` |
-| Encoding | `data_encoding` |
+| Encoding | inline `frp_core::base64` (encode/decode) + `frp_core::hex_encode` |
 | Compression | `snap` |
 | QUIC | `quinn` |
 | TcpMux | `yamux` |

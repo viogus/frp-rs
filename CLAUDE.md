@@ -36,24 +36,24 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 ```bash
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~7.7MB), frpc (~6.7MB)
-#   (NOTE: these baselines were measured with `lto=false, opt-level=2` — the
-#   local `.cargo/config.toml` override and CI both disable LTO for build
-#   speed. Release artifacts built from the declared profile (fat-LTO +
-#   opt-level=z, see [profile.release] in Cargo.toml) are ~10-20% smaller.
-#   Local measurements do not reflect release artifacts.)
+# → frps (~5.3MB), frpc (~4.5MB)
+#   (measured 2026-08-08 with the DECLARED release profile: fat-LTO,
+#   opt-level=z, strip=symbols, panic=abort — see [profile.release] in
+#   Cargo.toml. Local/CI dev builds override LTO/opt (`lto=false,
+#   opt-level=2` via .cargo/config.toml for build speed) and come out
+#   ~40% larger; they do not reflect release artifacts.)
 
-# Full (all features; dashboard is the only opt-in on top of default)
+# Full (all features; dashboard is the main opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~8.3MB), frpc (~6.7MB)
+# → frps (~5.7MB), frpc (~4.5MB)
 
 # Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~4.6MB), frpc-tiny (~4.4MB)
+# → frps-tiny (~3.3MB), frpc-tiny (~3.2MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~3.5MB), frpc-micro (~3.3MB)
+# → frps-micro (~2.3MB), frpc-micro (~2.2MB)
 ```
 
 Feature flags across crates:
@@ -68,7 +68,7 @@ Feature flags across crates:
 | `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots) |
 | `compression` | frp-core | Snappy bridge compression (snap) |
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
-| `http-proxy` | frp-server | HTTP proxy plugin (reqwest) |
+| `http-proxy` | frp-server | HTTP proxy plugin (hyper/http-client) |
 | `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
 | `vnet` | frp-core/server/client | L3 VPN / TUN device routing |
 | `admin` | frp-client | frpc admin API (axum) |
@@ -76,10 +76,10 @@ Feature flags across crates:
 | `mimalloc` | frps/frpc | mimalloc global allocator (exclusive with mem-profile) — measured no ≥5% throughput gain in the 2026-08 A/B (see `docs/superpowers/notes/2026-08-04-mimalloc-throughput-ab.md`), keep opt-in |
 | `mem-profile` | frp-core/server/client | CountingAlloc global allocator + MEMPROFILE emitter (dev only) |
 | `profiling` | frp-core | profiling feature gate (dev only) |
-| `otel` | frp-core/server/client | OpenTelemetry tracing + OTLP export (~+2-3MB) |
+| `otel` | frp-core/server/client | OpenTelemetry tracing + OTLP export (~+2-3MB) — frp-server exposes no `otel` feature; frps/frpc forward frp-core's |
 | `debug-logs` | frp-core | debug/trace logging (dev only) |
 
-Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compression, chacha20, tcp-mux, ssh; frpc = websocket, kcp, quic, oidc, tls, admin, compression, chacha20, tcp-mux. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
+Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compression, chacha20, tcp-mux, ssh; frpc = websocket, kcp, quic, oidc, tls, admin, compression, chacha20, tcp-mux. `quic` implies `tls`. `oidc` implies `http-client` (hyper). `ssh` implies `rand`. Note: `frp-core`'s own default includes `vnet`/`stun`/`tcp-mux`, but frps/frpc default binaries do **not** include `vnet` (opt-in) — only the `stun` (NAT hole punch) and `tcp-mux` parts that they forward.
 
 **Opt-in (NOT default):** `dashboard`, `mimalloc`, `otel`, `debug-logs`, `profiling`, `mem-profile`, `vnet` (frps/frpc — L3 VPN/TUN routing, drops frp-vnet from default binaries); `http-proxy` is a server-side opt-in (the client http_proxy plugin compiles unconditionally). `mem-profile` installs a `CountingAlloc` global allocator + a 1 Hz `MEMPROFILE` stderr emitter and is mutually exclusive with `mimalloc` (the `#[global_allocator]` guards are cfg-exclusive — with both enabled neither allocator is installed and the emitter does not run). Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
 
@@ -108,10 +108,10 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 844 passed, 0 failed |
-| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~7.7MB/frpc ~6.7MB default; ~8.3/6.7 full; frps-tiny ~4.6MB/frpc-tiny ~4.4MB; frps-micro ~3.5MB/frpc-micro ~3.3MB — measured 2026-08-06 with `lto=false, opt-level=2` (local `.cargo/config.toml` + CI override LTO off for build speed); declared-profile release artifacts (fat-LTO + opt-z) are ~10-20% smaller, so local/CI measurements do not reflect release artifacts; reqwest→hyper + otel/prometheus default-features pruning) |
-| `compat-test.sh` (Go frp v0.70.1) | 72 run_test scenarios + 17 XTCP pairwise, all green in CI |
-| `unsafe` blocks | 9 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
+| `cargo test --workspace --all-features` | 797 passed, 0 failed |
+| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); local/CI dev builds override LTO/opt (`lto=false opt-level=2` via .cargo/config.toml for build speed) and come out ~40% larger, so local/CI measurements do not reflect release artifacts; hyper-based HTTP client + otel/prometheus default-features pruning) |
+| `compat-test.sh` (Go frp v0.70.1) | 76 run_test scenarios + 17 XTCP pairwise, all green in CI |
+| `unsafe` blocks | 13 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
 | `data-encoding` crate | removed — inline `frp_core::base64` (encode/decode, standard alphabet) + existing `hex_encode` for the one HEXLOWER log site |
@@ -213,7 +213,7 @@ The `Transport` trait bundles `AsyncRead + AsyncWrite + Unpin + Send + 'static` 
 
 ### Config Normalization
 
-`frp-core/src/config.rs` includes a full Go→Rust config compatibility layer:
+`frp-core/src/config/` (directory: `mod.rs`/`client.rs`/`server.rs`/`normalize.rs`/`loader.rs`/`strict.rs`) includes a full Go→Rust config compatibility layer:
 
 - `[common]` sections are flattened to the top level
 - `auth_method` / `auth_token` → nested under `[auth]`
@@ -245,10 +245,10 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 
 - **TCP**: fully implemented (control + work connections, TLS, WebSocket upgrade)
 - **WebSocket**: fully implemented — dial, accept, message dispatch (control + work connections)
-- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Architecture: `KcpSocket` driver (UDP event loop), `KcpSession` per-peer (in-tree Kcp protocol + FEC), `KcpStream` (AsyncRead/AsyncWrite). The KCP state machine is implemented in-tree (`kcp/protocol.rs`, aligned with kcp-go v5.6.13 wire behavior) — the vendored `kcp` crate and its `[patch.crates-io]` entry are gone. `conv_index: HashMap<u32, SocketAddr>` provides O(1) write-path lookup. Write backpressure via `Arc<AtomicUsize>` shared between `KcpSocket` and `KcpStream` (gates `poll_write` at 200 unprocessed messages, `KCP_WRITE_BACKLOG_THRESHOLD` — pre-full gate for the 256-cap channel). Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. Our KCP handler follows same order. Verified with Go frpc v0.70.1: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test in `frp-core/tests/kcp.rs` (real UDP sockets).
+- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Architecture: `KcpSocket` driver (UDP event loop), `KcpSession` per-peer (in-tree Kcp protocol + FEC), `KcpStream` (AsyncRead/AsyncWrite). The KCP state machine is implemented in-tree (`kcp/protocol.rs`, aligned with kcp-go v5.6.13 wire behavior) — the vendored `kcp` crate and its `[patch.crates-io]` entry are gone. `conv_index: HashMap<u32, SocketAddr>` provides O(1) write-path lookup. Write backpressure via `Arc<AtomicUsize>` shared between `KcpSocket` and `KcpStream` (gates `poll_write` at 200 unprocessed messages, `KCP_WRITE_BACKLOG_THRESHOLD` — pre-full gate for the 256-cap channel). Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. frp-rs's KCP handler is functionally equivalent but checks the V2 magic first (7-byte read → V2? → TLS detect → TLS accept → tcpMux → V2/V1); both orders interop with Go frpc v0.70.1. Verified: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test in `frp-core/tests/kcp.rs` (real UDP sockets).
 - **QUIC**: fully implemented — dial, accept, message dispatch (requires TLS cert on server)
 - **TcpMux** (`frp-core/src/mux.rs`, ~699 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn via `server_mux`/`client_mux`. Double-poll pattern flushes pending frames to socket. A zero keepalive interval is normalized to the 30s default instead of causing an immediate timeout or spin. Dead-conn detection: `MAX_IDLE_KEEPALIVE_TICKS = 3` (~90s idle). `open_stream` is wakeup-loss-proof (`watch` channel, not `Notify`) and fails fast once the driver has died (`alive` flag).
-- **Dashboard** (`frp-server/src/dashboard.rs`, ~2166 lines): basic status API with axum (version, uptime, client/proxy counts)
+- **Dashboard** (`frp-server/src/dashboard.rs`, ~2757 lines): basic status API with axum (version, uptime, client/proxy counts)
 - **VHost** (`frp-server/src/vhost.rs`, ~1300 lines): HTTP/HTTPS VHost routing with Host header parsing, SNI, pre-read byte forwarding
 
 ### Gotchas
@@ -256,7 +256,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - `login_fail_exit` defaults to `true` in `ClientConfig::default()` but README example shows `false` — be aware the code default is `true`
 - `#[serde(untagged)]` on `FrpMessage` enum — ordering matters for serde matching, but V1 protocol dispatches by type byte first via `deserialize_v1()`, so untagged matching is not involved in wire deserialization
 - `ProxyRuntimeInfo` must include `sk: String` field — XTCP P2P encryption derives its AES-128 key from the proxy's SecretKey via `derive_key(&sk)`. Adding new fields to `ProxyRuntimeInfo` requires updating all construction sites: `Service::new()`, `do_reload()` in `frp-client/src/reload.rs`, and any other future sites.
-- **KCP handler dispatch order** (`service.rs:956-1438`): MUST match Go frps `service.go:670-710` exactly — TLS detection before yamux wrapping before V2/V1. Order: read bytes → V2 magic? → TLS detect → TLS accept → (tcpMux? yamux : direct) → V2/V1. Getting this wrong was root cause of both "invalid V1 message length" (yamux SYN interpreted as FRP) and TLS rejection bugs.
+- **KCP handler dispatch order** (`service.rs:714-1174`): MUST interop with Go frps `service.go:670-710` (read 1 byte → TLS detect → TLS accept → tcpMux → V2/V1). frp-rs reads 7 bytes and detects the V2 magic first, then TLS detect, TLS accept, (tcpMux? yamux : direct), then V2/V1 — functionally equivalent and verified against Go frpc v0.70.1. Getting this wrong was root cause of both "invalid V1 message length" (yamux SYN interpreted as FRP) and TLS rejection bugs.
 - **NewVisitorConn race**: STCP/XTCP visitors may send `NewVisitorConn` before the server's `proxy_manager.register()` completes. Go frp handles this via `startVisitorListener()` — the listener is pre-registered during `proxy.Run()` before registration returns. frp-rs equivalent: pre-populate `sk_index` in `proxy_ops.rs` BEFORE calling `proxy_manager.register()`, and use `sk_index` as fallback in both `handlers.rs` (accept loop) and `control/mod.rs` (control channel) when `proxy_manager.get()` returns `None`. Without this, visitor auth fails with "proxy not found" when the visitor connects before registration is visible.
 - **Wire field naming**: NewProxy JSON fields MUST use snake_case for Go frp v0.70.1 wire compatibility (`http_user`, `http_pwd`, `host_header_rewrite`, `response_headers`, `route_by_http_user`, `bandwidth_limit_mode`, `proxy_protocol_version`). CamelCase variants are silently ignored by Go frp, causing silent config loss. Contract test in `msg.rs` verifies both serialize and deserialize paths.
 - **V1 type bytes 7/8, V2 types 19/20**: Rust-only extensions. Must NOT be sent to Go frp peers — Go frp v0.70.1 treats unknown message types as errors. Only send on Rust↔Rust connections after capability negotiation.
@@ -264,11 +264,11 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 ### Testing & Tooling
 
 - **Benchmarks**: `cargo bench -p frp-core` (8 groups: key derivation, compression, cipher stream, STUN, V1+V2 protocol all-types, bridge plain/encrypted/compressed, bandwidth limiter) + `cargo bench -p frp-server` (`nathole` classify + analysis; `proxy_registration` register throughput + ProxyInfo construct). CI: `cargo bench --workspace --no-run` build-check in `ci.yml`. Note: connection-accept/setup latency is measured e2e by `scripts/latency-baseline.sh` (setup mode), NOT criterion — a real TCP+TLS+yamux accept is dominated by kernel/handshake noise, not code-path cost.
-- **Property/fuzz tests**: proptest-based config normalization (`frp-core/src/config.rs`, 9 proptest! blocks) and V1/V2 protocol frame fuzzing (`frp-core/src/protocol.rs`, 6 fuzz tests + 20 regular tests, 0 panics found).
+- **Property/fuzz tests**: proptest-based config normalization (`frp-core/src/config/tests.rs`, 9 proptest! blocks) and V1/V2 protocol frame fuzzing (`frp-core/src/protocol.rs`, 6 fuzz tests + 35 regular tests, 0 panics found).
 - **Integration tests**: KCP real-UDP-socket test (`frp-core/tests/kcp.rs`), XTCP hole-punch e2e (`frp-server/tests/xtcp_hole_punch.rs`), plus 13+ server integration tests covering control handler, vhost, proxy registration, OIDC, reload, graceful drain.
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
 - **Perf baselines** (4-axis program, host-specific JSONL committed under `scripts/frp-stress/baselines/`): `scripts/throughput-baseline.sh` (MB/s per cipher/transport config), `scripts/latency-baseline.sh` (steady-state RTT + connection-setup percentiles), `scripts/memory-baseline.sh` (idle-hold + churn footprint via the `mem-profile` counting allocator + `ps` RSS). Run manually before/after a data-plane change; not blocking CI gates. Gate rule: a change to one axis must not regress the others (>5% throughput/MB/s, or RTT p99).
-- **Cross-compat tests**: `scripts/compat-test.sh` — 72 run_test scenarios + 17 XTCP pairwise scenarios against Go frp v0.70.1 (V2 included, plus KCP+TLS and KCP+tcpMux Go↔Rust scenarios since the in-tree KCP landed). Runs on every push via `compat.yml`; XTCP compat runs daily on VPS via `xtcp-compat.yml`.
+- **Cross-compat tests**: `scripts/compat-test.sh` — 76 run_test scenarios + 17 XTCP pairwise scenarios against Go frp v0.70.1 (V2 included, plus KCP+TLS and KCP+tcpMux Go↔Rust scenarios since the in-tree KCP landed). Runs on every push via `compat.yml`; XTCP compat runs daily on VPS via `xtcp-compat.yml`.
 - **Security audit**: Run `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` and `cargo deny check` before each release. The three ignores are pre-existing issues with **no upstream fix** (cargo-audit ≥0.21 dropped `audit.toml` config file support — flags are the only mechanism; keep reasons in sync with the CI job in `ci.yml`):
   - `RUSTSEC-2026-0194/0195` (quick-xml 0.26, high): dev-only `profiling` feature chain pprof 0.15 → inferno 0.11.21 → quick-xml 0.26. pprof 0.15.0 is the latest release; nothing newer resolves. Never compiled into release binaries.
   - `RUSTSEC-2023-0071` (rsa 0.10.0-rc.18, Marvin attack, medium): pinned by russh 0.62.5 (latest) via ssh-key 0.7.0-rc.11. Advisory has no fixed upgrade. Affects frps SSH gateway (RSA host keys/auth) only. Re-check on every russh bump.
@@ -296,13 +296,14 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 |--------|-------|-------|
 | Async runtime | `tokio` | net, io-util, time, sync, macros, rt-multi-thread, signal |
 | Serialization | `serde` + `serde_json` | derive feature |
-| Config | `toml` | 0.8 |
+| Config | `toml` | 0.8 (TOML); `.yaml`/`.yml`/`.json`/`.ini` via `serde_yaml_ng`/`serde_json` — auto-detected by extension |
+| Test certs (dev) | `rcgen` | optional under `tls` feature, dev/tests only (LTO-GC'd out of shipped binaries) |
 | Crypto (general) | `ring` | 0.17 — SHA256, AES-256-GCM, HKDF, HMAC |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` | ring only has ChaCha20 (96-bit nonce), V2 needs XChaCha20 (192-bit) |
-| TLS | `rustls` + `tokio-rustls` + `rustls-platform-verifier` | ring backend, tls12, native cert verifier |
+| TLS | `rustls` + `tokio-rustls` + `rustls-platform-verifier` | ring backend, tls12, native cert verifier. **Vendored** at `vendor/rustls` 0.23.41 with a one-line SNI patch (`ServerNamePayload::Invalid` → treat as no-SNI) for Go XTCP QUIC visitor compat; delete the vendored copy when upgrading to rustls ≥0.24 (native `invalid_sni_policy`) and keep tracking 0.23.x security updates manually |
 | SSH | `russh` | ring backend (NOT aws-lc-rs), features: ring+rsa only |
-| HTTP client | `reqwest` | rustls-tls only (no json, no socks features) |
+| HTTP client | inline `frp_core::http_client` | hyper + hyper-rustls direct (not reqwest — size-pruned); OIDC + http-proxy + dashboard health use it |
 | HTTP server | `axum` | dashboard, admin auth |
 | WebSocket | `tokio-tungstenite` | |
 | Encoding | inline `frp_core::base64` (encode/decode) + `frp_core::hex_encode` | standard base64 alphabet + `=` padding, wire-compatible with Go `base64.StdEncoding` |
@@ -315,7 +316,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Random | `rand` | 0.8 |
 | Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `prometheus` | |
 
-**Removed and banned** (do not reintroduce without approval):
+**Removed and banned as direct dependencies** (do not reintroduce without approval):
 - `aws-lc-sys` / `aws-lc-rs` — replaced by ring (russh default → ring feature)
 - `hmac` — dead dependency, ring covers HMAC
 - `base64` — replaced by inline `frp_core::base64`
@@ -326,6 +327,8 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 - `hickory-resolver` — replaced by custom DNS-over-UDP client
 - `lazy_static` — replaced by `std::sync::LazyLock` (stable since Rust 1.80)
 - `libc` — active direct dependency (frp-core Linux splice(2), frp-vnet TUN ioctl)
+
+> Note: "banned" means no **direct** dependency. Several still exist **transitively** in the default frps dependency tree via the SSH feature chain (russh 0.62.5 → ssh-key 0.7.0-rc): `data-encoding`, `aes-gcm`, `sha2`, `hkdf`, `hmac` (and `base64`/`lazy_static` via dev-only pprof/tracing paths). They cannot be removed without replacing russh; only direct use is forbidden.
 
 ### Workspace Dependencies
 

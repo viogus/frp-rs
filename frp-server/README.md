@@ -83,7 +83,7 @@ All features below are enabled by default (`default = ["websocket", "kcp",
 | `dashboard` | Prometheus metrics, axum status API (opt-in) |
 | `ssh` | SSH gateway (russh) |
 | `oidc` | OIDC token verification |
-| `http-proxy` | HTTP proxy plugin (reqwest) |
+| `http-proxy` | HTTP proxy plugin (hyper/http-client) |
 | `websocket` | WebSocket transport listener |
 | `quic` | QUIC transport listener |
 | `kcp` | KCP transport listener |

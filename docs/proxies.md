@@ -100,7 +100,13 @@ controls the datagram receive buffer.
 
 ### Encryption & Compression
 
-Not supported. UDP datagrams are forwarded as-is inside the wire protocol.
+Since the SUDP/three-stage encryption work, UDP proxies support
+`use_encryption`/`use_compression` on the data plane: the provider segment
+(frps ↔ provider) is encrypted with `derive_key(auth token)` and the
+visitor segment (frps ↔ visitor) with `derive_key(sk)` — the same
+Go-frp three-segment model used by SUDP (see the SUDP Visitor section
+below). Datagrams are compressed (Snappy) then encrypted before hitting
+the wire.
 
 ### Health Checks
 
