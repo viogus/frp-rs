@@ -210,7 +210,21 @@ Local client → visitor frpc:27015/UDP → [NewVisitorConn + UDPPacket on work 
 
 ### Encryption & Compression
 
-The first-version SUDP data plane is **plaintext-only**. `use_encryption` / `use_compression` are ignored and a warning is logged (Go frp applies stream-level encryption with `sk`; the Rust side is fixed plaintext — the per-packet transform model is not yet unified with Go's stream-level encryption). Leave both unset on the visitor and on the provider's SUDP proxy.
+The SUDP data plane is encrypted end-to-end with Go-frp's three-segment
+model: the **visitor segment** (visitor frpc ↔ frps) is AES-128-CFB stream
+encryption keyed by `derive_key(sk)`, the **provider segment** (frps ↔ provider
+frpc) by `derive_key(auth token)`, and frps joins the two decrypted streams in
+the middle. `use_encryption` is honored on both the visitor and the provider;
+`use_compression` is accepted but ignored on SUDP (Go's streaming-compression
+model for the per-packet plane is not unified here yet).
+
+Cross-compat: a Go frpc `sudp` visitor (with `transport.useEncryption = true`)
+works against a Rust frps + Rust provider, and a Rust visitor works against a
+Rust stack. The reverse direction (any visitor → Go frps) is **not supported by
+Go itself**: Go v0.70.1's server-side `UDPProxy` never registers the
+visitor-manager listener its own `sudp` visitor type requires
+("custom listener … doesn't exist"), so Go's sudp is a client-side half
+implementation — frp-rs is a superset.
 
 ### Visitor Fields
 
@@ -220,7 +234,8 @@ The first-version SUDP data plane is **plaintext-only**. `use_encryption` / `use
 | `server_name` | **Required.** Name of the SUDP proxy to connect to (must match the provider's `name`). |
 | `secret_key` | **Required.** Must match the provider's `sk` (validated by the server against the registered proxy). |
 | `bind_addr` / `bind_port` | Local UDP address and port for the visitor socket. |
-| `use_encryption` / `use_compression` | Accepted for config compatibility but ignored (see above). |
+| `use_encryption` | Encrypts the visitor segment with `derive_key(sk)` (matches the provider's `transport.useEncryption`). |
+| `use_compression` | Accepted for config compatibility but ignored on SUDP (see above). |
 
 ---
 

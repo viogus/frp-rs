@@ -13,7 +13,6 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
-#[cfg(feature = "vnet")]
 use frp_core::cipher_stream::{CipherReader, CipherWriter};
 use frp_core::encryption;
 use frp_core::metrics::ProxyMetricsRegistry;
@@ -22,7 +21,9 @@ use frp_core::mux::YamuxSession;
 use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
-use frp_core::transport::{dial_server, split_work_conn_halves, DialOptions, IoStream};
+use frp_core::transport::{
+    dial_server, split_work_conn_halves, BoxedReadHalf, BoxedWriteHalf, DialOptions, IoStream,
+};
 
 use crate::proxy;
 use crate::proxy_runtime::ProxyRuntimeInfo;
@@ -488,19 +489,36 @@ async fn run_udp_work_conn(
             return;
         }
     };
-    let (w_r, mut w_w) = match split_work_conn_halves(work) {
+    let (w_r, w_w) = match split_work_conn_halves(work) {
         Ok(pair) => pair,
         Err(e) => {
             warn!(proxy_name = %proxy_name, error = e, "UDP work conn '{}' could not be split: {}", proxy_name, e);
             return;
         }
     };
+    // Provider-segment encryption (Go frp v0.70.1 three-stage model): when
+    // use_enc is set, the whole work-conn byte stream is wrapped in
+    // CipherReader/CipherWriter with the token-derived key — the same stream
+    // cipher the server applies via bridge_encrypted. The V1/V2 frame
+    // protocol then runs over the encrypted stream (CipherWriter sends its
+    // random IV on the first write, so no manual IV flush is needed).
+    // Per-packet payload transforms are gone: encryption is stream-level.
+    let w_r: BoxedReadHalf = if use_enc {
+        Box::new(CipherReader::new(w_r, enc_key)) as BoxedReadHalf
+    } else {
+        w_r
+    };
+    let mut w_w: BoxedWriteHalf = if use_enc {
+        Box::new(CipherWriter::new(w_w, enc_key)) as BoxedWriteHalf
+    } else {
+        w_w
+    };
     // Buffer the frame reads: read_msg_v1/v2 issue two read_exact calls per
     // packet (header + payload), so BufReader amortizes them into one
     // syscall per packet — and one syscall for several small packets. The
     // write half is untouched (separate object), so no flush semantics
-    // change. UDP work conns are never Cipher-wrapped (the bridge cipher is
-    // applied per-packet to the payload), so exact-read framing is safe.
+    // change. The BufReader sits on top of the CipherReader (already
+    // decrypted plaintext), so exact-read framing is safe.
     let mut w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
@@ -518,8 +536,7 @@ async fn run_udp_work_conn(
     let mut reader_cancel = cancel_rx.clone();
     let reader = async move {
         debug!(proxy_name = %pn_r, "UDP reader '{}' started", pn_r);
-        // Ping-pong scratch for the decrypt/decompress chain (per-session).
-        let mut scratch_a: Vec<u8> = Vec::new();
+        // Ping-pong scratch for the per-packet decompress chain (per-session).
         let mut scratch_b: Vec<u8> = Vec::new();
         loop {
             tokio::select! {
@@ -547,14 +564,9 @@ async fn run_udp_work_conn(
                                 }
                             };
                             let mut payload = up.content;
-                            // Ping-pong scratch buffers (per-session) so the
-                            // decrypt/decompress chain reuses allocations.
-                            if use_enc
-                                && encryption::decrypt_into(&payload, &enc_key, &mut scratch_a)
-                                    .is_ok()
-                            {
-                                std::mem::swap(&mut payload, &mut scratch_a);
-                            }
+                            // Per-packet decompression only (compression stays
+                            // per-packet for UDP; stream-level encryption was
+                            // already applied by the CipherReader above).
                             if use_comp
                                 && encryption::decompress_into(&payload, &mut scratch_b).is_ok()
                             {
@@ -702,9 +714,8 @@ async fn run_udp_work_conn(
     let writer = async move {
         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
         let mut payload = Vec::with_capacity(udp_packet_size.max(1));
-        // Ping-pong scratch for the compress/encrypt chain (per-session).
+        // Ping-pong scratch for the per-packet compress chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
-        let mut scratch_d: Vec<u8> = Vec::new();
         let mut keepalive = tokio::time::interval(Duration::from_secs(30));
         keepalive.tick().await;
         loop {
@@ -720,11 +731,9 @@ async fn run_udp_work_conn(
                     {
                         std::mem::swap(&mut payload, &mut scratch_c);
                     }
-                    if use_enc
-                        && encryption::encrypt_into(&payload, &enc_key, &mut scratch_d).is_ok()
-                    {
-                        std::mem::swap(&mut payload, &mut scratch_d);
-                    }
+                    // Stream-level encryption is applied by the CipherWriter
+                    // that wraps w_w (Go frp three-stage model); the frame
+                    // below is written over the encrypted stream.
                     // Each reply is tagged with its own remote — no shared
                     // last_remote, so concurrent remotes never cross wires.
                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
@@ -1369,13 +1378,13 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     // local_addr/encryption apply naturally on the next
                     // work conn.
                     let is_sudp = info.proxy_type == "sudp";
-                    // SUDP data plane is FIXED plaintext (not a removable
-                    // hack): the SUDP per-packet transform model is not
-                    // unified with Go's stream-level encryption, so both
-                    // frpc sides and the server bridge force plaintext —
-                    // visitor declaration (visitor.rs), provider use_enc
-                    // here, and the server bridge (bridge.rs) all agree.
-                    let use_enc = info.use_encryption && !is_sudp;
+                    // Provider-segment encryption honors the proxy config for
+                    // UDP and SUDP alike (Go frp three-stage model): the work
+                    // conn stream is wrapped in CipherReader/CipherWriter with
+                    // the token-derived key inside run_udp_work_conn. SUDP
+                    // compression stays off (the per-packet compression model
+                    // is not unified with Go's stream compression).
+                    let use_enc = info.use_encryption;
                     let use_comp = info.use_compression && !is_sudp;
 
                     info!(label = %label, proxy_name = %proxy_name, use_enc = %use_enc, use_comp = %use_comp,

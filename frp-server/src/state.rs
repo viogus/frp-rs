@@ -35,6 +35,12 @@ pub enum InternalMsg {
     VisitorConn {
         proxy_name: String,
         visitor_conn: IoStream,
+        /// Visitor-segment encryption (Go 三段式第 1 段): whether the visitor
+        /// declared `use_encryption` in NewVisitorConn. When true, the bridge
+        /// wraps the visitor conn with `derive_key(proxy.sk)` before joining it
+        /// to the provider work conn (which keeps its own token-based
+        /// encryption or plaintext).
+        visitor_use_encryption: bool,
     },
     ProxyUserConn {
         proxy_name: String,

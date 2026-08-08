@@ -142,13 +142,13 @@ async fn test_sudp_e2e_roundtrip() {
     }
 }
 
-/// Regression: `use_encryption=true` on the proxy/visitor must NOT corrupt
-/// the data plane. The SUDP data plane is plaintext-first — both sides force
-/// plaintext and the NewVisitorConn declaration must match the wire (a
-/// provider that believed the tunnel was encrypted would AES-CFB-encrypt the
-/// return traffic and we would ship ciphertext to the local UDP client).
+/// Go-parity three-segment encryption: `use_encryption=true` on the SUDP
+/// proxy + visitor must produce a working tunnel (visitor segment encrypted
+/// with sk, provider segment with the auth token; server joins them in the
+/// middle). The data plane must roundtrip byte-for-byte — ciphertext never
+/// leaks to the local UDP client.
 #[tokio::test]
-async fn test_sudp_e2e_encryption_config_declared_but_plaintext() {
+async fn test_sudp_e2e_encrypted_roundtrip() {
     let echo_port = allocate_udp_port();
     let server_port = allocate_port();
     let visitor_port = allocate_udp_port();
@@ -197,13 +197,13 @@ async fn test_sudp_e2e_encryption_config_declared_but_plaintext() {
         .await
         .expect("SUDP tunnel ready");
 
-    // Plaintext payload must survive the relay byte-for-byte even though the
-    // config asked for encryption (which is ignored with a warning).
-    let payload = b"encryption-config-must-not-corrupt-the-plane";
+    // Payload must survive the relay byte-for-byte with encryption enabled
+    // (both segments encrypted end-to-end, symmetric on both sides).
+    let payload = b"encrypted-roundtrip-must-not-corrupt";
     let reply = udp_roundtrip(&client, visitor_addr, payload).await;
     assert_eq!(
         &reply, payload,
-        "declared-but-plaintext data plane must not corrupt payloads"
+        "encrypted SUDP data plane must roundtrip without corruption"
     );
 }
 
