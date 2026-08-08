@@ -166,7 +166,10 @@ for each UDP proxy.
 
 ### Encryption & Compression
 
-Not supported (same as UDP).
+Encryption is supported with the Go-frp three-segment model (see the SUDP
+Visitor section below): the visitor segment is encrypted with `derive_key(sk)`,
+the provider segment with `derive_key(auth token)`. Compression is not
+supported on the SUDP data plane.
 
 ### Health Checks
 
