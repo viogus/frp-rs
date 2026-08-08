@@ -49,7 +49,15 @@ use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo, ReloadRequest};
 use crate::store::{merge_client_config, StoreSource};
 use crate::util::opt_if_empty;
 #[cfg(feature = "vnet")]
-use crate::vnet::*;
+use crate::vnet::{
+    add_os_route, advertise_vnet_visitor_route, local_vnet_set, remove_os_route, remove_vnet_tun,
+    send_vnet_route_advertise, spawn_vnet_tun_controller, virtual_net_visitor_route_adv,
+    vnet_proxy_snapshot, vnet_tun_params, VnetPeerRoute, VnetTunCancelMap, VnetTunMap,
+};
+// register_vnet_tun, vnet_tun_cidr, VnetTunTxMap are used only by vnet tests,
+// so their imports are test-cfg'd to keep plain builds warning-free.
+#[cfg(all(feature = "vnet", test))]
+use crate::vnet::{register_vnet_tun, vnet_tun_cidr, VnetTunTxMap};
 use crate::work_conn::XtcpNotification;
 
 /// Go frp v0.70.1 visitor plugin type for virtual-net host routes.
