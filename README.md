@@ -56,7 +56,7 @@ suitable as a drop-in replacement for either the client or server side.
 | Server config reload | —      | ✅     |
 | Config directory mode| ✅     | ✅     |
 | Client plugins       | ✅     | —      |
-| Visitor (STCP/XTCP)  | ✅     | —      |
+| Visitor (STCP/XTCP/SUDP) | ✅     | —      |
 | Store (runtime config) | ✅   | ✅*    |
 | VirtualNet (L3 VPN)  | ✅     | ✅     |
 
@@ -341,7 +341,8 @@ tcp_mux_keepalive_interval = 30
 | `ssh_tunnel_gateway.allowNoneAuth` | `false` | Allow the SSH gateway to start with no credentials, accepting every connection (fail-closed by default) |
 | `log.level` | `"info"` | Log level: trace, debug, info, warn, error |
 | `log.file` | `""` | Log file path (empty = stderr) |
-| `log.max_days` | `3` | Max days to retain log files |
+| `log.max_days` | `3` | Max days to retain log files (mtime-based cleanup at startup + daily; `<= 0` disables) |
+| `log.format` | `"text"` | Log format: `text` or `json` (CLI `--log-format` overrides) |
 | `web_server.port` | `0` | Dashboard port (0 = disabled) |
 | `web_server.user` | `""` | Dashboard Basic Auth username |
 | `web_server.password` | `""` | Dashboard Basic Auth password |
@@ -387,6 +388,8 @@ Both frps (dashboard) and frpc expose a management API over HTTP with Basic Auth
 | GET | `/api/proxy/{type}` | List proxies of one type |
 | GET | `/api/proxy/{name}/traffic` | Proxy traffic counters |
 | GET | `/api/clients` / `/api/clients/{run_id}` | Connected clients |
+| GET | `/api/v2/config` | Sanitized server config (auth/dashboard secrets omitted) |
+| PUT | `/api/v2/proxy/{name}/update` | Hot-update a live proxy's `bandwidthLimit` / `bandwidthLimitMode` (provider-dependent fields → 400) |
 | GET | `/metrics` | Prometheus text format (if `enable_prometheus = true`) |
 
 **frpc endpoints** (on admin port):
@@ -441,6 +444,7 @@ use_compression = false
 | `tls_ca_file` | `""` | CA certificate for server verification |
 | `tls_server_name` | `""` | Server name for TLS SNI |
 | `log.level` | `"info"` | Log level |
+| `log.format` | `"text"` | Log format: `text` or `json` (CLI `--log-format` overrides) |
 | `login_fail_exit` | `true` | Exit on login failure; false to keep retrying |
 | `pool_count` | `1` | Number of pre-established work connections (pooled on the server) |
 | `tcp_mux` | `true` | Enable TCP multiplexing |

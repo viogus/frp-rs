@@ -505,7 +505,17 @@ The dashboard provides:
 | `GET /api/proxies` | List all proxies with traffic stats |
 | `GET /api/proxies/{name}` | Single proxy detail (also `GET /api/proxy/{type}/{name}`) |
 | `GET /api/proxy/:name/traffic` | Traffic counters for a proxy |
+| `GET /api/v2/config` | Sanitized server config (the `auth` section carries only the method name; dashboard `user`/`password` are omitted) |
+| `PUT /api/v2/proxy/{name}/update` | Hot-update a live proxy's server-side bandwidth settings |
 | `GET /metrics` | Prometheus text format (if enabled) |
+
+`PUT /api/v2/proxy/{name}/update` accepts a JSON body such as
+`{"bandwidthLimit": "2MB", "bandwidthLimitMode": "server"}`. Only
+`bandwidthLimit` / `bandwidthLimitMode` are hot-applied (enforced on
+subsequently established bridges). Provider-dependent fields
+(`localIP`, `localPort`, `remotePort`, `customDomains`, `useEncryption`,
+`useCompression`) are rejected with 400 — update the frpc config and reload
+instead. Unknown proxy names return 404.
 
 For production, put nginx in front of the dashboard with TLS and IP allowlisting:
 
@@ -614,17 +624,26 @@ max_days = 3
 The `max_days` setting auto-rotates log files. Combined with logrotate
 (see Section 1), you get both rotation and compression.
 
-**3. Structured logging (for ELK / Loki):**
+**3. JSON / structured logging (for ELK / Loki):**
 
-Set `RUST_LOG` for more granular control:
+frp-rs emits JSON logs natively via `log.format`:
 
-```bash
-# Per-module log levels
-RUST_LOG=info,frp_server=debug,frp_core::bridge=trace frps -c frps.toml
+```toml
+[log]
+level = "info"
+file = "/var/log/frp/frps.log"
+max_days = 3
+format = "json"
 ```
 
-For JSON-formatted logs (suitable for ELK/Loki), pipe through a transformer
-or use `tracing-subscriber`'s JSON layer (requires custom build).
+or from the CLI: `frps -c frps.toml --log-format json` (CLI wins over the
+config file; `frpc` supports the same `--log-format`). JSON output combines
+with `RUST_LOG` for per-module verbosity:
+
+```bash
+# Per-module log levels, JSON output
+RUST_LOG=info,frp_server=debug,frp_core::bridge=trace frps -c frps.toml --log-format json
+```
 
 ---
 

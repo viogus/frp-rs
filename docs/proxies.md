@@ -184,6 +184,44 @@ Server-level fields (`frps.toml`):
 |-------|-------------|
 | `sudp_port` | Port all SUDP proxies share. When set, `remote_port` on each SUDP proxy is overridden to this value. |
 
+### SUDP Visitor (frpc)
+
+A SUDP visitor (`[[visitors]]` with `type = "sudp"`) binds a local UDP port on the client and tunnels datagrams to a remote SUDP provider through the frps server. It mirrors Go frp's `client/visitor/sudp.go`:
+
+```toml
+# frpc.toml
+[[visitors]]
+name = "game-visitor"
+type = "sudp"
+server_name = "game-server-1"   # the SUDP proxy name registered by the provider
+secret_key = "shared-sk"        # must match the provider's sk
+bind_addr = "127.0.0.1"
+bind_port = 27015               # local UDP port to listen on
+```
+
+### Data Flow
+
+```
+Local client → visitor frpc:27015/UDP → [NewVisitorConn + UDPPacket on work conn] → frps → provider frpc → 10.0.0.1:27015/UDP
+```
+
+- **Lazy tunnel:** no server connection is held until the first datagram arrives; the first datagram triggers a fresh `NewVisitorConn` handshake over a dedicated connection to the server. After the tunnel closes (disconnect or 60s idle timeout) the visitor returns to the wait state and the next datagram reconnects.
+- The shared UDP socket is multiplexed by datagram source address: replies are sent back to the `UdpAddr` source, and outbound datagrams carry their own source address in `UDPPacket.remote_addr`.
+
+### Encryption & Compression
+
+The first-version SUDP data plane is **plaintext-only**. `use_encryption` / `use_compression` are ignored and a warning is logged (Go frp applies stream-level encryption with `sk`; the Rust side is fixed plaintext — the per-packet transform model is not yet unified with Go's stream-level encryption). Leave both unset on the visitor and on the provider's SUDP proxy.
+
+### Visitor Fields
+
+| Field | Description |
+|-------|-------------|
+| `type` | `"sudp"` |
+| `server_name` | **Required.** Name of the SUDP proxy to connect to (must match the provider's `name`). |
+| `secret_key` | **Required.** Must match the provider's `sk` (validated by the server against the registered proxy). |
+| `bind_addr` / `bind_port` | Local UDP address and port for the visitor socket. |
+| `use_encryption` / `use_compression` | Accepted for config compatibility but ignored (see above). |
+
 ---
 
 ## HTTP Proxy (`type = "http"`)
