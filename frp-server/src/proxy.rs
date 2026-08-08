@@ -69,6 +69,13 @@ pub struct ProxyInfo {
     pub bandwidth_limit: String,
     pub bandwidth_limit_mode: String,
     pub user: String,
+    /// Per-proxy user-connection cap (audit D2-2): a Semaphore of size
+    /// `max_conns_per_proxy` when configured (>0); None = unlimited (Go
+    /// default). Permits are held for the user conn's full lifetime (they
+    /// live in `PendingRequest` and drop when the bridge ends), bounding
+    /// per-proxy connection floods that would otherwise grow
+    /// `pending_requests` + fds without limit.
+    pub user_conn_sem: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl ProxyInfo {
@@ -553,30 +560,20 @@ pub struct ProxyEntry {
     pub info: ProxyInfo,
 }
 
-/// Allocate a port across multiple ranges.
-/// If `port` > 0, try to allocate exactly that port. If already used or
-/// not bindable at the OS level, return None.
-/// If `port` == 0, scan all ranges in order and return the first available
-/// port that is both not in `used_ports` and not bound by another process
-/// on the system.
-///
-/// The `bind_addr` parameter specifies the IP address to use for the OS-level
-/// TCP bind probe, matching Go frp's `Manager.isPortAvailable` behavior.
-pub fn allocate_port_multi(
-    used_ports: &mut std::collections::HashSet<u16>,
+/// Collect up to `limit` candidate TCP ports without probing the OS:
+/// explicit `port` (with allow_ports range validation) or free ports from
+/// `ranges`. This is the lock-fast portion of allocation — the blocking
+/// `TcpListener::bind` probe must happen outside any shared lock (see
+/// [`allocate_port_multi`]).
+pub fn pick_tcp_port_candidates(
+    used_ports: &std::collections::HashSet<u16>,
     port: u16,
     ranges: &[frp_core::config::PortsRange],
-    bind_addr: &str,
-) -> Option<u16> {
-    let bind_addr = if bind_addr.is_empty() {
-        "0.0.0.0"
-    } else {
-        bind_addr
-    };
-
+    limit: usize,
+) -> Vec<u16> {
     if port > 0 {
         if used_ports.contains(&port) {
-            return None;
+            return Vec::new();
         }
         // When allow_ports ranges are configured, an explicit port must fall
         // within at least one range (Go frp compat: Manager.Acquire checks
@@ -589,23 +586,54 @@ pub fn allocate_port_multi(
                 ranges = ?ranges,
                 "Explicit port {port} is not within any configured allow_ports range",
             );
-            return None;
+            return Vec::new();
         }
-        if is_port_bindable(bind_addr, port) {
-            used_ports.insert(port);
-            return Some(port);
-        }
-        return None;
+        return vec![port];
     }
+    let mut out = Vec::new();
     for r in ranges {
         for p in r.iter() {
-            if used_ports.contains(&p) {
-                continue;
+            if !used_ports.contains(&p) {
+                out.push(p);
+                if out.len() >= limit {
+                    return out;
+                }
             }
-            if is_port_bindable(bind_addr, p) {
-                used_ports.insert(p);
-                return Some(p);
-            }
+        }
+    }
+    out
+}
+
+/// Allocate a port across multiple ranges.
+/// If `port` > 0, try to allocate exactly that port. If already used or
+/// not bindable at the OS level, return None.
+/// If `port` == 0, scan all ranges in order and return the first available
+/// port that is both not in `used_ports` and not bound by another process
+/// on the system.
+///
+/// The `bind_addr` parameter specifies the IP address to use for the OS-level
+/// TCP bind probe, matching Go frp's `Manager.isPortAvailable` behavior.
+///
+/// NOTE: the OS bind probe runs while `used_ports` is mutably borrowed. Hot
+/// registration paths (proxy_ops) should prefer the lock-free three-phase
+/// pattern: pick candidates under a read lock, probe outside any lock, then
+/// commit under a short write lock.
+pub fn allocate_port_multi(
+    used_ports: &mut std::collections::HashSet<u16>,
+    port: u16,
+    ranges: &[frp_core::config::PortsRange],
+    bind_addr: &str,
+) -> Option<u16> {
+    let bind_addr = if bind_addr.is_empty() {
+        "0.0.0.0"
+    } else {
+        bind_addr
+    };
+
+    for candidate in pick_tcp_port_candidates(used_ports, port, ranges, u16::MAX as usize) {
+        if is_port_bindable(bind_addr, candidate) {
+            used_ports.insert(candidate);
+            return Some(candidate);
         }
     }
     tracing::warn!(

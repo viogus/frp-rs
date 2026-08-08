@@ -199,7 +199,10 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
 
     let mut buf = PoolGuard::acquire();
     let cap = buf.as_mut_slice().len();
-    let mut comp_buf = Vec::new();
+    // Pre-size the compression buffer to the bridge chunk size; grow is
+    // amortized by reusing it across iterations (was Vec::new() -> re-grow
+    // to ~128-256 KiB on every bridge call, dropped at teardown).
+    let mut comp_buf = Vec::with_capacity(cap);
     let mut compressor = make_compressor(use_compression);
     loop {
         let n = match user_r.read(buf.as_mut_slice()).await {
@@ -280,7 +283,9 @@ async fn bridge_work_to_user(
 ) {
     let mut buf = PoolGuard::acquire();
     let cap = buf.as_mut_slice().len();
-    let mut batch_buf = Vec::new();
+    // Pre-size the decompression batch buffer to the bridge chunk size;
+    // reuse across iterations instead of growing from zero per bridge call.
+    let mut batch_buf = Vec::with_capacity(cap);
     let mut decompressor = make_decompressor(use_compression);
     let mut header_timeout = header_timeout;
     'read_loop: loop {

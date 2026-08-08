@@ -4,6 +4,87 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+### Security & Robustness
+- **TCP-group proxy registration self-deadlock fixed (HIGH, audit D3-1)**:
+  `handle_new_proxy` held `used_ports.write()` across
+  `handle_tcp_group_member_registration`, which writes the same
+  `tokio::sync::RwLock` again (non-reentrant) — a TCP-group name conflict or
+  dashboard-delete race hung the control select loop forever. The write lock
+  is now scoped to the insert.
+- **Per-proxy user-connection cap (audit D2-2)**: new server config
+  `maxConnsPerProxy` (default 0 = unlimited, Go parity). When set, a
+  `Semaphore` permit is acquired per user connection and held for the
+  connection's full lifetime (via `PendingRequest`), bounding floods that
+  previously grew `pending_requests` + fds without limit.
+- Pending-request expiry is now **timer-driven** (audit D2-1): with
+  `tcp_mux` on (default) the select had no timer arm, so a silent client
+  could pin pending-request entries + user fds indefinitely. A
+  `sleep_until(earliest deadline)` branch wakes the select; loop-top does
+  the cleanup.
+- `run_id_to_ctl_tx` switched from `RwLock<HashMap>` to **`DashMap`**
+  (audit D3-3) — every work-conn dispatch previously took the global read
+  lock; DashMap reads are lock-free per shard.
+- TLS connector cache: `Mutex` → `RwLock` (audit D3-4) — concurrent TLS
+  dials no longer serialize on the cache-hit path.
+- Splice(2) relay failures now log at `warn` (audit D1-10); a fallback copy
+  is not possible because splice consumes the streams (partially-moved
+  bytes would be lost).
+- Bridge tasks now select against the server shutdown token (audit D2-4):
+  graceful shutdown interrupts half-open idle bridges instead of waiting on
+  2h TCP keepalive.
+
+### Performance
+- UDP data plane per-packet allocations removed (audits D1-4/D1-5): server
+  relay reuses a spare `Vec` for packet content (allocation removed, memcpy
+  stays); client relay pre-parses the loop-invariant local `UdpAddr` once
+  instead of re-parsing the address string per packet.
+
+### Fixes
+- Dead code removed: pooled work-conn idle-expiry branch (audit D2-3,
+  `idle_timeout` is never configured — Go parity keeps pooled conns alive);
+  the `pooled_at` field it used.
+- `login_throttle`/replay-table doc comment corrected (audit D3-5): cleanup
+  is an O(n) `retain` (two precision domains), not the claimed
+  `BTreeMap::split_off`; bounded by 100k total / 100 per timestamp.
+- 24h port-reservation lookup no longer runs the blocking bind probe under
+  the `port_reservations` write lock (audit D3-6).
+- Doc figures corrected: local/CI builds with `lto=false opt-level=2` come
+  out **~70% larger** (9.1MB vs 5.3MB), not ~40% (audit D5-2).
+
+## Unreleased
+
+### Changed
+- **frpc `admin` is now opt-in** (was in the default feature set): build with
+  `--features admin` to include the axum-based admin API (~0.5 MB smaller
+  default frpc). `frpc reload`/`status` require a running frpc built with
+  `admin` and `web_server.port > 0`.
+- WebSocket transport no longer links `tokio-tungstenite`: the tungstenite
+  variant had no callers (all paths use the manual RFC 6455 upgrade); the
+  dependency and its dead code were removed.
+- Local `.cargo/config.toml` release override (`lto=false opt-level=2`)
+  removed — local `cargo build --release` uses the declared profile
+  (fat-LTO + opt-level=z). CI still writes the override on runners for speed.
+
+### Performance
+- WebSocket raw path: per-frame payload allocation replaced with a reused
+  per-connection buffer; frame building writes into a reused `write_buf` (no
+  per-chunk alloc on the bridge hot path).
+- Bridge buffer pool: `std::sync::Mutex` → lock-free `crossbeam-queue`
+  `ArrayQueue`; pool cap raised 32 → 128 (env `FRP_BRIDGE_POOL_MAX`, cap
+  4096). Pre-sized compression/decompression buffers.
+- UDP proxy: session table sharded 8 ways (per-remote locks instead of one
+  global mutex per packet).
+- TCP port allocation: OS bind probe moved out of the `used_ports` write
+  lock (three-phase pick/probe/commit) — registrations no longer serialize
+  behind socket-bind latency.
+
+### Fixes
+- `webpki-roots` bumped to 1.0 (drops the 0.26 shim layer).
+- `frp-vnet` controller: poisoned-lock `.unwrap()` unified to recovery.
+- `mem_profile.rs`: added `// SAFETY:` documentation for the `GlobalAlloc` impl.
+
+## Unreleased
+
 - **OIDC `proxyUrl` supported (Go frp parity)**: `auth.oidcProxyUrl` on
   server and client now routes OIDC HTTP requests (well-known config, JWKS,
   token endpoint) through an HTTP CONNECT or SOCKS5 proxy — previously the

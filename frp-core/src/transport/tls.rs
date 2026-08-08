@@ -518,8 +518,10 @@ fn connector_key(
     }
 }
 
-static CONNECTOR_CACHE: std::sync::Mutex<Option<(ConnectorKey, TlsConnector)>> =
-    std::sync::Mutex::new(None);
+// RwLock: the cache-hit path (every outbound TLS dial) only needs a read
+// lock; the exclusive lock is taken only on the rare rebuild (audit D3-4).
+static CONNECTOR_CACHE: std::sync::RwLock<Option<(ConnectorKey, TlsConnector)>> =
+    std::sync::RwLock::new(None);
 
 /// Number of actual connector builds (cache misses). Test-only — lets tests
 /// assert a cache hit did not rebuild.
@@ -545,7 +547,7 @@ pub fn build_tls_connector_skip_verify(
 ) -> Result<TlsConnector, crate::Error> {
     let key = connector_key(ca_file, cert_file, key_file);
     if let Some((cached_key, cached)) = CONNECTOR_CACHE
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
     {
@@ -557,7 +559,7 @@ pub fn build_tls_connector_skip_verify(
     let connector = build_tls_connector_skip_verify_inner(ca_file, cert_file, key_file)?;
     #[cfg(test)]
     CONNECTOR_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    *CONNECTOR_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, connector.clone()));
+    *CONNECTOR_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some((key, connector.clone()));
     Ok(connector)
 }
 

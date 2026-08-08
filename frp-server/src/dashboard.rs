@@ -206,17 +206,19 @@ struct ClientDetail {
 /// alias `/api/serverinfo`.
 async fn build_status_response(state: &Arc<AppState>) -> StatusResponse {
     let uptime = state.dashboard_start.elapsed().as_secs();
-    let ctl_map = state.run_id_to_ctl_tx.read().await;
-    let client_count = ctl_map.len();
+    let client_count = state.run_id_to_ctl_tx.len();
     let proxies = state.proxy_manager.list().await;
 
-    let (total_pool_size, total_pending) = ctl_map.values().fold((0i64, 0i64), |(s, p), ctl| {
-        (
-            s + ctl.pool_stats.pool_size.load(Ordering::Relaxed),
-            p + ctl.pool_stats.pending_requests.load(Ordering::Relaxed),
-        )
-    });
-    drop(ctl_map);
+    let (total_pool_size, total_pending) =
+        state
+            .run_id_to_ctl_tx
+            .iter()
+            .fold((0i64, 0i64), |(s, p), ctl| {
+                (
+                    s + ctl.pool_stats.pool_size.load(Ordering::Relaxed),
+                    p + ctl.pool_stats.pending_requests.load(Ordering::Relaxed),
+                )
+            });
 
     StatusResponse {
         version: frp_core::VERSION.to_string(),
@@ -248,12 +250,11 @@ async fn handle_proxies(
     let proxies = state.proxy_manager.list().await;
     let filter_type = query.proxy_type;
     let mut entries = Vec::new();
-    let ctl_map = state.run_id_to_ctl_tx.read().await;
     for p in &proxies {
         if !filter_type.is_empty() && p.proxy_type != filter_type {
             continue;
         }
-        let online = ctl_map.contains_key(&p.run_id);
+        let online = state.run_id_to_ctl_tx.contains_key(&p.run_id);
         let traffic = state
             .proxy_metrics
             .get(&p.name)
@@ -288,11 +289,7 @@ async fn handle_proxy_detail(
         .await
         .ok_or_else(|| not_found("proxy not found"))?;
 
-    let online = state
-        .run_id_to_ctl_tx
-        .read()
-        .await
-        .contains_key(&proxy.run_id);
+    let online = state.run_id_to_ctl_tx.contains_key(&proxy.run_id);
     let traffic = state
         .proxy_metrics
         .get(&name)
@@ -353,12 +350,11 @@ async fn handle_proxies_by_type(
     }
     let proxies = state.proxy_manager.list().await;
     let mut entries = Vec::new();
-    let ctl_map = state.run_id_to_ctl_tx.read().await;
     for p in &proxies {
         if p.proxy_type != proxy_type {
             continue;
         }
-        let online = ctl_map.contains_key(&p.run_id);
+        let online = state.run_id_to_ctl_tx.contains_key(&p.run_id);
         let traffic = state
             .proxy_metrics
             .get(&p.name)
@@ -398,11 +394,7 @@ async fn handle_proxy_by_type_name(
         return Err(not_found("proxy type mismatch"));
     }
 
-    let online = state
-        .run_id_to_ctl_tx
-        .read()
-        .await
-        .contains_key(&proxy.run_id);
+    let online = state.run_id_to_ctl_tx.contains_key(&proxy.run_id);
     let traffic = state
         .proxy_metrics
         .get(&name)
@@ -442,13 +434,12 @@ async fn handle_clients(State(state): State<Arc<AppState>>) -> Json<Vec<ClientEn
     // Go compat: /api/clients lists the registry (online AND offline clients,
     // with a pruning policy), not just the live control connections.
     let registry = state.client_registry.list();
-    let map = state.run_id_to_ctl_tx.read().await;
     let mut clients = Vec::with_capacity(registry.len());
     for info in registry {
         let ctl = if info.run_id.is_empty() {
             None
         } else {
-            map.get(&info.run_id)
+            state.run_id_to_ctl_tx.get(&info.run_id).map(|c| c.clone())
         };
         let (proxies, pool_size, pending) = match ctl {
             Some(ctl) => {
@@ -494,11 +485,11 @@ async fn handle_client_detail(
     State(state): State<Arc<AppState>>,
     Path(run_id): Path<String>,
 ) -> Result<Json<ClientDetail>, (axum::http::StatusCode, Json<ErrorResponse>)> {
-    let ctl = {
-        let map = state.run_id_to_ctl_tx.read().await;
-        map.get(&run_id).cloned()
-    }
-    .ok_or_else(|| not_found("client not found"))?;
+    let ctl = state
+        .run_id_to_ctl_tx
+        .get(&run_id)
+        .map(|c| c.clone())
+        .ok_or_else(|| not_found("client not found"))?;
 
     let proxy_infos = state.proxy_manager.list_client(&run_id).await;
     let mut proxies = Vec::new();
@@ -609,20 +600,20 @@ async fn handle_healthz(
             // Verify internal state structures are accessible (not deadlocked).
             let used_ok = state.used_ports.try_read().is_ok();
             let used_udp_ok = state.used_udp_ports.try_read().is_ok();
-            let ctl_ok = state.run_id_to_ctl_tx.try_read().is_ok();
+            // `run_id_to_ctl_tx` is a DashMap (sharded locks) — there is no
+            // single global lock to probe, so the lock-contention check is
+            // dropped.
             let proxy_ok = state.proxy_manager.is_responsive();
-            if used_ok && used_udp_ok && ctl_ok && proxy_ok {
+            if used_ok && used_udp_ok && proxy_ok {
                 (StatusCode::OK, "ok")
             } else {
                 tracing::warn!(
                     used_ports = %used_ok,
                     used_udp_ports = %used_udp_ok,
-                    ctl_map = %ctl_ok,
                     proxy_manager = %proxy_ok,
-                    "Readiness check failed: used_ports={} used_udp_ports={} ctl_map={} proxy_manager={}",
+                    "Readiness check failed: used_ports={} used_udp_ports={} proxy_manager={}",
                     used_ok,
                     used_udp_ok,
-                    ctl_ok,
                     proxy_ok
                 );
                 (StatusCode::SERVICE_UNAVAILABLE, "not ready")
@@ -818,7 +809,7 @@ async fn handle_store_proxy_delete(
     }
 
     // Notify the client to close the proxy on its side (Go frp compat).
-    if let Some(ctl_tx) = state.run_id_to_ctl_tx.read().await.get(&run_id).cloned() {
+    if let Some(ctl_tx) = state.run_id_to_ctl_tx.get(&run_id).map(|c| c.clone()) {
         let _ = ctl_tx
             .tx
             .try_send(InternalMsg::WriteCloseProxy {
@@ -1871,9 +1862,7 @@ mod v2 {
     /// GET /api/v2/system/info — Go `APIV2SystemInfo`.
     async fn handle_system_info(State(state): State<Arc<AppState>>) -> Json<SystemInfoResp> {
         let snap = &state.server_config_snapshot;
-        let ctl_map = state.run_id_to_ctl_tx.read().await;
-        let client_counts = ctl_map.len() as i64;
-        drop(ctl_map);
+        let client_counts = state.run_id_to_ctl_tx.len() as i64;
 
         let proxies = state.proxy_manager.list().await;
         let mut proxy_type_counts: HashMap<String, i64> = HashMap::new();
@@ -2098,7 +2087,6 @@ mod v2 {
         validate_type(q.proxy_type.as_deref().unwrap_or(""))?;
 
         let all = state.proxy_manager.list().await;
-        let ctl_map = state.run_id_to_ctl_tx.read().await;
         let mut items = Vec::new();
         for p in &all {
             if let Some(ref pt) = q.proxy_type {
@@ -2106,7 +2094,7 @@ mod v2 {
                     continue;
                 }
             }
-            let online = ctl_map.contains_key(&p.run_id);
+            let online = state.run_id_to_ctl_tx.contains_key(&p.run_id);
             if !match_status(online, q.status.as_deref().unwrap_or("")) {
                 continue;
             }
@@ -2169,7 +2157,6 @@ mod v2 {
 
             items.push(resp);
         }
-        drop(ctl_map);
 
         // Go: sort by (Spec.Type, Name).
         items.sort_by(|a, b| {
@@ -2183,7 +2170,7 @@ mod v2 {
 
     /// Go `buildV2ProxyResp` — build the detail response for a proxy.
     async fn build_proxy_resp(state: &Arc<AppState>, p: &crate::proxy::ProxyInfo) -> ProxyResp {
-        let online = state.run_id_to_ctl_tx.read().await.contains_key(&p.run_id);
+        let online = state.run_id_to_ctl_tx.contains_key(&p.run_id);
         let (today_in, today_out, cur_conns) = state
             .proxy_metrics
             .get(&p.name)
@@ -2299,10 +2286,9 @@ mod v2 {
     pub(super) async fn prune_offline_stats(state: &Arc<AppState>) -> (usize, usize) {
         let all = state.proxy_manager.list().await;
         let total = all.len();
-        let ctl_map = state.run_id_to_ctl_tx.read().await;
         let mut cleared = 0usize;
         for p in &all {
-            if !ctl_map.contains_key(&p.run_id) {
+            if !state.run_id_to_ctl_tx.contains_key(&p.run_id) {
                 state.proxy_metrics.remove(&p.name).await;
                 cleared += 1;
             }
@@ -2375,6 +2361,7 @@ mod v2 {
                 String::new(),
                 Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
                 0,
+                0,
                 168,
                 true,
                 0,
@@ -2405,6 +2392,7 @@ mod v2 {
                 bandwidth_limit: String::new(),
                 bandwidth_limit_mode: String::new(),
                 user: String::new(),
+                user_conn_sem: None,
             }
         }
 

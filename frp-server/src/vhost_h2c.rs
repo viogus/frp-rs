@@ -225,10 +225,10 @@ async fn handle_stream(
 
     // Locate the control handler for the target run_id (shared with the
     // HTTP/1.1 path).
-    let internal_tx = {
-        let map = state.run_id_to_ctl_tx.read().await;
-        map.get(&forward.run_id).cloned()
-    };
+    let internal_tx = state
+        .run_id_to_ctl_tx
+        .get(&forward.run_id)
+        .map(|v| v.clone());
     let Some(ctl_tx) = internal_tx else {
         tracing::warn!(host = %host, path = %path, "HTTP VHost (h2c) route for '{}' path '{}' found but control handler gone", host, path);
         return send_h2_error(respond, 502, &[], Bytes::new()).await;

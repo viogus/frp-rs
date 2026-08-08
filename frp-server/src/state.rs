@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -157,8 +158,9 @@ pub struct PoolMetrics {
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     pub drops: AtomicU64,
-    /// Idle timeout for pooled work conns. `Duration::ZERO` = disabled.
-    pub idle_timeout: Duration,
+    // (pooled-conn idle timeout was removed 2026-08-09, audit D2-3: never
+    // wired from config, Go parity keeps pooled conns alive; the field and
+    // its consumer were dead code.)
 }
 
 /// State for a TCP group's shared listener.
@@ -377,7 +379,10 @@ pub struct AppState {
     /// Separate UDP port tracking (Go frp compat). TCP port 8080 can coexist
     /// with UDP port 8080 — Go has separate TCPPortManager and UDPPortManager.
     pub used_udp_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
-    pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
+    /// (run_id) → control-channel sender. DashMap: sharded locks, so the
+    /// per-work-conn lookup on every dispatch no longer contends on one
+    /// global read lock.
+    pub run_id_to_ctl_tx: Arc<DashMap<String, ControlTx>>,
     /// Client registry tracking connected frpc instances with metadata.
     pub client_registry: Arc<ClientRegistry>,
     /// Monotonically increasing counter for control generation IDs.
@@ -428,6 +433,9 @@ pub struct AppState {
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
     /// Per-client proxy count limit. 0 = unlimited.
     pub max_ports_per_client: u64,
+    /// Per-proxy concurrent user-connection cap. 0 = unlimited (Go frp
+    /// default). Bounds per-proxy connection floods (audit D2-2).
+    pub max_conns_per_proxy: u64,
     /// Per-client port usage count: run_id → number of ports currently used.
     /// Incremented when a proxy registers a remote port, decremented on close.
     /// Matches Go frp's portsUsedNum tracking.
@@ -461,9 +469,13 @@ pub struct AppState {
     /// at that timestamp. Duplicate (run_id, ts) pairs within the freshness
     /// window are rejected as replay attacks.
     ///
-    /// Cleanup uses `BTreeMap::split_off` (O(log n)) instead of a full
-    /// `HashSet::retain` scan (O(n)), avoiding lock-hold latency under
-    /// heavy reconnect churn.
+    /// Cleanup uses a full `retain` scan (O(n)) over both precision domains
+    /// (ms keys for frpc, seconds keys for Go frpc — a single split_off cut
+    /// cannot handle the two domains). Bounded by `MAX_TOTAL_REPLAY_ENTRIES`
+    /// (100k) globally and 100 per timestamp, so the scan is bounded and the
+    /// lock-hold latency is a few microseconds per login. The comment
+    /// previously claimed `BTreeMap::split_off` (O(log n)); that was never
+    /// implemented — the claim was corrected 2026-08-09 (audit D3-5).
     ///
     /// Memory bound: at `R` logins/sec and default 15s timeout, ~15·R entries,
     /// or ~1,500 entries (~60 KB) at 100 QPS.
@@ -490,7 +502,7 @@ pub struct AppState {
     /// counter increases from new connections started just before the accept
     /// loop shut down are expected and handled.
     pub active_connections: AtomicU64,
-    /// Aggregate work-conn pool metrics (hits/misses/drops/idle_timeout).
+    /// Aggregate work-conn pool metrics (hits/misses/drops).
     /// Updated atomically from control handlers, read by Prometheus /admin API.
     pub pool: PoolMetrics,
     /// Immutable snapshot of server config fields exposed via dashboard v2 API.
@@ -530,6 +542,7 @@ impl AppState {
         custom_404_page: String,
         plugin_manager: Arc<crate::plugin::HttpPluginManager>,
         max_ports_per_client: u64,
+        max_conns_per_proxy: u64,
         nat_hole_analysis_data_reserve_hours: u64,
         detailed_errors_to_client: bool,
         max_connections: usize,
@@ -547,7 +560,7 @@ impl AppState {
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             used_udp_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             port_reservations: Arc::new(RwLock::new(PortReservationMap::new())),
-            run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
+            run_id_to_ctl_tx: Arc::new(DashMap::new()),
             client_registry: Arc::new(ClientRegistry::new()),
             control_id_counter: AtomicU64::new(1),
             run_mu_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -576,6 +589,7 @@ impl AppState {
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             max_ports_per_client,
+            max_conns_per_proxy,
             client_ports_used: Arc::new(RwLock::new(std::collections::HashMap::new())),
             sudp_port,
             tcp_group_ctl: TcpGroupCtl::new(),
@@ -801,10 +815,9 @@ impl AppState {
                 }
             }
         }
-        let map = self.run_id_to_ctl_tx.read().await;
         run_ids
             .iter()
-            .filter_map(|rid| map.get(rid).map(|ctl| ctl.tx.clone()))
+            .filter_map(|rid| self.run_id_to_ctl_tx.get(rid).map(|ctl| ctl.tx.clone()))
             .collect()
     }
 
@@ -900,6 +913,7 @@ mod tests {
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
             0,
+            0,
             168,
             true,
             0,
@@ -934,8 +948,7 @@ mod tests {
     #[cfg(feature = "vnet")]
     async fn insert_control(state: &Arc<AppState>, run_id: &str) -> mpsc::Receiver<InternalMsg> {
         let (tx, rx) = mpsc::channel(16);
-        let mut map = state.run_id_to_ctl_tx.write().await;
-        map.insert(
+        state.run_id_to_ctl_tx.insert(
             run_id.to_string(),
             ControlTx {
                 tx,

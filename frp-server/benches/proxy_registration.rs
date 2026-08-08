@@ -34,6 +34,7 @@ fn make_info(name: &str, run_id: &str, group: Option<&str>) -> ProxyInfo {
         multiplexer: String::new(),
         bandwidth_limit: String::new(),
         bandwidth_limit_mode: String::new(),
+        user_conn_sem: None,
     }
 }
 

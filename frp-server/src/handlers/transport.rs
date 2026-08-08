@@ -108,10 +108,10 @@ pub(crate) async fn handle_tls_connection(
                 // SNI routing: no HTTP path, so pass empty string.
                 // Routes with empty locations (HTTPS SNI) match any path.
                 if let Some(route) = state.vhost_manager.lookup_wildcard(&sni_host, "", "").await {
-                    let ctl_tx = {
-                        let map = state.run_id_to_ctl_tx.read().await;
-                        map.get(route.run_id.as_ref()).cloned()
-                    };
+                    let ctl_tx = state
+                        .run_id_to_ctl_tx
+                        .get(route.run_id.as_ref())
+                        .map(|v| v.clone());
                     if let Some(ctl) = ctl_tx {
                         info!(sni_host = %sni_host, proxy_name = %route.proxy_name, addr = %addr,
                                                         "SNI route '{}' → HTTPS proxy '{}' from {}",

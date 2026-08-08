@@ -386,13 +386,55 @@ struct UdpSession {
     first_packet: bool,
 }
 
+/// Sharded remote-visitor session table (8 shards).
+///
+/// The per-packet hot path (reader lookup/refresh + session reply refresh)
+/// locks only the shard of the packet's remote instead of one global mutex,
+/// so concurrent remotes do not serialize on a single cache line. Sweep and
+/// exit-removal iterate all shards (cold paths). std Mutex is fine: critical
+/// sections are short and never held across an await (bind/connect happen
+/// outside any lock).
+struct UdpSessionTable {
+    shards: [std::sync::Mutex<HashMap<SocketAddr, UdpSession>>; UDP_SESSION_SHARDS],
+}
+
+const UDP_SESSION_SHARDS: usize = 8;
+
+impl UdpSessionTable {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Lock the shard owning `remote`.
+    fn shard(
+        &self,
+        remote: &SocketAddr,
+    ) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, UdpSession>> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        remote.hash(&mut h);
+        let idx = (h.finish() as usize) % UDP_SESSION_SHARDS;
+        self.shards[idx].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lock every shard (cold paths: sweep, global inspection).
+    fn lock_all(&self) -> Vec<std::sync::MutexGuard<'_, HashMap<SocketAddr, UdpSession>>> {
+        self.shards
+            .iter()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect()
+    }
+}
+
 async fn run_udp_session(
     socket: Arc<UdpSocket>,
     remote: SocketAddr,
     tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     session_alive: Arc<AtomicBool>,
     udp_packet_size: usize,
-    sessions: Arc<std::sync::Mutex<HashMap<SocketAddr, UdpSession>>>,
+    sessions: Arc<UdpSessionTable>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut buf = vec![0u8; udp_packet_size.max(1)];
@@ -409,10 +451,7 @@ async fn run_udp_session(
                     Ok((n, _src)) => {
                         // Refresh the shared entry's activity so inbound-heavy
                         // remotes (rare/no replies) are not reaped.
-                        if let Some(entry) = sessions
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get_mut(&remote)
+                        if let Some(entry) = sessions.shard(&remote).get_mut(&remote)
                         {
                             entry.last_active = Instant::now();
                         }
@@ -432,7 +471,7 @@ async fn run_udp_session(
                 // last_active is refreshed by the reader on inbound remote
                 // packets and by us on local replies.
                 let idle_for = {
-                    let map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    let map = sessions.shard(&remote);
                     map.get(&remote)
                         .map(|e| e.last_active.elapsed())
                         .unwrap_or(UDP_SESSION_IDLE_TIMEOUT)
@@ -448,7 +487,7 @@ async fn run_udp_session(
         }
     }
     // Remove self from the session table (only if it still refers to us).
-    let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = sessions.shard(&remote);
     if let Some(entry) = map.get(&remote) {
         if Arc::ptr_eq(&entry.socket, &socket) {
             map.remove(&remote);
@@ -524,8 +563,7 @@ async fn run_udp_work_conn(
 
     // Remote-visitor session table. std Mutex (short critical sections,
     // never held across an await — bind() happens outside the lock).
-    let sessions: Arc<std::sync::Mutex<HashMap<SocketAddr, UdpSession>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let sessions: Arc<UdpSessionTable> = Arc::new(UdpSessionTable::new());
     // Per-session socket -> single writer aggregation channel.
     let (write_tx, mut write_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(64);
 
@@ -594,7 +632,7 @@ async fn run_udp_work_conn(
                             // packet (mirror invariant: shared-map hit implies
                             // mirror hit).
                             let entry = {
-                                let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut map = sessions.shard(&remote);
                                 match map.get_mut(&remote) {
                                     Some(entry) => {
                                         entry.last_active = Instant::now();
@@ -627,8 +665,7 @@ async fn run_udp_work_conn(
                                         continue;
                                     }
                                     let sock = Arc::new(sock);
-                                    let mut map =
-                                        sessions.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut map = sessions.shard(&remote);
                                     match map.get(&remote) {
                                         // Defensive: unreachable today (the
                                         // reader is the sole sessions inserter
@@ -694,11 +731,7 @@ async fn run_udp_work_conn(
                                     final_payload = buf;
                                 }
                             }
-                            if let Some(entry) = sessions
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get_mut(&remote)
-                            {
+                            if let Some(entry) = sessions.shard(&remote).get_mut(&remote) {
                                 entry.first_packet = false;
                             }
                             debug!(proxy_name = %pn_r, byte_count = final_payload.len(),
@@ -739,11 +772,11 @@ async fn run_udp_work_conn(
                     // sockets accumulate FDs and ephemeral ports for the work
                     // conn's lifetime — bounded only by distinct remotes seen.
                     {
-                        let map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                        let maps = sessions.lock_all();
                         reader_socks.retain(|_k, v| {
                             // retain by value: keep only entries whose Arc
-                            // still matches a live session entry.
-                            map.values().any(|e| Arc::ptr_eq(&e.socket, v))
+                            // still matches a live session entry in ANY shard.
+                            maps.iter().any(|m| m.values().any(|e| Arc::ptr_eq(&e.socket, v)))
                         });
                     }
                 }
@@ -759,6 +792,13 @@ async fn run_udp_work_conn(
     let writer = async move {
         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
         let mut payload = Vec::with_capacity(udp_packet_size.max(1));
+        // local_addr is loop-invariant (already parsed to a SocketAddr at
+        // startup); pre-build the UdpAddr once and move it in/out per packet
+        // instead of re-parsing the string every packet (audit D1-5). An
+        // invalid local_addr is a recoverable config error (warned at
+        // startup, run_udp_work_conn continues) — degrade to None (the old
+        // per-packet from_string would return None too), never panic.
+        let mut local_udp_addr: Option<msg::UdpAddr> = msg::UdpAddr::from_string(&local_addr_str);
         // Ping-pong scratch for the per-packet compress chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
         let mut keepalive = tokio::time::interval(Duration::from_secs(30));
@@ -783,7 +823,11 @@ async fn run_udp_work_conn(
                     // last_remote, so concurrent remotes never cross wires.
                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
                         content: std::mem::take(&mut payload),
-                        local_addr: msg::UdpAddr::from_string(&local_addr_str),
+                        local_addr: local_udp_addr.take().or_else(|| {
+                            // Unreachable after the first packet (returned
+                            // below); defensive fallback.
+                            msg::UdpAddr::from_string(&local_addr_str)
+                        }),
                         remote_addr: Some(msg::UdpAddr {
                             ip: remote.ip().to_string(),
                             port: remote.port(),
@@ -795,6 +839,10 @@ async fn run_udp_work_conn(
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
+                    // Return the invariant UdpAddr for the next packet.
+                    if let FrpMessage::UDPPacket(p) = pkt {
+                        local_udp_addr = p.local_addr;
+                    }
                     if let Err(e) = result {
                         debug!(proxy_name = %pn_w, error = %e,
                             "UDP '{}' send to work conn failed: {}", pn_w, e);

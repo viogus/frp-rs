@@ -41,10 +41,11 @@ pub(crate) const WORK_POOL_EXTRA: usize = 10;
 
 // ---- Types ----
 
-/// A pooled work connection with its pool-entry timestamp for idle expiry.
+/// A pooled work connection. (Idle expiry was removed 2026-08-09 — audit
+/// D2-3: `idle_timeout` is never configured and Go frp parity keeps pooled
+/// conns alive until control disconnect, so `pooled_at` was dead.)
 pub(crate) struct PoolEntry {
     pub(crate) conn: IoStream,
-    pub(crate) pooled_at: Instant,
 }
 
 /// A pending request from a proxy listener waiting for a work connection.
@@ -72,6 +73,13 @@ pub(crate) struct PendingRequest {
     /// visitor-segment encryption is also on — snappy inner, CFB outer).
     pub(crate) visitor_use_compression: bool,
     pub(crate) created_at: Instant,
+    /// Per-proxy user-conn cap permit (audit D2-2). Held for the connection's
+    /// full lifetime: dropped when this request is bridged and completes, or
+    /// when the pending entry is expired/cleaned. None = unlimited.
+    /// Never read directly — its `Drop` releases the semaphore permit, which
+    /// is the entire point.
+    #[allow(dead_code)]
+    pub(crate) user_conn_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// Proxy metadata fetched once by the dispatcher. `assign_work_to_proxy`
     /// reads local_addr/remote_port/bandwidth_limit/etc. from it instead of
     /// re-acquiring the proxy-map RwLock per user connection.
@@ -295,10 +303,7 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                 let enc_key = ctx.reloadable.encryption_key;
                 bridge::assign_work_to_proxy(stream, req, enc_key, ctx.state.clone(), ctx.v2).await;
             } else if ctl.work_pool.len() < ctx.pool_cap {
-                ctl.work_pool.push_back(PoolEntry {
-                    conn: stream,
-                    pooled_at: Instant::now(),
-                });
+                ctl.work_pool.push_back(PoolEntry { conn: stream });
                 ctx.pool_stats
                     .pool_size
                     .store(ctl.work_pool.len() as i64, Ordering::Relaxed);
@@ -363,6 +368,10 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
             visitor_use_encryption,
             visitor_use_compression,
             created_at: Instant::now(),
+            // STCP/XTCP visitors are not bounded by the provider's
+            // user-conn cap (Go semantics: visitor conns are peer-initiated
+            // and already gated by sk auth).
+            user_conn_permit: None,
             proxy_info,
         },
     )
@@ -433,10 +442,11 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
     };
     // If backend is on a different run_id, forward to that handler
     if target_run_id != ctx.run_id {
-        let ctl_tx = {
-            let map = ctx.state.run_id_to_ctl_tx.read().await;
-            map.get(&target_run_id).cloned()
-        };
+        let ctl_tx = ctx
+            .state
+            .run_id_to_ctl_tx
+            .get(&target_run_id)
+            .map(|v| v.clone());
         if let Some(ctl) = ctl_tx {
             match ctl.tx.try_send(InternalMsg::ProxyUserConn {
                 proxy_name: target_proxy.clone(),
@@ -487,6 +497,21 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
         .as_ref()
         .map(|p| (p.use_encryption, p.use_compression))
         .unwrap_or((false, false));
+    // Per-proxy user-conn cap (audit D2-2): acquire the permit before
+    // enqueueing so a flood cannot grow pending_requests + fds unbounded.
+    // The permit lives in the PendingRequest and drops when the bridge
+    // ends (or the pending entry expires), covering the conn's lifetime.
+    // 0 = unlimited (Go frp default; no equivalent option upstream).
+    let user_conn_permit = match proxy_info.as_ref().and_then(|p| p.user_conn_sem.clone()) {
+        Some(sem) => match sem.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                debug!(proxy_name = %target_proxy, "Proxy '{}' at user-conn cap, dropping connection", target_proxy);
+                return Ok(());
+            }
+        },
+        None => None,
+    };
     assign_or_queue(
         &mut ctl.work_pool,
         &mut ctl.pending_requests,
@@ -504,6 +529,7 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             visitor_use_encryption: false,
             visitor_use_compression: false,
             created_at: Instant::now(),
+            user_conn_permit,
             proxy_info,
         },
     )

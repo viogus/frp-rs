@@ -171,8 +171,6 @@ pub(crate) async fn handle_visitor_conn_inner(
         let visitor_identity = match msg.run_id.as_deref() {
             Some(visitor_run_id) if !visitor_run_id.is_empty() => state
                 .run_id_to_ctl_tx
-                .read()
-                .await
                 .get(visitor_run_id)
                 .map(|control| control.user.clone())
                 .unwrap_or_default(),
@@ -215,10 +213,7 @@ pub(crate) async fn handle_visitor_conn_inner(
         return;
     }
 
-    let ctl_tx = {
-        let map = state.run_id_to_ctl_tx.read().await;
-        map.get(&run_id).cloned()
-    };
+    let ctl_tx = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.clone());
 
     match ctl_tx {
         Some(ctl) => {
@@ -330,10 +325,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         }
     };
 
-    let ctl_tx = {
-        let map = state.run_id_to_ctl_tx.read().await;
-        map.get(&run_id).cloned()
-    };
+    let ctl_tx = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.clone());
 
     let ctl_tx = match ctl_tx {
         Some(ctl) => ctl,
@@ -1098,10 +1090,7 @@ pub(crate) async fn handle_work_conn_inner(
         return;
     }
 
-    let ctl_tx = {
-        let map = state.run_id_to_ctl_tx.read().await;
-        map.get(&run_id).cloned()
-    };
+    let ctl_tx = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.clone());
 
     match ctl_tx {
         Some(ctl) => {

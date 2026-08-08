@@ -221,7 +221,7 @@ impl ClientVnetController {
         self.routes.write().await.insert("", name, cidr)?;
         self.visitor_txs
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string(), packet_tx);
         tracing::info!(visitor_name = %name, cidr = %cidr, "virtual_net visitor route registered");
         Ok(())
