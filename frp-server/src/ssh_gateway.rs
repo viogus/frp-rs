@@ -320,17 +320,19 @@ impl VirtualControl {
 /// Lifecycle:
 /// 1. `auth_succeeded` → store handle, spawn work-connection background task
 /// 2. `exec_request` → parse proxy args from SSH remote command
-/// 3. `tcpip_forward` → rejected; SSH reverse forwarding is disabled
-/// 4. When a work connection is needed, the control handler sends
-///    ReqWorkConn → VirtualControl intercepts → WorkConnRequest →
-///    background task drops the request (no reverse tunnel is available).
+/// 3. `tcpip_forward` → accepted (Go semantics: no port bound, address
+///    recorded); when a work connection is requested, the control handler
+///    opens a `forwarded-tcpip` channel back to the SSH client
+/// 4. When a work connection is needed, the control handler opens a
+///    `forwarded-tcpip` channel back to the SSH client (the reverse tunnel).
 pub struct SshSession {
     /// Unique run_id for this SSH client (used as FRP run_id).
     pub run_id: String,
     /// Proxy names registered by this session (for cleanup).
     pub registered_proxies: Vec<String>,
     /// Stored after auth_succeeded; retained for session lifecycle handling.
-    /// Reverse-forward channels are not opened in this release.
+    /// (Reverse-forward channels are opened via `channel_open_forwarded_tcpip`
+    /// when a work connection is requested.)
     pub ssh_handle: Option<russh::server::Handle>,
     /// V1 frame sender into the VirtualControl channel (→ control handler).
     frame_tx: Option<mpsc::Sender<Vec<u8>>>,

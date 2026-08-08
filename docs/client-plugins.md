@@ -503,8 +503,8 @@ type = "virtual_net"
 ```
 
 The Go-style flat form `plugin = "virtual_net"` is also accepted. Requires
-`[feature] VirtualNet = true`, the `vnet` build feature, and a valid IPv4
-`[virtualNet] address`.
+`[feature] VirtualNet = true`, the `vnet` build feature (opt-in, not in
+default binaries), and a valid IPv4 `[virtualNet] address`.
 
 ------------------------------------------------------------------------------
 
@@ -527,8 +527,9 @@ type = "virtual_net"
 destinationIP = "100.86.0.1"
 ```
 
-Requires `[feature] VirtualNet = true` and the `vnet` build feature (on by
-default). frp-rs parses, validates, advertises/removes the `destinationIP`
+Requires `[feature] VirtualNet = true` and the `vnet` build feature
+(opt-in: `--features vnet` on frps/frpc — not in default binaries).
+frp-rs parses, validates, advertises/removes the `destinationIP`
 route (IPv4 `/32` or IPv6 `/128`) over the control connection, and forwards
 inbound `VnetPacket`s into the STCP/XTCP visitor tunnel. The visitor tunnel is
 a no-bind tunnel: raw IP packets are written into it with the visitor's

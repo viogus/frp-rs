@@ -694,10 +694,11 @@ Keep `tcp_mux = true` unless you have a specific reason to disable it. Benefits:
 
 **`pool_count` (client-side):**
 
-Caps the number of pre-established (idle) work connections. The pool is
-filled **lazily** — connections are created on-demand when the server requests
-them via `ReqWorkConn`, and surplus connections are kept in the pool up to
-`pool_count`. The pool is NOT pre-warmed at startup.
+Caps the number of pre-established (idle) work connections. After login
+the server issues `pool_count` `ReqWorkConn` requests immediately, so the
+pool is **pre-warmed** right after login (Go frp semantics); further
+connections are created on-demand when the server requests them, and
+surplus connections are kept in the pool up to `pool_count`.
 
 ```toml
 # frpc.toml

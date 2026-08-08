@@ -6,7 +6,7 @@
 
 frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 10 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
 
-**68 non-XTCP compatibility tests and the 16-test XTCP pairwise matrix run against Go frp v0.70.1 (V2 included).**
+**76 non-XTCP compatibility tests and the 17-test XTCP pairwise matrix run against Go frp v0.70.1 (V2 included).**
 
 ---
 
@@ -78,7 +78,7 @@ frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/S
 | `/api/clients` | ✅ | ✅ |
 | Dashboard TLS | ✅ | ✅ |
 | Static web UI | ✅ | ✅ (inline HTML dashboard) |
-| Pprof endpoint | ✅ | ❌ (out of scope — Go-specific) |
+| Pprof endpoint | ✅ | ⚠️ placeholder routes (`/debug/pprof/*` return a notice; no Go-style profiles) |
 
 ---
 

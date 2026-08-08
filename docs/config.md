@@ -57,6 +57,9 @@ Authentication configuration for control connections.
 | `oidc_additional_audience` | `string[]` | `[]` | `auth.oidcAdditionalAudience` | Additional accepted audiences. A token is accepted when its `"aud"` claim matches `oidc_audience` OR any entry of this list (union). |
 | `oidc_tls_trusted_ca_file` | `string` | `""` | `auth.oidcTLSTrustedCAFile` | Path to a custom CA certificate PEM file used to verify the OIDC provider's TLS certificate (openid-configuration / JWKS fetches). Extends the default root store with the file's certificates. |
 | `oidc_proxy_url` | `string` | `""` | `auth.oidcProxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
+| `oidc_skip_nbf` | `bool` | `false` | `auth.oidcSkipNbf` | Skip the `"nbf"` (not-before) claim validation. For development only. |
+| `authentication_timeout` | `i64` | `90` | `auth.authenticationTimeout` | Login timestamp freshness window in seconds (replay protection; `0` = disabled, Go frp default). |
+| `token_auth_timeout` | `bool` | `true` | `auth.tokenAuthTimeout` | Apply the freshness window to token (MD5) auth logins. |
 | `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalAuthScopes` | Extra auth scopes: `"HeartBeats"`, `"NewWorkConns"`. When listed, those message types require authentication in addition to `Login`. |
 
 `auth.tokenSource` supports two source types:
@@ -95,6 +98,8 @@ Dashboard and metrics HTTP server.
 | `tls_cert_file` | `string` | `""` | `webServer.tlsCertFile` | TLS certificate for dashboard HTTPS. When both `tls_cert_file` and `tls_key_file` are non-empty, dashboard serves HTTPS. |
 | `tls_key_file` | `string` | `""` | `webServer.tlsKeyFile` | TLS private key for dashboard HTTPS. |
 | `custom_404_page` | `string` | `""` | `webServer.custom404Page` | Custom HTML body for 404 responses from VHost and TCPMux handlers. Content-Type is set to `text/html`. |
+| `assets_dir` | `string` | `""` | `webServer.assetsDir` | Directory containing a custom dashboard `index.html`; read once at startup (empty = built-in page). |
+| `pprof_enable` | `bool` | `false` | `webServer.pprofEnable` | Serve `/debug/pprof/*` placeholder routes (frp-rs does not expose Go-style pprof profiles). |
 
 ### `[transport]` Section
 
@@ -109,9 +114,10 @@ Transport-level settings for the server.
 ### `[ssh_tunnel_gateway]` Section
 
 SSH tunnel gateway. When `bind_port > 0`, an embedded SSH server accepts SSH
-proxy-registration commands. Reverse forwarding (`ssh -R`) is disabled in
-0.7.1 and rejected explicitly; only the forward proxy-registration command
-path is supported.
+proxy-registration commands. Reverse forwarding (`ssh -R`, `tcpip-forward` /
+`forwarded-tcpip`) is supported since the 0.7.1 parity pass (Go semantics: the
+port is recorded, not bound; a `forwarded-tcpip` channel is opened when a work
+connection is requested).
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
@@ -299,7 +305,9 @@ Full OIDC authentication configuration. When `method = "oidc"`, the client obtai
 | `oidc_token_endpoint` | `string` | `""` | `auth.oidcTokenEndpoint` | OIDC token endpoint URL. |
 | `oidc_scope` | `string` | `""` | `auth.oidcScope` | OIDC scope string (e.g. `"openid profile"`). |
 | `oidc_issuer` | `string` | `""` | `auth.oidcIssuer` | OIDC issuer URL. |
-| `additional_endpoint_params` | `string` | `""` | `auth.additionalEndpointParams` | Extra parameters appended to the token endpoint request. |
+| `additional_endpoint_params` | `table` | `{}` | `auth.additionalEndpointParams` | Extra key/value parameters appended to the token endpoint request (map). |
+| `oidc_token_source` | `table` | `null` | `auth.oidcTokenSource` | Dynamic OIDC token source (`type = "file"`/`"exec"`), same shape as `tokenSource`. |
+| `authentication_timeout` | `i64` | `90` | `auth.authenticationTimeout` | Login timestamp freshness window in seconds (replay protection; `0` = disabled, Go frp default). |
 | `oidc_tls_trusted_ca_file` | `string` | `""` | `auth.tlsTrustedCaFile` | Custom CA certificate PEM file for OIDC provider TLS verification. |
 | `oidc_tls_insecure_skip_verify` | `bool` | `false` | `auth.insecureSkipVerify` | Skip TLS certificate verification for OIDC provider. For development only. |
 | `oidc_proxy_url` | `string` | `""` | `auth.oidcProxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
@@ -440,7 +448,7 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `name` | `string` | — | **Required.** | Unique proxy name. Used as identifier in logs, admin API, and routing. |
-| `type` | `string` | — | **Required.** | Proxy type: `"tcp"`, `"udp"`, `"http"`, `"https"`, `"stcp"`, `"xtcp"`, `"tcpmux"`, `"sudp"`. |
+| `type` | `string` | — | **Required.** | Proxy type: `"tcp"`, `"udp"`, `"http"`, `"https"`, `"stcp"`, `"xtcp"`, `"tcpmux"`, `"sudp"`, `"vnet"`. |
 | `local_ip` | `string` | `"127.0.0.1"` | `localIp` | Local service IP address. |
 | `local_port` | `u16` | `0` | `localPort` | Local service port. |
 | `remote_port` | `u16` | `0` | `remotePort` | Remote port to expose on the server. 0 = auto-assign from server's port range. |
@@ -839,8 +847,8 @@ All other features gate only the runtime behavior. Their config fields are alway
 Some Go frp v0.70.1 fields are parsed and validated for source-level
 compatibility but are not yet consumed by the frp-rs runtime. They are
 accepted so Go frp configs load unchanged; setting them currently has no
-runtime effect: `log.disablePrintColor`, `webServer.assetsDir`,
-`webServer.pprofEnable`, and plugin `enableHTTP2`.
+runtime effect: `log.disablePrintColor`, and `webServer.pprofEnable`
+(served as placeholder routes only).
 
 ---
 

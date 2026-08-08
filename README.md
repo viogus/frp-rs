@@ -39,7 +39,7 @@ suitable as a drop-in replacement for either the client or server side.
 | Auto port allocation | —      | ✅     |
 | Encryption (AES-128-CFB) | ✅  | ✅     |
 | Compression (Snappy) | ✅     | ✅     |
-| Bandwidth limiting   | ✅     | —      |
+| Bandwidth limiting   | ✅     | ✅     |
 | TCP multiplexing (yamux) | ✅ | ✅     |
 | WebSocket transport  | ✅     | ✅     |
 | TLS transport        | ✅     | ✅     |
@@ -122,14 +122,17 @@ but not literally 100% — see "Known limitations" below.
 
 | Metric | Go frp v0.70.1 | frp-rs (default) | frp-rs (`tiny`) | frp-rs (`micro`) |
 |--------|---------------|------------------|-----------------|-------------------|
-| frps binary | ~14 MB | ~5.1 MB | ~3.0 MB | ~1.8 MB |
-| frpc binary | ~12 MB | ~4.3 MB | ~2.6 MB | ~1.9 MB |
+| frps binary | ~14 MB | ~9.1 MB | ~5.3 MB | ~3.7 MB |
+| frpc binary | ~12 MB | ~7.7 MB | ~5.3 MB | ~3.6 MB |
 | Memory (idle) | ~8-12 MB | ~2-4 MB | ~1.5-3 MB | ~1-2 MB |
 
-**Build sizes via feature flags.** Trim unused protocols and features to match your deployment. `frps`'s `default` feature set already enables every transport and the SSH gateway, so `default` and `full` produce the same binary — the only opt-in feature is `dashboard`:
+> Binary sizes measured 2026-08-08 (macOS arm64, `lto=false opt-level=2` per the local build override; declared release profile is ~10-20% smaller).
 
-- **default** (= full minus dashboard): TCP, WS, TLS, KCP, QUIC, OIDC auth, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux, vnet, and the SSH gateway.
-- **full** (`--features "ssh,quic,dashboard"`): default + dashboard/metrics. (`ssh` and `quic` are redundant here — both are already on by default.)
+**Build sizes via feature flags.** Trim unused protocols and features to match your deployment. `frps`'s `default` feature set already enables every transport and the SSH gateway (the Cargo `full` feature is identical to `default`); opt-in features are `dashboard`, `vnet`, `mimalloc`, `otel`, and the dev-only profiling flags:
+
+- **default** (= Cargo `full`, no dashboard): TCP, WS, TLS, KCP, QUIC, OIDC auth, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux, and the SSH gateway.
+- **dashboard build** (`--features "ssh,quic,dashboard"`): default + dashboard/metrics. (`ssh` and `quic` are redundant here — both are already on by default.)
+- **vnet** (`--features vnet`): adds L3 VPN / TUN device routing (frp-vnet; opt-in, not in default binaries).
 - **`tiny`**: Drops QUIC, KCP, WebSocket, SSH, OIDC, dashboard, and compression. Keeps TLS and TCP mux (frps also keeps the HTTP proxy plugin). Ideal for edge devices.
 - **`micro`**: Core only — no TLS, no compression, no chacha20, no HTTP proxy, no TCP mux. Minimal attack surface and footprint.
 
@@ -149,18 +152,19 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 ### frp-rs 核心优势
 
-**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 68 项常规兼容性测试加 17 项 XTCP 两两矩阵测试（含 QUIC 数据面）。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
+**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 76 项常规兼容性测试加 17 项 XTCP 两两矩阵测试（含 QUIC 数据面）。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
-**体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.1 MB，frpc ~4.3 MB（含 QUIC/KCP/SSH 等全部默认 feature），约为 Go frp 的 1/3。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
+**体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~9.1 MB，frpc ~7.7 MB（含 QUIC/KCP/SSH 等全部默认 feature），约为 Go frp 的 2/3。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
 **功能裁剪。** 四级构建体系，按需组合，适配从云端到嵌入式的全场景（QUIC/SSH 默认启用，dashboard 需显式启用）：
 
 | 版本 | 体积 (frps/frpc) | 保留能力 | 适用场景 |
 |------|-----------------|---------|---------|
-| **default** | ~5.1MB / ~4.3MB | TCP/WS/TLS/KCP/QUIC、SSH、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux、vnet | 通用部署 |
-| **full** | ~5.3MB / ~4.3MB | default + dashboard（`--features "ssh,quic,dashboard"`，ssh/quic 已默认启用） | 全功能部署 |
-| **tiny** | ~3.0MB / ~2.6MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/TCP mux（frps 另保留 HTTP 代理） | 边缘设备、嵌入式 |
-| **micro** | ~1.8MB / ~1.9MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
+| **default** | ~9.1MB / ~7.7MB | TCP/WS/TLS/KCP/QUIC、SSH、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
+| **full** | ~9.9MB / ~7.7MB | default + dashboard（`--features "ssh,quic,dashboard"`，ssh/quic 已默认启用） | 全功能部署 |
+| **vnet** | default + ~0.5MB | 加 L3 VPN / TUN 路由（`--features vnet`，默认二进制不含） | 需要虚拟局域网 |
+| **tiny** | ~5.3MB / ~5.3MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/TCP mux（frps 另保留 HTTP 代理） | 边缘设备、嵌入式 |
+| **micro** | ~3.7MB / ~3.6MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
 
 每个 feature 均可独立开关（frps 20 个、frpc 18 个编译期 feature flag），精细控制二进制内容。无需修改代码，Cargo feature 即按需裁剪。
 
@@ -221,16 +225,16 @@ Four size tiers (see [Why frp-rs?](#why-frp-rs) for sizes). SSH and QUIC are
 enabled by default; dashboard is opt-in:
 
 ```bash
-# Default — core transports + SSH + QUIC, no dashboard (~5.1 MB frps, ~4.3 MB frpc)
+# Default — core transports + SSH + QUIC, no dashboard (~9.1 MB frps, ~7.7 MB frpc)
 cargo build --release -p frps -p frpc
 
-# Full — default + dashboard (~5.3 MB frps, ~4.3 MB frpc)
+# Full — default + dashboard (~9.9 MB frps, ~7.7 MB frpc)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
 
-# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard/compression, keeps TLS+TCP mux (frps also HTTP proxy) (~3.0 MB / ~2.6 MB)
+# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard/compression, keeps TLS+TCP mux (frps also HTTP proxy) (~5.3 MB / ~5.3 MB)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
 
-# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~1.8 MB / ~1.9 MB)
+# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~3.7 MB / ~3.6 MB)
 cargo build --release -p frps -p frpc --no-default-features --features micro
 ```
 
@@ -244,7 +248,7 @@ and the rest are default ON):
 | `dashboard` | Metrics/status API (prometheus, axum) |
 | `kcp` | KCP transport (in-tree, kcp-go compatible) |
 | `websocket` | WebSocket transport |
-| `oidc` | OIDC auth (jsonwebtoken, reqwest) |
+| `oidc` | OIDC auth (jsonwebtoken, hyper/hyper-rustls via `http-client`) |
 | `tls` | TLS encryption (rustls) |
 | `compression` | Snappy bridge compression |
 | `chacha20` | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
@@ -258,7 +262,7 @@ and the rest are default ON):
 
 `tiny`/`micro` are binary-level profiles (`frps/Cargo.toml`, `frpc/Cargo.toml`) that select a fixed feature set; they build `frps-tiny`/`frpc-tiny`/`frps-micro`/`frpc-micro` binaries respectively.
 
-`quic` implies `tls`; `oidc` implies `reqwest`; `ssh` implies `rand`.
+`quic` implies `tls`; `oidc` implies `http-client` (hyper); `ssh` implies `rand`.
 
 ### Quick Start
 
@@ -716,7 +720,7 @@ frp-rs/
       auth.rs             MD5 token authentication + OIDC verification
       bridge.rs           Encrypted/compressed data bridge (streaming CFB)
       cipher_stream.rs    AES-128-CFB streaming encrypt/decrypt (CipherReader/CipherWriter)
-      config.rs           TOML config structs + Go→Rust compat normalization
+      config/             TOML/YAML/JSON/INI config structs + Go→Rust compat normalization
       config_store.rs     Runtime config store (client proxy/visitor CRUD)
       encryption.rs       Key derivation (PBKDF2-SHA1) + Snappy compression
       crypto.rs           V2 AEAD algorithms (AES-256-GCM / XChaCha20-Poly1305)
@@ -805,7 +809,7 @@ frp-rs/
     entrypoint.c           Minimal static entrypoint (FRP_MODE, conf path)
     README.md              Docker build documentation
   scripts/
-    compat-test.sh         Go↔Rust cross-compatibility test suite (68 regular + 17 XTCP scenarios)
+    compat-test.sh         Go↔Rust cross-compatibility test suite (76 regular + 17 XTCP scenarios)
   frps.toml               Example server config
   frpc.toml               Example client config
   CLAUDE.md               Claude Code project instructions
