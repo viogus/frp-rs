@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::{BoxedReadHalf, BoxedWriteHalf, Transport};
+use super::{poll_pre_read, BoxedReadHalf, BoxedWriteHalf, Transport};
 
 pub struct PreReadTransport {
     pre_read: Vec<u8>,
@@ -35,18 +35,15 @@ impl PreReadTransport {
 
 impl AsyncRead for PreReadTransport {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.pos < self.pre_read.len() {
-            let remaining = &self.pre_read[self.pos..];
-            let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            self.pos += n;
+        let this = self.get_mut();
+        if poll_pre_read(&this.pre_read, &mut this.pos, buf) {
             return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
