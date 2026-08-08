@@ -1362,6 +1362,7 @@ impl Service {
                 Some(self.cfg.web_server.tls_key_file.clone())
             };
             let enable_prom = self.cfg.web_server.enable_prometheus;
+            let dash_assets = self.cfg.web_server.assets_dir.clone();
             tokio::spawn(async move {
                 if let Err(e) = crate::dashboard::run_dashboard(
                     dash_addr,
@@ -1371,6 +1372,7 @@ impl Service {
                     enable_prom,
                     dash_tls_cert,
                     dash_tls_key,
+                    dash_assets,
                 )
                 .await
                 {

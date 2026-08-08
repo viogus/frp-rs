@@ -14,11 +14,10 @@ use bytes::Bytes;
 use http::header::{CONTENT_TYPE, LOCATION};
 use http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
-use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use rustls::pki_types::CertificateDer;
+use tokio::io::AsyncWrite;
 
 /// Default timeout for OIDC HTTP requests (10 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -26,7 +25,208 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum number of redirect hops before giving up.
 const MAX_REDIRECTS: usize = 10;
 
-type HttpsClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+type HttpsClient = Client<HttpConnect, Full<Bytes>>;
+
+// ── Connector: direct or via HTTP CONNECT / SOCKS5 proxy ─────────────────
+
+/// A tunneled stream: plain TCP (http target or http-proxy CONNECT) or
+/// TLS-wrapped (https target). `IoStream` is the transport crate's
+/// type-erased AsyncRead+AsyncWrite stream.
+enum TunnelStream {
+    Plain(crate::transport::IoStream),
+    Tls(Box<dyn crate::transport::AsyncReadWrite>),
+}
+
+impl tokio::io::AsyncRead for TunnelStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_read(cx, buf),
+        }
+    }
+}
+
+// hyper's runtime IO trait (used by hyper-util's legacy connect::Connect).
+// The ReadBufCursor → tokio ReadBuf bridge mirrors hyper-util's own
+// TokioIo implementation.
+impl hyper::rt::Read for TunnelStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        let n = unsafe {
+            let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
+            // SAFETY: hyper's ReadBufCursor exposes the same
+            // init/unfilled-region semantics as tokio's ReadBuf; this is
+            // exactly the bridge hyper-util's TokioIo performs.
+            std::task::ready!(tokio::io::AsyncRead::poll_read(self, cx, &mut tbuf))?;
+            tbuf.filled().len()
+        };
+        unsafe {
+            buf.advance(n);
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl hyper::rt::Write for TunnelStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        match self.get_mut() {
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl hyper_util::client::legacy::connect::Connection for TunnelStream {
+    fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
+        hyper_util::client::legacy::connect::Connected::new()
+    }
+}
+
+impl tokio::io::AsyncWrite for TunnelStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            TunnelStream::Tls(s) => std::pin::Pin::new(&mut **s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// hyper connector that dials each request URI — directly, or through an
+/// HTTP CONNECT / SOCKS5 proxy when `proxy_url` is set (reuses
+/// `transport::connect_via_proxy`, the same proxy path as frpc↔frps
+/// connections, so proxy auth and scheme handling stay consistent).
+#[derive(Clone)]
+struct HttpConnect {
+    proxy_url: Option<String>,
+    tls_config: Arc<rustls::ClientConfig>,
+    dial_timeout: Duration,
+}
+
+impl tower_service::Service<Uri> for HttpConnect {
+    type Response = TunnelStream;
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let proxy_url = self.proxy_url.clone();
+        let tls_config = self.tls_config.clone();
+        let dial_timeout = self.dial_timeout;
+        Box::pin(async move {
+            let host = uri
+                .host()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "URI without host")
+                })?
+                .to_string();
+            let port = uri
+                .port_u16()
+                .unwrap_or(if uri.scheme_str() == Some("https") {
+                    443
+                } else {
+                    80
+                });
+            let is_tls = uri.scheme_str() == Some("https");
+
+            let io = match &proxy_url {
+                Some(p) => {
+                    let timeout_secs = dial_timeout.as_secs().clamp(1, 60);
+                    crate::transport::connect_via_proxy(
+                        p,
+                        &host,
+                        port,
+                        timeout_secs,
+                        0, // keepalive 0: OIDC/plugin requests are short-lived
+                    )
+                    .await
+                    .map_err(std::io::Error::other)?
+                }
+                None => {
+                    let addr = format!("{host}:{port}");
+                    let tcp = tokio::net::TcpStream::connect(&addr).await?;
+                    crate::transport::set_nodelay(&tcp);
+                    crate::transport::IoStream::Tcp(tcp)
+                }
+            };
+
+            if is_tls {
+                let server_name =
+                    rustls::pki_types::ServerName::try_from(host).map_err(std::io::Error::other)?;
+                let connector = tokio_rustls::TlsConnector::from(tls_config);
+                let tls = connector
+                    .connect(server_name, io)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                Ok(TunnelStream::Tls(Box::new(tls)))
+            } else {
+                Ok(TunnelStream::Plain(io))
+            }
+        })
+    }
+}
 
 // ── TLS helpers ────────────────────────────────────────────────────────
 
@@ -84,13 +284,13 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 fn build_tls_config(
     skip_verify: bool,
     ca_cert_pem: Option<&[u8]>,
-) -> Result<rustls::ClientConfig, String> {
+) -> Result<Arc<rustls::ClientConfig>, String> {
     if skip_verify {
         let config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
             .with_no_client_auth();
-        return Ok(config);
+        return Ok(Arc::new(config));
     }
 
     let mut root_store = rustls::RootCertStore::empty();
@@ -120,7 +320,7 @@ fn build_tls_config(
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-    Ok(config)
+    Ok(Arc::new(config))
 }
 
 // ── HttpClient ──────────────────────────────────────────────────────────
@@ -157,6 +357,7 @@ pub struct HttpClientBuilder {
     timeout: Duration,
     skip_verify: bool,
     ca_cert_pem: Option<Vec<u8>>,
+    proxy_url: Option<String>,
 }
 
 impl HttpClientBuilder {
@@ -165,6 +366,7 @@ impl HttpClientBuilder {
             timeout: DEFAULT_TIMEOUT,
             skip_verify: false,
             ca_cert_pem: None,
+            proxy_url: None,
         }
     }
 
@@ -189,17 +391,27 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Route requests through an HTTP CONNECT or SOCKS5 proxy (Go frp
+    /// `oidcProxyUrl` compat). An empty/None value connects directly.
+    pub fn proxy(mut self, url: Option<String>) -> Self {
+        self.proxy_url = url.filter(|u| !u.is_empty());
+        self
+    }
+
     /// Build the HTTP client.
     pub fn build(self) -> Result<HttpClient, String> {
-        let tls_config = build_tls_config(self.skip_verify, self.ca_cert_pem.as_deref())?;
+        let mut tls_config = build_tls_config(self.skip_verify, self.ca_cert_pem.as_deref())?;
+        // Force HTTP/1.1 ALPN: hyper-util's legacy client speaks HTTP/1.1
+        // here (http1-only), and without ALPN some servers fail to
+        // negotiate. The old HttpsConnectorBuilder set this implicitly.
+        Arc::make_mut(&mut tls_config).alpn_protocols = vec![b"http/1.1".to_vec()];
 
-        let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_or_http()
-            .enable_http1()
-            .build();
-
-        let client: HttpsClient = Client::builder(TokioExecutor::new()).build(https_connector);
+        let connector = HttpConnect {
+            proxy_url: self.proxy_url,
+            tls_config,
+            dial_timeout: self.timeout,
+        };
+        let client: HttpsClient = Client::builder(TokioExecutor::new()).build(connector);
 
         Ok(HttpClient {
             inner: client,
@@ -538,5 +750,67 @@ mod tests {
         assert_eq!(resolved.scheme_str().unwrap(), "https");
         assert_eq!(resolved.authority().unwrap().as_str(), "example.com");
         assert_eq!(resolved.path(), "/.well-known/jwks");
+    }
+
+    /// End-to-end: a request through an HTTP CONNECT proxy reaches the
+    /// target and the reply comes back through the tunnel. Exercises the
+    /// HttpConnect connector's proxy branch + transport::connect_via_proxy.
+    #[tokio::test]
+    async fn http_client_routes_through_http_connect_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Target origin server.
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut sock, _) = target.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("GET /hello"),
+                "expected GET /hello, got: {req:?}"
+            );
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        // Minimal HTTP CONNECT proxy: answer CONNECT then splice bytes.
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut client, _) = proxy.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = client.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("CONNECT 127.0.0.1:"),
+                "expected CONNECT to target, got: {req:?}"
+            );
+            client
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut target = tokio::net::TcpStream::connect(&target_addr).await.unwrap();
+            tokio::io::copy_bidirectional(&mut client, &mut target)
+                .await
+                .unwrap();
+        });
+
+        let http_client = HttpClientBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .proxy(Some(format!("http://{proxy_addr}")))
+            .build()
+            .unwrap();
+        let resp = http_client
+            .get(&format!("http://{target_addr}/hello"))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(resp.text().await.unwrap(), "ok");
+
+        target_task.await.unwrap();
+        proxy_task.await.unwrap();
     }
 }

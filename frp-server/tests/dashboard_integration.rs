@@ -181,6 +181,54 @@ async fn test_dashboard_root_requires_auth() {
     assert!(resp.text().await.unwrap().contains("<!DOCTYPE html>"));
 }
 
+/// Go compat (`assetsDir`): when `assets_dir` points at a directory with an
+/// `index.html`, the dashboard root serves that custom page instead of the
+/// built-in one.
+#[tokio::test]
+async fn test_dashboard_serves_custom_assets_dir() {
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let dir = tempfile::tempdir().unwrap();
+    let custom = "<!DOCTYPE html><html><body>custom-dashboard</body></html>";
+    std::fs::write(dir.path().join("index.html"), custom).unwrap();
+
+    let cfg = format!(
+        r#"bind_addr = "127.0.0.1"
+bind_port = {bind_port}
+
+[auth]
+method = "token"
+token = "test-token"
+
+[transport]
+tcp_mux = false
+
+[web_server]
+addr = "127.0.0.1"
+port = {dashboard_port}
+user = "admin"
+password = "admin"
+assetsDir = "{}"
+"#,
+        dir.path().display()
+    );
+    let frps = FrpsHandle::start(&cfg).await;
+
+    let resp = auth_client()
+        .get(frps.dashboard_url("/"))
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("custom-dashboard"),
+        "expected custom assets_dir page, got: {}",
+        &body[..body.len().min(120)]
+    );
+}
+
 /// Go compat: /debug/pprof is outside auth (placeholder in frp-rs).
 #[tokio::test]
 async fn test_dashboard_pprof_outside_auth() {
