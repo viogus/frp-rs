@@ -36,24 +36,24 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 ```bash
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~9.1MB), frpc (~7.7MB)
-#   (NOTE: these baselines were measured with `lto=false, opt-level=2` — the
-#   local `.cargo/config.toml` override and CI both disable LTO for build
-#   speed. Release artifacts built from the declared profile (fat-LTO +
-#   opt-level=z, see [profile.release] in Cargo.toml) are ~10-20% smaller.
-#   Local measurements do not reflect release artifacts.)
+# → frps (~5.3MB), frpc (~4.5MB)
+#   (measured 2026-08-08 with the DECLARED release profile: fat-LTO,
+#   opt-level=z, strip=symbols, panic=abort — see [profile.release] in
+#   Cargo.toml. Local/CI dev builds override LTO/opt (`lto=false,
+#   opt-level=2` via .cargo/config.toml for build speed) and come out
+#   ~40% larger; they do not reflect release artifacts.)
 
-# Full (all features; dashboard is the only opt-in on top of default)
+# Full (all features; dashboard is the main opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~9.9MB), frpc (~7.7MB)
+# → frps (~5.7MB), frpc (~4.5MB)
 
 # Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~5.3MB), frpc-tiny (~5.3MB)
+# → frps-tiny (~3.3MB), frpc-tiny (~3.2MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~3.7MB), frpc-micro (~3.6MB)
+# → frps-micro (~2.3MB), frpc-micro (~2.2MB)
 ```
 
 Feature flags across crates:
@@ -109,7 +109,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 797 passed, 0 failed |
-| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~9.1MB/frpc ~7.7MB default; ~9.9/7.7 full; frps-tiny ~5.3MB/frpc-tiny ~5.3MB; frps-micro ~3.7MB/frpc-micro ~3.6MB — measured 2026-08-08 with `lto=false, opt-level=2` (local `.cargo/config.toml` + CI override LTO off for build speed); declared-profile release artifacts (fat-LTO + opt-z) are ~10-20% smaller, so local/CI measurements do not reflect release artifacts; hyper-based HTTP client + otel/prometheus default-features pruning) |
+| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); local/CI dev builds override LTO/opt (`lto=false opt-level=2` via .cargo/config.toml for build speed) and come out ~40% larger, so local/CI measurements do not reflect release artifacts; hyper-based HTTP client + otel/prometheus default-features pruning) |
 | `compat-test.sh` (Go frp v0.70.1) | 76 run_test scenarios + 17 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 13 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |

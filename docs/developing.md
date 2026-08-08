@@ -430,20 +430,24 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 ```bash
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~9.1MB), frpc (~7.7MB)
+# → frps (~5.3MB), frpc (~4.5MB)
 
 # Full (all features; dashboard the main opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~9.9MB), frpc (~7.7MB)
+# → frps (~5.7MB), frpc (~4.5MB)
 
 # Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~5.3MB), frpc-tiny (~5.3MB)
+# → frps-tiny (~3.3MB), frpc-tiny (~3.2MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~3.7MB), frpc-micro (~3.6MB)
+# → frps-micro (~2.3MB), frpc-micro (~2.2MB)
 ```
+
+> Sizes measured 2026-08-08 (macOS arm64) with the declared release profile
+> (fat-LTO, opt-level=z, strip=symbols, panic=abort). Local dev builds that
+> override `lto=false opt-level=2` (`.cargo/config.toml`) come out ~40% larger.
 
 The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and `frps-micro`/`frpc-micro` respectively.
 
