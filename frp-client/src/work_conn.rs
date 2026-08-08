@@ -538,6 +538,16 @@ async fn run_udp_work_conn(
         debug!(proxy_name = %pn_r, "UDP reader '{}' started", pn_r);
         // Ping-pong scratch for the per-packet decompress chain (per-session).
         let mut scratch_b: Vec<u8> = Vec::new();
+        // Reader-owned mirror of the per-remote session sockets. The hot path
+        // sends on `&Arc<UdpSocket>` from here instead of cloning the Arc out
+        // of the shared `sessions` map (an atomic refcount inc/dec pair per
+        // packet). Invariant: an entry is (re)inserted in the same bind path
+        // that (re)inserts into `sessions`, so a shared-map hit implies a
+        // mirror hit. A reaped session may leave a stale mirror entry until
+        // the next periodic sweep (every ~5s); the next packet from that
+        // remote misses the shared map, re-creates the session, and replaces
+        // the entry.
+        let mut reader_socks: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
         loop {
             tokio::select! {
                 biased;
@@ -579,16 +589,23 @@ async fn run_udp_work_conn(
                             // a session task's self-removal, which the
                             // Arc::ptr_eq guard in run_udp_session protects
                             // against clobbering a live replacement).
+                            // The send socket comes back by reference from the
+                            // reader-owned mirror instead of an Arc clone per
+                            // packet (mirror invariant: shared-map hit implies
+                            // mirror hit).
                             let entry = {
                                 let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                                map.get_mut(&remote).map(|entry| {
-                                    entry.last_active = Instant::now();
-                                    (entry.socket.clone(), entry.first_packet)
-                                })
+                                match map.get_mut(&remote) {
+                                    Some(entry) => {
+                                        entry.last_active = Instant::now();
+                                        (reader_socks.get(&remote), entry.first_packet)
+                                    }
+                                    None => (None, false),
+                                }
                             };
-                            let entry = match entry {
-                                Some(e) => e,
-                                None => {
+                            let (sock, first_packet) = match entry {
+                                (Some(sock), first_packet) => (sock, first_packet),
+                                (None, _) => {
                                     let bind = SocketAddr::new(local_addr.ip(), 0);
                                     let sock = match UdpSocket::bind(bind).await {
                                         Ok(s) => s,
@@ -613,7 +630,18 @@ async fn run_udp_work_conn(
                                     let mut map =
                                         sessions.lock().unwrap_or_else(|e| e.into_inner());
                                     match map.get(&remote) {
-                                        Some(entry) => (entry.socket.clone(), entry.first_packet),
+                                        // Defensive: unreachable today (the
+                                        // reader is the sole sessions inserter
+                                        // and held the lock across the bind
+                                        // gap), but if a future concurrent
+                                        // inserter is added, reuse its socket
+                                        // rather than silently re-create.
+                                        Some(entry) => (
+                                            reader_socks
+                                                .get(&remote)
+                                                .expect("sessions hit implies mirror hit"),
+                                            entry.first_packet,
+                                        ),
                                         None => {
                                             let stx = write_tx.clone();
                                             let s_alive = session_alive_r.clone();
@@ -635,12 +663,17 @@ async fn run_udp_work_conn(
                                                     first_packet: true,
                                                 },
                                             );
-                                            (sock, true)
+                                            reader_socks.insert(remote, sock);
+                                            (
+                                                reader_socks
+                                                    .get(&remote)
+                                                    .expect("mirror entry just inserted"),
+                                                true,
+                                            )
                                         }
                                     }
                                 }
                             };
-                            let (sock, first_packet) = entry;
                             // PROXY header on the first packet of each remote
                             // session (Go: first packet of each remote conn).
                             let mut final_payload = payload;
@@ -700,6 +733,18 @@ async fn run_udp_work_conn(
                     if !session_alive_r.load(Ordering::Acquire) {
                         debug!(proxy_name = %pn_r, "UDP reader '{}': session dead, stopping", pn_r);
                         break;
+                    }
+                    // Sweep stale mirror entries for sessions reaped by the
+                    // idle timeout. Without this, the per-remote connected UDP
+                    // sockets accumulate FDs and ephemeral ports for the work
+                    // conn's lifetime — bounded only by distinct remotes seen.
+                    {
+                        let map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                        reader_socks.retain(|_k, v| {
+                            // retain by value: keep only entries whose Arc
+                            // still matches a live session entry.
+                            map.values().any(|e| Arc::ptr_eq(&e.socket, v))
+                        });
                     }
                 }
             }

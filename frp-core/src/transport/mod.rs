@@ -269,7 +269,7 @@ impl IoStream {
     /// Created after V2 handshake with crypto negotiation.
     #[allow(non_snake_case)]
     pub fn Aead(inner: Box<AeadStream>) -> Self {
-        Self(Box::new(*inner))
+        Self(inner)
     }
 
     /// SSH reverse-forward channel (type-erased).
@@ -2001,6 +2001,20 @@ where
     Ok(IoStream::WebSocket(ws))
 }
 
+/// Serve buffered bytes from `pre_read` starting at `pos`.
+/// Returns `true` if bytes were served from the buffer, `false` if exhausted.
+pub(crate) fn poll_pre_read(pre_read: &[u8], pos: &mut usize, buf: &mut ReadBuf<'_>) -> bool {
+    if *pos < pre_read.len() {
+        let remaining = &pre_read[*pos..];
+        let n = remaining.len().min(buf.remaining());
+        buf.put_slice(&remaining[..n]);
+        *pos += n;
+        true
+    } else {
+        false
+    }
+}
+
 /// A stream wrapper that yields pre-read bytes before the inner stream.
 /// Used when bytes have been consumed for protocol detection (e.g., SNI peek)
 /// but need to be replayed for the actual protocol handler (e.g., TLS handshake).
@@ -2022,18 +2036,15 @@ impl<S> PreReadStream<S> {
 
 impl<S: AsyncRead + Unpin> AsyncRead for PreReadStream<S> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.pos < self.pre_read.len() {
-            let remaining = &self.pre_read[self.pos..];
-            let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            self.pos += n;
+        let this = self.get_mut();
+        if poll_pre_read(&this.pre_read, &mut this.pos, buf) {
             return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
