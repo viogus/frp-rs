@@ -642,9 +642,36 @@ impl Service {
         #[cfg(feature = "tcp-mux")]
         let mut prev_yamux: Option<std::sync::Arc<frp_core::mux::YamuxSession>> = None;
         loop {
-            let cfg_local = self.cfg.read().await.clone();
+            // Read guard over the config instead of cloning the whole
+            // ClientConfig (all proxies/visitors/strings) per connection
+            // attempt. Field reads go through the guard's Deref; the guard
+            // is dropped just before the message loop (a reload there must
+            // take the write lock), so only the fields the loop needs are
+            // copied out first (see wc_* hoists and cfg_user below).
+            let cfg_local = self.cfg.read().await;
             let all_proxies = Arc::clone(&*self.proxies.read().await);
             let proxies = filter_active_proxies(&cfg_local, &all_proxies);
+
+            // Owned copies of the snapshot fields the work-conn config macro
+            // needs. `handle_req_work_conn` (which expands it) also runs from
+            // the message loop, where the snapshot guard is no longer held,
+            // so the macro reads these instead of the guard. Keeps the
+            // snapshot semantics (fields fixed at connection start) without
+            // cloning the whole ClientConfig.
+            let wc_server_addr = cfg_local.server_addr.clone();
+            let wc_server_port = cfg_local.server_port;
+            let wc_tls_enable = cfg_local.tls_enable;
+            let wc_tls_server_name = cfg_local.tls_server_name.clone();
+            let wc_tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+            let wc_tls_cert_file = opt_if_empty!(cfg_local.tls_cert_file);
+            let wc_tls_key_file = opt_if_empty!(cfg_local.tls_key_file);
+            let wc_dns_server = opt_if_empty!(cfg_local.dns_server);
+            let wc_udp_packet_size = cfg_local.udp_packet_size.max(0) as usize;
+            let wc_disable_custom_tls_first_byte = cfg_local.disable_custom_tls_first_byte;
+            let wc_keepalive_secs = cfg_local.dial_server_keepalive.max(0) as u64;
+            let wc_bind_addr = opt_if_empty!(cfg_local.connect_server_local_ip);
+            let wc_proxy_url = cfg_local.proxy_url.clone();
+            let wc_dial_timeout_secs = cfg_local.dial_server_timeout.max(1) as u64;
 
             // Go frp compat (d486018): drop previous yamux session before
             // creating a new control connection. This drops the sender channel,
@@ -786,33 +813,33 @@ impl Service {
                     #[cfg(not(feature = "quic"))]
                     let quic_arg = ();
                     crate::work_conn::WorkConnConfig {
-                        server_addr: cfg_local.server_addr.clone(),
-                        server_port: cfg_local.server_port,
+                        server_addr: wc_server_addr.clone(),
+                        server_port: wc_server_port,
                         protocol: protocol.clone(),
                         run_id: run_id.clone(),
                         proxy_info_map: self.proxy_info_map.clone(),
                         enc_key: self.encryption_key,
                         pool_id: $pool_id,
                         auth_cfg: self.auth_cfg.clone(),
-                        tls_enable: cfg_local.tls_enable,
-                        tls_server_name: cfg_local.tls_server_name.clone(),
-                        tls_ca_file: opt_if_empty!(cfg_local.tls_ca_file),
-                        tls_cert_file: opt_if_empty!(cfg_local.tls_cert_file),
-                        tls_key_file: opt_if_empty!(cfg_local.tls_key_file),
-                        dns_server: opt_if_empty!(cfg_local.dns_server),
+                        tls_enable: wc_tls_enable,
+                        tls_server_name: wc_tls_server_name.clone(),
+                        tls_ca_file: wc_tls_ca_file.clone(),
+                        tls_cert_file: wc_tls_cert_file.clone(),
+                        tls_key_file: wc_tls_key_file.clone(),
+                        dns_server: wc_dns_server.clone(),
                         yamux: yamux.clone(),
                         quic_conn: quic_arg,
                         v2,
                         oidc_client: self.oidc_client.clone(),
-                        udp_packet_size: cfg_local.udp_packet_size.max(0) as usize,
+                        udp_packet_size: wc_udp_packet_size,
                         proxy_metrics: self.proxy_metrics.clone(),
                         client_auth_scopes: client_scopes.clone(),
                         server_auth_scopes: server_scopes.clone(),
-                        disable_custom_tls_first_byte: cfg_local.disable_custom_tls_first_byte,
-                        keepalive_secs: cfg_local.dial_server_keepalive.max(0) as u64,
-                        bind_addr: opt_if_empty!(cfg_local.connect_server_local_ip),
-                        proxy_url: cfg_local.proxy_url.clone(),
-                        dial_timeout_secs: cfg_local.dial_server_timeout.max(1) as u64,
+                        disable_custom_tls_first_byte: wc_disable_custom_tls_first_byte,
+                        keepalive_secs: wc_keepalive_secs,
+                        bind_addr: wc_bind_addr.clone(),
+                        proxy_url: wc_proxy_url.clone(),
+                        dial_timeout_secs: wc_dial_timeout_secs,
                         xtcp_tx: xtcp_tx.clone(),
                         session_alive: session_alive.clone(),
                         spawned_counter: None,
@@ -1314,7 +1341,7 @@ impl Service {
                                         disable_custom_tls_first_byte: transport_nocustomtls,
                                         tls_cert_file: transport_tls_cert.clone(),
                                         tls_key_file: transport_tls_key.clone(),
-                                        v2: cfg_local.v2,
+                                        v2,
                                         destination_cidr: adv.subnet,
                                         controller,
                                         vnet_tun_tx,
@@ -1403,7 +1430,7 @@ impl Service {
                         disable_custom_tls_first_byte: transport_nocustomtls,
                         tls_cert_file: transport_tls_cert.clone(),
                         tls_key_file: transport_tls_key.clone(),
-                        v2: cfg_local.v2,
+                        v2,
                     })
                     .await;
                 });
@@ -1455,6 +1482,13 @@ impl Service {
             let mut last_pong = Instant::now();
             let hb_timeout = cfg_local.heartbeat_timeout;
             let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
+
+            // The message loop handles config reloads (try_reload), which
+            // take the config write lock — the snapshot read guard must be
+            // dropped first. `user` is the only snapshot field the loop still
+            // needs; copy it here.
+            let cfg_user = cfg_local.user.clone();
+            drop(cfg_local);
 
             loop {
                 tokio::select! {
@@ -1741,11 +1775,11 @@ impl Service {
                                 .collect()
                         };
                         for (name, local_addr) in to_retry {
-                            let bare_name = if cfg_local.user.is_empty() { name.as_str() } else {
-                                name.strip_prefix(&format!("{}.", cfg_local.user)).unwrap_or(&name)
+                            let bare_name = if cfg_user.is_empty() { name.as_str() } else {
+                                name.strip_prefix(&format!("{}.", cfg_user)).unwrap_or(&name)
                             };
                             if let Some(p) = proxies.iter().find(|p| p.name == bare_name) {
-                                let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_local.user);
+                                let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_user);
                                 if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
                                     warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
                                 } else {
@@ -1800,7 +1834,7 @@ impl Service {
                                             info.phase = ProxyPhase::WaitStart;
                                         }
                                     }
-                                    let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr, &cfg_local.user);
+                                    let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr, &cfg_user);
                                     if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
                                         warn!(proxy_name = %proxy_name, error = %e, "Failed to re-register proxy on health recovery: {}", e);
                                     } else {
