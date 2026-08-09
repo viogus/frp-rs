@@ -880,16 +880,29 @@ pub fn set_keepalive(stream: &tokio::net::TcpStream, secs: u64) {
     }
     let keepalive = socket2::SockRef::from(stream);
     let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(secs));
-    #[cfg(not(any(
-        target_os = "openbsd",
-        target_os = "redox",
-        target_os = "solaris",
-        target_os = "nto",
-        target_os = "espidf",
-        target_os = "vita",
-        target_os = "haiku",
-        target_os = "horizon",
-    )))]
+    // Probe interval/retries mirror socket2 0.6.5's `with_interval` support
+    // list (allow-list, so platforms added upstream are covered automatically
+    // instead of drifting from a denylist). `with_retries` needs the `all`
+    // feature, enabled at the workspace level.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+        target_os = "cygwin",
+        target_os = "nuttx",
+        target_os = "wasi",
+    ))]
     let ka = ka
         .with_interval(Duration::from_secs((secs / 10).clamp(1, 60)))
         .with_retries(3);
