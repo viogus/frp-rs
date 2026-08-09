@@ -2,7 +2,7 @@
 
 All notable changes to frp-rs.
 
-## Unreleased
+## v0.70.1 (2026-08-09)
 
 ### Security & Robustness
 - **Login-throttle nested lock removed (MEDIUM, audit 3.1)**: `check_login_throttle`
