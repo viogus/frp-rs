@@ -268,6 +268,7 @@ pub(crate) async fn handle_nat_hole_resp(
             assisted_addrs: resp_msg.assisted_addrs.clone(),
             detect_behavior: resp_msg.detect_behavior.clone(),
         }));
+        // Accept-loop writer broken — visitor will time out and retry
         let _ = write_ctl_msg(&mut accept_writer, &forward, ctx.v2).await;
         ctx.state
             .xtcp
@@ -330,6 +331,7 @@ pub(crate) async fn handle_nat_hole_report(
                     sid: Some(sid.clone()),
                     success: report_msg.success,
                 });
+                // Accept-loop writer broken — visitor will time out and retry
                 let _ = write_ctl_msg(&mut accept_writer, &forward, ctx.v2).await;
             }
         }
@@ -426,6 +428,7 @@ pub(crate) async fn handle_new_visitor_conn<W: AsyncWriteExt + Unpin>(
         // Rust frpc control.rs register_visitor() treats
         // ReqWorkConn as success (just like Go frps does).
         let rwc = FrpMessage::ReqWorkConn(msg::ReqWorkConn {});
+        // Write failure — peer disconnected, non-recoverable at this point
         let _ = write_ctl_msg(writer, &rwc, ctx.v2).await;
     } else {
         warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn auth failed on control channel for proxy '{}'",
@@ -434,6 +437,7 @@ pub(crate) async fn handle_new_visitor_conn<W: AsyncWriteExt + Unpin>(
             proxy_name: nvc.proxy_name.clone(),
             error: Some("auth failed".into()),
         });
+        // Write failure — peer disconnected, non-recoverable at this point
         let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
     }
 }
@@ -462,6 +466,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 error: Some("proxy not found".into()),
                 ..Default::default()
             }));
+            // Write failure — peer disconnected, non-recoverable at this point
             let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
             return Ok(());
         }
@@ -490,6 +495,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             error: Some(error.into()),
             ..Default::default()
         }));
+        // Write failure — peer disconnected, non-recoverable at this point
         let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
         return Ok(());
     }
@@ -505,6 +511,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             error: None,
             ..Default::default()
         }));
+        // Write failure — peer disconnected, non-recoverable at this point
         let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
         return Ok(());
     }
@@ -526,6 +533,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                     error: Some("auth required".into()),
                     ..Default::default()
                 }));
+                // Write failure — peer disconnected, non-recoverable at this point
                 let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
                 return Ok(());
             }
@@ -536,6 +544,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                     error: Some("auth failed".into()),
                     ..Default::default()
                 }));
+                // Write failure — peer disconnected, non-recoverable at this point
                 let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
                 return Ok(());
             }
@@ -558,6 +567,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                         error: Some(freshness_err),
                         ..Default::default()
                     }));
+                    // Write failure — peer disconnected, non-recoverable at this point
                     let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
                     return Ok(());
                 }
@@ -583,6 +593,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 error: Some("provider offline".into()),
                 ..Default::default()
             }));
+            // Write failure — peer disconnected, non-recoverable at this point
             let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
             return Ok(());
         }
@@ -601,6 +612,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 error: Some("provider disconnected".into()),
                 ..Default::default()
             }));
+            // Write failure — peer disconnected, non-recoverable at this point
             let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
             return Ok(());
         }

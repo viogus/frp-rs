@@ -519,6 +519,9 @@ async fn run_udp_work_conn(
     session_alive: Arc<AtomicBool>,
     udp_packet_size: usize,
     proxy_protocol_version: String,
+    // Application-level keepalive Ping interval in seconds (transport
+    // keepalive config; 0 = keep the built-in 30s default).
+    udp_keepalive_secs: u64,
 ) {
     let local_addr = match local_addr_str.parse::<SocketAddr>() {
         Ok(a) => a,
@@ -801,7 +804,12 @@ async fn run_udp_work_conn(
         let mut local_udp_addr: Option<msg::UdpAddr> = msg::UdpAddr::from_string(&local_addr_str);
         // Ping-pong scratch for the per-packet compress chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
-        let mut keepalive = tokio::time::interval(Duration::from_secs(30));
+        let mut keepalive = tokio::time::interval(Duration::from_secs(if udp_keepalive_secs > 0 {
+            udp_keepalive_secs
+        } else {
+            // Config not set (0): keep the long-standing 30s default.
+            30
+        }));
         keepalive.tick().await;
         loop {
             tokio::select! {
@@ -1495,6 +1503,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         session_alive.clone(),
                         udp_packet_size,
                         info.proxy_protocol_version.clone(),
+                        cfg.keepalive_secs,
                     )
                     .await;
                 } else {
@@ -1717,6 +1726,7 @@ mod tests {
             session_alive,
             65535,
             String::new(),
+            0,
         ));
         drop(peer);
 
@@ -1750,6 +1760,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             65535,
             String::new(),
+            0,
         ));
 
         // Establish the session: reader creates the per-remote socket and
@@ -1795,6 +1806,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             65535,
             String::new(),
+            0,
         ));
 
         peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
@@ -1855,6 +1867,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             65535,
             String::new(),
+            0,
         ));
 
         // Interleaved requests from two distinct remotes.

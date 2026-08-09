@@ -66,7 +66,7 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 jsonwebtoken = { workspace = true }
 bytes = { workspace = true }
-criterion.workspace = true
+criterion = "0.5"
 
 [[bench]]
 name = "nathole"

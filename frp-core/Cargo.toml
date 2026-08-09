@@ -89,7 +89,7 @@ libc.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tower = "0.5"
-criterion.workspace = true
+criterion = "0.5"
 proptest = "1.6"
 tempfile = "3"
 

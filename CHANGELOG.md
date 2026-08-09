@@ -5,6 +5,37 @@ All notable changes to frp-rs.
 ## Unreleased
 
 ### Security & Robustness
+- **Login-throttle nested lock removed (MEDIUM, audit 3.1)**: `check_login_throttle`
+  now drops the main-table guard before acquiring the overflow lock — the nested
+  acquisition was safe but fragile to future refactoring.
+- **nathole.rs error discards commented (MEDIUM, audit 4.1)**: all 12
+  `let _ = write_ctl_msg(...)` sites now carry a comment explaining why the
+  write failure is non-recoverable (client rejected / accept-loop writer
+  broken), closing the last gap in the "all discards commented" rule.
+- **Proxy-listener bind retries EADDRINUSE (MEDIUM, audit 4.2)**: on
+  supersession the old handler's abort does not wait for socket release, so
+  the new handler now retries the bind 3× with 100ms backoff instead of
+  failing once and relying on the next client reconnect.
+- **UDP work-conn keepalive honors config (MEDIUM, audit 2.2)**: the
+  application-level Ping interval was hardcoded at 30s; it now uses
+  `transport.keepalive` (0 keeps the 30s default).
+- **WebSocket pong uses a 128-byte stack buffer (LOW, audit 1.2)**: per-frame
+  heap alloc removed from the control-frame path (RFC 6455 caps control
+  payloads at 125 bytes).
+- **KcpListener driver JoinHandle stored (LOW, audit 2.3)**: the listener's
+  UDP event-loop task is now held on the struct and aborted on drop. The
+  dial-path driver is deliberately NOT aborted on stream drop — dial returns
+  before the KCP handshake completes, and aborting would kill the connection
+  before its first probe (verified: broke dial→accept in kcp.rs).
+- **OIDC JWKS background refresh is cancellable (LOW, audit 2.4)**: the
+  refresh task's JoinHandle is stored on the verifier; new
+  `stop_background_refresh()` aborts it.
+- **`futures-util` `sink` feature dropped (LOW, audit 5.3)**: zero uses of
+  `Sink`/`SinkExt`; saves the sink machinery from every build.
+- **`strip = true` release profile (LOW, audit 5.4)**: removes debuginfo
+  sections too (was `strip = "symbols"`).
+- **`criterion` moved out of workspace deps (LOW, audit 5.5)**: declared
+  per-crate in dev-dependencies (frp-core, frp-server).
 - **`pending_requests` bounded queue (MEDIUM, audit round 5)**: within the 10s
   expiry window a burst of user connections with no work conns could pile up live
   sockets; the queue now caps at 256 entries and evicts the oldest (closing that
