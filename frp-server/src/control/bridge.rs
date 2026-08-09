@@ -402,6 +402,26 @@ async fn run_udp_work_conn(
     }
 }
 
+/// Log a bridge-task panic. Bridge tasks are spawned fire-and-forget and
+/// their JoinHandles deliberately dropped, so a panic used to be silently
+/// swallowed by Tokio (audit round 5, MEDIUM). The RAII `ConnGuard` still
+/// releases the connection slot during unwind, but the panic cause was lost
+/// — `catch_unwind` at the spawn sites preserves the diagnostic.
+fn log_bridge_panic(proxy_name: &str, what: &str, p: Box<dyn std::any::Any + Send>) {
+    let msg = p
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(|s| s.as_str()))
+        .unwrap_or("(unknown)");
+    tracing::error!(
+        proxy_name = %proxy_name,
+        panic = %msg,
+        "Bridge task panicked: {what} (proxy '{}', panic: {})",
+        proxy_name,
+        msg
+    );
+}
+
 /// Assign a work connection to a UDP proxy for bidirectional data forwarding.
 /// Matches Go frp v0.69.1 behavior: sends StartWorkConn, then bridges
 /// UDP socket ↔ work connection via UDPPacket messages.
@@ -459,17 +479,29 @@ pub(crate) async fn assign_udp_work_conn(
     }
     debug!(proxy_name = %proxy_name, "UDP work conn assigned to '{}', starting bridge supervisor", proxy_name);
 
-    tokio::spawn(run_udp_work_conn(
-        work_conn,
-        sock,
-        proxy_name,
-        local_addr,
-        use_enc,
-        enc_key,
-        v2,
-        udp_packet_size,
-        cancel,
-    ));
+    let log_proxy_name = proxy_name.clone();
+    tokio::spawn(async move {
+        // Await the bridge's JoinHandle instead of dropping it: if the task
+        // panics, JoinError carries the panic payload (audit round 5, MEDIUM).
+        // The RAII ConnGuard still releases the slot during unwind; this just
+        // preserves the panic cause in the logs.
+        let handle = tokio::spawn(run_udp_work_conn(
+            work_conn,
+            sock,
+            proxy_name,
+            local_addr,
+            use_enc,
+            enc_key,
+            v2,
+            udp_packet_size,
+            cancel,
+        ));
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                log_bridge_panic(&log_proxy_name, "UDP bridge", e.into_panic());
+            }
+        }
+    });
 }
 
 /// Relay plain traffic between two IoStreams, preferring zero-copy splice
@@ -1109,22 +1141,35 @@ pub(crate) async fn assign_work_to_proxy(
     // Spawn the bridge; select against the server shutdown token so a
     // graceful shutdown can interrupt half-open idle bridges instead of
     // waiting on TCP keepalive (2h) or yamux keepalive (90s) — audit D2-4.
-    // The JoinHandle is deliberately dropped: bridges are connection-bounded
-    // and self-terminate; shutdown just accelerates teardown.
+    // The outer task is fire-and-forget (bridges are connection-bounded and
+    // self-terminate; shutdown just accelerates teardown); the inner
+    // JoinHandle is awaited only to surface panics (audit round 5, MEDIUM).
     let shutdown = state.shutdown_token.clone();
     let state_for_bridge = state.clone();
+    let log_proxy_name = req.proxy_name.clone();
     tokio::spawn(async move {
-        tokio::select! {
-            _ = run_work_bridge(
-                work_conn,
-                req,
-                proxy_info,
-                encryption_key,
-                metrics,
-                header_timeout,
-                state_for_bridge,
-            ) => {}
-            _ = shutdown.cancelled() => {}
+        // Await the bridge's JoinHandle instead of dropping it: if the task
+        // panics, JoinError carries the panic payload (audit round 5, MEDIUM).
+        // The RAII ConnGuard still releases the slot during unwind; this just
+        // preserves the panic cause in the logs.
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = run_work_bridge(
+                    work_conn,
+                    req,
+                    proxy_info,
+                    encryption_key,
+                    metrics,
+                    header_timeout,
+                    state_for_bridge,
+                ) => {}
+                _ = shutdown.cancelled() => {}
+            }
+        });
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                log_bridge_panic(&log_proxy_name, "bridge", e.into_panic());
+            }
         }
     });
 }

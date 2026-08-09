@@ -11,8 +11,10 @@ frp-vnet = { workspace = true, optional = true }
 # h2c HTTP vhost support: the byte-level bridge cannot decode HTTP/2 frames; h2
 # is the tokio-official HTTP/2 implementation (Go uses net/http's h2c; Rust has
 # no std HTTP/2). No existing dep fits (axum/hyper are dashboard-only and
-# opt-in).
-h2 = { workspace = true }
+# opt-in). Optional — only compiled with the `http-proxy` feature (audit round
+# 5, MEDIUM): vhost_h2c.rs + h2's dependency tree (indexmap/hashbrown/fnv)
+# were previously forced into micro/tiny builds that never serve vhosts.
+h2 = { workspace = true, optional = true }
 http = { workspace = true }
 # Lock-free sharded map for run_id → control-channel routing (D3-3: eliminates
 # the global RwLock read-lock contention on every work-conn dispatch).
@@ -47,7 +49,7 @@ quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
 oidc = ["frp-core/oidc"]
 tls = ["frp-core/tls", "dep:tokio-rustls"]
-http-proxy = ["frp-core/http-client"]
+http-proxy = ["frp-core/http-client", "dep:h2"]
 vnet = ["frp-core/vnet", "dep:frp-vnet"]
 compression = ["frp-core/compression"]
 chacha20 = ["frp-core/chacha20"]

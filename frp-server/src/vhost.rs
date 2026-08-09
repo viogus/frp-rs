@@ -9,6 +9,9 @@ use tracing::{debug, info, instrument, warn};
 use crate::service::{AppState, InternalMsg};
 
 /// HTTP/2 cleartext (h2c) vhost handling — see `vhost_h2c.rs`.
+/// Only compiled when the `http-proxy` feature is enabled (audit round 5:
+/// `h2` is now optional, so micro/tiny builds without vhosts skip it).
+#[cfg(feature = "http-proxy")]
 #[path = "vhost_h2c.rs"]
 mod vhost_h2c;
 
@@ -519,40 +522,48 @@ async fn serve_vhost_request<S>(
     // for all 24 preface bytes). `H2_PREFACE.starts_with(&pre_read)` covers
     // the short-prefix case; `pre_read.starts_with(H2_PREFACE)` the case
     // where frames arrived together with the preface.
-    let is_h2 = pre_read.starts_with(vhost_h2c::H2_PREFACE)
-        || (vhost_h2c::H2_PREFACE.starts_with(&pre_read) && n < vhost_h2c::H2_PREFACE.len());
-    if is_h2 {
-        // A short first read may be a partial HTTP/2 preface ("P", "PR",
-        // "PRI"…) — read the remaining bytes and confirm the full 24-byte
-        // preface before committing to the h2 path. A truncated HTTP/1.1
-        // request (e.g. "POST …" cut to "P") falls back to the HTTP/1.1
-        // parser (Go's bufio-based h2 server matches the exact line).
-        let mut prefix_len = n;
-        while prefix_len < vhost_h2c::H2_PREFACE.len() {
-            let m = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                stream.read(&mut buf[prefix_len..vhost_h2c::H2_PREFACE.len()]),
-            )
-            .await
-            {
-                Ok(Ok(m)) if m > 0 => m,
-                _ => return,
-            };
-            prefix_len += m;
-        }
-        if buf[..vhost_h2c::H2_PREFACE.len()] == *vhost_h2c::H2_PREFACE {
-            return vhost_h2c::serve_h2c_request(stream, buf[..prefix_len].to_vec(), state, peer)
+    #[cfg(feature = "http-proxy")]
+    {
+        let is_h2 = pre_read.starts_with(vhost_h2c::H2_PREFACE)
+            || (vhost_h2c::H2_PREFACE.starts_with(&pre_read) && n < vhost_h2c::H2_PREFACE.len());
+        if is_h2 {
+            // A short first read may be a partial HTTP/2 preface ("P", "PR",
+            // "PRI"…) — read the remaining bytes and confirm the full 24-byte
+            // preface before committing to the h2 path. A truncated HTTP/1.1
+            // request (e.g. "POST …" cut to "P") falls back to the HTTP/1.1
+            // parser (Go's bufio-based h2 server matches the exact line).
+            let mut prefix_len = n;
+            while prefix_len < vhost_h2c::H2_PREFACE.len() {
+                let m = match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    stream.read(&mut buf[prefix_len..vhost_h2c::H2_PREFACE.len()]),
+                )
+                .await
+                {
+                    Ok(Ok(m)) if m > 0 => m,
+                    _ => return,
+                };
+                prefix_len += m;
+            }
+            if buf[..vhost_h2c::H2_PREFACE.len()] == *vhost_h2c::H2_PREFACE {
+                return vhost_h2c::serve_h2c_request(
+                    stream,
+                    buf[..prefix_len].to_vec(),
+                    state,
+                    peer,
+                )
                 .await;
+            }
+            return handle_http1_request(
+                stream,
+                buf[..prefix_len].to_vec(),
+                state,
+                peer,
+                scheme,
+                wrap,
+            )
+            .await;
         }
-        return handle_http1_request(
-            stream,
-            buf[..prefix_len].to_vec(),
-            state,
-            peer,
-            scheme,
-            wrap,
-        )
-        .await;
     }
     return handle_http1_request(stream, pre_read, state, peer, scheme, wrap).await;
 }

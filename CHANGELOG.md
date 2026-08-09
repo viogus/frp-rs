@@ -5,6 +5,20 @@ All notable changes to frp-rs.
 ## Unreleased
 
 ### Security & Robustness
+- **`pending_requests` bounded queue (MEDIUM, audit round 5)**: within the 10s
+  expiry window a burst of user connections with no work conns could pile up live
+  sockets; the queue now caps at 256 entries and evicts the oldest (closing that
+  user connection) instead of holding fds until expiry.
+- **Bridge-task panic logging (MEDIUM, audit round 5)**: TCP/UDP bridge tasks
+  were spawned fire-and-forget with the JoinHandle dropped, so a panic was
+  silently swallowed by Tokio (the RAII `ConnGuard` still released the slot).
+  The JoinHandles are now awaited and panics logged with proxy name + payload.
+- **`h2` gated behind `http-proxy` (MEDIUM, audit round 5)**: `vhost_h2c.rs` and
+  the `h2` dependency tree (indexmap/hashbrown/fnv) were compiled into every
+  binary including micro/tiny builds that never serve vhosts. `h2` is now
+  optional and `vhost_h2c` is `#[cfg(feature = "http-proxy")]`; the h2c preface
+  detection block is gated likewise. Verified: `h2` absent from the micro
+  dependency tree (0 occurrences vs 1 in default).
 - **XTCP probe decode integer overflow fixed (HIGH, audit H1)**: `decode_detect_msg`
   computed `9 + json_len` from an attacker-controlled network length field; a
   `u64::MAX` value wrapped (release build) past the length check and panicked on the
