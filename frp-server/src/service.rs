@@ -1726,7 +1726,9 @@ impl Service {
         // Stop the OIDC background JWKS refresh before exiting — the verifier
         // itself is dropped with AppState, but aborting the refresh task here
         // gives it a deterministic stop point during graceful shutdown
-        // (audit round 5, LOW 2.4).
+        // (audit round 5, LOW 2.4). cfg-gated: without the `oidc` feature the
+        // verifier is a method-less stub type.
+        #[cfg(feature = "oidc")]
         if let Some(verifier) = &self.state.oidc.verifier {
             verifier.stop_background_refresh();
         }
