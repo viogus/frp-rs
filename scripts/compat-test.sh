@@ -157,6 +157,22 @@ cleanup_pids() {
     for pid in $PIDS; do
         kill "$pid" 2>/dev/null || true
     done
+    # Bounded grace period after SIGTERM (graceful drain), then force-kill.
+    # Without this, a process whose SIGTERM handler stalls makes the bare
+    # `wait` hang the whole compat run (observed on CI: 25m job timeout with
+    # 60+ orphaned frps/frpc processes after the socks5 scenario).
+    local deadline=$((SECONDS + 10))
+    while (( SECONDS < deadline )); do
+        local alive=""
+        for pid in $PIDS; do
+            kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
+        done
+        [[ -z "$alive" ]] && break
+        sleep 0.2
+    done
+    for pid in $PIDS; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
     wait 2>/dev/null || true
     PIDS=""
 }
