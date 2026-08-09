@@ -488,7 +488,7 @@ use_compression = false
 | `store.path` | `""` | JSON file for runtime proxy/visitor store (admin API CRUD); entries overlay config-file entries |
 | `virtualNet.address` | `""` | Local TUN IPv4 address for the `virtual_net` proxy/visitor plugins (requires `[feature] VirtualNet = true`) |
 | `metas` | `{}` | Client-level metadata sent in Login message |
-| `dial_server_keepalive` | `7200` | TCP keepalive interval (seconds) for server connection |
+| `dial_server_keepalive` | `300` | TCP keepalive idle time (seconds) for server connection; 0 disables |
 | `connect_server_local_ip` | `""` | Local IP to bind when connecting to server |
 | `disable_custom_tls_first_byte` | `true` | Skip Go frp TLS head byte (0x17) |
 | `nat_hole_stun_server` | `"stun.easyvoip.com:3478"` | STUN server for NAT traversal |

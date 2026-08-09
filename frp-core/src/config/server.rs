@@ -778,7 +778,9 @@ pub struct ServerTransportConfig {
     #[serde(default = "default_max_pool_count", alias = "maxPoolCount")]
     pub max_pool_count: i64,
     /// TCP keepalive interval in seconds for server-side connections.
-    /// Go frp v0.70.1 compat: tcpKeepalive. Default: 7200.
+    /// Go frp v0.70.1 compat: tcpKeepalive. Go default: 7200.
+    /// frp-rs production default: 300 (paired with aggressive probe
+    /// interval/retries so dead peers release fds sooner).
     #[serde(default = "default_tcp_keepalive", alias = "tcpKeepalive")]
     pub tcp_keepalive: i64,
     /// QUIC protocol options.
@@ -803,7 +805,7 @@ pub(super) fn default_heartbeat_timeout() -> i64 {
     90
 }
 fn default_tcp_keepalive() -> i64 {
-    7200
+    300
 }
 fn default_max_pool_count() -> i64 {
     5

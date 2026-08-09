@@ -224,7 +224,8 @@ pub struct ClientConfig {
     pub dns_server: String,
     /// TCP keepalive interval in seconds for outbound connections to the
     /// frp server. 0 disables. Go frp compat: dialServerKeepalive.
-    #[serde(default, alias = "dialServerKeepalive")]
+    /// frp-rs production default: 300 (Go default: 7200).
+    #[serde(default = "default_dial_server_keepalive", alias = "dialServerKeepalive")]
     pub dial_server_keepalive: i64,
     /// Timeout in seconds for dialing the frp server.
     /// Go frp v0.70.1 compat: dialServerTimeout. Default: 10.
@@ -297,7 +298,7 @@ impl Default for ClientConfig {
             heartbeat_interval: default_heartbeat_interval(),
             heartbeat_timeout: default_heartbeat_timeout(),
             dns_server: String::new(),
-            dial_server_keepalive: 7200,
+            dial_server_keepalive: 300,
             dial_server_timeout: default_dial_server_timeout(),
             connect_server_local_ip: String::new(),
             tcp_mux: default_tcp_mux(),
@@ -414,6 +415,13 @@ fn default_nat_hole_stun_server() -> String {
 }
 pub(super) fn default_dial_server_timeout() -> i64 {
     10
+}
+
+/// frp-rs production default for the outbound TCP keepalive idle time.
+/// 300s pairs with the aggressive probe interval/retries so dead peers
+/// release fds sooner (Go frp default is 7200).
+pub(super) fn default_dial_server_keepalive() -> i64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
