@@ -2928,6 +2928,7 @@ mod tests {
 
     /// A `ControlWriter` wired to a live (never-polled) channel, for tests
     /// that only exercise map/lifecycle logic without delivering messages.
+    #[cfg(feature = "vnet")]
     fn test_control_writer() -> Arc<ControlWriter> {
         let (writer, mut rx) = test_control_writer_rx();
         // Drain instead of dropping rx so `send` in the code under test
@@ -2938,6 +2939,7 @@ mod tests {
 
     /// Like [`test_control_writer`], but keeps the receiver so the test can
     /// assert on the messages enqueued by the code under test.
+    #[cfg(feature = "vnet")]
     fn test_control_writer_rx() -> (
         Arc<ControlWriter>,
         tokio::sync::mpsc::Receiver<(FrpMessage, bool)>,
