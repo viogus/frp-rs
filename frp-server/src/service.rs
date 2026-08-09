@@ -379,6 +379,7 @@ impl Service {
                                 };
                                 if let Some(wait) = rate_wait {
                                     warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying WebSocket {}ms", wait.as_millis());
+                                    drop(permit);
                                     tokio::time::sleep(wait).await;
                                     continue;
                                 }
@@ -729,6 +730,7 @@ impl Service {
                                         };
                                         if let Some(wait) = rate_wait {
                                             warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying KCP {}ms", wait.as_millis());
+                                            drop(permit);
                                             tokio::time::sleep(wait).await;
                                             continue;
                                         }
@@ -1269,6 +1271,7 @@ impl Service {
                                         };
                                         if let Some(wait) = rate_wait {
                                             warn!(addr = %quic_addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying QUIC {}ms", wait.as_millis());
+                                            drop(permit);
                                             tokio::time::sleep(wait).await;
                                             continue;
                                         }
@@ -1591,6 +1594,10 @@ impl Service {
                     };
                     if let Some(wait) = rate_wait {
                         warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached ({} conn/s), delaying {}ms", max_accept_rate, wait.as_millis());
+                        // The connection is being delayed, not accepted — do not
+                        // hold a conn_semaphore slot while we wait (parity with
+                        // the vhost/tcpmux accept loops).
+                        drop(permit);
                         tokio::time::sleep(wait).await;
                         continue;
                     }

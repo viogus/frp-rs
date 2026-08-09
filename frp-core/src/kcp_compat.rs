@@ -120,6 +120,12 @@ impl Fec {
     /// matrix (e.g. `(i+1)^j`) is self-consistent but reconstructs Go-encoded
     /// parity into garbage, corrupting the KCP stream under packet loss.
     pub fn new(data_shards: usize, parity_shards: usize) -> Self {
+        // GF(2^8) caps distinct Vandermonde rows at 256: beyond that `r as u8`
+        // wraps and the top data×data square becomes singular, which would
+        // panic in `invert_matrix`. Saturate defensively — an oversized
+        // `data_shards` is a config error, not a network input (kcp-go does
+        // the same via reedsolomon's field-size limit).
+        let data_shards = data_shards.min(256);
         let total_shards = data_shards + parity_shards;
         let encode_matrix = if data_shards > 0 && parity_shards > 0 {
             // Vandermonde: vm[r][c] = r^c (r from 0), matching klauspost galExp.
