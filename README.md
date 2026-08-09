@@ -91,7 +91,7 @@ but not literally 100% — see "Known limitations" below.
   [2026-08-04-xtcp-quic-sni-compat.md](docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md)).
   See [full audit](docs/go-frp-compat-audit.md) for details.
 
-### Known limitations (as of frp-rs 0.7.1)
+### Known limitations (as of frp-rs 0.70.1)
 
 - **HTTP vhost reverse-proxy semantics**: frps forwards HTTP vhost traffic at
   the byte level (X-Forwarded-For and requestHeaders are injected, Host

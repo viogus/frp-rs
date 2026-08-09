@@ -9,7 +9,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="${1:-0.7.1}"
+VERSION="${1:-0.70.1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
