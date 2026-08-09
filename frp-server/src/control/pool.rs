@@ -140,6 +140,19 @@ where
             return Err(());
         }
         pending_requests.push_back(req);
+        // Bounded queue (audit round 5, MEDIUM): within the 10s expiry window
+        // a burst of user connections with no work conns available can pile
+        // up live sockets; cap the queue and evict the oldest entry instead.
+        // Dropping the socket closes the user's connection (HTTP-style
+        // backpressure) rather than holding the fd until expiry.
+        const MAX_PENDING_REQUESTS: usize = 256;
+        if pending_requests.len() > MAX_PENDING_REQUESTS {
+            tracing::warn!(
+                pending = %pending_requests.len(),
+                "pending_requests queue full (>{MAX_PENDING_REQUESTS}), dropping oldest"
+            );
+            pending_requests.pop_front();
+        }
         ctx.pool_stats
             .pending_requests
             .store(pending_requests.len() as i64, Ordering::Relaxed);
