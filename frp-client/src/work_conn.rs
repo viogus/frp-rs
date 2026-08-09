@@ -639,7 +639,11 @@ async fn run_udp_work_conn(
                                 match map.get_mut(&remote) {
                                     Some(entry) => {
                                         entry.last_active = Instant::now();
-                                        (reader_socks.get(&remote), entry.first_packet)
+                                        let mirror = reader_socks
+                                            .get(&remote)
+                                            .cloned()
+                                            .unwrap_or_else(|| entry.socket.clone());
+                                        (Some(mirror), entry.first_packet)
                                     }
                                     None => (None, false),
                                 }
@@ -676,12 +680,21 @@ async fn run_udp_work_conn(
                                         // gap), but if a future concurrent
                                         // inserter is added, reuse its socket
                                         // rather than silently re-create.
-                                        Some(entry) => (
-                                            reader_socks
+                                        Some(entry) => {
+                                            // Defensive: unreachable today (the
+                                            // reader is the sole sessions
+                                            // inserter and held the lock across
+                                            // the bind gap), but degrade
+                                            // gracefully instead of panicking
+                                            // on the UDP hot path if a future
+                                            // concurrent inserter appears — the
+                                            // session itself carries the socket.
+                                            let mirror = reader_socks
                                                 .get(&remote)
-                                                .expect("sessions hit implies mirror hit"),
-                                            entry.first_packet,
-                                        ),
+                                                .cloned()
+                                                .unwrap_or_else(|| entry.socket.clone());
+                                            (mirror, entry.first_packet)
+                                        }
                                         None => {
                                             let stx = write_tx.clone();
                                             let s_alive = session_alive_r.clone();
@@ -703,13 +716,8 @@ async fn run_udp_work_conn(
                                                     first_packet: true,
                                                 },
                                             );
-                                            reader_socks.insert(remote, sock);
-                                            (
-                                                reader_socks
-                                                    .get(&remote)
-                                                    .expect("mirror entry just inserted"),
-                                                true,
-                                            )
+                                            reader_socks.insert(remote, sock.clone());
+                                            (sock, true)
                                         }
                                     }
                                 }
