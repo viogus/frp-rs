@@ -123,8 +123,9 @@ impl Fec {
         // GF(2^8) caps distinct Vandermonde rows at 256: beyond that `r as u8`
         // wraps and the top data×data square becomes singular, which would
         // panic in `invert_matrix`. Saturate defensively — an oversized
-        // `data_shards` is a config error, not a network input (kcp-go does
-        // the same via reedsolomon's field-size limit).
+        // `data_shards` is a config error, not a network input. (kcp-go's
+        // reedsolomon rejects >256 at construction instead of saturating;
+        // the session layer clamps the same value so both stay consistent.)
         let data_shards = data_shards.min(256);
         let total_shards = data_shards + parity_shards;
         let encode_matrix = if data_shards > 0 && parity_shards > 0 {

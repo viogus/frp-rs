@@ -134,10 +134,16 @@ impl KcpSession {
     pub fn new(
         conv: u32,
         peer_addr: std::net::SocketAddr,
-        config: KcpConfig,
+        mut config: KcpConfig,
         read_tx: mpsc::Sender<Vec<u8>>,
     ) -> Self {
         let fec = if config.data_shards > 0 && config.parity_shards > 0 {
+            // FEC data shards are capped at 256 by the GF(2^8) Vandermonde
+            // field (Fec::new clamps internally); clamp the session's copy
+            // too so the send path (shard counting in update/force_flush)
+            // matches the codec instead of asserting in encode_parity at
+            // runtime for oversized configs.
+            config.data_shards = config.data_shards.min(256);
             Some(Fec::new(config.data_shards, config.parity_shards))
         } else {
             None
