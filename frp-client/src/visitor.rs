@@ -767,8 +767,10 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         }
 
                         // Unwrap user_conn for STCP fallback (hole punch failed, so not moved).
-                        let user_conn =
-                            user_conn.expect("user_conn not consumed when hole_punch_ok=false");
+                        let Some(user_conn) = user_conn else {
+                            warn!(visitor_name = %visitor_name, "Visitor '{}': user_conn missing in XTCP fallback path", visitor_name);
+                            return;
+                        };
 
                         // --- STCP fallback (hole punch failed) ---
                         // STCP relay via NewVisitorConn on a fresh connection works against

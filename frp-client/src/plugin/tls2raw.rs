@@ -138,13 +138,16 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
             }
 
             // 5. Bridge TLS (tunnel) ↔ raw TCP (local).
-            let _ = tokio::io::copy_bidirectional_with_sizes(
+            if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
                 &mut tls_stream,
                 &mut raw_conn,
                 *frp_core::buffer_pool::BUFFER_SIZE,
                 *frp_core::buffer_pool::BUFFER_SIZE,
             )
-            .await;
+            .await
+            {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
         },
     )
     .await
@@ -369,7 +372,9 @@ mod tests {
                             buf.extend_from_slice(&chunk[..n]);
                             if !ponged {
                                 ponged = true;
-                                let _ = conn.write_all(b"pong").await;
+                                if let Err(e) = conn.write_all(b"pong").await {
+                                    tracing::debug!(error = %e, "plugin relay error: {}", e);
+                                }
                             }
                         }
                     }
@@ -562,9 +567,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             if let Ok((mut conn, _)) = listener.accept().await {
-                let _ = conn
+                if let Err(e) = conn
                     .write_all(b"PROXY TCP4 203.0.113.7 127.0.0.1 45678 6000\r\nCLIENT_HELLO_START")
-                    .await;
+                    .await
+                {
+                    tracing::debug!(error = %e, "plugin relay error: {}", e);
+                }
             }
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -583,7 +591,9 @@ mod tests {
         let header_for_task = header.clone();
         tokio::spawn(async move {
             if let Ok((mut conn, _)) = listener.accept().await {
-                let _ = conn.write_all(&header_for_task).await;
+                if let Err(e) = conn.write_all(&header_for_task).await {
+                    tracing::debug!(error = %e, "plugin relay error: {}", e);
+                }
             }
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -598,7 +608,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             if let Ok((mut conn, _)) = listener.accept().await {
-                let _ = conn.write_all(b"NOPE 1.2.3.4 127.0.0.1 1 2\r\n").await;
+                if let Err(e) = conn.write_all(b"NOPE 1.2.3.4 127.0.0.1 1 2\r\n").await {
+                    tracing::debug!(error = %e, "plugin relay error: {}", e);
+                }
             }
         });
         let mut client = TcpStream::connect(addr).await.unwrap();

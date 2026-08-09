@@ -182,7 +182,9 @@ async fn handle_socks5_conn(
         Ok(remote) => remote,
         Err(_) => {
             let reply = make_socks5_reply(REP_HOST_UNREACHABLE, ATYP_IPV4, &[0, 0, 0, 0], 0);
-            let _ = client.write_all(&reply).await;
+            if let Err(e) = client.write_all(&reply).await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
             return Err(format!("connect to {target}: failed"));
         }
     };
@@ -196,13 +198,16 @@ async fn handle_socks5_conn(
         .map_err(|e| format!("write reply: {e}"))?;
 
     // Step 5: Bidirectional relay
-    let _ = tokio::io::copy_bidirectional_with_sizes(
+    if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
         &mut client,
         &mut remote,
         *frp_core::buffer_pool::BUFFER_SIZE,
         *frp_core::buffer_pool::BUFFER_SIZE,
     )
-    .await;
+    .await
+    {
+        tracing::debug!(error = %e, "plugin relay error: {}", e);
+    }
     Ok(())
 }
 
@@ -412,7 +417,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             // No username/password → no-auth only
-            let _ = handle_socks5_conn(stream, None, None).await;
+            if let Err(e) = handle_socks5_conn(stream, None, None).await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -447,7 +454,11 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_socks5_conn(stream, Some("alice".into()), Some("s3cret".into())).await;
+            if let Err(e) =
+                handle_socks5_conn(stream, Some("alice".into()), Some("s3cret".into())).await
+            {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();

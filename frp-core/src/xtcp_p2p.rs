@@ -189,14 +189,17 @@ fn decode_detect_msg(data: &[u8], key: &[u8; 16]) -> Result<NatHoleDetectSid, St
             .try_into()
             .map_err(|_| "invalid frame: missing length bytes".to_string())?,
     ) as usize;
-    if frame.len() < 9 + json_len {
+    let need = 9usize
+        .checked_add(json_len)
+        .ok_or_else(|| "invalid frame: length overflow".to_string())?;
+    if frame.len() < need {
         return Err(format!(
             "frame truncated: need {} bytes, have {}",
-            9 + json_len,
+            need,
             frame.len()
         ));
     }
-    let json = &frame[9..9 + json_len];
+    let json = &frame[9..need];
     serde_json::from_slice(json).map_err(|e| format!("json decode: {e}"))
 }
 

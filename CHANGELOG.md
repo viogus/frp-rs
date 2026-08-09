@@ -5,7 +5,44 @@ All notable changes to frp-rs.
 ## Unreleased
 
 ### Security & Robustness
-- **TCP-group proxy registration self-deadlock fixed (HIGH, audit D3-1)**:
+- **XTCP probe decode integer overflow fixed (HIGH, audit H1)**: `decode_detect_msg`
+  computed `9 + json_len` from an attacker-controlled network length field; a
+  `u64::MAX` value wrapped (release build) past the length check and panicked on the
+  `frame[9..8]` slice. Now `checked_add` rejects overflow before slicing.
+- **SIGTERM graceful shutdown (HIGH, audit H2)**: `tokio::signal::ctrl_c()` only
+  catches SIGINT — `docker stop`/`systemctl stop`/`kill` (SIGTERM) killed frps
+  instantly and the drain phase never ran. frps now listens for SIGTERM on Unix
+  (separate `#[cfg]` blocks for the select); frpc gained a `request_stop()` channel
+  + SIGTERM handler mirroring the reload pattern.
+- **Bridge/plugin/vhost error visibility (HIGH, audits H3/H4/H5)**: I/O errors
+  previously swallowed by `let _ =` in `frp-core/src/bridge.rs`, all
+  `frp-client/src/plugin/*` relays, and HTTP error-response writes in
+  `tcpmux.rs`/`vhost.rs` are now logged at debug level (no behavior change).
+- **XTCP fallback + HTTP plugin panic removal (HIGH, audits H6/H7)**: visitor STCP
+  fallback no longer `.expect()`s a moved `Option`; the HTTP plugin manager degrades
+  to `None` client (notify skipped) instead of panicking when client build fails.
+- **SO_KEEPALIVE on six accept paths (HIGH, audit H8)**: `ssh_gateway`, vhost
+  HTTP/HTTPS, tcpmux, per-proxy TCP listener and TCP-group listener now set
+  keepalive alongside nodelay, so dead clients release fds/tasks/semaphore permits
+  within `tcpKeepalive` instead of ~2h.
+- **VHost/tcpmux connection limits (HIGH, audit H9)**: vhost HTTP/HTTPS and tcpmux
+  accept loops now enforce `maxConnsPerProxy`-style `conn_semaphore` + the shared
+  accept rate limiter (permit released before the rate-limit sleep).
+- **frpc heartbeat watchdog event-driven (HIGH, audit H10)**: replaced 1s polling
+  with `sleep(hb_timeout_dur.saturating_sub(last_pong.elapsed()))`.
+- **Stale control-entry reaper (HIGH, audit H11)**: 60s sweep removes
+  `run_id_to_ctl_tx` entries whose receiver was dropped without
+  `unregister_control` (handler panic), using DashMap `remove_if` with a
+  generation check so a superseding control is never removed.
+- **`proxy_manager.proxies` migrated to DashMap (HIGH, audit H12)**: the global
+  `RwLock<HashMap>` read lock on every work-conn dispatch is gone; `is_responsive`
+  now constant-true (DashMap has no global lock to probe).
+- **Lock-free accept rate limiter (HIGH, audit H13)**: `RateLimiter` is now an
+  `AtomicU64` fixed-point token bucket (ms-resolution wrapping timestamps, CAS
+  loop) instead of a shared `Mutex`.
+- **frp-vnet drops serde from production deps (HIGH, audit H14)**: `serde`/
+  `serde_json` moved to dev-dependencies (tests only).
+
   `handle_new_proxy` held `used_ports.write()` across
   `handle_tcp_group_member_registration`, which writes the same
   `tokio::sync::RwLock` again (non-reentrant) — a TCP-group name conflict or

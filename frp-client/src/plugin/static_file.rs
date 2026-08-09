@@ -85,7 +85,9 @@ async fn handle_static_file_conn(
     if method != "GET" {
         let resp =
             b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let _ = client.write_all(resp).await;
+        if let Err(e) = client.write_all(resp).await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
         return Err(format!("method not allowed: {method}"));
     }
 
@@ -105,7 +107,9 @@ async fn handle_static_file_conn(
         let resp = b"HTTP/1.1 401 Unauthorized\r\n\
                        WWW-Authenticate: Basic realm=\"frp\"\r\n\
                        Content-Length: 0\r\nConnection: close\r\n\r\n";
-        let _ = client.write_all(resp).await;
+        if let Err(e) = client.write_all(resp).await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
         return Err("auth failed".into());
     }
 
@@ -116,7 +120,9 @@ async fn handle_static_file_conn(
     // Reject empty path components (//), current-dir (.), and parent-dir (..).
     if !validate_rel_path(&rel_path) {
         let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let _ = client.write_all(resp).await;
+        if let Err(e) = client.write_all(resp).await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
         return Err("path traversal rejected".into());
     }
 
@@ -143,7 +149,9 @@ async fn handle_static_file_conn(
         Ok(f) => f,
         Err(_) => {
             let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let _ = client.write_all(resp).await;
+            if let Err(e) = client.write_all(resp).await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
             return Err(format!("file not found: {}", full_path.display()));
         }
     };
@@ -155,7 +163,9 @@ async fn handle_static_file_conn(
         std::fs::canonicalize(&full_path).map_err(|e| format!("failed to resolve path: {e}"))?;
     if !resolved.starts_with(&base) {
         let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let _ = client.write_all(resp).await;
+        if let Err(e) = client.write_all(resp).await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
         return Err("path traversal rejected".into());
     }
 

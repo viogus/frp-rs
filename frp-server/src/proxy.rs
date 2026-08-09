@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -96,7 +97,9 @@ impl ProxyInfo {
 
 /// Manages all proxy registrations on the server.
 pub struct ProxyManager {
-    proxies: RwLock<HashMap<String, Arc<ProxyInfo>>>,
+    /// Sharded lock-free map (dashmap): per-proxy lookups on every
+    /// NewWorkConn dispatch no longer contend on one global read lock.
+    proxies: DashMap<String, Arc<ProxyInfo>>,
     by_client: RwLock<HashMap<String, HashMap<String, Arc<ProxyInfo>>>>,
     /// group name → sorted list of proxy names (for round-robin selection)
     groups: RwLock<HashMap<String, Vec<String>>>,
@@ -120,7 +123,7 @@ impl Default for ProxyManager {
 impl ProxyManager {
     pub fn new() -> Self {
         Self {
-            proxies: RwLock::new(HashMap::new()),
+            proxies: DashMap::new(),
             by_client: RwLock::new(HashMap::new()),
             groups: RwLock::new(HashMap::new()),
             group_counters: Mutex::new(HashMap::new()),
@@ -129,26 +132,29 @@ impl ProxyManager {
         }
     }
 
-    /// Non-blocking readiness probe: true if the proxy registry lock is
-    /// acquirable right now (not held/deadlocked). Used by /healthz readiness.
+    /// Readiness probe. With the DashMap migration the registry has no global
+    /// lock that could deadlock, so the legacy `try_read().is_ok()` probe is
+    /// replaced by a constant `true` — the registry is always accessible.
     pub fn is_responsive(&self) -> bool {
-        self.proxies.try_read().is_ok()
+        true
     }
 
     pub async fn register(&self, run_id: String, info: ProxyInfo) -> Result<(), String> {
         let name = info.name.clone();
         let group = info.group.clone();
         let info = Arc::new(info);
-        // Check-and-insert atomically under write lock (fixes TOCTOU).
+        // Check-and-insert atomically on the DashMap entry (fixes TOCTOU).
         // Must check BEFORE updating group index — if registration fails
         // due to name conflict, the group index must not be polluted with
         // a proxy name that belongs to a different (already-registered) proxy.
-        {
-            let mut proxies = self.proxies.write().await;
-            if proxies.contains_key(&name) {
+        // The entry guard is not Send and is dropped before the .await below.
+        match self.proxies.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
                 return Err(format!("proxy '{}' already registered", name));
             }
-            proxies.insert(name.clone(), info.clone());
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(info.clone());
+            }
         }
         self.by_client
             .write()
@@ -167,7 +173,7 @@ impl ProxyManager {
     }
 
     pub async fn get(&self, name: &str) -> Option<Arc<ProxyInfo>> {
-        self.proxies.read().await.get(name).cloned()
+        self.proxies.get(name).map(|r| r.value().clone())
     }
 
     /// Hot-update server-side runtime settings for a live proxy without
@@ -209,22 +215,25 @@ impl ProxyManager {
                 );
             }
         }
-        let mut proxies = self.proxies.write().await;
-        let current = proxies
-            .get(name)
-            .ok_or_else(|| format!("proxy '{name}' not found"))?;
-        let mut updated = (**current).clone();
-        // Read-modify-write is atomic inside the lock: `None` keeps the
-        // current value, so concurrent PUTs updating disjoint fields do not
-        // clobber each other.
-        if let Some(v) = bandwidth_limit {
-            updated.bandwidth_limit = v;
-        }
-        if let Some(v) = bandwidth_limit_mode {
-            updated.bandwidth_limit_mode = v;
-        }
-        let updated = Arc::new(updated);
-        proxies.insert(name.to_string(), updated.clone());
+        // Read-modify-write is atomic inside the DashMap entry guard:
+        // `None` keeps the current value, so concurrent PUTs updating
+        // disjoint fields do not clobber each other. The guard is not Send
+        // and is dropped before the .await below.
+        let updated = match self.proxies.get_mut(name) {
+            Some(mut entry) => {
+                let mut changed = (**entry).clone();
+                if let Some(v) = bandwidth_limit {
+                    changed.bandwidth_limit = v;
+                }
+                if let Some(v) = bandwidth_limit_mode {
+                    changed.bandwidth_limit_mode = v;
+                }
+                let updated = Arc::new(changed);
+                *entry = updated.clone();
+                updated
+            }
+            None => return Err(format!("proxy '{name}' not found")),
+        };
         // Keep the by_client index (run_id → name → info) in sync so
         // list_client / per-client iteration see the same updated record.
         // Use entry().or_default() like register() so a missing run_id key
@@ -245,8 +254,10 @@ impl ProxyManager {
     /// removal paths can race (dashboard delete vs CloseProxy vs client
     /// disconnect) and both may observe the proxy before either removes it.
     pub async fn remove(&self, name: &str) -> bool {
-        let mut proxies = self.proxies.write().await;
-        if let Some(info) = proxies.remove(name) {
+        // DashMap::remove is synchronous and releases the shard guard on
+        // return; no guard is held across the .await calls below.
+        let info = self.proxies.remove(name).map(|(_, v)| v);
+        if let Some(info) = info {
             // Clean up group index
             if let Some(ref group) = info.group {
                 if !group.is_empty() {
@@ -273,7 +284,6 @@ impl ProxyManager {
                     self.health_tracking_active.store(false, Ordering::Release);
                 }
             }
-            drop(proxies);
             let mut by_client = self.by_client.write().await;
             if let Some(client_proxies) = by_client.get_mut(&info.run_id) {
                 client_proxies.remove(name);
@@ -288,65 +298,69 @@ impl ProxyManager {
     ///
     /// ## Lock ordering
     ///
-    /// The canonical lock acquisition order is:
-    ///   1. `self.proxies` (tokio RwLock)
-    ///   2. `self.by_client` (tokio RwLock)
-    ///   3. `self.groups` (tokio RwLock)
-    ///   4. `self.group_counters` (std Mutex)
+    /// `proxies` is a sharded DashMap, so it no longer participates in the
+    /// global tokio-lock ordering. The remaining canonical order is:
+    ///   1. `self.by_client` (tokio RwLock)
+    ///   2. `self.groups` (tokio RwLock)
+    ///   3. `self.group_counters` (std Mutex)
     ///
-    /// When a proxy belongs to a group, we must clean up the group entry.
-    /// To avoid deadlock, we **drop** proxies and by_client before acquiring
-    /// groups (step 3). After the group cleanup, we **re-acquire** proxies
-    /// and by_client to continue iterating. This drop/reacquire is correct
-    /// because:
-    ///   - `client_proxies.keys()` is an owned Vec (from `by_client.remove`)
-    ///     and does not borrow the lock guards.
-    ///   - The loop over proxy names iterates the owned keys — no iterator
-    ///     invalidation risk from releasing and reacquiring.
-    ///   - Other clients may add/remove proxies between the drop and
-    ///     reacquire, but only THIS client's proxies are being removed,
-    ///     and `by_client.remove(run_id)` already took them out — no other
-    ///     task can observe them.
+    /// The by_client entry is removed first (taking proxies out of
+    /// visibility), then the DashMap sweep via `retain` runs synchronously,
+    /// and finally group + health indexes are cleaned up. Each lock is held
+    /// one at a time and never across the other's acquisition, so no
+    /// drop/reacquire dance is needed.
     ///
     /// **Do not** reorder these locks without verifying the full call graph
     /// for cycles. The existing callers acquire in this order; changing it
     /// risks deadlock with `register`, `unregister`, or `select_group_backend`.
     pub async fn remove_client(&self, run_id: &str) {
-        let mut proxies = self.proxies.write().await;
         let mut by_client = self.by_client.write().await;
-        if let Some(client_proxies) = by_client.remove(run_id) {
-            for name in client_proxies.keys() {
-                if let Some(info) = proxies.remove(name) {
-                    if let Some(ref group) = info.group {
-                        if !group.is_empty() {
-                            // Drop proxies and by_client to avoid deadlock
-                            // when acquiring the groups lock below.
-                            // See doc comment above for the full ordering.
-                            drop(proxies);
-                            drop(by_client);
-                            let mut groups = self.groups.write().await;
-                            if let Some(members) = groups.get_mut(group) {
-                                members.retain(|n| n != name);
-                                if members.is_empty() {
-                                    groups.remove(group);
-                                    // Clean up stale round-robin counter.
-                                    // group_counters is a std Mutex (not
-                                    // tokio), so it must not be held across
-                                    // .await. It is always acquired last.
-                                    let mut counters = self
-                                        .group_counters
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    counters.remove(group);
-                                }
+        let client_proxies = by_client.remove(run_id);
+        drop(by_client);
+        if let Some(client_proxies) = client_proxies {
+            // Collect owned (name, group) pairs first: DashMap guards are
+            // not Send and must not be held across .await.
+            let removed: Vec<(String, Option<String>)> = client_proxies
+                .values()
+                .map(|p| (p.name.clone(), p.group.clone()))
+                .collect();
+            // Remove every proxy belonging to this client in one sweep.
+            // DashMap supports retain; shard locks are held only for the
+            // synchronous callback (no .await inside).
+            self.proxies.retain(|_, v| v.run_id != run_id);
+            // Group index cleanup. The by_client entry is already gone and
+            // the DashMap sweep is done, so each group lock acquisition is
+            // short and non-nested.
+            for (name, group) in &removed {
+                if let Some(ref group) = group {
+                    if !group.is_empty() {
+                        let mut groups = self.groups.write().await;
+                        if let Some(members) = groups.get_mut(group) {
+                            members.retain(|n| n != name);
+                            if members.is_empty() {
+                                groups.remove(group);
+                                // Clean up stale round-robin counter.
+                                // group_counters is a std Mutex (not tokio),
+                                // so it must not be held across .await. It is
+                                // always acquired last.
+                                let mut counters = self
+                                    .group_counters
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                counters.remove(group);
                             }
-                            // Re-acquire proxies and by_client for the
-                            // remaining loop iterations. Safe because we
-                            // iterate over owned keys (see doc comment).
-                            proxies = self.proxies.write().await;
-                            by_client = self.by_client.write().await;
                         }
                     }
+                }
+            }
+            // Clean up health tracking for the removed proxies.
+            {
+                let mut health = self.group_health.write().await;
+                for (name, _) in &removed {
+                    health.remove(name);
+                }
+                if health.is_empty() {
+                    self.health_tracking_active.store(false, Ordering::Release);
                 }
             }
         }
@@ -487,10 +501,8 @@ impl ProxyManager {
     /// Get the group for a proxy, if any.
     pub async fn get_group(&self, name: &str) -> Option<String> {
         self.proxies
-            .read()
-            .await
             .get(name)
-            .and_then(|p| p.group.clone())
+            .and_then(|r| r.value().group.clone())
             .filter(|g| !g.is_empty())
     }
 
@@ -529,11 +541,7 @@ impl ProxyManager {
     }
 
     pub async fn get_run_id(&self, name: &str) -> Option<String> {
-        self.proxies
-            .read()
-            .await
-            .get(name)
-            .map(|p| p.run_id.clone())
+        self.proxies.get(name).map(|r| r.value().run_id.clone())
     }
 
     /// Select a backend from a group and return both the backend name and its run_id.
@@ -549,7 +557,7 @@ impl ProxyManager {
     }
 
     pub async fn list(&self) -> Vec<Arc<ProxyInfo>> {
-        self.proxies.read().await.values().cloned().collect()
+        self.proxies.iter().map(|r| r.value().clone()).collect()
     }
 }
 

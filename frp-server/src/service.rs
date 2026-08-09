@@ -373,11 +373,7 @@ impl Service {
                                     continue;
                                 }
                                 let rate_wait = if rate_limiter_enabled {
-                                    let mut rl = state
-                                        .accept_rate_limiter
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    rl.try_acquire().err()
+                                    state.accept_rate_limiter.try_acquire().err()
                                 } else {
                                     None
                                 };
@@ -727,8 +723,7 @@ impl Service {
                                             continue;
                                         }
                                         let rate_wait = if rate_limiter_enabled {
-                                            let mut rl = state.accept_rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
-                                            rl.try_acquire().err()
+                                            state.accept_rate_limiter.try_acquire().err()
                                         } else {
                                             None
                                         };
@@ -1268,8 +1263,7 @@ impl Service {
                                             continue;
                                         }
                                         let rate_wait = if rate_limiter_enabled {
-                                            let mut rl = state.accept_rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
-                                            rl.try_acquire().err()
+                                            state.accept_rate_limiter.try_acquire().err()
                                         } else {
                                             None
                                         };
@@ -1487,13 +1481,83 @@ impl Service {
         // Uses MSG_PEEK to detect connection type without consuming bytes,
         // matching Go frp v0.69.1 behavior.
 
-        // Spawn ctrl_c listener for graceful shutdown.
-        // tokio::signal::ctrl_c() catches both SIGINT and SIGTERM on Unix.
+        // Spawn signal listener for graceful shutdown.
+        // ctrl_c() only catches SIGINT; SIGTERM needs an explicit unix signal
+        // handler (docker stop / systemctl stop send SIGTERM).
         let shutdown_token = self.state.shutdown_token.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            info!("Received SIGINT/SIGTERM, initiating graceful shutdown...");
+            #[cfg(unix)]
+            {
+                // SIGTERM → graceful shutdown (docker stop / systemctl stop
+                // send SIGTERM; ctrl_c() alone only catches SIGINT).
+                let mut term_sig =
+                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "SIGTERM handler unavailable: {}", e);
+                            None
+                        }
+                    };
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Received SIGINT, initiating graceful shutdown...");
+                    }
+                    _ = async {
+                        if let Some(sig) = term_sig.as_mut() {
+                            sig.recv().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        info!("Received SIGTERM, initiating graceful shutdown...");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok();
+                info!("Received SIGINT, initiating graceful shutdown...");
+            }
             shutdown_token.cancel();
+        });
+
+        // Stale-control reaper: run_id_to_ctl_tx entries whose receiver has
+        // been dropped (control handler panicked / exited without running
+        // unregister_control) would otherwise linger forever and dispatch
+        // work-conns into a dead channel. Sweep every 60s.
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let stale: Vec<(String, u64)> = state
+                    .run_id_to_ctl_tx
+                    .iter()
+                    .filter(|r| r.tx.is_closed())
+                    .map(|r| (r.key().clone(), r.control_id))
+                    .collect();
+                for (run_id, control_id) in stale {
+                    // Atomically remove only if the entry still belongs to the
+                    // same generation: remove_if compares inside the shard
+                    // lock, so a superseding control that registered a fresh
+                    // sender for this run_id is never removed by this sweep
+                    // (a get-then-remove would race with re-login).
+                    let removed = state
+                        .run_id_to_ctl_tx
+                        .remove_if(&run_id, |_, cur| cur.control_id == control_id);
+                    if removed.is_some() {
+                        state
+                            .client_registry
+                            .mark_offline_by_run_id_and_control_id(&run_id, control_id);
+                        tracing::info!(
+                            run_id = %run_id,
+                            "removed stale control entry (handler died)"
+                        );
+                    }
+                }
+            }
         });
 
         loop {
@@ -1516,16 +1580,12 @@ impl Service {
                         warn!(addr = %addr, "Max connections reached, rejecting connection from {}", addr);
                         continue;
                     }
-                    // Rate limit: extract into non-async scope so MutexGuard
-                    // doesn't live across any .await boundary. When disabled
-                    // (max_accept_rate == 0) skip the lock entirely — the
-                    // limiter is a no-op.
+                    // Rate limit: the limiter is lock-free (AtomicU64 CAS),
+                    // so no guard is held across any .await boundary. When
+                    // disabled (max_accept_rate == 0) skip the call entirely
+                    // — the limiter is a no-op.
                     let rate_wait = if rate_limiter_enabled {
-                        let mut rl = state
-                            .accept_rate_limiter
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        rl.try_acquire().err()
+                        state.accept_rate_limiter.try_acquire().err()
                     } else {
                         None
                     };

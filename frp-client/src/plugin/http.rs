@@ -124,7 +124,9 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
         let resp = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
                        Proxy-Authenticate: Basic realm=\"frp\"\r\n\
                        Content-Length: 0\r\n\r\n";
-        let _ = client.write_all(resp).await;
+        if let Err(e) = client.write_all(resp).await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
         return Err("auth failed".into());
     }
 
@@ -156,13 +158,16 @@ async fn handle_connect(mut client: TcpStream, target: &str) -> Result<(), Strin
         .map_err(|e| format!("write: {e}"))?;
 
     // Bidirectional copy
-    let _ = tokio::io::copy_bidirectional_with_sizes(
+    if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
         &mut client,
         &mut remote,
         *frp_core::buffer_pool::BUFFER_SIZE,
         *frp_core::buffer_pool::BUFFER_SIZE,
     )
-    .await;
+    .await
+    {
+        tracing::debug!(error = %e, "plugin relay error: {}", e);
+    }
     Ok(())
 }
 
@@ -212,7 +217,9 @@ async fn handle_http_forward(
         .map_err(|e| format!("write forward request: {e}"))?;
 
     // Copy response back to client
-    let _ = tokio::io::copy(&mut remote, &mut client).await;
+    if let Err(e) = tokio::io::copy(&mut remote, &mut client).await {
+        tracing::debug!(error = %e, "plugin relay error: {}", e);
+    }
     Ok(())
 }
 

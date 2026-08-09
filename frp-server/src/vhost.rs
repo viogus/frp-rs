@@ -454,13 +454,18 @@ pub(crate) async fn write_http_error(
 ) {
     // Write failures here mean the client disconnected before receiving the
     // error response — there is no recovery path, so we silently drop them.
+    // They are still logged at debug so a hung client that never reads the
+    // error response remains observable in traces (audit-round4 H5).
     if custom_body.is_empty() {
-        let _ = stream
+        if let Err(e) = stream
             .write_all(format!("{status_line}\r\nContent-Length: 0\r\n\r\n").as_bytes())
-            .await;
+            .await
+        {
+            tracing::debug!(error = %e, "failed to write HTTP error response");
+        }
     } else {
         let body = custom_body.as_bytes();
-        let _ = stream
+        if let Err(e) = stream
             .write_all(
                 format!(
                     "{status_line}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
@@ -468,8 +473,13 @@ pub(crate) async fn write_http_error(
                 )
                 .as_bytes(),
             )
-            .await;
-        let _ = stream.write_all(body).await;
+            .await
+        {
+            tracing::debug!(error = %e, "failed to write HTTP error response header");
+        }
+        if let Err(e) = stream.write_all(body).await {
+            tracing::debug!(error = %e, "failed to write HTTP error response body");
+        }
     }
 }
 
@@ -809,9 +819,35 @@ pub async fn run_vhost_http_listener(
             result = listener.accept() => {
                 let (stream, peer) = result?;
                 frp_core::transport::set_nodelay(&stream);
+                if state.tcp_keepalive > 0 {
+                    frp_core::transport::set_keepalive(&stream, state.tcp_keepalive as u64);
+                }
+                let permit = state
+                    .conn_semaphore
+                    .as_ref()
+                    .and_then(|s| s.clone().try_acquire_owned().ok());
+                if permit.is_none() && state.conn_semaphore.is_some() {
+                    warn!(addr = %peer, "Max connections reached, rejecting from {}", peer);
+                    continue;
+                }
+                let rate_wait = if state.accept_rate_limiter.rate() > 0.0 {
+                    state.accept_rate_limiter.try_acquire().err()
+                } else {
+                    None
+                };
+                if let Some(wait) = rate_wait {
+                    warn!(addr = %peer, wait_ms = wait.as_millis(), "accept rate limit reached, delaying {}ms", wait.as_millis());
+                    // Release the semaphore permit before sleeping — the
+                    // connection is being delayed, not accepted, so it must
+                    // not hold a connection slot while we wait.
+                    drop(permit);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
                 let state = state.clone();
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     serve_vhost_request(
                         stream,
                         peer,
@@ -853,9 +889,35 @@ pub async fn run_vhost_https_listener(
             result = listener.accept() => {
                 let (mut stream, peer) = result?;
                 frp_core::transport::set_nodelay(&stream);
+                if state.tcp_keepalive > 0 {
+                    frp_core::transport::set_keepalive(&stream, state.tcp_keepalive as u64);
+                }
+                let permit = state
+                    .conn_semaphore
+                    .as_ref()
+                    .and_then(|s| s.clone().try_acquire_owned().ok());
+                if permit.is_none() && state.conn_semaphore.is_some() {
+                    warn!(addr = %peer, "Max connections reached, rejecting from {}", peer);
+                    continue;
+                }
+                let rate_wait = if state.accept_rate_limiter.rate() > 0.0 {
+                    state.accept_rate_limiter.try_acquire().err()
+                } else {
+                    None
+                };
+                if let Some(wait) = rate_wait {
+                    warn!(addr = %peer, wait_ms = wait.as_millis(), "accept rate limit reached, delaying {}ms", wait.as_millis());
+                    // Release the semaphore permit before sleeping — the
+                    // connection is being delayed, not accepted, so it must
+                    // not hold a connection slot while we wait.
+                    drop(permit);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
                 let state = state.clone();
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let timeout_secs = state.vhost_http_timeout.max(1);
                     // Read the TLS ClientHello (SNI lives in the first
                     // record; 4096 bytes comfortably covers it).

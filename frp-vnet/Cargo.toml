@@ -8,8 +8,6 @@ description = "Virtual network (L3 VPN) TUN device and routing for frp-rs"
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false, features = ["vnet"] }
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt"] }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 
@@ -21,3 +19,9 @@ libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_IO"] }
+
+# serde/serde_json are only used by integration tests (frp-vnet/tests/), not
+# by the library itself — dev-only so the library build stays lean.
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

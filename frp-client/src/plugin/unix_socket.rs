@@ -52,13 +52,16 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                             tokio::spawn(async move {
                                 match UnixStream::connect(&path).await {
                                     Ok(mut unix_stream) => {
-                                        let _ = tokio::io::copy_bidirectional_with_sizes(
+                                        if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
                                             &mut tcp_stream,
                                             &mut unix_stream,
                                             *frp_core::buffer_pool::BUFFER_SIZE,
                                             *frp_core::buffer_pool::BUFFER_SIZE,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            tracing::debug!(error = %e, "plugin relay error: {}", e);
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!(
