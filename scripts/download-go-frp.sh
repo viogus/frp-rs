@@ -2,12 +2,29 @@
 # =============================================================================
 # Download Go frp release binaries for compatibility testing.
 # Usage: download-go-frp.sh [version] [arch] [dest]
+#   arch defaults to the host platform (same auto-detect convention as
+#   compat-test.sh), e.g. darwin_arm64 on Apple Silicon macOS,
+#   linux_amd64 on x86_64 Linux — pass an explicit arch to override.
 # =============================================================================
 set -euo pipefail
 
 VERSION="${1:-0.70.1}"
-ARCH="${2:-linux_amd64}"
-DEST="${3:-/tmp/frp_${VERSION}_linux_amd64}"
+
+# Auto-detect host platform, matching compat-test.sh's path convention
+# (/tmp/frp_${VERSION}_${os}_${arch}).
+if [[ -n "${2:-}" ]]; then
+    ARCH="$2"
+else
+    _gos="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    _goa="$(uname -m)"
+    case "$_goa" in
+        x86_64)  _goa="amd64" ;;
+        aarch64|arm64) _goa="arm64" ;;
+    esac
+    ARCH="${_gos}_${_goa}"
+fi
+
+DEST="${3:-/tmp/frp_${VERSION}_${ARCH}}"
 
 URL="https://github.com/fatedier/frp/releases/download/v${VERSION}/frp_${VERSION}_${ARCH}.tar.gz"
 
