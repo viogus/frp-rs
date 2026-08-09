@@ -225,7 +225,10 @@ pub struct ClientConfig {
     /// TCP keepalive interval in seconds for outbound connections to the
     /// frp server. 0 disables. Go frp compat: dialServerKeepalive.
     /// frp-rs production default: 300 (Go default: 7200).
-    #[serde(default = "default_dial_server_keepalive", alias = "dialServerKeepalive")]
+    #[serde(
+        default = "default_dial_server_keepalive",
+        alias = "dialServerKeepalive"
+    )]
     pub dial_server_keepalive: i64,
     /// Timeout in seconds for dialing the frp server.
     /// Go frp v0.70.1 compat: dialServerTimeout. Default: 10.
