@@ -1137,9 +1137,10 @@ token = "test-token"
     // (disabled), silently diverging from the documented default.
     assert_eq!(cfg.dial_server_keepalive, 300);
     // An explicit 0 still disables.
-    let cfg0: ClientConfig =
-        load_client_config_from_str("server_addr = '127.0.0.1'\n[transport]\ndial_server_keepalive = 0")
-            .unwrap();
+    let cfg0: ClientConfig = load_client_config_from_str(
+        "server_addr = '127.0.0.1'\n[transport]\ndial_server_keepalive = 0",
+    )
+    .unwrap();
     assert_eq!(cfg0.dial_server_keepalive, 0);
 }
 
