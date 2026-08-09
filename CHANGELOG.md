@@ -166,6 +166,15 @@ All notable changes to frp-rs.
 - Doc figures corrected: local/CI builds with `lto=false opt-level=2` come
   out **~70% larger** (9.1MB vs 5.3MB), not ~40% (audit D5-2).
 
+### Dependencies
+- **`cargo update` (2026-08-10)**: 16 patch-level upgrades, lockfile-only
+  (no code changes) — async-trait 0.1.91→0.1.92, cc 1.4.0→1.4.2,
+  clap 4.6.5→4.6.6, thiserror 2.0.19→2.0.20, wasm-bindgen 0.2.126→0.2.127
+  (+ macro/macro-support/shared, futures), web-sys 0.3.103→0.3.104,
+  js-sys 0.3.103→0.3.104, zerocopy 0.8.55→0.8.56, find-msvc-tools
+  0.1.9→0.1.10. Verified: workspace tests 928 passed / 0 failed,
+  clippy `-D warnings` and fmt clean.
+
 ## Unreleased
 
 ### Changed
