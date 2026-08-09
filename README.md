@@ -177,6 +177,18 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 每个 feature 均可独立开关（frps 21 个、frpc 20 个编译期 feature flag），精细控制二进制内容。无需修改代码，Cargo feature 即按需裁剪。
 
+#### Feature 归属一览
+
+**frps（21 个）** — `default` 已启用：`websocket` `kcp` `quic` `oidc` `tls` `http-proxy` `compression` `chacha20` `tcp-mux` `ssh`；opt-in：`dashboard`（指标/状态 API）、`vnet`（L3 VPN / TUN 路由）、`mimalloc`（全局分配器）、`otel`（遥测）；dev-only（不进入 shipped 构建）：`debug-logs` `mem-profile` `profiling`；组合别名：`default` `full`（= frp-server 默认）、`tiny`（tls+http-proxy+tcp-mux）、`micro`（仅 TCP 核心）。
+
+**frpc（20 个）** — `default` 已启用：`tls` `kcp` `quic` `websocket` `oidc` `compression` `chacha20` `tcp-mux` `http2http`；opt-in：`vnet`、`admin`（frpc 管理 API）、`mimalloc`、`otel`；dev-only：`debug-logs` `mem-profile` `profiling`；组合别名：`default` `full`（= frp-client 默认）、`tiny`（tls+tcp-mux）、`micro`。
+
+**隐含关系**：
+- 底层 crate 通过二进制的 feature 转发裁剪：frp-core 默认虽含 `vnet`/`stun`，但 frps/frpc 以 `default-features = false` 引用，因此**默认二进制不含 vnet**（opt-in）
+- `http2http`（frpc/frp-client）独立控制 h2 插件，**隐含 `tls`**，tiny 构建不含
+- 共享内部 feature：`http-client`（被 `oidc`/`http-proxy` 依赖）、`admin-auth`（被 `dashboard`/`admin` 依赖）
+- dev-only 三个 feature 在全部 shipped 构建（full/tiny/micro）中关闭，生产二进制字节一致
+
 ---
 
 ## Architecture
