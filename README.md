@@ -171,7 +171,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 | 版本 | 体积 (frps/frpc) | 保留能力 | 适用场景 |
 |------|-----------------|---------|---------|
 | **default** | ~5.1MB / ~4.0MB | TCP/WS/TLS/KCP/QUIC、SSH、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
-| **full** | ~5.5MB / ~4.0MB | default + dashboard（`--features "ssh,quic,dashboard"`，ssh/quic 已默认启用）；需要 L3 VPN / TUN 路由再加 `--features vnet`（默认二进制不含） | 全功能部署 |
+| **full** | ~5.5MB / ~4.0MB | default + dashboard（`--features dashboard`；ssh/quic 等其余能力已在 default 内）；L3 VPN / TUN 路由可再叠加 `--features vnet` | 全功能部署 |
 | **tiny** | ~3.2MB / ~3.1MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/TCP mux（frps 另保留 HTTP 代理；frpc 的 h2 支持也独立为 `http2http` feature） | 边缘设备、嵌入式 |
 | **micro** | ~2.2MB / ~2.1MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
 
