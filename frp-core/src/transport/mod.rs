@@ -846,14 +846,11 @@ async fn connect_direct(
     .map_err(|_| crate::Error::Transport(format!("dial timeout to {addr}").into()))?
     .map_err(|e| crate::Error::Transport(format!("dial to {addr}: {e}").into()))?;
 
-    // Configure TCP keepalive after connection
-    if opts.keepalive_secs > 0 {
-        let keepalive = socket2::SockRef::from(&stream);
-        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(opts.keepalive_secs));
-        keepalive
-            .set_tcp_keepalive(&ka)
-            .map_err(|e| crate::Error::Transport(format!("set keepalive: {e}").into()))?;
-    }
+    // Configure TCP keepalive after connection: idle time + probe
+    // interval/retries via `set_keepalive` (same behavior as server-side
+    // accepted connections; a failed socket option is debug-logged and
+    // ignored, matching `set_nodelay`).
+    crate::transport::set_keepalive(&stream, opts.keepalive_secs);
 
     // Disable Nagle for low-latency small-message RTT (Go frp parity).
     crate::transport::set_nodelay(&stream);
@@ -870,16 +867,32 @@ pub fn set_nodelay(stream: &tokio::net::TcpStream) {
     }
 }
 
-/// Set TCP keepalive interval on a stream, matching Go frp's server-side
-/// `muxer.SetKeepAlive(7200s)` behavior. Uses socket2 to configure the
-/// keepalive timeout. A failed socket option is logged at debug and ignored
-/// — consistent with `set_nodelay` error-handling policy.
+/// Set TCP keepalive on a stream.
+///
+/// In addition to the idle time, supported platforms also set a short probe
+/// interval and a small probe count so a dead peer is reclaimed in minutes
+/// instead of hours (kernel defaults can otherwise stretch one probe period
+/// to ~75s with 9 retries). A failed socket option is logged at debug and
+/// ignored — consistent with `set_nodelay` error-handling policy.
 pub fn set_keepalive(stream: &tokio::net::TcpStream, secs: u64) {
     if secs == 0 {
         return;
     }
     let keepalive = socket2::SockRef::from(stream);
     let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(secs));
+    #[cfg(not(any(
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "solaris",
+        target_os = "nto",
+        target_os = "espidf",
+        target_os = "vita",
+        target_os = "haiku",
+        target_os = "horizon",
+    )))]
+    let ka = ka
+        .with_interval(Duration::from_secs((secs / 10).clamp(1, 60)))
+        .with_retries(3);
     if let Err(e) = keepalive.set_tcp_keepalive(&ka) {
         tracing::debug!(error = %e, keepalive_secs = secs,
             "set_keepalive failed (continuing without keepalive)");

@@ -110,6 +110,7 @@ Transport-level settings for the server.
 | `tcp_mux` | `bool` | `true` | `transport.tcpMux` | Enable TCP multiplexing (yamux) for work connections. When enabled, all proxies share a single TCP connection. |
 | `tcp_mux_keepalive_interval` | `i64` | `30` | `transport.tcpMuxKeepaliveInterval` | Keepalive interval in seconds for mux connections. Serde default is `0`; a zero value is normalized to the 30s default at load time. |
 | `heartbeat_timeout` | `i64` | `90` | `transport.heartbeatTimeout` | Heartbeat timeout in seconds. Server disconnects the client if no `Ping` received within this interval. When `tcp_mux` is enabled (the default), this is normalized to `-1` (disabled — yamux keepalive covers liveness). |
+| `tcp_keepalive` | `i64` | `300` | `transport.tcpKeepalive` | TCP keepalive idle time in seconds for server-side accepted connections. 0 = disabled. Probe interval and retries are also set so dead peers are reclaimed quickly. |
 
 ### `[ssh_tunnel_gateway]` Section
 
@@ -285,7 +286,7 @@ enable_control = true
 | `pool_count` | `i32` | `1` | `poolCount` | Number of pre-established work connections kept in the server-side pool. Higher values reduce latency for new proxy connections. |
 | `heartbeat_interval` | `i64` | `30` | `transport.heartbeatInterval` | Ping interval in seconds. Client sends a heartbeat `Ping` at this interval. When `tcp_mux` is enabled (the default), this is normalized to `-1` (disabled — yamux keepalive covers liveness). |
 | `dns_server` | `string` | `""` | `dnsServer` | Custom DNS server address for resolving `server_addr`. Empty = system DNS. Queries `A` and `AAAA` records concurrently, preferring IPv4 (an `A` answer wins even when `AAAA` also succeeds); falls back to IPv6 when only `AAAA` resolves. |
-| `dial_server_keepalive` | `i64` | `0` | `dialServerKeepalive` | TCP keepalive interval in seconds for outbound connections to the server. 0 = disabled. |
+| `dial_server_keepalive` | `i64` | `300` | `dialServerKeepalive` | TCP keepalive idle time in seconds for outbound connections to the server. 0 = disabled. |
 | `connect_server_local_ip` | `string` | `""` | `connectServerLocalIP` | Local IP address to bind when dialing the frp server. Empty = system default. |
 | `tcp_mux` | `bool` | `true` | `transport.tcpMux` | Enable TCP multiplexing (yamux) for work connections. |
 | `v2` | `bool` | `false` | `transport.wireProtocol = "v2"` | Enable V2 wire protocol framing. Requires `tcp_mux` for yamux multiplexing. |

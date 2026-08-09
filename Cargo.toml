@@ -77,7 +77,7 @@ quinn = "0.11"
 
 frp-vnet = { path = "frp-vnet" }
 
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 libc = "0.2"
 chacha20poly1305 = "0.10"
 pprof = { version = "0.15", features = ["flamegraph"] }
@@ -101,3 +101,10 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Throughput/latency-first build: same LTO/strip/abort discipline as
+# `release`, but with -O3 instead of -Oz for the hot data plane. Binary is
+# a few hundred KB larger; use `cargo build --profile release-perf`.
+[profile.release-perf]
+inherits = "release"
+opt-level = 3

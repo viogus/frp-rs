@@ -78,23 +78,10 @@ impl WsByteStream {
             }
             let mask: [u8; 4] = rand::random();
             frame.extend_from_slice(&mask);
-            // XOR the payload with the mask key (RFC 6455 §5.3). Chunk the
-            // aligned prefix as u32 words instead of a byte-by-byte loop with
-            // per-byte modulo — ~4x fewer ops on the 32 KiB bridge chunks.
+            // XOR the payload with the mask key (RFC 6455 §5.3).
             let start = frame.len();
             frame.extend_from_slice(buf);
-            let chunk = &mut frame[start..];
-            let mask_u32 = u32::from_ne_bytes(mask);
-            let mut i = 0;
-            while i + 4 <= len {
-                let word = u32::from_ne_bytes([chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]]);
-                chunk[i..i + 4].copy_from_slice(&(word ^ mask_u32).to_ne_bytes());
-                i += 4;
-            }
-            while i < len {
-                chunk[i] ^= mask[i % 4];
-                i += 1;
-            }
+            xor_mask(&mut frame[start..], mask);
         } else {
             // Server MUST NOT mask frames per RFC 6455 §5.1
             if len < 126 {
@@ -108,6 +95,28 @@ impl WsByteStream {
             }
             frame.extend_from_slice(buf);
         }
+    }
+}
+
+/// XOR a payload with an RFC 6455 masking key.
+///
+/// The aligned prefix is processed as 32-bit words instead of a byte-by-byte
+/// loop with a per-byte modulo, which is ~4x cheaper on the 32 KiB bridge
+/// chunks used by the WebSocket transport.
+#[inline]
+fn xor_mask(payload: &mut [u8], mask: [u8; 4]) {
+    let mask_u32 = u32::from_ne_bytes(mask);
+    let mut i = 0;
+    while i + 4 <= payload.len() {
+        let mut word = [0u8; 4];
+        word.copy_from_slice(&payload[i..i + 4]);
+        let word = u32::from_ne_bytes(word) ^ mask_u32;
+        payload[i..i + 4].copy_from_slice(&word.to_ne_bytes());
+        i += 4;
+    }
+    while i < payload.len() {
+        payload[i] ^= mask[i % 4];
+        i += 1;
     }
 }
 
@@ -509,9 +518,7 @@ impl AsyncRead for WsByteStream {
                                 return Poll::Pending;
                             }
                             if *raw_frame_masked {
-                                for i in 0..payload.len() {
-                                    payload[i] ^= raw_frame_mask_key[i % 4];
-                                }
+                                xor_mask(payload, *raw_frame_mask_key);
                             }
                             // Take ownership of payload and reset state before
                             // dispatch to avoid double-borrow on raw_read_state.

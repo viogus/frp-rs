@@ -82,17 +82,17 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
             backend_port,
             enable_h2,
         ),
-        |tcp, peer, (target, rewrite, headers, acceptor, connector, host, port, enable_h2)| {
+        |tcp, peer, (target, rewrite, headers, acceptor, connector, _host, _port, _enable_h2)| {
             async move {
                 match acceptor.accept(tcp).await {
                     Ok(client_tls) => {
                         #[cfg(feature = "http2http")]
                         {
-                            if enable_h2 && client_tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                            if _enable_h2 && client_tls.get_ref().1.alpn_protocol() == Some(b"h2") {
                                 let backend = Backend::Tls {
                                     connector,
-                                    host,
-                                    port,
+                                    host: _host,
+                                    port: _port,
                                 };
                                 serve_h2_connection(client_tls, target, rewrite, headers, backend)
                                     .await;
@@ -162,7 +162,7 @@ async fn handle_conn(
         .map_err(|e| format!("write forward request: {e}"))?;
 
     // Copy response back to client
-    if let Err(e) = tokio::io::copy(&mut backend_tls, &mut client_tls).await {
+    if let Err(e) = super::copy_stream_large(backend_tls, &mut client_tls).await {
         tracing::debug!(error = %e, "plugin relay error: {}", e);
     }
     Ok(())

@@ -1,5 +1,8 @@
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tracing::{debug, warn};
 
@@ -12,6 +15,45 @@ use frp_core::transport::{self, BoxedReadHalf, BoxedWriteHalf, DialOptions, Tran
 use frp_core::VERSION;
 
 use super::{PluginContext, PluginHandle};
+
+/// Recombine split read/write halves into a duplex stream for
+/// `copy_bidirectional_with_sizes`.
+struct Duplex<R, W> {
+    r: R,
+    w: W,
+}
+
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncRead for Duplex<R, W> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.r).poll_read(cx, buf)
+    }
+}
+
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncWrite for Duplex<R, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.w).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.w).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.w).poll_shutdown(cx)
+    }
+}
 
 /// Start a visitor plugin that tunnels connections to a remote STCP/XTCP proxy.
 ///
@@ -318,7 +360,7 @@ async fn handle_visitor_conn(
     }
 
     // 5. Bridge user_conn ↔ server_stream
-    let (mut u_r, mut u_w) = tokio::io::split(user_conn);
+    let (u_r, u_w) = tokio::io::split(user_conn);
     let (s_r, s_w) = match frp_core::transport::split_work_conn_halves(server_stream) {
         Ok(pair) => pair,
         Err(e) => {
@@ -336,7 +378,7 @@ async fn handle_visitor_conn(
     // outer) or the server would decrypt/decompress a plaintext stream.
     let use_enc = use_encryption && !secret_key.is_empty();
     let enc_key = use_enc.then(|| frp_core::encryption::derive_key(secret_key));
-    let mut s_r: BoxedReadHalf = if use_compression {
+    let s_r: BoxedReadHalf = if use_compression {
         let inner: BoxedReadHalf = if let Some(key) = enc_key {
             Box::new(frp_core::cipher_stream::CipherReader::new(s_r, key))
         } else {
@@ -348,7 +390,7 @@ async fn handle_visitor_conn(
     } else {
         s_r
     };
-    let mut s_w: BoxedWriteHalf = if use_compression {
+    let s_w: BoxedWriteHalf = if use_compression {
         let inner: BoxedWriteHalf = if let Some(key) = enc_key {
             Box::new(frp_core::cipher_stream::CipherWriter::new(s_w, key))
         } else {
@@ -361,26 +403,20 @@ async fn handle_visitor_conn(
         s_w
     };
 
-    let a = tokio::spawn(async move {
-        let n = tokio::io::copy(&mut u_r, &mut s_w).await;
-        if let Err(e) = s_w.shutdown().await {
-            tracing::debug!(error = %e, "plugin relay error: {}", e);
-        }
-        n
-    });
-    let b = tokio::spawn(async move {
-        let n = tokio::io::copy(&mut s_r, &mut u_w).await;
-        if let Err(e) = u_w.shutdown().await {
-            tracing::debug!(error = %e, "plugin relay error: {}", e);
-        }
-        n
-    });
-
-    match tokio::join!(a, b) {
-        (Ok(n1), Ok(n2)) => {
+    let mut user_side = Duplex { r: u_r, w: u_w };
+    let mut server_side = Duplex { r: s_r, w: s_w };
+    match tokio::io::copy_bidirectional_with_sizes(
+        &mut user_side,
+        &mut server_side,
+        *frp_core::buffer_pool::BUFFER_SIZE,
+        *frp_core::buffer_pool::BUFFER_SIZE,
+    )
+    .await
+    {
+        Ok((n1, n2)) => {
             debug!(n1 = ?n1, n2 = ?n2, "visitor plugin: bridge done ({:?}B→server, {:?}B→user)", n1, n2)
         }
-        (Err(e), _) | (_, Err(e)) => debug!(error = %e, "visitor plugin: bridge closed: {}", e),
+        Err(e) => debug!(error = %e, "visitor plugin: bridge closed: {}", e),
     }
 
     Ok(())

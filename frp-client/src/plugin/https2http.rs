@@ -75,15 +75,18 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
             backend_port,
             enable_h2,
         ),
-        |tcp, peer, (target, rewrite, headers, acceptor, host, port, enable_h2)| async move {
+        |tcp, peer, (target, rewrite, headers, acceptor, _host, _port, _enable_h2)| async move {
             match acceptor.accept(tcp).await {
                 Ok(tls) => {
                     #[cfg(feature = "http2http")]
                     {
                         // ALPN h2 negotiated → decode h2 frames and forward to the
                         // backend as HTTP/1.1 (Go http.Server + ReverseProxy).
-                        if enable_h2 && tls.get_ref().1.alpn_protocol() == Some(b"h2") {
-                            let backend = Backend::Plain { host, port };
+                        if _enable_h2 && tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                            let backend = Backend::Plain {
+                                host: _host,
+                                port: _port,
+                            };
                             serve_h2_connection(tls, target, rewrite, headers, backend).await;
                         } else if let Err(e) = handle_conn(tls, &target, &rewrite, &headers).await {
                             debug!(%peer, error = %e, "https2http: {peer} error: {e}");
@@ -132,7 +135,7 @@ async fn handle_conn(
         .map_err(|e| format!("write forward request: {e}"))?;
 
     // Copy response back to client
-    if let Err(e) = tokio::io::copy(&mut remote, &mut tls).await {
+    if let Err(e) = super::copy_stream_large(remote, &mut tls).await {
         tracing::debug!(error = %e, "plugin relay error: {}", e);
     }
     Ok(())

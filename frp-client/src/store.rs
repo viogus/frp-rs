@@ -81,43 +81,37 @@ impl StoreSource {
         &self.path
     }
 
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, StoreInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Reload entries from disk. Used before merging so external edits made
     /// through another process are reflected in the running service.
     pub fn reload(&self) -> Result<(), StoreError> {
         let (proxies, visitors) = load_from_file(&self.path)?;
-        let mut inner = self.inner.lock().expect("store mutex poisoned");
+        let mut inner = self.lock_inner();
         inner.proxies = proxies;
         inner.visitors = visitors;
         Ok(())
     }
 
     pub fn get_proxy(&self, name: &str) -> Option<ProxyConfig> {
-        self.inner
-            .lock()
-            .expect("store mutex poisoned")
-            .proxies
-            .get(name)
-            .cloned()
+        self.lock_inner().proxies.get(name).cloned()
     }
 
     pub fn get_visitor(&self, name: &str) -> Option<VisitorConfig> {
-        self.inner
-            .lock()
-            .expect("store mutex poisoned")
-            .visitors
-            .get(name)
-            .cloned()
+        self.lock_inner().visitors.get(name).cloned()
     }
 
     pub fn all_proxies(&self) -> Vec<ProxyConfig> {
-        let inner = self.inner.lock().expect("store mutex poisoned");
+        let inner = self.lock_inner();
         let mut values: Vec<ProxyConfig> = inner.proxies.values().cloned().collect();
         values.sort_by(|a, b| a.name.cmp(&b.name));
         values
     }
 
     pub fn all_visitors(&self) -> Vec<VisitorConfig> {
-        let inner = self.inner.lock().expect("store mutex poisoned");
+        let inner = self.lock_inner();
         let mut values: Vec<VisitorConfig> = inner.visitors.values().cloned().collect();
         values.sort_by(|a, b| a.name.cmp(&b.name));
         values
@@ -126,7 +120,7 @@ impl StoreSource {
     pub fn add_proxy(&self, proxy: ProxyConfig) -> Result<ProxyConfig, StoreError> {
         validate_proxy(&proxy)?;
         let name = proxy.name.clone();
-        let mut inner = self.inner.lock().expect("store mutex poisoned");
+        let mut inner = self.lock_inner();
         if inner.proxies.contains_key(&name) {
             return Err(StoreError::Conflict(format!(
                 "proxy {name:?} already exists"
@@ -143,7 +137,7 @@ impl StoreSource {
     pub fn update_proxy(&self, proxy: ProxyConfig) -> Result<ProxyConfig, StoreError> {
         validate_proxy(&proxy)?;
         let name = proxy.name.clone();
-        let mut inner = self.inner.lock().expect("store mutex poisoned");
+        let mut inner = self.lock_inner();
         let old = inner
             .proxies
             .get(&name)
@@ -163,7 +157,7 @@ impl StoreSource {
                 "proxy name cannot be empty".into(),
             ));
         }
-        let mut inner = self.inner.lock().expect("store mutex poisoned");
+        let mut inner = self.lock_inner();
         let old = inner
             .proxies
             .remove(name)
@@ -178,7 +172,7 @@ impl StoreSource {
     pub fn add_visitor(&self, visitor: VisitorConfig) -> Result<VisitorConfig, StoreError> {
         validate_visitor(&visitor)?;
         let name = visitor.name.clone();
-        let mut inner = self.inner.lock().expect("store mutex poisoned");
+        let mut inner = self.lock_inner();
         if inner.visitors.contains_key(&name) {
             return Err(StoreError::Conflict(format!(
                 "visitor {name:?} already exists"
@@ -195,7 +189,7 @@ impl StoreSource {
     pub fn update_visitor(&self, visitor: VisitorConfig) -> Result<VisitorConfig, StoreError> {
         validate_visitor(&visitor)?;
         let name = visitor.name.clone();
-        let mut inner = self.inner.lock().expect("store mutex poisoned");
+        let mut inner = self.lock_inner();
         let old = inner
             .visitors
             .get(&name)
@@ -215,7 +209,7 @@ impl StoreSource {
                 "visitor name cannot be empty".into(),
             ));
         }
-        let mut inner = self.inner.lock().expect("store mutex poisoned");
+        let mut inner = self.lock_inner();
         let old = inner
             .visitors
             .remove(name)

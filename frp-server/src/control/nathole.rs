@@ -1349,7 +1349,11 @@ mod vnet_route_tests {
         let ctx = ControlContext {
             state: Arc::clone(state),
             pool_stats: Arc::new(PoolStats::default()),
-            reloadable: state.reloadable.read().unwrap().clone(),
+            reloadable: state
+                .reloadable
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             v2: false,
             run_id: run_id.to_string(),
             control_id: 1,

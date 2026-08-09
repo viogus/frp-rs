@@ -154,6 +154,21 @@ pub(crate) async fn dispatch_plugin_start(
     }
 }
 
+/// Copy one direction of a plugin tunnel with a large, configurable buffer.
+///
+/// `tokio::io::copy` defaults to an 8 KiB internal buffer; wrapping the
+/// reader in a `BufReader` lets the plugin HTTP/HTTPS data planes honor
+/// `FRP_BRIDGE_BUF_KB` (32 KiB default) without changing flush semantics.
+pub(super) async fn copy_stream_large<R, W>(reader: R, writer: &mut W) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut reader =
+        tokio::io::BufReader::with_capacity(*frp_core::buffer_pool::BUFFER_SIZE, reader);
+    tokio::io::copy_buf(&mut reader, writer).await
+}
+
 impl Service {
     /// Start a single plugin and return its handle with resolved bound address.
     /// Used during reload to restart plugins with updated config.

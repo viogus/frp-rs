@@ -39,6 +39,7 @@ type Aes128CfbDec = cfb_mode::Decryptor<aes::Aes128>;
 /// frame (the only non-test callers are UDP-packet paths, whose datagrams are
 /// bounded by `udp_packet_size`, default 1500 / max 65535) while capping any
 /// bomb at a single 1 MiB allocation.
+#[cfg(feature = "compression")]
 const MAX_DECOMPRESSED_OUTPUT: usize = 1024 * 1024;
 
 /// Derive an AES-128 key from a token using PBKDF2-SHA1.
