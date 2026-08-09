@@ -1,6 +1,6 @@
 [package]
 name = "frp-client"
-version = "0.7.1"
+version = "0.70.1"
 edition = "2021"
 license = "MIT"
 
