@@ -10,6 +10,7 @@ pub mod cipher_stream;
 pub mod cli;
 pub mod config;
 pub mod config_store;
+pub mod control_sink;
 pub mod crypto;
 pub mod encryption;
 pub mod feature_gate;
@@ -30,6 +31,7 @@ pub mod mux;
 pub mod profiling;
 pub mod protocol;
 pub mod proxy_protocol;
+pub use control_sink::ControlSink;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod snappy_stream;

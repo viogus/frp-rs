@@ -37,9 +37,14 @@ rand.workspace = true
 # default frpc. Build with `--features admin` (or `cargo build -p frpc --features admin`)
 # to enable the admin API; `frpc reload`/`status` talk to a running frpc built
 # with this feature and `web_server.port > 0` configured.
-default = ["tls", "kcp", "quic", "websocket", "oidc", "compression", "chacha20", "tcp-mux"]
+default = ["tls", "kcp", "quic", "websocket", "oidc", "compression", "chacha20", "tcp-mux", "http2http"]
 admin = ["dep:axum", "frp-core/admin-auth"]
-tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls", "dep:h2", "dep:http", "dep:bytes"]
+tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls"]
+# HTTP/2 (h2) support for the https2http/https2https plugins (enableHTTP2
+# path). Implies `tls` — h2 only makes sense on a TLS listener. Kept out of
+# `tls` itself so tiny builds (tls without http2http) skip h2/indexmap/bytes
+# (audit v0.70.1 P2-A3).
+http2http = ["dep:h2", "dep:http", "dep:bytes", "tls"]
 quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp", "frp-core/stun"]
 websocket = ["frp-core/websocket"]

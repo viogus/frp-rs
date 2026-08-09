@@ -13,12 +13,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
+use crate::service::ControlWriter;
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::write_msg;
-use frp_core::transport::BoxedWriteHalf;
 
 use crate::service::Service;
 
@@ -30,7 +29,7 @@ impl Service {
     pub(crate) async fn handle_nat_hole_client(
         &self,
         nhc: msg::NatHoleClient,
-        writer: &Arc<Mutex<BoxedWriteHalf>>,
+        writer: &Arc<ControlWriter>,
         v2: bool,
     ) {
         debug!(proxy_name = %nhc.proxy_name, "Received NatHoleClient for proxy '{}'", nhc.proxy_name);
@@ -83,7 +82,7 @@ impl Service {
             sid: Some(sid.clone()),
             ..Default::default()
         });
-        if let Err(e) = write_msg(&mut *writer.lock().await, &sid_msg, v2).await {
+        if let Err(e) = writer.send(sid_msg, v2) {
             warn!(error = %e, "Failed to send NatHoleSid: {}", e);
             return;
         }
@@ -201,7 +200,7 @@ impl Service {
     /// Build and send a NatHoleReport for `sid`; log at debug on failure.
     /// `reason` labels the failure context in the log line.
     pub(crate) async fn send_nat_hole_report(
-        writer: &Arc<Mutex<BoxedWriteHalf>>,
+        writer: &Arc<ControlWriter>,
         v2: bool,
         sid: String,
         success: bool,
@@ -211,7 +210,7 @@ impl Service {
             sid: Some(sid),
             success,
         });
-        if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+        if let Err(e) = writer.send(report, v2) {
             debug!(error = %e, "Failed to send NatHoleReport ({reason})");
         }
     }
@@ -231,7 +230,7 @@ impl Service {
                 std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
             >,
         >,
-        writer: &Arc<Mutex<BoxedWriteHalf>>,
+        writer: &Arc<ControlWriter>,
     ) {
         // Route to waiting visitor first (Go frps compat path).
         let txn_id = resp.transaction_id.clone();
@@ -436,9 +435,7 @@ impl Service {
                         sid: Some(sid_clone.clone()),
                         success: true,
                     });
-                    let mut w = resp_writer.lock().await;
-                    let _ = frp_core::protocol::write_msg(&mut *w, &ok_report, resp_v2).await;
-                    drop(w);
+                    let _ = resp_writer.send(ok_report, resp_v2);
                     info!(proxy_name = %proxy_name_clone, protocol = %p2p_protocol, "XTCP provider '{}': P2P connected", proxy_name_clone);
                     if let Some(ref local) = local_addr {
                         match tokio::net::TcpStream::connect(local).await {
@@ -484,11 +481,7 @@ impl Service {
                                     sid: Some(sid_clone.clone()),
                                     success: false,
                                 });
-                                let mut w = resp_writer.lock().await;
-                                let _ =
-                                    frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2)
-                                        .await;
-                                drop(w);
+                                let _ = resp_writer.send(fail_report, resp_v2);
                             }
                         }
                     } else {
@@ -497,9 +490,7 @@ impl Service {
                             sid: Some(sid_clone.clone()),
                             success: false,
                         });
-                        let mut w = resp_writer.lock().await;
-                        let _ = frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2).await;
-                        drop(w);
+                        let _ = resp_writer.send(fail_report, resp_v2);
                     }
                 }
                 Err(e) => {
@@ -508,9 +499,7 @@ impl Service {
                         sid: Some(sid_clone.clone()),
                         success: false,
                     });
-                    let mut w = resp_writer.lock().await;
-                    let _ = frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2).await;
-                    drop(w);
+                    let _ = resp_writer.send(fail_report, resp_v2);
                 }
             }
         });

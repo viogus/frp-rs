@@ -66,6 +66,10 @@ impl hyper::rt::Read for TunnelStream {
             std::task::ready!(tokio::io::AsyncRead::poll_read(self, cx, &mut tbuf))?;
             tbuf.filled().len()
         };
+        // SAFETY: `advance(n)` is safe because exactly `n` bytes were filled
+        // by the poll_read above (n ≤ the unfilled capacity we exposed via
+        // `buf.as_mut()`); ReadBufCursor permits advancing within the
+        // initialized region, mirroring hyper-util's TokioIo bridge.
         unsafe {
             buf.advance(n);
         }
@@ -804,9 +808,14 @@ mod tests {
                 .await
                 .unwrap();
             let mut target = tokio::net::TcpStream::connect(&target_addr).await.unwrap();
-            tokio::io::copy_bidirectional(&mut client, &mut target)
-                .await
-                .unwrap();
+            tokio::io::copy_bidirectional_with_sizes(
+                &mut client,
+                &mut target,
+                32 * 1024,
+                32 * 1024,
+            )
+            .await
+            .unwrap();
         });
 
         let http_client = HttpClientBuilder::new()
@@ -913,9 +922,14 @@ mod tests {
                 .await
                 .unwrap();
             let mut origin = tokio::net::TcpStream::connect(&origin_addr).await.unwrap();
-            tokio::io::copy_bidirectional(&mut client, &mut origin)
-                .await
-                .unwrap();
+            tokio::io::copy_bidirectional_with_sizes(
+                &mut client,
+                &mut origin,
+                32 * 1024,
+                32 * 1024,
+            )
+            .await
+            .unwrap();
         });
 
         let http_client = HttpClientBuilder::new()

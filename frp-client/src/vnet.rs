@@ -13,9 +13,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{info, warn};
 
+use crate::service::ControlWriter;
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::write_msg;
-use frp_core::transport::{BoxedWriteHalf, IoStream};
+use frp_core::transport::IoStream;
 
 use crate::service::{Service, VISITOR_PLUGIN_VIRTUAL_NET};
 
@@ -228,7 +228,7 @@ pub(crate) async fn spawn_vnet_tun_controller(
     vnet_controller: &Arc<frp_vnet::controller::ClientVnetController>,
     proxy_name: &str,
     vnet: &str,
-    writer: &Arc<Mutex<BoxedWriteHalf>>,
+    writer: &Arc<ControlWriter>,
     v2: bool,
 ) -> Option<()> {
     let tun = {
@@ -270,7 +270,7 @@ pub(crate) async fn spawn_vnet_tun_controller(
 
 /// Send a VnetRouteAdvertise for a `type = vnet` proxy that owns a subnet.
 pub(crate) async fn send_vnet_route_advertise(
-    writer: &Arc<Mutex<BoxedWriteHalf>>,
+    writer: &Arc<ControlWriter>,
     v2: bool,
     p: &frp_core::config::ProxyConfig,
 ) {
@@ -287,9 +287,7 @@ pub(crate) async fn send_vnet_route_advertise(
         },
     };
     let msg = FrpMessage::VnetRouteAdvertise(adv);
-    let mut w = writer.lock().await;
-    let result = write_msg(&mut *w, &msg, v2).await;
-    drop(w);
+    let result = writer.send(msg, v2);
     if let Err(e) = result {
         tracing::warn!(proxy_name = %p.name, error = %e, "failed to send VnetRouteAdvertise");
     } else {
@@ -309,7 +307,7 @@ pub(crate) async fn remove_vnet_tun(
     vnet_tun_subnets: &Arc<Mutex<HashMap<String, String>>>,
     route_table: &Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
     vnet_peer_routes: &Arc<Mutex<HashMap<String, VnetPeerRoute>>>,
-    writer: &Arc<Mutex<BoxedWriteHalf>>,
+    writer: &Arc<ControlWriter>,
     v2: bool,
     proxy_name: &str,
     vnet: &str,
@@ -346,8 +344,7 @@ pub(crate) async fn remove_vnet_tun(
         },
     };
     let msg = FrpMessage::VnetRouteRemove(rem);
-    let mut w = writer.lock().await;
-    if let Err(e) = write_msg(&mut *w, &msg, v2).await {
+    if let Err(e) = writer.send(msg, v2) {
         tracing::warn!(proxy_name, error = %e, "failed to send VnetRouteRemove for '{}'", proxy_name);
     } else {
         tracing::info!(proxy_name, "VnetRouteRemove sent for '{}'", proxy_name);

@@ -22,7 +22,7 @@ use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
 use frp_core::transport::build_tls_acceptor_with_alpn;
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "http2http")]
 use super::h2::{serve_h2_connection, Backend};
 #[cfg(feature = "tls")]
 use super::serve_plugin;
@@ -52,7 +52,11 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
     // negotiates h2 via ALPN (http2http/http2https are plaintext HTTP/1.1
     // only and have no such field).
     let enable_h2 = cfg.enable_http2 != Some(false);
-    let alpn: &[&[u8]] = if enable_h2 {
+    // Without the `http2http` feature the h2 decoder is not compiled, so the
+    // listener must not advertise ALPN h2 even when enable_http2 is on — a
+    // client would negotiate h2 and then fail (audit A1 P1). `cfg!` folds at
+    // compile time, so tiny builds always advertise only http/1.1.
+    let alpn: &[&[u8]] = if enable_h2 && cfg!(feature = "http2http") {
         &[b"h2", b"http/1.1"]
     } else {
         &[b"http/1.1"]
@@ -74,12 +78,19 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
         |tcp, peer, (target, rewrite, headers, acceptor, host, port, enable_h2)| async move {
             match acceptor.accept(tcp).await {
                 Ok(tls) => {
-                    // ALPN h2 negotiated → decode h2 frames and forward to the
-                    // backend as HTTP/1.1 (Go http.Server + ReverseProxy).
-                    if enable_h2 && tls.get_ref().1.alpn_protocol() == Some(b"h2") {
-                        let backend = Backend::Plain { host, port };
-                        serve_h2_connection(tls, target, rewrite, headers, backend).await;
-                    } else if let Err(e) = handle_conn(tls, &target, &rewrite, &headers).await {
+                    #[cfg(feature = "http2http")]
+                    {
+                        // ALPN h2 negotiated → decode h2 frames and forward to the
+                        // backend as HTTP/1.1 (Go http.Server + ReverseProxy).
+                        if enable_h2 && tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                            let backend = Backend::Plain { host, port };
+                            serve_h2_connection(tls, target, rewrite, headers, backend).await;
+                        } else if let Err(e) = handle_conn(tls, &target, &rewrite, &headers).await {
+                            debug!(%peer, error = %e, "https2http: {peer} error: {e}");
+                        }
+                    }
+                    #[cfg(not(feature = "http2http"))]
+                    if let Err(e) = handle_conn(tls, &target, &rewrite, &headers).await {
                         debug!(%peer, error = %e, "https2http: {peer} error: {e}");
                     }
                 }

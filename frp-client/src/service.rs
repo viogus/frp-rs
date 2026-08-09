@@ -36,7 +36,7 @@ use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
-use frp_core::transport::{BoxedWriteHalf, TransportProtocol};
+use frp_core::transport::TransportProtocol;
 
 use frp_core::metrics::ProxyMetricsRegistry;
 
@@ -48,6 +48,63 @@ use crate::proxy::wire_proxy_name;
 use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo, ReloadRequest};
 use crate::store::{merge_client_config, StoreSource};
 use crate::util::opt_if_empty;
+
+/// Serializes control-message writes onto a single dedicated writer task.
+///
+/// Producers call [`ControlWriter::send`] — a `try_send` on a bounded
+/// channel that never blocks, so a slow peer (TCP backpressure) cannot
+/// stall the control loop or any sub-task behind a `Mutex<BoxedWriteHalf>`
+/// (audit v0.70.1 P1-A1). The writer task owns the raw write half
+/// exclusively and writes FIFO; on a write error it marks the writer failed
+/// and wakes the control loop, which tears the connection down and
+/// reconnects. A full channel drops the message (bounded, Go frp parity:
+/// "when full, drop").
+#[derive(Clone)]
+pub(crate) struct ControlWriter {
+    tx: tokio::sync::mpsc::Sender<(FrpMessage, bool)>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ControlWriter {
+    /// Try to enqueue `msg` for the writer task. Never blocks. Returns an
+    /// error when the writer has failed, the channel is full (peer slow) or
+    /// the connection is being torn down.
+    pub(crate) fn send(&self, msg: FrpMessage, v2: bool) -> Result<(), String> {
+        if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("control writer failed".to_string());
+        }
+        self.tx.try_send((msg, v2)).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                "control channel full (peer slow)".to_string()
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                "control channel closed".to_string()
+            }
+        })
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until the writer task reports a failure. Re-checks the flag
+    /// after every wake so a notification cannot be lost.
+    pub(crate) async fn wait_failed(&self) {
+        loop {
+            if self.is_failed() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+impl frp_core::ControlSink for ControlWriter {
+    fn send_msg(&self, msg: FrpMessage, v2: bool) -> Result<(), String> {
+        self.send(msg, v2)
+    }
+}
 #[cfg(feature = "vnet")]
 use crate::vnet::{
     add_os_route, advertise_vnet_visitor_route, local_vnet_set, remove_os_route, remove_vnet_tun,
@@ -1263,9 +1320,38 @@ impl Service {
                 }
             }
 
-            // Split control stream for reading and writing
+            // Split control stream for reading and writing.
             let (mut reader, raw_writer) = control_stream.into_split()?;
-            let writer = Arc::new(Mutex::new(raw_writer));
+
+            // Control writes are funneled through a bounded channel to a
+            // single dedicated writer task (audit v0.70.1 P1-A1): producers
+            // never block on a slow peer, the raw write half is owned by
+            // exactly one task, and a write failure wakes the control loop
+            // to tear down and reconnect.
+            let (control_tx, control_rx) = tokio::sync::mpsc::channel::<(FrpMessage, bool)>(1024);
+            let control_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let control_notify = Arc::new(tokio::sync::Notify::new());
+            let writer = Arc::new(ControlWriter {
+                tx: control_tx,
+                failed: control_failed.clone(),
+                notify: control_notify.clone(),
+            });
+            {
+                let failed = control_failed.clone();
+                let notify = control_notify.clone();
+                tokio::spawn(async move {
+                    let mut rx = control_rx;
+                    let mut w = raw_writer;
+                    while let Some((msg, v2)) = rx.recv().await {
+                        if let Err(e) = write_msg(&mut w, &msg, v2).await {
+                            tracing::error!(error = %e, "Control writer failed: {}", e);
+                            failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            notify.notify_waiters();
+                            break;
+                        }
+                    }
+                });
+            }
 
             // Spawn VnetControllers for all vnet proxies now that the
             // control connection writer is available.
@@ -1799,7 +1885,7 @@ impl Service {
                             }
                         }
                         let ping = FrpMessage::Ping(ping_msg);
-                        if let Err(e) = write_msg(&mut *writer.lock().await, &ping, v2).await {
+                        if let Err(e) = writer.send(ping, v2) {
                             warn!(error = %e, "Ping write failed: {}", e);
                             // Non-fatal: heartbeat timeout will detect actual dead connection.
                         } else {
@@ -1821,7 +1907,7 @@ impl Service {
                             };
                             if let Some(p) = proxies.iter().find(|p| p.name == bare_name) {
                                 let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_user);
-                                if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
+                                if let Err(e) = writer.send(new_proxy, v2) {
                                     warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
                                 } else {
                                     info!(proxy_name = %name, "Proxy '{}' retry: sent NewProxy", name);
@@ -1849,7 +1935,7 @@ impl Service {
                                 let close = FrpMessage::CloseProxy(msg::CloseProxy {
                                     proxy_name: proxy_name.clone(),
                                 });
-                                if let Err(e) = write_msg(&mut *writer.lock().await, &close, v2).await {
+                                if let Err(e) = writer.send(close, v2) {
                                     warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
                                 }
                                 // Keep health check running -- monitor for recovery (Go frp compat).
@@ -1876,7 +1962,7 @@ impl Service {
                                         }
                                     }
                                     let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr, &cfg_user);
-                                    if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
+                                    if let Err(e) = writer.send(new_proxy, v2) {
                                         warn!(proxy_name = %proxy_name, error = %e, "Failed to re-register proxy on health recovery: {}", e);
                                     } else {
                                         info!(proxy_name = %proxy_name, "Health recovery: re-registered proxy '{}'", proxy_name);
@@ -2008,7 +2094,7 @@ impl Service {
                     // connection and track sid→proxy_name for NatHoleResp routing.
                     Some(stun_result) = stun_result_rx.recv() => {
                         let StunResult { sid, proxy_name, msg } = stun_result;
-                        if let Err(e) = write_msg(&mut *writer.lock().await, &msg, v2).await {
+                        if let Err(e) = writer.send(msg, v2) {
                             warn!(error = %e, "XTCP: failed to send NatHoleClient: {}", e);
                             // The STUN socket was stored in xtcp_sockets but no
                             // pending_xtcp entry was created; reclaim it now so it
@@ -2052,7 +2138,7 @@ impl Service {
                     Some(vreq) = visitor_rx.recv() => {
                         let txn_id = vreq.nhv.transaction_id.clone();
                         let nhv = FrpMessage::NatHoleVisitor(vreq.nhv);
-                        match write_msg(&mut *writer.lock().await, &nhv, v2).await {
+                        match writer.send(nhv, v2) {
                             Ok(()) => {
                                 debug!(sid = %txn_id, "Visitor: sent NatHoleVisitor on control, sid={}", txn_id);
                                 visitor_pending.insert(txn_id.clone(), vreq.reply);
@@ -2102,6 +2188,13 @@ impl Service {
                         warn!("Heartbeat timeout ({}s), reconnecting...", hb_timeout);
                         break;
                     }
+                    // The dedicated writer task hit a write failure (peer
+                    // dead / connection reset on the control path). Tear down
+                    // and reconnect, mirroring the read-error branch.
+                    _ = writer.wait_failed() => {
+                        warn!("Control writer failed, reconnecting...");
+                        break;
+                    }
                 }
             }
 
@@ -2138,7 +2231,7 @@ impl Service {
                             virtual_net: adv.virtual_net,
                         };
                         let msg = FrpMessage::VnetRouteRemove(rem);
-                        if let Err(e) = write_msg(&mut *writer.lock().await, &msg, v2).await {
+                        if let Err(e) = writer.send(msg, v2) {
                             warn!(visitor_name = %v.name, error = %e, "failed to remove vnet route for visitor '{}'", v.name);
                         } else {
                             info!(visitor_name = %v.name, "vnet route removed for visitor '{}'", v.name);
@@ -2326,11 +2419,11 @@ impl Service {
     /// Diffs old vs new proxy configs, restarts affected plugins, sends
     /// CloseProxy/NewProxy messages with correct plugin bound addresses,
     /// and updates the shared proxy_info_map.
-    pub async fn try_reload(
+    pub(crate) async fn try_reload(
         &self,
         config_path: &str,
         strict: bool,
-        writer: &Arc<Mutex<BoxedWriteHalf>>,
+        writer: &Arc<ControlWriter>,
     ) -> Result<String, String> {
         self.reload_from_sources(config_path, strict, writer).await
     }
@@ -2340,11 +2433,11 @@ impl Service {
     ///
     /// Also refreshes the in-memory config/proxy snapshots so the next session
     /// and admin API see the merged result.
-    pub async fn reload_from_sources(
+    pub(crate) async fn reload_from_sources(
         &self,
         config_path: &str,
         strict: bool,
-        writer: &Arc<Mutex<BoxedWriteHalf>>,
+        writer: &Arc<ControlWriter>,
     ) -> Result<String, String> {
         let mut new_cfg = frp_core::config::load_client_config(config_path, strict)
             .map_err(|e| format!("failed to load config: {e}"))?;
@@ -2574,16 +2667,16 @@ impl Service {
             }
         }
 
-        // Acquire writer lock once and send all messages in a tight loop.
-        // Lock is dropped after the last write — no other .await happens
-        // between lock acquisition and drop. On a write failure the reload is
-        // aborted before any commit: drop the not-yet-committed plugin handles
-        // (killing the fresh plugins) so the old plugin set, health checks,
-        // proxy_info_map, and cfg all remain untouched and consistent.
+        // Enqueue all reload messages to the control writer in order. The
+        // writer task owns the raw write half; `send` never blocks and fails
+        // fast when the channel is full or the writer has died. On failure
+        // the reload is aborted before any commit: drop the not-yet-committed
+        // plugin handles (killing the fresh plugins) so the old plugin set,
+        // health checks, proxy_info_map, and cfg all remain untouched and
+        // consistent.
         {
-            let mut w = writer.lock().await;
             for rm in &msgs {
-                if let Err(e) = write_msg(&mut *w, &rm.msg, v2).await {
+                if let Err(e) = writer.send(rm.msg.clone(), v2) {
                     drop(new_plugin_handles);
                     return Err(format!("{}: {e}", rm.label));
                 }
@@ -2832,6 +2925,33 @@ pub(crate) fn filter_active_visitors(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `ControlWriter` wired to a live (never-polled) channel, for tests
+    /// that only exercise map/lifecycle logic without delivering messages.
+    fn test_control_writer() -> Arc<ControlWriter> {
+        let (writer, mut rx) = test_control_writer_rx();
+        // Drain instead of dropping rx so `send` in the code under test
+        // succeeds (drop would make it fail with Closed).
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        writer
+    }
+
+    /// Like [`test_control_writer`], but keeps the receiver so the test can
+    /// assert on the messages enqueued by the code under test.
+    fn test_control_writer_rx() -> (
+        Arc<ControlWriter>,
+        tokio::sync::mpsc::Receiver<(FrpMessage, bool)>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<(FrpMessage, bool)>(16);
+        (
+            Arc::new(ControlWriter {
+                tx,
+                failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                notify: Arc::new(tokio::sync::Notify::new()),
+            }),
+            rx,
+        )
+    }
 
     #[test]
     fn heartbeat_auth_scope_unions_client_and_server_requirements() {
@@ -3183,12 +3303,7 @@ mod tests {
         let subnets = Arc::new(Mutex::new(HashMap::new()));
         let peer_routes = Arc::new(Mutex::new(HashMap::new()));
         let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
-        let (_peer, writer_raw) = tokio::io::duplex(4096);
-        let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
-        let (_, writer_half) = tokio::io::split(writer_stream);
-        let writer = Arc::new(Mutex::new(
-            Box::new(writer_half) as frp_core::transport::BoxedWriteHalf
-        ));
+        let writer = test_control_writer();
         let (tun, configured) = fake_tun();
 
         register_vnet_tun(
@@ -3249,12 +3364,7 @@ mod tests {
         let peer_routes = Arc::new(Mutex::new(HashMap::new()));
         let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
         let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
-        let (_peer, writer_raw) = tokio::io::duplex(4096);
-        let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
-        let (_, writer_half) = tokio::io::split(writer_stream);
-        let writer = Arc::new(Mutex::new(
-            Box::new(writer_half) as frp_core::transport::BoxedWriteHalf
-        ));
+        let writer = test_control_writer();
 
         let (tun, _) = fake_tun();
         register_vnet_tun(
@@ -3368,12 +3478,7 @@ mod tests {
         let subnets = Arc::new(Mutex::new(HashMap::new()));
         let peer_routes = Arc::new(Mutex::new(HashMap::new()));
         let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
-        let (mut peer, writer_raw) = tokio::io::duplex(4096);
-        let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
-        let (_, writer_half) = tokio::io::split(writer_stream);
-        let writer = Arc::new(Mutex::new(
-            Box::new(writer_half) as frp_core::transport::BoxedWriteHalf
-        ));
+        let (writer, mut control_rx) = test_control_writer_rx();
 
         // Pre-populate every map the removal path must clean up.
         names.lock().await.insert("vnet-a".into(), "tun0".into());
@@ -3442,12 +3547,16 @@ mod tests {
         );
 
         // A VnetRouteRemove for the proxy's virtual net is sent to the server.
-        match frp_core::protocol::read_msg_v1(&mut peer).await.unwrap() {
-            FrpMessage::VnetRouteRemove(rem) => {
+        match control_rx
+            .recv()
+            .await
+            .expect("no VnetRouteRemove enqueued")
+        {
+            (FrpMessage::VnetRouteRemove(rem), _v2) => {
                 assert_eq!(rem.proxy_name, "vnet-a");
                 assert_eq!(rem.virtual_net.as_deref(), Some("corp-net"));
             }
-            other => panic!("expected VnetRouteRemove frame, got {:?}", other),
+            (other, _v2) => panic!("expected VnetRouteRemove message, got {:?}", other),
         }
     }
 

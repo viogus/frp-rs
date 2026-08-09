@@ -23,7 +23,7 @@ use crate::service::Service;
 use crate::util::opt_if_empty;
 
 mod context;
-#[cfg(feature = "tls")]
+#[cfg(feature = "http2http")]
 mod h2;
 mod http;
 mod http2http;
