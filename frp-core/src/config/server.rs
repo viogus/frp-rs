@@ -142,7 +142,7 @@ pub struct ServerConfig {
     /// OpenTelemetry / observability settings.
     #[serde(default)]
     pub observability: ObservabilityConfig,
-    /// Maximum concurrent connections allowed. None = default (10000).
+    /// Maximum concurrent connections allowed. `None` = default (512).
     /// When the limit is reached, new connections are rejected.
     /// Set to 0 to disable the connection limit entirely.
     #[serde(default, alias = "maxConnections")]

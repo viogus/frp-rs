@@ -4,7 +4,28 @@ All notable changes to frp-rs.
 
 ## v0.70.1 (2026-08-09)
 
+### Performance
+- **Client control writer lock-free funnel (P1, audit A1)**: control messages
+  are no longer serialized behind a `Mutex<BoxedWriteHalf>` held across
+  `write_msg().await`. A new `ControlWriter` funnels every control message
+  (Ping / NewProxy / CloseProxy / NatHole* / reload / vnet routes) through a
+  bounded mpsc channel to a single dedicated writer task — producers never
+  block on a slow peer, ordering is FIFO, and a write failure wakes the
+  control loop to reconnect. `frp-core::ControlSink` trait lets `frp-vnet`
+  emit control messages without depending on the concrete write half.
+- **HTTP client CONNECT tunnels use 32 KiB buffers (P3, audit A5)** (test
+  paths; production CONNECT rides hyper's internal connector).
+
 ### Security & Robustness
+- **`max_connections` docs corrected (P2, audit A2)**: the default was
+  already bounded (`None` → 512); the stale "default (10000)" doc is fixed.
+- **`h2` moved to a dedicated `http2http` feature (P2, audit A3)**: the
+  frp-client `tls` feature no longer drags `h2`/`indexmap`/`hashbrown`/`fnv`
+  into tiny builds (`http2http` implies `tls`; default features unchanged).
+  Verified: `h2` absent from the tiny dependency tree.
+- **Dead `ring` direct dep removed from frp-server (P2, audit A4)**: zero
+  `ring::` uses in the crate (rustls pulls it transitively where needed).
+- **`http_client.rs` missing SAFETY comment added (P4, audit A8)**.
 - **Login-throttle nested lock removed (MEDIUM, audit 3.1)**: `check_login_throttle`
   now drops the main-table guard before acquiring the overflow lock — the nested
   acquisition was safe but fragile to future refactoring.

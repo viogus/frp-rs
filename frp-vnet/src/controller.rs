@@ -73,7 +73,7 @@ impl VnetController {
     pub async fn run(
         &self,
         mut tun: Box<dyn TunDevice>,
-        ctl_writer: Arc<tokio::sync::Mutex<frp_core::transport::BoxedWriteHalf>>,
+        ctl_writer: Arc<dyn frp_core::ControlSink>,
         mut tun_packet_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let mtu = tun.mtu() as usize;
@@ -134,14 +134,7 @@ impl VnetController {
                                 data: b64_encode(packet),
                             };
                             let msg = frp_core::msg::FrpMessage::VnetPacket(vnet_pkt);
-                            let mut writer = ctl_writer.lock().await;
-                            let write_result = if self.v2 {
-                                frp_core::protocol::write_msg_v2(&mut *writer, &msg).await
-                            } else {
-                                frp_core::protocol::write_msg_v1(&mut *writer, &msg).await
-                            };
-                            drop(writer);
-                            if let Err(e) = write_result {
+                            if let Err(e) = ctl_writer.send_msg(msg, self.v2) {
                                 tracing::error!(%self.proxy_name, %e, "control write error");
                                 break;
                             }
@@ -344,6 +337,23 @@ impl Default for ClientVnetController {
 
 #[cfg(test)]
 mod tests {
+    /// Records control messages; stands in for the real writer funnel.
+    #[derive(Default)]
+    struct TestSink {
+        msgs: std::sync::Mutex<Vec<(frp_core::msg::FrpMessage, bool)>>,
+    }
+
+    impl frp_core::ControlSink for TestSink {
+        fn send_msg(&self, msg: frp_core::msg::FrpMessage, v2: bool) -> Result<(), String> {
+            self.msgs.lock().unwrap().push((msg, v2));
+            Ok(())
+        }
+    }
+
+    fn test_sink() -> Arc<TestSink> {
+        Arc::new(TestSink::default())
+    }
+
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::pin::Pin;
@@ -511,12 +521,7 @@ mod tests {
 
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
         let tun = Box::new(FakeTun { inner: tun_stream });
-        let ctl_stream: Box<dyn frp_core::transport::AsyncReadWrite> =
-            Box::new(tokio::io::duplex(4096).0);
-        let (_, ctl_w) = tokio::io::split(ctl_stream);
-        let writer = Arc::new(tokio::sync::Mutex::new(
-            Box::new(ctl_w) as frp_core::transport::BoxedWriteHalf
-        ));
+        let writer = test_sink();
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
@@ -556,12 +561,7 @@ mod tests {
 
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
         let tun = Box::new(FakeTun { inner: tun_stream });
-        let ctl_stream: Box<dyn frp_core::transport::AsyncReadWrite> =
-            Box::new(tokio::io::duplex(4096).0);
-        let (_, ctl_w) = tokio::io::split(ctl_stream);
-        let writer = Arc::new(tokio::sync::Mutex::new(
-            Box::new(ctl_w) as frp_core::transport::BoxedWriteHalf
-        ));
+        let writer = test_sink();
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
@@ -597,15 +597,8 @@ mod tests {
 
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
         let tun = Box::new(FakeTun { inner: tun_stream });
-        let (ctl_peer_raw, ctl_writer_raw) = tokio::io::duplex(4096);
-        let ctl_peer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(ctl_peer_raw);
-        let ctl_writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> =
-            Box::new(ctl_writer_raw);
-        let (mut ctl_peer, _) = tokio::io::split(ctl_peer_stream);
-        let (_, ctl_w) = tokio::io::split(ctl_writer_stream);
-        let writer = Arc::new(tokio::sync::Mutex::new(
-            Box::new(ctl_w) as frp_core::transport::BoxedWriteHalf
-        ));
+        let writer = test_sink();
+        let writer_for_task = writer.clone();
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
@@ -614,7 +607,7 @@ mod tests {
             String::new(),
         );
         let handle = tokio::spawn(async move {
-            ctrl.run(tun, writer, tun_packet_rx).await.unwrap();
+            ctrl.run(tun, writer_for_task, tun_packet_rx).await.unwrap();
         });
 
         let packet = ipv6_packet(
@@ -622,9 +615,18 @@ mod tests {
             "2001:db8::1".parse().unwrap(),
         );
         tun_peer.write_all(&packet).await.unwrap();
-        let msg = frp_core::protocol::read_msg_v1(&mut ctl_peer)
-            .await
-            .unwrap();
+        // Poll the sink until the routed packet arrives.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let pending = { writer.msgs.lock().unwrap().last().cloned() };
+                if let Some((msg, _)) = pending {
+                    return msg;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sink never received VnetPacket");
         match msg {
             frp_core::msg::FrpMessage::VnetPacket(vpkt) => {
                 assert_eq!(vpkt.proxy_name, "v6-target");
