@@ -5,6 +5,18 @@ All notable changes to frp-rs.
 ## v0.70.1 (2026-08-09)
 
 ### Performance
+- **TCP keepalive hardening**: `dial_server_keepalive` / `tcp_keepalive`
+  default to **300s** (Go frp's 7200 is deliberately not followed), and
+  `set_keepalive` additionally sets a short probe interval (`secs/10`,
+  clamped 1-60s) + 3 retries so dead peers release fds in minutes instead
+  of hours. Client dial path now uses the same `set_keepalive` (probe
+  hardening on both sides; failures debug-logged, matching `set_nodelay`).
+- **`[profile.release-perf]`**: same LTO/strip/abort discipline as
+  `release` with `opt-level = 3` for the hot data plane
+  (`cargo build --profile release-perf`).
+- **Plugin relay**: visitor plugin relays via a `Duplex` (recombined
+  split halves) + `copy_bidirectional_with_sizes`; `copy_stream_large`
+  uses a 32 KiB buffered copy.
 - **Client control writer lock-free funnel (P1, audit A1)**: control messages
   are no longer serialized behind a `Mutex<BoxedWriteHalf>` held across
   `write_msg().await`. A new `ControlWriter` funnels every control message
