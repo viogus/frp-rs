@@ -709,6 +709,10 @@ impl AppState {
         // limiting while the table drains.
         if !throttle.contains_key(&ip) && throttle.len() >= MAX_THROTTLE_ENTRIES {
             const OVERFLOW_MAX_PER_IP: u32 = 50;
+            // Drop the main-table guard before acquiring the overflow lock —
+            // the nested acquisition was safe (no reverse order anywhere) but
+            // fragile to future refactoring (audit round 5, MEDIUM 3.1).
+            drop(throttle);
             let mut overflow = self.login_throttle_overflow.lock().await;
             // Cleanup mirrors the main table (90s).
             overflow

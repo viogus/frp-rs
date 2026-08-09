@@ -419,6 +419,9 @@ mod oidc_impl {
         /// A jti seen with a different subject is rejected; the same jti with
         /// the same subject is allowed (frpc reconnects reuse the cached token).
         seen_jtis: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
+        /// Background JWKS refresh task (started via `start_background_refresh`),
+        /// aborted via `stop_background_refresh` (audit round 5, LOW 2.4).
+        refresh_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     }
 
     /// Decide the audience-validation mode for a verifier.
@@ -528,6 +531,7 @@ mod oidc_impl {
                 skip_audience,
                 http,
                 seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
+                refresh_task: std::sync::Mutex::new(None),
             };
 
             if verifier.skip_expiry {
@@ -551,7 +555,7 @@ mod oidc_impl {
         /// Prevents latency spikes on token verification when cache is stale.
         pub fn start_background_refresh(self: &std::sync::Arc<Self>) {
             let verifier = self.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                     if let Err(e) = verifier.refresh_jwks().await {
@@ -561,6 +565,20 @@ mod oidc_impl {
                     }
                 }
             });
+            *self.refresh_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        }
+
+        /// Cancel the background JWKS refresh task, if one was started.
+        /// Safe to call multiple times; no-op when nothing is running.
+        pub fn stop_background_refresh(&self) {
+            if let Some(h) = self
+                .refresh_task
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                h.abort();
+            }
         }
 
         async fn refresh_jwks(&self) -> Result<(), String> {
@@ -1203,6 +1221,7 @@ mod oidc_impl {
                     .build()
                     .expect("test HTTP client"),
                 seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
+                refresh_task: std::sync::Mutex::new(None),
             }
         }
 

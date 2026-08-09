@@ -164,9 +164,14 @@ fn dispatch_raw_frame(
             } else {
                 payload
             };
-            let mut pong = vec![0x8a, pong_payload.len() as u8];
-            pong.extend_from_slice(pong_payload);
-            if let Poll::Ready(Err(e)) = Pin::new(raw.as_mut()).poll_write(cx, &pong) {
+            let mut pong = [0u8; 128];
+            // RFC 6455 caps control-frame payloads at 125 bytes, so the
+            // stack buffer always fits: 2-byte header + payload.
+            pong[0] = 0x8a;
+            pong[1] = pong_payload.len() as u8;
+            pong[2..2 + pong_payload.len()].copy_from_slice(pong_payload);
+            let pong_len = 2 + pong_payload.len();
+            if let Poll::Ready(Err(e)) = Pin::new(raw.as_mut()).poll_write(cx, &pong[..pong_len]) {
                 tracing::debug!(error = %e, "WS pong write failed");
             }
             cx.waker().wake_by_ref();

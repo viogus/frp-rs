@@ -1176,15 +1176,35 @@ pub(crate) async fn listen_and_proxy(
     tcp_keepalive: i64,
 ) {
     let addr = format_socket_addr(&bind_addr, port);
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => {
-            info!(addr = %addr, proxy_name = %proxy_name, "Proxy listener started on {} for '{}'", addr, proxy_name);
-            l
+    // On supersession the old handler's `abort()` schedules cancellation but
+    // does not wait for the socket to be released; retry EADDRINUSE briefly
+    // so the new handler wins the bind instead of failing once (self-heals
+    // only on the next client reconnect) — audit round 5, MEDIUM 4.2.
+    let mut listener = None;
+    for attempt in 0..3 {
+        match TcpListener::bind(&addr).await {
+            Ok(l) => {
+                info!(addr = %addr, proxy_name = %proxy_name, "Proxy listener started on {} for '{}'", addr, proxy_name);
+                listener = Some(l);
+                break;
+            }
+            Err(e) if attempt < 2 && e.kind() == std::io::ErrorKind::AddrInUse => {
+                warn!(addr = %addr, proxy_name = %proxy_name, attempt = attempt + 1,
+                    "Proxy port {} for '{}' busy (EADDRINUSE), retrying (attempt {})", port, proxy_name, attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                tracing::error!(port = %port, error = %e, "Failed to bind proxy port {}: {}", port, e);
+                return;
+            }
         }
-        Err(e) => {
-            tracing::error!(port = %port, error = %e, "Failed to bind proxy port {}: {}", port, e);
-            return;
-        }
+    }
+    // Defensive: the loop always breaks with `listener` Some (a final Err
+    // returns early), but keep the guard so a future refactor cannot pass an
+    // unbound listener through.
+    let Some(listener) = listener else {
+        tracing::error!(port = %port, "Failed to bind proxy port {} after 3 attempts", port);
+        return;
     };
 
     loop {

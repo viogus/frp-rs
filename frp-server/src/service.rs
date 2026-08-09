@@ -1722,6 +1722,14 @@ impl Service {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        // Stop the OIDC background JWKS refresh before exiting — the verifier
+        // itself is dropped with AppState, but aborting the refresh task here
+        // gives it a deterministic stop point during graceful shutdown
+        // (audit round 5, LOW 2.4).
+        if let Some(verifier) = &self.state.oidc.verifier {
+            verifier.stop_background_refresh();
+        }
         Ok(())
     }
 

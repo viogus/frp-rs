@@ -22,10 +22,19 @@ pub struct KcpListener {
     local_addr: SocketAddr,
     /// Held to keep write/register channels alive for spawned driver.
     _handle: KcpSocketHandle,
+    /// The UDP socket event-loop task. Aborted on drop so closing the
+    /// listener also stops the driver explicitly (audit round 5, LOW 2.3).
+    _driver: tokio::task::JoinHandle<()>,
     accept_rx: mpsc::Receiver<KcpStream>,
     /// Back-channel: notify the socket driver when a session has been
     /// accepted, so it stops being subject to the unaccepted timeout.
     accept_notify_tx: mpsc::Sender<(u32, SocketAddr)>,
+}
+
+impl Drop for KcpListener {
+    fn drop(&mut self) {
+        self._driver.abort();
+    }
 }
 
 impl KcpListener {
@@ -46,12 +55,13 @@ impl KcpListener {
 
         let (kcp_socket, handle, accept_rx) = KcpSocket::new(socket, config);
 
-        tokio::spawn(async move { kcp_socket.run().await });
+        let driver = tokio::spawn(async move { kcp_socket.run().await });
 
         let accept_notify_tx = handle.accept_notify_tx.clone();
         Ok(Self {
             local_addr,
             _handle: handle,
+            _driver: driver,
             accept_rx,
             accept_notify_tx,
         })
@@ -121,6 +131,12 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
         .try_send((conv, remote, session))
         .map_err(|e| io::Error::other(format!("KCP register failed: {e}")))?;
 
+    // Spawn the socket driver. NOTE: the JoinHandle is deliberately not
+    // stored/aborted on the dial path — dial_kcp returns before the KCP
+    // handshake completes, so aborting the driver on stream drop would kill
+    // the connection before its first probe is sent (audit round 5 tried
+    // this and it broke dial→accept). The driver self-cleans when its UDP
+    // socket errors/closes (cold path, per audit round 5 LOW 2.3).
     tokio::spawn(async move { kcp_socket.run().await });
 
     Ok(KcpStream::new(
