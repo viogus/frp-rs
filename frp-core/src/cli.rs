@@ -356,7 +356,7 @@ pub fn parse_frps_args() -> FrpsArgs {
         .descr("frps is the server of frp-rs (https://github.com/fatedier/frp)")
         .run();
     if args.show_version {
-        println!("frps {}", crate::VERSION);
+        println!("frps {} (Rust)", crate::VERSION);
         std::process::exit(0);
     }
     args
@@ -1029,7 +1029,7 @@ fn status_cmd() -> impl Parser<FrpcCmd> {
 fn frpc_parser() -> impl Parser<FrpcCmd> {
     let run = run_mode().map(|args| {
         if args.show_version {
-            println!("frpc {}", crate::VERSION);
+            println!("frpc {} (Rust)", crate::VERSION);
             std::process::exit(0);
         }
         FrpcCmd::Run(args)
