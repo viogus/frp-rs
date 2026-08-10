@@ -77,9 +77,6 @@ const KCP_THRESH_MIN: u16 = 2;
 const KCP_PROBE_INIT: u32 = 7000;
 /// Maximum window probe delay (ms).
 const KCP_PROBE_LIMIT: u32 = 120_000;
-/// Maximum fast-ack count before a segment is always retransmitted.
-const KCP_FASTACK_LIMIT: u32 = 5;
-
 #[inline]
 fn bound(lower: u32, v: u32, upper: u32) -> u32 {
     cmp::min(cmp::max(lower, v), upper)
@@ -246,8 +243,6 @@ pub struct Kcp<Output> {
 
     /// Fast-resend threshold (0 = disabled).
     fastresend: u32,
-    /// Max fast retransmissions before RTO takes over.
-    fastlimit: u32,
     /// Disable congestion control.
     nocwnd: bool,
     /// Stream mode (no message boundaries).
@@ -291,7 +286,6 @@ impl<Output> fmt::Debug for Kcp<Output> {
             .field("rcv_queue.len", &self.rcv_queue.len())
             .field("acklist.len", &self.acklist.len())
             .field("fastresend", &self.fastresend)
-            .field("fastlimit", &self.fastlimit)
             .field("nocwnd", &self.nocwnd)
             .field("stream", &self.stream)
             .field("input_conv", &self.input_conv)
@@ -347,7 +341,6 @@ impl<Output> Kcp<Output> {
             acklist: VecDeque::new(),
             buf: Vec::with_capacity((KCP_MTU_DEF + KCP_OVERHEAD) * 3),
             fastresend: 0,
-            fastlimit: KCP_FASTACK_LIMIT,
             nocwnd: false,
             stream,
             input_conv: false,
@@ -1104,18 +1097,20 @@ impl<Output: Write> Kcp<Output> {
                 snd_segment.resendts = self.current + snd_segment.rto + rtomin;
             } else if snd_segment.fastack >= resent {
                 // ── fast retransmit (kcp-go: before RTO) ──
-                // xmit <= fastlimit gate is kept to match the vendored C-port
-                // behavior (kcp-go v5.6.13 dropped it; keeping it preserves the
-                // pre-existing interop behavior with Go peers).
-                if snd_segment.xmit <= self.fastlimit || self.fastlimit == 0 {
-                    need_send = true;
-                    snd_segment.xmit += 1;
-                    snd_segment.fastack = 0;
-                    // kcp-go: reset rto to rx_rto on fast retransmit.
-                    snd_segment.rto = self.rx_rto;
-                    snd_segment.resendts = self.current + snd_segment.rto;
-                    change += 1;
-                }
+                // No xmit cap, matching kcp-go v5.6.13 (which has no fastlimit
+                // concept). The old C-kcp fastlimit gate combined with kcp-go's
+                // branch order could permanently wedge a segment: fastack >= resent
+                // with xmit > fastlimit entered the branch but skipped the send,
+                // and the else-if chain then never evaluated the RTO fallback —
+                // the segment was never retransmitted and the connection froze
+                // under sustained loss.
+                need_send = true;
+                snd_segment.xmit += 1;
+                snd_segment.fastack = 0;
+                // kcp-go: reset rto to rx_rto on fast retransmit.
+                snd_segment.rto = self.rx_rto;
+                snd_segment.resendts = self.current + snd_segment.rto;
+                change += 1;
             } else if snd_segment.fastack > 0 && new_segs_count == 0 {
                 // ── early retransmit (kcp-go only; not in the original C) ──
                 need_send = true;

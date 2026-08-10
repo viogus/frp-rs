@@ -203,6 +203,16 @@ All notable changes to frp-rs.
   behind socket-bind latency.
 
 ### Fixes
+- **KCP fast-retransmit deadlock (reliability)**: the fast-retransmit branch
+  no longer carries the C-kcp `xmit <= fastlimit` cap (kcp-go v5.6.13 has no
+  such cap). Combined with kcp-go's branch order (fast → early → RTO), the
+  cap could permanently wedge a segment: `fastack >= resent` but
+  `xmit > fastlimit` entered the branch without sending, and the else-if
+  chain then skipped the RTO fallback — the segment was never retransmitted
+  and the connection froze under sustained packet loss (surfaced by the
+  `link_massive_loss_fast` KCP test failing CI's convergence guard ~1/50
+  runs). Retransmission now matches kcp-go v5.6.13 exactly; the dead
+  `fastlimit` field and `KCP_FASTACK_LIMIT` const were removed.
 - `webpki-roots` bumped to 1.0 (drops the 0.26 shim layer).
 - `frp-vnet` controller: poisoned-lock `.unwrap()` unified to recovery.
 - `mem_profile.rs`: added `// SAFETY:` documentation for the `GlobalAlloc` impl.
