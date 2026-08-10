@@ -87,6 +87,17 @@ Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compressio
 - No `cargo check` variation needed for day-to-day work — `cargo build` covers the full workspace; ci.yml additionally gates the size tiers with `cargo check --no-default-features --features tiny|micro`.
 - Unit tests live inline (`#[cfg(test)] mod tests`); integration tests live in per-crate `tests/` dirs (`frp-server/tests/`, `frp-client/tests/`, `frp-core/tests/`).
 
+## Versioning (mandatory)
+
+**frp-rs 自身版本号严格对齐 Go frp 的发布号** —— frp-rs 的版本号 = 当前兼容目标 Go frp 的版本号（当前 `0.70.1`），不搞独立版本演进。Go frp 发布新版本号时，frp-rs 同步 bump 到相同号。以下位置必须保持一致：
+
+- 各 crate `Cargo.toml` 的 `version`（`frp-core` / `frp-server` / `frp-client` / `frps` / `frpc`）
+- `frp-core/src/lib.rs` 的 `VERSION` 常量
+- `scripts/download-frp-rs.sh` 的默认版本
+- README 中标注的版本号
+
+例外：`frp-vnet` 保持独立版本 `0.1.0`，不受对齐规则影响。
+
 ## Development Workflow (mandatory)
 
 Every feature, fix, and test change follows three rules:

@@ -2,7 +2,7 @@
 
 All notable changes to frp-rs.
 
-## v0.70.1 (2026-08-09)
+## v0.70.1 (2026-08-11)
 
 ### Performance
 - **TCP keepalive hardening**: `dial_server_keepalive` / `tcp_keepalive`
@@ -175,8 +175,6 @@ All notable changes to frp-rs.
   0.1.9→0.1.10. Verified: workspace tests 928 passed / 0 failed,
   clippy `-D warnings` and fmt clean.
 
-## Unreleased
-
 ### Changed
 - **frpc `admin` is now opt-in** (was in the default feature set): build with
   `--features admin` to include the axum-based admin API (~0.5 MB smaller
@@ -216,8 +214,6 @@ All notable changes to frp-rs.
 - `webpki-roots` bumped to 1.0 (drops the 0.26 shim layer).
 - `frp-vnet` controller: poisoned-lock `.unwrap()` unified to recovery.
 - `mem_profile.rs`: added `// SAFETY:` documentation for the `GlobalAlloc` impl.
-
-## Unreleased
 
 - **OIDC `proxyUrl` supported (Go frp parity)**: `auth.oidcProxyUrl` on
   server and client now routes OIDC HTTP requests (well-known config, JWKS,
