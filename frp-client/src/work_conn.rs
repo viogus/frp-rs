@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
+use frp_core::bandwidth::BandwidthLimiter;
 use frp_core::cipher_stream::{CipherReader, CipherWriter};
 use frp_core::encryption;
 use frp_core::metrics::ProxyMetricsRegistry;
@@ -522,6 +523,8 @@ async fn run_udp_work_conn(
     // Application-level keepalive Ping interval in seconds (transport
     // keepalive config; 0 = keep the built-in 30s default).
     udp_keepalive_secs: u64,
+    bw_rate: u64,
+    bw_mode: String,
 ) {
     let local_addr = match local_addr_str.parse::<SocketAddr>() {
         Ok(a) => a,
@@ -531,6 +534,13 @@ async fn run_udp_work_conn(
             return;
         }
     };
+    // UDP bandwidth limiting (frp-rs extension; Go frp v0.70.1 has no UDP
+    // limiter). Same direction semantics as the TCP bridge (proxy.rs):
+    // "client" throttles upload (local→work), "server" throttles download
+    // (work→local), "both"/empty apply both. rate 0 (unset) → unlimited; a
+    // limiter is only built when the operator explicitly sets a rate.
+    let apply_read = bw_mode == "server" || bw_mode == "both" || bw_mode.is_empty();
+    let apply_write = bw_mode == "client" || bw_mode == "both" || bw_mode.is_empty();
     let (w_r, w_w) = match split_work_conn_halves(work) {
         Ok(pair) => pair,
         Err(e) => {
@@ -575,6 +585,11 @@ async fn run_udp_work_conn(
     let session_alive_r = session_alive.clone();
     let local_addr_str_r = local_addr_str.clone();
     let mut reader_cancel = cancel_rx.clone();
+    let mut read_lim = if bw_rate > 0 && apply_read {
+        Some(BandwidthLimiter::new(bw_rate))
+    } else {
+        None
+    };
     let reader = async move {
         debug!(proxy_name = %pn_r, "UDP reader '{}' started", pn_r);
         // Ping-pong scratch for the per-packet decompress chain (per-session).
@@ -756,6 +771,9 @@ async fn run_udp_work_conn(
                             // must NOT tear down the whole work conn —
                             // Go frp logs and skips (per-remote model means
                             // other remotes and future packets still work).
+                            if let Some(lim) = &mut read_lim {
+                                lim.consume(final_payload.len()).await;
+                            }
                             if let Err(e) = sock.send(&final_payload).await {
                                 debug!(proxy_name = %pn_r, error = %e, local = %local_addr,
                                     "UDP '{}' send to local failed, dropping packet: {}", pn_r, e);
@@ -800,6 +818,11 @@ async fn run_udp_work_conn(
     let pn_w = proxy_name;
     let session_alive_w = session_alive;
     let mut writer_cancel = cancel_rx;
+    let mut write_lim = if bw_rate > 0 && apply_write {
+        Some(BandwidthLimiter::new(bw_rate))
+    } else {
+        None
+    };
     let writer = async move {
         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
         let mut payload = Vec::with_capacity(udp_packet_size.max(1));
@@ -837,6 +860,7 @@ async fn run_udp_work_conn(
                     // below is written over the encrypted stream.
                     // Each reply is tagged with its own remote — no shared
                     // last_remote, so concurrent remotes never cross wires.
+                    let pkt_len = payload.len();
                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
                         content: std::mem::take(&mut payload),
                         local_addr: local_udp_addr.take().or_else(|| {
@@ -850,6 +874,11 @@ async fn run_udp_work_conn(
                             zone: String::new(),
                         }),
                     });
+                    if let Some(lim) = &mut write_lim {
+                        // Limiter counts the (compressed) payload the tunnel
+                        // actually carries.
+                        lim.consume(pkt_len).await;
+                    }
                     let result = if v2 {
                         write_msg_v2(&mut w_w, &pkt).await
                     } else {
@@ -1512,6 +1541,8 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         udp_packet_size,
                         info.proxy_protocol_version.clone(),
                         cfg.keepalive_secs,
+                        info.bandwidth_limit,
+                        info.bandwidth_limit_mode.clone(),
                     )
                     .await;
                 } else {
@@ -1735,6 +1766,8 @@ mod tests {
             65535,
             String::new(),
             0,
+            0,
+            String::new(),
         ));
         drop(peer);
 
@@ -1769,6 +1802,8 @@ mod tests {
             65535,
             String::new(),
             0,
+            0,
+            String::new(),
         ));
 
         // Establish the session: reader creates the per-remote socket and
@@ -1815,6 +1850,8 @@ mod tests {
             65535,
             String::new(),
             0,
+            0,
+            String::new(),
         ));
 
         peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
@@ -1876,6 +1913,8 @@ mod tests {
             65535,
             String::new(),
             0,
+            0,
+            String::new(),
         ));
 
         // Interleaved requests from two distinct remotes.

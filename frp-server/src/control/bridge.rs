@@ -231,6 +231,8 @@ async fn run_udp_work_conn(
     enc_key: [u8; 16],
     v2: bool,
     udp_packet_size: usize,
+    bw_rate: u64,
+    bw_mode: String,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
@@ -272,6 +274,17 @@ async fn run_udp_work_conn(
     let reader_name = proxy_name.clone();
     let mut reader_cancel = cancel_rx.clone();
     let cancel_reader = cancel.clone();
+    // UDP bandwidth limiting (frp-rs extension; Go frp v0.70.1 has no UDP
+    // limiter). Go parity for the mode: the server throttles only in
+    // "server" mode, and wraps BOTH directions with a single rate (proxy.go
+    // semantics). Empty/unset rate (0) stays unlimited — a limiter exists
+    // only when the operator explicitly configures bandwidthLimit.
+    let server_limited = bw_mode == "server";
+    let mut read_lim = if bw_rate > 0 && server_limited {
+        Some(BandwidthLimiter::new(bw_rate))
+    } else {
+        None
+    };
     let reader = async move {
         debug!(proxy_name = %reader_name, "UDP work conn reader task started for '{}'", reader_name);
         loop {
@@ -288,6 +301,9 @@ async fn run_udp_work_conn(
             };
             match result {
                 Ok(FrpMessage::UDPPacket(up)) => {
+                    if let Some(lim) = &mut read_lim {
+                        lim.consume(up.content.len()).await;
+                    }
                     if let Some(ref remote) = up.remote_addr {
                         if let Err(e) = sock_reader.send_to(&up.content, remote.to_string()).await {
                             debug!(proxy_name = %reader_name, error = %e,
@@ -312,6 +328,11 @@ async fn run_udp_work_conn(
     let writer_name = proxy_name.clone();
     let mut writer_cancel = cancel_rx;
     let cancel_writer = cancel;
+    let mut write_lim = if bw_rate > 0 && server_limited {
+        Some(BandwidthLimiter::new(bw_rate))
+    } else {
+        None
+    };
     let writer = async move {
         debug!(proxy_name = %writer_name, "UDP work conn writer task started for '{}'", writer_name);
         let mut buf = vec![0u8; udp_packet_size];
@@ -349,6 +370,9 @@ async fn run_udp_work_conn(
                             zone: String::new(),
                         }),
                     });
+                    if let Some(lim) = &mut write_lim {
+                        lim.consume(n).await;
+                    }
                     let result = if v2 {
                         if no_flush {
                             write_msg_v2_nof(&mut w_w, &pkt).await
@@ -435,6 +459,8 @@ pub(crate) async fn assign_udp_work_conn(
     enc_key: [u8; 16],
     v2: bool,
     udp_packet_size: usize,
+    bw_rate: u64,
+    bw_mode: String,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     let mut work_conn = work_conn;
@@ -494,6 +520,8 @@ pub(crate) async fn assign_udp_work_conn(
             enc_key,
             v2,
             udp_packet_size,
+            bw_rate,
+            bw_mode,
             cancel,
         ));
         if let Err(e) = handle.await {
@@ -590,7 +618,7 @@ async fn relay_plain_fast_inner(
 /// Pure config parsing — no `.await` calls. Extracted from the
 /// async state machine in `assign_work_to_proxy`.
 #[inline(never)]
-fn parse_bandwidth_config(
+pub(crate) fn parse_bandwidth_config(
     bandwidth_limit: Option<&str>,
     bandwidth_limit_mode: Option<&str>,
 ) -> (u64, String) {
@@ -1237,6 +1265,8 @@ mod tests {
             [0u8; 16],
             false,
             1500,
+            0,
+            String::new(),
             tokio_util::sync::CancellationToken::new(),
         ));
         drop(peer);
@@ -1274,6 +1304,8 @@ mod tests {
             [0u8; 16],
             false,
             1500,
+            0,
+            String::new(),
             tokio_util::sync::CancellationToken::new(),
         ));
         sender.send_to(b"force-write", socket_addr).await.unwrap();
@@ -1305,6 +1337,8 @@ mod tests {
             [0u8; 16],
             false,
             1500,
+            0,
+            String::new(),
             tokio_util::sync::CancellationToken::new(),
         ));
 
@@ -1371,6 +1405,8 @@ mod tests {
             [0u8; 16],
             false,
             1500,
+            0,
+            String::new(),
             bridge_cancel,
         ));
 

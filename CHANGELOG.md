@@ -4,6 +4,19 @@ All notable changes to frp-rs.
 
 ## v0.70.1 (2026-08-11)
 
+### Features
+- **UDP bandwidth limiting (frp-rs extension)**: `bandwidthLimit` /
+  `bandwidthLimitMode` now throttle the UDP data plane (`proxy_type = "udp"`,
+  incl. the SUDP provider side) with the same direction semantics as the TCP
+  bridge — "server" applies a two-direction limiter on frps, "client" limits
+  upload on frpc, "both"/empty apply both on the client (server does not
+  recognize "both", same as TCP). Default stays
+  unlimited: a limiter is only instantiated when a rate is explicitly
+  configured. Go frp v0.70.1's UDP forwarder has no limiter, so this is a
+  deliberate frp-rs lead over Go. E2e coverage in
+  `frp-client/tests/udp_bandwidth.rs` (unlimited default + server-mode
+  throttling).
+
 ### Performance
 - **TCP keepalive hardening**: `dial_server_keepalive` / `tcp_keepalive`
   default to **300s** (Go frp's 7200 is deliberately not followed), and

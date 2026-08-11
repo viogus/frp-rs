@@ -108,8 +108,13 @@ but not literally 100% — see "Known limitations" below.
   `http2https` are plaintext HTTP/1.1 only and have no such field (Go parity).
 - **`pprof` endpoints**: `/debug/pprof/*` is a placeholder (no Go-style CPU
   profiles); `/healthz` and pprof are outside auth, matching Go.
-- **UDP bandwidth limiting**: Go v0.70.1's UDP forwarder has no limiter, so
-  frp-rs intentionally applies none either (parity, not a gap).
+- **UDP bandwidth limiting**: frp-rs extension — Go v0.70.1's UDP forwarder
+  has no limiter. `bandwidthLimit` / `bandwidthLimitMode` now throttle the
+  UDP data plane too, with the same direction semantics as the TCP bridge
+  ("server" limits both directions on frps; "client" limits upload on frpc;
+  "both" is enforced on the client only — the server does not recognize it,
+  same as TCP). Default stays unlimited: a limiter is only active when a
+  rate is explicitly configured.
 - **SSH gateway anonymity**: when no `authorized_keys` file and no server
   token are configured, the SSH tunnel gateway **fails to start** by default
   (fail-closed). Set `ssh_tunnel_gateway.allowNoneAuth = true` to explicitly
