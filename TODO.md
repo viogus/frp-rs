@@ -129,7 +129,7 @@ Closed in the `fix/go-parity-2026-08-02` branch:
   (tcpip-forward/forwarded-tcpip), dashboard root auth / pprof / offline
   clients / Go v1 client fields / store 0600 / file tokenSource.
 
-Remaining known gaps (documented, architectural):
+Closed known gaps (documented, architectural):
 
 - OIDC JWT jti replay protection — **implemented**: `OidcVerifier::check_replay`
   tracks seen `jti` claims on login; same jti + same subject allowed (frpc
@@ -143,16 +143,29 @@ Remaining known gaps (documented, architectural):
   (byte-level and h2c), and h2c via `h2`-crate decoding on the vhost port
   (routed like HTTP/1.1, forwarded to providers as HTTP/1.1, responses
   re-encoded as HTTP/2).
-- HTTP plugin `enableHTTP2` (byte-level bridge).
-- XTCP **data plane**: hole-punching/coordination is complete (17/17 XTCP
-  pairwise compat incl. the QUIC data plane, 2026-08). Rust supports both
-  KCP+yamux and QUIC for the P2P stream, selected by the `protocol` field
-  (Rust visitor `protocol="quic"` ↔ Go provider works). Known limitation: a
-  **Go** visitor with the default `protocol="quic"` cannot talk to a Rust
-  provider — Go frp v0.70.1 sends `"ip:port"` as the QUIC SNI (Go 1.25
-  `hostnameInSNI` no longer strips the port), which rustls rejects; rewriting
-  the ClientHello would break the TLS 1.3 transcript. Such a Go visitor must
-  set `protocol = "kcp"`. (See plan
+- HTTP plugin `enableHTTP2` — **implemented** (`c05add4`, 2026-08-05): the
+  https2http/https2https TLS listener advertises ALPN `h2` + `http/1.1`
+  (`enable_h2 = enable_http2 != Some(false)`, matching Go `Complete()`
+  backfilling nil → true) and decodes inbound HTTP/2 frames, forwarding to
+  the backend as HTTP/1.1 (`frp-client/src/plugin/https2http.rs` /
+  `https2https.rs`). The h2 decoder is gated by the `http2http` feature
+  (frpc default ON); tiny builds without it advertise `http/1.1` only.
+  http2http/http2https have no such field (plaintext inbound) — Go parity.
+- XTCP **data plane** — complete (17/17 XTCP pairwise compat incl. the QUIC
+  data plane, 2026-08). Rust supports both KCP+yamux and QUIC for the P2P
+  stream, selected by the `protocol` field (Rust visitor `protocol="quic"`
+  ↔ Go provider works). The former Go-visitor QUIC SNI limitation is
+  **fixed** (`f76aa42`, 2026-08-04): Go v0.70.1 sends `"ip:port"` as the
+  QUIC SNI (Go 1.25 `hostnameInSNI` no longer strips the port), which
+  upstream rustls 0.23 rejects as `ServerNamePayload::Invalid`; the vendored
+  copy (`vendor/rustls`, pinned 0.23.41) treats invalid SNI as no-SNI,
+  equivalent to upstream 0.24 `invalid_sni_policy = IgnoreAll`. Go visitors
+  with the default `protocol="quic"` now connect to Rust providers. See
+  `docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md` (incl.
+  maintenance: drop `vendor/` + `[patch.crates-io]` when upgrading past
+  rustls 0.23). Remaining validation gap: real-public-NAT e2e of the QUIC
+  data plane is covered by the daily VPS `xtcp-compat.yml`, not locally.
+  (See plan
   `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`.)
 - VirtualNet isolation/routing reload — **implemented**: `RouteTable` is now
   partitioned per virtual net (same subnet may coexist in different vnets,
@@ -163,3 +176,17 @@ Remaining known gaps (documented, architectural):
   net; clients ignore advertisements for virtual nets they do not participate
   in. (See plan
   `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`.)
+
+Remaining known gaps (verified against code 2026-08):
+
+- Windows TUN (Wintun) — `frp-vnet/src/tun_windows.rs` is a stub: every op
+  errors out. vnet L3 VPN runs on Linux/macOS only; needs wintun.dll
+  integration (bundled or system-installed). Not a Go-compat gap.
+- KCP XOR encryption — `frp-core/src/kcp_compat.rs` `XorBlock` is implemented
+  but not wired: `KcpConfig` (`kcp/config.rs`) has no `crypt` field. Not a
+  Go-compat need (Go frp encrypts KCP via TLS); frp-rs extension only.
+- OIDC `authorization_code` grant — `OidcClient` implements the
+  `client_credentials` grant only (`frp-core/src/auth.rs`);
+  `authorization_code` remains a design TODO
+  (`docs/superpowers/specs/2026-06-26-oidc-auth-design.md`). Not a Go-compat
+  gap — Go frp v0.70.1 has client_credentials + tokenSource only.
