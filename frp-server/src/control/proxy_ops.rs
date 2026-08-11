@@ -184,16 +184,28 @@ async fn allocate_proxy_port(
                         reservations.remove(&np.proxy_name);
                         None
                     } else {
-                        let used = state.used_ports.read().await;
-                        if used.contains(&res_port) {
-                            None
-                        } else {
-                            Some(res_port)
-                        }
+                        Some(res_port)
                     }
                 } else {
                     None
                 }
+            };
+            // Check used_ports OUTSIDE the reservations write lock. Holding
+            // port_reservations across a used_ports acquisition inverts the
+            // lock order vs unregister_control (used_ports.write() →
+            // port_reservations.write()) and deadlocks both on
+            // reconnect-during-cleanup. The commit phase below re-checks
+            // under used_ports.write(), closing the small race this opens.
+            let res_candidate = match res_candidate {
+                Some(res_port) => {
+                    let used = state.used_ports.read().await;
+                    if used.contains(&res_port) {
+                        None
+                    } else {
+                        Some(res_port)
+                    }
+                }
+                None => None,
             };
             // Probe bindability OUTSIDE the reservations write lock: the
             // blocking std::net::TcpListener::bind must not serialize
@@ -1282,8 +1294,17 @@ pub(crate) async fn unregister_control(
     // a delayed cleanup could remove them. Extremely unlikely (cleanup is
     // short and the timeout is generous); tracked in PR #227 review.
     let proxies = state.proxy_manager.list_client(run_id).await;
-    // TCP port cleanup
-    let mut ports = state.used_ports.write().await;
+    // TCP port cleanup. Phase 1 (no locks held): decide what to release.
+    // group_len is queried here — NOT while holding used_ports — and the
+    // port_reservations inserts / remove_group / sk_index calls run after
+    // the used_ports guard is dropped (phase 3). Holding used_ports across
+    // those inverts the lock order vs allocate_proxy_port
+    // (port_reservations → used_ports) and deadlocks both on
+    // reconnect-during-cleanup. The registry is not mutated during cleanup,
+    // so the group_len decisions stay valid until phase 3.
+    let mut ports_to_remove: Vec<u16> = Vec::new();
+    let mut reservations: Vec<(String, u16)> = Vec::new();
+    let mut groups_to_remove: Vec<String> = Vec::new();
     for p in &proxies {
         if let Some(port) = p.remote_port {
             // For TCP group proxies, only release the port if this is the last
@@ -1295,35 +1316,46 @@ pub(crate) async fn unregister_control(
                 // Check if the group still has other members
                 let group_name = p.group.as_deref().unwrap_or("");
                 if state.proxy_manager.group_len(group_name).await <= 1 {
-                    ports.remove(&port);
+                    ports_to_remove.push(port);
                     if port > 0 {
-                        state
-                            .port_reservations
-                            .write()
-                            .await
-                            .insert(p.name.clone(), (port, false, std::time::Instant::now()));
+                        reservations.push((p.name.clone(), port));
                     }
-                    // Stop the shared group listener
-                    state.tcp_group_ctl.remove_group(group_name).await;
+                    groups_to_remove.push(group_name.to_string());
                 }
             } else if p.proxy_type != "udp" && p.proxy_type != "sudp" {
-                ports.remove(&port);
+                ports_to_remove.push(port);
                 if port > 0 {
-                    state
-                        .port_reservations
-                        .write()
-                        .await
-                        .insert(p.name.clone(), (port, false, std::time::Instant::now()));
+                    reservations.push((p.name.clone(), port));
                 }
             }
         }
-        // Clean up STCP sk_index (indexed by proxy_name — exact match, no
-        // risk of removing another proxy's entry even when keys are shared)
+    }
+    // Phase 2: remove the ports under the used_ports write lock only.
+    {
+        let mut ports = state.used_ports.write().await;
+        for port in ports_to_remove {
+            ports.remove(&port);
+        }
+    }
+    // Phase 3: cross-lock mutations WITHOUT holding used_ports.
+    for (name, port) in &reservations {
+        state
+            .port_reservations
+            .write()
+            .await
+            .insert(name.clone(), (*port, false, std::time::Instant::now()));
+    }
+    for group_name in &groups_to_remove {
+        // Stop the shared group listener
+        state.tcp_group_ctl.remove_group(group_name).await;
+    }
+    // Clean up STCP sk_index (indexed by proxy_name — exact match, no
+    // risk of removing another proxy's entry even when keys are shared)
+    for p in &proxies {
         if let Some(key) = p.sk_index_key() {
             state.xtcp.sk_index.write().await.remove(key);
         }
     }
-    drop(ports);
     // UDP port cleanup (Go frp compat: separate port manager for UDP)
     // SUDP proxies can share one server port across run_ids: a port is
     // released only when no OTHER live udp/sudp proxy still occupies it.
@@ -1745,6 +1777,150 @@ mod unregister_generation_tests {
         // The replacement itself may still clean up its own generation.
         unregister_control(&state, "run-1", 7, false).await;
         assert!(!state.run_id_to_ctl_tx.contains_key("run-1"));
+    }
+
+    /// Regression test for the used_ports ↔ port_reservations lock-order
+    /// inversion (audit Task 1). `unregister_control` used to hold
+    /// `used_ports.write()` while acquiring `port_reservations.write()`,
+    /// while `allocate_proxy_port` held `port_reservations.write()` while
+    /// acquiring `used_ports.read()` — the reconnect-during-cleanup
+    /// interleaving below deadlocked both, wedging the whole service.
+    ///
+    /// Deterministic staging (single-threaded test runtime): the test holds
+    /// `port_reservations.write()` and spawns the allocator first, then the
+    /// cleanup, so both queue on `port_reservations` in FIFO order. The
+    /// cleanup grabs `used_ports.write()` and parks on `port_reservations`
+    /// behind the allocator; releasing the test's guard grants the
+    /// allocator, which (old order) parks on `used_ports.read()` while still
+    /// holding `port_reservations` — a guaranteed ABBA deadlock. With the
+    /// fix the allocator drops `port_reservations` before touching
+    /// `used_ports`, so the cleanup proceeds and both complete.
+    #[tokio::test]
+    async fn concurrent_register_unregister_no_lock_order_deadlock() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+
+        // A live TCP proxy for run-1 so the cleanup exercises the TCP port
+        // release path.
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                ProxyInfo {
+                    name: "p1".to_string(),
+                    proxy_type: "tcp".to_string(),
+                    run_id: "run-1".to_string(),
+                    remote_port: Some(49901),
+                    sk: None,
+                    group: None,
+                    group_key: None,
+                    local_addr: Some("127.0.0.1:8080".to_string()),
+                    use_encryption: false,
+                    use_compression: false,
+                    virtual_net: None,
+                    allow_users: Vec::new(),
+                    proxy_protocol_version: String::new(),
+                    response_headers: std::collections::HashMap::new(),
+                    custom_domains: Vec::new(),
+                    route_by_http_user: String::new(),
+                    multiplexer: String::new(),
+                    bandwidth_limit: String::new(),
+                    bandwidth_limit_mode: String::new(),
+                    user: String::new(),
+                    user_conn_sem: None,
+                },
+            )
+            .await
+            .expect("register p1");
+
+        // Fresh (non-expired) 24h reservation for the allocating proxy.
+        state
+            .port_reservations
+            .write()
+            .await
+            .insert("reg-test".to_string(), (49902, false, Instant::now()));
+
+        // Stage the interleaving. Allocator first: it queues as a writer on
+        // port_reservations (held by the test) and parks without acquiring
+        // anything else.
+        let held_reservations = state.port_reservations.write().await;
+        let alloc = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let np = msg::NewProxy {
+                    proxy_name: "reg-test".to_string(),
+                    proxy_type: "tcp".to_string(),
+                    use_encryption: None,
+                    use_compression: None,
+                    group: None,
+                    group_key: None,
+                    local_str: None,
+                    remote_port: None,
+                    sk: None,
+                    custom_domains: None,
+                    subdomain: None,
+                    locations: None,
+                    http_user: None,
+                    http_pwd: None,
+                    host_header_rewrite: None,
+                    headers: None,
+                    response_headers: None,
+                    route_by_http_user: None,
+                    allow_users: None,
+                    bandwidth_limit: None,
+                    bandwidth_limit_mode: None,
+                    annotations: None,
+                    metas: None,
+                    multiplexer: None,
+                    virtual_net: None,
+                    proxy_protocol_version: None,
+                    advertise_subnet: None,
+                    vnet_ip: None,
+                    vnet_netmask: None,
+                    vnet_mtu: None,
+                };
+                allocate_proxy_port(&state, &np, true, false, false, 0).await
+            }
+        });
+        tokio::task::yield_now().await;
+        // Cleanup second: it must acquire used_ports.write() (free) and park
+        // on port_reservations behind the allocator. Staging check: the
+        // cleanup removes the run_id entry before its first park, and every
+        // await between that removal and the port_reservations park is
+        // uncontended (cannot pend), so a removed entry means it is parked
+        // on port_reservations. (Pre-fix it was parked there while still
+        // holding used_ports.write().)
+        let unreg = tokio::spawn({
+            let state = state.clone();
+            async move { unregister_control(&state, "run-1", 1, false).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !state.run_id_to_ctl_tx.contains_key("run-1"),
+            "cleanup should have run and parked on port_reservations"
+        );
+
+        // Release the reservations lock: the allocator is granted first
+        // (FIFO). With the old lock order both tasks now wait on each other
+        // forever; with the fix both complete.
+        drop(held_reservations);
+        tokio::time::timeout(Duration::from_secs(5), alloc)
+            .await
+            .expect("allocator hung: lock-order deadlock")
+            .expect("allocator task panicked");
+        tokio::time::timeout(Duration::from_secs(5), unreg)
+            .await
+            .expect("cleanup hung: lock-order deadlock")
+            .expect("cleanup task panicked");
+        // End-state: the cleanup released the live proxy's port and recorded
+        // the 24h reservation for it.
+        assert!(!state.used_ports.read().await.contains(&49901));
+        assert!(state
+            .port_reservations
+            .read()
+            .await
+            .get("p1")
+            .is_some_and(|&(port, is_udp, _)| port == 49901 && !is_udp));
     }
 
     #[cfg(feature = "vnet")]
