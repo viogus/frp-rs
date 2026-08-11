@@ -546,6 +546,7 @@ where
 pub async fn server_mux<S>(
     _stream: S,
     _mux_cfg: &TcpMuxConfig,
+    _accept_deadline: tokio::time::Instant,
 ) -> Result<(YamuxStream, IncomingStreams), crate::Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
