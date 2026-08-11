@@ -365,6 +365,12 @@ impl YamuxSession {
 
 /// Create a server-side yamux session from an already-established TcpStream.
 ///
+/// `accept_deadline` bounds the wait for the FIRST stream (the control
+/// channel): the idle-kill driver task only spawns after that stream
+/// arrives, so an unbounded wait would let a silent peer park the
+/// caller's task, fd, and conn_semaphore permit indefinitely (slowloris;
+/// Go frp bounds this pre-auth read phase with connReadTimeout=10s).
+///
 /// Returns:
 /// - `control_stream`: the first accepted stream (control channel)
 /// - `incoming`: channel receiver for subsequent accepted streams (work connections)
@@ -374,6 +380,7 @@ impl YamuxSession {
 pub async fn server_mux<S>(
     stream: S,
     mux_cfg: &TcpMuxConfig,
+    accept_deadline: tokio::time::Instant,
 ) -> Result<(YamuxStream, IncomingStreams), crate::Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -383,12 +390,24 @@ where
     let yamux_cfg = yamux_config(mux_cfg);
     let mut conn = Connection::new(compat, yamux_cfg, Mode::Server);
 
-    // Accept the first stream — this is the control channel.
-    let control = poll_fn(|cx| conn.poll_next_inbound(cx))
-        .await
-        .ok_or_else(|| {
-            crate::Error::Protocol("yamux: connection closed before control stream".into())
-        })?
+    // Accept the first stream — this is the control channel. Bounded by
+    // the caller's accept deadline: without it, a client that completes
+    // the transport (TCP/TLS/WS/KCP) but sends no yamux frame would park
+    // this task forever — the keepalive/idle-kill driver below only
+    // spawns AFTER this first stream arrives.
+    let control =
+        match tokio::time::timeout_at(accept_deadline, poll_fn(|cx| conn.poll_next_inbound(cx)))
+            .await
+        {
+            Ok(r) => r.ok_or_else(|| {
+                crate::Error::Protocol("yamux: connection closed before control stream".into())
+            })?,
+            Err(_elapsed) => {
+                return Err(crate::Error::Protocol(
+                    "yamux: timed out waiting for the first stream".into(),
+                ));
+            }
+        }
         .map_err(|e| crate::Error::Protocol(format!("yamux: {e}").into()))?;
 
     let control_compat = control.compat();

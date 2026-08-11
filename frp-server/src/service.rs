@@ -404,11 +404,19 @@ impl Service {
                                                 return;
                                             }
 
-                                            // Try V2 magic detection
+                                            // Try V2 magic detection. Bounded by the same
+                                            // accept deadline as the handshakes above: a client
+                                            // that completes the WS upgrade then goes silent must
+                                            // not park the task/fd/permit forever (Go frp
+                                            // connReadTimeout=10s covers this post-upgrade read).
                                             let mut magic = [0u8; 7];
-                                            let is_v2 = match ws.read_exact(&mut magic).await {
-                                                Ok(_) => crate::handlers::is_v2_magic(&magic),
-                                                Err(_) => false,
+                                            let is_v2 = match tokio::time::timeout_at(accept_deadline, ws.read_exact(&mut magic)).await {
+                                                Ok(Ok(_)) => crate::handlers::is_v2_magic(&magic),
+                                                Ok(Err(_)) => false,
+                                                Err(_elapsed) => {
+                                                    tracing::warn!(addr = %addr, "WS (dedicated port): timed out reading first 7 bytes from {}", addr);
+                                                    return;
+                                                }
                                             };
 
                                             if magic[0] == 0x16 {
@@ -450,7 +458,7 @@ impl Service {
 
                                                         ..Default::default()
                                                         };
-                                                        match mux::server_mux(tls_stream, &mux_cfg).await {
+                                                        match mux::server_mux(tls_stream, &mux_cfg, accept_deadline).await {
                                                             Ok((control_stream, incoming)) => {
                                                                 let mut io = IoStream::Yamux(control_stream);
                                                                 tracing::info!(addr = ?addr, "Yamux over WS+TLS session established for {:?}", addr);
@@ -517,7 +525,7 @@ impl Service {
 
                                                 ..Default::default()
                                                 };
-                                                match mux::server_mux(stream, &mux_cfg).await {
+                                                match mux::server_mux(stream, &mux_cfg, accept_deadline).await {
                                                     Ok((control_stream, incoming)) => {
                                                         let mut io = IoStream::Yamux(control_stream);
                                                         tracing::info!(addr = ?addr, "Yamux over WebSocket session established for {:?}", addr);
@@ -736,6 +744,14 @@ impl Service {
                                         }
                                         spawn_boxed(Box::pin(async move {
                                             let _permit = permit;
+                                            // Absolute deadline for the post-handshake read
+                                            // phase (first yamux stream), matching Go frp's
+                                            // connReadTimeout=10s and the main TCP accept loop.
+                                            // Bounds the server_mux first-stream wait below — a
+                                            // peer that sends the magic bytes but no yamux frame
+                                            // would otherwise park the task and conn_semaphore
+                                            // permit indefinitely (slowloris).
+                                            let accept_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
                                             let peer = stream.peer_addr;
                                     let conv = stream.conv();
                                     tracing::debug!(peer = %peer, conv = conv, "KCP HANDLER: spawned");
@@ -852,7 +868,7 @@ impl Service {
 
                                                     ..Default::default()
                                                     };
-                                                    match frp_core::mux::server_mux(tls_io, &mux_cfg).await {
+                                                    match frp_core::mux::server_mux(tls_io, &mux_cfg, accept_deadline).await {
                                                         Ok((control_stream, incoming)) => {
                                                             let mut io = frp_core::transport::IoStream::Yamux(control_stream);
                                                             tracing::info!(peer = %peer, "KCP TLS+yamux session established for {}", peer);
@@ -1058,7 +1074,7 @@ impl Service {
 
                                             ..Default::default()
                                             };
-                                            match frp_core::mux::server_mux(stream, &mux_cfg).await {
+                                            match frp_core::mux::server_mux(stream, &mux_cfg, accept_deadline).await {
                                                 Ok((control_stream, incoming)) => {
                                                     let mut io = frp_core::transport::IoStream::Yamux(control_stream);
                                                     tracing::info!(peer = %peer, "KCP yamux session established for {}", peer);

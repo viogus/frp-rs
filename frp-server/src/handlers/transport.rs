@@ -279,10 +279,23 @@ pub(crate) async fn handle_tls_connection(
             Ok(mut ws) => {
                 info!(addr = %addr, "WebSocket upgrade over TLS for {}", addr);
                 let mut magic = [0u8; 7];
-                let is_v2 = match ws.read_exact(&mut magic).await {
-                    Ok(_) => is_v2_magic(&magic),
-                    Err(e) => {
+                // Bounded by the same accept deadline as the TLS/WS accept
+                // above: a client that completes the WS upgrade then goes
+                // silent must not park the task/fd/permit forever (Go frp
+                // connReadTimeout=10s covers this post-upgrade read too).
+                let is_v2 = match tokio::time::timeout_at(
+                    accept_deadline,
+                    ws.read_exact(&mut magic),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => is_v2_magic(&magic),
+                    Ok(Err(e)) => {
                         warn!(addr = %addr, error = %e, "WS+TLS failed to read first 7 bytes: {}", e);
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        warn!(addr = %addr, "WS+TLS timed out reading first 7 bytes from {}", addr);
                         return;
                     }
                 };
@@ -355,7 +368,7 @@ pub(crate) async fn handle_tls_connection(
 
                         ..Default::default()
                     };
-                    match mux::server_mux(ws, &mux_cfg).await {
+                    match mux::server_mux(ws, &mux_cfg, accept_deadline).await {
                         Ok((control_stream, incoming)) => {
                             let mut io = IoStream::Yamux(control_stream);
                             info!(addr = %addr, "Yamux over WS+TLS session established for {}", addr);
@@ -459,7 +472,7 @@ pub(crate) async fn handle_tls_connection(
 
             ..Default::default()
         };
-        match mux::server_mux(io, &mux_cfg).await {
+        match mux::server_mux(io, &mux_cfg, accept_deadline).await {
             Ok((control_stream, incoming)) => {
                 let mut io = IoStream::Yamux(control_stream);
                 info!(addr = ?addr, "Yamux over TLS session established for {:?}", addr);
@@ -551,11 +564,19 @@ pub(crate) async fn handle_tls_connection(
     } else {
         // io already includes peeked bytes via BufferedRead.
         // Proceed with V2/V1 detection on the TLS stream.
-        // Try V2 magic detection
+        // Try V2 magic detection. Bounded by the accept deadline: a client
+        // that finishes the TLS handshake then sends nothing must be
+        // dropped instead of parking the task/fd/permit forever (Go frp
+        // connReadTimeout=10s covers this read).
         let mut magic = [0u8; 7];
-        let is_v2 = match io.read_exact(&mut magic).await {
-            Ok(_) => is_v2_magic(&magic),
-            Err(_) => false,
+        let is_v2 = match tokio::time::timeout_at(accept_deadline, io.read_exact(&mut magic)).await
+        {
+            Ok(Ok(_)) => is_v2_magic(&magic),
+            Ok(Err(_)) => false,
+            Err(_elapsed) => {
+                warn!(addr = %addr, "TLS: timed out reading first 7 bytes from {}", addr);
+                return;
+            }
         };
 
         if is_v2 {
@@ -688,10 +709,15 @@ pub(crate) async fn handle_websocket_connection(
         Ok(mut ws) => {
             info!(addr = %addr, "WebSocket upgrade on main port for {}", addr);
 
-            // Try V2 magic detection
+            // Try V2 magic detection. Bounded by the accept deadline: a
+            // client that completes the WS upgrade then goes silent must
+            // not park the task/fd/permit forever (Go frp connReadTimeout
+            // =10s covers this post-upgrade read).
             let mut magic = [0u8; 7];
-            let is_v2 = match ws.read_exact(&mut magic).await {
-                Ok(_) => {
+            let is_v2 = match tokio::time::timeout_at(accept_deadline, ws.read_exact(&mut magic))
+                .await
+            {
+                Ok(Ok(_)) => {
                     let matches = is_v2_magic(&magic);
                     debug!(
                         addr = %addr,
@@ -701,7 +727,11 @@ pub(crate) async fn handle_websocket_connection(
                     );
                     matches
                 }
-                Err(_) => false,
+                Ok(Err(_)) => false,
+                Err(_elapsed) => {
+                    warn!(addr = %addr, "WS: timed out reading first 7 bytes from {}", addr);
+                    return;
+                }
             };
 
             if magic[0] == 0x16 {
@@ -760,7 +790,7 @@ pub(crate) async fn handle_websocket_connection(
 
                             ..Default::default()
                         };
-                        match mux::server_mux(tls_stream, &mux_cfg).await {
+                        match mux::server_mux(tls_stream, &mux_cfg, accept_deadline).await {
                             Ok((control_stream, incoming)) => {
                                 let mut io = IoStream::Yamux(control_stream);
                                 info!(addr = ?addr, "Yamux over WS+TLS session established for {:?}", addr);
@@ -839,11 +869,23 @@ pub(crate) async fn handle_websocket_connection(
                     } else {
                         let mut io = IoStream::Tls(Box::new(tls_stream), addr);
 
-                        // V2 chicken check on the decrypted TLS stream
+                        // V2 chicken check on the decrypted TLS stream.
+                        // Bounded by the accept deadline: a client that
+                        // stops after the WS+TLS handshakes must not park
+                        // the task/fd/permit forever.
                         let mut chicken = [0u8; 7];
-                        let is_tls_v2 = match io.read_exact(&mut chicken).await {
-                            Ok(_) => is_v2_magic(&chicken),
-                            Err(_) => false,
+                        let is_tls_v2 = match tokio::time::timeout_at(
+                            accept_deadline,
+                            io.read_exact(&mut chicken),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => is_v2_magic(&chicken),
+                            Ok(Err(_)) => false,
+                            Err(_elapsed) => {
+                                warn!(addr = %addr, "WS+TLS: timed out reading first 7 bytes from {}", addr);
+                                return;
+                            }
                         };
                         if is_tls_v2 {
                             let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
@@ -928,7 +970,7 @@ pub(crate) async fn handle_websocket_connection(
 
                     ..Default::default()
                 };
-                match mux::server_mux(stream, &mux_cfg).await {
+                match mux::server_mux(stream, &mux_cfg, accept_deadline).await {
                     Ok((control_stream, incoming)) => {
                         let mut io = IoStream::Yamux(control_stream);
                         info!(addr = ?addr, "Yamux over WebSocket session established for {:?}", addr);
@@ -1112,7 +1154,7 @@ pub(crate) async fn handle_v2_connection(
 
             ..Default::default()
         };
-        match mux::server_mux(inner_stream, &mux_cfg).await {
+        match mux::server_mux(inner_stream, &mux_cfg, accept_deadline).await {
             Ok((control_stream, incoming)) => {
                 let mut io = IoStream::Yamux(control_stream);
                 info!(addr = ?addr, "Yamux over V2 session established for {:?}", addr);
@@ -1290,7 +1332,7 @@ pub(crate) async fn handle_v1_connection(
 
             ..Default::default()
         };
-        match mux::server_mux(stream, &mux_cfg).await {
+        match mux::server_mux(stream, &mux_cfg, accept_deadline).await {
             Ok((control_stream, incoming)) => {
                 let mut io = IoStream::Yamux(control_stream);
                 info!(addr = ?addr, "Yamux session established for {:?}", addr);

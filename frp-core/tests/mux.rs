@@ -59,7 +59,11 @@ where
 
     let (mut server_control, incoming) = tokio::time::timeout(
         Duration::from_secs(2),
-        server_mux(server_io, &server_config),
+        server_mux(
+            server_io,
+            &server_config,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        ),
     )
     .await
     .expect("server mux should receive the control stream")
@@ -377,4 +381,45 @@ async fn dead_peer_session_closes_after_bounded_idle_keepalive_ticks() {
         client_stream.is_none(),
         "client session must close a peer with zero transport I/O"
     );
+}
+
+#[tokio::test]
+async fn server_mux_first_stream_wait_is_bounded_by_accept_deadline() {
+    // Slowloris guard: a peer that establishes the transport but never
+    // sends a yamux frame must not park the server_mux caller forever.
+    // The idle-kill driver only spawns AFTER the first stream arrives,
+    // so the first-stream wait is bounded solely by the caller's accept
+    // deadline (Go frp connReadTimeout=10s). A regression here would
+    // hang the outer timeout below.
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    // client_io is kept alive (connected but silent) for the whole wait:
+    // dropping it would EOF the read side and error out early instead of
+    // exercising the deadline.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        server_mux(server_io, &TcpMuxConfig::default(), deadline),
+    )
+    .await;
+
+    let err = match result {
+        Ok(Ok((_control, _incoming))) => {
+            panic!("a silent peer must not yield a control stream")
+        }
+        Ok(Err(e)) => e,
+        Err(_) => {
+            panic!("server_mux must resolve (with a timeout error) within the outer 5s bound")
+        }
+    };
+    assert!(
+        err.to_string().contains("timed out"),
+        "expected a first-stream timeout error, got: {err}"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "server_mux returned before the accept deadline: {elapsed:?}"
+    );
+    drop(client_io);
 }
