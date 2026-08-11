@@ -115,6 +115,10 @@ but not literally 100% — see "Known limitations" below.
   (fail-closed). Set `ssh_tunnel_gateway.allowNoneAuth = true` to explicitly
   accept anonymous connections (Go parity) on a trusted network; otherwise
   always set a token or `authorized_keys`.
+- **Windows vnet (TUN)**: the `vnet` (L3 VPN) feature runs on Linux and macOS
+  only — Windows TUN is a stub (`frp-vnet/src/tun_windows.rs`), every op
+  errors out, pending a Wintun (`wintun.dll`) integration. Not a Go-compat
+  gap; Go frp's vnet is Linux-focused too.
 
 ### Why frp-rs?
 
