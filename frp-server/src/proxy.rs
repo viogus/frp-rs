@@ -43,6 +43,11 @@ pub struct ProxyInfo {
     pub name: String,
     pub proxy_type: String,
     pub run_id: String,
+    /// Control generation that registered this proxy. Lets a disconnect
+    /// sweep (`unregister_control`) skip proxies registered by a
+    /// superseding control for the same run_id (audit finding 3).
+    /// 0 = legacy/unknown generation (tests, manual registration).
+    pub control_id: u64,
     pub remote_port: Option<u16>,
     pub sk: Option<String>,
     pub group: Option<String>,
@@ -234,6 +239,13 @@ impl ProxyManager {
             }
             None => return Err(format!("proxy '{name}' not found")),
         };
+        // The DashMap entry guard was dropped above; a concurrent remove()
+        // may have deleted the proxy in between. Re-check the registry
+        // before syncing by_client so a removed proxy cannot be resurrected
+        // as a phantom by_client entry (audit finding 7).
+        if !self.proxies.contains_key(name) {
+            return Err(format!("proxy '{name}' not found"));
+        }
         // Keep the by_client index (run_id → name → info) in sync so
         // list_client / per-client iteration see the same updated record.
         // Use entry().or_default() like register() so a missing run_id key
@@ -258,6 +270,16 @@ impl ProxyManager {
         // return; no guard is held across the .await calls below.
         let info = self.proxies.remove(name).map(|(_, v)| v);
         if let Some(info) = info {
+            // A concurrent register() may have re-inserted a proxy under the
+            // same name between our remove and the index cleanup below
+            // (register() only touches `proxies` first, then the indexes).
+            // Re-check the registry: if the name is live again, its fresh
+            // indexes must not be deleted — doing so would leave the new
+            // registration unreachable by group selection and list_client
+            // (audit finding 6).
+            if self.proxies.contains_key(name) {
+                return true;
+            }
             // Clean up group index
             if let Some(ref group) = info.group {
                 if !group.is_empty() {
@@ -362,6 +384,20 @@ impl ProxyManager {
                 if health.is_empty() {
                     self.health_tracking_active.store(false, Ordering::Release);
                 }
+            }
+            // A concurrent register() for this run_id may have raced the
+            // sweep: its proxy can end up removed from `proxies` while its
+            // by_client entry survives (or vice versa — register() writes
+            // by_client after `proxies`, so the interleaving is possible).
+            // Re-sync by_client so it only references proxies that are still
+            // in the registry — a phantom by_client entry would otherwise
+            // surface a removed proxy to list_client (audit finding 9).
+            {
+                let mut by_client = self.by_client.write().await;
+                by_client.retain(|_, proxies| {
+                    proxies.retain(|name, _| self.proxies.contains_key(name));
+                    !proxies.is_empty()
+                });
             }
         }
     }

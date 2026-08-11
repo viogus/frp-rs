@@ -294,6 +294,7 @@ async fn build_proxy_info(
     state: &Arc<AppState>,
     np: &msg::NewProxy,
     run_id: &str,
+    control_id: u64,
     port: u16,
 ) -> ProxyInfo {
     let virtual_net = np.virtual_net.clone().filter(|v| !v.is_empty());
@@ -301,6 +302,9 @@ async fn build_proxy_info(
         name: np.proxy_name.clone(),
         proxy_type: np.proxy_type.clone(),
         run_id: run_id.to_string(),
+        // Registration generation (audit finding 3): a disconnect sweep
+        // skips proxies registered by a superseding control.
+        control_id,
         remote_port: Some(port),
         sk: np.sk.clone(),
         group: np.group.clone(),
@@ -403,11 +407,47 @@ async fn udp_port_has_other_owner(
     })
 }
 
+/// Release a UDP port mark when no OTHER live udp/sudp proxy still holds
+/// it, returning whether the port was released.
+///
+/// SUDP proxies can share one server port (frp-rs extension); closing one
+/// proxy must not free the mark while a sibling still owns the bound
+/// socket — otherwise the next SUDP registration's OS bind probe fails
+/// with EADDRINUSE even though the shared socket is alive (audit finding
+/// 2). The closing proxy itself is still in the registry when callers
+/// invoke this, so it is excluded from the owner count.
+pub(crate) async fn release_udp_port_with_owner_check(
+    state: &Arc<AppState>,
+    port: u16,
+    closing_proxy: &str,
+) -> bool {
+    let mut exclude = std::collections::HashSet::new();
+    exclude.insert(closing_proxy.to_string());
+    if udp_port_has_other_owner(state, port, &exclude).await {
+        return false;
+    }
+    state.used_udp_ports.write().await.remove(&port);
+    true
+}
+
 /// Roll back a vhost route conflict: release the port and decrement the
 /// per-client port count. Callers keep their own `proxy_manager.remove`
 /// and error-response ordering.
+///
+/// Both actions only apply when the failing proxy actually consumed a
+/// port: http/https/tcpmux proxies register with remote port 0 and never
+/// incremented `client_ports_used` (audit finding 8), so rolling back
+/// must not remove another proxy's port mark or under-count the client.
 #[inline(never)]
-async fn rollback_vhost_conflict(state: &Arc<AppState>, run_id: &str, port: u16) {
+async fn rollback_vhost_conflict(
+    state: &Arc<AppState>,
+    run_id: &str,
+    port: u16,
+    consumes_port: bool,
+) {
+    if !consumes_port {
+        return;
+    }
     state.used_ports.write().await.remove(&port);
     state
         .client_ports_used
@@ -427,6 +467,28 @@ async fn rollback_udp_bind_failure(
     proxy_name: &str,
 ) {
     state.used_udp_ports.write().await.remove(&port);
+    state
+        .client_ports_used
+        .write()
+        .await
+        .entry(run_id.to_string())
+        .and_modify(|c| *c = c.saturating_sub(1));
+    state.proxy_manager.remove(proxy_name).await;
+}
+
+/// Roll back a failed TCP bind: release the TCP port, decrement the
+/// per-client port count, and drop the proxy registration. Mirrors
+/// `rollback_udp_bind_failure` — TCP proxies register no sk_index or
+/// vhost/tcpmux routes, so this covers everything a TCP proxy registered
+/// before `setup_proxy_listeners` ran (audit finding 4).
+#[inline(never)]
+async fn rollback_tcp_bind_failure(
+    state: &Arc<AppState>,
+    run_id: &str,
+    port: u16,
+    proxy_name: &str,
+) {
+    state.used_ports.write().await.remove(&port);
     state
         .client_ports_used
         .write()
@@ -569,8 +631,10 @@ async fn register_http_vhost(
         )
         .await
     {
-        // Roll back previous registrations.
-        rollback_vhost_conflict(state, run_id, port).await;
+        // Roll back previous registrations. http proxies never consume a
+        // port (remote port 0), so the rollback is a no-op — kept for
+        // symmetry with the general conflict path (audit finding 8).
+        rollback_vhost_conflict(state, run_id, port, false).await;
         state.proxy_manager.remove(&np.proxy_name).await;
         reject_new_proxy(
             writer,
@@ -644,8 +708,10 @@ async fn register_https_vhost(
         )
         .await
     {
-        // Roll back previous registrations.
-        rollback_vhost_conflict(state, run_id, port).await;
+        // Roll back previous registrations. https proxies never consume a
+        // port (remote port 0), so the rollback is a no-op — kept for
+        // symmetry with the general conflict path (audit finding 8).
+        rollback_vhost_conflict(state, run_id, port, false).await;
         state.proxy_manager.remove(&np.proxy_name).await;
         reject_new_proxy(
             writer,
@@ -808,13 +874,37 @@ async fn setup_proxy_listeners(
     } else if tcp_group_created {
         // TCP group first member: create a shared group listener
         // that dispatches connections via round-robin (Go frp dev compat).
-        // NOT a per-proxy listener — groups share one port.
+        // NOT a per-proxy listener — groups share one port. The listener
+        // is bound synchronously so a bind failure rejects the proxy
+        // instead of leaving a registered-but-dead group holding the port
+        // (audit finding 4; mirrors the UDP/TCP bind rollback paths).
         let group_name = np.group.clone().unwrap_or_default();
         let group_key = np.group_key.clone().unwrap_or_default();
+        let addr = format_socket_addr(&bind_addr, port);
+        let listener = match bind_proxy_listener(&bind_addr, port, &np.proxy_name).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(port = %port, error = %e, "Failed to bind TCP group port {} for '{}': {}", port, np.proxy_name, e);
+                rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
+                reject_new_proxy(
+                    writer,
+                    &np.proxy_name,
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        format!("TCP group bind failed: {e}"),
+                        "TCP group bind failed",
+                    ),
+                    v2,
+                )
+                .await;
+                return Err(());
+            }
+        };
         info!(
             proxy_name = %np.proxy_name,
             group = %group_name,
             port = %port,
+            addr = %addr,
             "TCP proxy '{}' creating shared group listener for '{}' on port {}",
             np.proxy_name, group_name, port,
         );
@@ -822,9 +912,8 @@ async fn setup_proxy_listeners(
         let ct = cancel_token.clone();
         let st = state.clone();
         let gn = group_name.clone();
-        let ba = bind_addr.clone();
         let handle = tokio::spawn(async move {
-            tcp_group_listener(ba, port, gn, st, ct).await;
+            tcp_group_listener(listener, port, gn, st, ct).await;
         });
         if let Err(e) = state
             .tcp_group_ctl
@@ -850,9 +939,35 @@ async fn setup_proxy_listeners(
         // Only TCP proxies bind a per-proxy listener. HTTP/HTTPS use
         // the shared vhost listener, TCPMux the shared tcpmux
         // listener, and STCP/XTCP have no remote port.
+        //
+        // Bind synchronously BEFORE the NewProxyResp is written: a bind
+        // failure (TOCTOU race with the allocation-time probe) must reject
+        // the proxy instead of leaving a registered-but-dead proxy holding
+        // the port (audit finding 4; mirrors the UDP bind rollback path).
+        let addr = format_socket_addr(&bind_addr, port);
+        let listener = match bind_proxy_listener(&bind_addr, port, &np.proxy_name).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(port = %port, error = %e, "Failed to bind proxy port {}: {}", port, e);
+                rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
+                reject_new_proxy(
+                    writer,
+                    &np.proxy_name,
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        format!("TCP bind failed: {e}"),
+                        "TCP bind failed",
+                    ),
+                    v2,
+                )
+                .await;
+                return Err(());
+            }
+        };
+        info!(addr = %addr, proxy_name = %np.proxy_name, "Proxy listener started on {} for '{}'", addr, np.proxy_name);
         let tcp_keepalive = state.tcp_keepalive;
         let handle = tokio::spawn(async move {
-            listen_and_proxy(bind_addr, port, pn, itx, tcp_keepalive).await;
+            listen_and_proxy(listener, port, pn, itx, tcp_keepalive).await;
         });
         listener_handles.insert(np.proxy_name.clone(), handle);
     } else {
@@ -875,6 +990,7 @@ async fn setup_proxy_listeners(
 pub(crate) async fn handle_new_proxy(
     np: msg::NewProxy,
     run_id: &str,
+    control_id: u64,
     state: &Arc<AppState>,
     writer: &mut (impl AsyncWriteExt + Unpin),
     internal_tx: &mpsc::Sender<InternalMsg>,
@@ -985,6 +1101,7 @@ pub(crate) async fn handle_new_proxy(
             handle_tcp_group_member_registration(
                 state,
                 run_id,
+                control_id,
                 writer,
                 np,
                 remote_port,
@@ -1010,7 +1127,7 @@ pub(crate) async fn handle_new_proxy(
 
     match allocated_port {
         Some(port) => {
-            let info = build_proxy_info(state, &np, run_id, port).await;
+            let info = build_proxy_info(state, &np, run_id, control_id, port).await;
 
             // Go frp compat: proxy.Run() calls startVisitorListener() BEFORE
             // proxyManager.Add(). Insert sk_index before proxy_manager.register()
@@ -1041,13 +1158,19 @@ pub(crate) async fn handle_new_proxy(
             }
 
             // Track port usage per client (matching Go frp's portsUsedNum).
-            state
-                .client_ports_used
-                .write()
-                .await
-                .entry(run_id.to_string())
-                .and_modify(|c| *c += 1)
-                .or_insert(1);
+            // Only proxies that actually consume a port are counted:
+            // stcp/xtcp/http/https/tcpmux register with remote port 0 and
+            // would otherwise inflate the count the max_ports_per_client
+            // gate checks (audit finding 1).
+            if consumes_port && port > 0 {
+                state
+                    .client_ports_used
+                    .write()
+                    .await
+                    .entry(run_id.to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+            }
 
             #[cfg(feature = "vnet")]
             if np.proxy_type == "vnet" {
@@ -1084,12 +1207,14 @@ pub(crate) async fn handle_new_proxy(
             }
 
             // Register TCPMux proxies with TcpMuxManager (domain-based CONNECT routing).
-            // Follows the same pattern as VHost HTTP registration.
+            // Follows the same pattern as VHost HTTP registration: a route
+            // conflict rejects the proxy instead of silently overwriting the
+            // live sibling's route (audit finding 5).
             if np.proxy_type == "tcpmux" {
                 let domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
                 if domains.is_empty() {
                     // TCPMux requires at least one domain for routing
-                    rollback_vhost_conflict(state, run_id, port).await;
+                    rollback_vhost_conflict(state, run_id, port, false).await;
                     reject_new_proxy(
                         writer,
                         &np.proxy_name,
@@ -1102,7 +1227,7 @@ pub(crate) async fn handle_new_proxy(
                 }
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
-                state
+                if let Err(conflict) = state
                     .tcpmux_manager
                     .register(
                         &np.proxy_name,
@@ -1116,7 +1241,26 @@ pub(crate) async fn handle_new_proxy(
                             .into_iter()
                             .collect::<Vec<(String, String)>>(),
                     )
+                    .await
+                {
+                    // Roll back previous registrations (mirror
+                    // register_http_vhost). tcpmux proxies never consume a
+                    // port, so the rollback is a no-op (audit finding 8).
+                    rollback_vhost_conflict(state, run_id, port, false).await;
+                    state.proxy_manager.remove(&np.proxy_name).await;
+                    reject_new_proxy(
+                        writer,
+                        &np.proxy_name,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            conflict,
+                            "tcpmux route config conflict",
+                        ),
+                        v2,
+                    )
                     .await;
+                    return;
+                }
                 info!(
                     proxy_name = %np.proxy_name, domains = ?domains, "TCPMux routes registered for '{}': domains={:?}",
                     np.proxy_name, domains
@@ -1178,47 +1322,48 @@ pub(crate) async fn handle_new_proxy(
     }
 }
 
-/// Listen on a proxy port and forward incoming connections to the control handler.
-#[instrument(skip(internal_tx), fields(proxy_name = %proxy_name, port = %port))]
-pub(crate) async fn listen_and_proxy(
-    bind_addr: String,
+/// Bind a proxy listener on `bind_addr:port`, retrying briefly on
+/// EADDRINUSE: on supersession the old handler's `abort()` schedules
+/// cancellation but does not wait for the socket to be released, and the
+/// retry lets the new handler win the bind instead of failing once
+/// (audit round 5, MEDIUM 4.2). Callers bind synchronously so a bind
+/// failure rejects the proxy before the success response is written
+/// (audit finding 4).
+async fn bind_proxy_listener(
+    bind_addr: &str,
     port: u16,
-    proxy_name: String,
-    internal_tx: mpsc::Sender<InternalMsg>,
-    tcp_keepalive: i64,
-) {
-    let addr = format_socket_addr(&bind_addr, port);
-    // On supersession the old handler's `abort()` schedules cancellation but
-    // does not wait for the socket to be released; retry EADDRINUSE briefly
-    // so the new handler wins the bind instead of failing once (self-heals
-    // only on the next client reconnect) — audit round 5, MEDIUM 4.2.
-    let mut listener = None;
+    proxy_name: &str,
+) -> Result<TcpListener, std::io::Error> {
+    let addr = format_socket_addr(bind_addr, port);
     for attempt in 0..3 {
         match TcpListener::bind(&addr).await {
-            Ok(l) => {
-                info!(addr = %addr, proxy_name = %proxy_name, "Proxy listener started on {} for '{}'", addr, proxy_name);
-                listener = Some(l);
-                break;
-            }
+            Ok(l) => return Ok(l),
             Err(e) if attempt < 2 && e.kind() == std::io::ErrorKind::AddrInUse => {
                 warn!(addr = %addr, proxy_name = %proxy_name, attempt = attempt + 1,
                     "Proxy port {} for '{}' busy (EADDRINUSE), retrying (attempt {})", port, proxy_name, attempt + 1);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(e) => {
-                tracing::error!(port = %port, error = %e, "Failed to bind proxy port {}: {}", port, e);
-                return;
-            }
+            Err(e) => return Err(e),
         }
     }
-    // Defensive: the loop always breaks with `listener` Some (a final Err
-    // returns early), but keep the guard so a future refactor cannot pass an
-    // unbound listener through.
-    let Some(listener) = listener else {
-        tracing::error!(port = %port, "Failed to bind proxy port {} after 3 attempts", port);
-        return;
-    };
+    // Unreachable: the final (third) failed bind returns via the catch-all
+    // arm above; kept so the loop's Result type checks.
+    Err(std::io::Error::other(
+        "proxy listener bind failed after retries",
+    ))
+}
 
+/// Accept loop for an already-bound proxy listener: forward incoming
+/// connections to the control handler. The bind happens synchronously in
+/// `setup_proxy_listeners` (audit finding 4) — this function only accepts.
+#[instrument(skip(listener, internal_tx), fields(proxy_name = %proxy_name, port = %port))]
+pub(crate) async fn listen_and_proxy(
+    listener: TcpListener,
+    port: u16,
+    proxy_name: String,
+    internal_tx: mpsc::Sender<InternalMsg>,
+    tcp_keepalive: i64,
+) {
     loop {
         match listener.accept().await {
             Ok((user_conn, _addr)) => {
@@ -1286,14 +1431,22 @@ pub(crate) async fn unregister_control(
         None
     };
     // Release allocated ports and clean up sk/vhost entries for this client.
-    // KNOWN LIMITATION: proxies are removed by run_id only (ProxyInfo has no
-    // control_id). In the normal handoff path the old handler's cleanup
-    // finishes before the new login proceeds (barrier), so this is safe. If
-    // the 10s handoff-barrier timeout fires (old handler stuck), the new
-    // control may have already re-registered proxies for the same run_id and
-    // a delayed cleanup could remove them. Extremely unlikely (cleanup is
-    // short and the timeout is generous); tracked in PR #227 review.
-    let proxies = state.proxy_manager.list_client(run_id).await;
+    // In the normal handoff path the old handler's cleanup finishes before
+    // the new login proceeds (barrier), so everything is safe. If the 10s
+    // handoff-barrier timeout fires (old handler stuck), the new control may
+    // have already re-registered proxies for the same run_id — the filter
+    // below skips any proxy registered by a newer control generation, so a
+    // delayed cleanup can never tear down the superseding control's fresh
+    // proxies (audit finding 3).
+    let proxies: Vec<_> = state
+        .proxy_manager
+        .list_client(run_id)
+        .await
+        .into_iter()
+        // Skip proxies registered by a NEWER control generation. control_id
+        // == 0 (legacy callers) sweeps everything.
+        .filter(|p| control_id == 0 || p.control_id <= control_id)
+        .collect();
     // TCP port cleanup. Phase 1 (no locks held): decide what to release.
     // group_len is queried here — NOT while holding used_ports — and the
     // port_reservations inserts / remove_group / sk_index calls run after
@@ -1400,8 +1553,27 @@ pub(crate) async fn unregister_control(
         }
     }
     drop(udp_ports);
-    // Clear per-client port usage tracking (matching Go frp's portsUsedNum cleanup).
-    state.client_ports_used.write().await.remove(run_id);
+    // Clear per-client port usage tracking (matching Go frp's portsUsedNum
+    // cleanup). Decrement by the number of port-consuming proxies actually
+    // removed: the per-run_id counter is shared with a superseding control's
+    // registrations, so a wholesale remove would clear its counts too
+    // (audit finding 3).
+    let consumed: usize = proxies
+        .iter()
+        .filter(|p| {
+            matches!(p.proxy_type.as_str(), "tcp" | "udp" | "sudp")
+                && p.remote_port.is_some_and(|port| port > 0)
+        })
+        .count();
+    if consumed > 0 {
+        let mut port_counts = state.client_ports_used.write().await;
+        if let Some(count) = port_counts.get_mut(run_id) {
+            *count = count.saturating_sub(consumed as u64);
+            if *count == 0 {
+                port_counts.remove(run_id);
+            }
+        }
+    }
     // VHost unregister outside port lock to avoid holding it across awaits
     //
     // NOTE: the SNI-sniff gate count (https_proxy_count) is NOT decremented
@@ -1415,7 +1587,18 @@ pub(crate) async fn unregister_control(
         state.proxy_metrics.remove(&p.name).await;
     }
     #[cfg(feature = "vnet")]
-    state.remove_run_id_vnet_routes(run_id).await;
+    {
+        // Remove vnet routes for the proxies being swept (control_id
+        // filtered) so a superseding control's vnet routes survive the old
+        // control's cleanup (audit finding 3).
+        for p in &proxies {
+            if p.proxy_type == "vnet" {
+                state
+                    .remove_proxy_vnet_routes_and_broadcast(run_id, &p.name)
+                    .await;
+            }
+        }
+    }
     // Clean up OIDC subject mapping for this client.
     // Map key is run_id; remove it directly rather than scanning values
     // (which are OIDC subject strings, not proxy names — retain would
@@ -1438,37 +1621,17 @@ pub(crate) async fn unregister_control(
 /// Shared TCP group listener: accepts connections on the group's shared port
 /// and dispatches them to group members via round-robin (`select_group_backend`).
 /// Stops when the group has no members or the cancel token is triggered.
-#[instrument(skip(state, cancel_token), fields(group = %group_name, port = %port))]
+/// The listener is bound synchronously by the caller (audit finding 4), so a
+/// bind failure rejects the first group member instead of leaving a
+/// registered-but-dead group.
+#[instrument(skip(listener, state, cancel_token), fields(group = %group_name, port = %port))]
 async fn tcp_group_listener(
-    bind_addr: String,
+    listener: TcpListener,
     port: u16,
     group_name: String,
     state: Arc<AppState>,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
-    let addr = format_socket_addr(&bind_addr, port);
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => {
-            info!(
-                addr = %addr,
-                group = %group_name,
-                "TCP group '{}' shared listener started on {}",
-                group_name, addr,
-            );
-            l
-        }
-        Err(e) => {
-            tracing::error!(
-                port = %port,
-                group = %group_name,
-                error = %e,
-                "Failed to bind TCP group port {} for '{}': {}",
-                port, group_name, e,
-            );
-            return;
-        }
-    };
-
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -1561,6 +1724,7 @@ async fn tcp_group_listener(
 async fn handle_tcp_group_member_registration(
     state: &Arc<AppState>,
     run_id: &str,
+    control_id: u64,
     writer: &mut (impl AsyncWriteExt + Unpin),
     np: msg::NewProxy,
     _remote_port: u16,
@@ -1585,7 +1749,7 @@ async fn handle_tcp_group_member_registration(
         }
     };
 
-    let info = build_proxy_info(state, &np, run_id, port).await;
+    let info = build_proxy_info(state, &np, run_id, control_id, port).await;
 
     if let Err(e) = state
         .proxy_manager
@@ -1606,6 +1770,18 @@ async fn handle_tcp_group_member_registration(
         .await;
         return;
     }
+
+    // Track port usage per client (matching Go frp's portsUsedNum — each
+    // group member counts against the client's port budget, keeping the
+    // count in sync with handle_close_proxy's decrement and
+    // unregister_control's per-proxy decrement; audit finding 1).
+    state
+        .client_ports_used
+        .write()
+        .await
+        .entry(run_id.to_string())
+        .and_modify(|c| *c += 1)
+        .or_insert(1);
 
     // Emit dashboard event
     #[cfg(feature = "dashboard")]
@@ -1764,6 +1940,76 @@ mod unregister_generation_tests {
         rx
     }
 
+    fn proxy_info(
+        name: &str,
+        proxy_type: &str,
+        run_id: &str,
+        remote_port: Option<u16>,
+        control_id: u64,
+    ) -> ProxyInfo {
+        ProxyInfo {
+            name: name.into(),
+            proxy_type: proxy_type.into(),
+            run_id: run_id.into(),
+            control_id,
+            remote_port,
+            sk: None,
+            group: None,
+            group_key: None,
+            local_addr: Some("127.0.0.1:8080".to_string()),
+            use_encryption: false,
+            use_compression: false,
+            virtual_net: None,
+            allow_users: Vec::new(),
+            proxy_protocol_version: String::new(),
+            response_headers: std::collections::HashMap::new(),
+            custom_domains: Vec::new(),
+            route_by_http_user: String::new(),
+            multiplexer: String::new(),
+            bandwidth_limit: String::new(),
+            bandwidth_limit_mode: String::new(),
+            user: String::new(),
+            user_conn_sem: None,
+        }
+    }
+
+    /// A minimal `msg::NewProxy` for registration tests. All optional fields
+    /// start None so each test only sets what its path needs.
+    fn new_proxy(proxy_name: &str, proxy_type: &str) -> msg::NewProxy {
+        msg::NewProxy {
+            proxy_name: proxy_name.to_string(),
+            proxy_type: proxy_type.to_string(),
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: None,
+            local_str: None,
+            remote_port: None,
+            sk: None,
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: None,
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        }
+    }
+
     #[tokio::test]
     async fn stale_failure_cannot_unregister_superseding_control() {
         let state = test_state();
@@ -1806,29 +2052,7 @@ mod unregister_generation_tests {
             .proxy_manager
             .register(
                 "run-1".to_string(),
-                ProxyInfo {
-                    name: "p1".to_string(),
-                    proxy_type: "tcp".to_string(),
-                    run_id: "run-1".to_string(),
-                    remote_port: Some(49901),
-                    sk: None,
-                    group: None,
-                    group_key: None,
-                    local_addr: Some("127.0.0.1:8080".to_string()),
-                    use_encryption: false,
-                    use_compression: false,
-                    virtual_net: None,
-                    allow_users: Vec::new(),
-                    proxy_protocol_version: String::new(),
-                    response_headers: std::collections::HashMap::new(),
-                    custom_domains: Vec::new(),
-                    route_by_http_user: String::new(),
-                    multiplexer: String::new(),
-                    bandwidth_limit: String::new(),
-                    bandwidth_limit_mode: String::new(),
-                    user: String::new(),
-                    user_conn_sem: None,
-                },
+                proxy_info("p1", "tcp", "run-1", Some(49901), 0),
             )
             .await
             .expect("register p1");
@@ -1929,6 +2153,25 @@ mod unregister_generation_tests {
         let state = test_state();
         let mut peer_rx = insert_control_rx(&state, "run-b", 2).await;
         insert_control(&state, "run-a", 1).await;
+        // The sweep removes vnet routes per proxy (audit finding 3), so the
+        // proxies owning the routes must be registered under the removing
+        // control's generation.
+        state
+            .proxy_manager
+            .register(
+                "run-a".to_string(),
+                proxy_info("proxy-a", "vnet", "run-a", Some(0), 1),
+            )
+            .await
+            .expect("register proxy-a");
+        state
+            .proxy_manager
+            .register(
+                "run-a".to_string(),
+                proxy_info("visitor-v6", "vnet", "run-a", Some(0), 1),
+            )
+            .await
+            .expect("register visitor-v6");
         {
             let mut routes = state.vnet_routes.write().await;
             routes.insert(
@@ -2015,5 +2258,322 @@ mod unregister_generation_tests {
 
         assert_eq!(prune_expired_reservations_inner(&mut map, now), 0);
         assert!(map.contains_key("boundary"));
+    }
+
+    /// Audit finding 1 regression: `client_ports_used` must only count
+    /// proxies that actually consume a port (tcp/udp/sudp with a real
+    /// remote port). stcp/xtcp/http/https/tcpmux register with remote port
+    /// 0 and previously inflated the count the `max_ports_per_client` gate
+    /// checks.
+    #[tokio::test]
+    async fn client_ports_used_counts_only_port_consuming_proxies() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // tcp proxy → counted.
+        let mut np = new_proxy("p1", "tcp");
+        np.remote_port = Some(24021);
+        let mut writer = Vec::new();
+        handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            1,
+            "tcp proxy must count against the client port budget"
+        );
+
+        // http proxy (remote port 0) → must NOT inflate the count.
+        let mut np = new_proxy("p2", "http");
+        np.custom_domains = Some(vec!["example.com".to_string()]);
+        let mut writer = Vec::new();
+        handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            1,
+            "http proxy (remote port 0) must not inflate the port count"
+        );
+
+        // stcp proxy (no remote port) → must NOT inflate the count.
+        let mut np = new_proxy("p3", "stcp");
+        np.sk = Some("secret".to_string());
+        let mut writer = Vec::new();
+        handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            1,
+            "stcp proxy (no remote port) must not inflate the port count"
+        );
+
+        // Second tcp proxy → 2.
+        let mut np = new_proxy("p4", "tcp");
+        np.remote_port = Some(24022);
+        let mut writer = Vec::new();
+        handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            2,
+            "two tcp proxies must count 2"
+        );
+
+        // Disconnect cleanup decrements by the count of port-consuming
+        // proxies it actually removes (finding 3 symmetry): entry cleared.
+        unregister_control(&state, "run-1", 1, false).await;
+        assert!(
+            state.client_ports_used.read().await.get("run-1").is_none(),
+            "cleanup must remove the per-client port count"
+        );
+    }
+
+    /// Audit finding 2 regression: closing one SUDP proxy must not release
+    /// the shared UDP port while another live SUDP proxy still holds it.
+    #[tokio::test]
+    async fn sudp_shared_port_released_only_when_last_owner() {
+        let state = test_state();
+        state.used_udp_ports.write().await.insert(24023);
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                proxy_info("s1", "sudp", "run-1", Some(24023), 1),
+            )
+            .await
+            .expect("register s1");
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                proxy_info("s2", "sudp", "run-1", Some(24023), 1),
+            )
+            .await
+            .expect("register s2");
+
+        // Closing s1 while s2 still holds the port must NOT release it.
+        // Mirrors handle_close_proxy: the owner check runs while the closing
+        // proxy is still in the registry; the registry removal happens after.
+        assert!(
+            !release_udp_port_with_owner_check(&state, 24023, "s1").await,
+            "shared port must stay allocated while s2 is live"
+        );
+        assert!(
+            state.used_udp_ports.read().await.contains(&24023),
+            "port must remain marked while a sibling SUDP proxy holds it"
+        );
+        state.proxy_manager.remove("s1").await;
+
+        // Closing the last owner releases it.
+        assert!(
+            release_udp_port_with_owner_check(&state, 24023, "s2").await,
+            "last SUDP owner must release the port"
+        );
+        assert!(
+            !state.used_udp_ports.read().await.contains(&24023),
+            "port must be released after the last owner closes"
+        );
+        state.proxy_manager.remove("s2").await;
+
+        // Closing a proxy that never existed is a no-op release.
+        assert!(
+            release_udp_port_with_owner_check(&state, 24023, "ghost").await,
+            "no live owner means the port is free to release"
+        );
+    }
+
+    /// Audit finding 3 regression: when the 10s handoff barrier times out,
+    /// the old control's sweep must skip proxies registered by the
+    /// superseding control — it must only tear down its own generation.
+    #[tokio::test]
+    async fn unregister_control_generation_filter_skips_newer_proxies() {
+        let state = test_state();
+        // The superseding control (generation 2) owns the run_id entry.
+        insert_control(&state, "run-1", 2).await;
+        // Old control's proxy (generation 1) + new control's proxy (2).
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                proxy_info("old-proxy", "tcp", "run-1", Some(24024), 1),
+            )
+            .await
+            .expect("register old-proxy");
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                proxy_info("new-proxy", "tcp", "run-1", Some(24025), 2),
+            )
+            .await
+            .expect("register new-proxy");
+        {
+            let mut ports = state.used_ports.write().await;
+            ports.insert(24024);
+            ports.insert(24025);
+        }
+        state
+            .client_ports_used
+            .write()
+            .await
+            .insert("run-1".to_string(), 2);
+
+        // Old control (generation 1) sweeps: only its own proxy's port is
+        // released; the new control's proxy and counts survive.
+        unregister_control(&state, "run-1", 1, false).await;
+        assert!(
+            !state.used_ports.read().await.contains(&24024),
+            "old control's port must be released"
+        );
+        assert!(
+            state.used_ports.read().await.contains(&24025),
+            "superseding control's port must survive the old sweep"
+        );
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            1,
+            "only the old control's count may be decremented"
+        );
+        assert!(
+            state.run_id_to_ctl_tx.contains_key("run-1"),
+            "superseding control's routing entry must survive"
+        );
+
+        // The superseding control's own cleanup sweeps everything.
+        unregister_control(&state, "run-1", 2, false).await;
+        assert!(
+            !state.used_ports.read().await.contains(&24025),
+            "superseding control must release its own port on disconnect"
+        );
+        assert!(
+            state.client_ports_used.read().await.get("run-1").is_none(),
+            "per-client count must be cleared when the last control leaves"
+        );
+    }
+
+    /// Audit finding 5 regression: a tcpmux proxy claiming a domain already
+    /// routed by a live proxy is rejected — the sibling's route survives.
+    #[tokio::test]
+    async fn tcpmux_route_conflict_rejects_new_proxy() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np1 = new_proxy("mux-a", "tcpmux");
+        np1.custom_domains = Some(vec!["a.example.com".to_string()]);
+        let mut writer1 = Vec::new();
+        handle_new_proxy(
+            np1,
+            "run-1",
+            1,
+            &state,
+            &mut writer1,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(
+            state.proxy_manager.get("mux-a").await.is_some(),
+            "first tcpmux proxy must register"
+        );
+        assert!(state
+            .tcpmux_manager
+            .lookup("a.example.com")
+            .await
+            .is_some_and(|r| r.proxy_name == "mux-a"));
+
+        // Second proxy claims the same domain → must be rejected and rolled
+        // back, with an error response naming the conflict.
+        let mut np2 = new_proxy("mux-b", "tcpmux");
+        np2.custom_domains = Some(vec!["a.example.com".to_string()]);
+        let mut writer2 = Vec::new();
+        handle_new_proxy(
+            np2,
+            "run-1",
+            1,
+            &state,
+            &mut writer2,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(
+            state.proxy_manager.get("mux-b").await.is_none(),
+            "conflicting tcpmux proxy must be rolled back"
+        );
+        assert!(
+            String::from_utf8_lossy(&writer2).contains("conflict"),
+            "rejection response must surface the route conflict"
+        );
+        assert!(
+            state
+                .tcpmux_manager
+                .lookup("a.example.com")
+                .await
+                .is_some_and(|r| r.proxy_name == "mux-a"),
+            "live sibling's route must survive the rejected registration"
+        );
+
+        // tcpmux proxies never consume a port → no client port count.
+        assert!(
+            state.client_ports_used.read().await.get("run-1").is_none(),
+            "tcpmux proxies must not count against the client port budget"
+        );
     }
 }

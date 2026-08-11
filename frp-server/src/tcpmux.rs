@@ -41,6 +41,13 @@ impl TcpMuxManager {
     }
 
     /// Register domains for a tcpmux proxy.
+    ///
+    /// Returns `Err(conflict)` when any domain is already routed to a
+    /// different proxy. Every domain is validated BEFORE any insert, so a
+    /// rejected registration leaves no partial state — mirroring the VHost
+    /// manager. Previously the result was ignored and the last registration
+    /// silently overwrote the first (audit finding 5), which meant closing
+    /// the overwriting proxy deleted the live sibling's route.
     pub async fn register(
         &self,
         proxy_name: &str,
@@ -49,7 +56,7 @@ impl TcpMuxManager {
         http_user: &str,
         http_pwd: &str,
         _headers: &[(String, String)],
-    ) {
+    ) -> Result<(), String> {
         let route = TcpMuxRoute {
             proxy_name: proxy_name.to_string(),
             run_id: run_id.to_string(),
@@ -60,6 +67,19 @@ impl TcpMuxManager {
         let mut routes = self.routes.write().await;
         let mut by_proxy = self.by_proxy.write().await;
 
+        // Validate every domain before inserting anything (no partial state).
+        // Re-registration by the same proxy name is allowed (idempotent).
+        for domain in domains {
+            if let Some(existing) = routes.get(domain) {
+                if existing.proxy_name != proxy_name {
+                    return Err(format!(
+                        "tcpmux route conflict for domain '{}': proxy '{}' vs '{}'",
+                        domain, existing.proxy_name, proxy_name
+                    ));
+                }
+            }
+        }
+
         let mut domains_for_proxy = Vec::new();
         for domain in domains {
             routes.insert(domain.clone(), route.clone());
@@ -68,16 +88,27 @@ impl TcpMuxManager {
         if !domains_for_proxy.is_empty() {
             by_proxy.insert(proxy_name.to_string(), domains_for_proxy);
         }
+        Ok(())
     }
 
     /// Unregister all domains for a proxy.
+    ///
+    /// A domain's route is removed only when it still belongs to `proxy_name`:
+    /// if a concurrent registration (or a stale by_proxy entry from the
+    /// pre-fix last-writer-wins behavior) points the domain at another proxy,
+    /// that sibling's live route must survive (audit finding 5).
     pub async fn unregister(&self, proxy_name: &str) {
         let mut routes = self.routes.write().await;
         let mut by_proxy = self.by_proxy.write().await;
 
         if let Some(domains) = by_proxy.remove(proxy_name) {
             for domain in &domains {
-                routes.remove(domain);
+                if routes
+                    .get(domain)
+                    .is_some_and(|r| r.proxy_name == proxy_name)
+                {
+                    routes.remove(domain);
+                }
             }
         }
     }
@@ -428,7 +459,8 @@ mod tests {
         let mgr = TcpMuxManager::new();
 
         mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
-            .await;
+            .await
+            .expect("first registration must succeed");
 
         // Exact match
         let r = mgr.lookup("a.example.com").await.unwrap();
@@ -458,7 +490,8 @@ mod tests {
             "",
             &[],
         )
-        .await;
+        .await
+        .expect("registration must succeed");
 
         assert!(mgr.lookup("a.example.com").await.is_some());
         assert!(mgr.lookup("b.example.com").await.is_some());
@@ -467,5 +500,84 @@ mod tests {
         mgr.unregister("p1").await;
         assert!(mgr.lookup("a.example.com").await.is_none());
         assert!(mgr.lookup("b.example.com").await.is_none());
+    }
+
+    /// Regression test for audit finding 5: a second proxy claiming an
+    /// already-routed domain must be rejected, not silently overwrite the
+    /// first registration (which previously let the closing proxy delete a
+    /// live sibling's route).
+    #[tokio::test]
+    async fn test_tcpmux_manager_conflict_rejects_second_proxy() {
+        let mgr = TcpMuxManager::new();
+
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+            .await
+            .expect("first registration must succeed");
+
+        let err = mgr
+            .register("p2", &["a.example.com".into()], "run-2", "", "", &[])
+            .await
+            .expect_err("conflicting domain must be rejected");
+        assert!(
+            err.contains("a.example.com"),
+            "conflict must name the domain: {err}"
+        );
+
+        // The first proxy's route is intact; the second never registered.
+        assert!(mgr
+            .lookup("a.example.com")
+            .await
+            .is_some_and(|r| r.proxy_name == "p1"));
+
+        // Same-name re-registration is idempotent (allowed).
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+            .await
+            .expect("same-proxy re-registration must succeed");
+        assert!(mgr
+            .lookup("a.example.com")
+            .await
+            .is_some_and(|r| r.proxy_name == "p1"));
+    }
+
+    /// Regression test for audit finding 5: unregister must not delete a
+    /// route that now belongs to a different proxy (defense-in-depth for
+    /// stale by_proxy state from the pre-fix last-writer-wins behavior).
+    #[tokio::test]
+    async fn test_tcpmux_unregister_keeps_foreign_route() {
+        let mgr = TcpMuxManager::new();
+
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+            .await
+            .expect("registration must succeed");
+
+        // Simulate the pre-fix last-writer-wins state: the route now belongs
+        // to p2, and p2's by_proxy entry also lists the domain.
+        {
+            let mut routes = mgr.routes.write().await;
+            routes.insert(
+                "a.example.com".to_string(),
+                TcpMuxRoute {
+                    proxy_name: "p2".to_string(),
+                    run_id: "run-2".to_string(),
+                    http_user: String::new(),
+                    http_pwd: String::new(),
+                },
+            );
+            mgr.by_proxy
+                .write()
+                .await
+                .insert("p2".to_string(), vec!["a.example.com".to_string()]);
+        }
+
+        mgr.unregister("p1").await;
+        assert!(
+            mgr.lookup("a.example.com")
+                .await
+                .is_some_and(|r| r.proxy_name == "p2"),
+            "p1's unregister must not delete p2's live route"
+        );
+
+        mgr.unregister("p2").await;
+        assert!(mgr.lookup("a.example.com").await.is_none());
     }
 }

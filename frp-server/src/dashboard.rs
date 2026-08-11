@@ -2375,6 +2375,7 @@ mod v2 {
                 name: name.into(),
                 proxy_type: proxy_type.into(),
                 run_id: "run-1".into(),
+                control_id: 0,
                 remote_port: Some(10001),
                 sk: None,
                 group: None,

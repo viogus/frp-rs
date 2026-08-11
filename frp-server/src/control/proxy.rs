@@ -22,6 +22,7 @@ pub(crate) async fn handle_new_proxy<W: AsyncWriteExt + Unpin>(
     proxy_ops::handle_new_proxy(
         np,
         &ctx.run_id,
+        ctx.control_id,
         &ctx.state,
         writer,
         &ctx.internal_tx,
@@ -73,16 +74,29 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
             // For a TCP group member that is not the last member, the shared
             // group listener still owns the port — leave it allocated.
             if info.proxy_type == "udp" || info.proxy_type == "sudp" {
-                ctx.state.used_udp_ports.write().await.remove(&port);
+                // SUDP proxies can share one server port across proxies
+                // (frp-rs extension): only release the port mark when no
+                // OTHER live udp/sudp proxy still holds the bound socket —
+                // otherwise the next SUDP registration's OS bind probe
+                // fails with EADDRINUSE while the shared socket is alive
+                // (audit finding 2). The closing proxy itself is still in
+                // the registry here, so it is excluded from the owner count.
+                proxy_ops::release_udp_port_with_owner_check(&ctx.state, port, &cp.proxy_name)
+                    .await;
             } else if !is_tcp_group || last_group_member {
                 ctx.state.used_ports.write().await.remove(&port);
             }
             // Decrement per-client port count (matching Go frp's portsUsedNum).
-            let mut port_counts = ctx.state.client_ports_used.write().await;
-            if let Some(count) = port_counts.get_mut(&ctx.run_id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    port_counts.remove(&ctx.run_id);
+            // Only proxies that actually consumed a port were counted
+            // (audit finding 1 symmetry): stcp/xtcp/http/https/tcpmux close
+            // with remote_port Some(0) and must not decrement.
+            if matches!(info.proxy_type.as_str(), "tcp" | "udp" | "sudp") && port > 0 {
+                let mut port_counts = ctx.state.client_ports_used.write().await;
+                if let Some(count) = port_counts.get_mut(&ctx.run_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        port_counts.remove(&ctx.run_id);
+                    }
                 }
             }
         }
@@ -334,6 +348,20 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
     // Do NOT use remove_client() — it removes ALL proxies for this run_id,
     // which in supersession would delete the new handler's proxies.
     for name in &proxy_names {
+        // Skip proxies registered by a newer control generation: when the
+        // 10s handoff barrier times out, the superseding control may have
+        // registered proxies before this cleanup captured its snapshot, and
+        // the snapshot-then-remove loop must not tear them down (audit
+        // finding 3 — same generation filter as unregister_control).
+        if ctx
+            .state
+            .proxy_manager
+            .get(name)
+            .await
+            .is_some_and(|i| i.control_id != 0 && i.control_id > ctx.control_id)
+        {
+            continue;
+        }
         // Decrement the SNI-sniff gate count only when the proxy was
         // actually removed here — a racing dashboard delete may have removed
         // it first, and a double decrement would leave https_proxy_count at 0
