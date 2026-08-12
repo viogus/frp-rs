@@ -122,10 +122,12 @@ pub struct AuthConfig {
     /// are rejected. Set to 0 to disable timestamp verification (accepts
     /// any timestamp, weakening replay protection).
     ///
-    /// Go frp has no `authentication_timeout` equivalent (timestamp freshness
-    /// is not checked in the token auth path). The config default is 0
-    /// (disabled). When set, OIDC uses this for JWT expiry validation.
-    /// Go frp compat: authentication_timeout.
+    /// Default: 90s in frps (the serde default — see
+    /// `config::default_authentication_timeout`); 0 disables. This struct's
+    /// `Default` mirrors that serde default. Go frp has no
+    /// `authentication_timeout` equivalent (timestamp freshness is not
+    /// checked in the token auth path); when set, OIDC uses this for JWT
+    /// expiry validation. Go frp compat: authentication_timeout.
     pub authentication_timeout: i64,
     /// When true (default), token auth validates timestamp freshness and
     /// rejects duplicate (run_id, timestamp) pairs to prevent replay attacks.
@@ -186,7 +188,8 @@ impl Default for AuthConfig {
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
-            authentication_timeout: 300,
+            // Matches the frps serde default (`default_authentication_timeout`).
+            authentication_timeout: 90,
             token_auth_timeout: true,
             use_encryption: false,
         }
@@ -223,7 +226,7 @@ impl AuthConfig {
         privilege_key: Option<&str>,
         timestamp: Option<i64>,
     ) -> Result<String, String> {
-        let token = self.resolve_token()?;
+        let token = ZeroizingString::new(self.resolve_token()?);
         self.validate_login_with_token(token.as_str(), privilege_key, timestamp)
     }
 
@@ -285,8 +288,8 @@ impl AuthConfig {
     /// Resolve the current token and generate the privilege_key for a login
     /// message, returning an error when the dynamic source cannot be resolved.
     pub fn try_generate_login_key(&self, timestamp: i64) -> Result<String, String> {
-        let token = self.resolve_token()?;
-        if token.is_empty() {
+        let token = ZeroizingString::new(self.resolve_token()?);
+        if token.as_str().is_empty() {
             return Err(
                 "authentication token is empty. When auth.method = 'token', \
                  you must set auth.token or auth.tokenSource in the config file."
@@ -294,7 +297,7 @@ impl AuthConfig {
             );
         }
         match self.method {
-            AuthMethod::Token => Ok(generate_token(&token, timestamp)),
+            AuthMethod::Token => Ok(generate_token(token.as_str(), timestamp)),
             #[cfg(feature = "oidc")]
             AuthMethod::Oidc => Err("OIDC auth does not use token login keys".into()),
         }
@@ -304,8 +307,8 @@ impl AuthConfig {
     /// Call this at server startup to reject dangerously insecure configurations.
     pub fn check_startup(&self) -> Result<(), String> {
         if self.method == AuthMethod::Token {
-            let token = self.resolve_token()?;
-            if token.is_empty() {
+            let token = ZeroizingString::new(self.resolve_token()?);
+            if token.as_str().is_empty() {
                 return Err("CRITICAL: [auth].token / auth.tokenSource resolved empty with token auth method — server would accept ALL connections. Set a strong token in the config file.".into());
             }
         }
@@ -696,7 +699,15 @@ mod oidc_impl {
                 if let Some(ref c) = *cache {
                     if c.fetched_at.elapsed() > c.refresh_after {
                         drop(cache);
-                        let _ = self.refresh_jwks().await;
+                        // Best-effort refresh: keep serving from the stale
+                        // cache, but surface the failure so operators can
+                        // tell that key material may be out of date.
+                        if let Err(e) = self.refresh_jwks().await {
+                            tracing::warn!(
+                                error = %e,
+                                "OIDC: stale JWKS refresh failed (continuing with cached keys): {e}"
+                            );
+                        }
                     }
                 } else {
                     drop(cache);
@@ -1406,6 +1417,29 @@ pub fn zeroize_string(s: &mut String) {
     }
     // Clear len so the now-zeroed bytes are not accidentally re-read.
     s.clear();
+}
+
+/// RAII guard that wipes the wrapped `String`'s buffer on drop.
+///
+/// Used to zeroize the token temporaries resolved by
+/// [`AuthConfig::resolve_token`] — without a guard, the resolved `String`
+/// would be freed without wiping and the plaintext token would linger in
+/// freed memory.
+struct ZeroizingString(String);
+
+impl ZeroizingString {
+    fn new(s: String) -> Self {
+        Self(s)
+    }
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingString {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.0);
+    }
 }
 
 /// Resolve a dynamic token with `UnsafeFeatures` enforcement.
@@ -2355,9 +2389,12 @@ mod tests {
     // authentication_timeout now only applies to the OIDC auth path.
 
     #[test]
-    fn test_auth_timeout_default_is_300() {
+    fn test_auth_timeout_default_matches_serde_default() {
+        // AuthConfig::default() must mirror the frps serde default
+        // (`default_authentication_timeout` in config/server.rs, 90s).
+        // 0 disables the check.
         let cfg = AuthConfig::default();
-        assert_eq!(cfg.authentication_timeout, 300);
+        assert_eq!(cfg.authentication_timeout, 90);
     }
 
     #[test]
