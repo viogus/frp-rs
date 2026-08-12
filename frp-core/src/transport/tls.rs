@@ -79,8 +79,17 @@ impl Transport for TlsTransport {
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     pub enable: bool,
+    /// PEM file with the TLS certificate (server identity).
     pub cert_file: Option<String>,
+    /// PEM file with the TLS private key matching `cert_file`.
     pub key_file: Option<String>,
+    /// PEM file with CA certificates. On the server this enables mTLS:
+    /// client certificates are required and verified against this store.
+    /// On the client this is the trust anchor used instead of
+    /// skip-verify: when set, the server certificate is verified against
+    /// it. **Setting this on the client is the fix for the insecure
+    /// skip-verify default** (Go frp compat: `tls_trusted_ca_file` /
+    /// frpc `tls.trusted_ca_file`).
     pub ca_file: Option<String>,
 }
 
@@ -464,18 +473,20 @@ pub fn build_tls_connector(
 ///
 /// Rebuilding a connector re-reads and re-parses PEM files and constructs a
 /// verifier — repeated per dial even though the config is identical. Cache
-/// the most recent one keyed by (path, mtime): a reload that changes the CA
-/// or client-cert files yields a different mtime, so the entry self-invalidates.
+/// the most recent one keyed by (path, content hash): a reload that changes
+/// the CA or client-cert files yields a different hash, so the entry
+/// self-invalidates. Hashing the file *contents* (instead of only mtime/size,
+/// which the mtime-granularity window can miss) makes the key exact; the
+/// files are small PEM files and are read once per dial anyway when the
+/// connector is rebuilt.
 /// `tokio_rustls::TlsConnector` is an `Arc<ClientConfig>` — sharing is free.
 struct ConnectorKey {
-    // (path, mtime, size) — mtime None means "configured but file missing",
+    // (path, content hash) — hash None means "configured but file missing",
     // which must stay distinct from "not configured" (None) for cache
-    // correctness. Size is included so a content rewrite that lands inside
-    // the filesystem mtime granularity window (1s FAT 2s) still invalidates
-    // when the length changes.
-    ca: Option<(String, Option<std::time::SystemTime>, u64)>,
-    cert: Option<(String, Option<std::time::SystemTime>, u64)>,
-    key: Option<(String, Option<std::time::SystemTime>, u64)>,
+    // correctness.
+    ca: Option<(String, Option<[u8; 32]>)>,
+    cert: Option<(String, Option<[u8; 32]>)>,
+    key: Option<(String, Option<[u8; 32]>)>,
 }
 
 impl PartialEq for ConnectorKey {
@@ -484,10 +495,15 @@ impl PartialEq for ConnectorKey {
     }
 }
 
-fn file_stat(path: &str) -> Option<(std::time::SystemTime, u64)> {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
+/// SHA-256 of a file's contents, or `None` when the file cannot be read.
+fn file_hash(path: &str) -> Option<[u8; 32]> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(
+        ring::digest::digest(&ring::digest::SHA256, &bytes)
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 output is 32 bytes"),
+    )
 }
 
 fn non_empty(p: Option<&str>) -> Option<&str> {
@@ -503,18 +519,9 @@ fn connector_key(
     key_file: Option<&str>,
 ) -> ConnectorKey {
     ConnectorKey {
-        ca: non_empty(ca_file).map(|p| {
-            let (t, len) = file_stat(p).map_or((None, 0), |(t, len)| (Some(t), len));
-            (p.to_string(), t, len)
-        }),
-        cert: non_empty(cert_file).map(|p| {
-            let (t, len) = file_stat(p).map_or((None, 0), |(t, len)| (Some(t), len));
-            (p.to_string(), t, len)
-        }),
-        key: non_empty(key_file).map(|p| {
-            let (t, len) = file_stat(p).map_or((None, 0), |(t, len)| (Some(t), len));
-            (p.to_string(), t, len)
-        }),
+        ca: non_empty(ca_file).map(|p| (p.to_string(), file_hash(p))),
+        cert: non_empty(cert_file).map(|p| (p.to_string(), file_hash(p))),
+        key: non_empty(key_file).map(|p| (p.to_string(), file_hash(p))),
     }
 }
 
@@ -539,12 +546,27 @@ fn connector_build_count() -> usize {
 /// CA file is given (InsecureSkipVerify=true, matching Go frp's default for
 /// auto-generated self-signed certs). With `ca_file`, verify against it
 /// (mTLS when client cert/key are also provided). The most recent connector
-/// is cached per (path, mtime) — see [`ConnectorKey`].
+/// is cached per (path, content hash) — see [`ConnectorKey`]. When no CA file
+/// is configured, a per-connection MITM warning is logged (see the fn body).
 pub fn build_tls_connector_skip_verify(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
     key_file: Option<&str>,
 ) -> Result<TlsConnector, crate::Error> {
+    // Warn per TLS-enabled connection (not once per process at connector
+    // build — the connector is cached, so the build-time log was easy to
+    // miss). Fires for every dial that lands on the insecure skip-verify
+    // default, i.e. whenever no CA file is configured. A rate limit for
+    // busy deployments belongs to the log-flooding gates (audit-fix task 11).
+    if non_empty(ca_file).is_none() {
+        tracing::error!(
+            "TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
+             All control and data-plane traffic is vulnerable to MITM attacks and \
+             authentication credentials can be captured and replayed. \
+             For production, set tls.ca_file (frpc: tls.trusted_ca_file) to a CA \
+             that signed the server certificate to enable verification."
+        );
+    }
     let key = connector_key(ca_file, cert_file, key_file);
     if let Some((cached_key, cached)) = CONNECTOR_CACHE
         .read()
@@ -621,13 +643,6 @@ fn build_tls_connector_skip_verify_inner(
         // PRODUCTION WARNING: this means TLS connections are vulnerable to
         // man-in-the-middle attacks. Any intermediate node can intercept
         // and decrypt the control + data-plane traffic.
-        tracing::error!(
-            "TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
-             All control and data-plane traffic is vulnerable to MITM attacks and \
-             authentication credentials can be captured and replayed. \
-             For production, set tls.ca_file (frpc: tls.trusted_ca_file) to a CA \
-             that signed the server certificate to enable verification."
-        );
         let verifier = Arc::new(InsecureSkipVerify);
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
             if !cert_path.is_empty() && !key_path.is_empty() {
@@ -862,7 +877,7 @@ mod connector_cache_tests {
             "second call with identical args must hit the cache"
         );
 
-        // 2) mtime change → new key → rebuild.
+        // 2) content change → new key → rebuild.
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, dummy_ca_pem()).unwrap();
@@ -875,10 +890,11 @@ mod connector_cache_tests {
             before + 1,
             "unchanged CA must hit cache"
         );
-        // 2) mtime/size change → new key → rebuild. Sleep past the mtime
-        //    granularity window (1s on ext4/apfs, 2s on FAT).
-        std::thread::sleep(std::time::Duration::from_millis(2100));
-        std::fs::write(&ca_path, dummy_ca_pem()).unwrap();
+        // 2) content change → new key → rebuild. The key hashes file
+        //    *contents*, so even a same-size rewrite inside the mtime
+        //    granularity window (which the old mtime+size key could miss)
+        //    invalidates the cache entry.
+        std::fs::write(&ca_path, dummy_ca_pem().replace("MIID", "MIIE")).unwrap();
         let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
         assert_eq!(
             connector_build_count(),
