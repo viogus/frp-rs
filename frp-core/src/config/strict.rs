@@ -258,6 +258,7 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
             "tokenAuthTimeout",
             "additional_auth_scopes",
             "additionalScopes",
+            "additionalAuthScopes",
             "use_encryption",
             // Server-side OIDC flat fields
             "oidc_issuer",
@@ -328,6 +329,9 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
             "tcp_keepalive",
             "tcpKeepalive",
             "quic",
+            // Go frp wireProtocol v2 is expressed as `v2 = true`; the compat
+            // suite appends it inside [transport] (audit task 9 fix round 1).
+            "v2",
         ],
         "quic" => &[
             "keepalive_period",

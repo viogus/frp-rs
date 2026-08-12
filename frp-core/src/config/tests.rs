@@ -3124,7 +3124,8 @@ tokenz = "secret"
 #[test]
 fn test_strict_accepts_go_section_keys() {
     // Go-valid keys inside known sections must pass strict mode
-    // (audit task 9 findings 1+2).
+    // (audit task 9 findings 1+2, fix round 1: auth.additionalAuthScopes and
+    // transport.v2 — both used by scripts/compat-test.sh).
     let mut server_file = tempfile::NamedTempFile::new().unwrap();
     server_file
         .write_all(
@@ -3144,6 +3145,11 @@ pprofEnable = true
 tcpMux = true
 heartbeatTimeout = 90
 tcpKeepalive = 7200
+v2 = true
+
+[auth]
+token = "secret"
+additionalAuthScopes = ["HeartBeats", "NewWorkConns"]
 
 [ssh_tunnel_gateway]
 bindPort = 2200
@@ -3162,6 +3168,32 @@ allowNoneAuth = false
     assert_eq!(cfg.transport.heartbeat_timeout, 90);
     assert_eq!(cfg.transport.tcp_keepalive, 7200);
     assert_eq!(cfg.ssh_tunnel_gateway.bind_port, 2200);
+    assert_eq!(
+        cfg.auth.additional_auth_scopes,
+        vec!["HeartBeats".to_string(), "NewWorkConns".to_string()]
+    );
+
+    // Same on the client side (compat test_auth_r2g_heartbeats writes
+    // additionalAuthScopes under [auth] in frpc.toml).
+    let mut client_file = tempfile::NamedTempFile::new().unwrap();
+    client_file
+        .write_all(
+            br#"server_addr = "127.0.0.1"
+[auth]
+method = "token"
+token = "secret"
+additionalAuthScopes = ["HeartBeats"]
+"#,
+        )
+        .unwrap();
+    let cfg = load_client_config(client_file.path().to_str().unwrap(), true).unwrap();
+    assert_eq!(
+        cfg.auth
+            .as_ref()
+            .map(|a| a.additional_auth_scopes.clone())
+            .unwrap_or_default(),
+        vec!["HeartBeats".to_string()]
+    );
 }
 
 #[test]
