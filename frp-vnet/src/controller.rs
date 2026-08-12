@@ -16,6 +16,17 @@ use frp_core::base64::encode as b64_encode;
 use crate::router::RouteTable;
 use crate::tun::TunDevice;
 
+/// Size of the TUN read buffer for a given MTU.
+///
+/// macOS utun prepends a 4-byte AF header to every packet, so a
+/// full-size packet occupies `mtu + 4` bytes on the wire. Sizing the
+/// buffer exactly `mtu` truncates the tail of every full-size packet
+/// by 4 bytes. The extra 4 bytes are harmless on platforms without
+/// the header.
+fn tun_read_buf_len(mtu: u16) -> usize {
+    mtu as usize + 4
+}
+
 /// Manages a TUN device ↔ frp work connection packet loop.
 pub struct VnetController {
     /// Shared client-side controller: routing table plus server-conn registry.
@@ -76,8 +87,7 @@ impl VnetController {
         ctl_writer: Arc<dyn frp_core::ControlSink>,
         mut tun_packet_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
-        let mtu = tun.mtu() as usize;
-        let mut tun_buf = vec![0u8; mtu];
+        let mut tun_buf = vec![0u8; tun_read_buf_len(tun.mtu())];
 
         loop {
             tokio::select! {
@@ -115,7 +125,11 @@ impl VnetController {
                                     continue;
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    self.client.unregister_server_conn(&dst_ip);
+                                    // Only drop the registration if it still refers to
+                                    // the channel that closed; a newer connection may
+                                    // have registered the same dst_ip since.
+                                    self.client
+                                        .unregister_server_conn_if_matches(&dst_ip, &server_tx);
                                 }
                             }
                         }
@@ -634,6 +648,71 @@ mod tests {
             }
             other => panic!("expected VnetPacket, got type {}", other.v1_type_byte()),
         }
+
+        drop(tun_packet_tx);
+        drop(tun_peer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+    }
+
+    #[test]
+    fn tun_read_buf_len_reserves_room_for_macos_af_header() {
+        // macOS utun delivers [4-byte AF header][packet], so a full-size
+        // packet occupies mtu + 4 bytes; sizing the buffer exactly `mtu`
+        // would truncate the packet tail by 4 bytes.
+        assert_eq!(tun_read_buf_len(1500), 1504);
+        assert_eq!(tun_read_buf_len(1420), 1424);
+        assert_eq!(tun_read_buf_len(0), 4);
+    }
+
+    #[tokio::test]
+    async fn controller_cleans_up_closed_server_conn_without_clobbering_newer_registration() {
+        let client = Arc::new(ClientVnetController::new());
+        let remote_ip = IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1));
+
+        let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
+        let tun = Box::new(FakeTun { inner: tun_stream });
+        let writer = test_sink();
+        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let ctrl = VnetController::new(
+            "plugin-proxy".to_string(),
+            client.clone(),
+            false,
+            String::new(),
+        );
+        let handle = tokio::spawn(async move {
+            ctrl.run(tun, writer, tun_packet_rx).await.unwrap();
+        });
+
+        // A packet destined for remote_ip arrives while the registered
+        // server conn is already closed: the Closed error must clean up
+        // exactly that (matching) registration.
+        let (tx1, rx1) = mpsc::channel::<Vec<u8>>(16);
+        client.register_server_conn(remote_ip, tx1);
+        drop(rx1);
+        let packet = vec![
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 100, 86, 0, 2,
+            100, 86, 0, 1,
+        ];
+        tun_peer.write_all(&packet).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if client.server_conn_sender(&remote_ip).is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closed server conn was never unregistered");
+        assert!(client.server_conn_sender(&remote_ip).is_none());
+
+        // A newer registration under the same IP must not be clobbered by
+        // the stale closed channel: packets reach it and it stays registered.
+        let (tx2, mut rx2) = mpsc::channel::<Vec<u8>>(16);
+        client.register_server_conn(remote_ip, tx2);
+        tun_peer.write_all(&packet).await.unwrap();
+        assert_eq!(rx2.recv().await, Some(packet.clone()));
+        assert!(client.server_conn_sender(&remote_ip).is_some());
 
         drop(tun_packet_tx);
         drop(tun_peer);

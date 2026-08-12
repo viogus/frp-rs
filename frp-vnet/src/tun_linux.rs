@@ -8,6 +8,15 @@ use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 
 use super::tun::TunDevice;
 
+/// Number of interface-name bytes to copy into an `ifreq.ifr_name`.
+///
+/// The kernel requires NUL-terminated names, so at most `IFNAMSIZ - 1`
+/// bytes are copied; the final byte stays zero (the `ifreq` is
+/// zero-initialized at every call site).
+fn ifr_name_copy_len(name_len: usize) -> usize {
+    name_len.min(libc::IFNAMSIZ - 1)
+}
+
 /// Linux TUN device using /dev/net/tun.
 pub struct LinuxTun {
     async_fd: AsyncFd<OwnedFd>,
@@ -44,7 +53,7 @@ impl LinuxTun {
             bytes.push(0);
             bytes
         };
-        let copy_len = name_bytes.len().min(libc::IFNAMSIZ);
+        let copy_len = ifr_name_copy_len(name_bytes.len());
         for (dst, src) in ifr.ifr_name[..copy_len]
             .iter_mut()
             .zip(&name_bytes[..copy_len])
@@ -156,7 +165,7 @@ impl TunDevice for LinuxTun {
         // representation for this C struct.
         let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
         let name_bytes = self.name.as_bytes();
-        let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
+        let copy_len = ifr_name_copy_len(name_bytes.len());
         for (dst, src) in ifr.ifr_name[..copy_len]
             .iter_mut()
             .zip(&name_bytes[..copy_len])
@@ -265,15 +274,23 @@ impl AsyncRead for LinuxTun {
             let dst = buf.initialize_unfilled();
             match guard.try_io(|fd| {
                 let fd = fd.as_raw_fd();
-                // SAFETY: fd is the TUN device fd, registered with
-                // AsyncFd for readiness; dst is initialized_unfilled
-                // with correct length; read() is a standard POSIX call.
-                let n = unsafe { libc::read(fd, dst.as_mut_ptr() as *mut _, dst.len()) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
+                let n = loop {
+                    // SAFETY: fd is the TUN device fd, registered with
+                    // AsyncFd for readiness; dst is initialized_unfilled
+                    // with correct length; read() is a standard POSIX call.
+                    let n = unsafe { libc::read(fd, dst.as_mut_ptr() as *mut _, dst.len()) };
+                    if n >= 0 {
+                        break n;
+                    }
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        // EINTR: a signal interrupted the syscall before
+                        // any bytes were read; retry rather than erroring.
+                        continue;
+                    }
+                    return Err(err);
+                };
+                Ok(n as usize)
             }) {
                 Ok(Ok(n)) => {
                     buf.advance(n);
@@ -301,15 +318,23 @@ impl AsyncWrite for LinuxTun {
 
             match guard.try_io(|fd| {
                 let fd = fd.as_raw_fd();
-                // SAFETY: fd is the TUN device fd, registered with
-                // AsyncFd for readiness; buf is a valid read-only
-                // slice with correct length; write() is standard POSIX.
-                let n = unsafe { libc::write(fd, buf.as_ptr() as *const _, buf.len()) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
+                let n = loop {
+                    // SAFETY: fd is the TUN device fd, registered with
+                    // AsyncFd for readiness; buf is a valid read-only
+                    // slice with correct length; write() is standard POSIX.
+                    let n = unsafe { libc::write(fd, buf.as_ptr() as *const _, buf.len()) };
+                    if n >= 0 {
+                        break n;
+                    }
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        // EINTR: a signal interrupted the syscall before
+                        // any bytes were written; retry rather than erroring.
+                        continue;
+                    }
+                    return Err(err);
+                };
+                Ok(n as usize)
             }) {
                 Ok(Ok(n)) => return Poll::Ready(Ok(n)),
                 Ok(Err(e)) => return Poll::Ready(Err(e)),
@@ -323,5 +348,21 @@ impl AsyncWrite for LinuxTun {
     }
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ifr_name_copy_len_leaves_room_for_nul_terminator() {
+        assert_eq!(ifr_name_copy_len(0), 0);
+        assert_eq!(ifr_name_copy_len(5), 5);
+        assert_eq!(ifr_name_copy_len(libc::IFNAMSIZ - 1), libc::IFNAMSIZ - 1);
+        // Names at or beyond the buffer size are truncated to
+        // IFNAMSIZ - 1, leaving the last byte zero (NUL terminator).
+        assert_eq!(ifr_name_copy_len(libc::IFNAMSIZ), libc::IFNAMSIZ - 1);
+        assert_eq!(ifr_name_copy_len(64), libc::IFNAMSIZ - 1);
     }
 }

@@ -243,6 +243,10 @@ impl AsyncRead for MacOSTun {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Count of consecutive header-only reads (n <= 4: AF header with
+        // no payload) within this poll; bounds the retry so a pathological
+        // kernel cannot spin this task forever.
+        let mut header_only_reads = 0u8;
         loop {
             let mut guard = match self.async_fd.poll_read_ready(cx) {
                 Poll::Ready(Ok(g)) => g,
@@ -253,15 +257,23 @@ impl AsyncRead for MacOSTun {
             let dst = buf.initialize_unfilled();
             match guard.try_io(|fd| {
                 let fd = fd.as_raw_fd();
-                // SAFETY: fd is the utun fd registered with AsyncFd for
-                // readiness; dst is initialized_unfilled with correct
-                // length; read() is a standard POSIX call.
-                let n = unsafe { libc::read(fd, dst.as_mut_ptr() as *mut _, dst.len()) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
+                let n = loop {
+                    // SAFETY: fd is the utun fd registered with AsyncFd
+                    // for readiness; dst is initialized_unfilled with
+                    // correct length; read() is a standard POSIX call.
+                    let n = unsafe { libc::read(fd, dst.as_mut_ptr() as *mut _, dst.len()) };
+                    if n >= 0 {
+                        break n;
+                    }
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        // EINTR: a signal interrupted the syscall before
+                        // any bytes were read; retry rather than erroring.
+                        continue;
+                    }
+                    return Err(err);
+                };
+                Ok(n as usize)
             }) {
                 Ok(Ok(n)) => {
                     if n == 0 {
@@ -270,9 +282,17 @@ impl AsyncRead for MacOSTun {
                         return Poll::Ready(Ok(()));
                     }
                     // macOS utun prepends a 4-byte AF header (AF_INET=2).
-                    // Short read (n <= 4 means no packet data after AF header).
-                    // Continue the read loop instead of returning 0 (which signals EOF).
+                    // A read of just the header (n <= 4) carries no packet;
+                    // retry a bounded number of times, then surface an
+                    // error instead of spinning on the ready fd.
                     if n <= 4 {
+                        header_only_reads += 1;
+                        if header_only_reads >= 4 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "utun returned repeated header-only reads",
+                            )));
+                        }
                         continue;
                     }
                     let actual = n - 4;
@@ -302,22 +322,48 @@ impl AsyncWrite for MacOSTun {
 
             match guard.try_io(|fd| {
                 let fd = fd.as_raw_fd();
-                // Prepend 4-byte AF header: AF_INET = 2 in network byte order
+                // Prepend the 4-byte AF header (AF_INET = 2 in network
+                // byte order) with a single writev: header and payload
+                // form one datagram without a per-packet heap allocation.
                 let header: [u8; 4] = [0, 0, 0, 2];
-                let mut packet = Vec::with_capacity(4 + buf.len());
-                packet.extend_from_slice(&header);
-                packet.extend_from_slice(buf);
-                // SAFETY: fd is the utun fd registered with AsyncFd for
-                // readiness; packet is a Vec with correct length including
-                // the 4-byte AF header; write() is standard POSIX.
-                let n = unsafe { libc::write(fd, packet.as_ptr() as *const _, packet.len()) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else if n < 4 {
-                    Err(io::Error::new(io::ErrorKind::WriteZero, "TUN short write"))
+                let iovs = [
+                    libc::iovec {
+                        iov_base: header.as_ptr() as *mut libc::c_void,
+                        iov_len: header.len(),
+                    },
+                    libc::iovec {
+                        iov_base: buf.as_ptr() as *mut libc::c_void,
+                        iov_len: buf.len(),
+                    },
+                ];
+                let n = loop {
+                    // SAFETY: fd is the utun fd registered with AsyncFd
+                    // for readiness; iovs are stack-live for the duration
+                    // of the call; writev is standard POSIX and sends the
+                    // AF header and payload as one datagram.
+                    let n = unsafe { libc::writev(fd, iovs.as_ptr(), 2) };
+                    if n >= 0 {
+                        break n;
+                    }
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        // EINTR: a signal interrupted the syscall before
+                        // any bytes were written; retry rather than erroring.
+                        continue;
+                    }
+                    return Err(err);
+                };
+                // utun is a datagram socket: a partial write would split
+                // one packet in two, each with its own AF header, and
+                // corrupt the stream. Treat anything short of the full
+                // datagram as an error.
+                if n as usize != 4 + buf.len() {
+                    Err(io::Error::new(io::ErrorKind::WriteZero, "utun short write"))
                 } else {
-                    // Subtract 4-byte AF header; return original payload bytes written
-                    Ok(n as usize - 4)
+                    // The 4 AF header bytes are not payload; report the
+                    // full payload length so write_all-style callers
+                    // advance past the entire packet.
+                    Ok(buf.len())
                 }
             }) {
                 Ok(Ok(n)) => return Poll::Ready(Ok(n)),
