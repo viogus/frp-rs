@@ -60,6 +60,33 @@ fn shutdown_write(dst_fd: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Run one splice direction, propagating the FIN to `dst` when the
+/// direction fails.
+///
+/// The loop below returns `Err` without telling `dst` that no more bytes
+/// will follow (e.g. the source errored with `ECONNRESET`). That leaves a
+/// peer waiting for our EOF — a half-duplex exchange where the response
+/// direction is parked on a live-but-silent connection — hanging. Shutting
+/// down the write half of `dst` on the error path lets that peer terminate
+/// instead. A shutdown error is secondary to the direction's own error, so
+/// it is dropped with a comment (matching the `let _ =` discipline
+/// elsewhere).
+async fn splice_direction(
+    src: &AsyncFd<OwnedFd>,
+    pipe_rd: &AsyncFd<OwnedFd>,
+    pipe_wr: &AsyncFd<OwnedFd>,
+    dst: &AsyncFd<OwnedFd>,
+    counter: &AtomicU64,
+) -> io::Result<()> {
+    let result = splice_direction_loop(src, pipe_rd, pipe_wr, dst, counter).await;
+    if result.is_err() {
+        // Tell dst that no more bytes will follow so a peer waiting for our
+        // EOF terminates instead of hanging on a live-but-silent conn.
+        let _ = shutdown_write(dst.get_ref().as_raw_fd());
+    }
+    result
+}
+
 /// Relay data from `src` through a pipe to `dst`.
 ///
 /// Phase A: `splice(src → pipe_wr)` to move data into the kernel pipe.
@@ -87,7 +114,7 @@ fn shutdown_write(dst_fd: libc::c_int) -> io::Result<()> {
 ///   that never yields to the runtime. The cleared bit forces
 ///   re-registration with epoll, which parks the task until the fd
 ///   truly becomes ready again.
-async fn splice_direction(
+async fn splice_direction_loop(
     src: &AsyncFd<OwnedFd>,
     pipe_rd: &AsyncFd<OwnedFd>,
     pipe_wr: &AsyncFd<OwnedFd>,
@@ -289,7 +316,21 @@ async fn splice_direction(
 /// Returns `(bytes_user_to_work, bytes_work_to_user)`.
 ///
 /// Both TCP streams are consumed. Two kernel pipe pairs are created (one per
-/// direction). The two direction futures run concurrently via `tokio::join!`.
+/// direction). The two direction futures run concurrently; the first
+/// completion wins:
+/// - a **clean EOF** (half-close) in one direction keeps the opposite
+///   direction running so it can carry the response — matching
+///   `tokio::io::copy_bidirectional` and the half-close semantics of
+///   `splice_direction`;
+/// - an **error** in one direction immediately cancels the sibling (its
+///   future is dropped) and propagates — previously the sibling was left
+///   running on a live-but-silent connection, hanging the bridge forever
+///   (`tokio::join!` waits for both).
+enum Side {
+    UserToWork,
+    WorkToUser,
+}
+
 pub async fn bridge_splice(
     user: tokio::net::TcpStream,
     work: tokio::net::TcpStream,
@@ -316,18 +357,39 @@ pub async fn bridge_splice(
     let u2w_count = AtomicU64::new(0);
     let w2u_count = AtomicU64::new(0);
 
-    // Step 5: Run both directions concurrently on the same task.
-    let (res1, res2) = tokio::join!(
-        splice_direction(&user_async, &u2w_r, &u2w_w, &work_async, &u2w_count),
-        splice_direction(&work_async, &w2u_r, &w2u_w, &user_async, &w2u_count),
-    );
+    // Step 5: Run both directions concurrently on the same task. First
+    // completion wins; the loser is dropped when the select completes.
+    let u2w_fut = splice_direction(&user_async, &u2w_r, &u2w_w, &work_async, &u2w_count);
+    let w2u_fut = splice_direction(&work_async, &w2u_r, &w2u_w, &user_async, &w2u_count);
+    // The pinned futures borrow the counters below; the block scopes them so
+    // the pins (and their borrows) are dropped before the counts are read.
+    {
+        let mut u2w = std::pin::pin!(u2w_fut);
+        let mut w2u = std::pin::pin!(w2u_fut);
+        let first: io::Result<Side> = tokio::select! {
+            r = u2w.as_mut() => r.map(|()| Side::UserToWork),
+            r = w2u.as_mut() => r.map(|()| Side::WorkToUser),
+        };
 
-    // Step 6: Propagate first error; return byte counts.
+        match first {
+            // Error: cancel the sibling by dropping its future and return
+            // immediately — the caller closes both connections.
+            Err(e) => return Err(e),
+            // Clean half-close: splice_direction already propagated the FIN
+            // to the peer. Keep the response direction alive until it
+            // finishes.
+            Ok(Side::UserToWork) => {
+                w2u.await?;
+            }
+            Ok(Side::WorkToUser) => {
+                u2w.await?;
+            }
+        }
+    }
+
+    // Step 6: Return byte counts.
     // Drop order: pipe AsyncFds → pipe OwnedFds (pipe fds closed) →
     // socket AsyncFds → socket OwnedFds (socket fds closed). Single owner each.
-    res1?;
-    res2?;
-
     Ok((u2w_count.into_inner(), w2u_count.into_inner()))
 }
 
@@ -499,6 +561,70 @@ mod tests {
             Ok(Err(join_err)) => panic!("join error: {}", join_err),
             Err(_timeout) => panic!("bridge_splice timed out under backpressure"),
         }
+    }
+
+    /// An error in one direction must terminate the whole bridge promptly:
+    /// the sibling direction is parked on a live-but-silent peer and would
+    /// otherwise hang forever (the join!-based implementation waited for
+    /// both directions — audit fix: select + drop loser on first error).
+    #[tokio::test]
+    async fn test_bridge_splice_error_cancels_sibling() {
+        let ((bridge_user, test_user), (bridge_work, mut test_work)) =
+            socket_pairs().await.expect("socket pairs");
+
+        let handle = tokio::spawn(async move { bridge_splice(bridge_user, bridge_work).await });
+
+        // Prove the user→work direction is live before killing the user side.
+        let mut t_user = test_user;
+        t_user.write_all(b"hello").await.expect("write to user");
+        let mut buf = [0u8; 5];
+        test_work
+            .read_exact(&mut buf)
+            .await
+            .expect("work should receive user data");
+        assert_eq!(&buf, b"hello");
+
+        // Hard-reset the user side while the work side stays open and
+        // silent: the work→user direction is parked on it and must be
+        // cancelled by the u2w error instead of waiting forever. Pump a
+        // 64 KiB burst to the user side and wait (FIONREAD) until ALL of it
+        // is queued in test_user's receive buffer — closing with unread
+        // data deterministically produces an RST (not a FIN), regardless of
+        // kernel buffer timing.
+        use std::os::fd::AsRawFd;
+        let payload = vec![0x42u8; 64 * 1024];
+        test_work
+            .write_all(&payload)
+            .await
+            .expect("write burst to user");
+        let user_fd = t_user.as_raw_fd();
+        let mut pending: libc::c_int = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                // SAFETY: user_fd is a live fd owned by t_user for the
+                // duration of this call; FIONREAD writes the number of
+                // queued bytes into `pending`. The pointer is not retained
+                // after the call returns.
+                unsafe { libc::ioctl(user_fd, libc::FIONREAD, &mut pending) };
+                if pending as usize >= payload.len() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all bytes must be queued at the user side");
+        drop(t_user); // close with unread data in the receive buffer → RST
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            Ok(Ok(Err(_e))) => {
+                // Error propagated; sibling cancelled. Success.
+            }
+            Ok(Ok(Ok(_))) => panic!("bridge_splice should report the reset as an error"),
+            Ok(Err(join_err)) => panic!("join error: {}", join_err),
+            Err(_timeout) => panic!("bridge_splice hung on dead sibling"),
+        }
+        drop(test_work);
     }
 
     /// A client half-close must become a FIN at the backend only after all

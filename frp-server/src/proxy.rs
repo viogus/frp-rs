@@ -582,14 +582,29 @@ impl ProxyManager {
 
     /// Select a backend from a group and return both the backend name and its run_id.
     /// Returns `None` if the group has no suitable backends.
+    ///
+    /// Cheap guard for the removal race (audit fix): a backend can be
+    /// unregistered between the group-member read and the run_id lookup
+    /// (client disconnect mid-selection), which would otherwise yield an
+    /// empty run_id and drop the user conn instead of falling back. Retry
+    /// once so the next member is picked; a backend that is still stale on
+    /// the second pass is genuinely gone and `None` lets the caller fall
+    /// back to the originating proxy.
     pub async fn select_group_backend_with_run_id(
         &self,
         group: &str,
         group_key: &str,
     ) -> Option<(String, String)> {
-        let backend = self.select_group_backend(group, group_key).await?;
-        let run_id = self.get_run_id(&backend).await.unwrap_or_default();
-        Some((backend, run_id))
+        for _ in 0..2 {
+            let backend = self.select_group_backend(group, group_key).await?;
+            if let Some(run_id) = self.get_run_id(&backend).await {
+                return Some((backend, run_id));
+            }
+            // Backend vanished between the group read and the run_id lookup;
+            // loop to pick another member (round-robin advances, group_key
+            // affinity re-picks — both bounded by the second pass).
+        }
+        None
     }
 
     pub async fn list(&self) -> Vec<Arc<ProxyInfo>> {
@@ -886,5 +901,74 @@ mod tests {
         );
         // Drop the listener to avoid test pollution
         drop(listener);
+    }
+
+    fn test_proxy_info(name: &str, run_id: &str, group: Option<String>) -> ProxyInfo {
+        ProxyInfo {
+            name: name.to_string(),
+            proxy_type: "tcp".into(),
+            run_id: run_id.to_string(),
+            control_id: 1,
+            remote_port: Some(24000),
+            sk: None,
+            group,
+            group_key: None,
+            local_addr: Some("127.0.0.1:8080".into()),
+            use_encryption: false,
+            use_compression: false,
+            virtual_net: None,
+            allow_users: Vec::new(),
+            proxy_protocol_version: String::new(),
+            response_headers: std::collections::HashMap::new(),
+            custom_domains: Vec::new(),
+            route_by_http_user: String::new(),
+            multiplexer: String::new(),
+            bandwidth_limit: String::new(),
+            bandwidth_limit_mode: String::new(),
+            user: String::new(),
+            user_conn_sem: None,
+        }
+    }
+
+    /// A backend removed between the group read and the run_id lookup (the
+    /// remove() race window: `proxies` is swept before `groups`) must not
+    /// yield a selection with an empty run_id — the cheap guard retries and
+    /// then returns None so the caller falls back to the originating proxy.
+    #[tokio::test]
+    async fn select_group_backend_with_run_id_never_returns_empty_run_id() {
+        let mgr = ProxyManager::new();
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("a", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register a");
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("b", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register b");
+
+        // Normal selection returns a live backend with its run_id.
+        let sel = mgr
+            .select_group_backend_with_run_id("g", "")
+            .await
+            .expect("group must select");
+        assert!(
+            !sel.1.is_empty(),
+            "live backend must carry a non-empty run_id: {sel:?}"
+        );
+
+        // Simulate the race-window state directly (test module has access):
+        // all members are still listed in the group index but gone from the
+        // proxies map — exactly what remove() leaves between its two sweeps.
+        mgr.proxies.remove("a");
+        mgr.proxies.remove("b");
+        let sel = mgr.select_group_backend_with_run_id("g", "").await;
+        assert!(
+            sel.is_none(),
+            "stale members must not yield Some((_, empty run_id)): {sel:?}"
+        );
     }
 }

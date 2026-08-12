@@ -23,7 +23,7 @@ use frp_core::mux::IncomingStreams;
 use crate::lock::RwLockExt;
 use crate::state::{AppState, ControlTx, InternalMsg, PoolStats};
 
-use super::pool::{PendingRequest, PoolEntry, WORK_POOL_EXTRA};
+use super::pool::{PendingRequest, PoolEntry, WORK_POOL_ABS_CEILING, WORK_POOL_EXTRA};
 use super::proxy_ops::{err_msg, unregister_control};
 use super::{write_ctl_msg, ControlContext, ControlState};
 
@@ -37,6 +37,21 @@ pub(crate) fn authenticated_user(
     _oidc_subject: Option<&str>,
 ) -> String {
     claimed_user.unwrap_or_default().to_string()
+}
+
+/// Clamp the client's requested pool_count against the server-side
+/// `max_pool_count`, and against the absolute ceiling `WORK_POOL_ABS_CEILING`
+/// when `max_pool_count` is unset (0) — the client must not be able to make
+/// the server pool an unbounded number of work conns (audit fix). Go frp
+/// treats poolCount < 1 as 1.
+fn capped_pool_count(pool_count: Option<i32>, max_pool_count: i64) -> usize {
+    let raw = pool_count.unwrap_or(1).max(1) as i64;
+    let capped = if max_pool_count > 0 {
+        raw.min(max_pool_count)
+    } else {
+        raw.min(WORK_POOL_ABS_CEILING as i64)
+    };
+    capped.max(1) as usize
 }
 
 async fn remove_oidc_subject_generation(state: &AppState, run_id: &str, control_id: u64) {
@@ -727,12 +742,7 @@ pub(crate) async fn authenticate(
     // both protocols benefit from pre-warmed work connections.
     {
         let max_pool = state.server_config_snapshot.max_pool_count;
-        let raw_pool = login.pool_count.unwrap_or(1).max(1) as i64;
-        let pool_count = if max_pool > 0 {
-            raw_pool.min(max_pool)
-        } else {
-            raw_pool
-        } as usize;
+        let pool_count = capped_pool_count(login.pool_count, max_pool);
         info!(peer = ?peer, pool_count = pool_count, max_pool_count = max_pool, "Sending ReqWorkConn x{} through encrypted stream", pool_count);
         for i in 0..pool_count {
             // writer is already the encrypted write half (CipherStream or AeadStream).
@@ -751,14 +761,10 @@ pub(crate) async fn authenticate(
     }
 
     // --- Per-client state ---
-    let max_pool = state.server_config_snapshot.max_pool_count;
-    let raw_pool = login.pool_count.unwrap_or(1).max(0) as i64;
-    let capped_pool = if max_pool > 0 {
-        raw_pool.min(max_pool)
-    } else {
-        raw_pool
-    } as usize;
-    let pool_cap = capped_pool + WORK_POOL_EXTRA;
+    let pool_cap = capped_pool_count(
+        login.pool_count,
+        state.server_config_snapshot.max_pool_count,
+    ) + WORK_POOL_EXTRA;
     let work_pool: VecDeque<PoolEntry> = VecDeque::new();
     let pending_requests: VecDeque<PendingRequest> = VecDeque::new();
     let pending_udp: VecDeque<(String, Instant)> = VecDeque::new();
@@ -946,5 +952,33 @@ mod auth_signal_tests {
         assert!(result.is_err());
         assert!(rx.await.is_err(), "bad token must drop the unsent signal");
         drain.abort();
+    }
+}
+
+#[cfg(test)]
+mod pool_count_tests {
+    use super::capped_pool_count;
+    use crate::control::pool::WORK_POOL_ABS_CEILING;
+
+    #[test]
+    fn unset_max_pool_count_clamps_to_absolute_ceiling() {
+        // max_pool_count = 0 (unset): the client's pool_count must not be
+        // able to make the server pool unbounded work conns (audit fix).
+        assert_eq!(capped_pool_count(Some(100_000), 0), WORK_POOL_ABS_CEILING);
+        assert_eq!(capped_pool_count(Some(65_000), 0), WORK_POOL_ABS_CEILING);
+        // Below the ceiling: honored as requested.
+        assert_eq!(capped_pool_count(Some(5), 0), 5);
+        assert_eq!(capped_pool_count(None, 0), 1);
+        // Go frp treats poolCount < 1 as 1.
+        assert_eq!(capped_pool_count(Some(0), 0), 1);
+    }
+
+    #[test]
+    fn configured_max_pool_count_wins() {
+        assert_eq!(capped_pool_count(Some(100_000), 50), 50);
+        assert_eq!(capped_pool_count(Some(5), 50), 5);
+        assert_eq!(capped_pool_count(None, 50), 1);
+        // The configured cap still applies above the absolute ceiling.
+        assert_eq!(capped_pool_count(Some(100_000), 10_000), 10_000);
     }
 }

@@ -584,14 +584,14 @@ async fn handle_http1_request<S>(
     // The vhost listener's single read may be short (e.g. an h2c-misdetected
     // HTTP/1.1 request): keep reading until the head terminator or the cap.
     let timeout_secs = state.vhost_http_timeout.max(1);
+    // Single absolute deadline for the whole head (audit fix): a slow-drip
+    // client sending one byte per read window would otherwise stretch the
+    // head read to 4096 × timeout. The whole head must arrive within
+    // vhost_http_timeout, matching Go frp's connReadTimeout semantics.
+    let head_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while pre_read.len() < 4096 && !pre_read.windows(4).any(|w| w == b"\r\n\r\n") {
         let mut buf = [0u8; 4096];
-        let m = match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            stream.read(&mut buf),
-        )
-        .await
-        {
+        let m = match tokio::time::timeout_at(head_deadline, stream.read(&mut buf)).await {
             Ok(Ok(m)) if m > 0 => m,
             _ => break,
         };
@@ -614,14 +614,25 @@ async fn handle_http1_request<S>(
     // `host`/`path` must still be owned Strings: `pre_read` is moved by
     // value into `resolve_vhost_request` below, so we cannot keep references
     // into it across that call.
+    // Only the header block up to the first \r\n\r\n is parsed (audit fix):
+    // bytes past the terminator are entity body or pipelined requests and
+    // must not influence routing/auth — a body line like
+    // "authorization: Basic ..." must not authenticate the request. Same
+    // bound as inject_vhost_request_headers below.
     // Zero-allocation parse for the common ASCII case; fall back to lossy
     // replacement for non-UTF-8 heads. A 400 here would diverge from Go frp,
     // which tolerates obs-text (0x80-0xFF) bytes in header values.
+    let head_end = pre_read
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(pre_read.len());
+    let head = &pre_read[..head_end];
     let request_text_cow;
-    let request_text: &str = match std::str::from_utf8(&pre_read) {
+    let request_text: &str = match std::str::from_utf8(head) {
         Ok(t) => t,
         Err(_) => {
-            request_text_cow = String::from_utf8_lossy(&pre_read);
+            request_text_cow = String::from_utf8_lossy(head);
             &request_text_cow
         }
     };
@@ -632,6 +643,14 @@ async fn handle_http1_request<S>(
             return;
         }
     };
+    // RFC 7230 §5.4: a request with more than one Host header is invalid.
+    // Go's net/http server (which Go frp uses for vhost routing) rejects
+    // such requests with 400; forwarding duplicates verbatim would let a
+    // second Host shadow the routed proxy's host_header_rewrite.
+    if count_host_headers(request_text) > 1 {
+        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        return;
+    }
     let path = extract_path(request_text).unwrap_or("/").to_string();
 
     // Parse Basic Auth once — reused for route matching, auth check,
@@ -1056,17 +1075,28 @@ fn extract_path(request: &str) -> Option<&str> {
 /// Returns a new Vec<u8> with the rewritten header. When no Host header is
 /// present, the input is returned unchanged (ownership transferred, no copy).
 fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
-    // Search for \r\nHost: anywhere in the request data, plus first-line Host:
+    // Only the header block up to the first \r\n\r\n is scanned (audit fix):
+    // bytes past the terminator are entity body / pipelined requests and
+    // must not be rewritten — a body containing "\r\nhost: evil" must never
+    // be mutated, and a head without a Host header must not rewrite a body
+    // line. Same bound as inject_vhost_request_headers.
+    let head_end = data
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(data.len());
+    let head = &data[..head_end];
+    // Search for \r\nHost: anywhere in the head, plus first-line Host:
     let host_pos = {
         // First check if Host: is the very first header (no leading \r\n)
-        let first_line = if data.len() >= 5 && data[..5].eq_ignore_ascii_case(b"host:") {
+        let first_line = if head.len() >= 5 && head[..5].eq_ignore_ascii_case(b"host:") {
             Some(0)
         } else {
             None
         };
         // Then scan for \r\n followed by Host: anywhere
         first_line.or_else(|| {
-            data.windows(7)
+            head.windows(7)
                 .position(|w| w[..2] == *b"\r\n" && w[2..].eq_ignore_ascii_case(b"host:"))
                 .map(|p| p + 2)
         })
@@ -1215,6 +1245,15 @@ fn extract_basic_auth(request: &str) -> Option<(String, String)> {
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;
     Some((user.to_string(), pwd.to_string()))
+}
+
+/// Count Host header lines (RFC 7230 §5.4 allows at most one). Must only be
+/// called on the head (up to the first `\r\n\r\n`) — see `handle_http1_request`.
+fn count_host_headers(request: &str) -> usize {
+    request
+        .lines()
+        .filter(|line| line.len() >= 6 && line[..5].eq_ignore_ascii_case("host:"))
+        .count()
 }
 
 /// Extract the Host header value from an HTTP request (hostname only, no port).
@@ -1433,6 +1472,43 @@ mod tests {
     fn test_extract_sni_short_data() {
         assert_eq!(extract_sni_from_client_hello(&[0x16, 0x03]), None);
         assert_eq!(extract_sni_from_client_hello(&[]), None);
+    }
+
+    /// A body line that looks like a Host header must never be rewritten
+    /// when the head has no Host of its own (audit fix: the scan was
+    /// previously unbounded and mutated bytes after \r\n\r\n).
+    #[test]
+    fn test_rewrite_host_header_does_not_touch_body() {
+        let data = b"GET / HTTP/1.1\r\n\r\nbody\r\nhost: evil.example.com".to_vec();
+        let out = rewrite_host_header(data.clone(), "good.example.com");
+        assert_eq!(out, data, "head without Host must not rewrite a body line");
+
+        let data = b"GET / HTTP/1.1\r\nHost: old.example.com\r\n\r\nbody\r\nhost: evil.example.com"
+            .to_vec();
+        let out = rewrite_host_header(data, "new.example.com");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.starts_with(
+                "GET / HTTP/1.1\r\nHost: new.example.com\r\n\r\nbody\r\nhost: evil.example.com"
+            ),
+            "only the head's Host may be rewritten: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_count_host_headers() {
+        let single = "GET / HTTP/1.1\r\nHost: a.example.com\r\n\r\n";
+        assert_eq!(count_host_headers(single), 1);
+        let dup = "GET / HTTP/1.1\r\nHost: a.example.com\r\nHost: b.example.com\r\n\r\n";
+        assert_eq!(count_host_headers(dup), 2);
+        let none = "GET / HTTP/1.1\r\nX-Foo: bar\r\n\r\n";
+        assert_eq!(count_host_headers(none), 0);
+        // The caller bounds the text to the head (up to \r\n\r\n); given a
+        // bounded head, a body "host:" line is simply not present.
+        assert_eq!(count_host_headers("GET / HTTP/1.1\r\n\r\n"), 0);
+        // Unbounded text (caller bug) would count body lines — the caller's
+        // head-bounding in handle_http1_request is what prevents this.
+        assert_eq!(count_host_headers("GET / HTTP/1.1\r\n\r\nhost: x"), 1);
     }
 
     #[tokio::test]

@@ -1068,13 +1068,21 @@ async fn run_work_bridge(
     debug!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);
 }
 
+/// Assign `req` to `work_conn`, starting the bridge.
+///
+/// Returns `Ok(())` once the bridge task is spawned (work_conn and req are
+/// consumed), or `Err(req)` if the StartWorkConn write failed — the work
+/// conn is dead and the request (with its user conn) is returned so the
+/// caller can retry it against a fresh work conn instead of dropping the
+/// user connection (audit fix: dead pooled work conns used to fail the user
+/// conn with no retry).
 pub(crate) async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
     encryption_key: [u8; 16],
     state: Arc<AppState>,
     v2: bool,
-) {
+) -> Result<(), PendingRequest> {
     // Extract peer address from user connection for PROXY protocol support
     let (src_addr, src_port) = req
         .user_conn
@@ -1116,7 +1124,10 @@ pub(crate) async fn assign_work_to_proxy(
 
     if let Err(e) = write_result {
         warn!(error = %e, "Failed to send StartWorkConn: {}", e);
-        return;
+        // The work conn is dead (e.g. the client closed it while pooled).
+        // Return the request so the caller can re-enqueue it against a
+        // fresh work conn instead of failing the user connection.
+        return Err(req);
     }
 
     // Flush StartWorkConn to wire before bridge data. KcpStream::poll_flush
@@ -1200,6 +1211,7 @@ pub(crate) async fn assign_work_to_proxy(
             }
         }
     });
+    Ok(())
 }
 
 #[cfg(test)]

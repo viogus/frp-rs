@@ -10,6 +10,9 @@ pub(crate) mod proxy_ops;
 
 // Re-export for the dashboard delete path (cleanup_deleted_proxy_port),
 // which mirrors handle_close_proxy's SUDP shared-port owner check.
+// Gated on `dashboard`: the only consumer outside control/ is dashboard.rs,
+// and the unused re-export warned in default (no-dashboard) builds.
+#[cfg(feature = "dashboard")]
 pub(crate) use proxy_ops::release_udp_port_with_owner_check;
 
 use std::collections::VecDeque;

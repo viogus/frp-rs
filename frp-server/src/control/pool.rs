@@ -39,6 +39,14 @@ pub(super) fn pending_request_timeout(user_conn_timeout_secs: u64) -> Duration {
 /// Max work connections to pool beyond what the client requested (Go frp: poolCount + 10).
 pub(crate) const WORK_POOL_EXTRA: usize = 10;
 
+/// Absolute server-side ceiling on a client's requested pool count when
+/// `max_pool_count` is unset (0). Without it the client-controlled
+/// `pool_count` would make the server hold an unbounded number of pooled
+/// work-conn fds (audit fix). Generous next to Go frp's default
+/// `maxPoolCount = 5`; Go's own hard cap is effectively the same resource
+/// question left to the operator, so this only bounds the unconfigured case.
+pub(crate) const WORK_POOL_ABS_CEILING: usize = 512;
+
 // ---- Types ----
 
 /// A pooled work connection. (Idle expiry was removed 2026-08-09 — audit
@@ -119,14 +127,29 @@ where
             warn!(error = %e, "Failed to send ReqWorkConn for pool replenish: {}", e);
             return Err(());
         }
-        bridge::assign_work_to_proxy(
+        match bridge::assign_work_to_proxy(
             entry.conn,
             req,
             ctx.reloadable.encryption_key,
             ctx.state.clone(),
             ctx.v2,
         )
-        .await;
+        .await
+        {
+            Ok(()) => {}
+            // Dead pooled work conn: the client closed it after pooling and
+            // StartWorkConn could not be written. The replenish ReqWorkConn
+            // above is already on the wire, so retry once by re-enqueueing —
+            // the replacement conn will pick this request up instead of
+            // failing the user connection (audit fix).
+            Err(req) => {
+                warn!(proxy_name = %req.proxy_name, "Pooled work conn died before StartWorkConn; re-enqueueing request for replacement");
+                pending_requests.push_back(req);
+                ctx.pool_stats
+                    .pending_requests
+                    .store(pending_requests.len() as i64, Ordering::Relaxed);
+            }
+        }
     } else {
         ctx.state.pool.misses.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = write_ctl_msg(
@@ -334,7 +357,18 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                     .pool_size
                     .store(ctl.work_pool.len() as i64, Ordering::Relaxed);
                 let enc_key = ctx.reloadable.encryption_key;
-                bridge::assign_work_to_proxy(stream, req, enc_key, ctx.state.clone(), ctx.v2).await;
+                match bridge::assign_work_to_proxy(stream, req, enc_key, ctx.state.clone(), ctx.v2)
+                    .await
+                {
+                    Ok(()) => {}
+                    // A freshly delivered work conn died at StartWorkConn —
+                    // the client is likely gone too, so dropping the request
+                    // (closing its user conn) is correct; no re-enqueue
+                    // without a new ReqWorkConn on the wire.
+                    Err(req) => {
+                        warn!(proxy_name = %req.proxy_name, "Fresh work conn died before StartWorkConn; dropping request");
+                    }
+                }
             } else if ctl.work_pool.len() < ctx.pool_cap {
                 ctl.work_pool.push_back(PoolEntry { conn: stream });
                 ctx.pool_stats
@@ -589,4 +623,176 @@ pub(crate) async fn handle_udp_work_conn<W: AsyncWriteExt + Unpin>(
     }
     ctl.pending_udp.push_back((proxy_name, Instant::now()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use frp_core::transport::Transport;
+
+    /// Work transport whose writes fail deterministically — a pooled conn
+    /// the client closed after pooling.
+    struct BrokenWorkTransport;
+
+    impl tokio::io::AsyncRead for BrokenWorkTransport {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for BrokenWorkTransport {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected writer failure",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Transport for BrokenWorkTransport {
+        fn debug_name(&self) -> &'static str {
+            "BrokenWorkTransport"
+        }
+    }
+
+    fn broken_io() -> IoStream {
+        IoStream::from(Box::new(BrokenWorkTransport) as Box<dyn Transport>)
+    }
+
+    fn test_state() -> Arc<crate::state::AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(crate::state::AppState::new(
+            frp_core::auth::AuthConfig::with_token("test-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("test-token"),
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
+            String::new(),
+            true,
+            30,
+            7200,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    fn test_context(
+        state: &Arc<crate::state::AppState>,
+        run_id: &str,
+    ) -> (ControlContext, ControlState) {
+        let (_, run_mu_guard) = state.get_run_mu(run_id);
+        let (internal_tx, _internal_rx) = mpsc::channel(16);
+        let ctx = ControlContext {
+            state: Arc::clone(state),
+            pool_stats: Arc::new(crate::state::PoolStats::default()),
+            reloadable: state
+                .reloadable
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            v2: false,
+            run_id: run_id.to_string(),
+            control_id: 1,
+            pool_cap: 10,
+            internal_tx,
+            peer: None,
+            authenticated_user: String::new(),
+            _run_mu_guard: run_mu_guard,
+        };
+        let ctl = ControlState {
+            shutting_down: false,
+            shutdown_done: None,
+            udp_cancel: tokio_util::sync::CancellationToken::new(),
+            work_pool: VecDeque::new(),
+            pending_requests: VecDeque::new(),
+            pending_udp: VecDeque::new(),
+            pending_nat_hole_sids: VecDeque::new(),
+            listener_handles: HashMap::new(),
+            udp_sockets: HashMap::new(),
+            last_ping: Instant::now(),
+        };
+        (ctx, ctl)
+    }
+
+    fn test_req(proxy_name: &str) -> PendingRequest {
+        PendingRequest {
+            proxy_name: proxy_name.to_string(),
+            user_conn: broken_io(),
+            pre_read: Vec::new(),
+            use_encryption: false,
+            use_compression: false,
+            visitor_use_encryption: false,
+            visitor_use_compression: false,
+            created_at: Instant::now(),
+            user_conn_permit: None,
+            proxy_info: None,
+        }
+    }
+
+    /// A pooled work conn that dies at StartWorkConn must re-enqueue the
+    /// request (the replenish ReqWorkConn is already on the wire) instead
+    /// of failing the user connection (audit fix).
+    #[tokio::test]
+    async fn dead_pooled_conn_reenqueues_request() {
+        let state = test_state();
+        let (ctx, mut ctl) = test_context(&state, "run-1");
+        ctl.work_pool.push_back(PoolEntry { conn: broken_io() });
+        let mut writer = Vec::new();
+
+        let res = assign_or_queue(
+            &mut ctl.work_pool,
+            &mut ctl.pending_requests,
+            &ctx,
+            &mut writer,
+            test_req("p1"),
+        )
+        .await;
+        assert!(res.is_ok(), "assign_or_queue must not fail the control");
+
+        // The dead conn was consumed and the request re-enqueued for the
+        // replacement work conn.
+        assert!(ctl.work_pool.is_empty(), "dead conn consumed");
+        assert_eq!(ctl.pending_requests.len(), 1, "request must be re-enqueued");
+        assert_eq!(ctl.pending_requests[0].proxy_name, "p1");
+        // Replenish ReqWorkConn was written to the control channel.
+        assert!(!writer.is_empty(), "ReqWorkConn replenish must be written");
+    }
 }

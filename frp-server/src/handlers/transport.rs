@@ -84,8 +84,12 @@ pub(crate) async fn handle_tls_connection(
         let mut sni_buf = [0u8; 4096];
         let sni_peek_n =
             match tokio::time::timeout_at(accept_deadline, inner_stream.read(&mut sni_buf)).await {
-                Ok(Ok(n)) if n >= 43 => n,
-                Ok(Ok(_)) => 0,
+                // Every byte read is replayed below — dropping a short read
+                // (1-42 bytes, e.g. a fragmented ClientHello) corrupted the
+                // TLS handshake (audit fix). The SNI lookup itself is
+                // naturally skipped for short data: extract_sni_from_client_hello
+                // requires a full record (≥44 bytes).
+                Ok(Ok(n)) => n,
                 _ => {
                     warn!(addr = %addr, "TLS read timeout from {} during SNI check", addr);
                     return;
