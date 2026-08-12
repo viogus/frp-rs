@@ -48,12 +48,12 @@ fn build_auth_config(
             .resolve()
             .map_err(|e| format!("failed to resolve auth.tokenSource: {e}"))?
     } else {
-        frp_core::auth::resolve_dynamic_token_checked(&auth.token, unsafe_features).unwrap_or_else(
-            |e| {
-                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
-                String::new()
-            },
-        )
+        // Go frp v0.70.1: a token-source resolution failure is a startup
+        // error — ValueSource.Resolve errors propagate in Go with no
+        // empty-token fallback. Match that: a failing dynamic source must
+        // not silently degrade auth to an empty token (when both sides'
+        // sources fail, that would silently disable auth).
+        frp_core::auth::resolve_dynamic_token_checked(&auth.token, unsafe_features)?
     };
     Ok(AuthConfig {
         method: match auth.method.to_lowercase().as_str() {
@@ -1873,5 +1873,29 @@ impl Service {
             info!(changes = %changes.join("; "), "Config reloaded: {}", changes.join("; "));
             Ok(changes.join("; "))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a failing dynamic token source is a startup error — it
+    /// must not silently fall back to an empty token (when both sides'
+    /// sources fail, that would silently degrade auth to no-auth). Go frp
+    /// v0.70.1 fails startup on token-source resolution errors.
+    #[test]
+    fn build_auth_config_fails_on_token_source_error() {
+        let auth = frp_core::config::AuthServerConfig {
+            token: "file:///nonexistent/frp-token-startup.txt".to_string(),
+            ..Default::default()
+        };
+        let result = build_auth_config(&auth, &UnsafeFeatures::default());
+        let err = result.expect_err("token-source failure must fail startup");
+        // The startup error must not leak the token-file path.
+        assert!(
+            !err.contains("frp-token-startup.txt"),
+            "error leaked the token-file path: {err}"
+        );
     }
 }

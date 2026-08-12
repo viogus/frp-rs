@@ -143,30 +143,36 @@ impl Controller {
             analysis_key: std::sync::Mutex::new(None),
         });
         // Check-and-insert atomically under write lock (fixes TOCTOU).
-        {
+        let rejection = {
             let mut sessions = self.sessions.write().await;
             if sessions.len() >= MAX_SESSIONS {
                 warn!(
                     max_sessions = MAX_SESSIONS,
                     "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session"
                 );
-                // Send error response to visitor so it doesn't hang.
-                let mut guard = session.visitor_writer.lock().await;
-                if let Some(ref mut w) = *guard {
-                    let _ = frp_core::protocol::write_v1_frame(
-                        w,
-                        &FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
-                            transaction_id: session.visitor_msg.transaction_id.clone(),
-                            sid: Some(sid.clone()),
-                            error: Some("NAT hole session limit reached".into()),
-                            ..Default::default()
-                        })),
-                    )
-                    .await;
-                }
-                return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
+                Some(FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
+                    transaction_id: session.visitor_msg.transaction_id.clone(),
+                    sid: Some(sid.clone()),
+                    error: Some("NAT hole session limit reached".into()),
+                    ..Default::default()
+                })))
+            } else {
+                sessions.insert(sid.clone(), session.clone());
+                None
             }
-            sessions.insert(sid.clone(), session.clone());
+        };
+        // Send the error response to the visitor so it doesn't hang, but only
+        // AFTER releasing the sessions lock: a wedged visitor TCP buffer must
+        // not stall all other XTCP session operations while blocked on this
+        // write.
+        if let Some(rejection) = rejection {
+            let mut guard = session.visitor_writer.lock().await;
+            if let Some(ref mut w) = *guard {
+                // Best-effort: the session is rejected either way, so a failed
+                // write to the wedged visitor is not actionable.
+                let _ = frp_core::protocol::write_v1_frame(w, &rejection).await;
+            }
+            return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
         }
         Ok((session, report_rx))
     }
@@ -573,5 +579,115 @@ pub fn build_nat_hole_response(params: NatHoleResponseParams) -> msg::NatHoleRes
             listen_random_ports: behavior.listen_random_ports,
             candidate_ports,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A writer whose write never completes — simulates a visitor with a
+    /// wedged TCP send buffer.
+    struct WedgedWriter {
+        /// Fires on the first write attempt so the test can observe the
+        /// rejection write in flight.
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Unpin for WedgedWriter {}
+
+    impl AsyncWrite for WedgedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            if let Some(tx) = self.started.take() {
+                let _ = tx.send(());
+            }
+            Poll::Pending
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn dummy_session(sid: &str) -> Arc<Session> {
+        let (notify_tx, _notify_rx) = tokio::sync::oneshot::channel();
+        let (report_tx, _report_rx) = tokio::sync::oneshot::channel();
+        Arc::new(Session {
+            sid: sid.to_string(),
+            proxy_name: "filler".to_string(),
+            visitor_msg: msg::NatHoleVisitor::default(),
+            visitor_writer: Mutex::new(None),
+            visitor_ctl_tx: None,
+            v_resp: Mutex::new(None),
+            v_nat_feature: Mutex::new(None),
+            client_msg: Mutex::new(None),
+            c_resp: Mutex::new(None),
+            c_nat_feature: Mutex::new(None),
+            notify_ch: Mutex::new(Some(notify_tx)),
+            report_tx: Mutex::new(Some(report_tx)),
+            created_at: Instant::now(),
+            last_activity: std::sync::Mutex::new(Instant::now()),
+            selected_index: Mutex::new(None),
+            analysis_key: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Regression: rejecting a session at MAX_SESSIONS must not hold the
+    /// `sessions` write lock across the rejection write to the visitor — a
+    /// wedged visitor TCP buffer must not stall all other XTCP session
+    /// operations. The rejection frame is written after the lock is released.
+    #[tokio::test]
+    async fn max_sessions_rejection_does_not_hold_lock_across_write() {
+        let controller = Arc::new(Controller::new(Duration::from_secs(3600)));
+        // Fill the session table to the cap.
+        {
+            let mut sessions = controller.sessions.write().await;
+            for i in 0..MAX_SESSIONS {
+                sessions.insert(format!("filler-{i}"), dummy_session(&format!("filler-{i}")));
+            }
+        }
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let writer: Box<dyn AsyncWrite + Send + Unpin> = Box::new(WedgedWriter {
+            started: Some(started_tx),
+        });
+        let ctl = controller.clone();
+        let handle = tokio::spawn(async move {
+            ctl.create_session_with_writer(
+                "rejected".to_string(),
+                "xtcp-test".to_string(),
+                msg::NatHoleVisitor::default(),
+                writer,
+            )
+            .await
+        });
+        // Wait until the rejection write to the wedged visitor is in flight.
+        started_rx
+            .await
+            .expect("rejection write to wedged visitor started");
+        // The sessions lock must be acquirable while the write is blocked.
+        let guard = tokio::time::timeout(Duration::from_millis(500), controller.sessions.read())
+            .await
+            .expect("sessions lock held across the rejection write");
+        drop(guard);
+        // The create call is still stuck on the wedged write (not completed).
+        assert!(
+            !handle.is_finished(),
+            "rejection task should still be writing"
+        );
+        handle.abort();
     }
 }

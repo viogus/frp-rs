@@ -327,11 +327,12 @@ impl Service {
                 .map_err(|e| format!("failed to resolve auth.tokenSource: {e}"))
                 .map_err(std::io::Error::other)?
         } else {
+            // Go frp v0.70.1: a token-source resolution failure is a startup
+            // error — no silent empty-token fallback (an empty token on both
+            // sides would silently degrade auth to no-auth).
             frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &unsafe_features)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
-                    String::new()
-                })
+                .map_err(|e| format!("failed to resolve auth token: {e}"))
+                .map_err(std::io::Error::other)?
         };
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
@@ -3778,5 +3779,28 @@ mod tests {
             &mut visitor_pending,
             "nope"
         ));
+    }
+
+    /// Regression: a failing dynamic token source must fail Service init
+    /// (startup), not silently fall back to an empty token. Go frp v0.70.1
+    /// fails startup when token-source resolution errors.
+    #[tokio::test]
+    async fn service_init_fails_on_token_source_error() {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            token: "file:///nonexistent/frp-token-startup.txt".to_string(),
+            ..Default::default()
+        };
+        let result = Service::with_unsafe_features(cfg, None, UnsafeFeatures::default()).await;
+        let err = match result {
+            Ok(_) => panic!("token-source failure must fail startup"),
+            Err(e) => e,
+        };
+        // The startup error must not leak the token-file path.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("frp-token-startup.txt"),
+            "error leaked the token-file path: {msg}"
+        );
     }
 }

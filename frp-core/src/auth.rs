@@ -1472,9 +1472,11 @@ fn resolve_dynamic_token_inner(
         let _ = unsafe_features;
         match std::fs::read_to_string(path) {
             Ok(content) => Ok(content.lines().next().unwrap_or("").trim().to_string()),
+            // Redact the token-file path: this error is surfaced at startup
+            // failure level and must not leak where the token file lives.
+            // Only the error class (the io error) is retained.
             Err(e) => Err(format!(
-                "Failed to read dynamic token from file://{}: {}",
-                path, e
+                "Failed to read dynamic token from file source: {e}"
             )),
         }
     } else if let Some(cmd) = token.strip_prefix("exec://") {
@@ -1506,11 +1508,15 @@ fn resolve_dynamic_token_inner(
             _ => exec_token_command_sync(&parts),
         };
         match output {
-            Ok(o) => finish_exec_output(cmd, o),
-            Err(e) => Err(format!(
-                "Failed to exec dynamic token command '{}': {}",
-                cmd, e
-            )),
+            // Redact the command line and the script's captured stderr (both
+            // may carry secrets): only the error class — the exit status, or
+            // the spawn io error below — is surfaced to the startup log.
+            Ok(o) => {
+                let status = o.status;
+                finish_exec_output(cmd, o)
+                    .map_err(|_| format!("Dynamic token exec command exited with {status}"))
+            }
+            Err(e) => Err(format!("Failed to exec dynamic token command: {e}")),
         }
     } else {
         Ok(token.to_string())
@@ -2223,6 +2229,14 @@ mod tests {
         let uf = crate::unsafe_features::UnsafeFeatures::default();
         let result = resolve_dynamic_token_checked("file:///nonexistent/path/token.txt", &uf);
         assert!(result.is_err());
+        // Regression: the failure is a hard error, and the error class must
+        // not leak the token-file path (the error is logged at startup
+        // failure level).
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("nonexistent/path/token.txt"),
+            "error must not contain the token-file path: {err}"
+        );
     }
 
     #[test]
@@ -2256,6 +2270,59 @@ mod tests {
         let uf = crate::unsafe_features::UnsafeFeatures::default();
         let result = resolve_dynamic_token_checked("exec:///bin/echo secret", &uf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_exec_spawn_failure_redacts_command() {
+        // Regression: a failing exec source must not leak the command line
+        // into the error (the error is logged at startup failure level).
+        let uf = crate::unsafe_features::UnsafeFeatures::new(
+            crate::unsafe_features::CLIENT_UNSAFE_FEATURES,
+        );
+        let result = resolve_dynamic_token_checked("exec:///nonexistent/frp-token-cmd-xyz", &uf);
+        let err = result.expect_err("missing exec command must be an error");
+        assert!(
+            !err.contains("frp-token-cmd-xyz"),
+            "error must not contain the exec command: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_exec_failure_redacts_stderr() {
+        // Regression: a token script that fails must not leak its stderr
+        // output (which may carry secrets) into the error — only the
+        // exit-status error class is surfaced.
+        let dir = std::env::temp_dir();
+        let script = dir.join(format!("frp-token-script-{}.sh", std::process::id()));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho SECRET_STDERR_MARKER_XYZ >&2\nexit 7\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let token = format!("exec://{}", script.display());
+        let uf = crate::unsafe_features::UnsafeFeatures::new(
+            crate::unsafe_features::CLIENT_UNSAFE_FEATURES,
+        );
+        let result = resolve_dynamic_token_checked(&token, &uf);
+        std::fs::remove_file(&script).ok();
+        let err = result.expect_err("failing token script must be an error");
+        assert!(
+            !err.contains("SECRET_STDERR_MARKER_XYZ"),
+            "error must not leak stderr: {err}"
+        );
+        assert!(
+            !err.contains("frp-token-script"),
+            "error must not leak the script path: {err}"
+        );
+        assert!(
+            err.contains("exited with"),
+            "error should retain the exit-status class: {err}"
+        );
     }
 
     #[test]
