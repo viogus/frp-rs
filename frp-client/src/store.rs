@@ -352,6 +352,22 @@ fn save_to_file(
             "failed to rename temp file: {e}"
         )));
     }
+    // fsync the parent directory so the rename is durable: POSIX does not
+    // guarantee a rename survives a crash until the directory entry itself is
+    // flushed. Best-effort — a directory fsync can fail on filesystems that
+    // do not support it (e.g. some macOS/network mounts); the write itself
+    // already succeeded, so log and continue rather than reporting a
+    // nonexistent failure.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                if let Err(e) = dir.sync_all() {
+                    tracing::warn!(path = %parent.display(), error = %e, "store: failed to fsync directory after rename");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
