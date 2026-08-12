@@ -93,9 +93,14 @@ async fn handle_conn(
         .await
         .map_err(|e| format!("TLS connect to {target}: {e}"))?;
 
-    tls.write_all(fwd.as_bytes())
+    tls.write_all(fwd.head.as_bytes())
         .await
         .map_err(|e| format!("write forward request: {e}"))?;
+
+    // Stream the request body (pre-read bytes plus the rest per its framing)
+    // before relaying the response — Go's ReverseProxy streams request bodies,
+    // and a backend that waits for the full request would hang otherwise.
+    crate::plugin::forward_request_body(&mut client, &mut tls, &fwd.body_prefix, fwd.body).await?;
 
     // Copy response back to client
     if let Err(e) = super::copy_stream_large(tls, &mut client).await {

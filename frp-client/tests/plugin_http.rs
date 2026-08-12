@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 use frp_core::config::PluginConfig;
 use frp_core::transport::IoStream;
@@ -233,4 +233,300 @@ async fn test_https2https_accepts_self_signed_backend() {
 
     // IoStream import kept for API-surface sanity (tunnel side uses raw TLS).
     let _ = IoStream::Tcp;
+}
+
+/// Read one HTTP request from the backend side: the head plus exactly
+/// `Content-Length` body bytes. A backend that waits for the full request
+/// before responding is exactly what the plugin must satisfy — this helper
+/// models that (Go-style) backend behavior.
+async fn read_full_cl_request(conn: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head_end = end + 4;
+            let head = String::from_utf8_lossy(&buf[..head_end]);
+            let content_length: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, value)| value.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            while buf.len() < head_end + content_length {
+                let n = conn.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            return buf;
+        }
+        let n = conn.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            return buf;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// Read one HTTP request with a chunked body from the backend side, stopping
+/// at the terminating `0\r\n\r\n` (trailer-free chunked body).
+async fn read_full_chunked_request(conn: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        if buf.ends_with(b"0\r\n\r\n") {
+            return buf;
+        }
+        let n = conn.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            return buf;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// POST with a Content-Length body far larger than one TCP read through the
+/// shared HTTP/1.1 forward path (http2http): the backend must receive the
+/// head plus the FULL body before it can answer. Regression test for the
+/// audit finding where only the bytes that arrived with the head were
+/// forwarded and the backend hung forever.
+#[tokio::test]
+async fn test_http2http_post_body_streams() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let req = read_full_cl_request(&mut conn).await;
+            let _ = tx.send(req);
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http2http".into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http2http_plugin(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    // The plugin's header read loop uses 512-byte chunks and stops at the
+    // first \r\n\r\n, so at most ~511 body bytes can arrive with the head —
+    // the rest must be drained from the stream.
+    let body = vec![b'x'; 256 * 1024];
+    client
+        .write_all(
+            format!(
+                "POST /upload HTTP/1.1\r\nHost: original\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    client.write_all(&body).await.unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("backend never responded: request body was not fully forwarded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let captured = rx.await.expect("backend captured request");
+    let head_end = captured
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("forwarded request must end its head with CRLFCRLF")
+        + 4;
+    assert!(
+        captured.starts_with(b"POST /upload HTTP/1.0"),
+        "unexpected forwarded request: {}",
+        String::from_utf8_lossy(&captured[..head_end])
+    );
+    assert_eq!(
+        &captured[head_end..],
+        body.as_slice(),
+        "backend must receive the full request body"
+    );
+}
+
+/// POST with a chunked body through the shared forward path: the client's
+/// chunk framing must reach the backend verbatim, with `Transfer-Encoding:
+/// chunked` re-added to the head (the original is stripped as hop-by-hop).
+#[tokio::test]
+async fn test_http2http_post_body_chunked() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let req = read_full_chunked_request(&mut conn).await;
+            let _ = tx.send(req);
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http2http".into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http2http_plugin(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    client
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: original\r\nTransfer-Encoding: chunked\r\n\r\n")
+        .await
+        .unwrap();
+    client.write_all(body).await.unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("chunked request body was not fully forwarded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let captured = rx.await.expect("backend captured request");
+    let head_end = captured
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("forwarded request must end its head with CRLFCRLF")
+        + 4;
+    let head = String::from_utf8_lossy(&captured[..head_end]);
+    assert!(
+        head.contains("Transfer-Encoding: chunked"),
+        "chunked framing must be re-added to the head: {head}"
+    );
+    assert!(
+        !head.to_lowercase().contains("content-length"),
+        "no Content-Length on a chunked request: {head}"
+    );
+    assert_eq!(
+        &captured[head_end..],
+        body.as_slice(),
+        "client chunk framing must be forwarded verbatim"
+    );
+}
+
+/// http_proxy plugin: a POST with a body larger than one read must be fully
+/// forwarded to the backend before the response is relayed (Go
+/// http.DefaultTransport streams the body; forwarding only the bytes that
+/// arrived with the head stalls the backend).
+#[tokio::test]
+async fn test_http_proxy_post_body_streams() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let req = read_full_cl_request(&mut conn).await;
+            let _ = tx.send(req);
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let body = vec![b'p'; 128 * 1024];
+    client
+        .write_all(
+            format!(
+                "POST http://{backend_addr}/upload HTTP/1.1\r\nHost: ignored\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    client.write_all(&body).await.unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("backend never responded: request body was not fully forwarded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let captured = rx.await.expect("backend captured request");
+    let head_end = captured
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("forwarded request must end its head with CRLFCRLF")
+        + 4;
+    let head = String::from_utf8_lossy(&captured[..head_end]);
+    assert!(
+        captured.starts_with(b"POST /upload HTTP/1.0"),
+        "absolute-form URL must be rewritten to origin-form: {head}"
+    );
+    assert_eq!(
+        &captured[head_end..],
+        body.as_slice(),
+        "backend must receive the full request body"
+    );
 }

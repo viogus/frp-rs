@@ -15,7 +15,7 @@
 
 use std::net::SocketAddr;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
@@ -37,7 +37,7 @@ mod unix_socket;
 mod visitor;
 
 pub(crate) use context::PluginContext;
-pub(crate) use http::start_http_proxy;
+pub use http::start_http_proxy;
 pub use http2http::start_http2http_plugin;
 pub use http2https::start_http2https_plugin;
 pub use https2http::start_https2http_plugin;
@@ -295,21 +295,90 @@ pub(super) fn split_host_port(s: &str) -> (&str, u16) {
     (s, 80)
 }
 
+/// A parsed HTTP request ready to be forwarded: the rewritten head, the
+/// request-body framing, and any body bytes that arrived in the same read
+/// as the head.
+pub(super) struct ForwardedRequest {
+    /// Rewritten HTTP/1.0 request head, ending in `\r\n\r\n`.
+    pub head: String,
+    /// Request body bytes that arrived together with the head. Forward these
+    /// verbatim before draining the rest of the body with
+    /// [`forward_request_body`].
+    pub body_prefix: Vec<u8>,
+    /// Framing of the request body; `None` when the request has no body.
+    pub body: Option<BodyFraming>,
+}
+
+/// How a request body is framed on the wire (RFC 7230 §3.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BodyFraming {
+    /// `Content-Length: N` — forward exactly N raw bytes.
+    Length(usize),
+    /// `Transfer-Encoding: chunked` — forward the client's framing verbatim.
+    Chunked,
+}
+
+/// Determine the request body framing from raw header lines. Chunked
+/// transfer-encoding wins over Content-Length (RFC 7230 §3.3.3); neither
+/// header means the request has no body.
+pub(super) fn parse_request_body_framing<'a>(
+    headers: impl Iterator<Item = &'a str>,
+) -> Option<BodyFraming> {
+    let mut chunked = false;
+    let mut content_length: Option<usize> = None;
+    for line in headers {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            if value.trim().to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            }
+        } else if name.trim().eq_ignore_ascii_case("content-length") {
+            // First parseable value wins; a conflicting second value makes
+            // the request malformed (Go's http.Server rejects it outright).
+            if content_length.is_none() {
+                content_length = value
+                    .split(',')
+                    .next()
+                    .and_then(|v| v.trim().parse::<usize>().ok());
+            }
+        }
+    }
+    if chunked {
+        Some(BodyFraming::Chunked)
+    } else {
+        content_length.map(BodyFraming::Length)
+    }
+}
+
 /// Read an HTTP request head from `stream` (chunked until CRLFCRLF, 64 KiB cap),
-/// parse the request line, and build the forwarded HTTP/1.0 request string with
+/// parse the request line, and build the forwarded HTTP/1.0 request head with
 /// optional Host rewrite and injected request headers. Shared by the
 /// http2http/http2https/https2http/https2https plugins; each then connects its
-/// own backend and writes the returned string.
+/// own backend, writes the returned head, and streams the request body with
+/// [`forward_request_body`].
 ///
 /// `request_headers` are injected via Set semantics (Go `req.Header.Set`:
 /// an existing header with the same name is replaced), matching Go
 /// `pkg/plugin/client/http_common.go rewriteHTTPPluginRequest`.
+///
+/// Only the head is read here. Body bytes that happen to arrive in the same
+/// TCP read as the head are returned in [`ForwardedRequest::body_prefix`] so
+/// nothing is lost — Go's http.Server streams request bodies, and discarding
+/// pre-read bytes made backends hang forever on POST/PUT.
 pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unpin>(
     stream: &mut S,
     host_rewrite: &str,
     request_headers: &std::collections::HashMap<String, String>,
-) -> Result<String, String> {
-    // Read HTTP headers in chunks until \r\n\r\n
+) -> Result<ForwardedRequest, String> {
+    // Read HTTP headers in chunks until \r\n\r\n. Stop at the FIRST
+    // \r\n\r\n anywhere in the buffer (not only at its end): with a request
+    // body the head terminator is followed by body bytes, and reading past
+    // it would swallow the body into the "headers" until the 64 KiB cap.
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     loop {
@@ -321,7 +390,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
             return Err("connection closed".into());
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
             break;
         }
         if buf.len() > 65536 {
@@ -346,6 +415,11 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     }
     let method = parts[0];
     let path = parts[1];
+
+    // Body framing is parsed from the original headers — Transfer-Encoding
+    // is stripped below as hop-by-hop and re-added only when the request is
+    // chunked (the forwarded body bytes keep the client's own framing).
+    let framing = parse_request_body_framing(lines.clone());
 
     // Build forwarded request with optional Host rewrite.
     // Strip hop-by-hop headers per RFC 2616 Section 13.5.1.
@@ -406,9 +480,261 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         }
         fwd.push_str(&format!("{safe_k}: {safe_v}\r\n"));
     }
+    if framing == Some(BodyFraming::Chunked) {
+        fwd.push_str("Transfer-Encoding: chunked\r\n");
+    }
     fwd.push_str("Connection: close\r\n\r\n");
 
-    Ok(fwd)
+    Ok(ForwardedRequest {
+        head: fwd,
+        body_prefix: buf[header_end..].to_vec(),
+        body: framing,
+    })
+}
+
+/// Max length of a chunk-size / trailer line in a chunked request body
+/// (matches the 64 KiB request-head cap).
+const CHUNK_LINE_MAX: usize = 64 * 1024;
+
+/// Stream a request body to `writer`: first the bytes that arrived together
+/// with the request head (`body_prefix`), then the rest of the body per its
+/// wire framing (Content-Length or chunked Transfer-Encoding). Mirrors the
+/// h2 plugin path (`plugin/h2.rs`): Go's http.Server/Transport stream
+/// request bodies, and a backend that waits for the full request would hang
+/// forever if only the bytes from the first read were forwarded.
+///
+/// The client's chunked framing is forwarded verbatim (it is already valid
+/// HTTP/1.1); the parser only tracks chunk boundaries to know where the body
+/// ends so the response relay can start without waiting for the client to
+/// close the connection.
+pub(super) async fn forward_request_body<S, W>(
+    stream: &mut S,
+    writer: &mut W,
+    body_prefix: &[u8],
+    framing: Option<BodyFraming>,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let Some(framing) = framing else {
+        return Ok(());
+    };
+    let mut reader = BodyReader::new(stream, body_prefix);
+    match framing {
+        BodyFraming::Length(total) => {
+            let mut remaining = total;
+            let mut buf = [0u8; 8192];
+            while remaining > 0 {
+                let max = remaining.min(buf.len());
+                let n = reader
+                    .read(&mut buf[..max])
+                    .await
+                    .map_err(|e| format!("read body: {e}"))?;
+                if n == 0 {
+                    return Err("connection closed before full body".into());
+                }
+                writer
+                    .write_all(&buf[..n])
+                    .await
+                    .map_err(|e| format!("write forward body: {e}"))?;
+                remaining -= n;
+            }
+        }
+        BodyFraming::Chunked => loop {
+            let line = reader
+                .read_line(CHUNK_LINE_MAX)
+                .await
+                .map_err(|e| format!("read chunk line: {e}"))?;
+            writer
+                .write_all(&line)
+                .await
+                .map_err(|e| format!("write forward body: {e}"))?;
+            // Strip the line terminator, then any chunk extension
+            // ("size;ext=val"), to isolate the chunk size.
+            let mut size_line = line.as_slice();
+            if size_line.ends_with(b"\n") {
+                size_line = &size_line[..size_line.len() - 1];
+            }
+            if size_line.ends_with(b"\r") {
+                size_line = &size_line[..size_line.len() - 1];
+            }
+            let size_part =
+                trim_ascii_ws(size_line.split(|&b| b == b';').next().unwrap_or(size_line));
+            if size_part.is_empty() {
+                continue; // tolerate stray blank lines between chunks
+            }
+            let size_str = std::str::from_utf8(size_part)
+                .map_err(|_| "invalid chunk size in request body".to_string())?;
+            let size = usize::from_str_radix(size_str, 16)
+                .map_err(|_| format!("invalid chunk size in request body: {size_str}"))?;
+            if size == 0 {
+                // Trailer section up to the final blank line (RFC 7230 §4.1.2).
+                loop {
+                    let trailer = reader
+                        .read_line(CHUNK_LINE_MAX)
+                        .await
+                        .map_err(|e| format!("read chunk trailer: {e}"))?;
+                    writer
+                        .write_all(&trailer)
+                        .await
+                        .map_err(|e| format!("write forward body: {e}"))?;
+                    if is_blank_line(&trailer) {
+                        break;
+                    }
+                }
+                break;
+            }
+            let mut buf = [0u8; 8192];
+            let mut remaining = size;
+            while remaining > 0 {
+                let max = remaining.min(buf.len());
+                let n = reader
+                    .read(&mut buf[..max])
+                    .await
+                    .map_err(|e| format!("read chunk data: {e}"))?;
+                if n == 0 {
+                    return Err("connection closed mid-chunk".into());
+                }
+                writer
+                    .write_all(&buf[..n])
+                    .await
+                    .map_err(|e| format!("write forward body: {e}"))?;
+                remaining -= n;
+            }
+            // Chunk data is followed by CRLF (RFC 7230 §4.1).
+            let mut crlf = [0u8; 2];
+            reader
+                .read_exact(&mut crlf)
+                .await
+                .map_err(|e| format!("read chunk terminator: {e}"))?;
+            writer
+                .write_all(&crlf)
+                .await
+                .map_err(|e| format!("write forward body: {e}"))?;
+        },
+    }
+    Ok(())
+}
+
+/// Reader over a request body that serves the bytes which arrived together
+/// with the request head first, then falls through to the stream. Mirrors
+/// the h2-plugin `BodyReader` (`plugin/h2.rs`), which handles the same
+/// "body bytes may precede the head split" situation for responses.
+struct BodyReader<'a, S: tokio::io::AsyncRead + Unpin> {
+    stream: &'a mut S,
+    /// Remaining unconsumed bytes that arrived with the head.
+    pending: Vec<u8>,
+    /// Bytes of `pending` already consumed.
+    pos: usize,
+}
+
+impl<'a, S: tokio::io::AsyncRead + Unpin> BodyReader<'a, S> {
+    fn new(stream: &'a mut S, prefix: &[u8]) -> Self {
+        Self {
+            stream,
+            pending: prefix.to_vec(),
+            pos: 0,
+        }
+    }
+
+    fn available(&self) -> &[u8] {
+        &self.pending[self.pos..]
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos += n;
+    }
+
+    /// Read into `out`, draining the pending prefix before the stream.
+    async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.available().is_empty() {
+            if self.pos > 0 {
+                self.pending.clear();
+                self.pos = 0;
+            }
+            return self.stream.read(out).await;
+        }
+        let n = self.available().len().min(out.len());
+        out[..n].copy_from_slice(&self.available()[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+
+    /// Read exactly `out.len()` bytes (UnexpectedEof on early close).
+    async fn read_exact(&mut self, out: &mut [u8]) -> std::io::Result<()> {
+        let mut filled = 0;
+        while filled < out.len() {
+            let n = self.read(&mut out[filled..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "eof",
+                ));
+            }
+            filled += n;
+        }
+        Ok(())
+    }
+
+    /// Read one line (LF or CRLF terminated, terminator included).
+    async fn read_line(&mut self, max: usize) -> std::io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        loop {
+            let avail = self.available();
+            if let Some(rel) = avail.iter().position(|&b| b == b'\n') {
+                line.extend_from_slice(&avail[..rel + 1]);
+                self.consume(rel + 1);
+                return Ok(line);
+            }
+            line.extend_from_slice(avail);
+            self.consume(avail.len());
+            if line.len() > max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "line too long",
+                ));
+            }
+            if self.pos > 0 {
+                self.pending.clear();
+                self.pos = 0;
+            }
+            let mut tmp = [0u8; 4096];
+            let n = self.stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "eof in line",
+                ));
+            }
+            line.extend_from_slice(&tmp[..n]);
+        }
+    }
+}
+
+/// Trim leading/trailing spaces and tabs from a byte slice (header values
+/// and chunk-size lines may carry them).
+fn trim_ascii_ws(mut b: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = b.split_first() {
+        if first == b' ' || first == b'\t' {
+            b = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&last, rest)) = b.split_last() {
+        if last == b' ' || last == b'\t' {
+            b = rest;
+        } else {
+            break;
+        }
+    }
+    b
+}
+
+/// True when a chunked-body trailer line is blank (only CR/LF/space/tab).
+fn is_blank_line(b: &[u8]) -> bool {
+    b.iter().all(|&c| matches!(c, b'\r' | b'\n' | b' ' | b'\t'))
 }
 
 /// Simple percent-decode (application/x-www-form-urlencoded style).
@@ -474,5 +800,44 @@ mod tests {
         assert_eq!(urlencoding_decode("noencoding"), "noencoding");
         assert_eq!(urlencoding_decode("a+b"), "a b");
         assert_eq!(urlencoding_decode("%gg"), "%gg"); // invalid hex
+    }
+
+    #[test]
+    fn test_parse_request_body_framing() {
+        // No body framing headers → no body.
+        assert_eq!(parse_request_body_framing("".lines()), None);
+        assert_eq!(
+            parse_request_body_framing("Host: example.com".lines()),
+            None
+        );
+        // Content-Length framing.
+        assert_eq!(
+            parse_request_body_framing("Content-Length: 42".lines()),
+            Some(BodyFraming::Length(42))
+        );
+        assert_eq!(
+            parse_request_body_framing("Content-Length: 0".lines()),
+            Some(BodyFraming::Length(0))
+        );
+        // Chunked transfer-encoding.
+        assert_eq!(
+            parse_request_body_framing("Transfer-Encoding: chunked".lines()),
+            Some(BodyFraming::Chunked)
+        );
+        assert_eq!(
+            parse_request_body_framing("Transfer-Encoding: Chunked".lines()),
+            Some(BodyFraming::Chunked)
+        );
+        // Chunked wins over Content-Length (RFC 7230 §3.3.3).
+        assert_eq!(
+            parse_request_body_framing("Content-Length: 42\r\nTransfer-Encoding: chunked".lines()),
+            Some(BodyFraming::Chunked)
+        );
+        // Unparseable Content-Length is ignored (Go's server rejects the
+        // request outright, but a body cannot be inferred from it).
+        assert_eq!(
+            parse_request_body_framing("Content-Length: abc".lines()),
+            None
+        );
     }
 }
