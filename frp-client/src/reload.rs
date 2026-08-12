@@ -210,3 +210,89 @@ pub(crate) async fn do_reload(
         new_config: new_cfg,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo};
+
+    fn wire_proxy_info(local_addr: &str) -> ProxyRuntimeInfo {
+        ProxyRuntimeInfo {
+            local_addr: local_addr.into(),
+            proxy_type: "tcp".into(),
+            use_encryption: false,
+            use_compression: false,
+            sk: String::new(),
+            bandwidth_limit: 0,
+            bandwidth_limit_mode: String::new(),
+            proxy_protocol_version: String::new(),
+            plugin: String::new(),
+            remote_addr: String::new(),
+            err: String::new(),
+            config_snapshot: String::new(),
+            phase: ProxyPhase::Running,
+        }
+    }
+
+    fn proxy(name: &str) -> ProxyConfig {
+        ProxyConfig {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// When the reload changes `user`, strip_prefix with the NEW user fails
+    /// against the old wire keys, so `removed` carries the full OLD wire
+    /// names. try_reload resolves those against proxy_info_map before any
+    /// keyed removal (close_wire_name_for_reload); this test pins the diff
+    /// contract that resolution relies on. Rebuilding the removal keys with
+    /// wire_proxy_name(&new_user, name) would double-prefix and miss
+    /// (stale proxy_info_map/health entries survive the reload).
+    #[tokio::test]
+    async fn user_change_puts_full_wire_names_in_removed() {
+        let map: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write()
+            .await
+            .insert("old_user.p1".into(), wire_proxy_info("127.0.0.1:8000"));
+        map.write()
+            .await
+            .insert("old_user.p2".into(), wire_proxy_info("127.0.0.1:8001"));
+
+        let new_cfg = ClientConfig {
+            user: "new_user".into(),
+            proxies: vec![proxy("p1"), proxy("p2"), proxy("p3")],
+            ..Default::default()
+        };
+
+        let delta = do_reload(&map, &[], new_cfg, "new_user").await.unwrap();
+        let mut removed = delta.removed;
+        removed.sort();
+        assert_eq!(removed, vec!["old_user.p1", "old_user.p2"]);
+        // All bare names are re-added (registered under the new user).
+        let mut added = delta.added;
+        added.sort();
+        assert_eq!(added, vec!["p1", "p2", "p3"]);
+    }
+
+    /// Without a user change, map keys strip cleanly and `removed`/`added`
+    /// carry bare names (the common case for wire_proxy_name-based keying).
+    #[tokio::test]
+    async fn unchanged_user_keeps_bare_names() {
+        let map: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write()
+            .await
+            .insert("user.p1".into(), wire_proxy_info("127.0.0.1:8000"));
+
+        let new_cfg = ClientConfig {
+            user: "user".into(),
+            proxies: vec![proxy("p2")],
+            ..Default::default()
+        };
+
+        let delta = do_reload(&map, &[], new_cfg, "user").await.unwrap();
+        assert_eq!(delta.removed, vec!["p1"]);
+        assert_eq!(delta.added, vec!["p2"]);
+    }
+}
