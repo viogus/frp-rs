@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OwnedSemaphorePermit;
 
 /// Build a 404 Not Found response tuple with the given error message.
 fn not_found(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
@@ -28,6 +29,36 @@ fn not_found(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
         StatusCode::NOT_FOUND,
         Json(ErrorResponse { error: msg.into() }),
     )
+}
+
+/// JSON body extractor that maps malformed bodies to a generic 422 instead
+/// of axum's default `JsonRejection` body — the default embeds the internal
+/// type path (e.g. `frp_server::dashboard::StoreProxyConfig`), leaking
+/// implementation detail to API clients. The rejection body here is a plain
+/// `{"error": "invalid JSON body"}`.
+struct JsonBody<T>(T);
+
+impl<S, T> axum::extract::FromRequest<S> for JsonBody<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(JsonBody(value)),
+            Err(err) => {
+                tracing::debug!(error = %err, "Dashboard: rejecting request with invalid JSON body");
+                Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ErrorResponse {
+                        error: "invalid JSON body".into(),
+                    }),
+                ))
+            }
+        }
+    }
 }
 
 // --- Local TlsListener (moved from frp-core to avoid axum in core) ---
@@ -700,7 +731,7 @@ async fn handle_store_proxies(State(state): State<Arc<AppState>>) -> Json<Vec<se
 /// POST /api/store/proxies — stash a proxy config in memory.
 async fn handle_store_proxy_create(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<StoreProxyConfig>,
+    JsonBody(config): JsonBody<StoreProxyConfig>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     if config.name.is_empty() || config.proxy_type.is_empty() {
         return Err((
@@ -871,7 +902,7 @@ async fn handle_store_proxy_delete(
 /// Body: {"proxies": ["name1", "name2"]}
 async fn handle_proxies_delete(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<DeleteProxiesBody>,
+    JsonBody(body): JsonBody<DeleteProxiesBody>,
 ) -> Json<serde_json::Value> {
     tracing::warn!(count = body.proxies.len(), names = ?body.proxies, "Dashboard: bulk proxy delete");
     let mut deleted = Vec::new();
@@ -910,17 +941,55 @@ async fn handle_proxies_delete(
 
 // --- WebSocket event stream ---
 
+/// Maximum number of concurrent WebSocket subscribers on `/api/events`.
+/// Caps per-process connection and task accumulation: the event feed is a
+/// best-effort broadcast, so excess connections are rejected outright.
+const MAX_WS_SUBSCRIBERS: usize = 64;
+
+/// Process-wide semaphore capping concurrent `/api/events` WebSocket
+/// connections. One permit is held for the lifetime of each connection
+/// (dropped when the socket closes) so a single client cannot accumulate
+/// unbounded connections.
+fn ws_conn_semaphore() -> Arc<tokio::sync::Semaphore> {
+    static SEM: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_WS_SUBSCRIBERS)));
+    SEM.clone()
+}
+
+/// Try to acquire a WebSocket subscriber permit, rejecting with 429 when the
+/// concurrent-subscriber cap is reached.
+fn try_acquire_ws_permit(
+    sem: &Arc<tokio::sync::Semaphore>,
+) -> Result<OwnedSemaphorePermit, (StatusCode, Json<ErrorResponse>)> {
+    sem.clone().try_acquire_owned().map_err(|_| {
+        tracing::warn!(
+            limit = MAX_WS_SUBSCRIBERS,
+            "Dashboard: WebSocket subscriber limit reached, rejecting /api/events upgrade"
+        );
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: "too many WebSocket connections".into(),
+            }),
+        )
+    })
+}
+
 /// Upgrade handler for GET /api/events.
 /// Auth is handled by the `apply_admin_auth` middleware on the router —
 /// this handler only runs when the Authorization header is valid.
 async fn handle_events(
     State(state): State<Arc<AppState>>,
     ws: WebSocketUpgrade,
-) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let sem = ws_conn_semaphore();
+    let permit = try_acquire_ws_permit(&sem)?;
+    Ok(ws.on_upgrade(move |socket| handle_ws(socket, state, permit)))
 }
 
-async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
+/// `_permit` is the RAII guard that caps concurrent subscribers: it is held
+/// for the full connection lifetime and dropped when the socket closes.
+async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, _permit: OwnedSemaphorePermit) {
     let mut rx = state.event_tx.subscribe();
     loop {
         tokio::select! {
@@ -987,28 +1056,44 @@ async fn run_traffic_events(state: Arc<AppState>) {
             continue;
         }
 
-        let proxies = state.proxy_manager.list().await;
-        for proxy in &proxies {
-            if let Some(metrics) = state.proxy_metrics.get(&proxy.name).await {
-                let snap = metrics.snapshot();
-                let changed = last_values
-                    .get(&proxy.name)
-                    .map(|prev| {
-                        prev.bytes_in != snap.bytes_in
-                            || prev.bytes_out != snap.bytes_out
-                            || prev.current_conns != snap.current_conns
-                    })
-                    .unwrap_or(true);
+        emit_traffic_events_tick(&state, &state.event_tx, &mut last_values).await;
+    }
+}
 
-                if changed {
-                    last_values.insert(proxy.name.clone(), snap.clone());
-                    let _ = state.event_tx.send(crate::event::ServerEvent::Traffic {
-                        proxy_name: proxy.name.clone(),
-                        bytes_in: snap.bytes_in,
-                        bytes_out: snap.bytes_out,
-                        current_conns: snap.current_conns,
-                    });
-                }
+/// Emit one round of traffic events: drop `last_values` entries for proxies
+/// that are no longer registered, then send events for proxies whose metrics
+/// changed since the last round. Dropping stale entries keeps `last_values`
+/// bounded by the set of live proxies instead of growing without bound
+/// across proxy churn (create/delete cycles).
+async fn emit_traffic_events_tick(
+    state: &AppState,
+    event_tx: &tokio::sync::broadcast::Sender<crate::event::ServerEvent>,
+    last_values: &mut HashMap<String, MetricsSnapshot>,
+) {
+    let proxies = state.proxy_manager.list().await;
+    let live: std::collections::HashSet<&str> = proxies.iter().map(|p| p.name.as_str()).collect();
+    last_values.retain(|name, _| live.contains(name.as_str()));
+
+    for proxy in &proxies {
+        if let Some(metrics) = state.proxy_metrics.get(&proxy.name).await {
+            let snap = metrics.snapshot();
+            let changed = last_values
+                .get(&proxy.name)
+                .map(|prev| {
+                    prev.bytes_in != snap.bytes_in
+                        || prev.bytes_out != snap.bytes_out
+                        || prev.current_conns != snap.current_conns
+                })
+                .unwrap_or(true);
+
+            if changed {
+                last_values.insert(proxy.name.clone(), snap.clone());
+                let _ = event_tx.send(crate::event::ServerEvent::Traffic {
+                    proxy_name: proxy.name.clone(),
+                    bytes_in: snap.bytes_in,
+                    bytes_out: snap.bytes_out,
+                    current_conns: snap.current_conns,
+                });
             }
         }
     }
@@ -1850,7 +1935,7 @@ mod v2 {
     async fn handle_proxy_update(
         State(state): State<Arc<AppState>>,
         Path(name): Path<String>,
-        Json(req): Json<UpdateProxyRequest>,
+        JsonBody(req): JsonBody<UpdateProxyRequest>,
     ) -> Result<Json<ProxyResp>, (StatusCode, Json<V2Error>)> {
         let name = percent_decode_path(&name)?;
 
@@ -2380,6 +2465,7 @@ mod v2 {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use axum::extract::FromRequest as _;
 
         fn test_state() -> Arc<AppState> {
             let cfg = frp_core::config::ServerConfig::default();
@@ -2503,7 +2589,7 @@ mod v2 {
                 ..Default::default()
             };
             let result =
-                handle_proxy_update(State(state.clone()), Path("p1".into()), Json(req)).await;
+                handle_proxy_update(State(state.clone()), Path("p1".into()), JsonBody(req)).await;
             let resp = result.expect("update should succeed");
             assert_eq!(
                 resp.0
@@ -2563,7 +2649,7 @@ mod v2 {
                 ..Default::default()
             };
             let (status, json) = expect_err(
-                handle_proxy_update(State(state.clone()), Path("p1".into()), Json(req)).await,
+                handle_proxy_update(State(state.clone()), Path("p1".into()), JsonBody(req)).await,
                 "provider-dependent fields must be rejected",
             );
             assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2592,7 +2678,7 @@ mod v2 {
                 ..Default::default()
             };
             let (status, _) = expect_err(
-                handle_proxy_update(State(state.clone()), Path("p1".into()), Json(req)).await,
+                handle_proxy_update(State(state.clone()), Path("p1".into()), JsonBody(req)).await,
                 "invalid bandwidth limit must be rejected",
             );
             assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2606,7 +2692,7 @@ mod v2 {
                 ..Default::default()
             };
             let (status, _) = expect_err(
-                handle_proxy_update(State(state), Path("missing".into()), Json(req)).await,
+                handle_proxy_update(State(state), Path("missing".into()), JsonBody(req)).await,
                 "unknown proxy must 404",
             );
             assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2624,12 +2710,101 @@ mod v2 {
                 handle_proxy_update(
                     State(state),
                     Path("p1".into()),
-                    Json(UpdateProxyRequest::default()),
+                    JsonBody(UpdateProxyRequest::default()),
                 )
                 .await,
                 "empty update body must be rejected",
             );
             assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn test_ws_subscriber_cap_rejects_when_exhausted() {
+            // Regression: concurrent /api/events WebSocket connections are
+            // capped; once the semaphore is exhausted, further upgrades are
+            // rejected with 429 instead of accumulating unboundedly.
+            let sem = Arc::new(tokio::sync::Semaphore::new(1));
+            let Ok(permit) = try_acquire_ws_permit(&sem) else {
+                panic!("first subscriber must acquire a permit");
+            };
+            let (status, _) = expect_err(
+                try_acquire_ws_permit(&sem),
+                "cap must reject the second concurrent subscriber",
+            );
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            drop(permit);
+            if try_acquire_ws_permit(&sem).is_err() {
+                panic!("permit released → acquisition succeeds again");
+            }
+        }
+
+        #[tokio::test]
+        async fn test_traffic_events_sweeps_stale_last_values() {
+            // Regression: last_values must not grow without bound across
+            // proxy churn — entries for proxies that are no longer
+            // registered are dropped each tick.
+            let state = test_state();
+            state
+                .proxy_manager
+                .register("run-1".into(), proxy_info("p1", "tcp"))
+                .await
+                .unwrap();
+            let metrics = state.proxy_metrics.get_or_create("p1").await;
+            metrics.record_traffic(100, 200);
+
+            let (event_tx, mut rx) = tokio::sync::broadcast::channel(64);
+            let mut last_values = HashMap::new();
+            last_values.insert("gone".into(), MetricsSnapshot::default());
+            last_values.insert("p1".into(), MetricsSnapshot::default());
+
+            emit_traffic_events_tick(&state, &event_tx, &mut last_values).await;
+
+            assert!(
+                !last_values.contains_key("gone"),
+                "stale proxy entry must be swept from last_values"
+            );
+            let p1 = last_values.get("p1").expect("p1 is tracked");
+            assert_eq!(p1.bytes_in, 100);
+            assert_eq!(p1.bytes_out, 200);
+
+            let ev = rx.try_recv().expect("changed traffic emits an event");
+            match ev {
+                crate::event::ServerEvent::Traffic {
+                    proxy_name,
+                    bytes_in,
+                    bytes_out,
+                    ..
+                } => {
+                    assert_eq!(proxy_name, "p1");
+                    assert_eq!(bytes_in, 100);
+                    assert_eq!(bytes_out, 200);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_json_body_malformed_returns_generic_422() {
+            // Regression: a malformed JSON body must yield a generic 422 that
+            // does not leak internal type paths (axum's default rejection
+            // embeds e.g. `frp_server::dashboard::StoreProxyConfig`).
+            let state = test_state();
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/store/proxies")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{\"name\": 123"))
+                .unwrap();
+            let (status, json) = expect_err(
+                JsonBody::<StoreProxyConfig>::from_request(req, &state).await,
+                "malformed JSON must be rejected",
+            );
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(json.0.error, "invalid JSON body");
+            assert!(
+                !json.0.error.contains("StoreProxyConfig"),
+                "rejection must not leak internal type paths"
+            );
         }
     }
 }

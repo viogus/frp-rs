@@ -18,8 +18,11 @@ struct AuthState {
 
 /// Apply HTTP Basic Auth middleware to a router.
 ///
-/// When both `user` and `password` are empty strings, auth is skipped
-/// (pass-through). Otherwise, requests without a valid
+/// When either `user` or `password` is empty, auth is skipped
+/// (pass-through): an empty half would otherwise be silently accepted as an
+/// empty credential, and both callers (frps dashboard, frpc admin API)
+/// already force a localhost-only bind in that case. Only when BOTH are
+/// non-empty is auth enforced — requests without a valid
 /// `Authorization: Basic <base64(user:pass)>` header receive
 /// 401 with `WWW-Authenticate: Basic realm="frp"`.
 ///
@@ -30,7 +33,7 @@ pub fn apply_admin_auth<S>(router: Router<S>, user: &str, password: &str) -> Rou
 where
     S: Clone + Send + Sync + 'static,
 {
-    let enabled = !user.is_empty() || !password.is_empty();
+    let enabled = !user.is_empty() && !password.is_empty();
     if enabled {
         tracing::warn!(
             "Admin API: Basic Auth enabled without TLS — credentials sent in plaintext. \
@@ -109,6 +112,40 @@ mod tests {
     #[tokio::test]
     async fn test_auth_disabled_when_empty() {
         let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "", "");
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_disabled_when_password_empty() {
+        // Either-empty means "no auth" (AND semantics): a user without a
+        // password must not turn the admin API into a public endpoint
+        // protected by an empty credential.
+        let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "admin", "");
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_disabled_when_user_empty() {
+        // Symmetric case: a password without a user is not enforced either.
+        let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "", "secret");
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
