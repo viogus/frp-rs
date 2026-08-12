@@ -683,9 +683,9 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     }
                                     #[cfg(not(all(feature = "quic", feature = "kcp")))]
                                     {
-                                        warn!(visitor_name = %visitor_name, "Visitor '{}': protocol 'quic' requested but the quic feature is disabled; refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)", visitor_name);
+                                        warn!(visitor_name = %visitor_name, "Visitor '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)", visitor_name);
                                         Err(format!(
-                                            "Visitor '{}': protocol 'quic' requires the quic feature",
+                                            "Visitor '{}': protocol 'quic' requires both the quic and kcp features",
                                             visitor_name
                                         ))
                                     }

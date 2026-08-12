@@ -407,6 +407,89 @@ async fn udp_port_has_other_owner(
     })
 }
 
+/// Free the port mark of a registry entry that a superseding control's
+/// re-registration just replaced (see `ProxyManager::register_or_replace`).
+///
+/// The old control's own sweep will skip the name (newer control_id) and
+/// nothing else would ever release the mark — used_ports is never pruned
+/// (the 24h pruner only touches port_reservations) — so the replacement is
+/// the only place that still knows the old port and must free it exactly
+/// once here. Rules mirror the sweep's port cleanup:
+/// - same port as the new registration: no-op (the mark now belongs to the
+///   new control's proxy — e.g. SUDP sharing the old port);
+/// - TCP group member: keep the mark while the old group still has other
+///   members (their shared listener owns the port); stop the group
+///   listener and free the mark when the group emptied;
+/// - SUDP: free only when no other live udp/sudp proxy still holds the
+///   port (shared-port ownership, `udp_port_has_other_owner`);
+/// - otherwise: remove the mark from used_ports / used_udp_ports.
+///
+/// The freed port is reserved under the old proxy's name for the standard
+/// 24h window, matching what the sweep's normal cleanup path would have
+/// created — the old control's sweep never runs for this name.
+async fn free_replaced_port(state: &Arc<AppState>, old: &Arc<ProxyInfo>, new_port: u16) {
+    let Some(port) = old.remote_port.filter(|p| *p > 0) else {
+        return;
+    };
+    if port == new_port {
+        // The new registration shares the old port (SUDP) — the mark is
+        // now the new control's, not a leak.
+        return;
+    }
+    let is_udp_type = old.proxy_type == "udp" || old.proxy_type == "sudp";
+    if old.proxy_type == "tcp" && old.group.as_deref().filter(|g| !g.is_empty()).is_some() {
+        // TCP group member: the shared group listener owns the port. Keep
+        // the mark while other members remain; stop the listener and free
+        // the mark when the group emptied. NOTE: unlike the sweep's
+        // `group_len <= 1` check (which counts the member being removed,
+        // still in the registry), the replacement already migrated the old
+        // entry out of the group index — a count of 1 here means a sibling
+        // still owns the shared port.
+        let group_name = old.group.as_deref().unwrap_or("");
+        if state.proxy_manager.group_len(group_name).await == 0 {
+            state.used_ports.write().await.remove(&port);
+            state
+                .port_reservations
+                .write()
+                .await
+                .insert(old.name.clone(), (port, false, std::time::Instant::now()));
+            // Re-check group_len immediately before tearing down the
+            // shared listener (mirrors the sweep's phase-3 re-check): a
+            // concurrent member join can land between the observation
+            // above and this point (register() pushes to the group index
+            // under its own lock). remove_group would then cancel the
+            // listener out from under the newly joined member, which
+            // registered against the shared listener without creating one
+            // of its own — a dead group with a live member. The port mark
+            // was already freed either way, but the listener's OS bind
+            // keeps the port from being re-allocated until the group
+            // empties. The TOCTOU cannot be fully closed (a join landing
+            // after this re-check) — best-effort, same as the sweep.
+            if state.proxy_manager.group_len(group_name).await == 0 {
+                state.tcp_group_ctl.remove_group(group_name).await;
+            }
+        }
+        return;
+    }
+    if is_udp_type {
+        if !udp_port_has_other_owner(state, port, &std::collections::HashSet::new()).await {
+            state.used_udp_ports.write().await.remove(&port);
+            state
+                .port_reservations
+                .write()
+                .await
+                .insert(old.name.clone(), (port, true, std::time::Instant::now()));
+        }
+        return;
+    }
+    state.used_ports.write().await.remove(&port);
+    state
+        .port_reservations
+        .write()
+        .await
+        .insert(old.name.clone(), (port, false, std::time::Instant::now()));
+}
+
 /// Release a UDP port mark when no OTHER live udp/sudp proxy still holds
 /// it, returning whether the port was released.
 ///
@@ -750,6 +833,7 @@ async fn setup_proxy_listeners(
     state: &Arc<AppState>,
     np: &msg::NewProxy,
     run_id: &str,
+    control_id: u64,
     port: u16,
     bind_addr: &str,
     itx: &mpsc::Sender<InternalMsg>,
@@ -884,6 +968,52 @@ async fn setup_proxy_listeners(
         let listener = match bind_proxy_listener(&bind_addr, port, &np.proxy_name).await {
             Ok(l) => l,
             Err(e) => {
+                // EADDRINUSE surviving the 3×100ms retries: a sibling member
+                // may have created the group (and bound its shared listener)
+                // while this registration was in flight. Rolling back would
+                // reject the first member for a transient collision — the
+                // join fallback below re-checks the group and registers as
+                // a member instead (audit-fix: group-create bind failure
+                // rejected the first member). Per-proxy TCP listeners keep
+                // the reject behavior: their port is exclusive.
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && state
+                        .tcp_group_ctl
+                        .get_group_port(&group_name, &group_key, port, &bind_addr)
+                        .await
+                        .is_some()
+                {
+                    // The group exists and matches this member's
+                    // group/key/port — join it. Roll back the create-path
+                    // registration (port mark + registry entry + count),
+                    // re-mark the port, then re-register via the member
+                    // path, which writes the NewProxyResp itself.
+                    tracing::warn!(
+                        port = %port,
+                        group = %group_name,
+                        proxy_name = %np.proxy_name,
+                        "TCP group port {port} bind raced a sibling group create for '{}' — joining existing group",
+                        np.proxy_name,
+                    );
+                    rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
+                    state.used_ports.write().await.insert(port);
+                    handle_tcp_group_member_registration(
+                        state,
+                        run_id,
+                        control_id,
+                        writer,
+                        np.clone(),
+                        np.remote_port.unwrap_or(0) as u16,
+                        &itx,
+                        listener_handles,
+                        udp_sockets,
+                        v2,
+                        Some(port),
+                        tcp_group_created,
+                    )
+                    .await;
+                    return Err(());
+                }
                 tracing::error!(port = %port, error = %e, "Failed to bind TCP group port {} for '{}': {}", port, np.proxy_name, e);
                 rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
                 reject_new_proxy(
@@ -1135,26 +1265,77 @@ pub(crate) async fn handle_new_proxy(
             // window can find the proxy via sk_index fallback.
             let needs_sk_index = register_sk_index(state, &np).await;
 
-            if let Err(e) = state
-                .proxy_manager
-                .register(run_id.to_string(), info.clone())
-                .await
-            {
-                // Cleanup sk_index on registration failure
-                rollback_port_allocation(state, &np.proxy_name, port, is_udp_type, needs_sk_index)
-                    .await;
-                reject_new_proxy(
-                    writer,
-                    &np.proxy_name,
-                    err_msg(
-                        state.detailed_errors_to_client,
-                        e,
-                        "proxy registration conflict",
-                    ),
-                    v2,
-                )
-                .await;
-                return;
+            // Supersession takeover: when the 10s handoff-barrier timeout
+            // fires, the superseding control may re-register a name the old
+            // control still holds. Port-consuming types (tcp/udp/sudp/
+            // stcp/xtcp/vnet) take over via register_or_replace — the
+            // replaced entry's port mark is freed below, exactly once
+            // (audit-fix: residual port-mark leak on barrier-timeout
+            // supersession). http/https/tcpmux keep the conflict-reject
+            // behavior: their vhost/tcpmux routes are owned by the old
+            // control's registration and cannot be taken over mid-flight
+            // (a replace-then-rollback would orphan the old routes).
+            let replaced = {
+                let replaceable = matches!(
+                    np.proxy_type.as_str(),
+                    "tcp" | "udp" | "sudp" | "stcp" | "xtcp" | "vnet"
+                );
+                let register_result = if replaceable {
+                    state
+                        .proxy_manager
+                        .register_or_replace(run_id.to_string(), info.clone())
+                        .await
+                } else {
+                    state
+                        .proxy_manager
+                        .register(run_id.to_string(), info.clone())
+                        .await
+                        .map(|_| None)
+                };
+                match register_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // Cleanup sk_index on registration failure
+                        rollback_port_allocation(
+                            state,
+                            &np.proxy_name,
+                            port,
+                            is_udp_type,
+                            needs_sk_index,
+                        )
+                        .await;
+                        reject_new_proxy(
+                            writer,
+                            &np.proxy_name,
+                            err_msg(
+                                state.detailed_errors_to_client,
+                                e,
+                                "proxy registration conflict",
+                            ),
+                            v2,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            };
+
+            // A replaced entry's per-client port count and port mark are
+            // released here: the old control's sweep will skip the name
+            // (newer control_id) and never decrement either.
+            if let Some(old) = replaced {
+                if (old.proxy_type == "tcp" || old.proxy_type == "udp" || old.proxy_type == "sudp")
+                    && old.remote_port.is_some_and(|p| p > 0)
+                {
+                    let mut port_counts = state.client_ports_used.write().await;
+                    if let Some(count) = port_counts.get_mut(run_id) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            port_counts.remove(run_id);
+                        }
+                    }
+                }
+                free_replaced_port(state, &old, port).await;
             }
 
             // Track port usage per client (matching Go frp's portsUsedNum).
@@ -1271,6 +1452,7 @@ pub(crate) async fn handle_new_proxy(
                 state,
                 &np,
                 run_id,
+                control_id,
                 port,
                 &state.proxy_bind_addr,
                 internal_tx,
@@ -1410,6 +1592,7 @@ pub(crate) async fn unregister_control(
     run_id: &str,
     control_id: u64,
     skip_ctl_unregister: bool,
+    sweep: bool,
 ) {
     let removed_control_id = if !skip_ctl_unregister {
         let current_control_id = state
@@ -1447,15 +1630,47 @@ pub(crate) async fn unregister_control(
         // == 0 (legacy callers) sweeps everything.
         .filter(|p| control_id == 0 || p.control_id <= control_id)
         .collect();
-    // TODO(audit-fix): residual port-mark leak on barrier-timeout
-    // supersession. When the 10s handoff barrier times out and the
-    // superseding control has already re-registered the same proxy names,
-    // those names are skipped here (newer control_id) — but the OLD
-    // control's original port marks in used_ports/used_udp_ports are never
-    // released, and nothing prunes used_ports (the 24h pruner only touches
-    // port_reservations). Real fix: have proxy_manager.register() return
-    // the ProxyInfo it replaced so the superseding login can free the old
-    // control's different port (same note at control/proxy.rs skip path).
+
+    // Clean up OIDC subject mapping for this client.
+    // Map key is run_id; remove it directly rather than scanning values
+    // (which are OIDC subject strings, not proxy names — retain would
+    // never match and entries would leak unboundedly). Generation-guarded,
+    // so this is safe to run in sweep-free mode too.
+    {
+        let mut subjects = state.oidc.subjects.write().await;
+        if let Some(control_id) = removed_control_id {
+            if subjects
+                .get(run_id)
+                .is_some_and(|(_, generation)| *generation == control_id)
+            {
+                subjects.remove(run_id);
+            }
+        }
+    }
+
+    // Sweep-free mode: the duplicate-login conflict path in login.rs calls
+    // this with sweep=false because ITS control_id (assigned from the
+    // monotonic counter) is HIGHER than the live control's — the generation
+    // filter above would let the live control's older proxies through and
+    // tear down their ports/vhost routes/sk_index (audit-fix: the
+    // duplicate-login conflict path swept the live control's routes). That
+    // path only wants the run_id entry removal and the OIDC subject cleanup
+    // below; the sweep must not run.
+    if !sweep {
+        return;
+    }
+
+    // Port-mark ownership on supersession: if the superseding control
+    // re-registered one of these names (barrier-timeout path), the registry
+    // entry now belongs to the newer control generation and is skipped by
+    // the filter above. Its port mark was freed exactly once by the
+    // replacement path — proxy_manager.register_or_replace returns the
+    // replaced entry and handle_new_proxy's free_replaced_port releases the
+    // old mark when it differs from the new port, reserving it for the
+    // standard 24h window. Nothing leaks here and this sweep never touches
+    // the superseding control's marks (audit-fix: residual port-mark leak
+    // on barrier-timeout supersession; same note at control/proxy.rs skip
+    // path).
     // TCP port cleanup. Phase 1 (no locks held): decide what to release.
     // group_len is queried here — NOT while holding used_ports — and the
     // port_reservations inserts / remove_group / sk_index calls run after
@@ -1471,6 +1686,25 @@ pub(crate) async fn unregister_control(
     // re-checked in phase 3 before remove_group.
     let mut groups_to_remove: Vec<(String, usize)> = Vec::new();
     for p in &proxies {
+        // Ownership re-check (mirrors the sk_index/vhost/tcpmux loops
+        // below): the snapshot is taken BEFORE this loop runs, so a
+        // superseding control that re-registered this name between the
+        // snapshot and phase 1 must not lose its port mark — the
+        // replacement path (handle_new_proxy → register_or_replace →
+        // free_replaced_port) already freed the old mark exactly once, so
+        // phase 2 must not free it again (a third-party proxy may have
+        // re-allocated the freed port in the meantime), and the count
+        // decrement below must not run twice for the same name
+        // (audit-fix: sweep port marks vs same-name re-registration).
+        if p.control_id != 0
+            && state
+                .proxy_manager
+                .get(&p.name)
+                .await
+                .is_some_and(|cur| cur.control_id > p.control_id)
+        {
+            continue;
+        }
         if let Some(port) = p.remote_port {
             // For TCP group proxies, only release the port if this is the last
             // member of the group. Otherwise the shared group listener still
@@ -1526,8 +1760,22 @@ pub(crate) async fn unregister_control(
         }
     }
     // Clean up STCP sk_index (indexed by proxy_name — exact match, no
-    // risk of removing another proxy's entry even when keys are shared)
+    // risk of removing another proxy's entry even when keys are shared).
+    // Ownership re-check: the snapshot above is taken BEFORE this loop
+    // runs, so a superseding control that re-registered the same name
+    // between snapshot and sweep must not lose its sk_index entry —
+    // mirror the tcpmux ownership guard below (audit-fix: sweep snapshot
+    // vs same-name re-registration).
     for p in &proxies {
+        if p.control_id != 0
+            && state
+                .proxy_manager
+                .get(&p.name)
+                .await
+                .is_some_and(|cur| cur.control_id > p.control_id)
+        {
+            continue;
+        }
         if let Some(key) = p.sk_index_key() {
             state.xtcp.sk_index.write().await.remove(key);
         }
@@ -1581,13 +1829,28 @@ pub(crate) async fn unregister_control(
     // removed: the per-run_id counter is shared with a superseding control's
     // registrations, so a wholesale remove would clear its counts too
     // (audit finding 3).
-    let consumed: usize = proxies
-        .iter()
-        .filter(|p| {
-            matches!(p.proxy_type.as_str(), "tcp" | "udp" | "sudp")
-                && p.remote_port.is_some_and(|port| port > 0)
-        })
-        .count();
+    let mut consumed: usize = 0;
+    for p in &proxies {
+        // Ownership re-check (same rationale as phase 1): the replacement
+        // path already decremented the per-client count for the old entry
+        // and incremented for the new registration (net zero), so a sweep
+        // decrement for a replaced name would undercount the client's port
+        // budget by 1 (audit-fix: double-decrement on supersession).
+        if p.control_id != 0
+            && state
+                .proxy_manager
+                .get(&p.name)
+                .await
+                .is_some_and(|cur| cur.control_id > p.control_id)
+        {
+            continue;
+        }
+        if matches!(p.proxy_type.as_str(), "tcp" | "udp" | "sudp")
+            && p.remote_port.is_some_and(|port| port > 0)
+        {
+            consumed += 1;
+        }
+    }
     if consumed > 0 {
         let mut port_counts = state.client_ports_used.write().await;
         if let Some(count) = port_counts.get_mut(run_id) {
@@ -1605,6 +1868,22 @@ pub(crate) async fn unregister_control(
     // and the decrement must be gated on remove()'s result so a racing
     // dashboard delete can never double-decrement (see control/proxy.rs).
     for p in &proxies {
+        // Ownership re-check (mirrors the tcpmux pattern): the snapshot was
+        // taken before this loop, so a superseding control that
+        // re-registered the same name between snapshot and sweep must not
+        // lose its vhost/tcpmux routes or metrics (audit-fix: sweep
+        // snapshot vs same-name re-registration). http/https/tcpmux cannot
+        // be replaced via register_or_replace today, so this guards against
+        // future route takeover paths too.
+        if p.control_id != 0
+            && state
+                .proxy_manager
+                .get(&p.name)
+                .await
+                .is_some_and(|cur| cur.control_id > p.control_id)
+        {
+            continue;
+        }
         state.vhost_manager.unregister(&p.name).await;
         state.tcpmux_manager.unregister(&p.name).await;
         state.proxy_metrics.remove(&p.name).await;
@@ -1613,27 +1892,24 @@ pub(crate) async fn unregister_control(
     {
         // Remove vnet routes for the proxies being swept (control_id
         // filtered) so a superseding control's vnet routes survive the old
-        // control's cleanup (audit finding 3).
+        // control's cleanup (audit finding 3). Ownership re-check: a
+        // superseding control that re-registered the name between the
+        // snapshot and this loop must keep its routes (audit-fix: sweep
+        // snapshot vs same-name re-registration).
         for p in &proxies {
+            if p.control_id != 0
+                && state
+                    .proxy_manager
+                    .get(&p.name)
+                    .await
+                    .is_some_and(|cur| cur.control_id > p.control_id)
+            {
+                continue;
+            }
             if p.proxy_type == "vnet" {
                 state
                     .remove_proxy_vnet_routes_and_broadcast(run_id, &p.name)
                     .await;
-            }
-        }
-    }
-    // Clean up OIDC subject mapping for this client.
-    // Map key is run_id; remove it directly rather than scanning values
-    // (which are OIDC subject strings, not proxy names — retain would
-    // never match and entries would leak unboundedly).
-    {
-        let mut subjects = state.oidc.subjects.write().await;
-        if let Some(control_id) = removed_control_id {
-            if subjects
-                .get(run_id)
-                .is_some_and(|(_, generation)| *generation == control_id)
-            {
-                subjects.remove(run_id);
             }
         }
     }
@@ -1774,24 +2050,44 @@ async fn handle_tcp_group_member_registration(
 
     let info = build_proxy_info(state, &np, run_id, control_id, port).await;
 
-    if let Err(e) = state
+    // Supersession takeover: a same-name re-registration by a newer control
+    // generation of the same run_id replaces the old entry; the old port
+    // mark and per-client count are freed here exactly once — the old
+    // control's sweep skips the name and would never release them
+    // (audit-fix: residual port-mark leak on barrier-timeout supersession).
+    let replaced = match state
         .proxy_manager
-        .register(run_id.to_string(), info.clone())
+        .register_or_replace(run_id.to_string(), info.clone())
         .await
     {
-        state.used_ports.write().await.remove(&port);
-        reject_new_proxy(
-            writer,
-            &np.proxy_name,
-            err_msg(
-                state.detailed_errors_to_client,
-                e,
-                "proxy registration conflict (TCP group)",
-            ),
-            v2,
-        )
-        .await;
-        return;
+        Ok(r) => r,
+        Err(e) => {
+            state.used_ports.write().await.remove(&port);
+            reject_new_proxy(
+                writer,
+                &np.proxy_name,
+                err_msg(
+                    state.detailed_errors_to_client,
+                    e,
+                    "proxy registration conflict (TCP group)",
+                ),
+                v2,
+            )
+            .await;
+            return;
+        }
+    };
+    if let Some(old) = replaced {
+        if old.remote_port.is_some_and(|p| p > 0) {
+            let mut port_counts = state.client_ports_used.write().await;
+            if let Some(count) = port_counts.get_mut(run_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    port_counts.remove(run_id);
+                }
+            }
+        }
+        free_replaced_port(state, &old, port).await;
     }
 
     // Track port usage per client (matching Go frp's portsUsedNum — each
@@ -2040,11 +2336,11 @@ pub(crate) mod unregister_generation_tests {
 
         // An older failing control (generation 3) must not delete the
         // replacement's routing entry.
-        unregister_control(&state, "run-1", 3, false).await;
+        unregister_control(&state, "run-1", 3, false, true).await;
         assert!(state.run_id_to_ctl_tx.contains_key("run-1"));
 
         // The replacement itself may still clean up its own generation.
-        unregister_control(&state, "run-1", 7, false).await;
+        unregister_control(&state, "run-1", 7, false, true).await;
         assert!(!state.run_id_to_ctl_tx.contains_key("run-1"));
     }
 
@@ -2139,7 +2435,7 @@ pub(crate) mod unregister_generation_tests {
         // holding used_ports.write().)
         let unreg = tokio::spawn({
             let state = state.clone();
-            async move { unregister_control(&state, "run-1", 1, false).await }
+            async move { unregister_control(&state, "run-1", 1, false, true).await }
         });
         tokio::task::yield_now().await;
         assert!(
@@ -2211,7 +2507,7 @@ pub(crate) mod unregister_generation_tests {
         let held_reservations = state.port_reservations.write().await;
         let unreg = tokio::spawn({
             let state = state.clone();
-            async move { unregister_control(&state, "run-1", 1, false).await }
+            async move { unregister_control(&state, "run-1", 1, false, true).await }
         });
         tokio::task::yield_now().await;
         assert!(
@@ -2296,7 +2592,7 @@ pub(crate) mod unregister_generation_tests {
             );
         }
 
-        unregister_control(&state, "run-a", 1, false).await;
+        unregister_control(&state, "run-a", 1, false, true).await;
 
         let routes = state.vnet_routes.read().await;
         assert!(routes.iter().all(|(_, (run_id, _))| run_id != "run-a"));
@@ -2469,7 +2765,7 @@ pub(crate) mod unregister_generation_tests {
 
         // Disconnect cleanup decrements by the count of port-consuming
         // proxies it actually removes (finding 3 symmetry): entry cleared.
-        unregister_control(&state, "run-1", 1, false).await;
+        unregister_control(&state, "run-1", 1, false, true).await;
         assert!(
             state.client_ports_used.read().await.get("run-1").is_none(),
             "cleanup must remove the per-client port count"
@@ -2568,7 +2864,7 @@ pub(crate) mod unregister_generation_tests {
 
         // Old control (generation 1) sweeps: only its own proxy's port is
         // released; the new control's proxy and counts survive.
-        unregister_control(&state, "run-1", 1, false).await;
+        unregister_control(&state, "run-1", 1, false, true).await;
         assert!(
             !state.used_ports.read().await.contains(&24024),
             "old control's port must be released"
@@ -2588,7 +2884,7 @@ pub(crate) mod unregister_generation_tests {
         );
 
         // The superseding control's own cleanup sweeps everything.
-        unregister_control(&state, "run-1", 2, false).await;
+        unregister_control(&state, "run-1", 2, false, true).await;
         assert!(
             !state.used_ports.read().await.contains(&24025),
             "superseding control must release its own port on disconnect"
@@ -2676,6 +2972,934 @@ pub(crate) mod unregister_generation_tests {
         assert!(
             state.client_ports_used.read().await.get("run-1").is_none(),
             "tcpmux proxies must not count against the client port budget"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Audit fixes (2026-08-13): supersession port-mark leak, group-create
+    // bind-race join, duplicate-login conflict sweep, sweep snapshot
+    // ownership re-checks.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn supersession_replacement_frees_old_port_mark() {
+        // Audit-fix regression (finding 1): when the superseding control
+        // re-registers a name the old control still holds (barrier-timeout
+        // supersession), the old control's original port mark must be freed
+        // exactly once — nothing else prunes used_ports (the 24h pruner
+        // only touches port_reservations), and the old control's own sweep
+        // skips the name (newer control_id).
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // Old control (generation 1) registers "p" with an AUTO-ASSIGNED
+        // port (remote_port 0 — the supersession leak scenario: an explicit
+        // occupied port is rejected today, matching Go frp's
+        // Manager.Acquire, so only auto-assigned re-registrations reach the
+        // replacement path).
+        let np = new_proxy("p", "tcp");
+        let mut writer = Vec::new();
+        handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        let old_port = state
+            .proxy_manager
+            .get("p")
+            .await
+            .expect("p registered")
+            .remote_port
+            .expect("auto-assigned port");
+        assert!(state.used_ports.read().await.contains(&old_port));
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            1,
+            "old control's proxy counts once"
+        );
+        assert_eq!(state.proxy_manager.get("p").await.unwrap().control_id, 1);
+
+        // Superseding control (generation 2) re-registers the same name.
+        // The old mark is still live, so allocation takes a different port;
+        // the replacement must free the old mark exactly once.
+        let np2 = new_proxy("p", "tcp");
+        let mut writer2 = Vec::new();
+        handle_new_proxy(
+            np2,
+            "run-1",
+            2,
+            &state,
+            &mut writer2,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+
+        let reg = state
+            .proxy_manager
+            .get("p")
+            .await
+            .expect("p still registered");
+        assert_eq!(reg.control_id, 2, "superseding control owns the entry");
+        let new_port = reg.remote_port.expect("tcp proxy has a port");
+        assert_ne!(new_port, old_port, "allocation must take a different port");
+        assert!(state.used_ports.read().await.contains(&new_port));
+        assert!(
+            !state.used_ports.read().await.contains(&old_port),
+            "old port mark freed exactly once by the replacement"
+        );
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            1,
+            "one live proxy counts once (not twice)"
+        );
+        assert!(
+            state.port_reservations.read().await.contains_key("p"),
+            "freed port reserved under the proxy name (normal-cleanup parity)"
+        );
+
+        // The old control's own sweep skips the name — the new port and
+        // entry must survive it.
+        unregister_control(&state, "run-1", 1, false, true).await;
+        assert!(state.proxy_manager.get("p").await.is_some());
+        assert!(
+            state.used_ports.read().await.contains(&new_port),
+            "old sweep must not free the superseding control's port"
+        );
+
+        // The new control's own cleanup releases everything.
+        unregister_control(&state, "run-1", 2, false, true).await;
+        assert!(!state.used_ports.read().await.contains(&new_port));
+        assert_eq!(
+            state.client_ports_used.read().await.get("run-1"),
+            None,
+            "count entry removed when it reaches zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersession_replacement_respects_sudp_shared_port_ownership() {
+        // Audit-fix regression (finding 1): SUDP shared-port ownership must
+        // survive a supersession replacement — the old mark stays while a
+        // sibling SUDP proxy still owns the port, and is freed once the
+        // sibling is gone.
+        let state = test_state();
+        state.used_udp_ports.write().await.insert(24043);
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                proxy_info("s", "sudp", "run-1", Some(24043), 1),
+            )
+            .await
+            .expect("register s");
+        // A sibling SUDP proxy shares the port (frp-rs shared-port extension).
+        state
+            .proxy_manager
+            .register(
+                "run-2".to_string(),
+                proxy_info("s2", "sudp", "run-2", Some(24043), 1),
+            )
+            .await
+            .expect("register s2");
+
+        let replaced = state
+            .proxy_manager
+            .register_or_replace(
+                "run-1".to_string(),
+                proxy_info("s", "sudp", "run-1", Some(24044), 2),
+            )
+            .await
+            .expect("supersession replacement")
+            .expect("replaced entry");
+        // The new registration's allocation inserted its own mark.
+        state.used_udp_ports.write().await.insert(24044);
+        free_replaced_port(&state, &replaced, 24044).await;
+
+        assert!(
+            state.used_udp_ports.read().await.contains(&24043),
+            "shared port mark stays while a sibling SUDP proxy holds it"
+        );
+        assert!(state.used_udp_ports.read().await.contains(&24044));
+        assert!(
+            !state.port_reservations.read().await.contains_key("s"),
+            "no reservation while a sibling still owns the shared port"
+        );
+
+        // The replacement only frees the REPLACED ENTRY's own port. The
+        // sibling's shared mark (24043) is released by the sibling's own
+        // cleanup (unregister_control's udp_port_has_other_owner path) —
+        // removing s2 without running its cleanup must leave the mark, or
+        // a concurrent s2 cleanup would double-free it.
+        state.proxy_manager.remove("s2").await;
+        assert!(
+            state.used_udp_ports.read().await.contains(&24043),
+            "shared port mark stays for the sibling's own cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersession_replacement_same_port_keeps_mark() {
+        // Audit-fix regression (finding 1): a replacement that SHARES the
+        // old port (SUDP) must not free the mark — it now belongs to the
+        // superseding control's proxy.
+        let state = test_state();
+        state.used_udp_ports.write().await.insert(24042);
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                proxy_info("s", "sudp", "run-1", Some(24042), 1),
+            )
+            .await
+            .expect("register s");
+        let replaced = state
+            .proxy_manager
+            .register_or_replace(
+                "run-1".to_string(),
+                proxy_info("s", "sudp", "run-1", Some(24042), 2),
+            )
+            .await
+            .expect("supersession replacement")
+            .expect("replaced entry");
+        free_replaced_port(&state, &replaced, 24042).await;
+        assert!(
+            state.used_udp_ports.read().await.contains(&24042),
+            "same-port replacement keeps the mark (now the new control's)"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersession_replacement_tcp_group_port_kept_while_members_remain() {
+        // Audit-fix regression (finding 1): a replaced TCP group member
+        // moving to a DIFFERENT group must not free the old group's shared
+        // port while a sibling member still owns the shared listener.
+        let state = test_state();
+        state.used_ports.write().await.insert(24046);
+        let mut g1 = proxy_info("g1", "tcp", "run-1", Some(24046), 1);
+        g1.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-1".to_string(), g1)
+            .await
+            .expect("register g1");
+        let mut g2 = proxy_info("g2", "tcp", "run-2", Some(24046), 1);
+        g2.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-2".to_string(), g2)
+            .await
+            .expect("register g2");
+
+        // Superseding control re-registers g1 into a different group.
+        let mut g1b = proxy_info("g1", "tcp", "run-1", Some(24047), 2);
+        g1b.group = Some("grp2".to_string());
+        let replaced = state
+            .proxy_manager
+            .register_or_replace("run-1".to_string(), g1b)
+            .await
+            .expect("supersession replacement")
+            .expect("replaced entry");
+        // The new registration's allocation inserted its own mark.
+        state.used_ports.write().await.insert(24047);
+        free_replaced_port(&state, &replaced, 24047).await;
+
+        assert!(
+            state.used_ports.read().await.contains(&24046),
+            "group port mark stays while a sibling member remains"
+        );
+        assert!(state.used_ports.read().await.contains(&24047));
+        assert_eq!(
+            state.proxy_manager.group_len("grp").await,
+            1,
+            "g1 left the old group index"
+        );
+        assert_eq!(state.proxy_manager.group_len("grp2").await, 1);
+    }
+
+    #[tokio::test]
+    async fn supersession_replacement_frees_group_port_when_group_emptied() {
+        // Audit-fix regression (finding 1): a replaced TCP group member
+        // whose old group emptied must free the shared port AND stop the
+        // group's shared listener.
+        let state = test_state();
+        state.used_ports.write().await.insert(24048);
+        let mut g1 = proxy_info("g1", "tcp", "run-1", Some(24048), 1);
+        g1.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-1".to_string(), g1)
+            .await
+            .expect("register g1");
+        // The shared group listener (normally created by the first member's
+        // NewProxy bind).
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        state
+            .tcp_group_ctl
+            .create_group(
+                "grp",
+                "k",
+                24048,
+                "127.0.0.1",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+
+        let mut g1b = proxy_info("g1", "tcp", "run-1", Some(24049), 2);
+        g1b.group = Some("grp2".to_string());
+        let replaced = state
+            .proxy_manager
+            .register_or_replace("run-1".to_string(), g1b)
+            .await
+            .expect("supersession replacement")
+            .expect("replaced entry");
+        // The new registration's allocation inserted its own mark.
+        state.used_ports.write().await.insert(24049);
+        free_replaced_port(&state, &replaced, 24049).await;
+
+        assert!(
+            !state.used_ports.read().await.contains(&24048),
+            "emptied old group's port mark is freed"
+        );
+        assert!(
+            cancel_token.is_cancelled(),
+            "emptied old group's shared listener is stopped"
+        );
+        assert!(
+            state.port_reservations.read().await.contains_key("g1"),
+            "freed group port reserved under the proxy name"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersession_replacement_group_recheck_keeps_listener_on_concurrent_join() {
+        // Audit-fix regression: free_replaced_port's TCP-group branch
+        // re-checks group_len immediately before remove_group (mirroring
+        // the sweep's phase-3 re-check). A member joining between the first
+        // observation and the teardown registers against the shared
+        // listener without creating one of its own — remove_group would
+        // cancel the listener out from under it, a dead group with a live
+        // member.
+        let state = test_state();
+        state.used_ports.write().await.insert(24055);
+        let mut g1 = proxy_info("g1", "tcp", "run-1", Some(24055), 1);
+        g1.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-1".to_string(), g1)
+            .await
+            .expect("register g1");
+        // The shared group listener (normally created by the first member's
+        // NewProxy bind).
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        state
+            .tcp_group_ctl
+            .create_group(
+                "grp",
+                "k",
+                24055,
+                "127.0.0.1",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+
+        let mut g1b = proxy_info("g1", "tcp", "run-1", Some(24056), 2);
+        g1b.group = Some("grp2".to_string());
+        let replaced = state
+            .proxy_manager
+            .register_or_replace("run-1".to_string(), g1b)
+            .await
+            .expect("supersession replacement")
+            .expect("replaced entry");
+        // The new registration's allocation inserted its own mark.
+        state.used_ports.write().await.insert(24056);
+
+        // Park free_replaced_port between its first group_len observation
+        // and the re-check: hold port_reservations (acquired after the mark
+        // removal, before the re-check). Every await before that park
+        // (group_len, used_ports) is uncontended, so a freed mark means the
+        // task has passed the first "group empty" observation and parked.
+        let held_reservations = state.port_reservations.write().await;
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { free_replaced_port(&state, &replaced, 24056).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !state.used_ports.read().await.contains(&24055),
+            "the old group's mark should be freed before the task parks on port_reservations"
+        );
+
+        // A new member joins the old group between the first observation
+        // and the re-check.
+        let mut g2 = proxy_info("g2", "tcp", "run-2", Some(24055), 3);
+        g2.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-2".to_string(), g2)
+            .await
+            .expect("register g2");
+        assert_eq!(state.proxy_manager.group_len("grp").await, 1);
+
+        drop(held_reservations);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("free_replaced_port hung")
+            .expect("task panicked");
+
+        // The shared listener survives with its live member.
+        assert!(
+            state.tcp_group_ctl.group_exists("grp").await,
+            "shared group listener must survive a concurrent member join"
+        );
+        assert!(!cancel_token.is_cancelled());
+        assert_eq!(state.proxy_manager.group_len("grp").await, 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_login_conflict_does_not_sweep_live_control() {
+        // Audit-fix regression (finding 3): the login paths must not sweep
+        // the LIVE control's proxies. Note the duplicate-login CONFLICT
+        // path itself could never have — register_with_control_id only
+        // reports conflict when the existing entry's run_id DIFFERS
+        // (registry.rs), and the sweep is run_id-scoped, so it would be
+        // vacuous for another run_id's proxies. The REAL danger is the
+        // login FAILURE paths after a 10s handoff-barrier timeout
+        // (LoginResp write / flush failures in login.rs): there the new
+        // login's control_id (monotonic counter) is HIGHER than the older
+        // live control's, so a full sweep's generation filter would let
+        // the older control's proxies through — tearing down ports,
+        // sk_index, and routes while that control may still be running.
+        // This test stages that state (same run_id, newer control_id,
+        // sweep-free unregister) and asserts the live control's proxies
+        // survive.
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                proxy_info("p", "tcp", "run-1", Some(24053), 1),
+            )
+            .await
+            .expect("register p");
+        state.used_ports.write().await.insert(24053);
+        let mut s = proxy_info("s", "stcp", "run-1", Some(0), 1);
+        s.sk = Some("secret".to_string());
+        state
+            .proxy_manager
+            .register("run-1".to_string(), s)
+            .await
+            .expect("register s");
+        state
+            .xtcp
+            .sk_index
+            .write()
+            .await
+            .insert("s".to_string(), "secret".to_string());
+        state
+            .client_ports_used
+            .write()
+            .await
+            .insert("run-1".to_string(), 1);
+
+        // The rejected duplicate login's own ctl entry (control_id 2)
+        // replaced the live control's entry before the conflict path ran —
+        // mirror that here, then unregister with sweep=false.
+        insert_control(&state, "run-1", 2).await;
+        unregister_control(&state, "run-1", 2, false, false).await;
+
+        assert!(
+            state.proxy_manager.get("p").await.is_some(),
+            "live control's proxy must survive the conflict path"
+        );
+        assert_eq!(state.proxy_manager.get("p").await.unwrap().control_id, 1);
+        assert!(
+            state.used_ports.read().await.contains(&24053),
+            "live control's port mark must survive"
+        );
+        assert!(
+            state.xtcp.sk_index.read().await.contains_key("s"),
+            "live control's sk_index entry must survive"
+        );
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            1,
+            "live control's port count must survive"
+        );
+        assert!(
+            !state.run_id_to_ctl_tx.contains_key("run-1"),
+            "the rejected login's own ctl entry is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_control_full_sweep_still_tears_down_older_generation() {
+        // Contrast for the sweep-free mode: with sweep=true, a higher
+        // control_id DOES tear down older proxies — that is the normal
+        // cleanup behavior the conflict path must not trigger.
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                proxy_info("p", "tcp", "run-1", Some(24054), 1),
+            )
+            .await
+            .expect("register p");
+        state.used_ports.write().await.insert(24054);
+
+        unregister_control(&state, "run-1", 2, false, true).await;
+        // unregister_control frees the ports; the registry-entry removal is
+        // the caller's job (control::cleanup) — the port assertion is what
+        // distinguishes the sweep from the sweep-free mode.
+        assert!(!state.used_ports.read().await.contains(&24054));
+    }
+
+    #[tokio::test]
+    async fn unregister_control_sweep_skips_replaced_proxy_routes() {
+        // Audit-fix regression (finding 6): the sweep's snapshot is taken
+        // BEFORE its route cleanup runs. A superseding control that
+        // re-registers the same name between snapshot and sweep must not
+        // lose its sk_index entry / vhost routes.
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let mut s = proxy_info("s", "stcp", "run-1", Some(0), 1);
+        s.sk = Some("secret".to_string());
+        state
+            .proxy_manager
+            .register("run-1".to_string(), s)
+            .await
+            .expect("register s");
+        state
+            .xtcp
+            .sk_index
+            .write()
+            .await
+            .insert("s".to_string(), "secret".to_string());
+
+        // Park the sweep after its snapshot, before the sk_index loop: hold
+        // used_ports so phase 2 blocks. Every await before that park
+        // (ctl removal, OIDC subjects, list_client, phase 1) is
+        // uncontended, so a removed run_id entry means the task is parked
+        // there with the snapshot already taken.
+        let held_ports = state.used_ports.write().await;
+        let unreg = tokio::spawn({
+            let state = state.clone();
+            async move { unregister_control(&state, "run-1", 1, false, true).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !state.run_id_to_ctl_tx.contains_key("run-1"),
+            "cleanup should have passed the ctl removal and parked on used_ports"
+        );
+
+        // A superseding control re-registers the same name between the
+        // snapshot and the sweep's route cleanup, and re-inserts its
+        // sk_index entry.
+        let mut s2 = proxy_info("s", "stcp", "run-1", Some(0), 2);
+        s2.sk = Some("secret".to_string());
+        state
+            .proxy_manager
+            .register_or_replace("run-1".to_string(), s2)
+            .await
+            .expect("superseding replacement");
+        state
+            .xtcp
+            .sk_index
+            .write()
+            .await
+            .insert("s".to_string(), "secret".to_string());
+
+        drop(held_ports);
+        tokio::time::timeout(Duration::from_secs(5), unreg)
+            .await
+            .expect("cleanup hung")
+            .expect("cleanup panicked");
+
+        assert!(
+            state.xtcp.sk_index.read().await.contains_key("s"),
+            "superseding control's sk_index must survive the old sweep"
+        );
+        assert_eq!(
+            state
+                .proxy_manager
+                .get("s")
+                .await
+                .expect("registry entry")
+                .control_id,
+            2,
+            "superseding control's registry entry survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_control_sweep_skips_replaced_proxy_ports_and_counts() {
+        // Audit-fix regression (phase-1 port decisions + per-client count
+        // decrement): the sweep's snapshot is taken BEFORE its phase-1 port
+        // decisions. A superseding control that re-registers a name between
+        // snapshot and phase 1 (barrier-timeout supersession) must not have
+        // its old port decisions re-run by the sweep. Scenario: g1 (group
+        // "grp") is replaced by a newer generation; the replacement's
+        // free_replaced_port KEEPS the shared port mark while the sibling
+        // g2 (another run_id) remains. Without the phase-1 ownership
+        // re-check the sweep would observe group_len("grp") == 1 and free
+        // the sibling's mark, then its phase-3 re-check (still 1, since g2
+        // is untouched) would match and cancel the shared listener out from
+        // under the live sibling — a dead group with a live member. The
+        // per-client count must likewise not be double-decremented (the
+        // replacement path already net-zeroed it).
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let mut g1 = proxy_info("g1", "tcp", "run-1", Some(24060), 1);
+        g1.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-1".to_string(), g1)
+            .await
+            .expect("register g1");
+        // A sibling in the same group under a different run_id: NOT part of
+        // this sweep's snapshot, and its shared listener must survive.
+        let mut g2 = proxy_info("g2", "tcp", "run-2", Some(24060), 5);
+        g2.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-2".to_string(), g2)
+            .await
+            .expect("register g2");
+        state.used_ports.write().await.insert(24060);
+        state
+            .client_ports_used
+            .write()
+            .await
+            .insert("run-1".to_string(), 1);
+        // The shared group listener (normally created by the first member's
+        // NewProxy bind).
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        state
+            .tcp_group_ctl
+            .create_group(
+                "grp",
+                "k",
+                24060,
+                "127.0.0.1",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+
+        // Park the sweep after its snapshot, before phase 1: hold
+        // oidc.subjects (acquired right after list_client). Every await
+        // before that park (ctl removal, list_client, subjects) is
+        // uncontended, so a removed run_id entry means the task is parked
+        // there with the snapshot already taken.
+        let held_subjects = state.oidc.subjects.write().await;
+        let unreg = tokio::spawn({
+            let state = state.clone();
+            async move { unregister_control(&state, "run-1", 1, false, true).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !state.run_id_to_ctl_tx.contains_key("run-1"),
+            "cleanup should have passed the ctl removal and parked on oidc subjects"
+        );
+
+        // A superseding control re-registers g1 between the snapshot and
+        // phase 1. Mirror the real replacement path (handle_new_proxy):
+        // register_or_replace + per-client count net-zero + free_replaced_port
+        // (which keeps the shared mark while g2 remains).
+        let replaced = state
+            .proxy_manager
+            .register_or_replace(
+                "run-1".to_string(),
+                proxy_info("g1", "tcp", "run-1", Some(24061), 2),
+            )
+            .await
+            .expect("superseding replacement")
+            .expect("replaced entry");
+        {
+            let mut port_counts = state.client_ports_used.write().await;
+            let count = port_counts.get_mut("run-1").unwrap();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                port_counts.remove("run-1");
+            }
+        }
+        state.used_ports.write().await.insert(24061);
+        free_replaced_port(&state, &replaced, 24061).await;
+        state
+            .client_ports_used
+            .write()
+            .await
+            .entry("run-1".to_string())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        assert!(
+            state.used_ports.read().await.contains(&24060),
+            "the shared port mark stays while the sibling remains"
+        );
+
+        drop(held_subjects);
+        tokio::time::timeout(Duration::from_secs(5), unreg)
+            .await
+            .expect("cleanup hung")
+            .expect("cleanup panicked");
+
+        // The sibling's mark, its shared listener, and the count all
+        // survive the old sweep.
+        assert!(
+            state.used_ports.read().await.contains(&24060),
+            "sibling's shared port mark must survive the old sweep"
+        );
+        assert!(
+            state.used_ports.read().await.contains(&24061),
+            "superseding control's port mark must survive the old sweep"
+        );
+        assert!(
+            state.tcp_group_ctl.group_exists("grp").await,
+            "shared group listener must survive the old sweep"
+        );
+        assert!(!cancel_token.is_cancelled());
+        assert_eq!(state.proxy_manager.group_len("grp").await, 1);
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            1,
+            "the sweep must not double-decrement the replacement's count"
+        );
+        assert_eq!(
+            state
+                .proxy_manager
+                .get("g1")
+                .await
+                .expect("registry entry")
+                .control_id,
+            2,
+            "superseding control's registry entry survives"
+        );
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn unregister_control_sweep_skips_replaced_vnet_routes() {
+        // Audit-fix regression (finding 6, vnet variant): the sweep's vnet
+        // route cleanup must skip a name re-registered by a superseding
+        // control between the snapshot and the vnet loop — mirror of the
+        // tested sk_index variant (vnet IS replaceable via
+        // register_or_replace, unlike http/https/tcpmux).
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        state
+            .proxy_manager
+            .register(
+                "run-1".to_string(),
+                proxy_info("v1", "vnet", "run-1", Some(0), 1),
+            )
+            .await
+            .expect("register v1");
+        state.vnet_routes.write().await.insert(
+            ("vnet-1".to_string(), "10.7.0.0/24".to_string()),
+            ("run-1".to_string(), "v1".to_string()),
+        );
+
+        // Park the sweep after its snapshot, before the vnet loop: hold
+        // used_ports so phase 2 blocks. The vnet loop runs last (after the
+        // sk_index/UDP/vhost loops), and every await before that park is
+        // uncontended, so a removed run_id entry means the task is parked
+        // there with the snapshot already taken.
+        let held_ports = state.used_ports.write().await;
+        let unreg = tokio::spawn({
+            let state = state.clone();
+            async move { unregister_control(&state, "run-1", 1, false, true).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !state.run_id_to_ctl_tx.contains_key("run-1"),
+            "cleanup should have passed the ctl removal and parked on used_ports"
+        );
+
+        // A superseding control re-registers the same name between the
+        // snapshot and the vnet loop, and re-inserts its routes (mirroring
+        // the replacement path's vnet route registration).
+        state
+            .proxy_manager
+            .register_or_replace(
+                "run-1".to_string(),
+                proxy_info("v1", "vnet", "run-1", Some(0), 2),
+            )
+            .await
+            .expect("superseding replacement");
+        state.vnet_routes.write().await.insert(
+            ("vnet-1".to_string(), "10.7.0.0/24".to_string()),
+            ("run-1".to_string(), "v1".to_string()),
+        );
+
+        drop(held_ports);
+        tokio::time::timeout(Duration::from_secs(5), unreg)
+            .await
+            .expect("cleanup hung")
+            .expect("cleanup panicked");
+
+        assert!(
+            state
+                .vnet_routes
+                .read()
+                .await
+                .contains_key(&("vnet-1".to_string(), "10.7.0.0/24".to_string())),
+            "superseding control's vnet route must survive the old sweep"
+        );
+        assert_eq!(
+            state
+                .proxy_manager
+                .get("v1")
+                .await
+                .expect("registry entry")
+                .control_id,
+            2,
+            "superseding control's registry entry survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_create_bind_race_joins_existing_group() {
+        // Audit-fix regression (finding 2): a group-create bind that hits
+        // EADDRINUSE (a sibling member created the group and bound its
+        // shared listener mid-registration) must JOIN the existing group
+        // instead of rejecting the first member.
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // Stage the interleaving: hold client_ports_used so the registration
+        // task parks right AFTER registering the proxy and BEFORE its
+        // group-create bind (the increment is the last await before
+        // setup_proxy_listeners). On this single-threaded test runtime the
+        // task only advances when the test awaits, so the bind collision is
+        // deterministic.
+        let held_counts = state.client_ports_used.write().await;
+        let mut np = new_proxy("m1", "tcp");
+        np.group = Some("g".to_string());
+        np.group_key = Some("k".to_string());
+        np.remote_port = Some(24051);
+        let task = tokio::spawn({
+            let state = state.clone();
+            let itx = itx.clone();
+            async move {
+                let mut writer = Vec::new();
+                handle_new_proxy(
+                    np,
+                    "run-1",
+                    1,
+                    &state,
+                    &mut writer,
+                    &itx,
+                    &mut handles,
+                    &mut udp_sockets,
+                    false,
+                )
+                .await;
+                writer
+            }
+        });
+
+        // Wait until the task has registered the proxy (parked at the
+        // client_ports_used increment, before its bind).
+        for _ in 0..100 {
+            if state.proxy_manager.get("m1").await.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            state.proxy_manager.get("m1").await.is_some(),
+            "registration task should have parked after registering"
+        );
+
+        // Now bind the port and create the group behind the task's back:
+        // its bind deterministically fails with EADDRINUSE (3×100ms
+        // retries), and the audit-fix fallback joins the group.
+        let listener = std::net::TcpListener::bind("127.0.0.1:24051").expect("hold the group port");
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        state
+            .tcp_group_ctl
+            .create_group(
+                "g",
+                "k",
+                24051,
+                "127.0.0.1",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+        drop(held_counts);
+
+        let writer = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("registration task hung")
+            .expect("registration task panicked");
+        drop(listener);
+
+        // The member was NOT rejected: it joined the existing group.
+        let reg = state
+            .proxy_manager
+            .get("m1")
+            .await
+            .expect("m1 must be registered (joined the group)");
+        assert_eq!(reg.control_id, 1);
+        assert_eq!(
+            reg.remote_port,
+            Some(24051),
+            "member registered on the group's shared port"
+        );
+        assert!(
+            state.used_ports.read().await.contains(&24051),
+            "group port stays marked"
+        );
+        assert_eq!(
+            state
+                .tcp_group_ctl
+                .get_group_port("g", "k", 24051, "127.0.0.1")
+                .await,
+            Some(24051),
+            "group still exists"
+        );
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            1,
+            "member counts exactly once after the rollback+join"
+        );
+        let resp_text = String::from_utf8_lossy(&writer);
+        assert!(
+            resp_text.contains("24051"),
+            "member's NewProxyResp must carry the group port: {resp_text}"
         );
     }
 }

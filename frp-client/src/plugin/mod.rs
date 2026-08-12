@@ -822,27 +822,36 @@ impl<'a, S: tokio::io::AsyncRead + Unpin> BodyReader<'a, S> {
     }
 
     /// Read one line (LF or CRLF terminated, terminator included).
+    ///
+    /// The cap is enforced after EVERY buffer extension (pending prefix and
+    /// each stream chunk): a line errors as soon as its accumulated length
+    /// exceeds `max` and is never returned over-length.
     async fn read_line(&mut self, max: usize) -> std::io::Result<Vec<u8>> {
         let mut line = Vec::new();
         loop {
+            // Serve the pending prefix first (body bytes that arrived with
+            // the head), scanning it for the terminator.
             let avail = self.available();
             if let Some(rel) = avail.iter().position(|&b| b == b'\n') {
                 line.extend_from_slice(&avail[..rel + 1]);
                 self.consume(rel + 1);
+                if line.len() > max {
+                    return Err(line_too_long());
+                }
                 return Ok(line);
             }
             line.extend_from_slice(avail);
             self.consume(avail.len());
             if line.len() > max {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "line too long",
-                ));
+                return Err(line_too_long());
             }
             if self.pos > 0 {
                 self.pending.clear();
                 self.pos = 0;
             }
+            // Refill from the stream, then scan the NEW bytes for the
+            // terminator: `line` accumulates across reads and the `\n` can
+            // only arrive inside a chunk.
             let mut tmp = [0u8; 4096];
             let n = self.stream.read(&mut tmp).await?;
             if n == 0 {
@@ -851,9 +860,31 @@ impl<'a, S: tokio::io::AsyncRead + Unpin> BodyReader<'a, S> {
                     "eof in line",
                 ));
             }
+            if let Some(rel) = tmp[..n].iter().position(|&b| b == b'\n') {
+                line.extend_from_slice(&tmp[..rel + 1]);
+                // Bytes past the terminator belong to the next line: stage
+                // them back into `pending` so the next read/read_line call
+                // serves them before touching the stream.
+                self.pending.extend_from_slice(&tmp[rel + 1..n]);
+                if line.len() > max {
+                    return Err(line_too_long());
+                }
+                return Ok(line);
+            }
             line.extend_from_slice(&tmp[..n]);
+            // Cap check after every extension: without it the overflow was
+            // only noticed at the next loop iteration, one full read past
+            // the cap boundary.
+            if line.len() > max {
+                return Err(line_too_long());
+            }
         }
     }
+}
+
+/// Error for a chunk-size/trailer line that exceeds the cap.
+fn line_too_long() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "line too long")
 }
 
 /// Trim leading/trailing spaces and tabs from a byte slice (header values
@@ -922,6 +953,215 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fake AsyncRead for BodyReader tests: serves a fixed byte blob in
+    /// fixed-size chunks, counting the bytes handed out in a shared counter
+    /// (readable while the reader still borrows the stream).
+    struct FakeStream {
+        data: Vec<u8>,
+        chunk: usize,
+        pos: usize,
+        served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeStream {
+        fn new(
+            data: Vec<u8>,
+            chunk: usize,
+        ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    data,
+                    chunk,
+                    pos: 0,
+                    served: served.clone(),
+                },
+                served,
+            )
+        }
+    }
+
+    impl tokio::io::AsyncRead for FakeStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let n = (self.data.len() - self.pos)
+                .min(self.chunk)
+                .min(buf.remaining());
+            buf.put_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            self.served
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Property guard, not a placement-regression catch: the bytes consumed
+    /// for an over-long stream-delivered line stay bounded near the cap —
+    /// at most one 4096-byte chunk past the boundary, never the whole
+    /// over-long line. This also held on the pre-fix code (its cap check
+    /// ran one iteration later and errored at the same byte count with the
+    /// same kind/message); the genuinely new cap enforcement on the
+    /// terminator-found paths is covered by
+    /// `read_line_caps_over_long_pending_line` (pending branch) and
+    /// `read_line_terminates_on_stream_line` (stream-terminator scanning).
+    #[tokio::test]
+    async fn read_line_caps_over_long_stream_line() {
+        let mut data = vec![b'x'; CHUNK_LINE_MAX + 8192];
+        data.push(b'\n');
+        let total = data.len();
+        let (stream, served) = FakeStream::new(data, 4096);
+        let mut boxed = Box::new(stream);
+        let mut reader = BodyReader::new(&mut boxed, &[]);
+        let err = reader.read_line(CHUNK_LINE_MAX).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let served = served.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(served > CHUNK_LINE_MAX, "the cap must have been crossed");
+        assert!(
+            served <= CHUNK_LINE_MAX + 4096,
+            "read {served} bytes past a {CHUNK_LINE_MAX} cap"
+        );
+        assert!(
+            served < total,
+            "the whole over-long line must not be consumed"
+        );
+    }
+
+    /// Regression: a line delivered via the stream (not coalesced with the
+    /// head) must still terminate. Previously only the pending prefix was
+    /// scanned for `\n`, so a stream-delivered line ran to EOF ("eof in
+    /// line") and the chunked forward failed. Bytes past the terminator
+    /// must stay staged for the next reads (chunk data, CRLF, next line).
+    #[tokio::test]
+    async fn read_line_terminates_on_stream_line() {
+        let (stream, _served) = FakeStream::new(b"5\r\nhello\r\n0\r\n\r\n".to_vec(), 4096);
+        let mut boxed = Box::new(stream);
+        let mut reader = BodyReader::new(&mut boxed, &[]);
+        let line = reader.read_line(CHUNK_LINE_MAX).await.unwrap();
+        assert_eq!(line, b"5\r\n");
+        let mut buf = [0u8; 5];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf).await.unwrap();
+        assert_eq!(&crlf, b"\r\n");
+        assert_eq!(reader.read_line(CHUNK_LINE_MAX).await.unwrap(), b"0\r\n");
+        assert_eq!(reader.read_line(CHUNK_LINE_MAX).await.unwrap(), b"\r\n");
+    }
+
+    /// The `\r` of a CRLF at the end of one stream chunk with the `\n`
+    /// opening the next must still terminate the line (only `\n` is
+    /// scanned for), and the bytes past the terminator must be staged.
+    #[tokio::test]
+    async fn read_line_crlf_split_across_stream_chunks() {
+        // Stream reads are 4096 bytes: 4095 x's plus `\r` fill the first
+        // read, `\n` opens the second — the worst-case split.
+        let mut data = vec![b'x'; 4095];
+        data.extend_from_slice(b"\r\nhello\r\n");
+        let (stream, _served) = FakeStream::new(data, 4096);
+        let mut boxed = Box::new(stream);
+        let mut reader = BodyReader::new(&mut boxed, &[]);
+        let line = reader.read_line(CHUNK_LINE_MAX).await.unwrap();
+        assert_eq!(line.len(), 4097);
+        assert!(line[..4095].iter().all(|&b| b == b'x'));
+        assert!(line.ends_with(b"\r\n"));
+        // The next line ("hello\r\n") was staged, not lost.
+        let mut buf = [0u8; 5];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf).await.unwrap();
+        assert_eq!(&crlf, b"\r\n");
+    }
+
+    /// A partial line followed by EOF must error ("eof in line"), never
+    /// return the truncated line.
+    #[tokio::test]
+    async fn read_line_eof_mid_line_errors() {
+        let (stream, _served) = FakeStream::new(b"hello".to_vec(), 4096);
+        let mut boxed = Box::new(stream);
+        let mut reader = BodyReader::new(&mut boxed, &[]);
+        let err = reader.read_line(CHUNK_LINE_MAX).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "eof in line");
+    }
+
+    /// A line delivered entirely with the head is served from the pending
+    /// prefix without touching the stream (existing behavior preserved).
+    #[tokio::test]
+    async fn read_line_serves_pending_prefix_line() {
+        let (stream, served) = FakeStream::new(Vec::new(), 4096);
+        let mut boxed = Box::new(stream);
+        let prefix = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
+        let mut reader = BodyReader::new(&mut boxed, &prefix);
+        assert_eq!(reader.read_line(CHUNK_LINE_MAX).await.unwrap(), b"5\r\n");
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the stream must not be read"
+        );
+        let mut buf = [0u8; 5];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    /// A line exactly `max` bytes long (terminator included) is accepted;
+    /// only EXCEEDING the cap errors.
+    #[tokio::test]
+    async fn read_line_accepts_line_at_cap() {
+        let mut data = vec![b'x'; CHUNK_LINE_MAX - 1];
+        data.push(b'\n');
+        let (stream, _served) = FakeStream::new(data, 4096);
+        let mut boxed = Box::new(stream);
+        let mut reader = BodyReader::new(&mut boxed, &[]);
+        let line = reader.read_line(CHUNK_LINE_MAX).await.unwrap();
+        assert_eq!(line.len(), CHUNK_LINE_MAX);
+        assert!(line.ends_with(b"\n"));
+    }
+
+    /// A line exactly `max` bytes long delivered via the pending prefix is
+    /// accepted (boundary is `>` not `>=`); the stream-path boundary is
+    /// covered by `read_line_accepts_line_at_cap`.
+    #[tokio::test]
+    async fn read_line_accepts_at_cap_pending_prefix_line() {
+        let mut prefix = vec![b'x'; CHUNK_LINE_MAX - 1];
+        prefix.push(b'\n');
+        let (stream, served) = FakeStream::new(Vec::new(), 4096);
+        let mut boxed = Box::new(stream);
+        let mut reader = BodyReader::new(&mut boxed, &prefix);
+        let line = reader.read_line(CHUNK_LINE_MAX).await.unwrap();
+        assert_eq!(line.len(), CHUNK_LINE_MAX);
+        assert!(line.ends_with(b"\n"));
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the stream must not be read"
+        );
+    }
+
+    /// An over-long line arriving entirely with the head errors from the
+    /// prefix alone — the stream is never read.
+    #[tokio::test]
+    async fn read_line_caps_over_long_pending_line() {
+        let mut prefix = vec![b'x'; CHUNK_LINE_MAX + 1];
+        prefix.push(b'\n');
+        let (stream, served) = FakeStream::new(Vec::new(), 4096);
+        let mut boxed = Box::new(stream);
+        let mut reader = BodyReader::new(&mut boxed, &prefix);
+        let err = reader.read_line(CHUNK_LINE_MAX).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the stream must not be read"
+        );
+    }
 
     #[test]
     fn test_base64_decode() {

@@ -31,11 +31,26 @@ fn not_found(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
+/// Map an axum `JsonRejection` to a status code. A missing or wrong
+/// Content-Type is 415 (axum's `MissingJsonContentType`); everything else
+/// (malformed body, size overflow, …) is 422 (audit-fix: JsonBody
+/// rejection semantics drift — missing/wrong Content-Type yielded 422
+/// instead of axum's 415).
+fn json_rejection_status(err: &axum::extract::rejection::JsonRejection) -> StatusCode {
+    match err {
+        axum::extract::rejection::JsonRejection::MissingJsonContentType(_) => {
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        }
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    }
+}
+
 /// JSON body extractor that maps malformed bodies to a generic 422 instead
 /// of axum's default `JsonRejection` body — the default embeds the internal
 /// type path (e.g. `frp_server::dashboard::StoreProxyConfig`), leaking
 /// implementation detail to API clients. The rejection body here is a plain
-/// `{"error": "invalid JSON body"}`.
+/// `{"error": "invalid JSON body"}`. A missing or wrong Content-Type is
+/// rejected with 415 (generic body too, matching axum's 415 semantics).
 struct JsonBody<T>(T);
 
 impl<S, T> axum::extract::FromRequest<S> for JsonBody<T>
@@ -50,8 +65,9 @@ where
             Ok(Json(value)) => Ok(JsonBody(value)),
             Err(err) => {
                 tracing::debug!(error = %err, "Dashboard: rejecting request with invalid JSON body");
+                let status = json_rejection_status(&err);
                 Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
+                    status,
                     Json(ErrorResponse {
                         error: "invalid JSON body".into(),
                     }),
@@ -1179,6 +1195,42 @@ mod v2 {
         (s, Json(V2Error { error: msg.into() }))
     }
 
+    /// V2 variant of `JsonBody`: same rejection semantics — 415 on a
+    /// missing/wrong Content-Type, generic 422 on a malformed body — but
+    /// rejects with the V2 error shape `{error}` instead of the V1
+    /// `ErrorResponse` (audit-fix: v2 endpoints returned the V1 shape on
+    /// malformed JSON).
+    struct V2JsonBody<T>(T);
+
+    impl<S, T> axum::extract::FromRequest<S> for V2JsonBody<T>
+    where
+        S: Send + Sync,
+        T: serde::de::DeserializeOwned,
+    {
+        type Rejection = (StatusCode, Json<V2Error>);
+
+        async fn from_request(
+            req: axum::extract::Request,
+            state: &S,
+        ) -> Result<Self, Self::Rejection> {
+            match Json::<T>::from_request(req, state).await {
+                Ok(Json(value)) => Ok(V2JsonBody(value)),
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        "Dashboard V2: rejecting request with invalid JSON body"
+                    );
+                    Err((
+                        json_rejection_status(&err),
+                        Json(V2Error {
+                            error: "invalid JSON body".into(),
+                        }),
+                    ))
+                }
+            }
+        }
+    }
+
     /// Go `model.V2SystemInfoConfigResp`.
     #[derive(Serialize)]
     struct SystemInfoConfig {
@@ -1935,7 +1987,7 @@ mod v2 {
     async fn handle_proxy_update(
         State(state): State<Arc<AppState>>,
         Path(name): Path<String>,
-        JsonBody(req): JsonBody<UpdateProxyRequest>,
+        V2JsonBody(req): V2JsonBody<UpdateProxyRequest>,
     ) -> Result<Json<ProxyResp>, (StatusCode, Json<V2Error>)> {
         let name = percent_decode_path(&name)?;
 
@@ -2589,7 +2641,7 @@ mod v2 {
                 ..Default::default()
             };
             let result =
-                handle_proxy_update(State(state.clone()), Path("p1".into()), JsonBody(req)).await;
+                handle_proxy_update(State(state.clone()), Path("p1".into()), V2JsonBody(req)).await;
             let resp = result.expect("update should succeed");
             assert_eq!(
                 resp.0
@@ -2649,7 +2701,7 @@ mod v2 {
                 ..Default::default()
             };
             let (status, json) = expect_err(
-                handle_proxy_update(State(state.clone()), Path("p1".into()), JsonBody(req)).await,
+                handle_proxy_update(State(state.clone()), Path("p1".into()), V2JsonBody(req)).await,
                 "provider-dependent fields must be rejected",
             );
             assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2678,7 +2730,7 @@ mod v2 {
                 ..Default::default()
             };
             let (status, _) = expect_err(
-                handle_proxy_update(State(state.clone()), Path("p1".into()), JsonBody(req)).await,
+                handle_proxy_update(State(state.clone()), Path("p1".into()), V2JsonBody(req)).await,
                 "invalid bandwidth limit must be rejected",
             );
             assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2692,7 +2744,7 @@ mod v2 {
                 ..Default::default()
             };
             let (status, _) = expect_err(
-                handle_proxy_update(State(state), Path("missing".into()), JsonBody(req)).await,
+                handle_proxy_update(State(state), Path("missing".into()), V2JsonBody(req)).await,
                 "unknown proxy must 404",
             );
             assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2710,7 +2762,7 @@ mod v2 {
                 handle_proxy_update(
                     State(state),
                     Path("p1".into()),
-                    JsonBody(UpdateProxyRequest::default()),
+                    V2JsonBody(UpdateProxyRequest::default()),
                 )
                 .await,
                 "empty update body must be rejected",
@@ -2805,6 +2857,86 @@ mod v2 {
                 !json.0.error.contains("StoreProxyConfig"),
                 "rejection must not leak internal type paths"
             );
+        }
+
+        #[tokio::test]
+        async fn test_json_body_missing_content_type_returns_415() {
+            // Audit-fix regression: a request without a JSON Content-Type
+            // must be rejected with 415 (axum's MissingJsonContentType), not
+            // 422 — and with the same generic, non-leaking body.
+            let state = test_state();
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/store/proxies")
+                .body(axum::body::Body::from("{\"name\":\"p1\"}"))
+                .unwrap();
+            let (status, json) = expect_err(
+                JsonBody::<StoreProxyConfig>::from_request(req, &state).await,
+                "missing content type must be rejected",
+            );
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(json.0.error, "invalid JSON body");
+            assert!(
+                !json.0.error.contains("StoreProxyConfig"),
+                "rejection must not leak internal type paths"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_json_body_wrong_content_type_returns_415() {
+            // Audit-fix regression: a wrong Content-Type is a
+            // MissingJsonContentType rejection in axum → 415, not 422.
+            let state = test_state();
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/store/proxies")
+                .header("content-type", "text/plain")
+                .body(axum::body::Body::from("{\"name\":\"p1\"}"))
+                .unwrap();
+            let (status, json) = expect_err(
+                JsonBody::<StoreProxyConfig>::from_request(req, &state).await,
+                "wrong content type must be rejected",
+            );
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(json.0.error, "invalid JSON body");
+        }
+
+        #[tokio::test]
+        async fn test_v2_json_body_malformed_returns_v2_422() {
+            // Audit-fix regression: v2 endpoints must reject malformed JSON
+            // with 422 and the V2 error shape ({error}), not the V1
+            // ErrorResponse shape.
+            let state = test_state();
+            let req = axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v2/proxies/p1")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{\"bandwidthLimit\": \"2MB"))
+                .unwrap();
+            let (status, json) = expect_err(
+                V2JsonBody::<UpdateProxyRequest>::from_request(req, &state).await,
+                "malformed JSON must be rejected",
+            );
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(json.0.error, "invalid JSON body");
+        }
+
+        #[tokio::test]
+        async fn test_v2_json_body_missing_content_type_returns_415() {
+            // Audit-fix regression: the V2 extractor maps a missing
+            // Content-Type to 415 like the V1 one.
+            let state = test_state();
+            let req = axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v2/proxies/p1")
+                .body(axum::body::Body::from("{\"bandwidthLimit\":\"2MB\"}"))
+                .unwrap();
+            let (status, json) = expect_err(
+                V2JsonBody::<UpdateProxyRequest>::from_request(req, &state).await,
+                "missing content type must be rejected",
+            );
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(json.0.error, "invalid JSON body");
         }
     }
 }

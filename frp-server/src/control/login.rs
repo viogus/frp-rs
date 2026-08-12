@@ -571,17 +571,24 @@ pub(crate) async fn authenticate(
             server_additional_auth_scopes: None,
         });
         let _ = write_ctl_msg(&mut stream, &resp, v2).await;
-        // TODO(audit-fix): the duplicate-login conflict path sweeps the LIVE
-        // control's routes. unregister_control runs with THIS login's control
-        // id — assigned from the monotonically increasing counter (see above),
-        // so it is HIGHER than the live control's — and its generation filter
-        // (p.control_id <= control_id) lets the live control's older proxies
-        // through, tearing down its port marks, vhost routes, and sk_index
-        // entries. The conflict path should arguably not sweep at all: only
-        // the generation-guarded run_id_to_ctl_tx removal (already done above
-        // the sweep) and the OIDC-subject cleanup below are wanted. Do not
-        // call unregister_control here until it gains a sweep-free mode.
-        unregister_control(&state, &run_id, control_id, false).await;
+        // Sweep-free unregister. NOTE: on THIS path a full sweep would be
+        // vacuous anyway — register_with_control_id only reports conflict
+        // when the existing entry's run_id DIFFERS (registry.rs), and the
+        // sweep is run_id-scoped, so it could never list the live control's
+        // proxies. sweep=false is still required for the login FAILURE
+        // paths below (LoginResp write / flush failures, which can happen
+        // after the 10s handoff-barrier timeout): there THIS login's
+        // control_id (assigned from the monotonically increasing counter,
+        // see above) is HIGHER than the older live control's, so a full
+        // sweep's generation filter (p.control_id <= control_id) would let
+        // the older control's proxies through and tear down its port marks,
+        // vhost routes, and sk_index entries while that control may still
+        // be running (audit-fix: the barrier-timeout login failure path
+        // swept the live control's routes). sweep=false keeps only the
+        // generation-guarded run_id_to_ctl_tx removal and OIDC-subject
+        // cleanup — this login registered no proxies, so nothing of its own
+        // is left behind.
+        unregister_control(&state, &run_id, control_id, false, false).await;
         // Clean up OIDC subject
         if oidc_subject.is_some() {
             remove_oidc_subject_generation(&state, &run_id, control_id).await;
@@ -635,7 +642,7 @@ pub(crate) async fn authenticate(
         }
     } {
         warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);
-        unregister_control(&state, &run_id, control_id, false).await;
+        unregister_control(&state, &run_id, control_id, false, false).await;
         // Clean up registry entry
         state
             .client_registry
@@ -649,7 +656,7 @@ pub(crate) async fn authenticate(
     // Flush TLS stream to ensure LoginResp reaches KCP before we wrap in CipherStream
     if let Err(e) = flush_login_response_and_signal(&mut *stream, auth_success).await {
         warn!(peer = ?peer, error = %e, "Failed to flush after LoginResp: {}", e);
-        unregister_control(&state, &run_id, control_id, false).await;
+        unregister_control(&state, &run_id, control_id, false, false).await;
         state
             .client_registry
             .mark_offline_by_run_id_and_control_id(&run_id, control_id);
@@ -707,14 +714,14 @@ pub(crate) async fn authenticate(
                     }
                     Err(e) => {
                         warn!(peer = ?peer, error = %e, "Failed to create AEAD stream for {:?}: {}", peer, e);
-                        unregister_control(&state, &run_id, control_id, false).await;
+                        unregister_control(&state, &run_id, control_id, false, false).await;
                         return Err(());
                     }
                 }
             }
             Err(e) => {
                 warn!(peer = ?peer, error = %e, "Failed to derive AEAD keys for {:?}: {}", peer, e);
-                unregister_control(&state, &run_id, control_id, false).await;
+                unregister_control(&state, &run_id, control_id, false, false).await;
                 return Err(());
             }
         }

@@ -442,10 +442,10 @@ impl Service {
                             #[cfg(not(all(feature = "quic", feature = "kcp")))]
                             {
                                 warn!(proxy_name = %proxy_name_clone,
-                                "XTCP provider '{}': protocol 'quic' requested but the quic feature is disabled; refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
+                                "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
                                 proxy_name_clone);
                                 Err(format!(
-                                    "XTCP provider '{}': protocol 'quic' requires the quic feature",
+                                    "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features",
                                     proxy_name_clone
                                 ))
                             }
@@ -734,4 +734,93 @@ pub(crate) fn list_local_ips_for_nat_hole(max_items: usize) -> Vec<String> {
     }
 
     ips
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `wait_session_dead` must resolve promptly when the
+    /// session flag is cleared (100ms poll) so detached XTCP tasks unwind
+    /// within one poll interval of session teardown instead of lingering up
+    /// to the hole-punch timeout.
+    #[tokio::test]
+    async fn wait_session_dead_resolves_after_session_teardown() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let alive2 = alive.clone();
+        let task = tokio::spawn(async move {
+            let _ = entered_tx.send(());
+            wait_session_dead(&alive2).await;
+        });
+        entered_rx.await.expect("session watcher never started");
+        alive.store(false, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("wait_session_dead did not resolve after session teardown")
+            .expect("session watcher task panicked");
+    }
+
+    /// Regression: a hole-punch future selected against `wait_session_dead`
+    /// (the session-bound pattern used by `handle_nat_hole_client` and
+    /// `handle_nat_hole_resp`) must abort on session teardown, dropping the
+    /// resource it holds instead of probing a dead control channel for the
+    /// full punch timeout. When the sandbox denies the UDP bind, a channel
+    /// sender stands in for the socket and the abort-release assertion runs
+    /// against the channel — the test never silently skips.
+    #[tokio::test]
+    async fn session_teardown_aborts_hole_punch_and_releases_socket() {
+        let socket = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                eprintln!(
+                    "UDP bind denied ({e}); asserting abort semantics with a channel stand-in"
+                );
+                None
+            }
+        };
+        // Channel stand-in for the socket: the sender is held by the punch
+        // future and dropped on abort, resolving the receiver with Err —
+        // the same drop-observable shape as the socket's Arc count.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let alive = Arc::new(AtomicBool::new(true));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let alive2 = alive.clone();
+        let socket_held = socket.clone();
+        let task = tokio::spawn(async move {
+            let _ = entered_tx.send(());
+            // Stand-in for the real hole-punch future
+            // (`xtcp_p2p_connect_yamux`): pending forever, and holding the
+            // resource (the UDP socket, or the channel sender when the
+            // sandbox denied the bind) so the select's drop path is
+            // observable.
+            let punch = async {
+                let _guard = socket_held;
+                let _sender = release_tx;
+                std::future::pending::<Result<(), String>>().await
+            };
+            tokio::pin!(punch);
+            tokio::select! {
+                _ = &mut punch => {}
+                _ = wait_session_dead(&alive2) => {}
+            }
+        });
+        entered_rx.await.expect("hole punch task never started");
+        alive.store(false, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("session-bound hole punch did not abort after session teardown")
+            .expect("hole punch task panicked");
+        // The aborted punch was dropped: whatever resource it held is released.
+        match socket {
+            Some(socket) => assert!(
+                Arc::try_unwrap(socket).is_ok(),
+                "UDP socket still referenced after abort"
+            ),
+            None => assert!(
+                release_rx.await.is_err(),
+                "channel stand-in still held after abort"
+            ),
+        }
+    }
 }

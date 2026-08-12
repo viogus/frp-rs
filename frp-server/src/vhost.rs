@@ -1246,9 +1246,24 @@ fn extract_basic_auth(request: &str) -> Option<(String, String)> {
 /// Count Host header lines (RFC 7230 §5.4 allows at most one). Must only be
 /// called on the head (up to the first `\r\n\r\n`) — see `handle_http1_request`.
 fn count_host_headers(request: &str) -> usize {
+    // Skip the request line: it cannot carry a Host header (RFC 7230 §5.4),
+    // and a request-target beginning with "host:" must not be miscounted.
+    // Every later line whose name (before the first colon) equals "host"
+    // counts — including an empty-valued "Host:" line, which Go net/http's
+    // MIME-header parser also counts (audit-fix: empty-valued Host and
+    // request-line "host:" edge cases). The name is deliberately NOT
+    // trimmed: Go's canonicalMIMEHeaderKey preserves whitespace in the
+    // field name (a space makes the name invalid and the whole line is
+    // skipped), so "Host : x" and " Host: x" are not counted as Host by Go
+    // either — and a leading-space obs-fold continuation line must not be
+    // miscounted as a second Host header.
     request
         .lines()
-        .filter(|line| line.len() >= 6 && line[..5].eq_ignore_ascii_case("host:"))
+        .skip(1)
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("host"))
+        })
         .count()
 }
 
@@ -1505,6 +1520,28 @@ mod tests {
         // Unbounded text (caller bug) would count body lines — the caller's
         // head-bounding in handle_http1_request is what prevents this.
         assert_eq!(count_host_headers("GET / HTTP/1.1\r\n\r\nhost: x"), 1);
+        // An empty-valued Host line is still a Host header (Go net/http
+        // counts it — audit-fix edge case).
+        assert_eq!(count_host_headers("GET / HTTP/1.1\r\nHost:\r\n\r\n"), 1);
+        // A request-target beginning with "host:" is not a header
+        // (audit-fix edge case); the real Host header still counts.
+        assert_eq!(
+            count_host_headers("host: evil\r\nHost: good.example.com\r\n\r\n"),
+            1
+        );
+        assert_eq!(count_host_headers("host: evil\r\n\r\n"), 0);
+        // Whitespace in the field name is NOT tolerated — Go's
+        // canonicalMIMEHeaderKey preserves it, so "Host : x" is an invalid
+        // name and the line is skipped by Go's MIME-header parser too.
+        assert_eq!(count_host_headers("GET / HTTP/1.1\r\nHost : x\r\n\r\n"), 0);
+        // A leading-space obs-fold continuation line is part of the
+        // previous header's value, never a second Host header.
+        assert_eq!(
+            count_host_headers(
+                "GET / HTTP/1.1\r\nHost: a.example.com\r\n Host: b.example.com\r\n\r\n"
+            ),
+            1
+        );
     }
 
     #[tokio::test]
