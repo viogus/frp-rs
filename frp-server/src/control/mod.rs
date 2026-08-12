@@ -4,7 +4,13 @@ mod login;
 mod nathole;
 mod pool;
 mod proxy;
-mod proxy_ops;
+// pub(crate) so the dashboard delete path (cleanup_deleted_proxy_port) can
+// reuse proxy_ops' test helpers and the SUDP owner-check helper.
+pub(crate) mod proxy_ops;
+
+// Re-export for the dashboard delete path (cleanup_deleted_proxy_port),
+// which mirrors handle_close_proxy's SUDP shared-port owner check.
+pub(crate) use proxy_ops::release_udp_port_with_owner_check;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;

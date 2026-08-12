@@ -1876,11 +1876,11 @@ impl AppState {
 }
 
 #[cfg(test)]
-mod unregister_generation_tests {
+pub(crate) mod unregister_generation_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    fn test_state() -> Arc<AppState> {
+    pub(crate) fn test_state() -> Arc<AppState> {
         let cfg = frp_core::config::ServerConfig::default();
         Arc::new(AppState::new(
             frp_core::auth::AuthConfig::with_token("test-token"),
@@ -1940,7 +1940,7 @@ mod unregister_generation_tests {
         rx
     }
 
-    fn proxy_info(
+    pub(crate) fn proxy_info(
         name: &str,
         proxy_type: &str,
         run_id: &str,

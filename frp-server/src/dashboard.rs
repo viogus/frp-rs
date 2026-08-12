@@ -743,17 +743,31 @@ async fn cleanup_deleted_proxy_port(state: &Arc<AppState>, proxy: &crate::proxy:
     let last_group_member = is_tcp_group && state.proxy_manager.group_len(&group_name).await <= 1;
     if let Some(port) = proxy.remote_port {
         if proxy.proxy_type == "udp" || proxy.proxy_type == "sudp" {
-            state.used_udp_ports.write().await.remove(&port);
+            // SUDP proxies can share one server port (frp-rs extension):
+            // only release the mark when no OTHER live udp/sudp proxy still
+            // holds the bound socket — otherwise the next SUDP registration's
+            // OS bind probe fails with EADDRINUSE (audit finding 2, mirroring
+            // handle_close_proxy). The deleted proxy is still in the registry
+            // here, so it is excluded from the owner count.
+            crate::control::release_udp_port_with_owner_check(state, port, &proxy.name).await;
         } else if !is_tcp_group || last_group_member {
             state.used_ports.write().await.remove(&port);
         }
         // Decrement per-client port count (matching Go frp's portsUsedNum).
-        let run_id = &proxy.run_id;
-        let mut port_counts = state.client_ports_used.write().await;
-        if let Some(count) = port_counts.get_mut(run_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                port_counts.remove(run_id);
+        // Only proxies that actually consumed a port were counted (audit
+        // finding 1 symmetry): http/https/tcpmux/stcp/xtcp delete with
+        // remote_port Some(0) and must not decrement — repeated deletes of
+        // non-consuming proxies would drive the shared budget counter down
+        // while live tcp/udp proxies still consume ports, letting the
+        // max_ports_per_client gate undercount.
+        if matches!(proxy.proxy_type.as_str(), "tcp" | "udp" | "sudp") && port > 0 {
+            let run_id = &proxy.run_id;
+            let mut port_counts = state.client_ports_used.write().await;
+            if let Some(count) = port_counts.get_mut(run_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    port_counts.remove(run_id);
+                }
             }
         }
     }
@@ -2743,4 +2757,90 @@ pub async fn run_dashboard(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cleanup_deleted_proxy_port_tests {
+    use super::*;
+    use crate::control::proxy_ops::unregister_generation_tests::{proxy_info, test_state};
+
+    /// Finding-1 symmetry (review round 1): deleting a proxy that never
+    /// consumed a port (http/https/tcpmux/stcp/xtcp register with
+    /// remote_port Some(0)) must not decrement client_ports_used — the
+    /// increment side is gated on `tcp|udp|sudp && port > 0`, so the
+    /// dashboard delete must mirror it. Before the fix, repeated deletes of
+    /// non-consuming proxies drove the shared budget counter down while live
+    /// tcp/udp proxies still consumed ports, letting the max_ports_per_client
+    /// gate undercount.
+    #[tokio::test]
+    async fn delete_non_port_consuming_proxy_keeps_client_count() {
+        let state = test_state();
+        // A tcp proxy consumes a port, so it is counted once.
+        let tcp = proxy_info("p-tcp", "tcp", "run-1", Some(6000), 1);
+        state
+            .proxy_manager
+            .register("run-1".to_string(), tcp.clone())
+            .await
+            .unwrap();
+        state
+            .client_ports_used
+            .write()
+            .await
+            .insert("run-1".to_string(), 1);
+
+        // Deleting an http proxy (remote_port Some(0)) must not decrement.
+        let http = proxy_info("p-http", "http", "run-1", Some(0), 1);
+        cleanup_deleted_proxy_port(&state, &http).await;
+        assert_eq!(
+            state.client_ports_used.read().await.get("run-1"),
+            Some(&1),
+            "deleting a non-port-consuming proxy must not touch the budget count"
+        );
+
+        // Deleting the tcp proxy returns the counter to zero and removes it.
+        cleanup_deleted_proxy_port(&state, &tcp).await;
+        assert!(
+            state.client_ports_used.read().await.get("run-1").is_none(),
+            "deleting the last port-consuming proxy must clear the count"
+        );
+    }
+
+    /// Finding-2 symmetry (review round 1): deleting one SUDP proxy of a
+    /// pair sharing a port must keep the port mark (the sibling still holds
+    /// the bound socket — an early release makes the next SUDP
+    /// registration's bind probe fail EADDRINUSE); deleting the last owner
+    /// frees it.
+    #[tokio::test]
+    async fn delete_sudp_proxy_keeps_shared_port_mark_until_last_owner() {
+        let state = test_state();
+        let p1 = proxy_info("p-sudp1", "sudp", "run-1", Some(7000), 1);
+        let p2 = proxy_info("p-sudp2", "sudp", "run-1", Some(7000), 1);
+        state
+            .proxy_manager
+            .register("run-1".to_string(), p1.clone())
+            .await
+            .unwrap();
+        state
+            .proxy_manager
+            .register("run-1".to_string(), p2.clone())
+            .await
+            .unwrap();
+        state.used_udp_ports.write().await.insert(7000);
+
+        cleanup_deleted_proxy_port(&state, &p1).await;
+        assert!(
+            state.used_udp_ports.read().await.contains(&7000),
+            "shared SUDP mark must survive while a sibling holds the socket"
+        );
+
+        // Mirror the handler's full sequence: cleanup runs while the deleted
+        // proxy is still registered, then the proxy is removed (the owner
+        // check must no longer see it).
+        assert!(state.proxy_manager.remove("p-sudp1").await);
+        cleanup_deleted_proxy_port(&state, &p2).await;
+        assert!(
+            !state.used_udp_ports.read().await.contains(&7000),
+            "last SUDP owner delete must release the mark"
+        );
+    }
 }
