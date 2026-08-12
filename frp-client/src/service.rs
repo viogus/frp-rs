@@ -163,10 +163,14 @@ pub struct Service {
     /// Set when a reload changed visitors; the session loop restarts so the
     /// new visitor set is fully rebuilt (visitors are session-scoped).
     visitor_reload_needed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Per-proxy health check cancel flags. Keyed by proxy name.
-    /// Set to true on CloseProxy/CloseProxyResp; entry removed in try_reload.
+    /// Per-proxy health check cancel flags. Keyed by the WIRE proxy name
+    /// ({user}.{name}) — the same key spawn_health_checks inserts with and
+    /// the CloseProxy handler looks up. Set to true on CloseProxy/CloseProxyResp;
+    /// entry removed in try_reload.
     health_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-    /// Proxy configs for health-checked proxies, used to re-register on health recovery.
+    /// Proxy configs for health-checked proxies, used to re-register on health
+    /// recovery. Keyed by the WIRE proxy name ({user}.{name}) — the same key
+    /// Service::new populates with and the Recover handler looks up.
     health_proxy_configs: Arc<Mutex<HashMap<String, frp_core::config::ProxyConfig>>>,
     /// Channel sender for health check events (Close/Recover). Cloned by try_reload()
     /// to spawn health checks for new/changed proxies after reload.
@@ -2694,10 +2698,14 @@ impl Service {
         {
             let mut cancels = self.health_cancels.lock().await;
             for name in delta.removed.iter().chain(delta.changed.iter()) {
-                if let Some(cancel) = cancels.get(name) {
+                // health_cancels is keyed by the wire proxy name ({user}.{name}),
+                // matching spawn_health_checks and the CloseProxy handler. Keying
+                // by the bare name would leave the health task running forever.
+                let wn = wire_proxy_name(&user, name);
+                if let Some(cancel) = cancels.get(&wn) {
                     cancel.store(true, Ordering::Relaxed);
                 }
-                cancels.remove(name);
+                cancels.remove(&wn);
             }
         }
         {
@@ -2810,14 +2818,19 @@ impl Service {
         {
             let mut configs = self.health_proxy_configs.lock().await;
             for name in &delta.removed {
-                configs.remove(name);
+                // health_proxy_configs is keyed by the wire proxy name
+                // ({user}.{name}), matching the initial population in
+                // Service::new and the Recover handler. A stale bare-name
+                // entry would let a removed proxy resurrect on recovery.
+                configs.remove(&wire_proxy_name(&user, name));
             }
             for name in delta.changed.iter().chain(delta.added.iter()) {
                 if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                    let wn = wire_proxy_name(&user, name);
                     if p.health_check_type.is_empty() {
-                        configs.remove(name);
+                        configs.remove(&wn);
                     } else {
-                        configs.insert(name.clone(), p.clone());
+                        configs.insert(wn, p.clone());
                     }
                 }
             }

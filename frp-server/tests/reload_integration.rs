@@ -8,7 +8,7 @@ mod unix_tests {
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpStream;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
@@ -104,6 +104,45 @@ mod unix_tests {
             .is_ok()
             {
                 return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        false
+    }
+
+    /// Wait until a TCP port stops accepting connections, with timeout.
+    /// A listening socket that has been closed rejects new connects.
+    fn wait_for_port_closed(port: u16, timeout_secs: u64) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(timeout_secs) {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(200),
+            )
+            .is_err()
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        false
+    }
+
+    /// Current byte length of a log file (appended to by a live child).
+    fn log_len(path: &Path) -> u64 {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Wait for `marker` to appear in the log file at or after byte `offset`.
+    fn wait_for_log_since(path: &Path, offset: u64, marker: &str, timeout_secs: u64) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(timeout_secs) {
+            if let Ok(content) = std::fs::read(path) {
+                if content.len() as u64 > offset
+                    && String::from_utf8_lossy(&content[offset as usize..]).contains(marker)
+                {
+                    return true;
+                }
             }
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -361,5 +400,285 @@ remote_port = {proxy_b_remote}
         let _ = frps.wait();
         stop_tcp_echo_server(echo_a_handle, echo_a_tx);
         stop_tcp_echo_server(echo_b_handle, echo_b_tx);
+    }
+
+    /// Reload of a health-checked proxy WITH `user` configured (regression).
+    ///
+    /// Audit-fix Task 5: `try_reload` keyed its health-state cleanup by the
+    /// BARE proxy name while every producer/consumer (spawn_health_checks,
+    /// Service::new, the CloseProxy handler, the Recover handler) uses the
+    /// WIRE name `{user}.{name}`. With `user` configured that meant:
+    ///   - a reload-REMOVED health-checked proxy kept its health task forever
+    ///     and re-registered on the server whenever the local service came
+    ///     back after a failure, and
+    ///   - a reload-ADDED health-checked proxy's Recover event found no
+    ///     config, so it never re-registered after recovery.
+    /// A CHANGED proxy goes through the same reload insert path as an added
+    /// one (Step 5/6 of reload_from_sources), so the add phase below covers
+    /// the changed lookup too; the removal phase covers the Step 1 cancel
+    /// path that changed proxies share.
+    ///
+    /// The test drives the real frps/frpc binaries and asserts on frpc's
+    /// RUST_LOG=info output (captured to a file), with remote ports as a
+    /// secondary observable:
+    ///   Phase 1 (removal): reload-remove the health-checked proxy, then kill
+    ///     and restore the local echo server. With the fix the health task
+    ///     was cancelled at reload, so no Recover event for the removed proxy
+    ///     ever appears again and the remote port stays closed. With the bug
+    ///     the surviving task fires Recover after the local service recovers
+    ///     and the stale config re-registers the proxy.
+    ///   Phase 2 (add): reload-add a health-checked proxy, kill and restore
+    ///     its local echo server. With the fix the Recover handler finds the
+    ///     config and logs "Health recovery: re-registered proxy ...". With
+    ///     the bug the lookup misses and it logs "no config found" instead.
+    ///
+    /// NOTE: the recovered remote port is NOT asserted via port probes: on
+    /// the first success tick after a failure, frp-rs's health monitor sends
+    /// Recover AND re-fires Close in the same tick (the `failures` counter is
+    /// monotonic and the Close guard also runs on success ticks — a
+    /// pre-existing Go-frp deviation outside this task's scope), so a
+    /// re-registered port closes again microseconds later. The log markers
+    /// prove the Recover handler found the config and sent NewProxy.
+    #[tokio::test]
+    async fn test_reload_health_check_with_user() {
+        // Skip if binaries not built.
+        let frps_bin = workspace_bin("frps");
+        let frpc_bin = workspace_bin("frpc");
+        if !frps_bin.exists() || !frpc_bin.exists() {
+            eprintln!(
+                "Skipping: binaries not found ({}, {}) — build with: cargo build -p frps -p frpc",
+                frps_bin.display(),
+                frpc_bin.display(),
+            );
+            return;
+        }
+
+        let bind_port = allocate_port();
+        let local_h = allocate_port();
+        let remote_h = allocate_port();
+        let local_h2 = allocate_port();
+        let remote_h2 = allocate_port();
+        let token = "test-reload-token";
+        // Health check floors in spawn_health_checks: interval >= 10s. One
+        // full interval plus margin is the longest we must wait for a buggy
+        // surviving task to fire its next Close/Recover.
+        const HC_INTERVAL_SECS: u64 = 10;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let frps_config_path = dir.path().join("frps.toml");
+        let frpc_config_path = dir.path().join("frpc.toml");
+        let frpc_log_path = dir.path().join("frpc.log");
+
+        // ---- Step 1: Start echo servers for the two local services ----
+        let (echo_h_handle, echo_h_tx) = start_tcp_echo_server(local_h);
+        let (echo_h2_handle, echo_h2_tx) = start_tcp_echo_server(local_h2);
+        assert!(wait_for_port(local_h, 5), "echo H did not start");
+        assert!(wait_for_port(local_h2, 5), "echo H2 did not start");
+
+        // ---- Step 2: Write frps config ----
+        let frps_config = format!(
+            r#"
+bind_addr = "127.0.0.1"
+bind_port = {bind_port}
+
+[auth]
+method = "token"
+token = "{token}"
+
+[transport]
+tcp_mux = false
+"#,
+            bind_port = bind_port,
+            token = token,
+        );
+        std::fs::write(&frps_config_path, &frps_config).unwrap();
+
+        // A health-checked TCP proxy block; the client runs with `user`.
+        let health_proxy_block = |name: &str, local_port: u16, remote_port: u16| {
+            format!(
+                r#"
+[[proxies]]
+name = "{name}"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = {local_port}
+remote_port = {remote_port}
+health_check_type = "tcp"
+health_check_interval_seconds = {HC_INTERVAL_SECS}
+health_check_timeout_seconds = 3
+health_check_max_failed = 1
+"#,
+                name = name,
+                local_port = local_port,
+                remote_port = remote_port,
+            )
+        };
+        let frpc_config = |proxy_block: &str| {
+            format!(
+                r#"
+server_addr = "127.0.0.1"
+server_port = {bind_port}
+user = "testuser"
+auth.token = "{token}"
+transport.tls.enable = false
+transport.tcp_mux = false
+{proxy_block}
+"#,
+                bind_port = bind_port,
+                token = token,
+                proxy_block = proxy_block,
+            )
+        };
+
+        // ---- Step 3: Write initial frpc config (health-checked tcp-h) ----
+        std::fs::write(
+            &frpc_config_path,
+            frpc_config(&health_proxy_block("tcp-h", local_h, remote_h)),
+        )
+        .unwrap();
+
+        // ---- Step 4: Start frps and frpc ----
+        let mut frps = Command::new(&frps_bin)
+            .arg("-c")
+            .arg(&frps_config_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to start frps");
+        assert!(wait_for_port(bind_port, 10), "frps did not start");
+
+        // frpc runs with RUST_LOG=info and its stdout/stderr captured to a
+        // log file (the tracing fmt layer defaults to stdout) so the test can
+        // assert on health Recover/Close markers.
+        let frpc_log = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&frpc_log_path)
+            .expect("create frpc log file");
+        let frpc_log_stdout = frpc_log.try_clone().expect("clone frpc log file");
+        let mut frpc = Command::new(&frpc_bin)
+            .arg("-c")
+            .arg(&frpc_config_path)
+            .env("RUST_LOG", "info")
+            .stdout(std::process::Stdio::from(frpc_log))
+            .stderr(std::process::Stdio::from(frpc_log_stdout))
+            .spawn()
+            .expect("failed to start frpc");
+
+        // Wait for tcp-h to be ready and working.
+        assert!(
+            wait_for_port(remote_h, 15),
+            "health-checked proxy tcp-h never became ready"
+        );
+        let echo_result = tcp_echo(remote_h, b"hello-h-before", 5);
+        assert!(
+            echo_result.is_ok(),
+            "proxy tcp-h should work before reload: {:?}",
+            echo_result.err()
+        );
+        assert_eq!(echo_result.unwrap(), b"hello-h-before".to_vec());
+        // Let the first health tick succeed so the monitor has seen the
+        // service healthy (Close only fires after a proxy was healthy once).
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // ---- Phase 1: reload REMOVES the health-checked proxy ----
+        let log_base = log_len(&frpc_log_path);
+        std::fs::write(&frpc_config_path, frpc_config("")).unwrap();
+        let frpc_pid = frpc.id();
+        let kill_status = Command::new("kill")
+            .args(["-USR1", &frpc_pid.to_string()])
+            .status()
+            .expect("kill command failed");
+        assert!(kill_status.success(), "kill -USR1 failed");
+        assert!(
+            wait_for_port_closed(remote_h, 15),
+            "remote port should close after reload removed tcp-h"
+        );
+
+        // With the bug the health task survives the reload: kill the local
+        // service and wait out a full health interval (Close fires), then
+        // bring it back and wait out another interval (Recover fires and the
+        // stale config re-registers the proxy on the server). With the fix
+        // the task was cancelled at reload and no Recover is ever emitted.
+        let _ = echo_h_tx.send(());
+        let _ = echo_h_handle.join();
+        tokio::time::sleep(Duration::from_secs(HC_INTERVAL_SECS + 5)).await;
+        assert!(
+            wait_for_port_closed(remote_h, 2),
+            "remote port must stay closed while local service is down"
+        );
+
+        let (echo_h_handle, echo_h_tx) = start_tcp_echo_server(local_h);
+        assert!(wait_for_port(local_h, 5), "echo H did not restart");
+        tokio::time::sleep(Duration::from_secs(HC_INTERVAL_SECS + 5)).await;
+        // Regression assert: with the bug the surviving health task fires
+        // Recover for the removed proxy here; with the fix it was cancelled
+        // at reload, so the wire-named Recover marker never appears.
+        assert!(
+            !wait_for_log_since(
+                &frpc_log_path,
+                log_base,
+                "Health check recovered for 'testuser.tcp-h'",
+                2,
+            ),
+            "REMOVED proxy still has a live health task — Recover fired after reload removal"
+        );
+        assert!(
+            wait_for_port_closed(remote_h, 2),
+            "REMOVED proxy remote port resurrected after recovery"
+        );
+
+        // ---- Phase 2: reload ADDS a second health-checked proxy ----
+        let log_base = log_len(&frpc_log_path);
+        std::fs::write(
+            &frpc_config_path,
+            frpc_config(&health_proxy_block("tcp-h2", local_h2, remote_h2)),
+        )
+        .unwrap();
+        let frpc_pid = frpc.id();
+        let kill_status = Command::new("kill")
+            .args(["-USR1", &frpc_pid.to_string()])
+            .status()
+            .expect("kill command failed");
+        assert!(kill_status.success(), "kill -USR1 failed");
+        assert!(
+            wait_for_port(remote_h2, 15),
+            "added health-checked proxy tcp-h2 never became ready"
+        );
+        // Let the new health task see one successful check first.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Kill the local service: the monitor must fire Close and the remote
+        // port must close.
+        let _ = echo_h2_tx.send(());
+        let _ = echo_h2_handle.join();
+        assert!(
+            wait_for_port_closed(remote_h2, 20),
+            "remote port did not close after local service died"
+        );
+
+        // Bring the local service back: the monitor must recover and the
+        // Recover handler must find the config (keyed by wire name) and send
+        // NewProxy. With the bug the Recover lookup misses and the handler
+        // logs "no config found" instead of re-registering.
+        let (echo_h2_handle, echo_h2_tx) = start_tcp_echo_server(local_h2);
+        assert!(wait_for_port(local_h2, 5), "echo H2 did not restart");
+        assert!(
+            wait_for_log_since(
+                &frpc_log_path,
+                log_base,
+                "Health recovery: re-registered proxy 'testuser.tcp-h2'",
+                25,
+            ),
+            "added health-checked proxy's Recover found no config — never re-registered after recovery"
+        );
+
+        // Cleanup
+        let _ = frpc.kill();
+        let _ = frps.kill();
+        let _ = frpc.wait();
+        let _ = frps.wait();
+        stop_tcp_echo_server(echo_h_handle, echo_h_tx);
+        stop_tcp_echo_server(echo_h2_handle, echo_h2_tx);
     }
 }
