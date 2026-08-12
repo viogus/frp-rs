@@ -2,6 +2,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tracing::{debug, warn};
@@ -269,6 +270,12 @@ async fn handle_visitor_conn(
         raw_stream
     };
 
+    // Bound the handshake response waits (mirrors
+    // read_start_work_conn_with_timeout in work_conn.rs): a server that
+    // accepts the dial but never answers must not pin this connection's
+    // task (and its user connection) forever.
+    let resp_timeout = Duration::from_secs(dial_timeout_secs.max(1));
+
     // 2. Login
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -319,8 +326,9 @@ async fn handle_visitor_conn(
         .await
         .map_err(|e| format!("write login: {e}"))?;
 
-    match read_msg_v1(&mut server_stream)
+    match tokio::time::timeout(resp_timeout, read_msg_v1(&mut server_stream))
         .await
+        .map_err(|_| format!("read login resp: timeout after {}s", resp_timeout.as_secs()))?
         .map_err(|e| format!("read login resp: {e}"))?
     {
         FrpMessage::LoginResp(resp) => {
@@ -347,8 +355,14 @@ async fn handle_visitor_conn(
         .map_err(|e| format!("write NewVisitorConn: {e}"))?;
 
     // 4. Read NewVisitorConnResp
-    match read_msg_v1(&mut server_stream)
+    match tokio::time::timeout(resp_timeout, read_msg_v1(&mut server_stream))
         .await
+        .map_err(|_| {
+            format!(
+                "read NewVisitorConnResp: timeout after {}s",
+                resp_timeout.as_secs()
+            )
+        })?
         .map_err(|e| format!("read NewVisitorConnResp: {e}"))?
     {
         FrpMessage::NewVisitorConnResp(resp) => {

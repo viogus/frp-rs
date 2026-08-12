@@ -831,21 +831,31 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         }
                         info!(visitor_name = %visitor_name, stcp_proxy_name = %stcp_proxy_name, "Visitor '{}': fell back to STCP relay for '{}'", visitor_name, stcp_proxy_name);
 
-                        // Read NewVisitorConnResp before bridging
-                        match server_conn.read_v1_frame().await {
-                            Ok(FrpMessage::NewVisitorConnResp(resp)) => {
+                        // Read NewVisitorConnResp before bridging. Bound the
+                        // wait: a server that accepts the dial but never answers
+                        // must not pin this task (and its user connection) for
+                        // the lifetime of the tunnel — mirrors
+                        // read_start_work_conn_with_timeout (work_conn.rs).
+                        let resp_timeout = Duration::from_secs(transport.dial_timeout_secs.max(1));
+                        match tokio::time::timeout(resp_timeout, server_conn.read_v1_frame()).await
+                        {
+                            Ok(Ok(FrpMessage::NewVisitorConnResp(resp))) => {
                                 if let Some(err) = resp.error {
                                     warn!(visitor_name = %visitor_name, error = %err, "Visitor '{}': STCP server error: {}", visitor_name, err);
                                     return;
                                 }
                                 debug!(visitor_name = %visitor_name, proxy_name = %resp.proxy_name, "Visitor '{}': STCP relay ready for '{}'", visitor_name, resp.proxy_name);
                             }
-                            Ok(other) => {
+                            Ok(Ok(other)) => {
                                 warn!(visitor_name = %visitor_name, type_byte = %other.v1_type_byte(), "Visitor received unexpected response type");
                                 return;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': read NewVisitorConnResp failed: {}", visitor_name, e);
+                                return;
+                            }
+                            Err(_elapsed) => {
+                                warn!(visitor_name = %visitor_name, timeout = ?resp_timeout, "Visitor '{}': timed out waiting for NewVisitorConnResp", visitor_name);
                                 return;
                             }
                         }
@@ -936,21 +946,31 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         }
                         debug!(visitor_name = %visitor_name, sn = %sn, "Visitor '{}': sent NewVisitorConn for '{}'", visitor_name, sn);
 
-                        // Read NewVisitorConnResp before bridging
-                        match server_conn.read_v1_frame().await {
-                            Ok(FrpMessage::NewVisitorConnResp(resp)) => {
+                        // Read NewVisitorConnResp before bridging. Bound the
+                        // wait: a server that accepts the dial but never answers
+                        // must not pin this task (and its user connection) for
+                        // the lifetime of the tunnel — mirrors
+                        // read_start_work_conn_with_timeout (work_conn.rs).
+                        let resp_timeout = Duration::from_secs(transport.dial_timeout_secs.max(1));
+                        match tokio::time::timeout(resp_timeout, server_conn.read_v1_frame()).await
+                        {
+                            Ok(Ok(FrpMessage::NewVisitorConnResp(resp))) => {
                                 if let Some(err) = resp.error {
                                     warn!(visitor_name = %visitor_name, error = %err, "Visitor '{}': STCP server error: {}", visitor_name, err);
                                     return;
                                 }
                                 debug!(visitor_name = %visitor_name, proxy_name = %resp.proxy_name, "Visitor '{}': STCP relay ready for '{}'", visitor_name, resp.proxy_name);
                             }
-                            Ok(other) => {
+                            Ok(Ok(other)) => {
                                 warn!(visitor_name = %visitor_name, type_byte = %other.v1_type_byte(), "Visitor received unexpected response type");
                                 return;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': read NewVisitorConnResp failed: {}", visitor_name, e);
+                                return;
+                            }
+                            Err(_elapsed) => {
+                                warn!(visitor_name = %visitor_name, timeout = ?resp_timeout, "Visitor '{}': timed out waiting for NewVisitorConnResp", visitor_name);
                                 return;
                             }
                         }
@@ -1350,20 +1370,28 @@ async fn connect_sudp_visitor_stream(
         warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
         return None;
     }
-    match server_conn.read_v1_frame().await {
-        Ok(FrpMessage::NewVisitorConnResp(resp)) => {
+    // Bound the response wait (mirrors read_start_work_conn_with_timeout in
+    // work_conn.rs): a silent server must not leave the tunnel connect
+    // hanging — the dispatcher falls back to waiting for the next datagram.
+    let resp_timeout = Duration::from_secs(transport.dial_timeout_secs.max(1));
+    match tokio::time::timeout(resp_timeout, server_conn.read_v1_frame()).await {
+        Ok(Ok(FrpMessage::NewVisitorConnResp(resp))) => {
             if let Some(err) = resp.error {
                 warn!(visitor_name = %visitor_name, error = %err, "SUDP visitor '{}': server error: {}", visitor_name, err);
                 return None;
             }
             debug!(visitor_name = %visitor_name, proxy_name = %resp.proxy_name, "SUDP visitor '{}': relay ready for '{}'", visitor_name, resp.proxy_name);
         }
-        Ok(other) => {
+        Ok(Ok(other)) => {
             warn!(visitor_name = %visitor_name, type_byte = %other.v1_type_byte(), "SUDP visitor '{}': unexpected response type", visitor_name);
             return None;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': read NewVisitorConnResp failed: {}", visitor_name, e);
+            return None;
+        }
+        Err(_elapsed) => {
+            warn!(visitor_name = %visitor_name, timeout = ?resp_timeout, "SUDP visitor '{}': timed out waiting for NewVisitorConnResp", visitor_name);
             return None;
         }
     }
@@ -1644,8 +1672,12 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         }
         debug!(visitor_name = %name, sn = %server_name, "Virtual net visitor '{}': sent NewVisitorConn for '{}'", name, server_name);
 
-        match server_conn.read_v1_frame().await {
-            Ok(FrpMessage::NewVisitorConnResp(resp)) => {
+        // Bound the response wait (mirrors read_start_work_conn_with_timeout
+        // in work_conn.rs): a silent server must not pin the tunnel connect —
+        // fail over to the reconnect backoff instead.
+        let resp_timeout = Duration::from_secs(dial_timeout_secs.max(1));
+        match tokio::time::timeout(resp_timeout, server_conn.read_v1_frame()).await {
+            Ok(Ok(FrpMessage::NewVisitorConnResp(resp))) => {
                 if let Some(err) = resp.error {
                     warn!(visitor_name = %name, error = %err, "Virtual net visitor '{}': tunnel setup failed: {}", name, err);
                     if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
@@ -1655,19 +1687,26 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
                 }
                 debug!(visitor_name = %name, proxy_name = %resp.proxy_name, "Virtual net visitor '{}': tunnel ready for '{}'", name, resp.proxy_name);
             }
-            Ok(FrpMessage::ReqWorkConn(_)) => {
+            Ok(Ok(FrpMessage::ReqWorkConn(_))) => {
                 // Go frps responds to NewVisitorConn with ReqWorkConn; treat as success.
                 debug!(visitor_name = %name, "Virtual net visitor '{}': tunnel ready (Go frps ReqWorkConn)", name);
             }
-            Ok(other) => {
+            Ok(Ok(other)) => {
                 warn!(visitor_name = %name, type_byte = %other.v1_type_byte(), "Virtual net visitor received unexpected response type");
                 if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
                     return;
                 }
                 continue 'reconnect;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': read tunnel response failed: {}", name, e);
+                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                    return;
+                }
+                continue 'reconnect;
+            }
+            Err(_elapsed) => {
+                warn!(visitor_name = %name, timeout = ?resp_timeout, "Virtual net visitor '{}': timed out waiting for tunnel response", name);
                 if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
                     return;
                 }
