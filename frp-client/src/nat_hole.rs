@@ -10,8 +10,9 @@
 //! tiny/micro builds (the message-loop dispatch arms stay uniform).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
@@ -31,6 +32,7 @@ impl Service {
         nhc: msg::NatHoleClient,
         writer: &Arc<ControlWriter>,
         v2: bool,
+        session_alive: Arc<AtomicBool>,
     ) {
         debug!(proxy_name = %nhc.proxy_name, "Received NatHoleClient for proxy '{}'", nhc.proxy_name);
         let visitor_addr = nhc.visitor_addr.unwrap_or_default();
@@ -89,8 +91,12 @@ impl Service {
 
         // Spawn the blocking P2P connection + bridging into a detached task
         // so it doesn't starve the control loop's ping/health/reload handling.
+        // The task is session-bound: `session_alive` is cleared at session
+        // teardown, which aborts both the hole punch and the P2P bridge
+        // instead of leaving them probing a dead control channel.
         let w = writer.clone();
         tokio::spawn(async move {
+            let alive = session_alive;
             let candidates = vec![visitor_addr];
             let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
             let kcp_cfg = frp_core::kcp::default_kcp_config();
@@ -110,20 +116,34 @@ impl Service {
             // address (Go `mapped_addrs`); previously it was passed as
             // candidates=&[]/assisted, which always failed with
             // "no candidate addresses" — the provider never hole-punched.
-            match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
-                socket,
-                &candidates,
-                &[],
-                None,
-                conv,
-                kcp_cfg,
-                5000,
-                false, // yamux_client = false (provider/server)
-                p2p_sid2,
-                p2p_key.as_ref(),
-            )
-            .await
-            {
+            // Scope the pinned punch future so its borrows of `sid`/`p2p_sid`
+            // are released before the match arms below move those values.
+            let punch_result = {
+                let punch = frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                    socket,
+                    &candidates,
+                    &[],
+                    None,
+                    conv,
+                    kcp_cfg,
+                    5000,
+                    false, // yamux_client = false (provider/server)
+                    p2p_sid2,
+                    p2p_key.as_ref(),
+                );
+                tokio::pin!(punch);
+                tokio::select! {
+                    r = &mut punch => r,
+                    _ = wait_session_dead(&alive) => {
+                        // Session torn down (reconnect/stop): drop the punch
+                        // future, releasing its UDP socket, instead of probing
+                        // a dead control channel for up to 5s more.
+                        debug!(proxy_name = %proxy_name, "XTCP provider '{}': session ended during hole punch, aborting", proxy_name);
+                        return;
+                    }
+                }
+            };
+            match punch_result {
                 Ok(mut p2p_stream) => {
                     // Send NatHoleReport with success=true after successful hole punch
                     // (Go frp compat: provider reports hole punch result to server)
@@ -137,39 +157,51 @@ impl Service {
                                 let use_comp = xtcp_use_comp;
                                 let sk = xtcp_sk.clone();
                                 let pn = proxy_name.clone();
+                                let alive_inner = alive.clone();
                                 tokio::spawn(async move {
                                     let (local_r, local_w) = local_stream.into_split();
                                     let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
-                                    if use_enc {
-                                        let key = frp_core::encryption::derive_key(&sk);
-                                        frp_core::bridge::bridge_encrypted(
-                                            local_r,
-                                            local_w,
-                                            p2p_r,
-                                            p2p_w,
-                                            &key,
-                                            use_comp,
-                                            vec![],
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                        )
-                                        .await;
-                                    } else {
-                                        frp_core::bridge::bridge_plain(
-                                            local_r,
-                                            local_w,
-                                            p2p_r,
-                                            p2p_w,
-                                            use_comp,
-                                            vec![],
-                                            None,
-                                            None,
-                                        )
-                                        .await;
+                                    let bridge = async {
+                                        if use_enc {
+                                            let key = frp_core::encryption::derive_key(&sk);
+                                            frp_core::bridge::bridge_encrypted(
+                                                local_r,
+                                                local_w,
+                                                p2p_r,
+                                                p2p_w,
+                                                &key,
+                                                use_comp,
+                                                vec![],
+                                                None,
+                                                None,
+                                                None,
+                                                None,
+                                            )
+                                            .await;
+                                        } else {
+                                            frp_core::bridge::bridge_plain(
+                                                local_r,
+                                                local_w,
+                                                p2p_r,
+                                                p2p_w,
+                                                use_comp,
+                                                vec![],
+                                                None,
+                                                None,
+                                            )
+                                            .await;
+                                        }
+                                    };
+                                    tokio::pin!(bridge);
+                                    tokio::select! {
+                                        _ = &mut bridge => {}
+                                        _ = wait_session_dead(&alive_inner) => {
+                                            // Session torn down: drop the bridge
+                                            // futures, closing the P2P stream and
+                                            // the local connection.
+                                            debug!(proxy_name = %pn, "XTCP provider '{}': session ended, closing P2P bridge", pn);
+                                        }
                                     }
-                                    debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
                                 });
                             }
                             Err(e) => {
@@ -231,6 +263,7 @@ impl Service {
             >,
         >,
         writer: &Arc<ControlWriter>,
+        session_alive: Arc<AtomicBool>,
     ) {
         // Route to waiting visitor first (Go frps compat path).
         let txn_id = resp.transaction_id.clone();
@@ -302,6 +335,10 @@ impl Service {
         let resp_writer = writer.clone();
         let resp_v2 = self.cfg.read().await.v2;
         tokio::spawn(async move {
+            // Session-bound task: `session_alive` is cleared at session
+            // teardown, which aborts both the hole punch and the P2P bridge
+            // instead of leaving them probing a dead control channel.
+            let alive = session_alive;
             // Retrieve the STUN socket persisted by the control loop.
             let stun_socket = {
                 let mut map = xtcp_sockets_clone.lock().await;
@@ -377,56 +414,73 @@ impl Service {
             // passed as candidates=&[]/behavior=None, which made the simplified
             // punch fail with "no candidate addresses" — the provider never
             // actually hole-punched.)
-            let p2p_stream: Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> =
-                match p2p_protocol.as_str() {
-                    "quic" => {
-                        #[cfg(all(feature = "quic", feature = "kcp"))]
-                        {
-                            match frp_core::xtcp_p2p::xtcp_p2p_connect_quic(
-                                socket,
-                                &candidate_addrs,
-                                &assisted_addrs,
-                                detect_behavior.as_ref(),
-                                hp_timeout,
-                                p2p_sid,
-                                p2p_key.as_ref(),
-                                true, // is_server = true (provider is QUIC server)
-                            )
-                            .await
+            // Scope the pinned punch future so its borrows of
+            // `candidate_addrs`/`p2p_sid` are released before the match arms
+            // below move `p2p_stream`/`local_addr` values.
+            let p2p_stream: Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> = {
+                let p2p_fut = async {
+                    match p2p_protocol.as_str() {
+                        "quic" => {
+                            #[cfg(all(feature = "quic", feature = "kcp"))]
                             {
-                                Ok(s) => Ok(Box::new(s) as Box<_>),
-                                Err(e) => Err(e),
+                                match frp_core::xtcp_p2p::xtcp_p2p_connect_quic(
+                                    socket,
+                                    &candidate_addrs,
+                                    &assisted_addrs,
+                                    detect_behavior.as_ref(),
+                                    hp_timeout,
+                                    p2p_sid,
+                                    p2p_key.as_ref(),
+                                    true, // is_server = true (provider is QUIC server)
+                                )
+                                .await
+                                {
+                                    Ok(s) => Ok(Box::new(s) as Box<_>),
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            #[cfg(not(all(feature = "quic", feature = "kcp")))]
+                            {
+                                warn!(proxy_name = %proxy_name_clone,
+                                "XTCP provider '{}': protocol 'quic' requested but the quic feature is disabled; refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
+                                proxy_name_clone);
+                                Err(format!(
+                                    "XTCP provider '{}': protocol 'quic' requires the quic feature",
+                                    proxy_name_clone
+                                ))
                             }
                         }
-                        #[cfg(not(all(feature = "quic", feature = "kcp")))]
+                        _ => match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                            socket,
+                            &candidate_addrs,
+                            &assisted_addrs,
+                            detect_behavior.as_ref(),
+                            conv,
+                            kcp_cfg,
+                            hp_timeout,
+                            false, // yamux_client = false (provider/server)
+                            p2p_sid,
+                            p2p_key.as_ref(),
+                        )
+                        .await
                         {
-                            warn!(proxy_name = %proxy_name_clone,
-                            "XTCP provider '{}': protocol 'quic' requested but the quic feature is disabled; refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
-                            proxy_name_clone);
-                            Err(format!(
-                                "XTCP provider '{}': protocol 'quic' requires the quic feature",
-                                proxy_name_clone
-                            ))
-                        }
+                            Ok(s) => Ok(Box::new(s) as Box<_>),
+                            Err(e) => Err(e),
+                        },
                     }
-                    _ => match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
-                        socket,
-                        &candidate_addrs,
-                        &assisted_addrs,
-                        detect_behavior.as_ref(),
-                        conv,
-                        kcp_cfg,
-                        hp_timeout,
-                        false, // yamux_client = false (provider/server)
-                        p2p_sid,
-                        p2p_key.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(s) => Ok(Box::new(s) as Box<_>),
-                        Err(e) => Err(e),
-                    },
                 };
+                tokio::pin!(p2p_fut);
+                tokio::select! {
+                    r = &mut p2p_fut => r,
+                    _ = wait_session_dead(&alive) => {
+                        // Session torn down (reconnect/stop): drop the punch
+                        // future, releasing its UDP socket, instead of probing
+                        // a dead control channel for the full punch timeout.
+                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': session ended during hole punch, aborting", proxy_name_clone);
+                        return;
+                    }
+                }
+            };
             match p2p_stream {
                 Ok(mut p2p_stream) => {
                     // Send NatHoleReport with success=true after successful hole punch
@@ -444,34 +498,46 @@ impl Service {
                                 let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
                                 let (local_r, local_w) = local_conn.into_split();
                                 let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
-                                if use_enc {
-                                    let key = frp_core::encryption::derive_key(&xtcp_sk);
-                                    frp_core::bridge::bridge_encrypted(
-                                        local_r,
-                                        local_w,
-                                        p2p_r,
-                                        p2p_w,
-                                        &key,
-                                        xtcp_use_comp,
-                                        vec![],
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                    )
-                                    .await;
-                                } else {
-                                    frp_core::bridge::bridge_plain(
-                                        local_r,
-                                        local_w,
-                                        p2p_r,
-                                        p2p_w,
-                                        xtcp_use_comp,
-                                        vec![],
-                                        None,
-                                        None,
-                                    )
-                                    .await;
+                                let bridge = async {
+                                    if use_enc {
+                                        let key = frp_core::encryption::derive_key(&xtcp_sk);
+                                        frp_core::bridge::bridge_encrypted(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            &key,
+                                            xtcp_use_comp,
+                                            vec![],
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                    } else {
+                                        frp_core::bridge::bridge_plain(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            xtcp_use_comp,
+                                            vec![],
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                };
+                                tokio::pin!(bridge);
+                                tokio::select! {
+                                    _ = &mut bridge => {}
+                                    _ = wait_session_dead(&alive) => {
+                                        // Session torn down: drop the bridge
+                                        // futures, closing the P2P stream and
+                                        // the local connection.
+                                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': session ended, closing P2P bridge", proxy_name_clone);
+                                    }
                                 }
                                 debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
                             }
@@ -503,6 +569,19 @@ impl Service {
                 }
             }
         });
+    }
+}
+
+/// Resolves once the control session has ended (session_alive == false).
+/// Polls at 100ms so detached XTCP tasks (hole punch, P2P bridge) unwind
+/// within one poll interval of session teardown instead of lingering up to
+/// the punch timeout. Mirrors wait_sudp_shutdown in visitor.rs.
+async fn wait_session_dead(session_alive: &Arc<AtomicBool>) {
+    loop {
+        if !session_alive.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
