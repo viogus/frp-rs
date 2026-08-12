@@ -212,16 +212,25 @@ async fn handle_http_forward(
         "connection:",
     ];
     let mut header_lines: Vec<&str> = headers_str.lines().skip(1).collect();
+    // Body framing is parsed from the original headers — Transfer-Encoding
+    // is stripped below as hop-by-hop and re-added only when chunked.
+    let framing = super::parse_request_body_framing(headers_str.lines().skip(1));
     header_lines.retain(|line| {
         // Skip the head's trailing blank line(s) too: lines() yields "" for
         // the \r\n\r\n terminator, and forwarding it would terminate the
         // head early, pushing `Connection: close` into the body.
         let lower = line.to_lowercase();
-        !line.is_empty() && !hop_by_hop.iter().any(|h| lower.starts_with(h))
+        if line.is_empty() || hop_by_hop.iter().any(|h| lower.starts_with(h)) {
+            return false;
+        }
+        // Drop Content-Length when the body is chunked (RFC 7230 §3.3.3):
+        // Go's http.Server deletes CL when Transfer-Encoding is chunked,
+        // and forwarding the ambiguous pair is request-smuggling shaped.
+        if framing == Some(super::BodyFraming::Chunked) && lower.starts_with("content-length:") {
+            return false;
+        }
+        true
     });
-    // Body framing is parsed from the original headers — Transfer-Encoding
-    // is stripped above as hop-by-hop and re-added only when chunked.
-    let framing = super::parse_request_body_framing(headers_str.lines().skip(1));
 
     let mut fwd = Vec::new();
     fwd.extend_from_slice(format!("{method} {path} HTTP/1.0\r\n").as_bytes());
@@ -242,7 +251,13 @@ async fn handle_http_forward(
     // Stream the request body (pre-read bytes plus the rest per its framing)
     // before relaying the response — Go's http.DefaultTransport streams it,
     // and a backend that waits for the full request would stall otherwise.
-    super::forward_request_body(&mut client, &mut remote, body_bytes, framing).await?;
+    // A body-forward error must NOT drop the connection: backends reply early
+    // without reading the full request (e.g. nginx's 413 client_max_body_size),
+    // and Go's Transport still delivers those responses.
+    if let Err(e) = super::forward_request_body(&mut client, &mut remote, body_bytes, framing).await
+    {
+        tracing::debug!(error = %e, "request body forward failed, relaying response anyway: {}", e);
+    }
 
     // Copy response back to client
     if let Err(e) = super::copy_stream_large(remote, &mut client).await {

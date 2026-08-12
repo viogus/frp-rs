@@ -137,7 +137,14 @@ async fn handle_conn(
     // Stream the request body (pre-read bytes plus the rest per its framing)
     // before relaying the response — Go's ReverseProxy streams request bodies,
     // and a backend that waits for the full request would hang otherwise.
-    crate::plugin::forward_request_body(&mut tls, &mut remote, &fwd.body_prefix, fwd.body).await?;
+    // A body-forward error must NOT drop the connection: backends reply early
+    // without reading the full request (e.g. nginx's 413 client_max_body_size),
+    // and Go's Transport still delivers those responses.
+    if let Err(e) =
+        crate::plugin::forward_request_body(&mut tls, &mut remote, &fwd.body_prefix, fwd.body).await
+    {
+        tracing::debug!(error = %e, "request body forward failed, relaying response anyway: {}", e);
+    }
 
     // Copy response back to client
     if let Err(e) = super::copy_stream_large(remote, &mut tls).await {

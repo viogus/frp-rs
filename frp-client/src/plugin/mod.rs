@@ -441,6 +441,12 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         if hop_by_hop.iter().any(|h| lower.starts_with(h)) {
             continue;
         }
+        // Drop Content-Length when the body is chunked (RFC 7230 §3.3.3):
+        // Go's http.Server deletes CL when Transfer-Encoding is chunked,
+        // and forwarding the ambiguous pair is request-smuggling shaped.
+        if framing == Some(BodyFraming::Chunked) && lower.starts_with("content-length:") {
+            continue;
+        }
         // Skip headers that request_headers will override (Go Header.Set).
         if let Some((name, _)) = line.split_once(':') {
             if request_headers

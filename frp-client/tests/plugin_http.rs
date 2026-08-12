@@ -530,3 +530,195 @@ async fn test_http_proxy_post_body_streams() {
         "backend must receive the full request body"
     );
 }
+
+/// A chunked request that ALSO carries `Content-Length` must be forwarded
+/// with `Transfer-Encoding: chunked` only — Content-Length is dropped
+/// (RFC 7230 §3.3.3: chunked wins; Go's http.Server deletes CL when
+/// Transfer-Encoding is chunked, and forwarding the ambiguous pair is
+/// request-smuggling shaped). Covers both the shared forward path
+/// (http2http) and the http_proxy path's own head builder.
+async fn assert_chunked_with_cl_strips_content_length(plugin_type: &str) {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let req = read_full_chunked_request(&mut conn).await;
+            let _ = tx.send(req);
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: plugin_type.into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match plugin_type {
+        "http_proxy" => frp_client::plugin::start_http_proxy(&cfg).await,
+        _ => frp_client::plugin::start_http2http_plugin(&cfg).await,
+    };
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    let req_line = match plugin_type {
+        "http_proxy" => format!("POST http://{backend_addr}/upload HTTP/1.1\r\n"),
+        _ => "POST /upload HTTP/1.1\r\n".to_string(),
+    };
+    client
+        .write_all(
+            format!(
+                "{req_line}Host: original\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    client.write_all(body).await.unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("chunked request with Content-Length was not forwarded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let captured = rx.await.expect("backend captured request");
+    let head_end = captured
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("forwarded request must end its head with CRLFCRLF")
+        + 4;
+    let head = String::from_utf8_lossy(&captured[..head_end]);
+    assert!(
+        head.to_lowercase().contains("transfer-encoding: chunked"),
+        "chunked framing must be re-added to the head: {head}"
+    );
+    assert!(
+        !head.to_lowercase().contains("content-length"),
+        "Content-Length must be stripped when chunked (RFC 7230 §3.3.3): {head}"
+    );
+    assert_eq!(
+        &captured[head_end..],
+        body.as_slice(),
+        "client chunk framing must be forwarded verbatim"
+    );
+}
+
+/// Both-framing-headers regression test through the shared forward path
+/// (http2http).
+#[tokio::test]
+async fn test_http2http_chunked_with_cl_strips_content_length() {
+    assert_chunked_with_cl_strips_content_length("http2http").await;
+}
+
+/// Both-framing-headers regression test through the http_proxy head builder.
+#[tokio::test]
+async fn test_http_proxy_chunked_with_cl_strips_content_length() {
+    assert_chunked_with_cl_strips_content_length("http_proxy").await;
+}
+
+/// A backend that answers without reading the full request body (e.g.
+/// nginx's 413 client_max_body_size) must not cause the client connection
+/// to be dropped: a body-forward error is logged at debug and the early
+/// response is still relayed (Go's Transport delivers early responses).
+///
+/// The client sends head + 1 KiB, then half-closes its write side; the
+/// backend reads what it needs, answers 413 and closes cleanly. The
+/// plugin's body forward hits "connection closed before full body" — a
+/// clean FIN close, so the 413 survives in the plugin's receive buffer and
+/// the relay delivers it. Pre-fix the `?` propagated the error and the
+/// client saw the connection dropped before any response.
+#[tokio::test]
+async fn test_http2http_early_response_relayed() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            // Read the head and the ~1 KiB body the client sent, then answer
+            // 413 WITHOUT reading the rest and close. Everything received so
+            // far was consumed, so the close is a clean FIN (no RST): the
+            // 413 stays readable in the plugin's receive buffer.
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0usize;
+            while total < 1024 {
+                let n = conn.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            let _ = conn
+                .write_all(b"HTTP/1.0 413 Payload Too Large\r\nContent-Length: 21\r\n\r\npayload too large")
+                .await;
+            // drop: close without reading the rest of the body
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http2http".into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http2http_plugin(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let total = 256 * 1024;
+    client
+        .write_all(
+            format!("POST /up HTTP/1.1\r\nHost: h\r\nContent-Length: {total}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    client.write_all(&vec![b'x'; 1024]).await.unwrap();
+    // Half-close the write side: the plugin's body forward then errors with
+    // "connection closed before full body" — the early-response case.
+    client.shutdown().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("early response was not relayed after body-forward error (regression)")
+    .unwrap();
+    assert!(
+        resp.starts_with(b"HTTP/1.0 413"),
+        "client must receive the early 413, got: {:?}",
+        String::from_utf8_lossy(&resp[..resp.len().min(80)])
+    );
+}
