@@ -61,11 +61,7 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
     // Go frp v0.70.1 compat: failedTimes is a monotonic uint64 that NEVER resets.
     // State transitions are tracked by was_failed/statusOK, not by resetting the counter.
     // See /tmp/frp-source/client/health/health.go:45,128-135.
-    let mut failures: u64 = 0;
-    let mut was_failed = false;
-    // Track whether the proxy has ever been healthy (Go frp: statusOK).
-    // Close is only fired after the proxy was healthy at least once.
-    let mut was_healthy = false;
+    let mut state = HealthState::new();
 
     // Go frp v0.70.1 compat: add 500ms startup delay before the first check.
     // This prevents a thundering herd of health checks when many proxies
@@ -87,51 +83,123 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
             run_tcp_check(&local_addr, timeout).await
         };
 
-        match result {
-            Ok(()) => {
-                // Go frp compat: failedTimes is NEVER reset on success — monotonic.
-                // See /tmp/frp-source/client/health/health.go:121-127.
-                was_healthy = true;
-                if was_failed {
-                    // Service recovered. Notify control loop to re-register.
-                    info!(proxy_name = %proxy_name, "Health check recovered for '{}', sending Recover event", proxy_name);
-                    // try_send: during a reconnect the control-loop consumer
-                    // is gone and the bounded channel may be full — blocking
-                    // here would pause health probing. On failure keep
-                    // was_failed=true so the next successful check retries.
-                    if health_tx
-                        .try_send(HealthEvent::Recover(proxy_name.clone()))
-                        .is_ok()
-                    {
-                        was_failed = false;
-                    }
+        // Close is only ever fired from a FAILURE tick (Go frp: statusFailedFn
+        // runs in the error branch). The old guard ran on every tick, so the
+        // first success after a failure sent Recover AND re-fired Close in the
+        // same tick (failures is monotonic and was_failed had just been cleared)
+        // — flapping CloseProxy/NewProxy every health interval.
+        match state.on_check(result.is_ok(), max_failed) {
+            HealthAction::Recover => {
+                // Service recovered. Notify control loop to re-register.
+                info!(proxy_name = %proxy_name, "Health check recovered for '{}', sending Recover event", proxy_name);
+                // try_send: during a reconnect the control-loop consumer
+                // is gone and the bounded channel may be full — blocking
+                // here would pause health probing. On failure keep
+                // was_failed=true so the next successful check retries.
+                if health_tx
+                    .try_send(HealthEvent::Recover(proxy_name.clone()))
+                    .is_ok()
+                {
+                    state.confirm_recover();
                 }
-                debug!(proxy_name = %proxy_name, "Health check OK for '{}'", proxy_name);
             }
-            Err(e) => {
-                failures += 1;
-                warn!(proxy_name = %proxy_name, failures = %failures, error = %e, "Health check FAIL for '{}' ({}): {}", proxy_name, failures, e);
+            HealthAction::Close => {
+                warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending Close event",
+                    proxy_name, max_failed);
+                // try_send: during a reconnect the consumer may be gone and the
+                // channel full — never block probing. On failure keep
+                // was_failed=false; the next failed check retries the Close.
+                if health_tx
+                    .try_send(HealthEvent::Close(proxy_name.clone()))
+                    .is_ok()
+                {
+                    state.confirm_close();
+                }
+                // Keep running -- monitor for recovery (Go frp compat).
             }
+            HealthAction::None => {}
         }
 
-        // Go frp compat: only fire Close after the proxy was ever healthy.
-        // (statusOK must be true before transitioning to false triggers the callback).
-        if was_healthy && failures >= max_failed as u64 && !was_failed {
-            warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending Close event",
-                proxy_name, max_failed);
-            // try_send: during a reconnect the consumer may be gone and the
-            // channel full — never block probing. On failure keep
-            // was_failed=false; the next failed check retries the Close.
-            if health_tx
-                .try_send(HealthEvent::Close(proxy_name.clone()))
-                .is_ok()
-            {
-                was_failed = true;
-            }
-            // Keep running -- monitor for recovery (Go frp compat).
+        if let Err(e) = result {
+            warn!(proxy_name = %proxy_name, failures = %state.failures, error = %e, "Health check FAIL for '{}' ({}): {}", proxy_name, state.failures, e);
+        } else {
+            debug!(proxy_name = %proxy_name, "Health check OK for '{}'", proxy_name);
         }
 
         tokio::time::sleep(interval).await;
+    }
+}
+
+/// Action a health-check monitor should take after one probe result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthAction {
+    /// No event; the check was healthy (or a failure below the threshold).
+    None,
+    /// The proxy exceeded `max_failed` failures and must be closed.
+    Close,
+    /// The proxy recovered and must be re-registered.
+    Recover,
+}
+
+/// Health-check state machine mirroring Go frp's `health.Monitor`
+/// (`statusOK`/`failedTimes` transitions). Pure and unit-testable.
+struct HealthState {
+    /// Go frp v0.70.1 compat: failedTimes is a monotonic uint64 that NEVER
+    /// resets — recovery is tracked via `was_failed`, not the counter.
+    failures: u64,
+    /// A Close event was emitted and no Recover has been delivered yet.
+    was_failed: bool,
+    /// The proxy was observed healthy at least once (Go frp: statusOK).
+    /// Close is only fired after the proxy was healthy at least once.
+    was_healthy: bool,
+}
+
+impl HealthState {
+    fn new() -> Self {
+        HealthState {
+            failures: 0,
+            was_failed: false,
+            was_healthy: false,
+        }
+    }
+
+    /// Process one probe result and return the event the monitor should emit.
+    ///
+    /// Transitions are NOT committed here: the caller confirms them via
+    /// [`confirm_recover`]/[`confirm_close`] only after the corresponding
+    /// event was actually delivered (`try_send` can fail during a reconnect,
+    /// in which case the transition is retried on the next matching tick).
+    fn on_check(&mut self, ok: bool, max_failed: u32) -> HealthAction {
+        if ok {
+            // Go frp compat: failedTimes is NEVER reset on success — monotonic.
+            // See /tmp/frp-source/client/health/health.go:121-127.
+            self.was_healthy = true;
+            if self.was_failed {
+                HealthAction::Recover
+            } else {
+                HealthAction::None
+            }
+        } else {
+            self.failures += 1;
+            // Go frp compat: only fire Close after the proxy was ever healthy
+            // (statusOK must be true before transitioning to false triggers the
+            // callback). Evaluated ONLY on failure ticks.
+            if self.was_healthy && self.failures >= max_failed as u64 && !self.was_failed {
+                HealthAction::Close
+            } else {
+                HealthAction::None
+            }
+        }
+    }
+
+    /// Commit a delivered Recover event (was_failed=false).
+    fn confirm_recover(&mut self) {
+        self.was_failed = false;
+    }
+
+    /// Commit a delivered Close event (was_failed=true).
+    fn confirm_close(&mut self) {
+        self.was_failed = true;
     }
 }
 
@@ -210,4 +278,69 @@ pub(crate) async fn run_http_check(
         }
     }
     Err(format!("non-2xx status: {}", status_line))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the Close guard must only ever run on FAILURE ticks. The
+    /// old guard (`was_healthy && failures >= max_failed && !was_failed`) ran
+    /// after every tick including successes, so the first success after a
+    /// recovery sent Recover AND re-fired Close in the same tick (failures is
+    /// monotonic and was_failed had just been cleared) — flapping
+    /// CloseProxy/NewProxy every health interval.
+    #[test]
+    fn success_tick_after_recovery_emits_recover_but_not_close() {
+        let mut st = HealthState::new();
+        // Healthy baseline: no events.
+        assert_eq!(st.on_check(true, 2), HealthAction::None);
+        // Failure 1: below max_failed, no event.
+        assert_eq!(st.on_check(false, 2), HealthAction::None);
+        // Failure 2: reaches max_failed -> Close.
+        assert_eq!(st.on_check(false, 2), HealthAction::Close);
+        st.confirm_close();
+        // Further failures while closed: no re-fire.
+        assert_eq!(st.on_check(false, 2), HealthAction::None);
+        // Success after a failure streak: Recover only.
+        assert_eq!(st.on_check(true, 2), HealthAction::Recover);
+        st.confirm_recover();
+        // Success right after recovery: NO event. Regression: the old guard
+        // fired Close here because `failures` is monotonic and was_failed was
+        // just cleared by the Recover above.
+        assert_eq!(st.on_check(true, 2), HealthAction::None);
+        // A later failure re-closes immediately (failures is monotonic and
+        // already past max_failed — Go compat) — but ONLY on a failure tick.
+        assert_eq!(st.on_check(false, 2), HealthAction::Close);
+        // And the following success tick is again silent.
+        st.confirm_close();
+        assert_eq!(st.on_check(true, 2), HealthAction::Recover);
+        st.confirm_recover();
+        assert_eq!(st.on_check(true, 2), HealthAction::None);
+    }
+
+    /// Close is only emitted on failure ticks; success ticks can only emit
+    /// Recover (or nothing).
+    #[test]
+    fn close_never_emitted_on_success_ticks() {
+        let mut st = HealthState::new();
+        // Force the closed state, then feed success ticks: never Close.
+        st.on_check(false, 1);
+        st.confirm_close();
+        assert_eq!(st.on_check(true, 1), HealthAction::Recover);
+        st.confirm_recover();
+        assert_eq!(st.on_check(true, 1), HealthAction::None);
+        assert_eq!(st.on_check(true, 1), HealthAction::None);
+    }
+
+    /// A proxy that was never healthy is never closed (Go frp statusOK gate).
+    #[test]
+    fn never_healthy_proxy_is_not_closed() {
+        let mut st = HealthState::new();
+        assert_eq!(st.on_check(false, 1), HealthAction::None);
+        assert_eq!(st.on_check(false, 1), HealthAction::None);
+        assert_eq!(st.on_check(false, 1), HealthAction::None);
+        // First ever success: nothing to recover from.
+        assert_eq!(st.on_check(true, 1), HealthAction::None);
+    }
 }
