@@ -21,8 +21,10 @@ struct AuthState {
 /// When either `user` or `password` is empty, auth is skipped
 /// (pass-through): an empty half would otherwise be silently accepted as an
 /// empty credential, and both callers (frps dashboard, frpc admin API)
-/// already force a localhost-only bind in that case. Only when BOTH are
-/// non-empty is auth enforced — requests without a valid
+/// already force a localhost-only bind in that case. A half-configured pair
+/// (exactly one of the two empty) additionally logs an explicit warning at
+/// startup so the operator is not left believing auth is enforced. Only when
+/// BOTH are non-empty is auth enforced — requests without a valid
 /// `Authorization: Basic <base64(user:pass)>` header receive
 /// 401 with `WWW-Authenticate: Basic realm="frp"`.
 ///
@@ -38,6 +40,21 @@ where
         tracing::warn!(
             "Admin API: Basic Auth enabled without TLS — credentials sent in plaintext. \
              Use a reverse proxy with TLS termination in production."
+        );
+    } else if user.is_empty() != password.is_empty() {
+        // Half-configured: exactly one of user/password is empty. Auth stays
+        // OFF (AND semantics — an empty half must not become an accepted
+        // empty credential), but an operator setting one of the two may
+        // believe auth is on. Say so explicitly; both callers already force
+        // a localhost-only bind in this case.
+        let which = if user.is_empty() {
+            "user empty, password set"
+        } else {
+            "user set, password empty"
+        };
+        tracing::warn!(
+            "Admin API: admin auth DISABLED — {which} (half-configured); binding \
+             localhost-only. Set BOTH user and password to enable auth."
         );
     }
     let expected = if enabled {
@@ -128,7 +145,12 @@ mod tests {
     async fn test_auth_disabled_when_password_empty() {
         // Either-empty means "no auth" (AND semantics): a user without a
         // password must not turn the admin API into a public endpoint
-        // protected by an empty credential.
+        // protected by an empty credential. Half-configured pairs also emit
+        // an explicit startup warning in apply_admin_auth ("user set,
+        // password empty") so the operator notices auth is off — the warning
+        // itself is not log-asserted here (no tracing capture in unit
+        // tests); the disabled-auth behavior it accompanies is what this
+        // test pins down.
         let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "admin", "");
         let resp = app
             .oneshot(
@@ -144,7 +166,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_disabled_when_user_empty() {
-        // Symmetric case: a password without a user is not enforced either.
+        // Symmetric case: a password without a user is not enforced either
+        // (also warned about at startup: "user empty, password set").
         let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "", "secret");
         let resp = app
             .oneshot(

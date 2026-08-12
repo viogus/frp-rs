@@ -199,17 +199,19 @@ async fn handle_http_forward(
 
     // Build forwarded request: rewrite request line, strip hop-by-hop and
     // proxy headers (Go removeProxyHeaders: Connection, Proxy-Connection,
-    // Proxy-Authorization, Proxy-Authenticate, TE, Trailer(s),
+    // Keep-Alive, Proxy-Authorization, Proxy-Authenticate, TE, Trailer(s),
     // Transfer-Encoding, Upgrade), add Connection: close.
     let headers_str = String::from_utf8_lossy(header_bytes);
     let hop_by_hop: &[&str] = &[
         "transfer-encoding:",
         "proxy-authorization:",
+        "proxy-connection:",
         "proxy-authenticate:",
         "te:",
         "trailer:",
         "upgrade:",
         "connection:",
+        "keep-alive:",
     ];
     let mut header_lines: Vec<&str> = headers_str.lines().skip(1).collect();
     // Body framing is parsed from the original headers — Transfer-Encoding

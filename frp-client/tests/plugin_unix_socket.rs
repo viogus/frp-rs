@@ -132,3 +132,54 @@ async fn test_unix_socket_plugin_missing_backend() {
         Ok(Err(_)) => {}
     }
 }
+
+/// The unix_domain_socket listener loop (its own accept loop, separate from
+/// the shared `serve_plugin` skeleton) must survive connection churn:
+/// transient accept errors are logged and retried after a pause, breaking
+/// only on shutdown. Each iteration connects, sends a byte, and must observe
+/// the handler close the connection (no backend socket → close) — proof the
+/// connection was accepted AND handled. A dead accept loop would leave the
+/// read hanging.
+#[tokio::test]
+async fn test_unix_socket_plugin_accept_loop_survives_churn() {
+    let path = unique_socket_path("churn");
+    let cfg = PluginConfig {
+        plugin_type: "unix_domain_socket".into(),
+        local_addr: path.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_unix_socket_plugin(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+    };
+    wait_tcp_ready(handle.local_addr).await;
+
+    for i in 0..3 {
+        let mut client = TcpStream::connect(handle.local_addr)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("churn iteration {i}: connect failed — accept loop dead: {e}")
+            });
+        client.write_all(b"x").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut buf = [0u8; 8];
+        match tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf)).await {
+            Err(_) => panic!(
+                "churn iteration {i}: read timed out — connection was never accepted/handled"
+            ),
+            // EOF, or reset — either way the connection was handled and closed.
+            Ok(Ok(n)) => assert_eq!(
+                n, 0,
+                "churn iteration {i}: handler must close the connection"
+            ),
+            Ok(Err(_)) => {}
+        }
+    }
+
+    drop(handle);
+    let _ = std::fs::remove_file(&path);
+}

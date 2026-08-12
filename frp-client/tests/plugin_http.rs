@@ -722,3 +722,100 @@ async fn test_http2http_early_response_relayed() {
         String::from_utf8_lossy(&resp[..resp.len().min(80)])
     );
 }
+
+/// A request carrying hop-by-hop headers must be forwarded WITHOUT them
+/// (RFC 2616 §13.5.1; Go parity: removeProxyHeaders strips Proxy-Connection
+/// and ReverseProxy's hopHeaders include Keep-Alive). Covers both strip
+/// lists: the shared http2http forward path (`read_request_and_build_forward`)
+/// and the http_proxy head builder. The forwarder adds its own
+/// `Connection: close` — that is expected and not asserted here.
+async fn assert_strips_hop_by_hop_extension_headers(plugin_type: &str) {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let n = conn.read(&mut buf).await.unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: plugin_type.into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match plugin_type {
+        "http_proxy" => frp_client::plugin::start_http_proxy(&cfg).await,
+        _ => frp_client::plugin::start_http2http_plugin(&cfg).await,
+    };
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let req_line = match plugin_type {
+        "http_proxy" => format!("GET http://{backend_addr}/hop HTTP/1.1\r\n"),
+        _ => "GET /hop HTTP/1.1\r\n".to_string(),
+    };
+    client
+        .write_all(
+            format!(
+                "{req_line}Host: original\r\n\
+                 Proxy-Connection: keep-alive\r\n\
+                 Keep-Alive: timeout=5, max=100\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("backend never responded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let head = rx.await.expect("backend captured request").to_lowercase();
+    // Connection: close is added by the forwarder itself — only verify
+    // the two hop-by-hop headers that were missing pre-fix were stripped.
+    for stripped in ["proxy-connection:", "keep-alive:"] {
+        assert!(
+            !head.contains(stripped),
+            "hop-by-hop header {stripped} must be stripped from the forwarded request: {head}"
+        );
+    }
+}
+
+/// Shared http2http forward path strips Proxy-Connection and Keep-Alive.
+#[tokio::test]
+async fn test_http2http_strips_proxy_connection_and_keep_alive() {
+    assert_strips_hop_by_hop_extension_headers("http2http").await;
+}
+
+/// http_proxy head builder strips Proxy-Connection and Keep-Alive.
+#[tokio::test]
+async fn test_http_proxy_strips_proxy_connection_and_keep_alive() {
+    assert_strips_hop_by_hop_extension_headers("http_proxy").await;
+}

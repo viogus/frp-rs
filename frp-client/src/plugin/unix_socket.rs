@@ -75,7 +75,11 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "unix_domain_socket plugin: accept error: {}", e);
-                            break;
+                            // Transient accept errors (EMFILE/ENFILE fd
+                            // exhaustion, etc.) must not kill the listener —
+                            // pause briefly and retry; only the shutdown
+                            // signal breaks the loop.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
                 }

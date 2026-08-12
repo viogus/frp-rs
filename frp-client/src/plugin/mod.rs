@@ -106,7 +106,13 @@ where
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "{plugin_name} plugin accept error: {e}");
-                            break;
+                            // Transient accept errors (EMFILE/ENFILE fd
+                            // exhaustion, etc.) must not kill the listener:
+                            // Go's Accept loop retries. Pause briefly to
+                            // avoid hot-spinning while the condition
+                            // persists; only the shutdown signal breaks the
+                            // loop.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
                 }
@@ -422,15 +428,20 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     let framing = parse_request_body_framing(lines.clone());
 
     // Build forwarded request with optional Host rewrite.
-    // Strip hop-by-hop headers per RFC 2616 Section 13.5.1.
+    // Strip hop-by-hop headers per RFC 2616 Section 13.5.1 (matches Go's
+    // removeProxyHeaders / ReverseProxy hopHeaders: Connection,
+    // Proxy-Connection, Keep-Alive, Proxy-Authorization, Proxy-Authenticate,
+    // TE, Trailer(s), Transfer-Encoding, Upgrade).
     let hop_by_hop: &[&str] = &[
         "transfer-encoding:",
         "proxy-authorization:",
+        "proxy-connection:",
         "proxy-authenticate:",
         "te:",
         "trailer:",
         "upgrade:",
         "connection:",
+        "keep-alive:",
     ];
     let mut fwd = format!("{method} {path} HTTP/1.0\r\n");
     for line in lines {
