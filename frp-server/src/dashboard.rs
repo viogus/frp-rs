@@ -18,7 +18,7 @@ use frp_core::admin_auth::apply_admin_auth;
 use frp_core::metrics::MetricsSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,6 +59,38 @@ impl TlsListener {
     }
 }
 
+/// Minimum interval between per-connection TLS handshake error warnings on
+/// the dashboard/admin listener. A client that repeatedly fails the
+/// handshake (e.g. a scanner probing the port) must not flood the log; the
+/// first failure in each window is enough to signal a problem.
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_WARN_MIN_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(feature = "tls")]
+static LAST_TLS_HANDSHAKE_WARN: AtomicU64 = AtomicU64::new(0);
+
+/// Warn about a failed TLS handshake at most once per
+/// [`TLS_HANDSHAKE_WARN_MIN_INTERVAL`]: the first failure in each window is
+/// logged, the rest are suppressed.
+#[cfg(feature = "tls")]
+fn warn_tls_handshake_rate_limited(addr: std::net::SocketAddr, error: &std::io::Error) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_TLS_HANDSHAKE_WARN.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < TLS_HANDSHAKE_WARN_MIN_INTERVAL.as_secs() {
+        return;
+    }
+    if LAST_TLS_HANDSHAKE_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        // Another connection already logged within this window.
+        return;
+    }
+    tracing::warn!(addr = %addr, error = %error, "TLS handshake error from {}: {}", addr, error);
+}
+
 #[cfg(feature = "tls")]
 impl axum::serve::Listener for TlsListener {
     type Io = tokio_rustls::server::TlsStream<TcpStream>;
@@ -83,7 +115,7 @@ impl axum::serve::Listener for TlsListener {
             match tls_acceptor.accept(stream).await {
                 Ok(tls_stream) => return (tls_stream, addr),
                 Err(e) => {
-                    tracing::warn!(addr = %addr, error = %e, "TLS handshake error from {}: {}", addr, e);
+                    warn_tls_handshake_rate_limited(addr, &e);
                     continue;
                 }
             }

@@ -180,11 +180,7 @@ async fn handle_stream(
     // pseudo-header). Reused for route matching, auth check, and per-user
     // routing — same as the HTTP/1.1 path.
     let http_auth = extract_basic_auth_headers(request.headers());
-    let http_user = http_auth
-        .as_ref()
-        .map(|(u, _)| u.as_str())
-        .unwrap_or_default();
-    tracing::debug!(host = %host, path = %path, peer = %peer, http_user = %http_user, "HTTP VHost (h2c) request for '{}' path '{}' from {}", host, path, peer);
+    tracing::debug!(host = %host, path = %path, peer = %peer, "HTTP VHost (h2c) request for '{}' path '{}' from {}", host, path, peer);
 
     // Re-encode as an HTTP/1.1 request head. Go's reverse proxy forwards to
     // the provider as plain HTTP/1.1 even when the inbound request is h2c.

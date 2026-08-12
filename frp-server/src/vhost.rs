@@ -656,12 +656,8 @@ async fn handle_http1_request<S>(
     // Parse Basic Auth once — reused for route matching, auth check,
     // and per-user routing (Go frp compat: getByRoute(host, path, username)).
     let http_auth = extract_basic_auth(request_text);
-    let http_user = http_auth
-        .as_ref()
-        .map(|(u, _)| u.as_str())
-        .unwrap_or_default();
 
-    debug!(host = %host, path = %path, peer = %peer, http_user = %http_user, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
+    debug!(host = %host, path = %path, peer = %peer, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
 
     match resolve_vhost_request(
         &state,
