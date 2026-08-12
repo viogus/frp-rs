@@ -254,7 +254,12 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
         cli.log_format.clone(),
         cfg.map(|c| c.log.format.as_str()).unwrap_or("text"),
     );
-    let ansi = logging::resolve_ansi(cli.disable_log_color);
+    // Go frp v0.70.1 compat: log.disablePrintColor from the config file is
+    // honored (audit task 9 finding 9); the CLI --disable-log-color flag
+    // takes precedence when both are set.
+    let ansi = logging::resolve_ansi(
+        cli.disable_log_color || cfg.map(|c| c.log.disable_print_color).unwrap_or(false),
+    );
     #[cfg(not(feature = "otel"))]
     logging::init_tracing(&level, file, max_days, &format, ansi, "frpc.log");
     #[cfg(feature = "otel")]

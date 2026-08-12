@@ -17,7 +17,11 @@ use bpaf::*;
 /// override the config value.  `None` means the config value is used.
 #[derive(Debug, Clone)]
 pub struct FrpsArgs {
-    pub config: String,
+    /// Config file path. `None` when `-c` was not given (default
+    /// "frps.toml" is applied by [`FrpsArgs::config_path`]).
+    /// Go frp v0.70.1 parity: when `-c` is given the file is authoritative
+    /// and CLI config flags are ignored (audit task 9 finding 5).
+    pub config: Option<String>,
     pub config_dir: Option<String>,
     pub bind_addr: Option<String>,
     pub bind_port: Option<u16>,
@@ -52,7 +56,7 @@ pub struct FrpsArgs {
 // Intermediate builder structs — each within bpaf construct! field limits.
 
 struct SvrMeta {
-    config: String,
+    config: Option<String>,
     config_dir: Option<String>,
     strict_config: bool,
     show_version: bool,
@@ -152,15 +156,23 @@ fn svr_meta() -> impl Parser<SvrMeta> {
     let config = long("config")
         .short('c')
         .argument::<String>("FILE")
-        .fallback("frps.toml".into());
+        .optional();
     let config_dir = long("config-dir")
         .long("config_dir")
         .argument::<String>("DIR")
         .optional();
-    let strict_config = long("strict-config")
+    // Go frp v0.70.1 pflag bool semantics: bare `--strict-config` → true,
+    // `--strict-config=false` (adjacent only) → false, absent → true.
+    // A plain `.switch()` cannot parse `=false` (audit task 9 finding 3);
+    // `or_else` picks the branch that consumes more arguments, so the
+    // `=false` form lands on the bool argument while the bare form falls
+    // back to the switch (which yields `true` both when present and absent).
+    let strict_value = long("strict-config")
         .long("strict_config")
-        .switch()
-        .fallback(true);
+        .argument::<bool>("BOOL")
+        .adjacent();
+    let strict_switch = long("strict-config").long("strict_config").flag(true, true);
+    let strict_config = construct!([strict_value, strict_switch]);
     let show_version = long("version").short('v').switch();
     construct!(SvrMeta {
         config,
@@ -541,10 +553,18 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         .long("config_dir")
         .argument::<String>("DIR")
         .optional();
-    let strict_config = long("strict-config")
+    // Go frp v0.70.1 pflag bool semantics: bare `--strict-config` → true,
+    // `--strict-config=false` (adjacent only) → false, absent → true.
+    // A plain `.switch()` cannot parse `=false` (audit task 9 finding 3);
+    // `or_else` picks the branch that consumes more arguments, so the
+    // `=false` form lands on the bool argument while the bare form falls
+    // back to the switch (which yields `true` both when present and absent).
+    let strict_value = long("strict-config")
         .long("strict_config")
-        .switch()
-        .fallback(true);
+        .argument::<bool>("BOOL")
+        .adjacent();
+    let strict_switch = long("strict-config").long("strict_config").flag(true, true);
+    let strict_config = construct!([strict_value, strict_switch]);
     let allow_unsafe = long("allow-unsafe")
         .long("allow_unsafe")
         .argument::<String>("FEATURES")
@@ -1064,8 +1084,28 @@ pub fn parse_frpc_args() -> FrpcCmd {
 // ──────────────────────────────────────────────────────────────────────
 
 impl FrpsArgs {
+    /// Config file path to load. Falls back to "frps.toml" when `-c` was
+    /// not given on the command line.
+    pub fn config_path(&self) -> String {
+        self.config
+            .clone()
+            .unwrap_or_else(|| "frps.toml".to_string())
+    }
+
+    /// Whether CLI config flags may override the loaded config file.
+    /// Go frp v0.70.1 parity: with an explicit `-c` (or `--config-dir`) the
+    /// file is authoritative and flags are ignored; without `-c` the CLI
+    /// flags act as overrides on top of the default config file (audit task
+    /// 9 finding 5).
+    pub fn cli_overrides_enabled(&self) -> bool {
+        self.config.is_none() && self.config_dir.is_none()
+    }
+
     /// Override ServerConfig fields with CLI values. Only fields explicitly
     /// set on the command line (`Some`) override config file values.
+    /// Callers should skip this entirely when
+    /// [`cli_overrides_enabled`](FrpsArgs::cli_overrides_enabled) is false
+    /// (Go frp v0.70.1 gives the config file precedence when `-c` is given).
     pub fn override_server_config(&self, cfg: &mut crate::config::ServerConfig) {
         if let Some(ref v) = self.token {
             cfg.auth.token = v.clone();
@@ -1123,6 +1163,9 @@ impl FrpsArgs {
         }
 
         // Dashboard
+        if let Some(ref v) = self.dashboard_addr {
+            cfg.web_server.addr = v.clone();
+        }
         if let Some(v) = self.dashboard_port {
             cfg.web_server.port = v;
         }
@@ -1313,5 +1356,84 @@ impl TcpmuxArgs {
             multiplexer: "httpconnect".into(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_frps(args: &[&str]) -> Result<FrpsArgs, bpaf::ParseFailure> {
+        frps_args().to_options().run_inner(args)
+    }
+
+    fn parse_frpc_run(args: &[&str]) -> Result<FrpcRunArgs, bpaf::ParseFailure> {
+        match frpc_parser().to_options().run_inner(args)? {
+            FrpcCmd::Run(a) => Ok(a),
+            other => panic!("expected run mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_config_defaults_to_true() {
+        assert!(parse_frps(&[]).unwrap().strict_config);
+        assert!(parse_frpc_run(&[]).unwrap().strict_config);
+    }
+
+    #[test]
+    fn strict_config_bare_flag_is_true() {
+        assert!(parse_frps(&["--strict-config"]).unwrap().strict_config);
+        assert!(parse_frpc_run(&["--strict-config"]).unwrap().strict_config);
+    }
+
+    #[test]
+    fn strict_config_equals_false_parses_and_disables() {
+        // Audit task 9 finding 3: `--strict-config=false` was a parse error
+        // with a plain switch; it must parse and disable strict mode.
+        // Both hyphen and underscore forms, both frps and frpc run mode.
+        for args in [
+            &["--strict-config=false"][..],
+            &["--strict_config=false"][..],
+        ] {
+            assert!(!parse_frps(args).unwrap().strict_config, "{args:?}");
+            assert!(!parse_frpc_run(args).unwrap().strict_config, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn strict_config_equals_true_parses() {
+        assert!(parse_frps(&["--strict-config=true"]).unwrap().strict_config);
+        assert!(
+            parse_frpc_run(&["--strict-config=true"])
+                .unwrap()
+                .strict_config
+        );
+    }
+
+    #[test]
+    fn dashboard_addr_flag_applied_to_web_server() {
+        // Audit task 9 finding 4: --dashboard-addr was parsed but never
+        // applied to the config.
+        let args = parse_frps(&["--dashboard-addr", "1.2.3.4"]).unwrap();
+        let mut cfg = crate::config::ServerConfig::default();
+        args.override_server_config(&mut cfg);
+        assert_eq!(cfg.web_server.addr, "1.2.3.4");
+    }
+
+    #[test]
+    fn config_file_precedence_go_parity() {
+        // Audit task 9 finding 5: with an explicit `-c` (or --config-dir)
+        // the file is authoritative — CLI overrides are disabled, matching
+        // Go frp v0.70.1 (root.go: flags only apply when cfgFile == "").
+        let no_c = parse_frps(&[]).unwrap();
+        assert_eq!(no_c.config_path(), "frps.toml");
+        assert!(no_c.cli_overrides_enabled());
+
+        let with_c = parse_frps(&["-c", "/etc/frp/frps.toml"]).unwrap();
+        assert_eq!(with_c.config_path(), "/etc/frp/frps.toml");
+        assert!(!with_c.cli_overrides_enabled());
+
+        let with_dir = parse_frps(&["--config-dir", "/etc/frp/conf.d"]).unwrap();
+        assert!(!with_dir.cli_overrides_enabled());
     }
 }

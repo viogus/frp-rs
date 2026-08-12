@@ -49,7 +49,12 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
         cli.log_format.clone(),
         cfg.map(|c| c.log.format.as_str()).unwrap_or("text"),
     );
-    let ansi = logging::resolve_ansi(cli.disable_log_color);
+    // Go frp v0.70.1 compat: log.disablePrintColor from the config file is
+    // honored (audit task 9 finding 9); the CLI --disable-log-color flag
+    // takes precedence when both are set.
+    let ansi = logging::resolve_ansi(
+        cli.disable_log_color || cfg.map(|c| c.log.disable_print_color).unwrap_or(false),
+    );
     #[cfg(not(feature = "otel"))]
     logging::init_tracing(&level, file, max_days, &format, ansi, "frps.log");
     #[cfg(feature = "otel")]
@@ -122,9 +127,11 @@ async fn run(mut cli: FrpsArgs) {
         let mut handles = Vec::new();
         for path in &files {
             let path_str = path.display().to_string();
+            // Go frp v0.70.1 parity: with --config-dir each file is
+            // authoritative — CLI config flags are not overlaid (audit task
+            // 9 finding 5).
             match load_server_config(&path_str, cli.strict_config) {
-                Ok(mut cfg) => {
-                    cli.override_server_config(&mut cfg);
+                Ok(cfg) => {
                     let uf = unsafe_features.clone();
                     handles.push(tokio::spawn(async move {
                         let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
@@ -157,7 +164,8 @@ async fn run(mut cli: FrpsArgs) {
     }
 
     // Single config mode: load config first, then init logging with [log] fallback
-    let mut cfg = match load_server_config(&cli.config, cli.strict_config) {
+    let config_path = cli.config_path();
+    let mut cfg = match load_server_config(&config_path, cli.strict_config) {
         Ok(cfg) => cfg,
         Err(e) => {
             init_logging(&cli, None);
@@ -166,11 +174,17 @@ async fn run(mut cli: FrpsArgs) {
         }
     };
 
-    cli.override_server_config(&mut cfg);
+    // Go frp v0.70.1 parity: an explicit `-c` makes the config file
+    // authoritative — CLI config flags are ignored (audit task 9 finding 5).
+    // Without `-c`, CLI flags override the default frps.toml (frp-rs
+    // extension; Go frps would use only flags in that mode).
+    if cli.cli_overrides_enabled() {
+        cli.override_server_config(&mut cfg);
+    }
     init_logging(&cli, Some(&cfg));
 
     tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
-    let config_path = Some(cli.config.clone());
+    let config_path = Some(config_path);
     let service = std::sync::Arc::new(
         Service::with_unsafe_features(cfg, config_path, unsafe_features)
             .await
