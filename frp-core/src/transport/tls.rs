@@ -477,8 +477,9 @@ pub fn build_tls_connector(
 /// the CA or client-cert files yields a different hash, so the entry
 /// self-invalidates. Hashing the file *contents* (instead of only mtime/size,
 /// which the mtime-granularity window can miss) makes the key exact; the
-/// files are small PEM files and are read once per dial anyway when the
-/// connector is rebuilt.
+/// hash itself is memoized per (mtime, size) in [`FILE_HASH_MEMO`], so the
+/// files are only re-read when their stat changes and a cache hit costs one
+/// `metadata()` syscall, not a full file read + hash per dial.
 /// `tokio_rustls::TlsConnector` is an `Arc<ClientConfig>` — sharing is free.
 struct ConnectorKey {
     // (path, content hash) — hash None means "configured but file missing",
@@ -495,15 +496,97 @@ impl PartialEq for ConnectorKey {
     }
 }
 
+/// A stat is only trustworthy for memoization once the mtime has settled.
+/// Linux filesystems update timestamps lazily: a same-size rewrite within
+/// ~ms of the previous write can leave mtime (and ctime) unchanged (kernel
+/// probe: back-to-back same-size rewrites keep the old mtime ~88% of the
+/// time at 4ms HZ=250 tick granularity; NFSv3 ~1s and FAT ~2s are worse),
+/// so a naive (mtime, size) memo could serve a stale hash. 100ms is far
+/// outside the observed coalescing window, so a file whose mtime is older
+/// than this is authoritative; a fresh mtime means the file may still be
+/// mid-write and is re-read + re-hashed every time (matching the pre-memo
+/// per-dial behavior).
+///
+/// The precise guarantee of the memo is therefore:
+/// - a file is re-read when its (mtime, size) stat changes, or when the
+///   mtime is fresh (unsettled — the file may still be mid-write);
+/// - a same-size rewrite whose mtime coalesces into an unchanged value is
+///   NOT detected: the old hash keeps being served until the next stat
+///   change (not forever — stale only until then);
+/// - atomic-rename rotations (write a temp file, then rename over the
+///   path — the dominant cert-manager pattern) always stamp a fresh mtime
+///   on the path, so they are never missed.
+///   For PEM updates, prefer atomic rename over in-place rewrite: besides
+///   never exposing a partially written file, it guarantees the memo
+///   re-reads, where an in-place same-size rewrite can hide inside the
+///   coalescing window.
+const STAT_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Memoized (stat → content hash) per PEM path. `stat: None` means the file
+/// could not be stat'ed (missing — "configured but absent"), which must stay
+/// distinct from "not configured" (`None` in the [`ConnectorKey`]).
+struct FileMemoEntry {
+    stat: Option<(std::time::SystemTime, u64)>,
+    hash: Option<[u8; 32]>,
+}
+
+static FILE_HASH_MEMO: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, FileMemoEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// SHA-256 of a file's contents, or `None` when the file cannot be read.
+///
+/// Memoized per (mtime, size): the file is only re-read when the stat
+/// changed or the mtime has not settled yet (see [`STAT_SETTLE_WINDOW`]) —
+/// a cache hit on an unchanged file costs one `metadata()` syscall instead
+/// of a full read + SHA-256 per dial.
 fn file_hash(path: &str) -> Option<[u8; 32]> {
-    let bytes = std::fs::read(path).ok()?;
-    Some(
+    let stat = std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len()));
+    // Settled = missing file (nothing to coalesce) or mtime at least
+    // STAT_SETTLE_WINDOW old. A future mtime (utime'd forward) is settled
+    // too — it cannot be re-coalesced by the lazy-timestamp window.
+    let settled = match stat {
+        Some((mtime, _)) => match mtime.elapsed() {
+            Ok(age) => age >= STAT_SETTLE_WINDOW,
+            Err(_) => true,
+        },
+        None => true,
+    };
+    // Lookup under a short lock only: the memo must not be held across the
+    // blocking read + SHA-256 below (that would serialize concurrent dials
+    // on unrelated paths and do blocking I/O under the mutex).
+    let memo_hit = {
+        let memo = FILE_HASH_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        if settled {
+            match memo.get(std::path::Path::new(path)) {
+                Some(entry) if entry.stat == stat => Some(entry.hash),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(hash) = memo_hit {
+        return hash;
+    }
+    #[cfg(test)]
+    FILE_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let hash = std::fs::read(path).ok().map(|bytes| {
         ring::digest::digest(&ring::digest::SHA256, &bytes)
             .as_ref()
             .try_into()
-            .expect("SHA-256 output is 32 bytes"),
-    )
+            .expect("SHA-256 output is 32 bytes")
+    });
+    // Re-insert outside the read (last-writer-wins): a concurrent dial may
+    // have inserted a fresher entry meanwhile; a duplicate read on a race
+    // is harmless — both computed the same content hash.
+    FILE_HASH_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(std::path::PathBuf::from(path), FileMemoEntry { stat, hash });
+    hash
 }
 
 fn non_empty(p: Option<&str>) -> Option<&str> {
@@ -536,33 +619,49 @@ static CONNECTOR_CACHE: std::sync::RwLock<Option<(ConnectorKey, TlsConnector)>> 
 /// with a repeat note — a busy deployment running the insecure default must
 /// not get a per-connection log flood.
 const SKIP_VERIFY_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-static LAST_SKIP_VERIFY_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Last skip-verify warning time; `None` = never warned. `tokio::time::Instant`
+/// is monotonic — it cannot run backwards or break under a mis-set wall
+/// clock, so a pre-1970 `SystemTime::now()` can never turn this rate limit
+/// into a per-dial flood (the old `AtomicU64` sentinel `last != 0` never held
+/// when `SystemTime::now()` errored and returned 0).
+static LAST_SKIP_VERIFY_WARN: std::sync::Mutex<Option<tokio::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// True when a skip-verify warning is due. The initial state is `None`
+/// ("never warned") — the first call always warns, with no sentinel
+/// timestamp value that a broken clock could alias.
+fn skip_verify_warn_due(last: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(prev) => now.saturating_duration_since(prev) >= SKIP_VERIFY_WARN_MIN_INTERVAL,
+    }
+}
 
 /// Log the InsecureSkipVerify warning at most once per
 /// [`SKIP_VERIFY_WARN_MIN_INTERVAL`] per process: error level on the first
 /// occurrence, then a shorter warn-level repeat carrying the interval.
 fn warn_skip_verify_rate_limited() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let last = LAST_SKIP_VERIFY_WARN.load(std::sync::atomic::Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < SKIP_VERIFY_WARN_MIN_INTERVAL.as_secs() {
+    // Only the state update runs under the lock; logging happens outside so
+    // a subscriber that itself dials TLS (e.g. an OTLP exporter) cannot
+    // deadlock on a re-entrant warning.
+    let (first, should_log) = {
+        let mut last = LAST_SKIP_VERIFY_WARN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = tokio::time::Instant::now();
+        if !skip_verify_warn_due(*last, now) {
+            (false, false)
+        } else {
+            let first = last.is_none();
+            *last = Some(now);
+            (first, true)
+        }
+    };
+    if !should_log {
         return;
     }
-    if LAST_SKIP_VERIFY_WARN
-        .compare_exchange(
-            last,
-            now,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        )
-        .is_err()
-    {
-        // Another connection claimed this window — suppressed.
-        return;
-    }
-    if last == 0 {
+    if first {
         tracing::error!(
             "TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
              All control and data-plane traffic is vulnerable to MITM attacks and \
@@ -592,6 +691,19 @@ static CONNECTOR_BUILD_COUNT: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 fn connector_build_count() -> usize {
     CONNECTOR_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of actual PEM file reads for hashing. Test-only — lets tests
+/// assert a cache hit did not re-read the file (the stat→hash memo must
+/// turn per-dial file reads into per-dial `metadata()` syscalls).
+#[cfg(test)]
+static FILE_READ_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only accessor: how many times a PEM file was actually read to hash
+/// its contents.
+#[cfg(test)]
+fn file_read_count() -> usize {
+    FILE_READ_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Build a TLS client connector with certificate verification skipped when no
@@ -801,6 +913,32 @@ mod tests {
     }
 
     #[test]
+    fn skip_verify_warn_rate_limit_first_call_always_warns() {
+        // The initial state is `None` ("never warned") — the first dial must
+        // warn immediately. A sentinel-timestamp implementation degenerates
+        // to a per-dial error-level flood when `SystemTime::now()` errors
+        // (pre-1970 clock: `now == 0` never satisfies `last != 0`); the
+        // monotonic Instant + Option state has no such hole.
+        let now = tokio::time::Instant::now();
+        assert!(skip_verify_warn_due(None, now), "first call must warn");
+        assert!(
+            !skip_verify_warn_due(Some(now), now),
+            "repeat within the window must be suppressed"
+        );
+        assert!(
+            !skip_verify_warn_due(
+                Some(now - SKIP_VERIFY_WARN_MIN_INTERVAL + std::time::Duration::from_millis(1)),
+                now
+            ),
+            "just inside the window must be suppressed"
+        );
+        assert!(
+            skip_verify_warn_due(Some(now - SKIP_VERIFY_WARN_MIN_INTERVAL), now),
+            "after the window the warning repeats"
+        );
+    }
+
+    #[test]
     fn test_build_tls_acceptor_missing_cert() {
         let result = build_tls_acceptor("/nonexistent/cert.pem", "/nonexistent/key.pem", None);
         assert!(
@@ -937,10 +1075,19 @@ mod connector_cache_tests {
             "unchanged CA must hit cache"
         );
         // 2) content change → new key → rebuild. The key hashes file
-        //    *contents*, so even a same-size rewrite inside the mtime
-        //    granularity window (which the old mtime+size key could miss)
-        //    invalidates the cache entry.
+        //    *contents*, so a same-size rewrite (which the old mtime+size
+        //    key could miss) invalidates the cache entry — as long as the
+        //    stat→hash memo re-reads. An in-place rewrite can coalesce
+        //    into an unchanged mtime, so make the stat change explicit and
+        //    settled first (same mechanism as step 4): without it, a dial
+        //    landing ≥100ms after the (unchanged) mtime would hit the memo
+        //    and serve the stale hash of the old content.
         std::fs::write(&ca_path, dummy_ca_pem().replace("MIID", "MIIE")).unwrap();
+        {
+            let f = std::fs::File::options().write(true).open(&ca_path).unwrap();
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
         let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
         assert_eq!(
             connector_build_count(),
@@ -957,6 +1104,37 @@ mod connector_cache_tests {
             connector_build_count(),
             before,
             "failed builds must not be cached"
+        );
+
+        // 4) Unchanged file → no re-read: the stat→hash memo must turn
+        //    per-dial file reads into per-dial metadata() syscalls. First
+        //    move the mtime far into the future: it changes the stat (so the
+        //    memo re-reads once) and, being a settled stat, makes the
+        //    subsequent memo hits trustworthy even under the kernel's lazy
+        //    timestamp coalescing.
+        let before_builds = connector_build_count();
+        let before_reads = file_read_count();
+        {
+            let f = std::fs::File::options().write(true).open(&ca_path).unwrap();
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
+        assert_eq!(
+            file_read_count(),
+            before_reads + 1,
+            "a stat change must re-read the file exactly once to re-hash it"
+        );
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
+        assert_eq!(
+            file_read_count(),
+            before_reads + 1,
+            "a second dial with an unchanged file must not re-read it"
+        );
+        assert_eq!(
+            connector_build_count(),
+            before_builds,
+            "unchanged content after a stat change must still hit the connector cache"
         );
     }
 }

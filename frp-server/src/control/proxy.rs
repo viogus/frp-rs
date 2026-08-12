@@ -343,7 +343,14 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
                 run_id: ctx.run_id.clone(),
             });
     }
-    proxy_ops::unregister_control(&ctx.state, &ctx.run_id, ctx.control_id, ctl.shutting_down).await;
+    proxy_ops::unregister_control(
+        &ctx.state,
+        &ctx.run_id,
+        ctx.control_id,
+        ctl.shutting_down,
+        true,
+    )
+    .await;
     // Remove only the proxies that existed at cleanup start.
     // Do NOT use remove_client() — it removes ALL proxies for this run_id,
     // which in supersession would delete the new handler's proxies.
@@ -360,13 +367,14 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
             .await
             .is_some_and(|i| i.control_id != 0 && i.control_id > ctx.control_id)
         {
-            // TODO(audit-fix): the skipped proxy's ORIGINAL port mark (from
-            // this control's pre-supersession registration) stays in
-            // used_ports/used_udp_ports forever — nothing prunes used_ports
-            // (the 24h pruner only touches port_reservations). Real fix:
-            // register() returning the replaced entry so the superseding
-            // login can free the old control's different port (same note in
-            // proxy_ops.rs unregister_control).
+            // Port-mark ownership on supersession: the skipped proxy's
+            // ORIGINAL port mark was freed exactly once by the superseding
+            // login's registration — register_or_replace returned the
+            // replaced entry and free_replaced_port (proxy_ops.rs) released
+            // the old mark when it differed from the new port. Nothing
+            // leaks here (audit-fix: residual port-mark leak on
+            // barrier-timeout supersession; same note in proxy_ops.rs
+            // unregister_control).
             continue;
         }
         // Decrement the SNI-sniff gate count only when the proxy was

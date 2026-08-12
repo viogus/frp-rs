@@ -145,6 +145,34 @@ impl ProxyManager {
     }
 
     pub async fn register(&self, run_id: String, info: ProxyInfo) -> Result<(), String> {
+        self.register_inner(run_id, info, false).await.map(|_| ())
+    }
+
+    /// Register a proxy, replacing an older control generation's entry for
+    /// the same name and returning the entry that was replaced.
+    ///
+    /// The plain `register` rejects a name conflict. This variant allows
+    /// ONE exception: the superseding control of the same run_id (strictly
+    /// newer, non-zero control_id) re-registering a name its older
+    /// generation still holds after a handoff-barrier timeout. The
+    /// replaced entry is handed back so the caller can free the old
+    /// control's port mark exactly once (audit-fix: residual port-mark
+    /// leak on barrier-timeout supersession). control_id 0 (legacy
+    /// callers) is never replaced, and a different run_id never replaces.
+    pub async fn register_or_replace(
+        &self,
+        run_id: String,
+        info: ProxyInfo,
+    ) -> Result<Option<Arc<ProxyInfo>>, String> {
+        self.register_inner(run_id, info, true).await
+    }
+
+    async fn register_inner(
+        &self,
+        run_id: String,
+        info: ProxyInfo,
+        replace: bool,
+    ) -> Result<Option<Arc<ProxyInfo>>, String> {
         let name = info.name.clone();
         let group = info.group.clone();
         let info = Arc::new(info);
@@ -153,12 +181,47 @@ impl ProxyManager {
         // due to name conflict, the group index must not be polluted with
         // a proxy name that belongs to a different (already-registered) proxy.
         // The entry guard is not Send and is dropped before the .await below.
-        match self.proxies.entry(name.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                return Err(format!("proxy '{}' already registered", name));
+        let replaced: Option<Arc<ProxyInfo>> = match self.proxies.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let old = entry.get().clone();
+                // Supersession takeover is only allowed when the SAME run_id
+                // re-registers under a strictly newer control generation.
+                let qualified = old.run_id == run_id
+                    && old.control_id != 0
+                    && info.control_id != 0
+                    && old.control_id < info.control_id;
+                if !replace || !qualified {
+                    return Err(format!("proxy '{}' already registered", name));
+                }
+                entry.insert(info.clone());
+                Some(old)
             }
             dashmap::mapref::entry::Entry::Vacant(v) => {
                 v.insert(info.clone());
+                None
+            }
+        };
+        // Group index migration: a replaced entry moving to a different
+        // group must leave its old group (cleaning up the group and its
+        // round-robin counter when empty, mirroring remove()). A
+        // replacement staying in the same group keeps its membership.
+        if let Some(ref old) = replaced {
+            if let Some(ref old_group) = old.group {
+                if !old_group.is_empty() && old.group != group {
+                    let mut groups = self.groups.write().await;
+                    if let Some(members) = groups.get_mut(old_group) {
+                        members.retain(|n| n != &name);
+                        if members.is_empty() {
+                            groups.remove(old_group);
+                            // Clean up stale round-robin counter
+                            let mut counters = self
+                                .group_counters
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            counters.remove(old_group);
+                        }
+                    }
+                }
             }
         }
         self.by_client
@@ -171,10 +234,15 @@ impl ProxyManager {
         if let Some(ref group) = group {
             if !group.is_empty() {
                 let mut groups = self.groups.write().await;
-                groups.entry(group.clone()).or_default().push(name);
+                let members = groups.entry(group.clone()).or_default();
+                // A replacement staying in the same group is already a
+                // member; re-pushing would double-count it.
+                if !members.contains(&name) {
+                    members.push(name);
+                }
             }
         }
-        Ok(())
+        Ok(replaced)
     }
 
     pub async fn get(&self, name: &str) -> Option<Arc<ProxyInfo>> {
