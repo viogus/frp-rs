@@ -675,8 +675,13 @@ impl Service {
 
         let all_startup_proxies = Arc::clone(&*self.proxies.read().await);
         let startup_proxies = filter_active_proxies(&cfg_snapshot, &all_startup_proxies);
-        self.spawn_health_checks(&startup_proxies, &self.health_tx, &health_cancels)
-            .await;
+        self.spawn_health_checks(
+            &cfg_snapshot.user,
+            &startup_proxies,
+            &self.health_tx,
+            &health_cancels,
+        )
+        .await;
 
         // Start admin HTTP server if configured
         let _reload_tx = self.reload_tx.clone();
@@ -708,8 +713,13 @@ impl Service {
             .expect("stop_rx already taken — run() called twice?");
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
+        // Handle of the spawned admin HTTP server task; aborted on shutdown
+        // (cancel_detached_tasks). Only spawned with the `admin` feature.
         #[cfg(feature = "admin")]
-        self.spawn_admin_server(&_reload_tx, &self.stop_tx).await;
+        let admin_handle: Option<tokio::task::JoinHandle<()>> =
+            self.spawn_admin_server(&_reload_tx, &self.stop_tx).await;
+        #[cfg(not(feature = "admin"))]
+        let admin_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         // Main session loop with reconnection.
         // Go frp dev two-phase fast-backoff:
@@ -853,6 +863,11 @@ impl Service {
                     consecutive_err_count += 1;
                     warn!(attempt = %consecutive_err_count, error = %e, "Login failed (attempt {}): {}", consecutive_err_count, e);
                     if cfg_local.login_fail_exit && !did_login_once {
+                        // Cancel detached health/admin tasks so a caller that
+                        // handles the error (e.g. tests) does not keep them
+                        // running after run() returns.
+                        self.cancel_detached_tasks(&health_cancels, admin_handle)
+                            .await;
                         return Err(e.into());
                     }
                     let delay = if did_login_once {
@@ -1613,6 +1628,12 @@ impl Service {
             let mut last_pong = Instant::now();
             let hb_timeout = cfg_local.heartbeat_timeout;
             let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
+            // The watchdog only makes sense while the ping loop is active:
+            // with heartbeat_interval <= 0 the client never sends Pings, so
+            // no Pong can ever arrive and an active watchdog would fire right
+            // after login and reconnect forever (Go frp gates its heartbeat
+            // on the interval too).
+            let hb_watchdog_active = hb_timeout > 0 && ping_interval.is_some();
 
             // The message loop handles config reloads (try_reload), which
             // take the config write lock — the snapshot read guard must be
@@ -1639,6 +1660,17 @@ impl Service {
                                 debug!("Pong received");
                                 last_pong = Instant::now();
                             }
+                            Ok(FrpMessage::Ping(_)) => {
+                                // Answer an unsolicited server Ping with Pong
+                                // (Go frp client parity). Previously inbound
+                                // Ping fell into the ignored-messages bucket, so
+                                // a server that probes liveness with Ping would
+                                // have its watchdog kill a healthy connection.
+                                let pong = FrpMessage::Pong(msg::Pong { error: None });
+                                if let Err(e) = writer.send(pong, v2) {
+                                    debug!(error = %e, "Pong reply to server Ping failed: {}", e);
+                                }
+                            }
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
                                 // Cancel health check task and remove map entry.
@@ -1658,10 +1690,10 @@ impl Service {
                                 warn!(error = %err.error, "Server error: {}", err.error);
                             }
                             Ok(FrpMessage::NatHoleClient(nhc)) => {
-                                self.handle_nat_hole_client(*nhc, &writer, v2).await;
+                                self.handle_nat_hole_client(*nhc, &writer, v2, session_alive.clone()).await;
                             }
                             Ok(FrpMessage::NatHoleResp(resp)) => {
-                                self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets, &writer).await;
+                                self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets, &writer, session_alive.clone()).await;
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
                                 let is_error = resp.error.as_ref().is_some_and(|e| !e.is_empty());
@@ -2188,7 +2220,9 @@ impl Service {
                     // Pong arrival naturally reschedules the wakeup. Uses sleep
                     // so the timer is only active when hb_timeout > 0. Explicit
                     // negative values disable it independently of tcp_mux.
-                    _ = tokio::time::sleep(hb_timeout_dur.saturating_sub(last_pong.elapsed())), if hb_timeout > 0 => {
+                    // Gated on the ping loop being active (hb_watchdog_active):
+                    // with heartbeat_interval <= 0 no Pong can ever arrive.
+                    _ = tokio::time::sleep(hb_timeout_dur.saturating_sub(last_pong.elapsed())), if hb_watchdog_active => {
                         warn!("Heartbeat timeout ({}s), reconnecting...", hb_timeout);
                         break;
                     }
@@ -2270,6 +2304,12 @@ impl Service {
             // Check if admin stop was requested
             if shutdown_flag.load(Ordering::SeqCst) {
                 info!("frpc shutting down");
+                // Cancel health check tasks and abort the admin HTTP server
+                // before returning. Both are detached tokio tasks; without
+                // this they keep running after run() exits (holding bind
+                // ports and channels until process exit).
+                self.cancel_detached_tasks(&health_cancels, admin_handle)
+                    .await;
                 return Ok(());
             }
 
@@ -2289,21 +2329,35 @@ impl Service {
             );
             warn!(delay_ms = %delay.as_millis(), attempt = %consecutive_err_count, "Session ended, reconnecting in {}ms (attempt {})...",
                 delay.as_millis(), consecutive_err_count);
-            tokio::time::sleep(delay).await;
+            // Race the backoff against a stop request: an admin/signal stop
+            // must not be held up by up to 20s of reconnect sleep.
+            tokio::select! {
+                Some(()) = stop_rx.recv() => {
+                    info!("Stop requested while waiting to reconnect, shutting down");
+                    shutdown_flag.store(true, Ordering::SeqCst);
+                    self.cancel_detached_tasks(&health_cancels, admin_handle).await;
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
         }
     }
 
     /// Spawn per-proxy health check tasks (once, outside reconnect loop).
     /// Reads local address from proxy_info_map to determine what to check.
+    /// `user` is explicit: during a reload the caller passes the NEW user
+    /// (self.cfg is only refreshed at the end of try_reload), so the tasks
+    /// and their health_cancels/health_proxy_configs keys match the wire
+    /// names the reload registers.
     async fn spawn_health_checks(
         &self,
+        user: &str,
         proxies: &[frp_core::config::ProxyConfig],
         health_tx: &mpsc::Sender<HealthEvent>,
         health_cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     ) {
-        let user = self.cfg.read().await.user.clone();
         for p in proxies {
-            let wn = wire_proxy_name(&user, &p.name);
+            let wn = wire_proxy_name(user, &p.name);
             let hc_type = p.health_check_type.clone();
             if hc_type.is_empty() {
                 continue;
@@ -2366,14 +2420,41 @@ impl Service {
         }
     }
 
+    /// Cancel health check tasks and abort the admin HTTP server before
+    /// run() returns. Both are detached tokio tasks; without this they keep
+    /// running after run() exits (holding bind ports and channels until
+    /// process exit).
+    async fn cancel_detached_tasks(
+        &self,
+        health_cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+        admin_handle: Option<tokio::task::JoinHandle<()>>,
+    ) {
+        {
+            let mut cancels = health_cancels.lock().await;
+            for cancel in cancels.values() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            cancels.clear();
+        }
+        #[cfg(feature = "admin")]
+        if let Some(admin) = admin_handle {
+            admin.abort();
+        }
+        // Non-admin builds never read the handle; keep the parameter used so
+        // the no-admin compile stays warning-free.
+        #[cfg(not(feature = "admin"))]
+        let _ = admin_handle;
+    }
+
     /// Start the admin HTTP server if configured.
-    /// Spawns as a background task; returns immediately.
+    /// Spawns as a background task; returns its JoinHandle (None when the
+    /// admin server is not configured).
     #[cfg(feature = "admin")]
     async fn spawn_admin_server(
         &self,
         reload_tx: &mpsc::Sender<ReloadRequest>,
         stop_tx: &mpsc::Sender<()>,
-    ) {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let cfg_snapshot = self.cfg.read().await.clone();
         if cfg_snapshot.web_server.port > 0 {
             let admin_addr = frp_core::format_socket_addr(
@@ -2400,7 +2481,7 @@ impl Service {
             } else {
                 Some(cfg_snapshot.web_server.tls_key_file.clone())
             };
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 if let Err(e) = crate::admin::run_admin_server(
                     admin_addr,
                     admin_state,
@@ -2415,6 +2496,9 @@ impl Service {
                 }
             });
             info!(addr = %cfg_snapshot.web_server.addr, port = %cfg_snapshot.web_server.port, "frpc admin server starting on {}:{}", cfg_snapshot.web_server.addr, cfg_snapshot.web_server.port);
+            Some(handle)
+        } else {
+            None
         }
     }
 
@@ -2687,6 +2771,22 @@ impl Service {
             }
         }
 
+        // Resolve the wire keys for removed/changed proxies while
+        // proxy_info_map still holds the pre-reload entries (Step 4 removes
+        // them below). When the reload changes `user`, do_reload's
+        // strip_prefix fails against the NEW user and delta.removed holds the
+        // full OLD wire names (old_user.name); rebuilding them with
+        // wire_proxy_name(&user, name) double-prefixes and misses every keyed
+        // lookup (health_cancels, proxy_info_map, health_proxy_configs),
+        // leaving stale entries and surviving health tasks.
+        let mut wire_keys: HashMap<String, String> = HashMap::new();
+        for name in delta.removed.iter().chain(delta.changed.iter()) {
+            wire_keys.insert(
+                name.clone(),
+                self.close_wire_name_for_reload(name, &user).await,
+            );
+        }
+
         // Commit point — every remaining operation is infallible, so the reload
         // can no longer fail part-way. Apply the plugin lifecycle changes that
         // were deferred until the server accepted the new proxy set.
@@ -2701,11 +2801,16 @@ impl Service {
                 // health_cancels is keyed by the wire proxy name ({user}.{name}),
                 // matching spawn_health_checks and the CloseProxy handler. Keying
                 // by the bare name would leave the health task running forever.
-                let wn = wire_proxy_name(&user, name);
-                if let Some(cancel) = cancels.get(&wn) {
+                // The resolved key (wire_keys) uses the registered wire name —
+                // for a `user` change in this reload, delta names are already
+                // full wire names and rebuilding them with the new user misses.
+                let Some(wn) = wire_keys.get(name) else {
+                    continue;
+                };
+                if let Some(cancel) = cancels.get(wn) {
                     cancel.store(true, Ordering::Relaxed);
                 }
-                cancels.remove(&wn);
+                cancels.remove(wn);
             }
         }
         {
@@ -2751,7 +2856,13 @@ impl Service {
         {
             let mut map = self.proxy_info_map.write().await;
             for name in &delta.removed {
-                map.remove(&wire_proxy_name(&user, name));
+                // Registered wire key (see wire_keys above): with a `user`
+                // change the delta name IS the old registered key, and
+                // rebuilding it with the new user would leave the stale entry
+                // in place.
+                if let Some(wn) = wire_keys.get(name) {
+                    map.remove(wn);
+                }
             }
             for name in delta.changed.iter().chain(delta.added.iter()) {
                 if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
@@ -2807,7 +2918,11 @@ impl Service {
                 .cloned()
                 .collect();
             if !hc_proxies.is_empty() {
-                self.spawn_health_checks(&hc_proxies, &self.health_tx, &self.health_cancels)
+                // Pass the NEW user explicitly: self.cfg still holds the
+                // pre-reload user at this point (refreshed in Step 7 below).
+                // Keying the health tasks with the old user would desync them
+                // from the wire names registered above.
+                self.spawn_health_checks(&user, &hc_proxies, &self.health_tx, &self.health_cancels)
                     .await;
             }
         }
@@ -2821,8 +2936,12 @@ impl Service {
                 // health_proxy_configs is keyed by the wire proxy name
                 // ({user}.{name}), matching the initial population in
                 // Service::new and the Recover handler. A stale bare-name
-                // entry would let a removed proxy resurrect on recovery.
-                configs.remove(&wire_proxy_name(&user, name));
+                // entry would let a removed proxy resurrect on recovery. Use
+                // the registered wire key (see wire_keys above) so a `user`
+                // change in this reload still removes the old-user entry.
+                if let Some(wn) = wire_keys.get(name) {
+                    configs.remove(wn);
+                }
             }
             for name in delta.changed.iter().chain(delta.added.iter()) {
                 if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
