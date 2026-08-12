@@ -255,6 +255,14 @@ impl<W: AsyncWrite + Unpin> SnappyStreamWriter<W> {
         if let Some(ref pending) = this.pending {
             let remaining = &pending[this.pending_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    // `remaining` is non-empty here (pending is only held while
+                    // bytes remain), so zero progress must surface as a fatal
+                    // write-zero — self-waking and re-polling would spin at
+                    // 100% CPU until the inner writer makes progress. Mirrors
+                    // CipherWriter's WriteZero handling.
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
+                }
                 Poll::Ready(Ok(n)) => {
                     this.pending_pos += n;
                     if this.pending_pos >= pending.len() {
@@ -537,6 +545,85 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = r.read(&mut buf).await.unwrap();
         assert_eq!(n, 0, "empty compressed stream must read EOF");
+    }
+
+    /// AsyncWrite stub that returns `Ok(0)` for the first `zeros` calls, then
+    /// accepts everything — pins how a pathological inner writer surfaces.
+    #[cfg(feature = "compression")]
+    struct ZeroThenSink {
+        zeros: usize,
+    }
+
+    #[cfg(feature = "compression")]
+    impl AsyncWrite for ZeroThenSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.zeros > 0 {
+                self.zeros -= 1;
+                return Poll::Ready(Ok(0));
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An inner writer returning `Ok(0)` while a partial write is pending must
+    /// surface as `WriteZero` instead of self-waking into an immediate-repoll
+    /// 100% CPU spin (the `drain_pending` retry loop).
+    #[test]
+    #[cfg(feature = "compression")]
+    fn drain_pending_ok_zero_surfaces_as_write_zero() {
+        let mut w = SnappyStreamWriter::new(ZeroThenSink { zeros: 2 });
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let buf = vec![0x42u8; 100];
+
+        // Poll 1: the fresh write hits Ok(0) → buffered as pending, Pending.
+        assert!(matches!(
+            Pin::new(&mut w).poll_write(&mut cx, &buf),
+            Poll::Pending
+        ));
+
+        // Poll 2: the drain retry hits Ok(0) again on a non-empty remainder →
+        // WriteZero error, not a self-wake → Pending spin.
+        match Pin::new(&mut w).poll_write(&mut cx, &buf) {
+            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::WriteZero),
+            other => panic!("expected WriteZero error, got {other:?}"),
+        }
+    }
+
+    /// A single transient `Ok(0)` followed by real progress must still flush
+    /// the pending write on the next poll — the WriteZero guard must not break
+    /// the legitimate partial-write retry path.
+    #[test]
+    #[cfg(feature = "compression")]
+    fn drain_pending_ok_zero_then_progress_flushes() {
+        let mut w = SnappyStreamWriter::new(ZeroThenSink { zeros: 1 });
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let buf = vec![0x42u8; 100];
+
+        // Poll 1: fresh write hits Ok(0) → buffered as pending, Pending.
+        assert!(matches!(
+            Pin::new(&mut w).poll_write(&mut cx, &buf),
+            Poll::Pending
+        ));
+
+        // Poll 2: the drain retry succeeds → the original write is reported.
+        match Pin::new(&mut w).poll_write(&mut cx, &buf) {
+            Poll::Ready(Ok(n)) => assert_eq!(n, buf.len()),
+            other => panic!("expected Ok({}), got {other:?}", buf.len()),
+        }
     }
 
     /// passthrough stub (no `compression` feature) must behave as plain copy.

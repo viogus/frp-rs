@@ -360,6 +360,13 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
             .await
             .is_some_and(|i| i.control_id != 0 && i.control_id > ctx.control_id)
         {
+            // TODO(audit-fix): the skipped proxy's ORIGINAL port mark (from
+            // this control's pre-supersession registration) stays in
+            // used_ports/used_udp_ports forever — nothing prunes used_ports
+            // (the 24h pruner only touches port_reservations). Real fix:
+            // register() returning the replaced entry so the superseding
+            // login can free the old control's different port (same note in
+            // proxy_ops.rs unregister_control).
             continue;
         }
         // Decrement the SNI-sniff gate count only when the proxy was

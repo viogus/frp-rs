@@ -819,3 +819,489 @@ async fn test_http2http_strips_proxy_connection_and_keep_alive() {
 async fn test_http_proxy_strips_proxy_connection_and_keep_alive() {
     assert_strips_hop_by_hop_extension_headers("http_proxy").await;
 }
+
+/// A request carrying `Expect: 100-continue` must be forwarded WITHOUT it:
+/// the plugin never relays the interim 100-continue response, and a strict
+/// client that gates its body-send on it would deadlock against the body
+/// read. Stripping the header makes the client send the body immediately
+/// (RFC 7231 §5.1.1). Covers both strip lists: the shared http2http forward
+/// path (`read_request_and_build_forward`) and the http_proxy head builder.
+async fn assert_strips_expect_header(plugin_type: &str) {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let n = conn.read(&mut buf).await.unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: plugin_type.into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match plugin_type {
+        "http_proxy" => frp_client::plugin::start_http_proxy(&cfg).await,
+        _ => frp_client::plugin::start_http2http_plugin(&cfg).await,
+    };
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let req_line = match plugin_type {
+        "http_proxy" => format!("GET http://{backend_addr}/expect HTTP/1.1\r\n"),
+        _ => "GET /expect HTTP/1.1\r\n".to_string(),
+    };
+    client
+        .write_all(format!("{req_line}Host: original\r\nExpect: 100-continue\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("backend never responded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let head = rx.await.expect("backend captured request").to_lowercase();
+    assert!(
+        !head.contains("expect:"),
+        "Expect must be stripped from the forwarded request: {head}"
+    );
+}
+
+/// Shared http2http forward path strips Expect: 100-continue.
+#[tokio::test]
+async fn test_http2http_strips_expect_header() {
+    assert_strips_expect_header("http2http").await;
+}
+
+/// http_proxy head builder strips Expect: 100-continue.
+#[tokio::test]
+async fn test_http_proxy_strips_expect_header() {
+    assert_strips_expect_header("http_proxy").await;
+}
+
+/// Duplicate identical Content-Length values must collapse to a single
+/// forwarded line (RFC 7230 §3.3.2: "reject or replace with a single
+/// value") — forwarding both keeps the request-smuggling shape alive for
+/// any backend honoring the second copy.
+async fn assert_duplicate_identical_cl_collapses(plugin_type: &str) {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let req = read_full_cl_request(&mut conn).await;
+            let _ = tx.send(req);
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: plugin_type.into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match plugin_type {
+        "http_proxy" => frp_client::plugin::start_http_proxy(&cfg).await,
+        _ => frp_client::plugin::start_http2http_plugin(&cfg).await,
+    };
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let req_line = match plugin_type {
+        "http_proxy" => format!("POST http://{backend_addr}/up HTTP/1.1\r\n"),
+        _ => "POST /up HTTP/1.1\r\n".to_string(),
+    };
+    let body = b"hello"; // 5 bytes, matching both duplicate CL values
+    client
+        .write_all(
+            format!("{req_line}Host: original\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    client.write_all(body).await.unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("backend never responded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let captured = rx.await.expect("backend captured request");
+    let head_end = captured
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("forwarded request must end its head with CRLFCRLF")
+        + 4;
+    let head = String::from_utf8_lossy(&captured[..head_end]);
+    assert_eq!(
+        head.to_lowercase().matches("content-length:").count(),
+        1,
+        "duplicate identical Content-Length must collapse to one line: {head}"
+    );
+    assert!(
+        head.contains("Content-Length: 5"),
+        "the collapsed Content-Length line is missing: {head}"
+    );
+    assert_eq!(
+        &captured[head_end..],
+        body.as_slice(),
+        "backend must receive the full body"
+    );
+}
+
+/// Duplicate identical Content-Length collapses on the shared http2http path.
+#[tokio::test]
+async fn test_http2http_duplicate_identical_cl_collapses() {
+    assert_duplicate_identical_cl_collapses("http2http").await;
+}
+
+/// Duplicate identical Content-Length collapses in the http_proxy builder.
+#[tokio::test]
+async fn test_http_proxy_duplicate_identical_cl_collapses() {
+    assert_duplicate_identical_cl_collapses("http_proxy").await;
+}
+
+/// Conflicting duplicate Content-Length values make the request framing
+/// invalid (RFC 7230 §3.3.2): the plugin must reject — close the connection
+/// without forwarding anything to the backend and without sending a 400 —
+/// instead of forwarding both values (a backend honoring the second would
+/// desync, request-smuggling shaped).
+async fn assert_conflicting_cl_rejects(plugin_type: &str) {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    // The backend must receive NO bytes: the http2http path rejects before
+    // dialing (no accept at all); the http_proxy path dials before
+    // rejecting, so the connection may be accepted and then closed with 0
+    // bytes. Either way nothing may be forwarded.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), backend.accept()).await {
+            Ok(Ok((mut conn, _))) => {
+                let mut buf = vec![0u8; 1024];
+                let _ = tx.send(Some(conn.read(&mut buf).await.unwrap_or(0)));
+            }
+            Ok(Err(_)) | Err(_) => {
+                let _ = tx.send(None);
+            }
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: plugin_type.into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match plugin_type {
+        "http_proxy" => frp_client::plugin::start_http_proxy(&cfg).await,
+        _ => frp_client::plugin::start_http2http_plugin(&cfg).await,
+    };
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let req_line = match plugin_type {
+        "http_proxy" => format!("POST http://{backend_addr}/up HTTP/1.1\r\n"),
+        _ => "POST /up HTTP/1.1\r\n".to_string(),
+    };
+    // Conflicting Content-Length values; no body bytes are sent — the
+    // rejection is header-driven, so the plugin closes cleanly (no RST from
+    // unread data).
+    client
+        .write_all(
+            format!("{req_line}Host: original\r\nContent-Length: 5\r\nContent-Length: 100\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    // The plugin must close the connection without writing any response.
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("conflicting Content-Length must be rejected: connection not closed (regression)")
+    .unwrap();
+    assert!(
+        resp.is_empty(),
+        "no response must be sent on a rejected request, got: {:?}",
+        String::from_utf8_lossy(&resp[..resp.len().min(80)])
+    );
+    let forwarded = rx.await.expect("backend task finished");
+    assert!(
+        forwarded == Some(0) || forwarded.is_none(),
+        "backend must receive no bytes on a rejected request, got: {forwarded:?}"
+    );
+}
+
+/// Conflicting Content-Length is rejected on the shared http2http path.
+#[tokio::test]
+async fn test_http2http_conflicting_cl_rejects() {
+    assert_conflicting_cl_rejects("http2http").await;
+}
+
+/// Conflicting Content-Length is rejected by the http_proxy head builder.
+#[tokio::test]
+async fn test_http_proxy_conflicting_cl_rejects() {
+    assert_conflicting_cl_rejects("http_proxy").await;
+}
+
+/// `Content-Length: 5, 5` (list form) declares a 10-byte body: the plugin
+/// must forward it as a single summed `Content-Length: 10` line and stream
+/// all 10 body bytes (RFC 7230 §3.3.2 replace-with-a-single-value policy).
+async fn assert_sum_form_cl_forwarded(plugin_type: &str) {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            // The forwarded head carries the summed "Content-Length: 10",
+            // so read_full_cl_request reads exactly the 10 summed bytes.
+            let req = read_full_cl_request(&mut conn).await;
+            let _ = tx.send(req);
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: plugin_type.into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match plugin_type {
+        "http_proxy" => frp_client::plugin::start_http_proxy(&cfg).await,
+        _ => frp_client::plugin::start_http2http_plugin(&cfg).await,
+    };
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let req_line = match plugin_type {
+        "http_proxy" => format!("POST http://{backend_addr}/sum HTTP/1.1\r\n"),
+        _ => "POST /sum HTTP/1.1\r\n".to_string(),
+    };
+    let body = b"0123456789"; // 10 bytes = 5 + 5
+    client
+        .write_all(format!("{req_line}Host: original\r\nContent-Length: 5, 5\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    client.write_all(body).await.unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("summed request body was not fully forwarded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let captured = rx.await.expect("backend captured request");
+    let head_end = captured
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("forwarded request must end its head with CRLFCRLF")
+        + 4;
+    let head = String::from_utf8_lossy(&captured[..head_end]);
+    assert!(
+        head.contains("Content-Length: 10"),
+        "list-form Content-Length must be forwarded as a single summed value: {head}"
+    );
+    assert!(
+        !head.contains("Content-Length: 5, 5"),
+        "the original list-form line must not be forwarded as-is: {head}"
+    );
+    assert_eq!(
+        head.to_lowercase().matches("content-length:").count(),
+        1,
+        "exactly one Content-Length line must be forwarded: {head}"
+    );
+    assert_eq!(
+        &captured[head_end..],
+        body.as_slice(),
+        "backend must receive the full summed body"
+    );
+}
+
+/// Sum-form Content-Length is summed on the shared http2http path.
+#[tokio::test]
+async fn test_http2http_sum_form_cl_forwarded() {
+    assert_sum_form_cl_forwarded("http2http").await;
+}
+
+/// Sum-form Content-Length is summed by the http_proxy head builder.
+#[tokio::test]
+async fn test_http_proxy_sum_form_cl_forwarded() {
+    assert_sum_form_cl_forwarded("http_proxy").await;
+}
+
+/// A HEAD request carries no body even when the head declares a
+/// Content-Length (RFC 7230 §3.3.2): the plugin must not block reading a
+/// body the client will never send — pre-fix the response relay stalled
+/// until the client closed — while still forwarding the Content-Length
+/// header so the backend knows the response framing.
+async fn assert_head_with_cl_relays_response(plugin_type: &str) {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            // HEAD has no body: read the head only, then answer.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                let n = conn.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    let _ = tx.send(buf);
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let _ = tx.send(buf);
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: plugin_type.into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match plugin_type {
+        "http_proxy" => frp_client::plugin::start_http_proxy(&cfg).await,
+        _ => frp_client::plugin::start_http2http_plugin(&cfg).await,
+    };
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let req_line = match plugin_type {
+        "http_proxy" => format!("HEAD http://{backend_addr}/head HTTP/1.1\r\n"),
+        _ => "HEAD /head HTTP/1.1\r\n".to_string(),
+    };
+    // Content-Length: 100 with NO body — the correct wire behavior for HEAD.
+    client
+        .write_all(format!("{req_line}Host: original\r\nContent-Length: 100\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    // The response must be relayed promptly — pre-fix the body forward
+    // blocked reading 100 bytes that never arrive and the relay hung.
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("HEAD request with Content-Length stalled the response relay (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let head = String::from_utf8_lossy(&rx.await.expect("backend captured request")).to_lowercase();
+    assert!(
+        head.contains("content-length: 100"),
+        "Content-Length must be kept in the forwarded head: {head}"
+    );
+}
+
+/// HEAD with Content-Length relays the response promptly on http2http.
+#[tokio::test]
+async fn test_http2http_head_with_cl_relays_response() {
+    assert_head_with_cl_relays_response("http2http").await;
+}
+
+/// HEAD with Content-Length relays the response promptly via http_proxy.
+#[tokio::test]
+async fn test_http_proxy_head_with_cl_relays_response() {
+    assert_head_with_cl_relays_response("http_proxy").await;
+}

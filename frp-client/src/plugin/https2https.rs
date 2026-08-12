@@ -172,6 +172,7 @@ async fn handle_conn(
         &mut backend_tls,
         &fwd.body_prefix,
         fwd.body,
+        &fwd.method,
     )
     .await
     {

@@ -71,9 +71,14 @@ async fn handle_conn(
     // and Go's Transport still delivers those responses. Log the error at
     // debug — the client-gone case is harmless, the backend-close case
     // recovers the response in the relay below.
-    if let Err(e) =
-        crate::plugin::forward_request_body(&mut client, &mut remote, &fwd.body_prefix, fwd.body)
-            .await
+    if let Err(e) = crate::plugin::forward_request_body(
+        &mut client,
+        &mut remote,
+        &fwd.body_prefix,
+        fwd.body,
+        &fwd.method,
+    )
+    .await
     {
         tracing::debug!(error = %e, "request body forward failed, relaying response anyway: {}", e);
     }

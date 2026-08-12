@@ -94,6 +94,9 @@ where
 
     let task = tokio::spawn(async move {
         tracing::debug!(%local_addr, "{plugin_name} plugin listening on {local_addr}");
+        // Throttle accept-error warnings: under persistent EMFILE the loop
+        // fails ~10/s (100ms pause below), which would flood the logs.
+        let mut last_accept_warn: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -105,7 +108,15 @@ where
                             tokio::spawn(handler(stream, peer, s));
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "{plugin_name} plugin accept error: {e}");
+                            // Warn at most once per second while the accept
+                            // failure persists (the first failure warns too).
+                            if last_accept_warn
+                                .map(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+                                .unwrap_or(true)
+                            {
+                                tracing::warn!(error = %e, "{plugin_name} plugin accept error: {e}");
+                                last_accept_warn = Some(std::time::Instant::now());
+                            }
                             // Transient accept errors (EMFILE/ENFILE fd
                             // exhaustion, etc.) must not kill the listener:
                             // Go's Accept loop retries. Pause briefly to
@@ -313,6 +324,9 @@ pub(super) struct ForwardedRequest {
     pub body_prefix: Vec<u8>,
     /// Framing of the request body; `None` when the request has no body.
     pub body: Option<BodyFraming>,
+    /// Request method (e.g. `HEAD`) — the body forward skips it when the
+    /// method can never carry a body.
+    pub method: String,
 }
 
 /// How a request body is framed on the wire (RFC 7230 §3.3.3).
@@ -327,11 +341,74 @@ pub(super) enum BodyFraming {
 /// Determine the request body framing from raw header lines. Chunked
 /// transfer-encoding wins over Content-Length (RFC 7230 §3.3.3); neither
 /// header means the request has no body.
+///
+/// Content-Length is resolved by [`resolve_content_length`]: duplicate
+/// identical values collapse to one length and list-form values ("5, 5")
+/// sum. A conflicting set of values yields no inferable framing — the
+/// request is malformed and the head builders reject it via
+/// [`resolve_content_length`] before this runs.
 pub(super) fn parse_request_body_framing<'a>(
     headers: impl Iterator<Item = &'a str>,
 ) -> Option<BodyFraming> {
+    // Collect so the Content-Length resolution below can re-scan the full
+    // header set — a single-pass "first value wins" scan would miss
+    // duplicate/conflicting lines.
+    let lines: Vec<&str> = headers.collect();
     let mut chunked = false;
-    let mut content_length: Option<usize> = None;
+    for line in &lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && transfer_encoding_is_chunked(value)
+        {
+            chunked = true;
+        }
+    }
+    if chunked {
+        Some(BodyFraming::Chunked)
+    } else {
+        resolve_content_length(lines.into_iter())
+            .ok()
+            .flatten()
+            .map(BodyFraming::Length)
+    }
+}
+
+/// True when a Transfer-Encoding value applies the chunked coding. Per RFC
+/// 7230 §3.3.3, chunked must be the FINAL coding of a comma-separated list
+/// ("gzip, chunked" is chunked; "chunkedfoo" or any coding after chunked is
+/// not) — a substring check would mis-detect `chunkedfoo`.
+fn transfer_encoding_is_chunked(value: &str) -> bool {
+    value
+        .split(',')
+        .next_back()
+        .map(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
+        .unwrap_or(false)
+}
+
+/// Resolve the Content-Length header(s) of a request head to one canonical
+/// value per RFC 7230 §3.3.2 ("reject or replace with a single value").
+///
+/// - no Content-Length → `Ok(None)`;
+/// - duplicate identical values (`Content-Length: 5` twice) → `Ok(Some(5))`,
+///   forwarded as a single line;
+/// - a list-form value (`Content-Length: 5, 5`) → `Ok(Some(10))` — the sum,
+///   forwarded as a single line with the summed body read;
+/// - an unparseable value → `Ok(None)` (no body length can be inferred; the
+///   head is forwarded as-is, matching the no-body fallback);
+/// - conflicting values (`Content-Length: 5` + `Content-Length: 100`) →
+///   `Err`: the request framing is invalid and the request must be rejected
+///   (the connection closes — no 400 is sent, like the other parser
+///   failures).
+pub(super) fn resolve_content_length<'a>(
+    headers: impl Iterator<Item = &'a str>,
+) -> Result<Option<usize>, String> {
+    // Parsed values per Content-Length line, in header order.
+    let mut per_line: Vec<Vec<usize>> = Vec::new();
     for line in headers {
         if line.is_empty() {
             continue;
@@ -339,25 +416,40 @@ pub(super) fn parse_request_body_framing<'a>(
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
-            if value.trim().to_ascii_lowercase().contains("chunked") {
-                chunked = true;
-            }
-        } else if name.trim().eq_ignore_ascii_case("content-length") {
-            // First parseable value wins; a conflicting second value makes
-            // the request malformed (Go's http.Server rejects it outright).
-            if content_length.is_none() {
-                content_length = value
-                    .split(',')
-                    .next()
-                    .and_then(|v| v.trim().parse::<usize>().ok());
+        if !name.trim().eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let mut values = Vec::new();
+        for token in value.split(',') {
+            match token.trim().parse::<usize>() {
+                Ok(n) => values.push(n),
+                Err(_) => {
+                    // Unparseable — no body length can be inferred. The head
+                    // is forwarded as-is (Go's server would reject the
+                    // request outright, but a body cannot be inferred from
+                    // it either).
+                    return Ok(None);
+                }
             }
         }
+        per_line.push(values);
     }
-    if chunked {
-        Some(BodyFraming::Chunked)
+    if per_line.is_empty() {
+        return Ok(None);
+    }
+    if per_line.len() == 1 {
+        // Single Content-Length line: list-form values ("5, 5") declare a
+        // body of the sum of the parts — forward the summed length and
+        // stream that many bytes.
+        return Ok(Some(per_line[0].iter().sum()));
+    }
+    // Multiple Content-Length lines: identical values collapse to one copy;
+    // any difference means the framing is invalid.
+    let first = per_line[0][0];
+    if per_line.iter().all(|v| v.len() == 1 && v[0] == first) {
+        Ok(Some(first))
     } else {
-        content_length.map(BodyFraming::Length)
+        Err("conflicting Content-Length headers".into())
     }
 }
 
@@ -426,12 +518,22 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // is stripped below as hop-by-hop and re-added only when the request is
     // chunked (the forwarded body bytes keep the client's own framing).
     let framing = parse_request_body_framing(lines.clone());
+    // Content-Length is resolved per RFC 7230 §3.3.2 ("reject or replace
+    // with a single value"): duplicate identical values collapse to one
+    // line, list-form values ("5, 5") sum, and conflicting values make the
+    // request framing invalid — reject (the connection closes, matching
+    // the other parser failures; no 400 is sent).
+    let content_length = resolve_content_length(lines.clone())?;
 
     // Build forwarded request with optional Host rewrite.
     // Strip hop-by-hop headers per RFC 2616 Section 13.5.1 (matches Go's
     // removeProxyHeaders / ReverseProxy hopHeaders: Connection,
     // Proxy-Connection, Keep-Alive, Proxy-Authorization, Proxy-Authenticate,
-    // TE, Trailer(s), Transfer-Encoding, Upgrade).
+    // TE, Trailer(s), Transfer-Encoding, Upgrade). Expect is stripped too:
+    // the plugin cannot relay the interim 100-continue response, and a
+    // strict client that gates its body-send on it would deadlock against
+    // the body read (RFC 7231 §5.1.1: without the header the client sends
+    // the body at once).
     let hop_by_hop: &[&str] = &[
         "transfer-encoding:",
         "proxy-authorization:",
@@ -442,6 +544,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         "upgrade:",
         "connection:",
         "keep-alive:",
+        "expect:",
     ];
     let mut fwd = format!("{method} {path} HTTP/1.0\r\n");
     for line in lines {
@@ -452,10 +555,16 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         if hop_by_hop.iter().any(|h| lower.starts_with(h)) {
             continue;
         }
-        // Drop Content-Length when the body is chunked (RFC 7230 §3.3.3):
-        // Go's http.Server deletes CL when Transfer-Encoding is chunked,
-        // and forwarding the ambiguous pair is request-smuggling shaped.
-        if framing == Some(BodyFraming::Chunked) && lower.starts_with("content-length:") {
+        // Drop every original Content-Length line: when the body is chunked
+        // (RFC 7230 §3.3.3 — Go's http.Server deletes CL when
+        // Transfer-Encoding is chunked, and forwarding the ambiguous pair
+        // is request-smuggling shaped), or when a usable Content-Length was
+        // resolved — all CL lines are then replaced by a single canonical
+        // line appended after the loop (RFC 7230 §3.3.2; forwarding
+        // duplicate/conflicting values would desync the backend).
+        if lower.starts_with("content-length:")
+            && (framing == Some(BodyFraming::Chunked) || content_length.is_some())
+        {
             continue;
         }
         // Skip headers that request_headers will override (Go Header.Set).
@@ -499,6 +608,10 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     }
     if framing == Some(BodyFraming::Chunked) {
         fwd.push_str("Transfer-Encoding: chunked\r\n");
+    } else if let Some(n) = content_length {
+        // Exactly one Content-Length line (RFC 7230 §3.3.2), matching the
+        // byte count the body forward will stream.
+        fwd.push_str(&format!("Content-Length: {n}\r\n"));
     }
     fwd.push_str("Connection: close\r\n\r\n");
 
@@ -506,6 +619,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         head: fwd,
         body_prefix: buf[header_end..].to_vec(),
         body: framing,
+        method: method.to_string(),
     })
 }
 
@@ -524,16 +638,29 @@ const CHUNK_LINE_MAX: usize = 64 * 1024;
 /// HTTP/1.1); the parser only tracks chunk boundaries to know where the body
 /// ends so the response relay can start without waiting for the client to
 /// close the connection.
+///
+/// A HEAD request carries no body at all — the forward is skipped even when
+/// the head declares a Content-Length (RFC 7230 §3.3.2: neither side sends
+/// a body with HEAD).
 pub(super) async fn forward_request_body<S, W>(
     stream: &mut S,
     writer: &mut W,
     body_prefix: &[u8],
     framing: Option<BodyFraming>,
+    method: &str,
 ) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    // HEAD requests never carry a body, even when the head declares a
+    // Content-Length (RFC 7230 §3.3.2). Blocking on a body that will never
+    // arrive would stall the response relay until the client closes — skip
+    // the read and keep the Content-Length header in the forwarded head so
+    // the backend still knows the response framing.
+    if method.eq_ignore_ascii_case("HEAD") {
+        return Ok(());
+    }
     let Some(framing) = framing else {
         return Ok(());
     };
@@ -845,15 +972,73 @@ mod tests {
             parse_request_body_framing("Transfer-Encoding: Chunked".lines()),
             Some(BodyFraming::Chunked)
         );
+        // Chunked must be the FINAL coding of the list (RFC 7230 §3.3.3);
+        // "gzip, chunked" is chunked, "chunkedfoo" or a coding after chunked
+        // is not.
+        assert_eq!(
+            parse_request_body_framing("Transfer-Encoding: gzip, chunked".lines()),
+            Some(BodyFraming::Chunked)
+        );
+        assert_eq!(
+            parse_request_body_framing("Transfer-Encoding: chunkedfoo".lines()),
+            None
+        );
+        assert_eq!(
+            parse_request_body_framing("Transfer-Encoding: chunked, gzip".lines()),
+            None
+        );
         // Chunked wins over Content-Length (RFC 7230 §3.3.3).
         assert_eq!(
             parse_request_body_framing("Content-Length: 42\r\nTransfer-Encoding: chunked".lines()),
             Some(BodyFraming::Chunked)
         );
+        // List-form Content-Length sums ("5, 5" declares a 10-byte body).
+        assert_eq!(
+            parse_request_body_framing("Content-Length: 5, 5".lines()),
+            Some(BodyFraming::Length(10))
+        );
+        // Duplicate identical Content-Length lines collapse to one value.
+        assert_eq!(
+            parse_request_body_framing("Content-Length: 5\r\nContent-Length: 5".lines()),
+            Some(BodyFraming::Length(5))
+        );
         // Unparseable Content-Length is ignored (Go's server rejects the
         // request outright, but a body cannot be inferred from it).
         assert_eq!(
             parse_request_body_framing("Content-Length: abc".lines()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_content_length() {
+        // No Content-Length header → no length.
+        assert_eq!(
+            resolve_content_length("Host: example.com".lines()).unwrap(),
+            None
+        );
+        // Single value.
+        assert_eq!(
+            resolve_content_length("Content-Length: 42".lines()).unwrap(),
+            Some(42)
+        );
+        // List-form values sum: "5, 5" declares a 10-byte body.
+        assert_eq!(
+            resolve_content_length("Content-Length: 5, 5".lines()).unwrap(),
+            Some(10)
+        );
+        // Duplicate identical lines collapse to one copy (RFC 7230 §3.3.2).
+        assert_eq!(
+            resolve_content_length("Content-Length: 5\r\nContent-Length: 5".lines()).unwrap(),
+            Some(5)
+        );
+        // Conflicting values invalidate the request framing.
+        assert!(
+            resolve_content_length("Content-Length: 5\r\nContent-Length: 100".lines()).is_err()
+        );
+        // Unparseable value → no usable length (head forwarded as-is).
+        assert_eq!(
+            resolve_content_length("Content-Length: abc".lines()).unwrap(),
             None
         );
     }

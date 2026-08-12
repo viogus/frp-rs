@@ -571,6 +571,16 @@ pub(crate) async fn authenticate(
             server_additional_auth_scopes: None,
         });
         let _ = write_ctl_msg(&mut stream, &resp, v2).await;
+        // TODO(audit-fix): the duplicate-login conflict path sweeps the LIVE
+        // control's routes. unregister_control runs with THIS login's control
+        // id — assigned from the monotonically increasing counter (see above),
+        // so it is HIGHER than the live control's — and its generation filter
+        // (p.control_id <= control_id) lets the live control's older proxies
+        // through, tearing down its port marks, vhost routes, and sk_index
+        // entries. The conflict path should arguably not sweep at all: only
+        // the generation-guarded run_id_to_ctl_tx removal (already done above
+        // the sweep) and the OIDC-subject cleanup below are wanted. Do not
+        // call unregister_control here until it gains a sweep-free mode.
         unregister_control(&state, &run_id, control_id, false).await;
         // Clean up OIDC subject
         if oidc_subject.is_some() {

@@ -36,6 +36,9 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
 
     let task = tokio::spawn(async move {
         debug!(local_addr = %local_addr, "unix_domain_socket plugin listening on {}", local_addr);
+        // Throttle accept-error warnings: under persistent EMFILE the loop
+        // fails ~10/s (100ms pause below), which would flood the logs.
+        let mut last_accept_warn: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -74,7 +77,15 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                             });
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "unix_domain_socket plugin: accept error: {}", e);
+                            // Warn at most once per second while the accept
+                            // failure persists (the first failure warns too).
+                            if last_accept_warn
+                                .map(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+                                .unwrap_or(true)
+                            {
+                                tracing::warn!(error = %e, "unix_domain_socket plugin: accept error: {}", e);
+                                last_accept_warn = Some(std::time::Instant::now());
+                            }
                             // Transient accept errors (EMFILE/ENFILE fd
                             // exhaustion, etc.) must not kill the listener —
                             // pause briefly and retry; only the shutdown
