@@ -943,9 +943,6 @@ pub async fn xtcp_p2p_connect_yamux(
         let mut loop_count: u64 = 0;
         loop {
             loop_count += 1;
-            if loop_count.is_multiple_of(100) {
-                tracing::debug!(count = loop_count, "yamux P2P: bg driver loop still alive");
-            }
             // Acquire the lock (async — yields if contended).
             let mut c = bg_conn.lock().await;
             // Use timeout + poll_fn with a real tokio waker, matching the

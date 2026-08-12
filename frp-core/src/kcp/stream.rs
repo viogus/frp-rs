@@ -116,14 +116,17 @@ impl AsyncRead for KcpStream {
             KCP_READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
             #[cfg(debug_assertions)]
             KCP_READ_CALLS.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                conv = self.conv,
-                n = n,
-                total = self.read_count,
-                "KCP read: {} bytes (total={})",
-                n,
-                self.read_count,
-            );
+            #[cfg(debug_assertions)]
+            if tracing::level_enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    conv = self.conv,
+                    n = n,
+                    total = self.read_count,
+                    "KCP read: {} bytes (total={})",
+                    n,
+                    self.read_count,
+                );
+            }
             return Poll::Ready(Ok(()));
         }
 

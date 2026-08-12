@@ -530,6 +530,58 @@ fn connector_key(
 static CONNECTOR_CACHE: std::sync::RwLock<Option<(ConnectorKey, TlsConnector)>> =
     std::sync::RwLock::new(None);
 
+/// Minimum interval between skip-verify warnings. The first occurrence logs
+/// immediately at error level (the security value); repeat occurrences
+/// within the window are suppressed, then re-logged once per window at warn
+/// with a repeat note — a busy deployment running the insecure default must
+/// not get a per-connection log flood.
+const SKIP_VERIFY_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+static LAST_SKIP_VERIFY_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Log the InsecureSkipVerify warning at most once per
+/// [`SKIP_VERIFY_WARN_MIN_INTERVAL`] per process: error level on the first
+/// occurrence, then a shorter warn-level repeat carrying the interval.
+fn warn_skip_verify_rate_limited() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_SKIP_VERIFY_WARN.load(std::sync::atomic::Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < SKIP_VERIFY_WARN_MIN_INTERVAL.as_secs() {
+        return;
+    }
+    if LAST_SKIP_VERIFY_WARN
+        .compare_exchange(
+            last,
+            now,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        // Another connection claimed this window — suppressed.
+        return;
+    }
+    if last == 0 {
+        tracing::error!(
+            "TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
+             All control and data-plane traffic is vulnerable to MITM attacks and \
+             authentication credentials can be captured and replayed. \
+             For production, set tls.ca_file (frpc: tls.trusted_ca_file) to a CA \
+             that signed the server certificate to enable verification. \
+             (This warning repeats at most once every {}s.)",
+            SKIP_VERIFY_WARN_MIN_INTERVAL.as_secs()
+        );
+    } else {
+        tracing::warn!(
+            "TLS certificate verification is still DISABLED (InsecureSkipVerify=true). \
+             See the first warning for remediation; this warning repeats at most \
+             once every {}s.",
+            SKIP_VERIFY_WARN_MIN_INTERVAL.as_secs()
+        );
+    }
+}
+
 /// Number of actual connector builds (cache misses). Test-only — lets tests
 /// assert a cache hit did not rebuild.
 #[cfg(test)]
@@ -556,16 +608,10 @@ pub fn build_tls_connector_skip_verify(
     // Warn per TLS-enabled connection (not once per process at connector
     // build — the connector is cached, so the build-time log was easy to
     // miss). Fires for every dial that lands on the insecure skip-verify
-    // default, i.e. whenever no CA file is configured. A rate limit for
-    // busy deployments belongs to the log-flooding gates (audit-fix task 11).
+    // default, i.e. whenever no CA file is configured. Rate-limited so busy
+    // deployments get the first occurrence at error level but no flood.
     if non_empty(ca_file).is_none() {
-        tracing::error!(
-            "TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
-             All control and data-plane traffic is vulnerable to MITM attacks and \
-             authentication credentials can be captured and replayed. \
-             For production, set tls.ca_file (frpc: tls.trusted_ca_file) to a CA \
-             that signed the server certificate to enable verification."
-        );
+        warn_skip_verify_rate_limited();
     }
     let key = connector_key(ca_file, cert_file, key_file);
     if let Some((cached_key, cached)) = CONNECTOR_CACHE

@@ -25,15 +25,14 @@ const GATEWAY_TIMEOUT_504: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Len
 
 /// Emit a TRACE-level event with a hex-encoded field.
 ///
-/// In release builds (`debug_assertions` off), the entire call is compiled
-/// away so `crate::hex_encode` is never evaluated.  In debug builds the standard
-/// `tracing::trace!` static-filter guard still applies.
+/// Compiled away entirely unless the `debug-logs` feature is enabled, so
+/// `crate::hex_encode` is never evaluated in shipped builds. When enabled,
+/// the standard `tracing::trace!` static-filter guard still applies.
 macro_rules! trace_hex {
     ($($arg:tt)*) => {
-        if cfg!(debug_assertions) {
-            if tracing::level_enabled!(tracing::Level::TRACE) {
-                tracing::trace!($($arg)*);
-            }
+        #[cfg(feature = "debug-logs")]
+        if tracing::level_enabled!(tracing::Level::TRACE) {
+            tracing::trace!($($arg)*);
         }
     };
 }
