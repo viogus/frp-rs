@@ -85,11 +85,14 @@ pub fn parse_allow_ports(s: &str) -> Result<Vec<PortsRange>, String> {
                     "invalid allow_ports entry '{part}': port 0 is not allowed"
                 ));
             }
-            let (start, end) = if start <= end {
-                (start, end)
-            } else {
-                (end, start)
-            };
+            // Go frp v0.70.1 compat (util.ParseRangeNumbers): a reversed range
+            // (max < min) is a config error, not silently swapped (audit task
+            // 9 finding 7).
+            if end < start {
+                return Err(format!(
+                    "invalid allow_ports entry '{part}': range number is invalid"
+                ));
+            }
             out.push(PortsRange {
                 start,
                 end,
@@ -218,6 +221,60 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
             return Err(format!(
                 "proxy '{}': invalid proxy_type '{}'. Valid types: tcp, udp, http, https, stcp, xtcp, sudp, tcpmux",
                 p.name, p.proxy_type
+            ));
+        }
+
+        // Go frp v0.70.1 compat: validation.ValidateProxyConfigurerForClient
+        // (pkg/config/v1/validation/proxy.go), ported per-type checks
+        // (audit task 9 finding 8).
+
+        // c.Name == "" → "name should not be empty".
+        if p.name.is_empty() {
+            return Err("proxy: name should not be empty".into());
+        }
+
+        // proxyProtocolVersion must be "", "v1", or "v2".
+        if !matches!(p.proxy_protocol_version.as_str(), "" | "v1" | "v2") {
+            return Err(format!(
+                "proxy '{}': not support proxy protocol version: {}",
+                p.name, p.proxy_protocol_version
+            ));
+        }
+
+        // healthCheck.type must be "", "tcp", or "http"; "http" requires a path.
+        if !matches!(p.health_check_type.as_str(), "" | "tcp" | "http") {
+            return Err(format!(
+                "proxy '{}': not support health check type: {}",
+                p.name, p.health_check_type
+            ));
+        }
+        if p.health_check_type == "http" && p.health_check_url.is_empty() {
+            return Err(format!(
+                "proxy '{}': health check path should not be empty",
+                p.name
+            ));
+        }
+
+        // HTTP/HTTPS/TCPMux proxies need subdomain or custom domains
+        // (validateDomainConfigForClient: "subdomain and custom domains
+        // should not be both empty").
+        if matches!(p.proxy_type.as_str(), "http" | "https" | "tcpmux")
+            && p.subdomain.is_empty()
+            && p.custom_domains.is_empty()
+        {
+            return Err(format!(
+                "proxy '{}': subdomain and custom domains should not be both empty",
+                p.name
+            ));
+        }
+
+        // '.' and '*' are not supported in subdomain (validateDomainConfigForServer).
+        if (p.subdomain.contains('.') || p.subdomain.contains('*'))
+            && matches!(p.proxy_type.as_str(), "http" | "https" | "tcpmux")
+        {
+            return Err(format!(
+                "proxy '{}': '.' and '*' are not supported in subdomain",
+                p.name
             ));
         }
 

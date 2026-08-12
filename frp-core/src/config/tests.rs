@@ -653,6 +653,7 @@ serverPort = 7000
 name = "web"
 type = "http"
 remotePort = 80
+customDomains = ["web.example.com"]
 
 [proxies.natTraversal]
 disableAssistedAddrs = true
@@ -744,15 +745,10 @@ fn test_parse_allow_ports() {
             },
         ]
     );
-    // Inverted range swapped
-    assert_eq!(
-        parse_allow_ports("20000-10000").unwrap(),
-        vec![PortsRange {
-            start: 10000,
-            end: 20000,
-            single: 0
-        }]
-    );
+    // Reversed range is an error, matching Go's ParseRangeNumbers
+    // ("range number is invalid") — audit task 9 finding 7.
+    let err = parse_allow_ports("20000-10000").unwrap_err();
+    assert!(err.contains("range number is invalid"), "got: {err}");
     // Single port
     assert_eq!(
         parse_allow_ports("8080").unwrap(),
@@ -3026,4 +3022,325 @@ fn test_parse_number_range_edge_inputs_kept_verbatim() {
         let token = value.get("token").unwrap().as_str().unwrap();
         assert_eq!(token, *input, "case {i}: kept verbatim");
     }
+}
+
+// ─── Audit task 9 regression tests (Config/CLI Go-compat) ─────────────────
+
+#[test]
+fn test_strict_accepts_go_valid_client_keys() {
+    // Go frp v0.70.1-valid client config that previously failed frpc verify
+    // with "unknown field heartbeat_timeout" (audit task 9 finding 1):
+    // transport.heartbeatTimeout is flattened to top-level heartbeat_timeout
+    // by normalize_client_config, and the Go camelCase aliases reach the top
+    // level untouched.
+    let mut client_file = tempfile::NamedTempFile::new().unwrap();
+    client_file
+        .write_all(
+            br#"serverAddr = "127.0.0.1"
+serverPort = 7000
+loginFailExit = true
+poolCount = 4
+tcpMux = true
+udpPacketSize = 1500
+dnsServer = "8.8.8.8"
+webServer = { addr = "127.0.0.1", port = 7400 }
+featureGates = { VirtualNet = true }
+
+[transport]
+heartbeatInterval = 10
+heartbeatTimeout = 60
+"#,
+        )
+        .unwrap();
+    let cfg = load_client_config(client_file.path().to_str().unwrap(), true).unwrap();
+    assert_eq!(cfg.heartbeat_interval, 10);
+    assert_eq!(cfg.heartbeat_timeout, 60);
+    assert_eq!(cfg.pool_count, 4);
+    assert_eq!(cfg.udp_packet_size, 1500);
+    assert_eq!(cfg.dns_server, "8.8.8.8");
+    assert_eq!(cfg.web_server.port, 7400);
+}
+
+#[test]
+fn test_strict_accepts_go_valid_server_aliases() {
+    // Go frp v0.70.1 camelCase server aliases that normalization does not
+    // rename away (audit task 9 finding 1).
+    let mut server_file = tempfile::NamedTempFile::new().unwrap();
+    server_file
+        .write_all(
+            br#"bindPort = 7000
+detailedErrorsToClient = false
+udpPacketSize = 2048
+tcpmuxPassthrough = true
+vhostHTTPTimeout = 30
+maxConnections = 100
+"#,
+        )
+        .unwrap();
+    let cfg = load_server_config(server_file.path().to_str().unwrap(), true).unwrap();
+    assert!(!cfg.detailed_errors_to_client);
+    assert_eq!(cfg.udp_packet_size, 2048);
+    assert!(cfg.tcp_mux_passthrough);
+    assert_eq!(cfg.vhost_http_timeout, 30);
+    assert_eq!(cfg.max_connections, Some(100));
+}
+
+#[test]
+fn test_strict_rejects_nested_unknown_keys() {
+    // Strict mode must recurse into sub-tables (audit task 9 finding 2):
+    // unknown keys inside [log] / [auth] are caught even though the section
+    // name itself is known.
+    let mut log_file = tempfile::NamedTempFile::new().unwrap();
+    log_file
+        .write_all(
+            br#"serverAddr = "127.0.0.1"
+[log]
+level = "info"
+levell = "info"
+"#,
+        )
+        .unwrap();
+    let err = load_client_config(log_file.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field \"log.levell\""), "got: {err}");
+
+    let mut auth_file = tempfile::NamedTempFile::new().unwrap();
+    auth_file
+        .write_all(
+            br#"bindPort = 7000
+[auth]
+token = "secret"
+tokenz = "secret"
+"#,
+        )
+        .unwrap();
+    let err = load_server_config(auth_file.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field \"auth.tokenz\""), "got: {err}");
+}
+
+#[test]
+fn test_strict_accepts_go_section_keys() {
+    // Go-valid keys inside known sections must pass strict mode
+    // (audit task 9 findings 1+2).
+    let mut server_file = tempfile::NamedTempFile::new().unwrap();
+    server_file
+        .write_all(
+            br#"bindPort = 7000
+[log]
+to = "console"
+maxDays = 7
+disablePrintColor = true
+
+[web_server]
+addr = "0.0.0.0"
+port = 7500
+assetsDir = "./static"
+pprofEnable = true
+
+[transport]
+tcpMux = true
+heartbeatTimeout = 90
+tcpKeepalive = 7200
+
+[ssh_tunnel_gateway]
+bindPort = 2200
+privateKeyFile = "/etc/frp/host.key"
+authorizedKeysFile = "/etc/frp/auth.keys"
+allowNoneAuth = false
+"#,
+        )
+        .unwrap();
+    let cfg = load_server_config(server_file.path().to_str().unwrap(), true).unwrap();
+    assert!(cfg.log.disable_print_color);
+    assert_eq!(cfg.log.max_days, 7);
+    assert_eq!(cfg.web_server.port, 7500);
+    assert_eq!(cfg.web_server.assets_dir, "./static");
+    assert!(cfg.web_server.pprof_enable);
+    assert_eq!(cfg.transport.heartbeat_timeout, 90);
+    assert_eq!(cfg.transport.tcp_keepalive, 7200);
+    assert_eq!(cfg.ssh_tunnel_gateway.bind_port, 2200);
+}
+
+#[test]
+fn test_strict_flag_false_disables_unknown_key_check() {
+    // --strict-config=false must parse and disable strict mode (audit task 9
+    // finding 3). The CLI flag itself is exercised in frp-core/src/cli.rs
+    // tests; here the loader honors the bool.
+    let mut client_file = tempfile::NamedTempFile::new().unwrap();
+    client_file
+        .write_all(
+            br#"server_addr = "127.0.0.1"
+totally_unknown_key = 1
+"#,
+        )
+        .unwrap();
+    // strict = true rejects, strict = false accepts.
+    assert!(load_client_config(client_file.path().to_str().unwrap(), true).is_err());
+    load_client_config(client_file.path().to_str().unwrap(), false).unwrap();
+}
+
+#[test]
+fn test_allow_ports_single_form_normalized() {
+    // Go allowPorts [{single=N}] must normalize to "{single=N}", not the
+    // previously emitted "0-0" (audit task 9 finding 6).
+    let toml_str = r#"
+bind_port = 7000
+
+[[allowPorts]]
+single = 40000
+
+[[allowPorts]]
+start = 10000
+end = 20000
+"#;
+    let cfg: ServerConfig = load_server_config_from_str(toml_str).unwrap();
+    assert_eq!(cfg.allow_ports, "{single=40000},10000-20000");
+    let ranges = parse_allow_ports(&cfg.allow_ports).unwrap();
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges[0].single, 40000, "single-port semantics preserved");
+    assert!(ranges[0].contains(40000));
+    assert!(!ranges[0].contains(40001));
+    assert!(ranges[1].contains(15000));
+}
+
+#[test]
+fn test_reversed_allow_ports_range_rejected() {
+    // Go's ParseRangeNumbers rejects max < min ("range number is invalid")
+    // instead of silently swapping (audit task 9 finding 7).
+    let err = load_server_config_from_str("bind_port = 7000\nallow_ports = \"20000-10000\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("range number is invalid"), "got: {err}");
+}
+
+#[test]
+fn test_proxy_validation_rejections() {
+    // Go frp v0.70.1 client proxy validation (audit task 9 finding 8).
+    let base = "server_addr = \"127.0.0.1\"\n[[proxies]]\nname = \"p\"\n";
+
+    // Empty proxy name.
+    let err = load_client_config_from_str(
+        "server_addr = \"127.0.0.1\"\n[[proxies]]\nname = \"\"\ntype = \"tcp\"\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("name should not be empty"), "got: {err}");
+
+    // Invalid proxy protocol version.
+    let err = load_client_config_from_str(&format!(
+        "{base}type = \"tcp\"\nproxyProtocolVersion = \"v3\"\n"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("not support proxy protocol version: v3"),
+        "got: {err}"
+    );
+    // Valid versions still parse.
+    for version in ["", "v1", "v2"] {
+        let cfg = load_client_config_from_str(&format!(
+            "{base}type = \"tcp\"\nproxyProtocolVersion = \"{version}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.proxies[0].proxy_protocol_version, version);
+    }
+
+    // Invalid health check type (Go nests health check config under
+    // [proxies.healthCheck]).
+    let err = load_client_config_from_str(&format!(
+        "{base}type = \"tcp\"\n[proxies.healthCheck]\ntype = \"icmp\"\n"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("not support health check type: icmp"),
+        "got: {err}"
+    );
+
+    // http health check without a path.
+    let err = load_client_config_from_str(&format!(
+        "{base}type = \"tcp\"\n[proxies.healthCheck]\ntype = \"http\"\n"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("health check path should not be empty"),
+        "got: {err}"
+    );
+
+    // http proxy without subdomain or custom domains.
+    let err = load_client_config_from_str(&format!("{base}type = \"http\"\n"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("subdomain and custom domains should not be both empty"),
+        "got: {err}"
+    );
+
+    // subdomain with '.' or '*'.
+    for bad in ["a.b", "a*b"] {
+        let err =
+            load_client_config_from_str(&format!("{base}type = \"http\"\nsubdomain = \"{bad}\"\n"))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("'.' and '*' are not supported in subdomain"),
+            "subdomain {bad:?}: got: {err}"
+        );
+    }
+
+    // tcpmux also requires domains (Go validateTCPMuxProxyConfigForClient).
+    let err = load_client_config_from_str(&format!(
+        "{base}type = \"tcpmux\"\nmultiplexer = \"httpconnect\"\n"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("subdomain and custom domains should not be both empty"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_strict_accepts_repo_frps_toml_legacy_keys() {
+    // The repo's own frps.toml example uses the frp-rs legacy keys
+    // `subdomain_host` and `tls_trusted_ca_file` under [common]; strict mode
+    // must accept them and serde must apply them (audit task 9 finding 1
+    // family — the documented `cargo run --bin frps -- -c frps.toml`
+    // workflow was broken by strict rejection).
+    let toml = r#"
+[common]
+bind_addr = "0.0.0.0"
+bind_port = 17000
+subdomain_host = "example.com"
+tls_enable = true
+tls_trusted_ca_file = "/etc/frp/ca.pem"
+auth_method = "token"
+token = "secret"
+log_level = "debug"
+web_server_addr = "0.0.0.0"
+web_server_port = 7500
+tcp_mux = true
+"#;
+    let cfg: ServerConfig = load_server_config_from_str(toml).unwrap();
+    assert_eq!(cfg.sub_domain_host, "example.com");
+    assert_eq!(cfg.tls_ca_file, "/etc/frp/ca.pem");
+}
+
+#[test]
+fn test_log_disable_print_color_parsed() {
+    // log.disablePrintColor must be honored from the config file (audit task
+    // 9 finding 9 — wired into resolve_ansi by the frps/frpc binaries).
+    let cfg: ClientConfig =
+        load_client_config_from_str("server_addr = '127.0.0.1'\n[log]\ndisablePrintColor = true\n")
+            .unwrap();
+    assert!(cfg.log.disable_print_color);
+
+    let cfg: ServerConfig =
+        load_server_config_from_str("bind_port = 7000\n[log]\ndisable_print_color = true\n")
+            .unwrap();
+    assert!(cfg.log.disable_print_color);
 }

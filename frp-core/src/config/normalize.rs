@@ -381,15 +381,22 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             table.entry("feature").or_insert(v);
         }
 
-        // Go allowPorts is an array of {start,end} ranges; normalize to the
-        // existing comma-separated "start-end" string form.
+        // Go allowPorts is an array of {start,end} ranges (types.PortsRange);
+        // normalize to the existing comma-separated string form. A
+        // `{single=N}` entry (Go PortsRange.Single) becomes `{single=N}` so
+        // parse_allow_ports keeps the single-port semantics (audit task 9
+        // finding 6 — previously emitted "0-0", which is rejected).
         if let Some(Value::Array(ranges)) = table.remove("allowPorts") {
             let mut parts = Vec::new();
             for range in ranges {
                 if let Some(t) = range.as_table() {
-                    let start = t.get("start").and_then(Value::as_integer).unwrap_or(0);
-                    let end = t.get("end").and_then(Value::as_integer).unwrap_or(start);
-                    parts.push(format!("{start}-{end}"));
+                    if let Some(single) = t.get("single").and_then(Value::as_integer) {
+                        parts.push(format!("{{single={single}}}"));
+                    } else {
+                        let start = t.get("start").and_then(Value::as_integer).unwrap_or(0);
+                        let end = t.get("end").and_then(Value::as_integer).unwrap_or(start);
+                        parts.push(format!("{start}-{end}"));
+                    }
                 }
             }
             if !parts.is_empty() {

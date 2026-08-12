@@ -34,7 +34,7 @@ pub struct ServerConfig {
     /// proxies share this port via HTTP CONNECT Host header routing.
     #[serde(default, alias = "tcpmuxHTTPConnectPort")]
     pub tcpmux_httpconnect_port: u16,
-    #[serde(default, alias = "subDomainHost")]
+    #[serde(default, alias = "subDomainHost", alias = "subdomain_host")]
     pub sub_domain_host: String,
     #[serde(default, alias = "websocketPort")]
     #[cfg(feature = "websocket")]
@@ -45,7 +45,7 @@ pub struct ServerConfig {
     pub tls_cert_file: String,
     #[serde(default)]
     pub tls_key_file: String,
-    #[serde(default)]
+    #[serde(default, alias = "tls_trusted_ca_file")]
     pub tls_ca_file: String,
     #[serde(default, alias = "tlsServerName")]
     pub tls_server_name: String,

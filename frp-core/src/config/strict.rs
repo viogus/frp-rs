@@ -89,6 +89,22 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "maxPortsPerClient",
         "userConnTimeout",
         "natholeAnalysisDataReserveHours",
+        // Go frp v0.70.1 camelCase aliases accepted by serde that are not
+        // renamed away by normalize_server_config (audit task 9 finding 1).
+        "detailedErrorsToClient",
+        "udpPacketSize",
+        "tcpmuxPassthrough",
+        "vhostHTTPTimeout",
+        "maxConnections",
+        "maxAcceptRate",
+        // frp-rs extension fields (strict mode must accept valid frp-rs configs).
+        "max_conns_per_proxy",
+        "maxConnsPerProxy",
+        // frp-rs legacy keys used by the repo's own frps.toml example
+        // (subdomain_host maps to sub_domain_host, tls_trusted_ca_file to
+        // tls_ca_file — strict mode must not reject the documented config).
+        "subdomain_host",
+        "tls_trusted_ca_file",
     ])
 }
 
@@ -167,6 +183,20 @@ pub(super) fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "oidc_proxy_url",
         "additional_endpoint_params",
         "oidc_token_source",
+        // Go frp v0.70.1 compat (audit task 9 finding 1): keys produced by
+        // normalize_client_config (transport.heartbeatTimeout is flattened
+        // to top level) plus Go camelCase aliases that serde accepts but
+        // normalization does not rename away.
+        "heartbeat_timeout",
+        "heartbeatTimeout",
+        "udp_packet_size",
+        "udpPacketSize",
+        "loginFailExit",
+        "poolCount",
+        "tcpMux",
+        "webServer",
+        "featureGates",
+        "dnsServer",
     ])
 }
 
@@ -208,6 +238,129 @@ pub(super) fn levenshtein(a: &str, b: &str) -> usize {
     prev[m]
 }
 
+/// Known keys for nested sections, used by `check_strict` recursion.
+/// Each entry lists the snake_case fields the frp-rs structs deserialize plus
+/// the Go frp v0.70.1 camelCase aliases serde accepts (normalization does not
+/// rename keys inside these sections). Sections not listed are not recursed
+/// into (e.g. `proxies`/`visitors` arrays — per-type keys would make the
+/// check a maintenance hazard and Go accepts type-specific fields there).
+fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
+    let keys: &'static [&'static str] = match section {
+        // Union of client and server auth flat fields (normalization flattens
+        // `[auth.oidc]` into `auth.oidc_*` before strict mode runs).
+        "auth" => &[
+            "method",
+            "token",
+            "tokenSource",
+            "authentication_timeout",
+            "authenticationTimeout",
+            "token_auth_timeout",
+            "tokenAuthTimeout",
+            "additional_auth_scopes",
+            "additionalScopes",
+            "use_encryption",
+            // Server-side OIDC flat fields
+            "oidc_issuer",
+            "oidc_audience",
+            "oidc_token_endpoint",
+            "oidc_skip_expiry",
+            "oidcSkipExpiry",
+            "oidc_skip_issuer",
+            "oidcSkipIssuer",
+            "oidc_skip_nbf",
+            "oidcSkipNbf",
+            "oidc_skip_audience",
+            "oidcSkipAudience",
+            "oidc_additional_audience",
+            "oidcAdditionalAudience",
+            "oidc_tls_trusted_ca_file",
+            "oidcTLSTrustedCAFile",
+            "oidc_proxy_url",
+            "oidcProxyURL",
+            // Client-side OIDC flat fields
+            "oidc_client_id",
+            "oidcClientId",
+            "oidc_client_secret",
+            "oidcClientSecret",
+            "oidc_scope",
+            "oidcScope",
+            "additional_endpoint_params",
+            "additionalEndpointParams",
+            "oidc_token_source",
+            "oidc_tls_insecure_skip_verify",
+        ],
+        "log" => &[
+            "level",
+            "file",
+            "to",
+            "max_days",
+            "maxDays",
+            "format",
+            "disable_print_color",
+            "disablePrintColor",
+        ],
+        "web_server" => &[
+            "addr",
+            "port",
+            "user",
+            "password",
+            "enable_prometheus",
+            "enablePrometheus",
+            "assets_dir",
+            "assetsDir",
+            "pprof_enable",
+            "pprofEnable",
+            "tls_cert_file",
+            "tls_key_file",
+            "certFile",
+            "keyFile",
+            "custom_404_page",
+        ],
+        "transport" => &[
+            "tcp_mux",
+            "tcpMux",
+            "tcp_mux_keepalive_interval",
+            "tcpMuxKeepaliveInterval",
+            "heartbeat_timeout",
+            "heartbeatTimeout",
+            "max_pool_count",
+            "maxPoolCount",
+            "tcp_keepalive",
+            "tcpKeepalive",
+            "quic",
+        ],
+        "quic" => &[
+            "keepalive_period",
+            "keepalivePeriod",
+            "max_idle_timeout",
+            "maxIdleTimeout",
+            "max_incoming_streams",
+            "maxIncomingStreams",
+        ],
+        "ssh_tunnel_gateway" => &[
+            "bind_port",
+            "bindPort",
+            "bind_addr",
+            "bindAddr",
+            "private_key_file",
+            "privateKeyFile",
+            "auto_gen_private_key_path",
+            "autoGenPrivateKeyPath",
+            "authorized_keys_file",
+            "authorizedKeysFile",
+            "ssh_session_idle_timeout",
+            "sshSessionIdleTimeout",
+            "allow_none_auth",
+            "allowNoneAuth",
+        ],
+        "observability" => &["otlp_endpoint", "service_name"],
+        "virtual_net" => &["address"],
+        "store" => &["path"],
+        _ => return None,
+    };
+    Some(keys)
+}
+
 pub(super) fn check_strict(
     table: &toml::Table,
     known: &std::collections::HashSet<&str>,
@@ -216,7 +369,7 @@ pub(super) fn check_strict(
 ) -> Vec<String> {
     let mut errors = Vec::new();
     // Sections whose keys are wildcards (HashMap via #[serde(flatten)])
-    let wildcard_sections: &[&str] = &["feature"];
+    let wildcard_sections: &[&str] = &["feature", "metas"];
 
     for key in table.keys() {
         let full_key = if path.is_empty() {
@@ -225,30 +378,47 @@ pub(super) fn check_strict(
             format!("{}.{}", path, key)
         };
 
+        let parent_section = path.rsplit('.').next().unwrap_or("");
+        if wildcard_sections.contains(&parent_section) {
+            continue;
+        }
+
         if !known.contains(key.as_str()) {
-            let parent_section = path.rsplit('.').next().unwrap_or("");
-            if !wildcard_sections.contains(&parent_section) {
-                let mut msg = format!(
-                    "unknown field \"{}\" in config file {}",
-                    full_key, config_path
-                );
-                // Suggest closest known key if within edit distance 3
-                let mut best: Option<(&str, usize)> = None;
-                for known_key in known.iter() {
-                    let d = levenshtein(key, known_key);
-                    if d <= 3
-                        && (best.is_none()
-                            || d < best
-                                .expect("best set by an earlier iteration of this loop")
-                                .1)
-                    {
-                        best = Some((known_key, d));
-                    }
+            let mut msg = format!(
+                "unknown field \"{}\" in config file {}",
+                full_key, config_path
+            );
+            // Suggest closest known key if within edit distance 3
+            let mut best: Option<(&str, usize)> = None;
+            for known_key in known.iter() {
+                let d = levenshtein(key, known_key);
+                if d <= 3
+                    && (best.is_none()
+                        || d < best
+                            .expect("best set by an earlier iteration of this loop")
+                            .1)
+                {
+                    best = Some((known_key, d));
                 }
-                if let Some((suggestion, _)) = best {
-                    msg.push_str(&format!(" — did you mean '{}'?", suggestion));
-                }
-                errors.push(msg);
+            }
+            if let Some((suggestion, _)) = best {
+                msg.push_str(&format!(" — did you mean '{}'?", suggestion));
+            }
+            errors.push(msg);
+            continue;
+        }
+
+        // Recurse into known sub-tables with per-section known-key sets so
+        // nested unknown fields are caught too (Go strict mode checks the
+        // whole config tree, not just the top level).
+        if let Some(toml::Value::Table(sub)) = table.get(key) {
+            if let Some(sub_keys) = section_known_keys(key) {
+                errors.extend(check_strict(
+                    sub,
+                    &known_set_from(sub_keys),
+                    &full_key,
+                    config_path,
+                ));
             }
         }
     }
