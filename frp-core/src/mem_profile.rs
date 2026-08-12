@@ -99,6 +99,10 @@ mod tests {
         // in the test binary — so we allocate through the wrapper directly.)
         let (_, t0, _) = snapshot();
         let layout = Layout::from_size_align(4096, 8).unwrap();
+        // SAFETY: `layout` is valid (non-zero 4096-byte size, alignment 8),
+        // and `dealloc` below receives the same layout with the exact
+        // pointer returned by the matching `alloc` — the `GlobalAlloc`
+        // contract as required by `CountingAlloc.alloc`/`dealloc`.
         unsafe {
             let p = CountingAlloc.alloc(layout);
             assert!(!p.is_null());
@@ -116,6 +120,10 @@ mod tests {
         // Direct alloc/dealloc through the wrapper moves LIVE_BYTES by size.
         let before = LIVE_BYTES.load(Ordering::Relaxed);
         let layout = Layout::from_size_align(8192, 8).unwrap();
+        // SAFETY: `layout` is valid (non-zero 8192-byte size, alignment 8),
+        // and `dealloc` below receives the same layout with the exact
+        // pointer returned by the matching `alloc` — the `GlobalAlloc`
+        // contract as required by `CountingAlloc.alloc`/`dealloc`.
         unsafe {
             let p = CountingAlloc.alloc(layout);
             assert!(!p.is_null());

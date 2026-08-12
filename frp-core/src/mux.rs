@@ -76,18 +76,14 @@ pub type YamuxStream = Compat<Stream>;
 
 /// Stub type when tcp-mux is disabled. Never constructed at runtime;
 /// only exists as a type-level stub when the tcp-mux feature is disabled.
+/// Auto-implements `Send`/`Sync` (its only field is the zero-sized `()`),
+/// which the `IoStream::Yamux` type-erased transport requires — no manual
+/// `unsafe impl` is needed.
 #[cfg(not(feature = "tcp-mux"))]
 #[derive(Debug)]
 pub struct YamuxStream {
     _priv: (),
 }
-
-// SAFETY: When tcp-mux is disabled, YamuxStream is never constructed at
-// runtime — it exists only as a type-level stub for the IoStream::Yamux
-// transport. All trait impls return errors. Marking Send is sound because
-// no instance of this type can exist.
-#[cfg(not(feature = "tcp-mux"))]
-unsafe impl Send for YamuxStream {}
 
 #[cfg(not(feature = "tcp-mux"))]
 impl tokio::io::AsyncRead for YamuxStream {
