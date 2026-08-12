@@ -190,11 +190,15 @@ impl AeadCipher {
 // Combined AeadStream (AsyncRead + AsyncWrite) — wraps Box<dyn AsyncReadWriteUnpin>
 // ---------------------------------------------------------------------------
 
-use crate::cipher_stream::AsyncReadWriteUnpin;
+use crate::cipher_stream::{zeroize_bytes, AsyncReadWriteUnpin};
 
 /// Read-half state for an AEAD stream.
 struct AeadReadState {
     cipher: AeadCipher,
+    /// Raw key copy retained so the key material this stream controls can be
+    /// wiped on drop (ring's `LessSafeKey` does not zeroize its internal
+    /// copy). Initialized once in `AeadStream::new`, never read otherwise.
+    raw_key: Vec<u8>,
     nonce: Vec<u8>,
     stream_nonce: Option<Vec<u8>>,
     header_read: bool,
@@ -227,6 +231,9 @@ struct AeadReadState {
 /// Write-half state for an AEAD stream.
 struct AeadWriteState {
     cipher: AeadCipher,
+    /// Raw key copy retained so the key material this stream controls can be
+    /// wiped on drop (see [`AeadReadState::raw_key`]).
+    raw_key: Vec<u8>,
     nonce: Vec<u8>,
     stream_nonce: Vec<u8>,
     header_sent: bool,
@@ -285,6 +292,7 @@ impl AeadStream {
             algorithm,
             read: AeadReadState {
                 cipher: read_cipher,
+                raw_key: read_key.to_vec(),
                 nonce: vec![0u8; nonce_size],
                 stream_nonce: None,
                 header_read: false,
@@ -302,6 +310,7 @@ impl AeadStream {
             },
             write: AeadWriteState {
                 cipher: write_cipher,
+                raw_key: write_key.to_vec(),
                 nonce: write_nonce.clone(),
                 stream_nonce: write_nonce.clone(),
                 header_sent: false,
@@ -313,6 +322,22 @@ impl AeadStream {
                 aad_buf: Vec::with_capacity(nonce_size + AEAD_FRAME_HEADER_SIZE),
             },
         })
+    }
+}
+
+impl Drop for AeadReadState {
+    fn drop(&mut self) {
+        // Wipe the raw key copy (defense-in-depth: ring's internal key copy
+        // is out of our reach).
+        zeroize_bytes(&mut self.raw_key);
+    }
+}
+
+impl Drop for AeadWriteState {
+    fn drop(&mut self) {
+        // Wipe the raw key copy (defense-in-depth: ring's internal key copy
+        // is out of our reach).
+        zeroize_bytes(&mut self.raw_key);
     }
 }
 

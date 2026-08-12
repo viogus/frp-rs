@@ -31,6 +31,25 @@ use aes::Aes128;
 pub trait AsyncReadWriteUnpin: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWriteUnpin for T {}
 
+/// Overwrite `buf` with zeros using volatile stores.
+///
+/// A plain `fill(0)`/`memset` can be eliminated by LLVM as a dead store when
+/// the allocation is freed immediately after (the typical lifetime of a
+/// cipher key), so the wipe must survive optimization to actually erase the
+/// material. Same primitive as `auth::zeroize_string`.
+pub(crate) fn zeroize_bytes(buf: &mut [u8]) {
+    let ptr = buf.as_mut_ptr();
+    let len = buf.len();
+    // SAFETY: `ptr..ptr+len` is exactly the allocation backing `buf`, valid
+    // for the slice's lifetime (we hold `&mut [u8]`), and `u8` writes are
+    // valid for any alignment. Each `write_volatile` is a single byte store.
+    unsafe {
+        for i in 0..len {
+            core::ptr::write_volatile(ptr.add(i), 0u8);
+        }
+    }
+}
+
 /// CFB-128 state matching Go frp's `crypto/cipher` CFB mode.
 ///
 /// In CFB-128 mode, AES encrypts the feedback register to produce a 16-byte
@@ -142,6 +161,17 @@ impl CfbState {
     }
 }
 
+impl Drop for CfbState {
+    fn drop(&mut self) {
+        // Wipe the feedback register and keystream block: they hold derived
+        // key material (the IV-then-ciphertext feedback chained through AES)
+        // that would otherwise persist in memory after the cipher state is
+        // freed. The AES key schedule inside `aes` is out of our reach.
+        zeroize_bytes(&mut self.feedback);
+        zeroize_bytes(&mut self.keystream);
+    }
+}
+
 /// Streaming AES-128-CFB decrypting reader.
 ///
 /// On first read, consumes a 16-byte IV from the underlying stream (sent by
@@ -164,6 +194,13 @@ impl<R: AsyncRead + Unpin> CipherReader<R> {
             iv_buf: [0u8; 16],
             iv_read: 0,
         }
+    }
+}
+
+impl<R: AsyncRead + Unpin> Drop for CipherReader<R> {
+    fn drop(&mut self) {
+        // Wipe the AES-128 key copy this reader retains.
+        zeroize_bytes(&mut self.key);
     }
 }
 
@@ -307,6 +344,13 @@ impl<W: AsyncWrite + Unpin> CipherWriter<W> {
     }
 }
 
+impl<W: AsyncWrite + Unpin> Drop for CipherWriter<W> {
+    fn drop(&mut self) {
+        // Wipe the AES-128 key copy this writer retains.
+        zeroize_bytes(&mut self.key);
+    }
+}
+
 impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -319,6 +363,12 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         if let Some(ref pending) = this.first_write_buf {
             let remaining = &pending[this.first_write_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.first_write_pos += n;
                     if this.first_write_pos >= pending.len() {
@@ -365,6 +415,12 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
                 Poll::Ready(Ok(n)) if n >= output.len() => {
                     return Poll::Ready(Ok(buf.len()));
                 }
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.first_write_buf = Some(output);
                     this.first_write_pos = n;
@@ -386,6 +442,12 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         if let Some(ref pending) = this.encrypted_buf {
             let remaining = &pending[this.encrypted_write_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
@@ -417,6 +479,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         cfb.encrypt(&mut this.scratch);
         match Pin::new(&mut this.inner).poll_write(cx, &this.scratch) {
             Poll::Ready(Ok(n)) if n >= this.scratch.len() => Poll::Ready(Ok(buf.len())),
+            Poll::Ready(Ok(0)) => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
+            }
             Poll::Ready(Ok(n)) => {
                 // Partial write: hand the un-written remainder to the pending
                 // buffer (rare backpressure path — pays one alloc via take).
@@ -441,6 +506,12 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         if let Some(ref pending) = this.first_write_buf {
             let remaining = &pending[this.first_write_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.first_write_pos += n;
                     if this.first_write_pos >= pending.len() {
@@ -461,6 +532,12 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         if let Some(ref pending) = this.encrypted_buf {
             let remaining = &pending[this.encrypted_write_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
@@ -492,6 +569,12 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
             this.cfb = Some(CfbState::new(&this.key, &iv));
             match Pin::new(&mut this.inner).poll_write(cx, &iv) {
                 Poll::Ready(Ok(n)) if n >= 16 => {}
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.first_write_data_len = 0; // IV-only, no payload data
                     this.first_write_buf = Some(iv.to_vec());
@@ -610,6 +693,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> CipherStream<S> {
     }
 }
 
+impl<S: AsyncRead + AsyncWrite + Unpin> Drop for CipherStream<S> {
+    fn drop(&mut self) {
+        // Wipe both directional AES-128 key copies this stream retains.
+        zeroize_bytes(&mut self.read_key);
+        zeroize_bytes(&mut self.write_key);
+    }
+}
+
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for CipherStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -712,6 +803,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
         if let Some(ref pending) = this.first_write_buf {
             let remaining = &pending[this.first_write_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.first_write_pos += n;
                     if this.first_write_pos >= pending.len() {
@@ -756,6 +853,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
                 Poll::Ready(Ok(n)) if n >= output.len() => {
                     return Poll::Ready(Ok(buf.len()));
                 }
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.first_write_buf = Some(output);
                     this.first_write_pos = n;
@@ -777,6 +880,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
         if let Some(ref pending) = this.encrypted_buf {
             let remaining = &pending[this.encrypted_write_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
@@ -808,6 +917,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
         cfb.encrypt(&mut this.scratch);
         match Pin::new(&mut this.inner).poll_write(cx, &this.scratch) {
             Poll::Ready(Ok(n)) if n >= this.scratch.len() => Poll::Ready(Ok(buf.len())),
+            Poll::Ready(Ok(0)) => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
+            }
             Poll::Ready(Ok(n)) => {
                 this.encrypted_buf = Some(std::mem::take(&mut this.scratch));
                 this.encrypted_write_pos = n;
@@ -830,6 +942,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
         if let Some(ref pending) = this.first_write_buf {
             let remaining = &pending[this.first_write_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.first_write_pos += n;
                     if this.first_write_pos >= pending.len() {
@@ -850,6 +968,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
         if let Some(ref pending) = this.encrypted_buf {
             let remaining = &pending[this.encrypted_write_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
@@ -876,6 +1000,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
             this.write_cfb = Some(CfbState::new(&this.write_key, &this.write_iv));
             match Pin::new(&mut this.inner).poll_write(cx, &this.write_iv) {
                 Poll::Ready(Ok(n)) if n >= 16 => {}
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.first_write_data_len = 0; // IV-only, no payload data
                     this.first_write_buf = Some(this.write_iv.to_vec());
