@@ -157,14 +157,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for SnappyStreamReader<R> {
                 }
             }
             if filled == 0 {
-                // Tradeoff vs Go's snappy.Reader: a truncated stream with a
-                // partial frame buffered in the decompressor is reported as a
-                // clean EOF here (bytes silently dropped), while Go returns
-                // ErrUnexpectedEOF. Normal teardown is unaffected (the writer
-                // flushes complete frames before shutdown); only an
-                // aborted/half-closed writer diverges, and for the visitor
-                // data plane the connection is torn down anyway.
                 this.eof = true;
+                // A truncated stream (partial frame buffered at EOF) must
+                // surface as an error, matching Go's snappy.Reader
+                // (ErrUnexpectedEOF), instead of silently dropping the tail
+                // bytes. Normal teardown is unaffected: the writer flushes
+                // complete frames before shutdown, so validate_partial_eof()
+                // is a no-op on a well-formed stream.
+                if let Err(e) = this.decompressor.validate_partial_eof() {
+                    return Poll::Ready(Err(io_err(e)));
+                }
                 return Poll::Ready(Ok(()));
             }
             this.out_buf.clear();
