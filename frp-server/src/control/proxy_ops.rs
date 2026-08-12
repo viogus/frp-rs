@@ -1447,17 +1447,29 @@ pub(crate) async fn unregister_control(
         // == 0 (legacy callers) sweeps everything.
         .filter(|p| control_id == 0 || p.control_id <= control_id)
         .collect();
+    // TODO(audit-fix): residual port-mark leak on barrier-timeout
+    // supersession. When the 10s handoff barrier times out and the
+    // superseding control has already re-registered the same proxy names,
+    // those names are skipped here (newer control_id) — but the OLD
+    // control's original port marks in used_ports/used_udp_ports are never
+    // released, and nothing prunes used_ports (the 24h pruner only touches
+    // port_reservations). Real fix: have proxy_manager.register() return
+    // the ProxyInfo it replaced so the superseding login can free the old
+    // control's different port (same note at control/proxy.rs skip path).
     // TCP port cleanup. Phase 1 (no locks held): decide what to release.
     // group_len is queried here — NOT while holding used_ports — and the
     // port_reservations inserts / remove_group / sk_index calls run after
     // the used_ports guard is dropped (phase 3). Holding used_ports across
     // those inverts the lock order vs allocate_proxy_port
     // (port_reservations → used_ports) and deadlocks both on
-    // reconnect-during-cleanup. The registry is not mutated during cleanup,
-    // so the group_len decisions stay valid until phase 3.
+    // reconnect-during-cleanup. The observed group_len is re-checked in
+    // phase 3 before remove_group, so a concurrent member join between the
+    // phases cannot leave a live group without its shared listener.
     let mut ports_to_remove: Vec<u16> = Vec::new();
     let mut reservations: Vec<(String, u16)> = Vec::new();
-    let mut groups_to_remove: Vec<String> = Vec::new();
+    // (group name, member count observed in phase 1) — the count is
+    // re-checked in phase 3 before remove_group.
+    let mut groups_to_remove: Vec<(String, usize)> = Vec::new();
     for p in &proxies {
         if let Some(port) = p.remote_port {
             // For TCP group proxies, only release the port if this is the last
@@ -1468,12 +1480,13 @@ pub(crate) async fn unregister_control(
             if is_tcp_group {
                 // Check if the group still has other members
                 let group_name = p.group.as_deref().unwrap_or("");
-                if state.proxy_manager.group_len(group_name).await <= 1 {
+                let group_len = state.proxy_manager.group_len(group_name).await;
+                if group_len <= 1 {
                     ports_to_remove.push(port);
                     if port > 0 {
                         reservations.push((p.name.clone(), port));
                     }
-                    groups_to_remove.push(group_name.to_string());
+                    groups_to_remove.push((group_name.to_string(), group_len));
                 }
             } else if p.proxy_type != "udp" && p.proxy_type != "sudp" {
                 ports_to_remove.push(port);
@@ -1498,9 +1511,19 @@ pub(crate) async fn unregister_control(
             .await
             .insert(name.clone(), (*port, false, std::time::Instant::now()));
     }
-    for group_name in &groups_to_remove {
-        // Stop the shared group listener
-        state.tcp_group_ctl.remove_group(group_name).await;
+    for (group_name, len_at_phase1) in &groups_to_remove {
+        // Re-check before stopping the shared listener: a concurrent member
+        // join can land between the phase-1 group_len decision above and this
+        // point (register() pushes to the group index under its own lock).
+        // remove_group would then kill the listener out from under a live
+        // group — a dead group with a live member. Skip teardown when the
+        // member count changed from what phase 1 observed. The port mark was
+        // already freed in phase 2 either way, but the listener's OS bind
+        // keeps the port from being re-allocated until the group empties.
+        if state.proxy_manager.group_len(group_name).await == *len_at_phase1 {
+            // Stop the shared group listener
+            state.tcp_group_ctl.remove_group(group_name).await;
+        }
     }
     // Clean up STCP sk_index (indexed by proxy_name — exact match, no
     // risk of removing another proxy's entry even when keys are shared)
@@ -2145,6 +2168,85 @@ pub(crate) mod unregister_generation_tests {
             .await
             .get("p1")
             .is_some_and(|&(port, is_udp, _)| port == 49901 && !is_udp));
+    }
+
+    #[tokio::test]
+    async fn unregister_group_len_recheck_keeps_listener_on_concurrent_join() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+
+        // A live TCP group proxy for run-1: only member of group "grp".
+        let mut g1 = proxy_info("g1", "tcp", "run-1", Some(49911), 1);
+        g1.group = Some("grp".to_string());
+        g1.group_key = Some("grp-key".to_string());
+        state
+            .proxy_manager
+            .register("run-1".to_string(), g1)
+            .await
+            .expect("register g1");
+        assert_eq!(state.proxy_manager.group_len("grp").await, 1);
+
+        // The shared group listener exists (normally created by the NewProxy
+        // handler for the first member).
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        state
+            .tcp_group_ctl
+            .create_group(
+                "grp",
+                "grp-key",
+                49911,
+                "0.0.0.0",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+
+        // Stage the interleaving: hold port_reservations so the cleanup parks
+        // at its phase-3 reservation insert — AFTER the phase-1 group_len
+        // decision but BEFORE the phase-3 remove_group re-check. Every await
+        // before that park (list_client, group_len, used_ports) is
+        // uncontended, so a removed run_id entry means the task is parked
+        // there with the phase-1 group_len already observed.
+        let held_reservations = state.port_reservations.write().await;
+        let unreg = tokio::spawn({
+            let state = state.clone();
+            async move { unregister_control(&state, "run-1", 1, false).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !state.run_id_to_ctl_tx.contains_key("run-1"),
+            "cleanup should have passed phase 1 and parked on port_reservations"
+        );
+
+        // A concurrent group-member join lands between phase 1 and phase 3.
+        let mut g2 = proxy_info("g2", "tcp", "run-2", Some(49911), 2);
+        g2.group = Some("grp".to_string());
+        g2.group_key = Some("grp-key".to_string());
+        state
+            .proxy_manager
+            .register("run-2".to_string(), g2)
+            .await
+            .expect("register g2");
+        assert_eq!(state.proxy_manager.group_len("grp").await, 2);
+
+        // Let the cleanup proceed: its phase-3 re-check must notice the
+        // joined member and skip remove_group, keeping the shared listener
+        // alive for the remaining live member.
+        drop(held_reservations);
+        tokio::time::timeout(Duration::from_secs(5), unreg)
+            .await
+            .expect("cleanup hung")
+            .expect("cleanup task panicked");
+
+        // The group listener survives with its live member.
+        assert!(
+            state.tcp_group_ctl.group_exists("grp").await,
+            "shared group listener must survive a concurrent member join"
+        );
+        assert!(!cancel_token.is_cancelled());
+        assert_eq!(state.proxy_manager.group_len("grp").await, 2);
+        assert!(state.proxy_manager.get("g2").await.is_some());
     }
 
     #[cfg(feature = "vnet")]

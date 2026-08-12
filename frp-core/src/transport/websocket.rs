@@ -609,6 +609,15 @@ impl AsyncWrite for WsByteStream {
                 // builds and writes a fresh frame.
                 let remaining = &write_buf[*write_pos..];
                 match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
+                    Poll::Ready(Ok(0)) => {
+                        // `remaining` is non-empty here (needs_flush is only
+                        // set while frame bytes remain), so zero progress is a
+                        // fatal write-zero — self-waking and re-polling would
+                        // spin at 100% CPU until the inner makes progress.
+                        // Mirrors CipherWriter's WriteZero handling.
+                        *needs_flush = false;
+                        Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
+                    }
                     Poll::Ready(Ok(n)) => {
                         *write_pos += n;
                         if *write_pos >= write_buf.len() {
@@ -647,6 +656,13 @@ impl AsyncWrite for WsByteStream {
         if needs_flush_local {
             let remaining = &write_buf[*write_pos..];
             match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    // Same pathological-inner guard as poll_write: zero
+                    // progress on a non-empty remainder is a write-zero error,
+                    // not a self-wake spin.
+                    *needs_flush = false;
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
+                }
                 Poll::Ready(Ok(n)) => {
                     *write_pos += n;
                     if *write_pos >= write_buf.len() {
@@ -862,5 +878,89 @@ mod tests {
             err.to_string().contains("WS frame too large"),
             "unexpected error: {err}"
         );
+    }
+
+    /// AsyncRead+AsyncWrite stub returning `Ok(0)` for the first `zeros`
+    /// poll_write calls, then accepting everything — pins WriteZero handling
+    /// for a pathological inner transport.
+    struct ZeroThenSink {
+        zeros: usize,
+    }
+
+    impl AsyncRead for ZeroThenSink {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ZeroThenSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.zeros > 0 {
+                self.zeros -= 1;
+                return Poll::Ready(Ok(0));
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A partially-flushed frame whose inner writer returns `Ok(0)` must
+    /// surface as `WriteZero` on the continuation poll instead of self-waking
+    /// into an immediate-repoll 100% CPU spin.
+    #[test]
+    fn partial_frame_flush_ok_zero_is_write_zero() {
+        let mut ws = WsByteStream::from_raw(Box::new(ZeroThenSink { zeros: 2 }), false);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let buf = vec![0x5Au8; 32];
+
+        // Poll 1: the fresh frame write hits Ok(0) → needs_flush, Pending.
+        assert!(matches!(
+            Pin::new(&mut ws).poll_write(&mut cx, &buf),
+            Poll::Pending
+        ));
+
+        // Poll 2: the continuation flush hits Ok(0) on a non-empty remainder →
+        // WriteZero error, not a self-wake → Pending spin.
+        match Pin::new(&mut ws).poll_write(&mut cx, &buf) {
+            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::WriteZero),
+            other => panic!("expected WriteZero error, got {other:?}"),
+        }
+    }
+
+    /// Same pathological-inner guard on the `poll_flush` continuation path.
+    #[test]
+    fn partial_frame_flush_ok_zero_in_poll_flush_is_write_zero() {
+        let mut ws = WsByteStream::from_raw(Box::new(ZeroThenSink { zeros: 2 }), false);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let buf = vec![0x5Au8; 32];
+
+        // Prime a partial flush: fresh frame write hits Ok(0) → needs_flush.
+        assert!(matches!(
+            Pin::new(&mut ws).poll_write(&mut cx, &buf),
+            Poll::Pending
+        ));
+
+        // The poll_flush continuation hits Ok(0) → WriteZero error.
+        match Pin::new(&mut ws).poll_flush(&mut cx) {
+            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::WriteZero),
+            other => panic!("expected WriteZero error, got {other:?}"),
+        }
     }
 }

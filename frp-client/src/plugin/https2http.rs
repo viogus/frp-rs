@@ -140,8 +140,14 @@ async fn handle_conn(
     // A body-forward error must NOT drop the connection: backends reply early
     // without reading the full request (e.g. nginx's 413 client_max_body_size),
     // and Go's Transport still delivers those responses.
-    if let Err(e) =
-        crate::plugin::forward_request_body(&mut tls, &mut remote, &fwd.body_prefix, fwd.body).await
+    if let Err(e) = crate::plugin::forward_request_body(
+        &mut tls,
+        &mut remote,
+        &fwd.body_prefix,
+        fwd.body,
+        &fwd.method,
+    )
+    .await
     {
         tracing::debug!(error = %e, "request body forward failed, relaying response anyway: {}", e);
     }

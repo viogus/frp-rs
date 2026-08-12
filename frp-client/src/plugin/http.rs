@@ -200,7 +200,10 @@ async fn handle_http_forward(
     // Build forwarded request: rewrite request line, strip hop-by-hop and
     // proxy headers (Go removeProxyHeaders: Connection, Proxy-Connection,
     // Keep-Alive, Proxy-Authorization, Proxy-Authenticate, TE, Trailer(s),
-    // Transfer-Encoding, Upgrade), add Connection: close.
+    // Transfer-Encoding, Upgrade; Expect is stripped too — the plugin
+    // cannot relay the interim 100-continue response, and a strict client
+    // that gates its body-send on it would deadlock against the body read,
+    // RFC 7231 §5.1.1), add Connection: close.
     let headers_str = String::from_utf8_lossy(header_bytes);
     let hop_by_hop: &[&str] = &[
         "transfer-encoding:",
@@ -212,11 +215,17 @@ async fn handle_http_forward(
         "upgrade:",
         "connection:",
         "keep-alive:",
+        "expect:",
     ];
     let mut header_lines: Vec<&str> = headers_str.lines().skip(1).collect();
     // Body framing is parsed from the original headers — Transfer-Encoding
     // is stripped below as hop-by-hop and re-added only when chunked.
     let framing = super::parse_request_body_framing(headers_str.lines().skip(1));
+    // Content-Length is resolved per RFC 7230 §3.3.2 ("reject or replace
+    // with a single value"): duplicate identical values collapse to one
+    // line, list-form values ("5, 5") sum, and conflicting values make the
+    // request framing invalid — reject (the connection closes).
+    let content_length = super::resolve_content_length(headers_str.lines().skip(1))?;
     header_lines.retain(|line| {
         // Skip the head's trailing blank line(s) too: lines() yields "" for
         // the \r\n\r\n terminator, and forwarding it would terminate the
@@ -225,10 +234,14 @@ async fn handle_http_forward(
         if line.is_empty() || hop_by_hop.iter().any(|h| lower.starts_with(h)) {
             return false;
         }
-        // Drop Content-Length when the body is chunked (RFC 7230 §3.3.3):
-        // Go's http.Server deletes CL when Transfer-Encoding is chunked,
-        // and forwarding the ambiguous pair is request-smuggling shaped.
-        if framing == Some(super::BodyFraming::Chunked) && lower.starts_with("content-length:") {
+        // Drop every original Content-Length line: when chunked per RFC
+        // 7230 §3.3.3, or when a usable Content-Length was resolved — all
+        // CL lines are then replaced by a single canonical line appended
+        // after the loop (RFC 7230 §3.3.2; forwarding duplicate/conflicting
+        // values would desync the backend).
+        if lower.starts_with("content-length:")
+            && (framing == Some(super::BodyFraming::Chunked) || content_length.is_some())
+        {
             return false;
         }
         true
@@ -242,6 +255,10 @@ async fn handle_http_forward(
     }
     if framing == Some(super::BodyFraming::Chunked) {
         fwd.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    } else if let Some(n) = content_length {
+        // Exactly one Content-Length line (RFC 7230 §3.3.2), matching the
+        // byte count the body forward will stream.
+        fwd.extend_from_slice(format!("Content-Length: {n}\r\n").as_bytes());
     }
     fwd.extend_from_slice(b"Connection: close\r\n\r\n");
 
@@ -256,7 +273,8 @@ async fn handle_http_forward(
     // A body-forward error must NOT drop the connection: backends reply early
     // without reading the full request (e.g. nginx's 413 client_max_body_size),
     // and Go's Transport still delivers those responses.
-    if let Err(e) = super::forward_request_body(&mut client, &mut remote, body_bytes, framing).await
+    if let Err(e) =
+        super::forward_request_body(&mut client, &mut remote, body_bytes, framing, method).await
     {
         tracing::debug!(error = %e, "request body forward failed, relaying response anyway: {}", e);
     }
