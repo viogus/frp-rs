@@ -10,12 +10,16 @@ use crate::proxy_runtime::ProxyRuntimeInfo;
 /// Build a config snapshot string for reload change detection.
 /// Includes all fields that matter for proxy registration and plugin config.
 pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
-    // Sort and serialize key fields deterministically
-    // Hash sk for change detection — never include plaintext secret in snapshot.
-    let sk_hash = if p.sk.is_empty() {
-        String::new()
-    } else {
-        frp_core::auth::generate_token(&p.sk, 0)
+    // Sort and serialize key fields deterministically.
+    // Hash secrets for change detection — never include plaintext secrets in
+    // the snapshot (same policy as `sk`; change detection only needs the
+    // hash to differ when the value differs).
+    let hash_secret = |s: &str| -> String {
+        if s.is_empty() {
+            String::new()
+        } else {
+            frp_core::auth::generate_token(s, 0)
+        }
     };
     let mut fields: Vec<(&str, String)> = vec![
         ("type", p.proxy_type.clone()),
@@ -24,17 +28,17 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
         ("remote_port", p.remote_port.to_string()),
         ("use_encryption", p.use_encryption.to_string()),
         ("use_compression", p.use_compression.to_string()),
-        ("sk", sk_hash),
+        ("sk", hash_secret(&p.sk)),
         ("custom_domains", format!("{:?}", p.custom_domains)),
         ("subdomain", p.subdomain.clone()),
         ("http_user", p.http_user.clone()),
-        ("http_pwd", p.http_pwd.clone()),
+        ("http_pwd", hash_secret(&p.http_pwd)),
         ("host_header_rewrite", p.host_header_rewrite.clone()),
         ("locations", format!("{:?}", p.locations)),
         ("bandwidth_limit", p.bandwidth_limit.clone()),
         ("bandwidth_limit_mode", p.bandwidth_limit_mode.clone()),
         ("group", p.group.clone()),
-        ("group_key", p.group_key.clone()),
+        ("group_key", hash_secret(&p.group_key)),
         ("multiplexer", p.multiplexer.clone()),
         ("proxy_protocol_version", p.proxy_protocol_version.clone()),
         ("vnet_ip", p.vnet_ip.clone()),
@@ -48,17 +52,17 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
     if let Some(ref pl) = p.plugin {
         fields.push(("plugin.type", pl.plugin_type.clone()));
         fields.push(("plugin.http_user", pl.http_user.clone()));
-        fields.push(("plugin.http_password", pl.http_password.clone()));
+        fields.push(("plugin.http_password", hash_secret(&pl.http_password)));
         fields.push(("plugin.local_addr", pl.local_addr.clone()));
         fields.push(("plugin.local_path", pl.local_path.clone()));
         fields.push(("plugin.strip_prefix", pl.strip_prefix.clone()));
         fields.push(("plugin.host_header_rewrite", pl.host_header_rewrite.clone()));
         fields.push(("plugin.username", pl.username.clone()));
-        fields.push(("plugin.password", pl.password.clone()));
+        fields.push(("plugin.password", hash_secret(&pl.password)));
         fields.push(("plugin.crt_file", pl.crt_file.clone()));
         fields.push(("plugin.key_file", pl.key_file.clone()));
         fields.push(("plugin.server_name", pl.server_name.clone()));
-        fields.push(("plugin.secret_key", pl.secret_key.clone()));
+        fields.push(("plugin.secret_key", hash_secret(&pl.secret_key)));
         fields.push(("plugin.bind_addr", pl.bind_addr.clone()));
         fields.push(("plugin.bind_port", pl.bind_port.to_string()));
     } else {

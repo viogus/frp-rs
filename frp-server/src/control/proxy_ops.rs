@@ -1115,6 +1115,11 @@ async fn setup_proxy_listeners(
 }
 
 /// Register a new proxy and start listening on its assigned port.
+/// Returns `true` when the proxy was fully registered (listener up, success
+/// response written), `false` when it was rejected at any stage — the caller
+/// uses this to attach per-proxy side state only to successful
+/// registrations (a rejected duplicate must not replace the live side state
+/// of a running proxy).
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(state, writer, internal_tx, listener_handles, udp_sockets), fields(proxy_name = %np.proxy_name, proxy_type = %np.proxy_type, run_id = %run_id))]
 pub(crate) async fn handle_new_proxy(
@@ -1127,10 +1132,10 @@ pub(crate) async fn handle_new_proxy(
     listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     v2: bool,
-) {
+) -> bool {
     if let Err(e) = validate_new_proxy(&np) {
         reject_new_proxy(writer, &np.proxy_name, e, v2).await;
-        return;
+        return false;
     }
     let remote_port = np.remote_port.unwrap_or(0) as u16;
 
@@ -1156,7 +1161,7 @@ pub(crate) async fn handle_new_proxy(
             });
         }
         reject_new_proxy(writer, &np.proxy_name, reason, v2).await;
-        return;
+        return false;
     }
 
     // Go frp compat: only TCP/UDP proxies consume ports. HTTP/HTTPS/TCPMux
@@ -1184,7 +1189,7 @@ pub(crate) async fn handle_new_proxy(
                 v2,
             )
             .await;
-            return;
+            return false;
         }
     }
 
@@ -1243,7 +1248,9 @@ pub(crate) async fn handle_new_proxy(
                 false,
             )
             .await;
-            return;
+            // TCP group member path: the callee completed its own
+            // registration (or rejection) — never udp/sudp.
+            return true;
         }
         // No existing group — will create one with a new shared listener.
         tcp_group_created = true;
@@ -1315,7 +1322,7 @@ pub(crate) async fn handle_new_proxy(
                             v2,
                         )
                         .await;
-                        return;
+                        return false;
                     }
                 }
             };
@@ -1375,7 +1382,7 @@ pub(crate) async fn handle_new_proxy(
             if np.proxy_type == "http"
                 && !register_http_vhost(state, &np, run_id, port, writer, v2).await
             {
-                return;
+                return false;
             }
 
             // Register HTTPS proxies with VhostManager for SNI routing.
@@ -1384,7 +1391,7 @@ pub(crate) async fn handle_new_proxy(
             if np.proxy_type == "https"
                 && !register_https_vhost(state, &np, run_id, port, writer, v2).await
             {
-                return;
+                return false;
             }
 
             // Register TCPMux proxies with TcpMuxManager (domain-based CONNECT routing).
@@ -1404,7 +1411,7 @@ pub(crate) async fn handle_new_proxy(
                     )
                     .await;
                     state.proxy_manager.remove(&np.proxy_name).await;
-                    return;
+                    return false;
                 }
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
@@ -1440,7 +1447,7 @@ pub(crate) async fn handle_new_proxy(
                         v2,
                     )
                     .await;
-                    return;
+                    return false;
                 }
                 info!(
                     proxy_name = %np.proxy_name, domains = ?domains, "TCPMux routes registered for '{}': domains={:?}",
@@ -1465,7 +1472,7 @@ pub(crate) async fn handle_new_proxy(
             .await
             {
                 Ok(signals) => signals,
-                Err(()) => return,
+                Err(()) => return false,
             };
 
             info!(proxy_name = %np.proxy_name, port = %port, run_id = %run_id, "Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
@@ -1481,7 +1488,13 @@ pub(crate) async fn handle_new_proxy(
                 });
             }
 
-            let remote_addr_str = format!("{}:{}", state.proxy_bind_addr, port);
+            // remote_addr is ":port" (Go frp parity — Go's NewProxyResp
+            // uses fmt.Sprintf(":%d", ...) and the client treats it as an
+            // opaque string; the TCP group path below already sends this
+            // form). No Rust-side consumer parses the host prefix — the
+            // frpc stores it opaquely for status display, and tests parse
+            // the port with rsplit(':').
+            let remote_addr_str = format!(":{}", port);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: np.proxy_name.clone(),
                 remote_addr: Some(remote_addr_str),
@@ -1496,10 +1509,13 @@ pub(crate) async fn handle_new_proxy(
             for tx in udp_resp_signals.drain(..) {
                 let _ = tx.send(());
             }
+            // Success — all failure paths above returned false.
+            return true;
         }
         None => {
             warn!(proxy_name = %np.proxy_name, "No available port for proxy '{}'", np.proxy_name);
             reject_new_proxy(writer, &np.proxy_name, "no available port".into(), v2).await;
+            return false;
         }
     }
 }
@@ -1564,6 +1580,9 @@ pub(crate) async fn listen_and_proxy(
                         proxy_name: proxy_name.clone(),
                         user_conn: IoStream::Tcp(user_conn),
                         pre_read: vec![],
+                        user_conn_permit: None,
+                        // Local sender — no group selection was done.
+                        group_selected: false,
                     })
                     .await
                 {
@@ -1959,6 +1978,44 @@ async fn tcp_group_listener(
                             .select_group_backend_with_run_id(&group_name, "")
                             .await
                         {
+                            // Audit M5 mirror: acquire the backend's
+                            // user-conn permit BEFORE the send. Without
+                            // this, a flood of group conns to an at-cap/slow
+                            // backend queues raw sockets (each holding an
+                            // fd) in the shared 1024-slot internal channel
+                            // ahead of the backend's own permit check —
+                            // starving that control's other internal
+                            // traffic. The permit crosses the message
+                            // boundary and the backend handler consumes it
+                            // instead of re-acquiring (no double-count). A
+                            // backend without a semaphore is unlimited —
+                            // send with None. At-cap → drop the conn here
+                            // (the permit never existed; nothing to leak).
+                            let forwarded_permit = match state
+                                .proxy_manager
+                                .get(&backend)
+                                .await
+                            {
+                                Some(p) => match p.user_conn_sem.clone() {
+                                    Some(sem) => match sem.try_acquire_owned() {
+                                        Ok(permit) => Some(permit),
+                                        Err(_) => {
+                                            debug!(
+                                                group = %group_name,
+                                                proxy_name = %backend,
+                                                "Group backend '{}' at user-conn cap, dropping connection from group '{}'",
+                                                backend, group_name,
+                                            );
+                                            continue;
+                                        }
+                                    },
+                                    None => None,
+                                },
+                                // Backend vanished mid-forward — carry no
+                                // permit; the send will surface the closed
+                                // channel.
+                                None => None,
+                            };
                             let ctl_tx = state
                                 .run_id_to_ctl_tx
                                 .get(&backend_run_id)
@@ -1969,12 +2026,21 @@ async fn tcp_group_listener(
                                 // stalls until the backend control handler
                                 // drains, letting the kernel backlog absorb
                                 // bursts. A closed channel means the backend
-                                // control is gone; the connection is dropped.
+                                // control is gone; the message (with its
+                                // permit) is dropped, returning the permit
+                                // to the semaphore — nothing leaks.
                                 if let Err(e) = tx
                                     .send(InternalMsg::ProxyUserConn {
                                         proxy_name: backend,
                                         user_conn: frp_core::transport::IoStream::Tcp(conn),
                                         pre_read: vec![],
+                                        user_conn_permit: forwarded_permit,
+                                        // Backend already selected here —
+                                        // the receiving handler must route
+                                        // directly, not re-run group
+                                        // selection (would bounce the conn
+                                        // between members forever).
+                                        group_selected: true,
                                     })
                                     .await
                                 {

@@ -250,7 +250,13 @@ async fn handle_http_forward(
     let mut fwd = Vec::new();
     fwd.extend_from_slice(format!("{method} {path} HTTP/1.0\r\n").as_bytes());
     for line in &header_lines {
-        fwd.extend_from_slice(line.as_bytes());
+        // Strip CR/LF from forwarded header lines: `lines()` splits only on
+        // `\n`, so a lone `\r` inside a header line (malformed client) would
+        // otherwise survive into the forwarded request as an injected line
+        // (request-smuggling shape). Same policy as read_request_and_build_
+        // forward and the h2 path, which reject CR/LF outright.
+        let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
+        fwd.extend_from_slice(safe_line.as_bytes());
         fwd.extend_from_slice(b"\r\n");
     }
     if framing == Some(super::BodyFraming::Chunked) {

@@ -190,10 +190,17 @@ impl Service {
     /// Start a single plugin and return its handle with resolved bound address.
     /// Used during reload to restart plugins with updated config.
     /// Returns None if plugin_type is unknown or start fails (logged internally).
+    ///
+    /// `use_encryption`/`use_compression` come from the owning proxy's config:
+    /// PluginConfig has no such fields, and the visitor plugin's NewVisitorConn
+    /// wire declaration plus its P2P bridge wrappers (visitor.rs) must match
+    /// what the proxy declares, not a hardcoded value.
     pub(crate) async fn start_plugin(
         &self,
         proxy_name: &str,
         plugin_cfg: &frp_core::config::PluginConfig,
+        use_encryption: bool,
+        use_compression: bool,
     ) -> Option<PluginHandle> {
         if plugin_cfg.plugin_type == "virtual_net" {
             return None;
@@ -207,8 +214,8 @@ impl Service {
                 tls_enable: current_cfg.tls_enable,
                 tls_server_name: current_cfg.tls_server_name.clone(),
                 tls_ca_file: opt_if_empty!(current_cfg.tls_ca_file),
-                use_encryption: true,
-                use_compression: false,
+                use_encryption,
+                use_compression,
                 token: self.auth_cfg.token.clone(),
                 oidc_client: self.oidc_client.clone(),
                 tcp_mux: current_cfg.tcp_mux,
@@ -624,8 +631,10 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
 }
 
 /// Max length of a chunk-size / trailer line in a chunked request body
-/// (matches the 64 KiB request-head cap).
-const CHUNK_LINE_MAX: usize = 64 * 1024;
+/// (matches the 64 KiB request-head cap). Shared with the h2 plugin's
+/// response-side chunked reader (plugin/h2.rs), which enforces the same
+/// bound on chunk-size / trailer lines read from the backend.
+pub(super) const CHUNK_LINE_MAX: usize = 64 * 1024;
 
 /// Stream a request body to `writer`: first the bytes that arrived together
 /// with the request head (`body_prefix`), then the rest of the body per its

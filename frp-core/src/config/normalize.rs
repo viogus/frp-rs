@@ -365,15 +365,6 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             table.entry("web_server").or_insert(v);
         }
         normalize_web_server_section(table);
-        if let Some(v) = table.remove("featureGates") {
-            table.entry("feature").or_insert(v);
-        }
-
-        // Rename canonical Go camelCase section names.
-        if let Some(v) = table.remove("webServer") {
-            table.entry("web_server").or_insert(v);
-        }
-        normalize_web_server_section(table);
         if let Some(v) = table.remove("httpPlugins") {
             table.entry("http_plugins").or_insert(v);
         }

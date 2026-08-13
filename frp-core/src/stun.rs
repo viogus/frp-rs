@@ -214,6 +214,12 @@ fn build_binding_request(tx_id: &[u8; 12]) -> Vec<u8> {
 }
 
 pub fn parse_binding_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<String, String> {
+    // A STUN message header is 20 bytes; guard before indexing data[0..4]
+    // below. (Call sites pre-check n >= 20 too — this keeps the parser safe
+    // for direct callers and tests.)
+    if data.len() < 20 {
+        return Err("STUN response too short".into());
+    }
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
     match msg_type {
         0x0101 => {} // Binding Success Response — continue parsing
@@ -272,6 +278,12 @@ pub fn parse_binding_response_full(
     data: &[u8],
     expected_tx_id: &[u8; 12],
 ) -> Result<StunResult, String> {
+    // A STUN message header is 20 bytes; guard before indexing data[0..4]
+    // below. (Call sites pre-check n >= 20 too — this keeps the parser safe
+    // for direct callers and tests.)
+    if data.len() < 20 {
+        return Err("STUN response too short".into());
+    }
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
     match msg_type {
         0x0101 => {} // Binding Success Response — continue parsing
@@ -340,6 +352,12 @@ pub fn parse_binding_response_full(
 /// Parse a STUN Binding Error Response (type 0x0111).
 /// Returns a human-readable error string including the error code and reason phrase.
 fn parse_error_response(data: &[u8], expected_tx_id: &[u8; 12]) -> String {
+    // A STUN message header is 20 bytes; guard before indexing data[2..4]
+    // below. (Call sites pre-check n >= 20 too — this keeps the parser safe
+    // for direct callers and tests.)
+    if data.len() < 20 {
+        return "STUN response too short".into();
+    }
     let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
     if data.len() < 20 + msg_len {
         return "STUN error message truncated".into();

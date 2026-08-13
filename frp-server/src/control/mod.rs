@@ -69,6 +69,14 @@ pub(crate) struct ControlState {
     /// bridge tasks spawned by `assign_udp_work_conn` terminate instead of
     /// hanging forever on a half-open work conn (Go frp v0.70.1 fix parity).
     pub udp_cancel: tokio_util::sync::CancellationToken,
+    /// Per-proxy UDP bridge cancellation (low finding 5): each UDP/SUDP
+    /// proxy gets a child token of `udp_cancel` at registration, and
+    /// `handle_close_proxy` cancels its own so a wedged per-proxy UDP
+    /// bridge task exits immediately instead of lingering until control
+    /// teardown. Children of `udp_cancel` — cleanup's
+    /// `udp_cancel.cancel()` covers them too (idempotent, no double-cancel
+    /// hazard). Map key: proxy_name.
+    pub udp_cancels: std::collections::HashMap<String, tokio_util::sync::CancellationToken>,
     pub work_pool: VecDeque<pool::PoolEntry>,
     pub pending_requests: VecDeque<pool::PendingRequest>,
     pub pending_udp: VecDeque<(String, Instant)>,
@@ -239,6 +247,15 @@ async fn handle_control_inner<S>(
             }
         }
 
+        // Expire stale pending_nat_hole_sids entries (low finding 1):
+        // previously they only expired inside handle_new_work_conn when a
+        // work conn arrived, so a provider that never delivers work conns
+        // let the queue grow unbounded. Same pattern as pending_requests.
+        pool::expire_pending_nat_hole_sids(
+            &mut ctl.pending_nat_hole_sids,
+            pool::pending_request_timeout(state.user_conn_timeout),
+        );
+
         // NOTE: pooled work-conn idle expiry was removed (audit D2-3):
         // `state.pool.idle_timeout` is always Duration::ZERO (never wired
         // from config; Go frp parity keeps pooled conns alive until the
@@ -266,6 +283,11 @@ async fn handle_control_inner<S>(
                 ctl.pending_udp
                     .front()
                     .map(|(_, ts)| *ts + pool::pending_request_timeout(state.user_conn_timeout))
+            })
+            .or_else(|| {
+                ctl.pending_nat_hole_sids
+                    .front()
+                    .map(|(_, _, ts)| *ts + pool::pending_request_timeout(state.user_conn_timeout))
             });
 
         tokio::select! {

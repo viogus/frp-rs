@@ -149,6 +149,17 @@ fn dispatch_raw_frame(
     *raw_read_state = RawReadState::Idle;
     match opcode {
         0x00..=0x02 => {
+            if payload.is_empty() {
+                // Zero-length data frame: consume it without forwarding.
+                // Returning `Ready(Ok(()))` with zero bytes filled reads as
+                // EOF to tokio and tears the tunnel down — mirror the KCP
+                // behavior (a zero-length read is swallowed and the next
+                // frame is read instead). Wake + Pending so the caller
+                // re-polls and the poll_read loop continues to the next
+                // frame.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             let n = payload.len().min(buf.remaining());
             buf.put_slice(&payload[..n]);
             if n < payload.len() {
@@ -771,6 +782,7 @@ mod tests {
             // Consume the upgrade request up to the blank line.
             let mut req = vec![0u8; 4096];
             let mut total = 0usize;
+            let mut client_key: Option<String> = None;
             loop {
                 let n = server.read(&mut req[total..]).await.expect("read request");
                 assert!(n > 0, "client closed before request completed");
@@ -779,16 +791,31 @@ mod tests {
                     break;
                 }
             }
+            // Extract the client's Sec-WebSocket-Key so the Accept header
+            // can be computed (connect_ws_raw verifies it).
+            let req_text = String::from_utf8_lossy(&req[..total]);
+            for line in req_text.lines() {
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("sec-websocket-key") {
+                        client_key = Some(value.trim().to_string());
+                    }
+                }
+            }
+            let client_key = client_key.expect("client Sec-WebSocket-Key header");
+            use sha1::{Digest, Sha1};
+            let mut hasher = Sha1::new();
+            hasher.update(client_key.as_bytes());
+            hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            let accept = super::super::base64_encode(&hasher.finalize());
             // 101 response + first WS frame in a single segment.
-            server
-                .write_all(
-                    b"HTTP/1.1 101 Switching Protocols\r\n\
-                      Upgrade: websocket\r\n\
-                      Connection: Upgrade\r\n\
-                      \r\n",
-                )
-                .await
-                .expect("write 101");
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n\
+                 \r\n"
+            );
+            server.write_all(resp.as_bytes()).await.expect("write 101");
             server
                 .write_all(&frame)
                 .await
@@ -829,6 +856,47 @@ mod tests {
         }
         frame.extend_from_slice(payload);
         frame
+    }
+
+    /// Zero-length data frames must be consumed without surfacing a 0-byte
+    /// read (which tokio treats as EOF and would tear the tunnel down).
+    /// A zero-length frame followed by a real frame must deliver the real
+    /// frame's payload.
+    #[tokio::test]
+    async fn ws_zero_length_frame_is_swallowed_not_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut server_io, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), false);
+
+        // Zero-length BINARY frame, then a real frame.
+        server_io.write_all(&[0x82, 0x00]).await.unwrap();
+        let payload = b"after-zero-frame";
+        server_io
+            .write_all(&ws_binary_frame(payload))
+            .await
+            .unwrap();
+
+        let mut out = vec![0u8; payload.len() + 1];
+        let n = ws.read(&mut out).await.unwrap();
+        assert_eq!(
+            n,
+            payload.len(),
+            "zero-length frame must not surface as EOF; got {n} bytes"
+        );
+        assert_eq!(&out[..n], payload);
+
+        // A second zero-length frame (through the extended-length path too:
+        // 0x82 with extended length 0) must behave the same.
+        server_io.write_all(&[0x82, 126, 0, 0]).await.unwrap();
+        let payload2 = b"second-payload";
+        server_io
+            .write_all(&ws_binary_frame(payload2))
+            .await
+            .unwrap();
+        let n2 = ws.read(&mut out).await.unwrap();
+        assert_eq!(n2, payload2.len());
+        assert_eq!(&out[..n2], payload2);
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::{interval, Duration};
 
-use super::config::KcpConfig;
+use super::config::{KcpConfig, KCP_WIRE_OVERHEAD, MAX_KCP_MTU};
 use super::session::KcpSession;
 use super::stream::KcpStream;
 
@@ -65,6 +65,13 @@ const MAX_SESSION_CREATES_PER_WINDOW: usize = 256;
 /// Max new sessions per IP per window. A single host cannot churn the
 /// session table / accept queue with new convs faster than this.
 const MAX_SESSION_CREATES_PER_IP_PER_WINDOW: usize = 32;
+
+/// Driver receive buffer size. The recv buffer must absorb ANY wire packet
+/// from a peer whose mtu is at most `MAX_KCP_MTU` (1492 + 8 FEC overhead =
+/// 1500 wire bytes); the local session's mtu only bounds what we send.
+/// Peers are clamped to `MAX_KCP_MTU` (see `KcpSocket::new` and
+/// `KcpConfig::clamped`), so 1500 bytes covers every legitimately-sized packet.
+pub(crate) const DRIVER_RECV_BUF_SIZE: usize = 1500;
 
 pub(crate) enum WriteRequest {
     Data(Vec<u8>),
@@ -139,8 +146,26 @@ pub(crate) struct KcpSocket {
 impl KcpSocket {
     pub fn new(
         socket: Arc<UdpSocket>,
-        config: KcpConfig,
+        mut config: KcpConfig,
     ) -> (Self, KcpSocketHandle, mpsc::Receiver<KcpStream>) {
+        // Clamp a configured MTU that would overflow the driver's fixed recv
+        // buffer: `mtu + KCP_WIRE_OVERHEAD` (max wire packet with FEC) must
+        // fit in DRIVER_RECV_BUF_SIZE. The default MTU 1350 is far below the
+        // cap; only an explicitly oversized config hits this. This is the
+        // listen-path clamp; the dial path clamps earlier via
+        // `KcpConfig::clamped` (before both KcpSocket::new and KcpSession::new)
+        // so socket and session agree. Sessions created from this socket
+        // inherit the clamped value.
+        if config.mtu > MAX_KCP_MTU {
+            tracing::warn!(
+                configured_mtu = config.mtu,
+                max_mtu = MAX_KCP_MTU,
+                "KCP MTU clamped to {MAX_KCP_MTU} (mtu + FEC overhead {}B must fit the {}B driver recv buffer)",
+                KCP_WIRE_OVERHEAD,
+                DRIVER_RECV_BUF_SIZE
+            );
+            config.mtu = MAX_KCP_MTU;
+        }
         const CAP_WRITE: usize = 256;
         const CAP_REGISTER: usize = 64;
         const CAP_ACCEPT: usize = 256;
@@ -195,7 +220,12 @@ impl KcpSocket {
         }
 
         let mut tick = interval(Duration::from_millis(10));
-        let mut buf = vec![0u8; 1500];
+        // Fixed-size recv buffer: must hold any wire packet from a peer with
+        // mtu <= MAX_KCP_MTU (1492 + 8 overhead = 1500 bytes). The local
+        // session's mtu only bounds what WE send — sizing the buffer from it
+        // would truncate legit mixed-mtu peers' packets, causing
+        // InvalidSegmentDataSize → retransmit loop → dead link.
+        let mut buf = vec![0u8; DRIVER_RECV_BUF_SIZE];
 
         loop {
             tokio::select! {
@@ -707,7 +737,7 @@ impl KcpSocket {
 
 #[cfg(test)]
 mod tests {
-    use super::SESSION_CREATE_WINDOW_MS;
+    use super::*;
 
     /// The rate-limit trim uses `now.wrapping_sub(ts) > WINDOW` (same
     /// convention as `session_created_at` cleanup) so the u32-ms clock's
@@ -731,5 +761,52 @@ mod tests {
         assert!(now_wrapped.wrapping_sub(just_before_wrap) <= window);
         let long_ago = u32::MAX - 60_000;
         assert!(now_wrapped.wrapping_sub(long_ago) > window);
+    }
+
+    /// Regression for the driver recv-buffer clamp defect: the recv buffer
+    /// must absorb ANY wire packet a peer can legitimately send. A peer's
+    /// mtu is clamped to MAX_KCP_MTU, so the largest wire packet is
+    /// `MAX_KCP_MTU + KCP_WIRE_OVERHEAD` = 1500 bytes. The buffer used to be
+    /// sized `mtu + KCP_WIRE_OVERHEAD` from the LOCAL config (1358 bytes for
+    /// the default mtu 1350), truncating legit mixed-mtu peers' packets →
+    /// InvalidSegmentDataSize → retransmit loop → dead link.
+    #[test]
+    fn driver_recv_buf_holds_max_peer_wire_packet() {
+        // A peer at the clamp cap (mtu MAX_KCP_MTU) sends wire packets of at
+        // most `mtu + KCP_WIRE_OVERHEAD` = 1500 bytes.
+        let max_peer = KcpConfig {
+            mtu: MAX_KCP_MTU,
+            ..KcpConfig::default()
+        };
+        assert!(
+            DRIVER_RECV_BUF_SIZE >= max_peer.mtu + KCP_WIRE_OVERHEAD,
+            "driver recv buffer {}B < max peer wire packet {}B",
+            DRIVER_RECV_BUF_SIZE,
+            max_peer.mtu + KCP_WIRE_OVERHEAD
+        );
+        // The default config (mtu 1350) must also land >= 1500 — this is
+        // the exact case that regressed (1358B).
+        let default = KcpConfig::default();
+        assert!(
+            DRIVER_RECV_BUF_SIZE >= default.mtu + KCP_WIRE_OVERHEAD,
+            "driver recv buffer {}B < default-config wire packet {}B",
+            DRIVER_RECV_BUF_SIZE,
+            default.mtu + KCP_WIRE_OVERHEAD
+        );
+    }
+
+    /// `KcpConfig::clamped` must match `KcpSocket::new`'s clamp so the dial
+    /// path's session (which reads config.mtu directly via kcp.set_mtu) and
+    /// socket agree on the wire mtu — the dial-clamp defect regression.
+    #[test]
+    fn clamped_caps_mtu_to_max() {
+        let oversized = KcpConfig {
+            mtu: 2000,
+            ..KcpConfig::default()
+        };
+        assert_eq!(oversized.clamped().mtu, MAX_KCP_MTU);
+        // An in-range mtu is untouched.
+        let default = KcpConfig::default();
+        assert_eq!(default.clone().clamped().mtu, default.mtu);
     }
 }

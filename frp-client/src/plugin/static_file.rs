@@ -137,10 +137,11 @@ async fn handle_static_file_conn(
         full_path = full_path.join("index.html");
     }
 
-    // Defense-in-depth: canonicalize the base directory, then open the resolved
-    // path and verify via the open file handle that it stays within the base.
-    // This avoids TOCTOU races by performing the check on the already-opened
-    // file descriptor rather than relying on a separate metadata+open sequence.
+    // Defense-in-depth: canonicalize the base directory, then open the file
+    // and verify via the ALREADY-OPENED handle that it stays within the base.
+    // The verification must resolve the open fd's inode, not re-resolve the
+    // path: re-canonicalizing the path after open() lets a symlink swap
+    // between the two make the check disagree with the opened inode (TOCTOU).
     let base = std::fs::canonicalize(local_path)
         .map_err(|e| format!("failed to resolve base directory '{}': {e}", local_path))?;
 
@@ -156,9 +157,20 @@ async fn handle_static_file_conn(
         }
     };
 
-    // Canonicalize the open file path via /proc/self/fd or by canonicalizing
-    // the path directly. On most platforms, canonicalize after open is safe
-    // because the file descriptor pins the inode.
+    // Linux: canonicalize via /proc/self/fd/<fd> — the fd symlink resolves to
+    // the inode the handle is pinned to, closing the TOCTOU window (a symlink
+    // swap after open() cannot change what the fd points at).
+    #[cfg(target_os = "linux")]
+    let resolved = {
+        use std::os::unix::io::AsRawFd;
+        std::fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|e| format!("failed to resolve path: {e}"))?
+    };
+    // Non-Linux: no /proc/self/fd — re-canonicalize the path. The residual
+    // race (a symlink swap between open() and canonicalize() making the
+    // check disagree with the opened inode) is accepted here; the check
+    // remains defense-in-depth on top of the component-level path validation.
+    #[cfg(not(target_os = "linux"))]
     let resolved =
         std::fs::canonicalize(&full_path).map_err(|e| format!("failed to resolve path: {e}"))?;
     if !resolved.starts_with(&base) {

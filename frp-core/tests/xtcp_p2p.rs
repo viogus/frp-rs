@@ -356,6 +356,104 @@ async fn test_xtcp_p2p_yamux_roundtrip() {
     assert_eq!(&buf, reply, "A should receive B's reply");
 }
 
+/// Regression test (audit M2): the yamux background driver must exit when
+/// the caller's stream is dropped, releasing the connection — and with it
+/// the XTCP P2P UDP socket and KCP session — instead of leaking one task +
+/// one UDP fd + KCP state per ended XTCP session.
+///
+/// Full in-process harness: both sides connect over loopback UDP, exchange
+/// data (proving both drivers are alive), then both streams are dropped.
+/// Each side's UDP socket must become rebindable within a bounded timeout —
+/// which can only happen once the driver task exited and dropped its
+/// `Arc<Mutex<Connection>>` (the sole holder of the socket).
+#[cfg(feature = "tcp-mux")]
+#[tokio::test]
+async fn test_yamux_driver_exits_when_stream_dropped() {
+    let (a, b, _addr_a, _addr_b) = bind_pair().await;
+    let addr_a = a.local_addr().unwrap();
+    let addr_b = b.local_addr().unwrap();
+
+    let candidate_a = vec![addr_a.to_string()];
+    let candidate_b = vec![addr_b.to_string()];
+
+    let conv = 88u32;
+    let kcp_config = frp_core::kcp::KcpConfig {
+        data_shards: 0,
+        parity_shards: 0,
+        ..frp_core::kcp::default_kcp_config()
+    };
+
+    // Provider (server) in a background task; visitor (client) inline.
+    let can_a_for_spawn = candidate_a.clone();
+    let cfg_for_spawn = kcp_config.clone();
+    let server = tokio::spawn(async move {
+        frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+            b,
+            &can_a_for_spawn,
+            &[],
+            None,
+            conv,
+            cfg_for_spawn,
+            5000,
+            false, // yamux_server = provider (accepts stream)
+            None,
+            None,
+        )
+        .await
+    });
+
+    let mut stream_a = frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+        a,
+        &candidate_b,
+        &[],
+        None,
+        conv,
+        kcp_config.clone(),
+        5000,
+        true, // yamux_client = visitor (opens stream)
+        None,
+        None,
+    )
+    .await
+    .expect("side A yamux connect");
+
+    // Exchange data so the provider accepts the stream and both drivers are
+    // provably alive (the driver is required for stream writes to reach the
+    // peer — frames are queued to the connection and flushed by its polls).
+    let payload = b"driver-lifetime probe";
+    stream_a.write_all(payload).await.expect("A write");
+    stream_a.flush().await.expect("A flush");
+    let mut stream_b = tokio::time::timeout(tokio::time::Duration::from_secs(10), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join")
+        .expect("side B yamux connect");
+    let mut buf = vec![0u8; payload.len()];
+    stream_b.read_exact(&mut buf).await.expect("B read");
+    assert_eq!(&buf, payload, "B should receive A's data");
+
+    // End both bridges. Dropping the wrapper streams closes the watch
+    // channels, which makes both background drivers exit and drop their
+    // connections (and the UDP sockets + KCP sessions underneath).
+    drop(stream_a);
+    drop(stream_b);
+
+    // A socket is released only when its driver task exited. Poll-bind the
+    // original addresses; success proves the leak is gone.
+    for (side, addr) in [("A", addr_a), ("B", addr_b)] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::net::UdpSocket::bind(addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("side {side} UDP socket not released within 5s"));
+    }
+}
+
 /// Go MakeHole state machine on loopback: sender probes assisted+candidate
 /// addresses, receiver listens with extra sockets; both use the "frp" magic
 /// (no sid/key) and must connect.

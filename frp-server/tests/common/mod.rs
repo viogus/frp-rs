@@ -148,7 +148,7 @@ pub async fn raw_login(
         FrpMessage::LoginResp(resp) => {
             // Wrap in AES-128-CFB encryption (matches server post-login)
             let enc_key = encryption::derive_key(token);
-            let mut encrypted = io.into_encrypted(enc_key);
+            let mut encrypted = io.into_encrypted(enc_key)?;
 
             // Drain initial ReqWorkConn messages sent by server after LoginResp.
             // Server sends pool_count ReqWorkConn immediately after wrapping

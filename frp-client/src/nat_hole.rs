@@ -150,7 +150,20 @@ impl Service {
                     Self::send_nat_hole_report(&w, v2, sid.clone(), true, "hole punch succeeded")
                         .await;
                     if let Some(ref local) = local_addr {
-                        match tokio::net::TcpStream::connect(local).await {
+                        // Bound the local connect with the session liveness
+                        // check: a session teardown (reconnect/stop) during a
+                        // slow connect must not leave this provider task
+                        // parked on connect forever.
+                        let connect_fut = tokio::net::TcpStream::connect(local);
+                        tokio::pin!(connect_fut);
+                        let local_result = tokio::select! {
+                            r = &mut connect_fut => r,
+                            _ = wait_session_dead(&alive) => {
+                                debug!(proxy_name = %proxy_name, "XTCP provider '{}': session ended during local connect, aborting", proxy_name);
+                                return;
+                            }
+                        };
+                        match local_result {
                             Ok(local_stream) => {
                                 frp_core::transport::set_nodelay(&local_stream);
                                 let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
@@ -492,7 +505,20 @@ impl Service {
                     let _ = resp_writer.send(ok_report, resp_v2);
                     info!(proxy_name = %proxy_name_clone, protocol = %p2p_protocol, "XTCP provider '{}': P2P connected", proxy_name_clone);
                     if let Some(ref local) = local_addr {
-                        match tokio::net::TcpStream::connect(local).await {
+                        // Bound the local connect with the session liveness
+                        // check: a session teardown (reconnect/stop) during a
+                        // slow connect must not leave this provider task
+                        // parked on connect forever.
+                        let connect_fut = tokio::net::TcpStream::connect(local);
+                        tokio::pin!(connect_fut);
+                        let local_result = tokio::select! {
+                            r = &mut connect_fut => r,
+                            _ = wait_session_dead(&alive) => {
+                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': session ended during local connect, aborting", proxy_name_clone);
+                                return;
+                            }
+                        };
+                        match local_result {
                             Ok(local_conn) => {
                                 frp_core::transport::set_nodelay(&local_conn);
                                 let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();

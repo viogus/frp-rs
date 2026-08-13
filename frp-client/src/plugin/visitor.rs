@@ -133,6 +133,9 @@ pub async fn start_visitor_plugin(
 
     let task = tokio::spawn(async move {
         debug!(local_addr = %local_addr, "visitor plugin listening on {}", local_addr);
+        // Throttle accept-error warnings: under persistent EMFILE the loop
+        // fails ~10/s (100ms pause below), which would flood the logs.
+        let mut last_accept_warn: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -181,8 +184,22 @@ pub async fn start_visitor_plugin(
                             });
                         }
                         Err(e) => {
-                            warn!(error = %e, "visitor plugin: accept error: {}", e);
-                            break;
+                            // Warn at most once per second while the accept
+                            // failure persists (the first failure warns too).
+                            if last_accept_warn
+                                .map(|t| t.elapsed() >= Duration::from_secs(1))
+                                .unwrap_or(true)
+                            {
+                                warn!(error = %e, "visitor plugin: accept error: {}", e);
+                                last_accept_warn = Some(std::time::Instant::now());
+                            }
+                            // Transient accept errors (EMFILE/ENFILE fd
+                            // exhaustion, etc.) must not kill the listener:
+                            // Go's Accept loop retries (same pattern as
+                            // serve_plugin). Pause briefly to avoid
+                            // hot-spinning while the condition persists; only
+                            // the shutdown signal breaks the loop.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
                 }

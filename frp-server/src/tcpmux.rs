@@ -320,6 +320,9 @@ pub async fn run_tcpmux_listener(
                         proxy_name: route.proxy_name.clone(),
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
                         pre_read,
+                        user_conn_permit: None,
+                        // Local sender — no group selection was done.
+                        group_selected: false,
                     })
                     .await
                 {

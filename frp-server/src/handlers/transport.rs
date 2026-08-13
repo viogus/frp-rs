@@ -130,6 +130,9 @@ pub(crate) async fn handle_tls_connection(
                                 proxy_name: route.proxy_name.to_string(),
                                 user_conn: IoStream::from(inner_stream),
                                 pre_read: sni_data,
+                                user_conn_permit: None,
+                                // Local sender — no group selection was done.
+                                group_selected: false,
                             })
                             .await;
                         return;

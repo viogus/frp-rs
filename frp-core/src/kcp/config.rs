@@ -29,6 +29,20 @@ impl Default for KcpNoDelayConfig {
     }
 }
 
+/// KCP wire overhead above the MTU-sized segment when FEC is enabled:
+/// the FEC header (SEQID 4B + TYPE 2B — `session::FEC_HEADER_SIZE`) plus
+/// the per-shard SIZE field (2B). A max-size KCP output segment is `mtu`
+/// bytes (mss = mtu - KCP_OVERHEAD, segment = mss + KCP_OVERHEAD), so the
+/// largest wire packet is `mtu + KCP_WIRE_OVERHEAD`.
+pub(crate) const KCP_WIRE_OVERHEAD: usize = crate::kcp::session::FEC_HEADER_SIZE + 2;
+
+/// Maximum configurable MTU. The socket driver's receive buffer is fixed
+/// (see `socket::DRIVER_RECV_BUF_SIZE`), so the largest wire packet a peer
+/// with the same config can send — `mtu + KCP_WIRE_OVERHEAD` — must fit.
+/// A larger configured MTU is clamped (with a warning) in `KcpSocket::new`
+/// on the listen path, and via `KcpConfig::clamped` on the dial path.
+pub const MAX_KCP_MTU: usize = crate::kcp::socket::DRIVER_RECV_BUF_SIZE - KCP_WIRE_OVERHEAD;
+
 /// KCP transport configuration.
 #[derive(Debug, Clone)]
 pub struct KcpConfig {
@@ -57,5 +71,21 @@ impl Default for KcpConfig {
             parity_shards: 0,
             stream: true,
         }
+    }
+}
+
+impl KcpConfig {
+    /// Returns a config with `mtu` clamped to `MAX_KCP_MTU` (matching what
+    /// `KcpSocket::new` enforces) so dial-side sessions agree with the
+    /// socket. `dial_kcp` clamps once via this helper before constructing
+    /// both the socket and the session — an un-clamped mtu would let the
+    /// session emit `mtu + KCP_WIRE_OVERHEAD`-byte FEC wire packets that the
+    /// receiver's fixed 1500-byte driver recv buffer would truncate.
+    pub fn clamped(self) -> Self {
+        let mut config = self;
+        if config.mtu > MAX_KCP_MTU {
+            config.mtu = MAX_KCP_MTU;
+        }
+        config
     }
 }

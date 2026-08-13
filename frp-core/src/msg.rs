@@ -136,7 +136,10 @@ pub struct LoginResp {
     pub error: Option<String>,
     /// Server's additional auth scopes (union with client's to decide
     /// which messages need authentication).
-    /// Go frp compat: serverAdditionalAuthScopes.
+    /// NOTE: this is a frp-rs extension — `serverAdditionalAuthScopes`
+    /// does NOT exist in Go frp v0.70.1. Go servers never set it, so the
+    /// field is absent on the wire (skip_serializing_if) and interop is
+    /// unaffected; it only carries extra data between Rust peers.
     #[serde(
         rename = "serverAdditionalAuthScopes",
         skip_serializing_if = "Option::is_none"
@@ -534,6 +537,16 @@ pub struct NatHoleReport {
 // unique required fields. V1 deserialization uses type-byte dispatch
 // (deserialize_v1), so untagged matching is only used for direct
 // serde_json::from_value calls (tests, future code paths).
+//
+// WARNING (latent): CloseProxyResp is deliberately kept FIRST, which
+// means it shadows every other variant whose fields it intersects in
+// untagged deserialization — most notably CloseProxy, NewVisitorConn,
+// NatHoleSid, and VnetRouteAdvertise, which all carry only `proxy_name`
+// or overlap it. A bare `{"proxy_name": ...}` JSON value always matches
+// CloseProxyResp. This is benign on the wire because V1 dispatch goes
+// through the message type byte (deserialize_v1), not untagged matching,
+// so no reordering was made; do not rely on untagged matching for any
+// proxy_name-only message without handling CloseProxyResp first.
 // ---------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

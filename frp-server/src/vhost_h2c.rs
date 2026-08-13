@@ -248,6 +248,9 @@ async fn handle_stream(
             proxy_name: forward.proxy_name,
             user_conn: frp_core::transport::IoStream::SshChannel(Box::new(control)),
             pre_read: forward.request_head,
+            user_conn_permit: None,
+            // Local sender — no group selection was done.
+            group_selected: false,
         })
         .await
         .is_err()

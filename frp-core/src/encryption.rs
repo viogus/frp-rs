@@ -437,7 +437,22 @@ impl SnappyDecompressor {
                     if chunk_len < 4 {
                         return Err("snappy: compressed chunk length too small".into());
                     }
-                    // Skip 4-byte header (already read) + 4-byte CRC
+                    // Skip 4-byte header (already read) + 4-byte CRC.
+                    //
+                    // INTENTIONAL DIVERGENCE (documented per audit): Go's
+                    // `golang/snappy` Reader verifies the CRC32C (Castagnoli)
+                    // of the uncompressed data against this field
+                    // (github.com/golang/snappy decode.go — `if crc(...) !=
+                    // checksum { err = ErrCorrupt }`), we deliberately do not.
+                    // Rationale: this decoder sits inside the encrypted
+                    // bridge/visitor tunnel (AES-128-CFB) whose ciphers are
+                    // Go-compat primitives, and implementing CRC32C would
+                    // require a new dependency or a hand-rolled hot-path
+                    // implementation for a check that catches only accidental
+                    // corruption — a deliberate attacker would recompute the
+                    // CRC. The data-plane cost is nonzero on every chunk.
+                    // Wire compatibility is unaffected (the CRC field is
+                    // still skipped/consumed, so framing stays aligned).
                     let compressed = &self.buf[start + 8..start + total];
                     let decompressed_len = snap::raw::decompress_len(compressed)
                         .map_err(|e| format!("snappy decompress: {e}"))?;
@@ -462,6 +477,9 @@ impl SnappyDecompressor {
                 }
                 0x01 => {
                     // Uncompressed data: length field includes 4-byte CRC.
+                    // CRC32C is intentionally not verified — same rationale
+                    // as the compressed arm above (Go verifies; we skip for
+                    // the encrypted-tunnel integrity argument).
                     if chunk_len < 4 {
                         return Err("snappy: uncompressed chunk length too small".into());
                     }

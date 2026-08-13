@@ -18,8 +18,12 @@ pub(crate) async fn handle_new_proxy<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     np: msg::NewProxy,
 ) -> Result<(), ()> {
-    info!(proxy_name = %np.proxy_name, "KCP TLS: received NewProxy for {}", np.proxy_name);
-    proxy_ops::handle_new_proxy(
+    info!(proxy_name = %np.proxy_name, "NewProxy: received NewProxy for {}", np.proxy_name);
+    let is_udp_proxy = np.proxy_type == "udp" || np.proxy_type == "sudp";
+    // np is moved into the callee — capture the name for the
+    // post-registration token insert below.
+    let proxy_name = np.proxy_name.clone();
+    let registered = proxy_ops::handle_new_proxy(
         np,
         &ctx.run_id,
         ctx.control_id,
@@ -31,6 +35,19 @@ pub(crate) async fn handle_new_proxy<W: AsyncWriteExt + Unpin>(
         ctx.v2,
     )
     .await;
+    // Per-proxy UDP bridge cancellation (low finding 5): each UDP/SUDP
+    // proxy gets a child token of the control's udp_cancel so
+    // handle_close_proxy can cancel a wedged per-proxy bridge without
+    // waiting for control teardown. Inserted ONLY after registration
+    // succeeded — a rejected duplicate NewProxy ("already registered")
+    // must not replace the live token without cancelling it, which would
+    // sever the cancel link to a running wedged bridge (it would then
+    // linger until control teardown). A failed registration leaves no
+    // token behind at all.
+    if registered && is_udp_proxy {
+        ctl.udp_cancels
+            .insert(proxy_name, ctl.udp_cancel.child_token());
+    }
     Ok(())
 }
 
@@ -146,6 +163,13 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     // bridge task may still hold a clone via its spawned Arc; the socket is
     // fully closed once that task exits.
     ctl.udp_sockets.remove(&cp.proxy_name);
+    // Cancel this proxy's UDP bridge task (low finding 5): without this, a
+    // wedged bridge (half-open work conn) only exits at control teardown
+    // via udp_cancel. The token is a child of udp_cancel, so cleanup's
+    // udp_cancel.cancel() still covers it — double-cancel is idempotent.
+    if let Some(cancel) = ctl.udp_cancels.remove(&cp.proxy_name) {
+        cancel.cancel();
+    }
     info!(proxy_name = %cp.proxy_name, "Proxy closed: {}", cp.proxy_name);
     // Emit WebSocket event for dashboard subscribers
     #[cfg(feature = "dashboard")]
@@ -320,6 +344,9 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
     // task's Arc is released when it observes the cancellation and exits.
     ctl.udp_cancel.cancel();
     ctl.udp_sockets.clear();
+    // Per-proxy UDP bridge tokens are children of udp_cancel — already
+    // cancelled by the line above; drop the map.
+    ctl.udp_cancels.clear();
     // Emit ProxyDown for all proxies owned by this client (before removing them)
     #[cfg(feature = "dashboard")]
     {
@@ -392,4 +419,95 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
         }
     }
     info!(run_id = %ctx.run_id, "Control connection {} removed", ctx.run_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Low finding 5: handle_close_proxy must cancel the per-proxy UDP
+    /// bridge token so a wedged bridge (half-open work conn) exits
+    /// immediately instead of lingering until control teardown.
+    ///
+    /// A full wedged-bridge task is not staged here: the bridge
+    /// (assign_udp_work_conn/run_udp_work_conn in pool.rs) selects on the
+    /// token it is handed, and the child-of-udp_cancel wiring means
+    /// teardown cancellation is identical to what a live bridge observes
+    /// on control disconnect — so the deterministic unit-level contract is
+    /// "close cancels the token and drops it from the map".
+    #[tokio::test]
+    async fn close_proxy_cancels_per_proxy_udp_bridge_token() {
+        let state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        let info = crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+            "u1",
+            "udp",
+            "run-1",
+            Some(24000),
+            1,
+        );
+        state
+            .proxy_manager
+            .register("run-1".into(), info)
+            .await
+            .expect("register udp proxy");
+
+        let (_, run_mu_guard) = state.get_run_mu("run-1");
+        let (internal_tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut ctx = ControlContext {
+            state: Arc::clone(&state),
+            pool_stats: Arc::new(crate::state::PoolStats::default()),
+            reloadable: state
+                .reloadable
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            v2: false,
+            run_id: "run-1".to_string(),
+            control_id: 1,
+            pool_cap: 10,
+            internal_tx,
+            peer: None,
+            authenticated_user: String::new(),
+            _run_mu_guard: run_mu_guard,
+        };
+        let mut ctl = ControlState {
+            shutting_down: false,
+            shutdown_done: None,
+            udp_cancel: tokio_util::sync::CancellationToken::new(),
+            udp_cancels: HashMap::new(),
+            work_pool: std::collections::VecDeque::new(),
+            pending_requests: std::collections::VecDeque::new(),
+            pending_udp: std::collections::VecDeque::new(),
+            pending_nat_hole_sids: std::collections::VecDeque::new(),
+            listener_handles: HashMap::new(),
+            udp_sockets: HashMap::new(),
+            last_ping: tokio::time::Instant::now(),
+        };
+        // Simulate the handle_new_proxy registration: per-proxy child token.
+        let token = ctl.udp_cancel.child_token();
+        ctl.udp_cancels.insert("u1".to_string(), token.clone());
+        assert!(!token.is_cancelled(), "token starts live");
+
+        let mut writer = Vec::new();
+        let res = handle_close_proxy(
+            &mut ctx,
+            &mut ctl,
+            &mut writer,
+            msg::CloseProxy {
+                proxy_name: "u1".to_string(),
+            },
+        )
+        .await;
+        assert!(res.is_ok());
+        assert!(
+            token.is_cancelled(),
+            "close_proxy must cancel the per-proxy UDP bridge token"
+        );
+        assert!(
+            ctl.udp_cancels.is_empty(),
+            "cancelled token must be removed from the map"
+        );
+    }
 }

@@ -289,7 +289,10 @@ async fn test_dashboard_offline_clients_listed() {
     // disconnect. (A bare `let _encrypted` binding would live until the end
     // of the test — drop explicitly.)
     let enc_key = frp_core::encryption::derive_key("test-token");
-    drop(io.into_encrypted(enc_key));
+    drop(
+        io.into_encrypted(enc_key)
+            .expect("plain test stream is encryptable"),
+    );
 
     // Wait for the server to notice the disconnect (control cleanup).
     // Poll the clients API instead of a fixed sleep: on slow CI the old

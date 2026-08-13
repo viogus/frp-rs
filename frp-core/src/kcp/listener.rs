@@ -113,6 +113,12 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     }
     let socket = Arc::new(socket);
 
+    // Clamp the MTU ONCE so the socket AND the session agree: KcpSocket::new
+    // clamps its internal copy, but KcpSession::new reads config.mtu directly
+    // (kcp.set_mtu), so passing the raw config would let the dial session
+    // emit `mtu + KCP_WIRE_OVERHEAD`-byte FEC wire packets that the receiver's
+    // fixed 1500-byte driver recv buffer would truncate.
+    let config = config.clamped();
     let (kcp_socket, handle, _accept_rx) = KcpSocket::new(socket, config.clone());
     let (read_tx, read_rx) = mpsc::channel(256);
     let session = KcpSession::new(conv, remote, config.clone(), read_tx);

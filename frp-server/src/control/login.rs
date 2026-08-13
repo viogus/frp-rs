@@ -397,10 +397,13 @@ pub(crate) async fn authenticate(
     ),
     (),
 > {
-    // Login throttle removed — it counted both successful and failed attempts,
-    // causing legitimate reconnects to be throttled after 5 connections in 60s
-    // per IP. Brute-force protection is still provided by auth failure logging
-    // and the reconnect backoff on the client side.
+    // Login throttle: FAIL-ONLY rate limiting (Go frp LoginThrottle parity).
+    // `check_login_throttle` is invoked on authentication failure below and
+    // counts only failed attempts — successful logins never consume a slot,
+    // so legitimate reconnects are never throttled. A throttled IP is
+    // rejected for the 60s window after the 5th failure (per-IP sliding
+    // window, capped table with a coarse overflow bucket). Rejection here
+    // returns Err(()) and the login error response is sent by the caller.
 
     // --- Authenticate ---
     // Split into its own state machine (OIDC/token verification + timestamp
@@ -790,6 +793,7 @@ pub(crate) async fn authenticate(
     // mechanism (UdpNeedsWorkConn → ReqWorkConn → assign_udp_work_conn).
     let listener_handles: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let udp_sockets: HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = HashMap::new();
+    let udp_cancels: HashMap<String, tokio_util::sync::CancellationToken> = HashMap::new();
     let shutting_down = false;
     let last_ping = Instant::now();
 
@@ -811,6 +815,7 @@ pub(crate) async fn authenticate(
             shutting_down,
             shutdown_done: None,
             udp_cancel: tokio_util::sync::CancellationToken::new(),
+            udp_cancels,
             work_pool,
             pending_requests,
             pending_udp,
