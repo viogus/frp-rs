@@ -195,7 +195,7 @@ struct SessionCtx {
     hb_watchdog_active: bool,
     /// Shared session-alive flag for spawned work-conn tasks.
     session_alive: Arc<AtomicBool>,
-    // --- Work-conn config snapshot (work_conn_config! macro locals) ---
+    // --- Work-conn config snapshot fields ---
     wc_server_addr: String,
     wc_server_port: u16,
     wc_tls_enable: bool,
@@ -216,8 +216,9 @@ struct SessionCtx {
     client_scopes: Vec<String>,
     /// Server-advertised auth scopes, for heartbeat auth decisions.
     server_scopes: Vec<String>,
-    /// Per-session shutdown flag; set when the message loop decides to exit
-    /// (e.g. ShutdownMsg or auth failure), read at teardown.
+    /// Per-session shutdown flag; set only when a stop was requested (the
+    /// stop_rx arm in the message loop, or the reconnect backoff race), read
+    /// at teardown. Never set on error/reconnect exits.
     shutdown_flag: Arc<AtomicBool>,
     /// Session start time, used to reset the backoff counter when a session
     /// runs healthily for a long time (Go frp's FastBackoffManager only
@@ -3015,6 +3016,7 @@ impl Service {
         }
         false
     }
+
     /// Spawn a work connection in response to a ReqWorkConn message from the
     /// server (pool pre-warm sent right after LoginResp, NewVisitorConn acks,
     /// and on-demand requests — handled in the registration read loop and the
