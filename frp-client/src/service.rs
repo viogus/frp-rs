@@ -36,7 +36,7 @@ use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
-use frp_core::transport::TransportProtocol;
+use frp_core::transport::{IoStream, TransportProtocol};
 
 use frp_core::metrics::ProxyMetricsRegistry;
 
@@ -143,6 +143,70 @@ pub(crate) const PROXY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// it can measure a hair under one full interval and a retry would slip to
 /// the next tick. The grace only ever advances a retry by at most one tick.
 const PROXY_RETRY_GRACE: Duration = Duration::from_millis(100);
+
+/// Per-session state shared across the login → registration → message-loop
+/// phases of one connection attempt. Created on successful login, dropped on
+/// teardown. Holds exactly the locals that used to live inline in run().
+///
+/// `control_stream` is `Option` because phase 5 splits it (`into_split`)
+/// into the writer task's halves; every use before that point unwraps it.
+struct SessionCtx {
+    /// Control connection stream, AES-128-CFB-wrapped, yamux-unwrapped.
+    /// `None` after phase 5 splits it into reader/writer halves.
+    control_stream: Option<IoStream>,
+    /// Server-assigned run_id for this session (Go frp compat: previousRunID
+    /// carries over to the next attempt via run()).
+    run_id: String,
+    /// Yamux session handle. Held so the previous session's handle can be
+    /// dropped before creating a new connection (Go frp compat: svr.ctl.Close()).
+    yamux: Option<std::sync::Arc<frp_core::mux::YamuxSession>>,
+    /// Protocol version negotiated for this session (V1 vs V2).
+    v2: bool,
+    /// QUIC connection handle, forwarded to work-conn configs.
+    #[cfg(feature = "quic")]
+    quic_conn: Option<std::sync::Arc<QuicConnection>>,
+    /// Heartbeat ping interval, armed at login. None disables heartbeats.
+    ping_interval: Option<tokio::time::Interval>,
+    /// Last Pong receive time; the watchdog fires if no Pong arrives within
+    /// heartbeat_timeout (also bounds the registration phase).
+    last_pong: Instant,
+    /// Configured heartbeat timeout in seconds (raw config value).
+    hb_timeout: i64,
+    /// heartbeat_timeout as a Duration (clamped at 0).
+    hb_timeout_dur: Duration,
+    /// Whether the heartbeat watchdog is armed (interval > 0 && timeout > 0).
+    hb_watchdog_active: bool,
+    /// Shared session-alive flag for spawned work-conn tasks.
+    session_alive: Arc<AtomicBool>,
+    // --- Work-conn config snapshot (work_conn_config! macro locals) ---
+    wc_server_addr: String,
+    wc_server_port: u16,
+    wc_tls_enable: bool,
+    wc_tls_server_name: String,
+    wc_tls_ca_file: Option<String>,
+    wc_tls_cert_file: Option<String>,
+    wc_tls_key_file: Option<String>,
+    wc_dns_server: Option<String>,
+    wc_udp_packet_size: usize,
+    wc_disable_custom_tls_first_byte: bool,
+    wc_keepalive_secs: u64,
+    wc_bind_addr: Option<String>,
+    wc_proxy_url: String,
+    wc_dial_timeout_secs: u64,
+    /// Transport protocol for work connections (snapshot of cfg_local.protocol).
+    protocol: TransportProtocol,
+    /// Client-declared additional auth scopes, for heartbeat auth decisions.
+    client_scopes: Vec<String>,
+    /// Server-advertised auth scopes, for heartbeat auth decisions.
+    server_scopes: Vec<String>,
+    /// Per-session shutdown flag; set when the message loop decides to exit
+    /// (e.g. ShutdownMsg or auth failure), read at teardown.
+    shutdown_flag: Arc<AtomicBool>,
+    /// Session start time, used to reset the backoff counter when a session
+    /// runs healthily for a long time (Go frp's FastBackoffManager only
+    /// counts consecutive failures).
+    session_started_at: Instant,
+}
 
 /// The main frpc service.
 pub struct Service {
@@ -728,7 +792,6 @@ impl Service {
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("visitor_rx already taken — run() called twice?");
-        let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
         let mut stop_rx = self
             .stop_rx
@@ -736,7 +799,6 @@ impl Service {
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("stop_rx already taken — run() called twice?");
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Handle of the spawned admin HTTP server task; aborted on shutdown
         // (cancel_detached_tasks). Only spawned with the `admin` feature.
@@ -760,8 +822,6 @@ impl Service {
         // error count is reset so an occasional blip doesn't reconnect with
         // the backoff cap already reached (Go frp's FastBackoffManager only
         // counts consecutive failures).
-        #[allow(unused_assignments)] // initial None is overwritten before first read
-        let mut session_started_at: Option<Instant> = None;
         // Track visitor listener tasks so they can be cancelled on reconnect.
         let mut visitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         // Carry over run_id across reconnections (Go frp compat: previousRunID).
@@ -789,116 +849,26 @@ impl Service {
             let all_proxies = Arc::clone(&*self.proxies.read().await);
             let proxies = filter_active_proxies(&cfg_local, &all_proxies);
 
-            // Owned copies of the snapshot fields the work-conn config macro
-            // needs. `handle_req_work_conn` (which expands it) also runs from
-            // the message loop, where the snapshot guard is no longer held,
-            // so the macro reads these instead of the guard. Keeps the
-            // snapshot semantics (fields fixed at connection start) without
-            // cloning the whole ClientConfig.
-            let wc_server_addr = cfg_local.server_addr.clone();
-            let wc_server_port = cfg_local.server_port;
-            let wc_tls_enable = cfg_local.tls_enable;
-            let wc_tls_server_name = cfg_local.tls_server_name.clone();
-            let wc_tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
-            let wc_tls_cert_file = opt_if_empty!(cfg_local.tls_cert_file);
-            let wc_tls_key_file = opt_if_empty!(cfg_local.tls_key_file);
-            let wc_dns_server = opt_if_empty!(cfg_local.dns_server);
-            let wc_udp_packet_size = cfg_local.udp_packet_size.max(0) as usize;
-            let wc_disable_custom_tls_first_byte = cfg_local.disable_custom_tls_first_byte;
-            let wc_keepalive_secs = cfg_local.dial_server_keepalive.max(0) as u64;
-            let wc_bind_addr = opt_if_empty!(cfg_local.connect_server_local_ip);
-            let wc_proxy_url = cfg_local.proxy_url.clone();
-            let wc_dial_timeout_secs = cfg_local.dial_server_timeout.max(1) as u64;
-
             // Go frp compat (d486018): drop previous yamux session before
             // creating a new control connection. This drops the sender channel,
             // causing the background yamux task to exit and close the TCP socket.
             #[cfg(feature = "tcp-mux")]
             drop(prev_yamux.take());
-            let mut ctl = ControlConnection::new(
-                cfg_local.server_addr.clone(),
-                cfg_local.server_port,
-                self.auth_cfg.clone(),
-                protocol.clone(),
-                pool_count,
-                cfg_local.user.clone(),
-                cfg_local.client_id.clone(),
-                cfg_local.tls_enable,
-                cfg_local.tls_server_name.clone(),
-                opt_if_empty!(cfg_local.tls_ca_file),
-                opt_if_empty!(cfg_local.tls_cert_file),
-                opt_if_empty!(cfg_local.tls_key_file),
-                opt_if_empty!(cfg_local.dns_server),
-                cfg_local.tcp_mux,
-                cfg_local.disable_custom_tls_first_byte,
-                cfg_local.dial_server_keepalive.max(0) as u64,
-                cfg_local.tcp_mux_keepalive_interval,
-                opt_if_empty!(cfg_local.connect_server_local_ip),
-                cfg_local.v2,
-                self.oidc_client.clone(),
-                cfg_local.metas.clone(),
-                cfg_local.proxy_url.clone(),
-                previous_run_id.clone(),
-                Some(ClientSpec {
-                    client_type: Some("frpc".into()),
-                    always_auth_pass: None,
-                }),
-                cfg_local.dial_server_timeout,
-                #[cfg(feature = "quic")]
-                frp_core::quic::quic_params_from_option_values(
-                    cfg_local
-                        .quic_options
-                        .as_ref()
-                        .map(|q| q.keepalive_period)
-                        .unwrap_or(0),
-                    cfg_local
-                        .quic_options
-                        .as_ref()
-                        .map(|q| q.max_idle_timeout)
-                        .unwrap_or(0),
-                    cfg_local
-                        .quic_options
-                        .as_ref()
-                        .map(|q| q.max_incoming_streams)
-                        .unwrap_or(0),
-                ),
-            );
 
-            // Initialized to None: the post-login Ok arm overwrites it, and
-            // the error path (below) diverges before it can be read.
-            #[cfg(feature = "quic")]
-            let mut quic_conn: Option<QuicConnection> = None;
-
-            // Login and the post-login encryption wrap funnel into one Result:
-            // `into_encrypted` can fail when the transport carries unconsumed
-            // read-ahead bytes (remote-triggerable: a proxy injecting junk
-            // after its CONNECT response), and that failure must take the
-            // same retry/exit path as a login error — never panic (release
-            // binaries build with panic=abort).
-            let enc_result = match ctl.login().await {
-                Ok(r) => {
-                    did_login_once = true;
-                    *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
-                    // After login, wrap control stream in AES-128-CFB encryption.
-                    // Go frps v0.69.1 always encrypts the control connection for V1.
-                    #[cfg(feature = "quic")]
-                    let (stream, run_id, yamux, quic) = r;
-                    #[cfg(not(feature = "quic"))]
-                    let (stream, run_id, yamux) = r;
-                    let enc_key = encryption::derive_key(&self.auth_cfg.token);
-                    #[cfg(feature = "quic")]
-                    {
-                        quic_conn = quic;
-                    }
-                    stream
-                        .into_encrypted(enc_key)
-                        .map(|stream| (stream, run_id, yamux))
-                        .map_err(frp_core::Error::from)
-                }
-                Err(e) => Err(e),
-            };
-            let (mut control_stream, run_id, yamux_session) = match enc_result {
-                Ok(r) => r,
+            // Phases 1-3 (config snapshot, dial + login, encryption wrap,
+            // yamux, heartbeat init) live in connect_and_login; it returns
+            // the per-session state or the error. Backoff counters stay here.
+            let mut ctx = match self
+                .connect_and_login(
+                    &cfg_local,
+                    &protocol,
+                    pool_count,
+                    previous_run_id.clone(),
+                    &mut did_login_once,
+                )
+                .await
+            {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     consecutive_err_count += 1;
                     warn!(attempt = %consecutive_err_count, error = %e, "Login failed (attempt {}): {}", consecutive_err_count, e);
@@ -934,128 +904,13 @@ impl Service {
                     continue;
                 }
             };
-            let yamux = yamux_session.map(std::sync::Arc::new);
+
             // Store for explicit cleanup before next reconnect (Go frp compat d486018).
             #[cfg(feature = "tcp-mux")]
             {
-                prev_yamux = yamux.clone();
+                prev_yamux = ctx.yamux.clone();
             }
-            #[cfg(feature = "quic")]
-            let quic_conn = quic_conn.map(std::sync::Arc::new);
-            previous_run_id = run_id.clone();
-            // Session established — mark its start for backoff reset.
-            session_started_at = Some(Instant::now());
-            let v2 = cfg_local.v2;
-            info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
-
-            // --- Heartbeat state: single arm point ---
-            // `last_pong` is initialized at login success so the heartbeat
-            // watchdog bounds the REGISTRATION phase too: no Ping is sent
-            // until the message loop starts, so a server that stays
-            // connected but never answers NewProxy is detected within
-            // heartbeat_timeout instead of hanging the client in
-            // registration forever (Go frp's heartbeat timer also runs
-            // continuously while proxies register in their own goroutines).
-            // The message loop below reuses these same variables — this is
-            // the only initialization point (the watchdog must not be
-            // double-armed with a fresh timer after registration).
-            let mut ping_interval = if cfg_local.heartbeat_interval > 0 {
-                let secs = cfg_local.heartbeat_interval as u64;
-                info!(interval = %secs, "Heartbeat interval: {}s", secs);
-                Some(tokio::time::interval(Duration::from_secs(secs)))
-            } else {
-                info!("Heartbeat: explicitly disabled (heartbeat_interval <= 0)");
-                None
-            };
-            let mut last_pong = Instant::now();
-            let hb_timeout = cfg_local.heartbeat_timeout;
-            let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
-            // The watchdog only makes sense while the ping loop is active:
-            // with heartbeat_interval <= 0 the client never sends Pings, so
-            // no Pong can ever arrive and an active watchdog would fire right
-            // after login and reconnect forever (Go frp gates its heartbeat
-            // on the interval too).
-            let hb_watchdog_active = hb_timeout > 0 && ping_interval.is_some();
-
-            let session_alive = Arc::new(AtomicBool::new(true));
-
-            // Shared pool/work-conn configuration. Both the registration read
-            // loop (below) and the on-demand ReqWorkConn handler in the message
-            // loop build a byte-identical WorkConnConfig differing only in
-            // `pool_id`. Collapse into one macro (defined here so its free
-            // identifier references resolve against the locals in scope).
-            let client_scopes: Vec<String> = cfg_local
-                .auth
-                .as_ref()
-                .map(|a| a.additional_auth_scopes.clone())
-                .unwrap_or_default();
-            let server_scopes = self.server_auth_scopes.read().await.clone();
-            // Bind local UDP sockets for UDP proxies.
-
-            macro_rules! work_conn_config {
-                ($pool_id:expr) => {{
-                    #[cfg(feature = "quic")]
-                    let quic_arg = quic_conn.clone();
-                    #[cfg(not(feature = "quic"))]
-                    let quic_arg = ();
-                    crate::work_conn::WorkConnConfig {
-                        server_addr: wc_server_addr.clone(),
-                        server_port: wc_server_port,
-                        protocol: protocol.clone(),
-                        run_id: run_id.clone(),
-                        proxy_info_map: self.proxy_info_map.clone(),
-                        enc_key: self.encryption_key,
-                        pool_id: $pool_id,
-                        auth_cfg: self.auth_cfg.clone(),
-                        tls_enable: wc_tls_enable,
-                        tls_server_name: wc_tls_server_name.clone(),
-                        tls_ca_file: wc_tls_ca_file.clone(),
-                        tls_cert_file: wc_tls_cert_file.clone(),
-                        tls_key_file: wc_tls_key_file.clone(),
-                        dns_server: wc_dns_server.clone(),
-                        yamux: yamux.clone(),
-                        quic_conn: quic_arg,
-                        v2,
-                        oidc_client: self.oidc_client.clone(),
-                        udp_packet_size: wc_udp_packet_size,
-                        proxy_metrics: self.proxy_metrics.clone(),
-                        client_auth_scopes: client_scopes.clone(),
-                        server_auth_scopes: server_scopes.clone(),
-                        disable_custom_tls_first_byte: wc_disable_custom_tls_first_byte,
-                        keepalive_secs: wc_keepalive_secs,
-                        bind_addr: wc_bind_addr.clone(),
-                        proxy_url: wc_proxy_url.clone(),
-                        dial_timeout_secs: wc_dial_timeout_secs,
-                        xtcp_tx: xtcp_tx.clone(),
-                        session_alive: session_alive.clone(),
-                        spawned_counter: None,
-                        #[cfg(feature = "vnet")]
-                        vnet_tuns: self.vnet_tuns.clone(),
-                        #[cfg(feature = "vnet")]
-                        vnet_controller: self.vnet_controller.clone(),
-                        #[cfg(feature = "vnet")]
-                        vnet_tun_tx: self.vnet_tun_tx.clone(),
-                    }
-                }};
-            }
-
-            // Go frp compat: work connections are created ONLY in response to
-            // ReqWorkConn messages from the server (pool pre-warm sent right
-            // after LoginResp, NewVisitorConn acks, and on-demand requests —
-            // handled in the registration read loop below and the message loop
-            // further down). Do NOT eagerly spawn pool_count connections here;
-            // pool_count is sent to the server via Login so it knows how many
-            // ReqWorkConn messages to issue.
-            let handle_req_work_conn = || {
-                // Go frp v0.70.1 spawns each ReqWorkConn handler asynchronously
-                // with no client-side in-flight cap (client/control.go:
-                // handleReqWorkConn). Spawn directly so a burst of requests
-                // cannot overflow a queue or tear down the control session;
-                // each work conn's dial/StartWorkConn read is still bounded by
-                // its own timeout in work_conn.rs.
-                debug!("Received ReqWorkConn, spawning work connection");
-                crate::work_conn::spawn_work_conn(work_conn_config!(-1));
-            };
+            previous_run_id = ctx.run_id.clone();
 
             // Register proxies using IoStream directly (supports TCP and TLS).
             // Pipelined: write ALL NewProxy frames first, then collect the
@@ -1090,10 +945,18 @@ impl Service {
                     "Registering proxy '{}' type={} remote_port={} local={}",
                     p.name, p.proxy_type, p.remote_port, local_addr);
                 let wire_name = wire_proxy_name(&cfg_local.user, &p.name);
-                let write_result = if v2 {
-                    control_stream.write_v2_frame(&np).await
+                let write_result = if ctx.v2 {
+                    ctx.control_stream
+                        .as_mut()
+                        .expect("control_stream available before split")
+                        .write_v2_frame(&np)
+                        .await
                 } else {
-                    control_stream.write_v1_frame(&np).await
+                    ctx.control_stream
+                        .as_mut()
+                        .expect("control_stream available before split")
+                        .write_v1_frame(&np)
+                        .await
                 };
                 if let Err(e) = write_result {
                     // A failed write leaves the stream state undefined; record
@@ -1131,7 +994,7 @@ impl Service {
                     v.use_compression,
                     Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
                     Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
-                    Some(run_id.as_str()).filter(|s| !s.is_empty()),
+                    Some(ctx.run_id.as_str()).filter(|s| !s.is_empty()),
                 );
                 debug!(
                     server_name = %v.server_name,
@@ -1145,10 +1008,18 @@ impl Service {
                     Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
                     &v.server_name,
                 );
-                let write_result = if v2 {
-                    control_stream.write_v2_frame(&nvc).await
+                let write_result = if ctx.v2 {
+                    ctx.control_stream
+                        .as_mut()
+                        .expect("control_stream available before split")
+                        .write_v2_frame(&nvc)
+                        .await
                 } else {
-                    control_stream.write_v1_frame(&nvc).await
+                    ctx.control_stream
+                        .as_mut()
+                        .expect("control_stream available before split")
+                        .write_v1_frame(&nvc)
+                        .await
                 };
                 if let Err(e) = write_result {
                     write_failed = true;
@@ -1200,18 +1071,26 @@ impl Service {
                 // (hb_watchdog_active false) the watchdog must never fire:
                 // sleep for ~136 years so both branches share the same Sleep
                 // type, leaving the per-read deadlines below as the bound.
-                let watchdog = tokio::time::sleep(if hb_watchdog_active {
-                    hb_timeout_dur.saturating_sub(last_pong.elapsed())
+                let watchdog = tokio::time::sleep(if ctx.hb_watchdog_active {
+                    ctx.hb_timeout_dur.saturating_sub(ctx.last_pong.elapsed())
                 } else {
                     Duration::from_secs(u32::MAX as u64)
                 });
                 tokio::pin!(watchdog);
                 let resp_msg = if pending_proxies.is_empty() && !pending_visitors.is_empty() {
                     let read = async {
-                        if v2 {
-                            control_stream.read_v2_frame().await
+                        if ctx.v2 {
+                            ctx.control_stream
+                                .as_mut()
+                                .expect("control_stream available before split")
+                                .read_v2_frame()
+                                .await
                         } else {
-                            control_stream.read_v1_frame().await
+                            ctx.control_stream
+                                .as_mut()
+                                .expect("control_stream available before split")
+                                .read_v1_frame()
+                                .await
                         }
                     };
                     tokio::select! {
@@ -1236,14 +1115,21 @@ impl Service {
                                         let v = session_visitors[idx];
                                         info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}' (no registration response — assumed registered)", v.name, v.server_name);
                                         #[cfg(feature = "vnet")]
-                                        advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
+                                        advertise_vnet_visitor_route(
+                                            ctx.control_stream
+                                                .as_mut()
+                                                .expect("control_stream available before split"),
+                                            ctx.v2,
+                                            v,
+                                        )
+                                        .await;
                                     }
                                     break;
                                 }
                             }
                         }
                         _ = &mut watchdog => {
-                            warn!(timeout = %hb_timeout, "Heartbeat timeout ({}s) during registration, reconnecting...", hb_timeout);
+                            warn!(timeout = %ctx.hb_timeout, "Heartbeat timeout ({}s) during registration, reconnecting...", ctx.hb_timeout);
                             aborted = true;
                             // Break the registration loop: `aborted` skips the
                             // session continuation (writer task, visitor
@@ -1272,10 +1158,18 @@ impl Service {
                     // whole session is torn down for a reconnect at
                     // hb_timeout.
                     let read = async {
-                        if v2 {
-                            control_stream.read_v2_frame().await
+                        if ctx.v2 {
+                            ctx.control_stream
+                                .as_mut()
+                                .expect("control_stream available before split")
+                                .read_v2_frame()
+                                .await
                         } else {
-                            control_stream.read_v1_frame().await
+                            ctx.control_stream
+                                .as_mut()
+                                .expect("control_stream available before split")
+                                .read_v1_frame()
+                                .await
                         }
                     };
                     tokio::select! {
@@ -1318,7 +1212,7 @@ impl Service {
                             }
                         }
                         _ = &mut watchdog => {
-                            warn!(timeout = %hb_timeout, "Heartbeat timeout ({}s) during registration, reconnecting...", hb_timeout);
+                            warn!(timeout = %ctx.hb_timeout, "Heartbeat timeout ({}s) during registration, reconnecting...", ctx.hb_timeout);
                             aborted = true;
                             // Break the registration loop: `aborted` skips the
                             // session continuation (writer task, visitor
@@ -1418,11 +1312,18 @@ impl Service {
                             // Virtual-net visitors advertise their destination IP
                             // as a host route instead of binding a local listener.
                             #[cfg(feature = "vnet")]
-                            advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
+                            advertise_vnet_visitor_route(
+                                ctx.control_stream
+                                    .as_mut()
+                                    .expect("control_stream available before split"),
+                                ctx.v2,
+                                v,
+                            )
+                            .await;
                         }
                     }
                     FrpMessage::ReqWorkConn(_) => {
-                        handle_req_work_conn();
+                        self.handle_req_work_conn(&ctx);
                         // Go frps v0.69.1 acks a successful NewVisitorConn on
                         // the control channel with an anonymous ReqWorkConn
                         // (no proxy_name; failures get a named
@@ -1455,7 +1356,14 @@ impl Service {
                             let v = session_visitors[idx];
                             info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}' (Go frps compat: ReqWorkConn after NewVisitorConn)", v.name, v.server_name);
                             #[cfg(feature = "vnet")]
-                            advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
+                            advertise_vnet_visitor_route(
+                                ctx.control_stream
+                                    .as_mut()
+                                    .expect("control_stream available before split"),
+                                ctx.v2,
+                                v,
+                            )
+                            .await;
                         }
                         req_work_conns_seen += 1;
                     }
@@ -1526,7 +1434,11 @@ impl Service {
             // writer task to clean up; the teardown below handles both.
             if !aborted {
                 // Split control stream for reading and writing.
-                let (mut reader, raw_writer) = control_stream.into_split()?;
+                let (mut reader, raw_writer) = ctx
+                    .control_stream
+                    .take()
+                    .expect("control_stream available before split")
+                    .into_split()?;
 
                 {
                     let failed = control_failed.clone();
@@ -1560,12 +1472,12 @@ impl Service {
                         &p.name,
                         &p.virtual_net,
                         &writer,
-                        v2,
+                        ctx.v2,
                     )
                     .await
                     .is_some()
                     {
-                        send_vnet_route_advertise(&writer, v2, p).await;
+                        send_vnet_route_advertise(&writer, ctx.v2, p).await;
                     }
                 }
 
@@ -1629,7 +1541,7 @@ impl Service {
                                     cfg_local.dial_server_keepalive.max(0) as u64;
                                 let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
                                 let user = cfg_local.user.clone();
-                                let rid = run_id.clone();
+                                let rid = ctx.run_id.clone();
                                 let controller = self.vnet_controller.clone();
                                 let vnet_tun_tx = self.vnet_tun_tx.clone();
                                 let tun_subnets = self.vnet_tun_subnets.clone();
@@ -1661,7 +1573,7 @@ impl Service {
                                             disable_custom_tls_first_byte: transport_nocustomtls,
                                             tls_cert_file: transport_tls_cert.clone(),
                                             tls_key_file: transport_tls_key.clone(),
-                                            v2,
+                                            v2: ctx.v2,
                                             destination_cidr: adv.subnet,
                                             controller,
                                             vnet_tun_tx,
@@ -1709,7 +1621,7 @@ impl Service {
                     let disable_assisted_addrs = v.disable_assisted_addrs;
                     let p2p_protocol = v.protocol.clone();
                     let user = cfg_local.user.clone();
-                    let rid = run_id.clone();
+                    let rid = ctx.run_id.clone();
                     let vtx = self.visitor_tx.clone();
                     let shutdown = visitor_shutdown.clone();
                     let handle = tokio::spawn(async move {
@@ -1751,7 +1663,7 @@ impl Service {
                                 disable_custom_tls_first_byte: transport_nocustomtls,
                                 tls_cert_file: transport_tls_cert.clone(),
                                 tls_key_file: transport_tls_key.clone(),
-                                v2,
+                                v2: ctx.v2,
                             },
                         )
                         .await;
@@ -1812,11 +1724,11 @@ impl Service {
 
                 loop {
                     tokio::select! {
-                        msg = read_msg(&mut reader, v2) => {
+                        msg = read_msg(&mut reader, ctx.v2) => {
                             match msg {
                                 Ok(FrpMessage::ReqWorkConn(_)) => {
                                     // Shared with the registration read loop above.
-                                    handle_req_work_conn();
+                                    self.handle_req_work_conn(&ctx);
                                 }
                                 Ok(FrpMessage::Pong(pong)) => {
                                     if let Some(ref err) = pong.error {
@@ -1826,7 +1738,7 @@ impl Service {
                                         }
                                     }
                                     debug!("Pong received");
-                                    last_pong = Instant::now();
+                                    ctx.last_pong = Instant::now();
                                 }
                                 Ok(FrpMessage::Ping(_)) => {
                                     // Answer an unsolicited server Ping with Pong
@@ -1835,7 +1747,7 @@ impl Service {
                                     // a server that probes liveness with Ping would
                                     // have its watchdog kill a healthy connection.
                                     let pong = FrpMessage::Pong(msg::Pong { error: None });
-                                    if let Err(e) = writer.send(pong, v2) {
+                                    if let Err(e) = writer.send(pong, ctx.v2) {
                                         debug!(error = %e, "Pong reply to server Ping failed: {}", e);
                                     }
                                 }
@@ -1858,10 +1770,10 @@ impl Service {
                                     warn!(error = %err.error, "Server error: {}", err.error);
                                 }
                                 Ok(FrpMessage::NatHoleClient(nhc)) => {
-                                    self.handle_nat_hole_client(*nhc, &writer, v2, session_alive.clone()).await;
+                                    self.handle_nat_hole_client(*nhc, &writer, ctx.v2, ctx.session_alive.clone()).await;
                                 }
                                 Ok(FrpMessage::NatHoleResp(resp)) => {
-                                    self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets, &writer, session_alive.clone()).await;
+                                    self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets, &writer, ctx.session_alive.clone()).await;
                                 }
                                 Ok(FrpMessage::NewProxyResp(resp)) => {
                                     let is_error = resp.error.as_ref().is_some_and(|e| !e.is_empty());
@@ -2052,7 +1964,7 @@ impl Service {
                         }
 
                         _ = async {
-                            if let Some(ref mut interval) = ping_interval {
+                            if let Some(ref mut interval) = ctx.ping_interval {
                                 interval.tick().await;
                             } else {
                                 std::future::pending::<()>().await;
@@ -2070,8 +1982,8 @@ impl Service {
                             // serverAdditionalAuthScopes field in LoginResp, so the
                             // server side of this union is ignored by Go peers.
                             let send_auth = crate::backoff::heartbeat_requires_auth(
-                                &client_scopes,
-                                &server_scopes,
+                                &ctx.client_scopes,
+                                &ctx.server_scopes,
                             );
                             if send_auth {
                                 if let Some(ref oidc) = self.oidc_client {
@@ -2097,7 +2009,7 @@ impl Service {
                                 }
                             }
                             let ping = FrpMessage::Ping(ping_msg);
-                            if let Err(e) = writer.send(ping, v2) {
+                            if let Err(e) = writer.send(ping, ctx.v2) {
                                 warn!(error = %e, "Ping write failed: {}", e);
                                 // Non-fatal: heartbeat timeout will detect actual dead connection.
                             } else {
@@ -2178,7 +2090,7 @@ impl Service {
                                     };
                                     if let Some(p) = retry_candidates.iter().find(|p| p.name == bare_name) {
                                         let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_user);
-                                        if let Err(e) = writer.send(new_proxy, v2) {
+                                        if let Err(e) = writer.send(new_proxy, ctx.v2) {
                                             warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
                                         } else {
                                             info!(proxy_name = %name, "Proxy '{}' retry: sent NewProxy", name);
@@ -2211,7 +2123,7 @@ impl Service {
                                     let close = FrpMessage::CloseProxy(msg::CloseProxy {
                                         proxy_name: proxy_name.clone(),
                                     });
-                                    if let Err(e) = writer.send(close, v2) {
+                                    if let Err(e) = writer.send(close, ctx.v2) {
                                         warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
                                     }
                                     // Keep health check running -- monitor for recovery (Go frp compat).
@@ -2238,7 +2150,7 @@ impl Service {
                                             }
                                         }
                                         let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr, &cfg_user);
-                                        if let Err(e) = writer.send(new_proxy, v2) {
+                                        if let Err(e) = writer.send(new_proxy, ctx.v2) {
                                             warn!(proxy_name = %proxy_name, error = %e, "Failed to re-register proxy on health recovery: {}", e);
                                         } else {
                                             info!(proxy_name = %proxy_name, "Health recovery: re-registered proxy '{}'", proxy_name);
@@ -2370,7 +2282,7 @@ impl Service {
                         // connection and track sid→proxy_name for NatHoleResp routing.
                         Some(stun_result) = stun_result_rx.recv() => {
                             let StunResult { sid, proxy_name, msg } = stun_result;
-                            if let Err(e) = writer.send(msg, v2) {
+                            if let Err(e) = writer.send(msg, ctx.v2) {
                                 warn!(error = %e, "XTCP: failed to send NatHoleClient: {}", e);
                                 // The STUN socket was stored in xtcp_sockets but no
                                 // pending_xtcp entry was created; reclaim it now so it
@@ -2414,7 +2326,7 @@ impl Service {
                         Some(vreq) = visitor_rx.recv() => {
                             let txn_id = vreq.nhv.transaction_id.clone();
                             let nhv = FrpMessage::NatHoleVisitor(vreq.nhv);
-                            match writer.send(nhv, v2) {
+                            match writer.send(nhv, ctx.v2) {
                                 Ok(()) => {
                                     debug!(sid = %txn_id, "Visitor: sent NatHoleVisitor on control, sid={}", txn_id);
                                     visitor_pending.insert(txn_id.clone(), vreq.reply);
@@ -2449,7 +2361,7 @@ impl Service {
 
                         Some(()) = stop_rx.recv() => {
                             info!("Stop requested, shutting down");
-                            shutdown_flag.store(true, Ordering::SeqCst);
+                            ctx.shutdown_flag.store(true, Ordering::SeqCst);
                             break;
                         }
 
@@ -2462,8 +2374,8 @@ impl Service {
                         // negative values disable it independently of tcp_mux.
                         // Gated on the ping loop being active (hb_watchdog_active):
                         // with heartbeat_interval <= 0 no Pong can ever arrive.
-                        _ = tokio::time::sleep(hb_timeout_dur.saturating_sub(last_pong.elapsed())), if hb_watchdog_active => {
-                            warn!("Heartbeat timeout ({}s), reconnecting...", hb_timeout);
+                        _ = tokio::time::sleep(ctx.hb_timeout_dur.saturating_sub(ctx.last_pong.elapsed())), if ctx.hb_watchdog_active => {
+                            warn!("Heartbeat timeout ({}s), reconnecting...", ctx.hb_timeout);
                             break;
                         }
                         // The dedicated writer task hit a write failure (peer
@@ -2509,7 +2421,7 @@ impl Service {
                             virtual_net: adv.virtual_net,
                         };
                         let msg = FrpMessage::VnetRouteRemove(rem);
-                        if let Err(e) = writer.send(msg, v2) {
+                        if let Err(e) = writer.send(msg, ctx.v2) {
                             warn!(visitor_name = %v.name, error = %e, "failed to remove vnet route for visitor '{}'", v.name);
                         } else {
                             info!(visitor_name = %v.name, "vnet route removed for visitor '{}'", v.name);
@@ -2521,7 +2433,7 @@ impl Service {
             // Go frp GracefulClose ordering: close proxies first, then visitors,
             // then the control connection. See /tmp/frp-source/client/control.go:203-210.
             // Step 1: Signal work connection pool to stop replenishment cascade.
-            session_alive.store(false, Ordering::Release);
+            ctx.session_alive.store(false, Ordering::Release);
 
             // Step 2: Signal visitor listeners to stop accepting new connections
             // (Go frp compat: vm.Close() closes all visitors before session is torn down).
@@ -2542,7 +2454,7 @@ impl Service {
                 .await;
 
             // Check if admin stop was requested
-            if shutdown_flag.load(Ordering::SeqCst) {
+            if ctx.shutdown_flag.load(Ordering::SeqCst) {
                 info!("frpc shutting down");
                 // Cancel health check tasks and abort the admin HTTP server
                 // before returning. Both are detached tokio tasks; without
@@ -2558,10 +2470,8 @@ impl Service {
             // Reset the consecutive-error count when the previous session was
             // healthy for ≥5 minutes, so a stable connection followed by an
             // occasional blip reconnects from Phase 1 instead of the 20s cap.
-            if let Some(started) = session_started_at {
-                if started.elapsed() > Duration::from_secs(300) {
-                    consecutive_err_count = 0;
-                }
+            if ctx.session_started_at.elapsed() > Duration::from_secs(300) {
+                consecutive_err_count = 0;
             }
             let delay = crate::backoff::reconnect_delay_after_session(
                 &mut consecutive_err_count,
@@ -2574,13 +2484,279 @@ impl Service {
             tokio::select! {
                 Some(()) = stop_rx.recv() => {
                     info!("Stop requested while waiting to reconnect, shutting down");
-                    shutdown_flag.store(true, Ordering::SeqCst);
+                    ctx.shutdown_flag.store(true, Ordering::SeqCst);
                     self.cancel_detached_tasks(&health_cancels, admin_handle).await;
                     return Ok(());
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
         }
+    }
+
+    /// Phases 1-3 of one connection attempt: snapshot the work-conn config
+    /// fields from the current client config, dial + login a new control
+    /// connection, wrap the stream in AES-128-CFB, and initialize the
+    /// per-session state (yamux handle, heartbeat watchdog, auth scopes,
+    /// shutdown flag) that registration and the message loop build on.
+    ///
+    /// Returns the per-session state on success; on failure returns the
+    /// error so run() can apply backoff + reconnect exactly as before.
+    /// Backoff counters (consecutive_err_count, fast_retry_timestamps,
+    /// previous_run_id) stay in run() scope — `did_login_once` is passed in
+    /// so it is set at login success (before the encryption wrap), matching
+    /// the previous ordering where a wrap failure still saw did_login_once
+    /// already true.
+    async fn connect_and_login(
+        &self,
+        cfg_local: &ClientConfig,
+        protocol: &TransportProtocol,
+        pool_count: i32,
+        previous_run_id: String,
+        did_login_once: &mut bool,
+    ) -> Result<SessionCtx, frp_core::Error> {
+        // Owned copies of the snapshot fields the work-conn config needs.
+        // `handle_req_work_conn` (which builds the same config) also runs from
+        // the message loop, where the snapshot guard is no longer held, so the
+        // fields are stored on SessionCtx instead of read from the guard.
+        // Keeps the snapshot semantics (fields fixed at connection start)
+        // without cloning the whole ClientConfig.
+        let wc_server_addr = cfg_local.server_addr.clone();
+        let wc_server_port = cfg_local.server_port;
+        let wc_tls_enable = cfg_local.tls_enable;
+        let wc_tls_server_name = cfg_local.tls_server_name.clone();
+        let wc_tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+        let wc_tls_cert_file = opt_if_empty!(cfg_local.tls_cert_file);
+        let wc_tls_key_file = opt_if_empty!(cfg_local.tls_key_file);
+        let wc_dns_server = opt_if_empty!(cfg_local.dns_server);
+        let wc_udp_packet_size = cfg_local.udp_packet_size.max(0) as usize;
+        let wc_disable_custom_tls_first_byte = cfg_local.disable_custom_tls_first_byte;
+        let wc_keepalive_secs = cfg_local.dial_server_keepalive.max(0) as u64;
+        let wc_bind_addr = opt_if_empty!(cfg_local.connect_server_local_ip);
+        let wc_proxy_url = cfg_local.proxy_url.clone();
+        let wc_dial_timeout_secs = cfg_local.dial_server_timeout.max(1) as u64;
+
+        let mut ctl = ControlConnection::new(
+            cfg_local.server_addr.clone(),
+            cfg_local.server_port,
+            self.auth_cfg.clone(),
+            protocol.clone(),
+            pool_count,
+            cfg_local.user.clone(),
+            cfg_local.client_id.clone(),
+            cfg_local.tls_enable,
+            cfg_local.tls_server_name.clone(),
+            opt_if_empty!(cfg_local.tls_ca_file),
+            opt_if_empty!(cfg_local.tls_cert_file),
+            opt_if_empty!(cfg_local.tls_key_file),
+            opt_if_empty!(cfg_local.dns_server),
+            cfg_local.tcp_mux,
+            cfg_local.disable_custom_tls_first_byte,
+            cfg_local.dial_server_keepalive.max(0) as u64,
+            cfg_local.tcp_mux_keepalive_interval,
+            opt_if_empty!(cfg_local.connect_server_local_ip),
+            cfg_local.v2,
+            self.oidc_client.clone(),
+            cfg_local.metas.clone(),
+            cfg_local.proxy_url.clone(),
+            previous_run_id.clone(),
+            Some(ClientSpec {
+                client_type: Some("frpc".into()),
+                always_auth_pass: None,
+            }),
+            cfg_local.dial_server_timeout,
+            #[cfg(feature = "quic")]
+            frp_core::quic::quic_params_from_option_values(
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.keepalive_period)
+                    .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.max_idle_timeout)
+                    .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.max_incoming_streams)
+                    .unwrap_or(0),
+            ),
+        );
+
+        // Initialized to None: the post-login Ok arm overwrites it, and
+        // the error path (below) diverges before it can be read.
+        #[cfg(feature = "quic")]
+        let mut quic_conn: Option<QuicConnection> = None;
+
+        // Login and the post-login encryption wrap funnel into one Result:
+        // `into_encrypted` can fail when the transport carries unconsumed
+        // read-ahead bytes (remote-triggerable: a proxy injecting junk
+        // after its CONNECT response), and that failure must take the
+        // same retry/exit path as a login error — never panic (release
+        // binaries build with panic=abort).
+        let enc_result = match ctl.login().await {
+            Ok(r) => {
+                *did_login_once = true;
+                *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
+                // After login, wrap control stream in AES-128-CFB encryption.
+                // Go frps v0.69.1 always encrypts the control connection for V1.
+                #[cfg(feature = "quic")]
+                let (stream, run_id, yamux, quic) = r;
+                #[cfg(not(feature = "quic"))]
+                let (stream, run_id, yamux) = r;
+                let enc_key = encryption::derive_key(&self.auth_cfg.token);
+                #[cfg(feature = "quic")]
+                {
+                    quic_conn = quic;
+                }
+                stream
+                    .into_encrypted(enc_key)
+                    .map(|stream| (stream, run_id, yamux))
+                    .map_err(frp_core::Error::from)
+            }
+            Err(e) => Err(e),
+        };
+        let (control_stream, run_id, yamux_session) = match enc_result {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+        let yamux = yamux_session.map(std::sync::Arc::new);
+        #[cfg(feature = "quic")]
+        let quic_conn = quic_conn.map(std::sync::Arc::new);
+        let v2 = cfg_local.v2;
+        info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
+
+        // --- Heartbeat state: single arm point ---
+        // `last_pong` is initialized at login success so the heartbeat
+        // watchdog bounds the REGISTRATION phase too: no Ping is sent
+        // until the message loop starts, so a server that stays
+        // connected but never answers NewProxy is detected within
+        // heartbeat_timeout instead of hanging the client in
+        // registration forever (Go frp's heartbeat timer also runs
+        // continuously while proxies register in their own goroutines).
+        // The message loop below reuses these same variables — this is
+        // the only initialization point (the watchdog must not be
+        // double-armed with a fresh timer after registration).
+        let ping_interval = if cfg_local.heartbeat_interval > 0 {
+            let secs = cfg_local.heartbeat_interval as u64;
+            info!(interval = %secs, "Heartbeat interval: {}s", secs);
+            Some(tokio::time::interval(Duration::from_secs(secs)))
+        } else {
+            info!("Heartbeat: explicitly disabled (heartbeat_interval <= 0)");
+            None
+        };
+        let last_pong = Instant::now();
+        let hb_timeout = cfg_local.heartbeat_timeout;
+        let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
+        // The watchdog only makes sense while the ping loop is active:
+        // with heartbeat_interval <= 0 the client never sends Pings, so
+        // no Pong can ever arrive and an active watchdog would fire right
+        // after login and reconnect forever (Go frp gates its heartbeat
+        // on the interval too).
+        let hb_watchdog_active = hb_timeout > 0 && ping_interval.is_some();
+
+        let session_alive = Arc::new(AtomicBool::new(true));
+
+        let client_scopes: Vec<String> = cfg_local
+            .auth
+            .as_ref()
+            .map(|a| a.additional_auth_scopes.clone())
+            .unwrap_or_default();
+        let server_scopes = self.server_auth_scopes.read().await.clone();
+
+        Ok(SessionCtx {
+            control_stream: Some(control_stream),
+            run_id,
+            yamux,
+            v2,
+            #[cfg(feature = "quic")]
+            quic_conn,
+            ping_interval,
+            last_pong,
+            hb_timeout,
+            hb_timeout_dur,
+            hb_watchdog_active,
+            session_alive,
+            wc_server_addr,
+            wc_server_port,
+            wc_tls_enable,
+            wc_tls_server_name,
+            wc_tls_ca_file,
+            wc_tls_cert_file,
+            wc_tls_key_file,
+            wc_dns_server,
+            wc_udp_packet_size,
+            wc_disable_custom_tls_first_byte,
+            wc_keepalive_secs,
+            wc_bind_addr,
+            wc_proxy_url,
+            wc_dial_timeout_secs,
+            protocol: protocol.clone(),
+            client_scopes,
+            server_scopes,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            session_started_at: Instant::now(),
+        })
+    }
+
+    /// Spawn a work connection in response to a ReqWorkConn message from the
+    /// server (pool pre-warm sent right after LoginResp, NewVisitorConn acks,
+    /// and on-demand requests — handled in the registration read loop and the
+    /// message loop). Go frp compat: work connections are created ONLY in
+    /// response to ReqWorkConn messages; pool_count is sent to the server via
+    /// Login so it knows how many ReqWorkConn messages to issue, and the
+    /// client never eagerly spawns pool connections.
+    fn handle_req_work_conn(&self, ctx: &SessionCtx) {
+        // Go frp v0.70.1 spawns each ReqWorkConn handler asynchronously
+        // with no client-side in-flight cap (client/control.go:
+        // handleReqWorkConn). Spawn directly so a burst of requests
+        // cannot overflow a queue or tear down the control session;
+        // each work conn's dial/StartWorkConn read is still bounded by
+        // its own timeout in work_conn.rs.
+        debug!("Received ReqWorkConn, spawning work connection");
+        #[cfg(feature = "quic")]
+        let quic_arg = ctx.quic_conn.clone();
+        #[cfg(not(feature = "quic"))]
+        let quic_arg = ();
+        crate::work_conn::spawn_work_conn(crate::work_conn::WorkConnConfig {
+            server_addr: ctx.wc_server_addr.clone(),
+            server_port: ctx.wc_server_port,
+            protocol: ctx.protocol.clone(),
+            run_id: ctx.run_id.clone(),
+            proxy_info_map: self.proxy_info_map.clone(),
+            enc_key: self.encryption_key,
+            pool_id: -1,
+            auth_cfg: self.auth_cfg.clone(),
+            tls_enable: ctx.wc_tls_enable,
+            tls_server_name: ctx.wc_tls_server_name.clone(),
+            tls_ca_file: ctx.wc_tls_ca_file.clone(),
+            tls_cert_file: ctx.wc_tls_cert_file.clone(),
+            tls_key_file: ctx.wc_tls_key_file.clone(),
+            dns_server: ctx.wc_dns_server.clone(),
+            yamux: ctx.yamux.clone(),
+            quic_conn: quic_arg,
+            v2: ctx.v2,
+            oidc_client: self.oidc_client.clone(),
+            udp_packet_size: ctx.wc_udp_packet_size,
+            proxy_metrics: self.proxy_metrics.clone(),
+            client_auth_scopes: ctx.client_scopes.clone(),
+            server_auth_scopes: ctx.server_scopes.clone(),
+            disable_custom_tls_first_byte: ctx.wc_disable_custom_tls_first_byte,
+            keepalive_secs: ctx.wc_keepalive_secs,
+            bind_addr: ctx.wc_bind_addr.clone(),
+            proxy_url: ctx.wc_proxy_url.clone(),
+            dial_timeout_secs: ctx.wc_dial_timeout_secs,
+            xtcp_tx: self.xtcp_tx.clone(),
+            session_alive: ctx.session_alive.clone(),
+            spawned_counter: None,
+            #[cfg(feature = "vnet")]
+            vnet_tuns: self.vnet_tuns.clone(),
+            #[cfg(feature = "vnet")]
+            vnet_controller: self.vnet_controller.clone(),
+            #[cfg(feature = "vnet")]
+            vnet_tun_tx: self.vnet_tun_tx.clone(),
+        });
     }
 
     /// Spawn per-proxy health check tasks (once, outside reconnect loop).
