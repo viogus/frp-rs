@@ -4,10 +4,10 @@
 //!
 //! The flow under test:
 //! - initial registration: NewProxy is sent, the server stays silent on it,
-//!   and `REGISTRATION_RESPONSE_TIMEOUT` (30s) marks the proxy StartErr
-//!   without tearing the session down;
-//! - the message loop's 30s retry arm re-sends NewProxy (StartErr -> send
-//!   -> WaitStart);
+//!   and `REGISTRATION_RESPONSE_TIMEOUT` marks the proxy StartErr without
+//!   tearing the session down;
+//! - the message loop's retry arm re-sends NewProxy (StartErr -> send ->
+//!   WaitStart);
 //! - a re-sent NewProxy that is again never answered keeps the phase in
 //!   WaitStart — only a NewProxyResp error moves it to StartErr, so without
 //!   the WaitStart-stuck re-arm a silent-but-ponging server would stop the
@@ -16,8 +16,14 @@
 //!   waitStart and retries indefinitely; the retry arm mirrors that.
 //!
 //! Assert the mock receives >= 3 NewProxy frames (initial + two retries).
-//! Each hop costs one hardcoded 30s period, so the third frame lands at
-//! ~90s; the assertion allows 120s.
+//! The 30s production cadence is shrunk via the env overrides
+//! (`FRP_REGISTRATION_RESPONSE_TIMEOUT_MS` / `FRP_PROXY_RETRY_INTERVAL_MS`)
+//! so the test finishes in a couple of seconds instead of ~90s of wall
+//! clock, removing CI timer-drift flake.
+//!
+//! The env vars MUST be set before `Service` is constructed: the cadence is
+//! read once into a `LazyLock` at first use (same pattern as
+//! `FRP_BRIDGE_BUF_KB`).
 
 mod common;
 
@@ -33,8 +39,17 @@ use frp_core::transport::IoStream;
 
 use common::allocate_port;
 
+// Production cadence is 30s per hop. With the env overrides below each hop
+// costs 250ms, so the third NewProxy lands at ~750ms; allow 10s.
+const TEST_CADENCE_MS: &str = "250";
+const ASSERT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[tokio::test]
 async fn silent_server_never_answering_newproxy_is_retried_forever() {
+    // Shrink the cadence BEFORE constructing the Service (LazyLock read-once).
+    std::env::set_var("FRP_REGISTRATION_RESPONSE_TIMEOUT_MS", TEST_CADENCE_MS);
+    std::env::set_var("FRP_PROXY_RETRY_INTERVAL_MS", TEST_CADENCE_MS);
+
     common::init_tracing();
     let token = "proxy-retry-token";
     let server_port = allocate_port();
@@ -125,12 +140,12 @@ async fn silent_server_never_answering_newproxy_is_retried_forever() {
         })
     };
 
-    // Registration times out after REGISTRATION_RESPONSE_TIMEOUT (30s), and
-    // each retry hop costs one PROXY_RETRY_INTERVAL (30s), so the third
-    // NewProxy lands at ~90s. 120s is generous headroom.
-    tokio::time::timeout(Duration::from_secs(120), async {
+    // Registration times out after REGISTRATION_RESPONSE_TIMEOUT, and each
+    // retry hop costs one PROXY_RETRY_INTERVAL — both shrunk to 250ms here,
+    // so the third NewProxy lands at ~750ms. 10s is generous headroom.
+    tokio::time::timeout(ASSERT_TIMEOUT, async {
         while newproxy_count.load(Ordering::SeqCst) < 3 {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await

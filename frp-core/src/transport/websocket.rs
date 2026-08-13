@@ -23,6 +23,17 @@ use super::{AsyncReadWrite, Transport};
 /// encrypted V2 frame at the payload cap is not rejected by the transport.
 const MAX_WS_FRAME_PAYLOAD: u64 = crate::protocol::V2_MAX_FRAME_PAYLOAD as u64 + 128;
 
+/// Cap on no-progress frames (zero-length data, ping, pong) drained within a
+/// single `poll_read` call. Each such frame is consumed, woken, and re-polled
+/// — a peer flooding empty frames at line rate would otherwise keep the poll
+/// loop spinning through the buffered batch CPU-bound (each empty frame is
+/// only 2-6 bytes on the wire, so a 64 KiB socket buffer holds tens of
+/// thousands of them). Beyond the cap the loop returns `Poll::Pending`
+/// (already woken by the frame dispatch), yielding to the executor; the next
+/// poll continues draining. Bounded per-call work — a full buffer of empty
+/// frames still drains, just across multiple polls instead of one.
+const MAX_NO_PROGRESS_FRAMES_PER_POLL: u32 = 1024;
+
 /// A WebSocket-to-byte-stream adapter that implements AsyncRead/AsyncWrite.
 /// Converts between WebSocket messages and a byte stream suitable
 /// for use with the V1 protocol functions.
@@ -272,9 +283,26 @@ impl AsyncRead for WsByteStream {
         } = this;
 
         let raw = inner;
+        // No-progress frames (zero-length data / ping / pong) consumed in
+        // this poll call — capped so a peer flooding empty frames cannot pin
+        // the poll loop CPU-bound within a single call (see the constant).
+        // Every no-progress dispatch resets `raw_read_state` to Idle and the
+        // caller `continue`s, so the Idle arm below is the single funnel
+        // point for counting them (productive frames return Ready directly
+        // and never pass through Idle again). The initial Idle entry before
+        // the first frame counts one spurious frame — irrelevant at the
+        // 1024 cap.
+        let mut no_progress_frames = 0u32;
         loop {
             match raw_read_state {
                 RawReadState::Idle => {
+                    no_progress_frames += 1;
+                    if no_progress_frames > MAX_NO_PROGRESS_FRAMES_PER_POLL {
+                        // Yield: dispatch_raw_frame already registered the
+                        // waker, so the executor re-polls us and the drain
+                        // continues from the next buffered frame.
+                        return Poll::Pending;
+                    }
                     *raw_read_state = RawReadState::ReadingHeader {
                         head: [0u8; 2],
                         filled: 0,
