@@ -1900,6 +1900,7 @@ impl Service {
         &self,
         ctx: &mut SessionCtx,
         cfg_local: &ClientConfig,
+        #[cfg_attr(not(feature = "vnet"), allow(unused_variables))]
         proxies: &[frp_core::config::ProxyConfig],
         protocol: &TransportProtocol,
         nat_hole_stun_server: &str,
