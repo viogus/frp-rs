@@ -45,6 +45,7 @@ pub(crate) async fn handle_visitor_conn_inner(
     msg: msg::NewVisitorConn,
     state: Arc<AppState>,
     v2: bool,
+    visitor_peer: Option<std::net::SocketAddr>,
 ) {
     let sign_key = msg.sign_key.unwrap_or_default();
     let timestamp = msg.timestamp.unwrap_or(0);
@@ -130,12 +131,10 @@ pub(crate) async fn handle_visitor_conn_inner(
             match pn {
                 Some(pn) => pn,
                 None => {
-                    // SAFETY: chars().take(8) is safe on any UTF-8 input, including
-                    // multi-byte characters. Byte-index slicing (&s[..8]) would
-                    // panic if byte 8 falls inside a multi-byte char boundary.
-                    let sign_key_prefix: String = sign_key.chars().take(8).collect();
-                    warn!(proxy_name = %msg.proxy_name, sign_key_prefix = %sign_key_prefix, "NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
-                        msg.proxy_name, sign_key_prefix);
+                    // The sign_key is attacker-supplied (and may itself be a
+                    // secret-guessing probe) — never log any part of it.
+                    // proxy_name is already in the message and stays logged.
+                    warn!(proxy_name = %msg.proxy_name, "NewVisitorConn: no STCP proxy found for proxy_name='{}'", msg.proxy_name);
                     // Send error response to visitor (Go frp expects NewVisitorConnResp)
                     let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
                         proxy_name: msg.proxy_name.clone(),
@@ -166,12 +165,39 @@ pub(crate) async fn handle_visitor_conn_inner(
 
     // Bind fresh visitor authorization to an existing authenticated control.
     // Go v0.70.1 fallback: visitors without a run_id are admitted with the
-    // empty identity and the normal owner/allow-users check.
+    // empty identity and the normal owner/allow-users check (Go frpc never
+    // sends run_id, so Go visitors always keep identity "" here).
+    //
+    // The claimed run_id is client-supplied and must NOT be trusted as an
+    // identity by itself (low finding 3): a fresh visitor conn has no login
+    // of its own, so the claim is only honored when it names an EXISTING
+    // authenticated control (run_id_to_ctl_tx, keyed by authenticated
+    // run_ids) AND that control originates from the same IP as this
+    // connection — a claim naming a control on a different IP is
+    // impersonation of that control's user. Residual risk (documented):
+    // an attacker who knows the proxy's sk and controls a client behind
+    // the SAME egress IP as an allowed user can still claim that user's
+    // run_id; closing that gap would require per-connection
+    // authentication the wire protocol does not provide. Unverifiable
+    // claims fall back to identity "" (Go parity → owner-only/allow-list
+    // check against "").
     if let Some(proxy_info) = state.proxy_manager.get(&proxy_name).await {
         let visitor_identity = match msg.run_id.as_deref() {
             Some(visitor_run_id) if !visitor_run_id.is_empty() => state
                 .run_id_to_ctl_tx
                 .get(visitor_run_id)
+                .filter(|control| match (&control.client_addr, visitor_peer) {
+                    // Canonicalize both sides: plain IPv4 vs IPv4-mapped
+                    // IPv6 (mixed transports/bind families) must compare
+                    // equal — otherwise a legit visitor degrades to
+                    // identity "" and is denied when allow_users is set.
+                    (Some(ctl_addr), Some(peer)) => {
+                        ctl_addr.ip().to_canonical() == peer.ip().to_canonical()
+                    }
+                    // Unknown control origin (client_addr unset) or unknown
+                    // visitor peer — the claim cannot be verified.
+                    _ => false,
+                })
                 .map(|control| control.user.clone())
                 .unwrap_or_default(),
             _ => String::new(),
@@ -929,7 +955,7 @@ async fn dispatch_v2_message_inner(
             handle_work_conn_inner(io, nwc, state).await;
         }
         FrpMessage::NewVisitorConn(vc) => {
-            handle_visitor_conn_inner(io, vc, state, true).await;
+            handle_visitor_conn_inner(io, vc, state, true, Some(addr)).await;
         }
         FrpMessage::NatHoleVisitor(nhv) => {
             handle_nat_hole_visitor(io, nhv, state, visitor_addr, true).await;
@@ -963,7 +989,7 @@ pub(crate) async fn dispatch_v1_message(
             handle_work_conn_inner(io, nwc, state).await;
         }
         Ok(Ok(FrpMessage::NewVisitorConn(nvc))) => {
-            handle_visitor_conn_inner(io, nvc, state, false).await;
+            handle_visitor_conn_inner(io, nvc, state, false, addr).await;
         }
         Ok(Ok(FrpMessage::NatHoleVisitor(nhv))) => {
             handle_nat_hole_visitor(io, nhv, state, visitor_addr, false).await;

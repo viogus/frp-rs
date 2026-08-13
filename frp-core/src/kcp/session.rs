@@ -25,7 +25,11 @@ use super::protocol::{Error as KcpError, Kcp};
 use super::socket::KCP_SND_BACKLOG_THRESHOLD;
 use crate::kcp_compat::Fec;
 
-const FEC_HEADER_SIZE: usize = 6;
+/// FEC wire header size (SEQID 4B + TYPE 2B) before the per-shard SIZE(2B)
+/// field. `pub(crate)` so `kcp/config.rs` can compute the MTU clamp bound
+/// (a full-MTU segment + this overhead + SIZE must fit the driver's fixed
+/// recv buffer).
+pub(crate) const FEC_HEADER_SIZE: usize = 6;
 const TYPE_DATA: u16 = 0xf1;
 const TYPE_PARITY: u16 = 0xf2;
 const MAX_SHARD_SETS: usize = 3;

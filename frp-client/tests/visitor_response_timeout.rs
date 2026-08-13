@@ -50,7 +50,9 @@ async fn stcp_visitor_times_out_waiting_for_response() {
             .await
             .expect("write LoginResp");
         let enc_key = frp_core::encryption::derive_key(token);
-        let mut enc = stream.into_encrypted(enc_key);
+        let mut enc = stream
+            .into_encrypted(enc_key)
+            .expect("plain test stream is encryptable");
         // Drain client traffic (e.g. the control-channel NewVisitorConn
         // registration message) in a detached task until the connection
         // closes. A one-shot read would complete on the first frame, drop

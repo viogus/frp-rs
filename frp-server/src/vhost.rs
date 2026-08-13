@@ -688,6 +688,9 @@ async fn handle_http1_request<S>(
                         proxy_name: forward.proxy_name,
                         user_conn: wrap(stream),
                         pre_read: forward.request_head,
+                        user_conn_permit: None,
+                        // Local sender — no group selection was done.
+                        group_selected: false,
                     })
                     .await
                 {
@@ -986,6 +989,9 @@ pub async fn run_vhost_https_listener(
                                     // Passthrough: raw encrypted bytes, no TLS wrap.
                                     user_conn: frp_core::transport::IoStream::Tcp(stream),
                                     pre_read,
+                                    user_conn_permit: None,
+                                    // Local sender — no group selection was done.
+                                    group_selected: false,
                                 })
                                 .await
                             {

@@ -54,6 +54,23 @@ pub enum InternalMsg {
         proxy_name: String,
         user_conn: IoStream,
         pre_read: Vec<u8>,
+        /// Per-proxy user-conn cap permit (audit M5). Acquired by the
+        /// FORWARDER before the cross-run_id group-LB try_send so an
+        /// at-cap/slow backend cannot accumulate raw sockets (fds) in this
+        /// shared 1024-slot channel ahead of the permit check. The backend
+        /// handler CONSUMES this permit instead of re-acquiring — never
+        /// both. `None` means "no permit carried" (unlimited proxy, or a
+        /// local sender like vhost/tcpmux that never acquired one; the
+        /// backend handler acquires one then).
+        user_conn_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        /// Set by forwarders that ALREADY chose the backend (the TCP group
+        /// shared listener and the cross-run_id group-LB M5 forwarder). The
+        /// receiving handler must route directly to the named `proxy_name`
+        /// instead of re-running group selection — re-selecting an
+        /// already-selected conn bounces it between group members forever
+        /// (the manager-level round-robin counter makes every hop pick the
+        /// next member) when the group spans run_ids without a group_key.
+        group_selected: bool,
     },
     /// UDP proxy needs a work connection for data forwarding
     /// (Go frp v0.69.1 uses work connections, not control connection).

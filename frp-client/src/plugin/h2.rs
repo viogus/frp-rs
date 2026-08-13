@@ -112,6 +112,15 @@ async fn handle_stream(
     backend: Backend,
 ) -> Result<(), h2::Error> {
     let has_content_length = request.headers().contains_key("content-length");
+    // Declared Content-Length for the request body. The h2 crate validates
+    // content-length per RFC 7540 §8.1.2.6 before delivering the request, so
+    // an unparseable value is unreachable in practice; a None falls back to
+    // forwarding all data frames (matches the previous behavior).
+    let declared_length = request
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
     let head = build_http1_request_head(&request, host_rewrite, request_headers);
 
     // A refused/unreachable backend answers 502 (Go ReverseProxy ErrorHandler).
@@ -136,14 +145,18 @@ async fn handle_stream(
         if remote_w.write_all(&head).await.is_err() {
             return;
         }
+        // Forward at most the declared Content-Length body bytes: surplus h2
+        // DATA frames are dropped (Go's http.Transport body reader stops at
+        // the declared length) so the backend cannot misread the surplus as
+        // a pipelined request on the HTTP/1.1 connection.
+        let mut remaining = declared_length;
         while let Some(Ok(data)) = body.data().await {
             let len = data.len();
             if !data.is_empty() {
-                if has_content_length {
-                    if remote_w.write_all(&data).await.is_err() {
-                        return;
-                    }
-                } else {
+                let (next_remaining, n) = cap_chunk(len, remaining);
+                if remaining.is_none() {
+                    // Chunked framing for an unknown-length body (no
+                    // Content-Length): the full chunk is written framed.
                     let frame = format!("{:X}\r\n", len);
                     if remote_w.write_all(frame.as_bytes()).await.is_err()
                         || remote_w.write_all(&data).await.is_err()
@@ -151,7 +164,14 @@ async fn handle_stream(
                     {
                         return;
                     }
+                } else if n > 0 {
+                    // Content-Length bounded: forward at most the remaining
+                    // bytes; the surplus is dropped.
+                    if remote_w.write_all(&data[..n]).await.is_err() {
+                        return;
+                    }
                 }
+                remaining = next_remaining;
             }
             let _ = body.flow_control().release_capacity(len);
         }
@@ -199,6 +219,22 @@ async fn connect_backend(backend: &Backend) -> std::io::Result<DynStream> {
             let tls = connector.connect(server_name, tcp).await?;
             Ok(Box::new(tls))
         }
+    }
+}
+
+/// Bytes of one request-body chunk to forward to the backend, given the
+/// remaining declared Content-Length. Surplus beyond the declared length is
+/// dropped — Go's `http.Transport` body reader stops at the declared length,
+/// so the surplus must not reach the HTTP/1.1 connection as a pipelined
+/// request. Returns `(new remaining budget, bytes to write)`.
+///
+/// `None` remaining means the request had no Content-Length: the whole chunk
+/// is forwarded (the caller applies chunked framing) and `None` is returned.
+fn cap_chunk(len: usize, remaining: Option<usize>) -> (Option<usize>, usize) {
+    match remaining {
+        None => (None, len),
+        Some(rem) if rem >= len => (Some(rem - len), len),
+        Some(rem) => (Some(0), rem),
     }
 }
 
@@ -452,9 +488,15 @@ impl<'a, R: AsyncRead + Unpin> BodyReader<'a, R> {
     }
 
     /// Append more bytes from the inner stream. Returns `Ok(false)` on EOF.
+    /// The consumed prefix is dropped before refilling, so `self.buf` never
+    /// holds more than the unconsumed portion plus one refill — the
+    /// `CHUNK_LINE_MAX` check in `read_line` on `available()` is therefore
+    /// the true memory bound (a `buf.len()` check would double-count bytes
+    /// already consumed, and without the drain the consumed prefix could
+    /// accumulate when lines are split across reads with a tail left over).
     async fn read_more(&mut self) -> std::io::Result<bool> {
-        if self.pos > 0 && self.pos == self.buf.len() {
-            self.buf.clear();
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
             self.pos = 0;
         }
         let mut tmp = [0u8; 8192];
@@ -483,18 +525,51 @@ impl<'a, R: AsyncRead + Unpin> BodyReader<'a, R> {
     }
 
     /// Read one CRLF (or LF) terminated line including its terminator.
+    ///
+    /// A line exceeding [`super::CHUNK_LINE_MAX`] errors instead of growing
+    /// `self.buf` without bound (a backend that never terminates its chunk
+    /// line would otherwise balloon memory). Same cap semantics as the
+    /// mod.rs body reader: the check runs on the terminator-found paths too,
+    /// so an over-long line is never returned.
     async fn read_line(&mut self) -> std::io::Result<Vec<u8>> {
         loop {
             let avail = self.available();
             if let Some(rel) = avail.windows(2).position(|w| w == b"\r\n") {
                 let line = avail[..rel + 2].to_vec();
+                if line.len() > super::CHUNK_LINE_MAX {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunk line too long",
+                    ));
+                }
                 self.consume(rel + 2);
                 return Ok(line);
             }
             if let Some(rel) = avail.iter().position(|&b| b == b'\n') {
                 let line = avail[..rel + 1].to_vec();
+                if line.len() > super::CHUNK_LINE_MAX {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunk line too long",
+                    ));
+                }
                 self.consume(rel + 1);
                 return Ok(line);
+            }
+            // No terminator in the buffer: the available portion is one
+            // (partial) line — bound it before extending. Checking
+            // `available()` (not `buf.len()`) keeps consumed bytes out of
+            // the accounting when `pos > 0`; `read_more` drains the consumed
+            // prefix on refill, so this is also the true memory bound. A
+            // line exactly at the cap whose terminator is split across reads
+            // is still served (the scan above finds it once the extension
+            // lands; the line-length check on the terminator paths then
+            // applies).
+            if self.available().len() > super::CHUNK_LINE_MAX {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "chunk line too long",
+                ));
             }
             if !self.read_more().await? {
                 return Err(std::io::Error::new(
@@ -651,7 +726,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_response_head;
+    use super::{cap_chunk, parse_response_head};
 
     #[test]
     fn parse_response_head_parses_normal_head() {
@@ -696,5 +771,39 @@ mod tests {
         // No "\r\n\r\n" terminator and an empty head both yield None.
         assert!(parse_response_head(b"garbage\r\n\r\n").is_none());
         assert!(parse_response_head(b"").is_none());
+    }
+
+    #[test]
+    fn cap_chunk_limits_to_declared_content_length() {
+        // A request body stream longer than the declared Content-Length:
+        // exactly Content-Length bytes are forwarded, the surplus is dropped
+        // (Go's http.Transport body reader stops at the declared length, so
+        // the surplus must not reach the HTTP/1.1 connection as a pipelined
+        // request).
+        let mut remaining = Some(10usize);
+        let mut forwarded = 0usize;
+        for chunk in [8usize, 5, 3, 4] {
+            let (next, n) = cap_chunk(chunk, remaining);
+            forwarded += n;
+            remaining = next;
+        }
+        assert_eq!(
+            forwarded, 10,
+            "surplus bytes beyond the declared Content-Length must be dropped"
+        );
+        assert_eq!(remaining, Some(0));
+
+        // Chunks arriving after the budget drained forward nothing.
+        assert_eq!(cap_chunk(4, Some(0)), (Some(0), 0));
+
+        // A chunk exactly at the remaining budget is fully forwarded and the
+        // budget drains to zero; a smaller chunk keeps the remainder.
+        assert_eq!(cap_chunk(5, Some(5)), (Some(0), 5));
+        assert_eq!(cap_chunk(3, Some(7)), (Some(4), 3));
+
+        // The chunked path (no declared Content-Length) is untouched: every
+        // chunk is forwarded whole and `None` propagates.
+        assert_eq!(cap_chunk(7, None), (None, 7));
+        assert_eq!(cap_chunk(0, None), (None, 0));
     }
 }

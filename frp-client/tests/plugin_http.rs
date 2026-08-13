@@ -1305,3 +1305,81 @@ async fn test_http2http_head_with_cl_relays_response() {
 async fn test_http_proxy_head_with_cl_relays_response() {
     assert_head_with_cl_relays_response("http_proxy").await;
 }
+
+/// A header line containing a lone `\r` (malformed client — `lines()` splits
+/// only on `\n`, so the CR would survive into the forwarded request as an
+/// injected request line, request-smuggling shaped) must be sanitized before
+/// forwarding. Go's http.Server rejects control chars in headers, so Go frp
+/// is immune; the http_proxy head builder must filter CR/LF per line like the
+/// shared forward path (`read_request_and_build_forward`) does.
+#[tokio::test]
+async fn test_http_proxy_sanitizes_embedded_cr_in_header_line() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let n = conn.read(&mut buf).await.unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    // The lone \r inside the header value is not followed by \n, so it does
+    // not terminate the head — pre-fix it would be forwarded verbatim.
+    client
+        .write_all(
+            format!(
+                "GET http://{backend_addr}/inj HTTP/1.1\r\n\
+                 Host: original\r\n\
+                 X-Evil: foo\rGET /admin HTTP/1.1\r\n\
+                 \r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("backend never responded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let head = rx.await.expect("backend captured request");
+    assert!(
+        head.contains("X-Evil: fooGET /admin HTTP/1.1"),
+        "embedded CR must be stripped — the injected request line must not survive: {head}"
+    );
+    assert!(
+        !head.contains("foo\rGET"),
+        "raw CR must not reach the backend: {head}"
+    );
+}

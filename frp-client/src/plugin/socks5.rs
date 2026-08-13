@@ -137,8 +137,11 @@ async fn handle_socks5_conn(
             .map_err(|e| format!("password utf8: {e}"))?
             .to_string();
 
+        // Both comparisons must run — bitwise `&` (not `&&`) so a mismatched
+        // username cannot skip the password comparison (timing oracle; parity
+        // with http.rs Basic auth).
         if constant_time_eq(client_user.as_bytes(), u.as_bytes())
-            && constant_time_eq(client_pass.as_bytes(), p.as_bytes())
+            & constant_time_eq(client_pass.as_bytes(), p.as_bytes())
         {
             client
                 .write_all(&[USERPASS_VERSION, USERPASS_OK])

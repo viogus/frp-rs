@@ -64,19 +64,26 @@ impl Transport for BufferedReadTransport {
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.inner.peer_addr()
     }
-    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> Box<dyn Transport> {
+    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> io::Result<Box<dyn Transport>> {
         // Buffered bytes are preserved inside the returned Cipher wrapper;
         // they will be replayed before encrypted reads begin.
         let BufferedReadTransport { buf, pos, inner } = *self;
-        assert!(
-            pos >= buf.len(),
-            "into_encrypted called before buffered bytes consumed"
-        );
-        Box::new(BufferedReadTransport {
+        if pos < buf.len() {
+            // Unconsumed plaintext below the cipher layer would be replayed
+            // ABOVE it once the control stream is encrypted — a desync. This
+            // is remote-triggerable (junk bytes after a proxy CONNECT
+            // response land in the wrapper), so it must be a recoverable
+            // error, never an assert panic (release builds are panic=abort).
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "into_encrypted called before buffered bytes consumed",
+            ));
+        }
+        Ok(Box::new(BufferedReadTransport {
             buf,
             pos,
-            inner: inner.into_encrypted(key),
-        })
+            inner: inner.into_encrypted(key)?,
+        }))
     }
     fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
         let BufferedReadTransport { buf, pos, inner } = *self;
@@ -87,5 +94,55 @@ impl Transport for BufferedReadTransport {
             ));
         }
         inner.into_split()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cipher_stream::CipherStream;
+
+    /// Build a `BufferedReadTransport` over an in-memory duplex wrapped in a
+    /// `CipherStream` (itself a `Transport`), with `pos` bytes of the buffer
+    /// consumed.
+    fn buffered_read_with(buf: Vec<u8>, pos: usize) -> Box<BufferedReadTransport> {
+        let (duplex, _peer) = tokio::io::duplex(1024);
+        let inner: Box<dyn Transport> = Box::new(CipherStream::new(duplex, [0u8; 16]));
+        Box::new(BufferedReadTransport::new(buf, pos, inner))
+    }
+
+    #[test]
+    fn into_encrypted_rejects_unconsumed_buffered_bytes() {
+        // Regression test for a remote-triggerable panic: a proxy (or MITM)
+        // sending junk bytes after the HTTP CONNECT response leaves
+        // `pos < buf.len()`, and `into_encrypted` must return Err — never
+        // assert-panic (release binaries build with panic=abort).
+        let wrapped = buffered_read_with(vec![1, 2, 3], 0);
+        // Match manually: `expect_err` requires `Debug` on the Ok type, and
+        // `Box<dyn Transport>` does not implement it.
+        let err = match wrapped.into_encrypted([0u8; 16]) {
+            Ok(_) => panic!("unconsumed buffered bytes must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "expected InvalidData, got: {err}"
+        );
+    }
+
+    #[test]
+    fn into_encrypted_ok_when_buffered_bytes_consumed() {
+        // Fully consumed buffer: the wrapper is preserved (buffered bytes
+        // replay before ciphertext reads) and the inner stream is encrypted.
+        let wrapped = buffered_read_with(vec![1, 2, 3], 3);
+        let encrypted = wrapped
+            .into_encrypted([0u8; 16])
+            .expect("fully consumed buffer is encryptable");
+        assert_eq!(
+            encrypted.debug_name(),
+            "IoStream::BufferedRead",
+            "wrapper must survive into_encrypted"
+        );
     }
 }

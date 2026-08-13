@@ -141,7 +141,9 @@ async fn test_v2_tcp_proxy() {
 
     // ---- Wrap control stream in AES-128-CFB encryption (matching server post-login) ----
     let enc_key = encryption::derive_key("test-token");
-    let mut control = control.into_encrypted(enc_key);
+    let mut control = control
+        .into_encrypted(enc_key)
+        .expect("plain test stream is encryptable");
 
     // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
     for _ in 0..1 {
@@ -374,7 +376,9 @@ async fn test_v2_ping_pong_raw_tcp() {
 
     // Wrap in encryption
     let enc_key = encryption::derive_key("test-token");
-    let mut stream = stream.into_encrypted(enc_key);
+    let mut stream = stream
+        .into_encrypted(enc_key)
+        .expect("plain test stream is encryptable");
 
     // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
     for _ in 0..1 {
@@ -491,7 +495,9 @@ async fn test_v2_ping_pong_yamux() {
 
     // Wrap in encryption
     let enc_key = encryption::derive_key("test-token");
-    let mut control = control.into_encrypted(enc_key);
+    let mut control = control
+        .into_encrypted(enc_key)
+        .expect("plain test stream is encryptable");
 
     // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
     for _ in 0..1 {

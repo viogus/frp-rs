@@ -913,7 +913,7 @@ impl Service {
                                                                     }
                                                                     Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
                                                                         tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS+yamux NewVisitorConn from {}", peer);
-                                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
+                                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state, false, Some(peer)).await;
                                                                     }
                                                                     Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
                                                                         tracing::info!(peer = %peer, "KCP TLS+yamux NatHoleVisitor from {}", peer);
@@ -1028,7 +1028,7 @@ impl Service {
                                                                 }
                                                                 Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
                                                                     tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS NewVisitorConn from {}", peer);
-                                                                    crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false).await;
+                                                                    crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false, Some(peer)).await;
                                                                 }
                                                                 Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
                                                                     tracing::info!(peer = %peer, "KCP TLS NatHoleVisitor from {}", peer);
@@ -1121,7 +1121,7 @@ impl Service {
                                                             }
                                                             Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
                                                                 tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP yamux NewVisitorConn from {}", peer);
-                                                                crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
+                                                                crate::handlers::handle_visitor_conn_inner(io, nvc, state, false, Some(peer)).await;
                                                             }
                                                             Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
                                                                 tracing::info!(peer = %peer, "KCP yamux NatHoleVisitor from {}", peer);
@@ -1154,7 +1154,7 @@ impl Service {
                                                 }
                                                 Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
                                                     tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP NewVisitorConn from {}", peer);
-                                                    crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false).await;
+                                                    crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false, Some(peer)).await;
                                                 }
                                                 Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
                                                     tracing::info!(peer = %peer, "KCP NatHoleVisitor from {}", peer);

@@ -401,7 +401,14 @@ impl XorBlock {
 /// Usage:
 /// 1. Create with desired FEC/XOR parameters (matching peer's config)
 /// 2. Call `encode_packet()` before sending raw KCP data
-/// 3. Call `decode_packets()` on received raw KCP data
+///
+/// Note: there is deliberately NO `decode_packets()` counterpart — the
+/// previous implementation stripped all trailing zero bytes as "padding",
+/// corrupting payloads legitimately ending in 0x00. It was dead code (the
+/// live FEC decode path is `kcp/session.rs`, which uses the FEC SIZE field
+/// for shard boundaries) and only its own tests referenced it, so it was
+/// deleted 2026-08-13. Do not re-add a decode here without size-field-based
+/// boundaries.
 pub struct KcpCompatSession {
     fec: Fec,
     xor: XorBlock,
@@ -465,47 +472,6 @@ impl KcpCompatSession {
 
         let shard_refs: Vec<&[u8]> = shards.iter().map(|s| s.as_slice()).collect();
         self.fec.encode(&shard_refs)
-    }
-
-    /// Decode received packets, reconstructing original data.
-    ///
-    /// `shards`: received shards (may have gaps/fewer than total).
-    /// Returns reconstructed data bytes.
-    pub fn decode_packets(&self, shards: &mut [Option<Vec<u8>>]) -> Option<Vec<u8>> {
-        if !self.fec.enabled() {
-            // No FEC: just return the first shard (should be only one)
-            let mut data = shards[0].take()?;
-            if self.xor.enabled() {
-                self.xor.process(&mut data);
-            }
-            return Some(data);
-        }
-
-        if !self.fec.decode(shards) {
-            return None;
-        }
-
-        // Apply XOR to each data shard individually (matching per-shard XOR in encode)
-        // This must happen BEFORE reassembly because each shard starts from key[0].
-        if self.xor.enabled() {
-            for data in shards.iter_mut().take(self.fec.data_shards).flatten() {
-                self.xor.process(data);
-            }
-        }
-
-        // Reassemble from data shards
-        let block_size = shards[0].as_ref()?.len();
-        let mut data = Vec::with_capacity(block_size * self.fec.data_shards);
-        for s in shards.iter().take(self.fec.data_shards).flatten() {
-            data.extend_from_slice(s);
-        }
-
-        // Remove padding (trailing zeros)
-        while data.last() == Some(&0) {
-            data.pop();
-        }
-
-        Some(data)
     }
 }
 
@@ -629,56 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn test_kcp_compat_session_roundtrip() {
-        let session = KcpCompatSession::new(2, 1, b"my-xor-key");
-        let data = b"hello kcp compat test message!";
-
-        let encoded = session.encode_packet(data);
-        assert_eq!(encoded.len(), 3); // 2 data + 1 parity
-
-        // Simulate all shards received
-        let mut received: Vec<Option<Vec<u8>>> = encoded.into_iter().map(Some).collect();
-        let decoded = session.decode_packets(&mut received).unwrap();
-        assert_eq!(&decoded[..data.len()], data);
-    }
-
-    #[test]
-    fn test_kcp_compat_session_roundtrip_with_loss() {
-        let session = KcpCompatSession::new(3, 2, b""); // 3 data + 2 parity, no XOR
-        let data = b"this is a test message for FEC recovery with data loss";
-
-        let encoded = session.encode_packet(data);
-        assert_eq!(encoded.len(), 5);
-
-        // Simulate loss of 2 data shards — should recover from remaining 1 data + 2 parity
-        let mut received: Vec<Option<Vec<u8>>> = encoded.into_iter().map(Some).collect();
-        received[0] = None;
-        received[1] = None;
-        let decoded = session.decode_packets(&mut received).unwrap();
-        assert_eq!(&decoded[..data.len()], data);
-    }
-
-    #[test]
-    fn test_kcp_compat_session_no_fec() {
-        let session = KcpCompatSession::new(0, 0, b"xor-key");
-        let data = b"test data";
-        let encoded = session.encode_packet(data);
-        assert_eq!(encoded.len(), 1);
-        let mut received: Vec<Option<Vec<u8>>> = encoded.into_iter().map(Some).collect();
-        let decoded = session.decode_packets(&mut received).unwrap();
-        assert_eq!(&decoded[..data.len()], data);
-    }
-
-    #[test]
-    fn test_kcp_compat_session_no_xor_no_fec() {
+    fn test_kcp_compat_session_encode_no_fec_no_xor() {
+        // encode_packet with no FEC/XOR is passthrough.
         let session = KcpCompatSession::new(0, 0, b"");
         let data = b"plain kcp data, no encoding at all";
         let encoded = session.encode_packet(data);
         assert_eq!(encoded.len(), 1);
         assert_eq!(encoded[0], data);
-
-        let mut received: Vec<Option<Vec<u8>>> = encoded.into_iter().map(Some).collect();
-        let decoded = session.decode_packets(&mut received).unwrap();
-        assert_eq!(decoded, data);
     }
 }

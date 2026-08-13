@@ -164,8 +164,15 @@ pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     /// The default wraps in [`CipherStream`]; [`AeadStream`] (already
     /// AEAD-encrypted) and the BufferedRead wrapper override it. `Self` may be
     /// unsized (trait object), so the wrap operates on the box.
-    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> Box<dyn Transport> {
-        Box::new(CipherStream::new(self, key))
+    ///
+    /// Returns `Err` instead of panicking when the transport cannot be
+    /// encrypted safely — e.g. [`BufferedReadTransport`] with unconsumed
+    /// read-ahead bytes, where replaying leftover plaintext above the cipher
+    /// layer would desync the encrypted stream. This is reachable from
+    /// remote input (junk bytes after a proxy CONNECT response), so callers
+    /// must propagate the error rather than unwrap.
+    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> io::Result<Box<dyn Transport>> {
+        Ok(Box::new(CipherStream::new(self, key)))
     }
 
     /// Split the transport into owned boxed read and write halves.
@@ -412,8 +419,12 @@ impl IoStream {
 
     /// Wrap this stream in AES-128-CFB encryption for control messages.
     /// Must be called after login (the Login message is NOT encrypted).
-    pub fn into_encrypted(self, key: [u8; 16]) -> Self {
-        Self(self.0.into_encrypted(key))
+    ///
+    /// Returns `Err` when the stream cannot be encrypted safely (e.g.
+    /// unconsumed read-ahead bytes in a [`BufferedRead`] wrapper) — callers
+    /// must propagate the error, never panic.
+    pub fn into_encrypted(self, key: [u8; 16]) -> io::Result<Self> {
+        self.0.into_encrypted(key).map(Self)
     }
 
     /// Split the stream into owned boxed read and write halves.
@@ -456,7 +467,7 @@ impl Transport for IoStream {
     fn into_yamux(self: Box<Self>) -> Option<YamuxStream> {
         self.0.into_yamux()
     }
-    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> Box<dyn Transport> {
+    fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> io::Result<Box<dyn Transport>> {
         self.0.into_encrypted(key)
     }
     fn into_split(self: Box<Self>) -> io::Result<(BoxedReadHalf, BoxedWriteHalf)> {
@@ -1990,7 +2001,9 @@ where
             ));
         }
 
-        // Consume response headers until \r\n\r\n
+        // Parse response headers until \r\n\r\n, capturing the
+        // Sec-WebSocket-Accept value.
+        let mut accept_header: Option<String> = None;
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).await.map_err(|e| {
@@ -1998,6 +2011,38 @@ where
             })?;
             if line == "\r\n" || line.is_empty() {
                 break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("sec-websocket-accept") {
+                    accept_header = Some(value.trim().to_string());
+                }
+            }
+        }
+
+        // Verify Sec-WebSocket-Accept == base64(SHA1(key + RFC 6455 magic
+        // GUID)). Exact match, mirroring Go's golang.org/x/net/websocket
+        // client handshake — a missing or mismatched accept means the peer
+        // did not complete the WebSocket upgrade, and sending the frp
+        // control stream to it would leak the stream to an arbitrary HTTP
+        // endpoint (or fail cryptically downstream).
+        let expected_accept = {
+            use sha1::{Digest, Sha1};
+            let mut hasher = Sha1::new();
+            hasher.update(key.as_bytes());
+            hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            base64_encode(&hasher.finalize())
+        };
+        match accept_header {
+            Some(actual) if actual == expected_accept => {}
+            Some(_) => {
+                return Err(crate::Error::Transport(
+                    "WS upgrade rejected: Sec-WebSocket-Accept mismatch".into(),
+                ));
+            }
+            None => {
+                return Err(crate::Error::Transport(
+                    "WS upgrade rejected: missing Sec-WebSocket-Accept".into(),
+                ));
             }
         }
 

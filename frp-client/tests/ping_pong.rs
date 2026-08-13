@@ -75,7 +75,9 @@ async fn client_answers_server_ping_with_pong() {
     // 3. The client wraps the control stream in AES-128-CFB with
     //    derive_key(token) after LoginResp; wrap our side symmetrically.
     let enc_key = frp_core::encryption::derive_key(token);
-    let mut enc = stream.into_encrypted(enc_key);
+    let mut enc = stream
+        .into_encrypted(enc_key)
+        .expect("plain test stream is encryptable");
 
     // 4. Send Ping; expect a Pong back.
     let ping = FrpMessage::Ping(msg::Ping {

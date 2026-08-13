@@ -77,7 +77,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
 use crate::kcp::{KcpConfig, KcpSession};
 
@@ -872,7 +872,10 @@ pub async fn xtcp_p2p_connect(
 /// A background task is spawned to drive the yamux Connection, which also
 /// keeps KCP ticking (poll_read/poll_write trigger `maybe_tick` every 10ms).
 /// Dead link detection in `maybe_tick` ensures the background task exits
-/// when the peer stops responding.
+/// when the peer stops responding; the returned
+/// [`XtcpP2pYamuxStream`] additionally signals the driver to exit when the
+/// caller drops the stream (so the UDP socket + KCP session are released
+/// instead of leaking per ended XTCP session).
 // --- yamux-enabled path (default) ---
 #[cfg(feature = "tcp-mux")]
 #[allow(clippy::too_many_arguments)]
@@ -887,7 +890,7 @@ pub async fn xtcp_p2p_connect_yamux(
     yamux_client: bool,
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
-) -> Result<crate::mux::YamuxStream, String> {
+) -> Result<XtcpP2pYamuxStream, String> {
     use futures_util::future::poll_fn;
     use std::time::Duration;
     use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
@@ -933,9 +936,20 @@ pub async fn xtcp_p2p_connect_yamux(
     // 4. Background driver: periodically poll yamux to drive KCP ticks.
     //    Uses a noop-waker poll so each call is a single non-blocking
     //    probe — no circular waker dependency, no select! deadlock.
+    //
+    //    The driver's lifetime is bound to the caller's stream via the
+    //    `driver_drop_tx`/`driver_drop_rx` watch channel: the caller-side
+    //    guard ([`XtcpP2pYamuxStream`]) holds the sender and drops it when
+    //    the bridge ends, at which point the driver selects out and exits,
+    //    releasing the `Arc<Mutex<Connection>>` — and with it the UDP
+    //    socket and KCP session. Without this, an ended XTCP session leaks
+    //    one task + one UDP fd + KCP state permanently: an idle connection
+    //    never trips `is_dead_link` (that needs unacked segments in flight;
+    //    yamux keepalive pings are ACKed by the peer's still-alive session).
     let tick_ms = KCP_TICK_MS as u64;
     let bg_conn = conn.clone();
     let (stream_tx, stream_rx) = tokio::sync::oneshot::channel::<Result<yamux::Stream, String>>();
+    let (driver_drop_tx, mut driver_drop_rx) = watch::channel(());
 
     tokio::spawn(async move {
         let keepalive = Duration::from_millis(tick_ms);
@@ -951,21 +965,30 @@ pub async fn xtcp_p2p_connect_yamux(
             // poll_next_inbound returns Pending (which is always, because
             // XtcpP2pStream's waker is self-referential — data is pushed by
             // maybe_tick which runs inside poll_read itself).
-            let result = tokio::time::timeout(
-                keepalive,
-                poll_fn(|cx| {
-                    match c.poll_next_inbound(cx) {
-                        Poll::Ready(r) => Poll::Ready(r),
-                        Poll::Pending => {
-                            // Double-poll: first poll processes stream
-                            // commands into pending_frames; second poll
-                            // sends them on the wire (matches mux.rs).
-                            c.poll_next_inbound(cx)
+            //
+            // The watch branch resolves when the caller-side guard
+            // ([`XtcpP2pYamuxStream`]) is dropped (the sender is dropped,
+            // closing the channel) — i.e. the caller's bridge ended and the
+            // connection is no longer needed. A watch channel (not Notify)
+            // guarantees the wakeup cannot be missed: the sender-drop
+            // releases every registered receiver waker.
+            let result = tokio::select! {
+                _ = driver_drop_rx.changed() => break,
+                r = tokio::time::timeout(
+                    keepalive,
+                    poll_fn(|cx| {
+                        match c.poll_next_inbound(cx) {
+                            Poll::Ready(r) => Poll::Ready(r),
+                            Poll::Pending => {
+                                // Double-poll: first poll processes stream
+                                // commands into pending_frames; second poll
+                                // sends them on the wire (matches mux.rs).
+                                c.poll_next_inbound(cx)
+                            }
                         }
-                    }
-                }),
-            )
-            .await;
+                    }),
+                ) => r,
+            };
             match result {
                 Ok(Some(Ok(stream))) => {
                     drop(c);
@@ -1054,7 +1077,78 @@ pub async fn xtcp_p2p_connect_yamux(
         conv,
     );
 
-    Ok(tokio_stream)
+    // Wrap the stream in the drop-signal guard: while this wrapper is alive
+    // the background driver keeps the connection (and KCP/UDP state) alive;
+    // dropping it closes the watch channel, making the driver exit and free
+    // the UDP socket + KCP session. Any error path above this point returns
+    // without a wrapper, so `driver_drop_tx` drops with the function's
+    // locals and the driver exits the same way.
+    Ok(XtcpP2pYamuxStream {
+        inner: tokio_stream,
+        driver_drop_tx,
+    })
+}
+
+/// The yamux stream returned by [`xtcp_p2p_connect_yamux`], carrying the
+/// driver-lifetime drop signal.
+///
+/// The background yamux driver task spawned by [`xtcp_p2p_connect_yamux`]
+/// must keep polling the connection for the whole time the caller uses the
+/// stream (yamux stream writes are queued to the connection driver, and
+/// inbound frames / window updates are only processed when the connection is
+/// polled), but must exit once the stream is gone so the connection — and
+/// with it the XTCP P2P UDP socket and KCP session — is released instead of
+/// leaking forever. This wrapper owns the `watch::Sender` end of the
+/// driver's exit signal: when the wrapper is dropped (the caller's bridge
+/// ended), the sender is dropped, the channel closes, and the driver's
+/// `select!` resolves and exits.
+#[cfg(feature = "tcp-mux")]
+pub struct XtcpP2pYamuxStream {
+    inner: crate::mux::YamuxStream,
+    /// Drop signal to the background driver. Dropping this (with the
+    /// wrapper) closes the channel and makes the driver exit. The driver
+    /// holds only the `watch::Receiver`, so this is the sole sender.
+    driver_drop_tx: watch::Sender<()>,
+}
+
+#[cfg(feature = "tcp-mux")]
+impl Drop for XtcpP2pYamuxStream {
+    fn drop(&mut self) {
+        // Signal the background driver to exit. The watch channel fires on
+        // sender drop anyway (the driver's select! waits on changed()); the
+        // explicit send is belt-and-braces so the wakeup happens before any
+        // other Drop logic runs. An Err here just means the driver already
+        // exited, which is the desired end state.
+        let _ = self.driver_drop_tx.send(());
+    }
+}
+
+#[cfg(feature = "tcp-mux")]
+impl tokio::io::AsyncRead for XtcpP2pYamuxStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "tcp-mux")]
+impl tokio::io::AsyncWrite for XtcpP2pYamuxStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,6 +1399,15 @@ async fn wait_detect_on_any(
     }
 }
 
+/// Defensive caps on server-supplied probe parameters. `detect_behavior`
+/// arrives from the frps over the control channel; a compromised or buggy
+/// server must not be able to drive an unbounded probe flood (each probe is
+/// a UDP send, and candidate-port scanning also sleeps 2 ms per port).
+/// These are upper bounds far above anything the NAT analyzer emits, so
+/// legitimate behaviors are unaffected.
+const MAX_LISTEN_RANDOM_PORTS: i32 = 64; // extra receiver listener sockets
+const MAX_CANDIDATE_PORT_PROBES: u64 = 2048; // total candidate-port-range probes
+
 /// Go `MakeHole` full-feature hole punch (owned socket variant).
 ///
 /// `socket` is the STUN socket (owned; extra listener sockets are created
@@ -1376,7 +1479,18 @@ pub async fn punch_udp_hole_makehole_owned(
         let _ = all[0].set_ttl(ttl as u32);
     }
     if role == "receiver" && behavior.listen_random_ports > 0 {
-        for _ in 0..behavior.listen_random_ports {
+        // Cap the number of extra listener sockets (defensive — a
+        // server-supplied value must not force an unbounded socket bind
+        // flood; see MAX_LISTEN_RANDOM_PORTS).
+        let n = behavior.listen_random_ports.min(MAX_LISTEN_RANDOM_PORTS);
+        if behavior.listen_random_ports > MAX_LISTEN_RANDOM_PORTS {
+            tracing::warn!(
+                configured = behavior.listen_random_ports,
+                capped = MAX_LISTEN_RANDOM_PORTS,
+                "XTCP MakeHole: listen_random_ports capped"
+            );
+        }
+        for _ in 0..n {
             if let Ok(s) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                 orig_ttls.push(s.ttl().ok());
                 if ttl > 0 {
@@ -1398,13 +1512,27 @@ pub async fn punch_udp_hole_makehole_owned(
     // Candidate port range scanning (Go sendSidMessageToRangePorts): probe
     // each candidate IP's port range from every socket, 2 ms between ports.
     if let Some(ref ranges) = behavior.candidate_ports {
-        for s in &all {
+        // Cap the total number of range-scan probes (defensive — a
+        // server-supplied value must not force an unbounded probe flood;
+        // see MAX_CANDIDATE_PORT_PROBES). Counts across sockets ×
+        // candidates × ranges so a malicious server cannot multiply the
+        // budget by repeating entries.
+        let mut probe_count: u64 = 0;
+        'scan: for s in &all {
             for cand in candidates {
                 let Ok(base) = cand.parse::<SocketAddr>() else {
                     continue;
                 };
                 for r in ranges {
                     for p in r.from.max(1)..=r.to.max(1) {
+                        probe_count += 1;
+                        if probe_count > MAX_CANDIDATE_PORT_PROBES {
+                            tracing::warn!(
+                                capped = MAX_CANDIDATE_PORT_PROBES,
+                                "XTCP MakeHole: candidate_ports probe count capped"
+                            );
+                            break 'scan;
+                        }
                         let target = SocketAddr::new(base.ip(), p as u16);
                         send_sid_probe(s, target, sid, key).await;
                         tokio::time::sleep(std::time::Duration::from_millis(2)).await;

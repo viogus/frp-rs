@@ -36,6 +36,31 @@ pub(super) fn pending_request_timeout(user_conn_timeout_secs: u64) -> Duration {
     }
 }
 
+/// Expire stale pending NatHoleSid entries from the front of the queue.
+/// Returns the number of entries removed.
+///
+/// Shared by the control loop-top expiry (control/mod.rs) and the
+/// delivery-time expiry in `handle_new_work_conn`. Without the loop-top
+/// arm, entries only expired when a work conn arrived — a provider that
+/// never delivers work conns let the queue grow unbounded (each entry
+/// otherwise only expired inside `handle_new_work_conn`).
+pub(crate) fn expire_pending_nat_hole_sids(
+    pending: &mut VecDeque<(String, String, Instant)>,
+    timeout: Duration,
+) -> usize {
+    let mut expired = 0;
+    while let Some((sid, _pn, ts)) = pending.pop_front() {
+        if ts.elapsed() >= timeout {
+            expired += 1;
+            debug!(sid = %sid, timeout = ?timeout, "Pending NatHoleSid {} timed out after {:?}", sid, timeout);
+        } else {
+            pending.push_front((sid, _pn, ts));
+            break;
+        }
+    }
+    expired
+}
+
 /// Max work connections to pool beyond what the client requested (Go frp: poolCount + 10).
 pub(crate) const WORK_POOL_EXTRA: usize = 10;
 
@@ -250,15 +275,13 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
     mut stream: IoStream,
 ) -> Result<(), ()> {
     debug!(run_id = %ctx.run_id, "Got work conn for run_id {}", ctx.run_id);
-    // Expire stale pending NatHoleSid entries first.
-    while let Some((sid, _pn, ts)) = ctl.pending_nat_hole_sids.pop_front() {
-        if ts.elapsed() > pending_request_timeout(ctx.state.user_conn_timeout) {
-            debug!(sid = %sid, "Pending NatHoleSid {} timed out", sid);
-        } else {
-            ctl.pending_nat_hole_sids.push_front((sid, _pn, ts));
-            break;
-        }
-    }
+    // Expire stale pending NatHoleSid entries first (shared helper — the
+    // control loop-top also expires them so the queue cannot grow while no
+    // work conns arrive).
+    expire_pending_nat_hole_sids(
+        &mut ctl.pending_nat_hole_sids,
+        pending_request_timeout(ctx.state.user_conn_timeout),
+    );
     // Check NatHoleSid delivery first (Go frp XTCP compat).
     // Pending sids take priority — they unblock waiting visitors.
     if let Some((sid, proxy_name, _ts)) = ctl.pending_nat_hole_sids.pop_front() {
@@ -333,7 +356,15 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                 ctx.state.udp_packet_size,
                 bw_rate,
                 bw_mode,
-                ctl.udp_cancel.clone(),
+                // Per-proxy cancel token (low finding 5): a wedged bridge
+                // exits when the proxy closes (handle_close_proxy cancels
+                // it) instead of lingering until control teardown. Falls
+                // back to the shared control token when the proxy never
+                // registered one (cleanup path).
+                ctl.udp_cancels
+                    .get(&proxy_name)
+                    .cloned()
+                    .unwrap_or_else(|| ctl.udp_cancel.clone()),
             )
             .await;
         } else {
@@ -449,6 +480,23 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
 ///
 /// Includes plugin hook, group load balancing with cross-run_id forwarding,
 /// and pool assignment.
+///
+/// `forwarded_permit` is the user-conn cap permit acquired by a FORWARDER
+/// (group-LB cross-run_id path, audit M5) and carried inside
+/// `InternalMsg::ProxyUserConn`. When `Some`, it is consumed directly — the
+/// backend must NOT re-acquire (the forwarder already counted this
+/// connection against the backend's cap). When `None` (local sends from
+/// vhost/tcpmux/proxy listeners, or an unlimited backend), the permit is
+/// acquired here as usual.
+///
+/// `group_selected` is set by forwarders that already chose the backend (the
+/// TCP group shared listener and the M5 cross-run_id forwarder). When `true`,
+/// group re-selection is SKIPPED and the conn routes directly to the named
+/// `proxy_name` — re-selecting an already-selected conn bounces it between
+/// group members forever (manager-level round-robin counter) when the group
+/// spans run_ids without a group_key, pinning both controls and never
+/// bridging the conn.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
     ctx: &mut ControlContext,
     ctl: &mut ControlState,
@@ -456,6 +504,8 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
     proxy_name: String,
     user_conn: IoStream,
     pre_read: Vec<u8>,
+    forwarded_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    group_selected: bool,
 ) -> Result<(), ()> {
     // NewUserConn plugin hook — control-enabled plugins can reject.
     // Skip payload construction when no plugins are configured (the
@@ -483,32 +533,69 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
     // backend is this same proxy, so the bridge never re-locks the map.
     let (target_proxy, target_run_id, orig_info) = {
         let p = ctx.state.proxy_manager.get(&proxy_name).await;
-        let group = p
-            .as_ref()
-            .and_then(|p| p.group.clone())
-            .filter(|g| !g.is_empty());
-        let group_key = p
-            .as_ref()
-            .and_then(|p| p.group_key.clone())
-            .unwrap_or_default();
-        if let Some(ref group_name) = group {
-            if let Some((backend, backend_run_id)) = ctx
-                .state
-                .proxy_manager
-                .select_group_backend_with_run_id(group_name, &group_key)
-                .await
-            {
-                info!(proxy_name = %proxy_name, backend = %backend, backend_run_id = %backend_run_id, "Group LB: {} -> backend {} (run_id {})", proxy_name, backend, backend_run_id);
-                (backend, backend_run_id, p)
+        if group_selected {
+            // The forwarder (TCP group shared listener / M5 cross-run_id
+            // path) already selected this backend and routed the message
+            // to its run_id. Re-running selection here would bounce the
+            // conn between members forever — the shared round-robin
+            // counter makes every hop pick the next member, so a
+            // 2+-member cross-run_id group without group_key never
+            // settles (pre-existing livelock fix). Route directly.
+            (proxy_name.clone(), ctx.run_id.clone(), p)
+        } else {
+            let group = p
+                .as_ref()
+                .and_then(|p| p.group.clone())
+                .filter(|g| !g.is_empty());
+            let group_key = p
+                .as_ref()
+                .and_then(|p| p.group_key.clone())
+                .unwrap_or_default();
+            if let Some(ref group_name) = group {
+                if let Some((backend, backend_run_id)) = ctx
+                    .state
+                    .proxy_manager
+                    .select_group_backend_with_run_id(group_name, &group_key)
+                    .await
+                {
+                    info!(proxy_name = %proxy_name, backend = %backend, backend_run_id = %backend_run_id, "Group LB: {} -> backend {} (run_id {})", proxy_name, backend, backend_run_id);
+                    (backend, backend_run_id, p)
+                } else {
+                    (proxy_name.clone(), ctx.run_id.clone(), p)
+                }
             } else {
                 (proxy_name.clone(), ctx.run_id.clone(), p)
             }
-        } else {
-            (proxy_name.clone(), ctx.run_id.clone(), p)
         }
     };
     // If backend is on a different run_id, forward to that handler
     if target_run_id != ctx.run_id {
+        // Audit M5: acquire the BACKEND's user-conn permit BEFORE the
+        // try_send. Without this, a flood of group-LB conns to an at-cap/
+        // slow backend queues raw sockets (each holding an fd) in the
+        // shared 1024-slot internal_rx channel before the backend's own
+        // permit check rejects them — starving that control's other
+        // internal traffic. The permit crosses the message boundary and
+        // the backend handler consumes it instead of re-acquiring
+        // (no double-count: forwarded permit replaces the re-acquire).
+        // A backend without a semaphore is unlimited — forward with
+        // permit None. A backend at cap is dropped here, mirroring the
+        // local path's behavior.
+        let forwarded_permit = match ctx.state.proxy_manager.get(&target_proxy).await {
+            Some(p) => match p.user_conn_sem.clone() {
+                Some(sem) => match sem.try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        debug!(proxy_name = %target_proxy, "Group backend '{}' at user-conn cap, dropping connection", target_proxy);
+                        return Ok(());
+                    }
+                },
+                None => None,
+            },
+            // Backend vanished mid-forward — carry no permit; try_send
+            // will surface the closed channel.
+            None => None,
+        };
         let ctl_tx = ctx
             .state
             .run_id_to_ctl_tx
@@ -519,6 +606,14 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
                 proxy_name: target_proxy.clone(),
                 user_conn,
                 pre_read,
+                // On TrySendError the message (with its permit) is dropped
+                // with the error — the permit returns to the backend's
+                // semaphore, so nothing leaks on Full/Closed.
+                user_conn_permit: forwarded_permit,
+                // Backend already selected here — the receiving handler
+                // must route directly, not re-run group selection (would
+                // bounce the conn between members forever).
+                group_selected: true,
             }) {
                 Ok(()) => {
                     // Reset health on successful dispatch
@@ -569,15 +664,22 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
     // The permit lives in the PendingRequest and drops when the bridge
     // ends (or the pending entry expires), covering the conn's lifetime.
     // 0 = unlimited (Go frp default; no equivalent option upstream).
-    let user_conn_permit = match proxy_info.as_ref().and_then(|p| p.user_conn_sem.clone()) {
-        Some(sem) => match sem.try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                debug!(proxy_name = %target_proxy, "Proxy '{}' at user-conn cap, dropping connection", target_proxy);
-                return Ok(());
-            }
+    // A forwarded permit (audit M5, cross-run_id group-LB path) is
+    // consumed as-is — the forwarder already counted this conn against
+    // the backend's cap, so re-acquiring would double-count and fail
+    // spuriously at cap.
+    let user_conn_permit = match forwarded_permit {
+        Some(permit) => Some(permit),
+        None => match proxy_info.as_ref().and_then(|p| p.user_conn_sem.clone()) {
+            Some(sem) => match sem.try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    debug!(proxy_name = %target_proxy, "Proxy '{}' at user-conn cap, dropping connection", target_proxy);
+                    return Ok(());
+                }
+            },
+            None => None,
         },
-        None => None,
     };
     assign_or_queue(
         &mut ctl.work_pool,
@@ -741,6 +843,7 @@ mod tests {
             shutting_down: false,
             shutdown_done: None,
             udp_cancel: tokio_util::sync::CancellationToken::new(),
+            udp_cancels: HashMap::new(),
             work_pool: VecDeque::new(),
             pending_requests: VecDeque::new(),
             pending_udp: VecDeque::new(),
@@ -794,5 +897,359 @@ mod tests {
         assert_eq!(ctl.pending_requests[0].proxy_name, "p1");
         // Replenish ReqWorkConn was written to the control channel.
         assert!(!writer.is_empty(), "ReqWorkConn replenish must be written");
+    }
+
+    /// Register a control channel for a run_id and hand back the receiver so
+    /// tests can assert what (if anything) the forwarder sent to the backend.
+    async fn insert_control_rx(
+        state: &Arc<crate::state::AppState>,
+        run_id: &str,
+        control_id: u64,
+    ) -> mpsc::Receiver<crate::state::InternalMsg> {
+        let (tx, rx) = mpsc::channel(8);
+        state.run_id_to_ctl_tx.insert(
+            run_id.to_string(),
+            crate::state::ControlTx {
+                tx,
+                client_addr: None,
+                login_time: std::time::Instant::now(),
+                login_time_unix: 0,
+                pool_stats: Arc::new(crate::state::PoolStats::default()),
+                user: String::new(),
+                control_id,
+            },
+        );
+        rx
+    }
+
+    /// Low finding 1: stale pending NatHoleSid entries must expire from the
+    /// queue front (the loop-top expiry arm in control/mod.rs), not linger
+    /// until a work conn happens to arrive.
+    #[test]
+    fn expire_pending_nat_hole_sids_removes_stale_keeps_fresh() {
+        let mut pending = VecDeque::new();
+        pending.push_back((
+            "sid-stale-1".to_string(),
+            "p1".to_string(),
+            Instant::now() - Duration::from_secs(120),
+        ));
+        pending.push_back((
+            "sid-stale-2".to_string(),
+            "p2".to_string(),
+            Instant::now() - Duration::from_secs(90),
+        ));
+        pending.push_back(("sid-fresh".to_string(), "p3".to_string(), Instant::now()));
+        let removed = expire_pending_nat_hole_sids(&mut pending, Duration::from_secs(60));
+        assert_eq!(removed, 2, "two stale entries must expire");
+        assert_eq!(pending.len(), 1, "fresh entry must survive");
+        assert_eq!(pending[0].0, "sid-fresh");
+    }
+
+    /// Audit M5: a group-LB cross-run_id forward to an at-cap backend must
+    /// drop the connection AT THE FORWARDER (acquiring the backend's permit
+    /// fails first) — the raw socket must never be queued into the backend's
+    /// internal channel, which would starve that control's other traffic.
+    #[tokio::test]
+    async fn cross_run_id_forward_drops_conn_when_backend_at_cap() {
+        let state = test_state();
+        // Register g2 (run-2) FIRST so the group round-robin counter (0)
+        // picks it as the backend for the first user conn.
+        let mut info_g2 = crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+            "g2",
+            "tcp",
+            "run-2",
+            Some(24002),
+            2,
+        );
+        info_g2.group = Some("grp".to_string());
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        // Hold the single permit: g2 is at cap, one conn in flight.
+        let _held = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("hold the only permit");
+        info_g2.user_conn_sem = Some(sem.clone());
+        state
+            .proxy_manager
+            .register("run-2".into(), info_g2)
+            .await
+            .expect("register g2");
+        // g1 (run-1) joins AFTER g2 → group members [g2, g1].
+        let mut info_g1 = crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+            "g1",
+            "tcp",
+            "run-1",
+            Some(24001),
+            1,
+        );
+        info_g1.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-1".into(), info_g1)
+            .await
+            .expect("register g1");
+
+        let mut rx_run2 = insert_control_rx(&state, "run-2", 2).await;
+        let (mut ctx, mut ctl) = test_context(&state, "run-1");
+        let mut writer = Vec::new();
+
+        let res = handle_proxy_user_conn(
+            &mut ctx,
+            &mut ctl,
+            &mut writer,
+            "g1".to_string(),
+            broken_io(),
+            Vec::new(),
+            None,
+            // Local conn, no prior group selection — selection runs here.
+            false,
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "dropping at the forwarder must not fail the control"
+        );
+        assert!(
+            rx_run2.try_recv().is_err(),
+            "at-cap backend conn must be dropped at the forwarder, not queued into the backend channel"
+        );
+        assert_eq!(sem.available_permits(), 0, "permit must not leak");
+        assert!(ctl.pending_requests.is_empty());
+    }
+
+    /// Audit M5 positive path: the forwarder acquires the BACKEND's permit
+    /// and ships it inside the message; the backend consumes it without
+    /// re-acquiring (no double-count — a re-acquire would fail spuriously
+    /// at cap).
+    #[tokio::test]
+    async fn cross_run_id_forward_carries_permit_backend_consumes_it() {
+        let state = test_state();
+        // g1 registered FIRST → members [g1, g2]. group_key "a" hashes to
+        // index 1 → BOTH controls deterministically select g2, so the
+        // forwarded conn terminates at the backend (no re-forward loop).
+        let mut info_g1 = crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+            "g1",
+            "tcp",
+            "run-1",
+            Some(24001),
+            1,
+        );
+        info_g1.group = Some("grp".to_string());
+        info_g1.group_key = Some("a".to_string());
+        state
+            .proxy_manager
+            .register("run-1".into(), info_g1)
+            .await
+            .expect("register g1");
+        let mut info_g2 = crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+            "g2",
+            "tcp",
+            "run-2",
+            Some(24002),
+            2,
+        );
+        info_g2.group = Some("grp".to_string());
+        info_g2.group_key = Some("a".to_string());
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        info_g2.user_conn_sem = Some(sem.clone());
+        state
+            .proxy_manager
+            .register("run-2".into(), info_g2)
+            .await
+            .expect("register g2");
+
+        let mut rx_run2 = insert_control_rx(&state, "run-2", 2).await;
+        let (mut ctx_fwd, mut ctl_fwd) = test_context(&state, "run-1");
+        let mut writer_fwd = Vec::new();
+
+        let res = handle_proxy_user_conn(
+            &mut ctx_fwd,
+            &mut ctl_fwd,
+            &mut writer_fwd,
+            "g1".to_string(),
+            broken_io(),
+            Vec::new(),
+            None,
+            // Local conn, no prior group selection — selection runs here.
+            false,
+        )
+        .await;
+        assert!(res.is_ok());
+
+        // Forwarder acquired the backend's permit and shipped it in the
+        // message: available is 0 and the message carries it.
+        let msg = rx_run2
+            .recv()
+            .await
+            .expect("forwarded conn must reach the backend");
+        let crate::state::InternalMsg::ProxyUserConn {
+            proxy_name,
+            user_conn,
+            pre_read,
+            user_conn_permit,
+            group_selected,
+        } = msg
+        else {
+            panic!("unexpected internal message: {msg:?}");
+        };
+        assert_eq!(proxy_name, "g2");
+        assert!(
+            group_selected,
+            "forwarder must mark the message as group-selected"
+        );
+        assert!(
+            user_conn_permit.is_some(),
+            "forwarder must carry the backend's permit in the message"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "permit held by the in-flight forwarded message"
+        );
+
+        // Backend consumes the carried permit WITHOUT re-acquiring: the
+        // request is queued (not dropped at cap) with the permit inside it.
+        let (mut ctx_bk, mut ctl_bk) = test_context(&state, "run-2");
+        let mut writer_bk = Vec::new();
+        let res = handle_proxy_user_conn(
+            &mut ctx_bk,
+            &mut ctl_bk,
+            &mut writer_bk,
+            proxy_name,
+            user_conn,
+            pre_read,
+            user_conn_permit,
+            // The message was forwarded with group_selected — the backend
+            // routes directly to the named proxy.
+            true,
+        )
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(
+            ctl_bk.pending_requests.len(),
+            1,
+            "backend must accept the conn — consuming the carried permit, not re-acquiring"
+        );
+        assert!(
+            ctl_bk.pending_requests[0].user_conn_permit.is_some(),
+            "permit must live inside the pending request"
+        );
+        assert_eq!(sem.available_permits(), 0, "permit moved, not leaked");
+    }
+
+    /// Pre-existing finding 2: a conn forwarded with group_selected=true
+    /// (TCP group shared listener / M5 forwarder) must NOT be re-selected by
+    /// the receiving backend handler. With a 2-member cross-run_id group
+    /// WITHOUT group_key, re-selection bounces the conn between members
+    /// forever — the manager-level round-robin counter makes every hop pick
+    /// the next member, so the conn never settles (CPU livelock on both
+    /// controls, never bridged). Same-run_id groups and group_key-sticky
+    /// paths terminate fine; only the no-key cross-run_id case bounces.
+    #[tokio::test]
+    async fn group_forwarded_conn_does_not_bounce_without_group_key() {
+        let state = test_state();
+        // g1 registered FIRST → members [g1, g2]. NO group_key: the group
+        // listener's first round-robin selection (counter 0) picks g1.
+        let mut info_g1 = crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+            "g1",
+            "tcp",
+            "run-1",
+            Some(24001),
+            1,
+        );
+        info_g1.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-1".into(), info_g1)
+            .await
+            .expect("register g1");
+        let mut info_g2 = crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+            "g2",
+            "tcp",
+            "run-2",
+            Some(24002),
+            2,
+        );
+        info_g2.group = Some("grp".to_string());
+        state
+            .proxy_manager
+            .register("run-2".into(), info_g2)
+            .await
+            .expect("register g2");
+
+        // run-2's control channel receives anything the handlers forward.
+        let mut rx_run2 = insert_control_rx(&state, "run-2", 2).await;
+        let (mut ctx_fwd, mut ctl_fwd) = test_context(&state, "run-1");
+        let mut writer_fwd = Vec::new();
+
+        // Simulate the group listener's FIRST selection (counter 0 → g1,
+        // advancing the shared round-robin counter to 1). Without this the
+        // counter would sit at 0 and even a re-selection would re-pick g1 —
+        // the bounce needs the counter to have advanced past g1.
+        let (first_backend, first_run_id) = state
+            .proxy_manager
+            .select_group_backend_with_run_id("grp", "")
+            .await
+            .expect("group has members");
+        assert_eq!(
+            (first_backend.as_str(), first_run_id.as_str()),
+            ("g1", "run-1"),
+            "first round-robin selection must pick g1"
+        );
+
+        // Conn 1: the group listener selected g1 (run-1) and forwarded with
+        // group_selected=true. The handler must route DIRECTLY to g1 — a
+        // re-selection would advance the shared counter, pick g2, and bounce
+        // the conn into run-2's channel.
+        let res = handle_proxy_user_conn(
+            &mut ctx_fwd,
+            &mut ctl_fwd,
+            &mut writer_fwd,
+            "g1".to_string(),
+            broken_io(),
+            Vec::new(),
+            None,
+            true,
+        )
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(
+            ctl_fwd.pending_requests.len(),
+            1,
+            "group-selected conn must be queued at the named backend (g1), not re-selected"
+        );
+        assert!(
+            rx_run2.try_recv().is_err(),
+            "group-selected conn must not bounce to the other member (run-2)"
+        );
+
+        // Conn 2: the listener's counter advanced, so it selected g2
+        // (run-2) and forwarded there with group_selected=true. It must
+        // stay at run-2 — not bounce back to run-1.
+        let (mut ctx_bk, mut ctl_bk) = test_context(&state, "run-2");
+        let mut writer_bk = Vec::new();
+        let res = handle_proxy_user_conn(
+            &mut ctx_bk,
+            &mut ctl_bk,
+            &mut writer_bk,
+            "g2".to_string(),
+            broken_io(),
+            Vec::new(),
+            None,
+            true,
+        )
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(
+            ctl_bk.pending_requests.len(),
+            1,
+            "group-selected conn must stay at the named backend (g2)"
+        );
+        // Nothing bounced: run-1 kept its conn and run-2 kept its own.
+        assert_eq!(ctl_fwd.pending_requests.len(), 1, "no conn left run-1");
+        assert!(
+            rx_run2.try_recv().is_err(),
+            "run-2 must not forward anything onward either"
+        );
     }
 }
