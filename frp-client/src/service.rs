@@ -1323,11 +1323,11 @@ impl Service {
                                     // running.
                                     let msg = format!(
                                         "registration timed out (no response within {}s)",
-                                        REGISTRATION_RESPONSE_TIMEOUT.as_secs()
+                                        REGISTRATION_RESPONSE_TIMEOUT.as_millis() as f64 / 1000.0
                                     );
                                     warn!(
                                         proxies = %pending_proxies.len(),
-                                        timeout = %REGISTRATION_RESPONSE_TIMEOUT.as_secs(),
+                                        timeout = %REGISTRATION_RESPONSE_TIMEOUT.as_millis(),
                                         "Registration response timeout; marking {} pending proxies as failed",
                                         pending_proxies.len()
                                     );
@@ -2230,7 +2230,11 @@ impl Service {
                                     if info.phase == ProxyPhase::WaitStart
                                         && waitstart_seen.get(name).is_some_and(|first_seen| {
                                             now.duration_since(*first_seen)
-                                                >= *PROXY_RETRY_INTERVAL - PROXY_RETRY_GRACE
+                                        // saturating_sub: an env-shrunk
+                                        // interval below the 100ms grace must
+                                        // not underflow (panic).
+                                        >= (*PROXY_RETRY_INTERVAL)
+                                            .saturating_sub(PROXY_RETRY_GRACE)
                                         })
                                     {
                                         Some((name.clone(), info.local_addr.clone()))
