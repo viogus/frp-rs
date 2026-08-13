@@ -36,7 +36,7 @@ use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
-use frp_core::transport::TransportProtocol;
+use frp_core::transport::{IoStream, TransportProtocol};
 
 use frp_core::metrics::ProxyMetricsRegistry;
 
@@ -143,6 +143,161 @@ pub(crate) const PROXY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// it can measure a hair under one full interval and a retry would slip to
 /// the next tick. The grace only ever advances a retry by at most one tick.
 const PROXY_RETRY_GRACE: Duration = Duration::from_millis(100);
+
+/// Finished STUN discovery result, handed from the off-loop STUN task back
+/// to the control loop so the NatHoleClient write + pending_xtcp bookkeeping
+/// stay on the loop (preserving the write-before-NatHoleResp ordering).
+struct StunResult {
+    sid: String,
+    proxy_name: String,
+    msg: FrpMessage,
+}
+
+/// How the message loop exited. `Shutdown` when a stop was requested (admin
+/// API or signal — the session must not reconnect); `Reconnect` when the
+/// session died and run() should tear down and reconnect.
+enum LoopExit {
+    Shutdown,
+    Reconnect,
+}
+
+/// Per-session state shared across the login → registration → message-loop
+/// phases of one connection attempt. Created on successful login, dropped on
+/// teardown. Holds exactly the locals that used to live inline in run().
+///
+/// `control_stream` is `Option` because phase 5 splits it (`into_split`)
+/// into the writer task's halves; every use before that point unwraps it.
+struct SessionCtx {
+    /// Control connection stream, AES-128-CFB-wrapped, yamux-unwrapped.
+    /// `None` after phase 5 splits it into reader/writer halves.
+    control_stream: Option<IoStream>,
+    /// Server-assigned run_id for this session (Go frp compat: previousRunID
+    /// carries over to the next attempt via run()).
+    run_id: String,
+    /// Yamux session handle. Held so the previous session's handle can be
+    /// dropped before creating a new connection (Go frp compat: svr.ctl.Close()).
+    yamux: Option<std::sync::Arc<frp_core::mux::YamuxSession>>,
+    /// Protocol version negotiated for this session (V1 vs V2).
+    v2: bool,
+    /// QUIC connection handle, forwarded to work-conn configs.
+    #[cfg(feature = "quic")]
+    quic_conn: Option<std::sync::Arc<QuicConnection>>,
+    /// Heartbeat ping interval, armed at login. None disables heartbeats.
+    ping_interval: Option<tokio::time::Interval>,
+    /// Last Pong receive time; the watchdog fires if no Pong arrives within
+    /// heartbeat_timeout (also bounds the registration phase).
+    last_pong: Instant,
+    /// Configured heartbeat timeout in seconds (raw config value).
+    hb_timeout: i64,
+    /// heartbeat_timeout as a Duration (clamped at 0).
+    hb_timeout_dur: Duration,
+    /// Whether the heartbeat watchdog is armed (interval > 0 && timeout > 0).
+    hb_watchdog_active: bool,
+    /// Shared session-alive flag for spawned work-conn tasks.
+    session_alive: Arc<AtomicBool>,
+    // --- Work-conn config snapshot fields ---
+    wc_server_addr: String,
+    wc_server_port: u16,
+    wc_tls_enable: bool,
+    wc_tls_server_name: String,
+    wc_tls_ca_file: Option<String>,
+    wc_tls_cert_file: Option<String>,
+    wc_tls_key_file: Option<String>,
+    wc_dns_server: Option<String>,
+    wc_udp_packet_size: usize,
+    wc_disable_custom_tls_first_byte: bool,
+    wc_keepalive_secs: u64,
+    wc_bind_addr: Option<String>,
+    wc_proxy_url: String,
+    wc_dial_timeout_secs: u64,
+    /// Transport protocol for work connections (snapshot of cfg_local.protocol).
+    protocol: TransportProtocol,
+    /// Client-declared additional auth scopes, for heartbeat auth decisions.
+    client_scopes: Vec<String>,
+    /// Server-advertised auth scopes, for heartbeat auth decisions.
+    server_scopes: Vec<String>,
+    /// Per-session shutdown flag; set only when a stop was requested (the
+    /// stop_rx arm in the message loop, or the reconnect backoff race), read
+    /// at teardown. Never set on error/reconnect exits.
+    shutdown_flag: Arc<AtomicBool>,
+    /// Session start time, used to reset the backoff counter when a session
+    /// runs healthily for a long time (Go frp's FastBackoffManager only
+    /// counts consecutive failures).
+    session_started_at: Instant,
+    // --- Registration bookkeeping (phase 4) ---
+    /// Wire proxy names of proxies whose NewProxy was written but whose
+    /// NewProxyResp has not arrived yet, paired with their index in the
+    /// active-proxies snapshot.
+    pending_proxies: Vec<(String, usize)>,
+    /// Same for visitors whose NewVisitorConn has not been acked yet.
+    pending_visitors: Vec<(String, usize)>,
+    /// Set when a NewProxy/NewVisitorConn write failed — the stream state
+    /// is undefined, so the registration response phase is skipped entirely.
+    write_failed: bool,
+    /// False until the first NewProxyResp / NewVisitorConnResp / visitor-ack
+    /// ReqWorkConn has been handled. The server's pool pre-warm
+    /// ReqWorkConns always precede every registration response on the wire,
+    /// so anonymous ReqWorkConns received before this point can never be
+    /// visitor acks.
+    seen_registration_response: bool,
+    /// Anonymous ReqWorkConns consumed so far — bounds the pool pre-warm
+    /// when no proxy registration exists to mark its end.
+    req_work_conns_seen: usize,
+    // --- Control writer (phase 5) ---
+    /// Control writer handle (bounded channel + dedicated writer task),
+    /// used by the message loop and teardown. `None` only before phase 5
+    /// creates it.
+    writer: Option<Arc<ControlWriter>>,
+    /// Receiver half of the control channel — moved into the writer task
+    /// when it is spawned.
+    control_rx: Option<tokio::sync::mpsc::Receiver<(FrpMessage, bool)>>,
+    /// Writer-failure flag shared with `ControlWriter`.
+    control_failed: Option<Arc<AtomicBool>>,
+    /// Wakeup used by the writer task to notify the control loop of a
+    /// write failure.
+    control_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Read half of the split control stream, owned by the message loop.
+    /// `None` before phase 5 splits it; the message loop takes it out.
+    reader: Option<frp_core::transport::BoxedReadHalf>,
+    /// Shared graceful shutdown signal for all visitor listener tasks.
+    /// Set to true at session end so tasks exit cleanly.
+    visitor_shutdown: Option<Arc<AtomicBool>>,
+    /// Join handles of the current session's visitor listener tasks,
+    /// cancelled at teardown.
+    visitor_handles: Vec<tokio::task::JoinHandle<()>>,
+    // --- Message loop (phase 6) ---
+    /// Map sid -> proxy_name for XTCP NatHoleResp routing (provider side).
+    pending_xtcp: std::collections::HashMap<String, String>,
+    /// Map sid -> STUN UDP socket for XTCP P2P hole punching.
+    xtcp_sockets: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+        >,
+    >,
+    /// Map sid -> oneshot sender for visitor NatHoleResp routing (Go frps compat).
+    visitor_pending:
+        std::collections::HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>>,
+    /// Finished STUN results handed back to the control loop (off-loop STUN
+    /// discovery), created in the message loop.
+    stun_result_tx: Option<mpsc::Sender<StunResult>>,
+    stun_result_rx: Option<mpsc::Receiver<StunResult>>,
+    /// Stale XTCP entry reclaim channel (created in the message loop).
+    xtcp_cleanup_rx: Option<mpsc::Receiver<String>>,
+    /// 30s proxy retry interval; armed in the message loop (first tick
+    /// skipped so the first retry happens a full interval after login).
+    proxy_retry_interval: Option<tokio::time::Interval>,
+    /// When each proxy last entered WaitStart (initial registration or a
+    /// retry send). A proxy whose NewProxy is never answered (a silent
+    /// server that still Pongs) stays in WaitStart forever — the StartErr
+    /// transition happens only on a NewProxyResp error — so the retry arm
+    /// tracks this to re-send after one full interval (Go frp parity:
+    /// proxy_wrapper re-arms startErrTimeout while in waitStart and
+    /// retries indefinitely). Pruned when the proxy leaves WaitStart.
+    waitstart_seen: HashMap<String, Instant>,
+    /// Copy of the client user name for the retry arm — the cfg snapshot
+    /// read guard is dropped before the message loop starts.
+    cfg_user: String,
+}
 
 /// The main frpc service.
 pub struct Service {
@@ -728,7 +883,6 @@ impl Service {
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("visitor_rx already taken — run() called twice?");
-        let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
         let mut stop_rx = self
             .stop_rx
@@ -736,15 +890,14 @@ impl Service {
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("stop_rx already taken — run() called twice?");
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Handle of the spawned admin HTTP server task; aborted on shutdown
         // (cancel_detached_tasks). Only spawned with the `admin` feature.
         #[cfg(feature = "admin")]
-        let admin_handle: Option<tokio::task::JoinHandle<()>> =
+        let mut admin_handle: Option<tokio::task::JoinHandle<()>> =
             self.spawn_admin_server(&_reload_tx, &self.stop_tx).await;
         #[cfg(not(feature = "admin"))]
-        let admin_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut admin_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         // Main session loop with reconnection.
         // Go frp dev two-phase fast-backoff:
@@ -760,10 +913,6 @@ impl Service {
         // error count is reset so an occasional blip doesn't reconnect with
         // the backoff cap already reached (Go frp's FastBackoffManager only
         // counts consecutive failures).
-        #[allow(unused_assignments)] // initial None is overwritten before first read
-        let mut session_started_at: Option<Instant> = None;
-        // Track visitor listener tasks so they can be cancelled on reconnect.
-        let mut visitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         // Carry over run_id across reconnections (Go frp compat: previousRunID).
         let mut previous_run_id = String::new();
         // Explicitly hold the previous session's yamux handle so we can drop it
@@ -789,116 +938,26 @@ impl Service {
             let all_proxies = Arc::clone(&*self.proxies.read().await);
             let proxies = filter_active_proxies(&cfg_local, &all_proxies);
 
-            // Owned copies of the snapshot fields the work-conn config macro
-            // needs. `handle_req_work_conn` (which expands it) also runs from
-            // the message loop, where the snapshot guard is no longer held,
-            // so the macro reads these instead of the guard. Keeps the
-            // snapshot semantics (fields fixed at connection start) without
-            // cloning the whole ClientConfig.
-            let wc_server_addr = cfg_local.server_addr.clone();
-            let wc_server_port = cfg_local.server_port;
-            let wc_tls_enable = cfg_local.tls_enable;
-            let wc_tls_server_name = cfg_local.tls_server_name.clone();
-            let wc_tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
-            let wc_tls_cert_file = opt_if_empty!(cfg_local.tls_cert_file);
-            let wc_tls_key_file = opt_if_empty!(cfg_local.tls_key_file);
-            let wc_dns_server = opt_if_empty!(cfg_local.dns_server);
-            let wc_udp_packet_size = cfg_local.udp_packet_size.max(0) as usize;
-            let wc_disable_custom_tls_first_byte = cfg_local.disable_custom_tls_first_byte;
-            let wc_keepalive_secs = cfg_local.dial_server_keepalive.max(0) as u64;
-            let wc_bind_addr = opt_if_empty!(cfg_local.connect_server_local_ip);
-            let wc_proxy_url = cfg_local.proxy_url.clone();
-            let wc_dial_timeout_secs = cfg_local.dial_server_timeout.max(1) as u64;
-
             // Go frp compat (d486018): drop previous yamux session before
             // creating a new control connection. This drops the sender channel,
             // causing the background yamux task to exit and close the TCP socket.
             #[cfg(feature = "tcp-mux")]
             drop(prev_yamux.take());
-            let mut ctl = ControlConnection::new(
-                cfg_local.server_addr.clone(),
-                cfg_local.server_port,
-                self.auth_cfg.clone(),
-                protocol.clone(),
-                pool_count,
-                cfg_local.user.clone(),
-                cfg_local.client_id.clone(),
-                cfg_local.tls_enable,
-                cfg_local.tls_server_name.clone(),
-                opt_if_empty!(cfg_local.tls_ca_file),
-                opt_if_empty!(cfg_local.tls_cert_file),
-                opt_if_empty!(cfg_local.tls_key_file),
-                opt_if_empty!(cfg_local.dns_server),
-                cfg_local.tcp_mux,
-                cfg_local.disable_custom_tls_first_byte,
-                cfg_local.dial_server_keepalive.max(0) as u64,
-                cfg_local.tcp_mux_keepalive_interval,
-                opt_if_empty!(cfg_local.connect_server_local_ip),
-                cfg_local.v2,
-                self.oidc_client.clone(),
-                cfg_local.metas.clone(),
-                cfg_local.proxy_url.clone(),
-                previous_run_id.clone(),
-                Some(ClientSpec {
-                    client_type: Some("frpc".into()),
-                    always_auth_pass: None,
-                }),
-                cfg_local.dial_server_timeout,
-                #[cfg(feature = "quic")]
-                frp_core::quic::quic_params_from_option_values(
-                    cfg_local
-                        .quic_options
-                        .as_ref()
-                        .map(|q| q.keepalive_period)
-                        .unwrap_or(0),
-                    cfg_local
-                        .quic_options
-                        .as_ref()
-                        .map(|q| q.max_idle_timeout)
-                        .unwrap_or(0),
-                    cfg_local
-                        .quic_options
-                        .as_ref()
-                        .map(|q| q.max_incoming_streams)
-                        .unwrap_or(0),
-                ),
-            );
 
-            // Initialized to None: the post-login Ok arm overwrites it, and
-            // the error path (below) diverges before it can be read.
-            #[cfg(feature = "quic")]
-            let mut quic_conn: Option<QuicConnection> = None;
-
-            // Login and the post-login encryption wrap funnel into one Result:
-            // `into_encrypted` can fail when the transport carries unconsumed
-            // read-ahead bytes (remote-triggerable: a proxy injecting junk
-            // after its CONNECT response), and that failure must take the
-            // same retry/exit path as a login error — never panic (release
-            // binaries build with panic=abort).
-            let enc_result = match ctl.login().await {
-                Ok(r) => {
-                    did_login_once = true;
-                    *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
-                    // After login, wrap control stream in AES-128-CFB encryption.
-                    // Go frps v0.69.1 always encrypts the control connection for V1.
-                    #[cfg(feature = "quic")]
-                    let (stream, run_id, yamux, quic) = r;
-                    #[cfg(not(feature = "quic"))]
-                    let (stream, run_id, yamux) = r;
-                    let enc_key = encryption::derive_key(&self.auth_cfg.token);
-                    #[cfg(feature = "quic")]
-                    {
-                        quic_conn = quic;
-                    }
-                    stream
-                        .into_encrypted(enc_key)
-                        .map(|stream| (stream, run_id, yamux))
-                        .map_err(frp_core::Error::from)
-                }
-                Err(e) => Err(e),
-            };
-            let (mut control_stream, run_id, yamux_session) = match enc_result {
-                Ok(r) => r,
+            // Phases 1-3 (config snapshot, dial + login, encryption wrap,
+            // yamux, heartbeat init) live in connect_and_login; it returns
+            // the per-session state or the error. Backoff counters stay here.
+            let mut ctx = match self
+                .connect_and_login(
+                    &cfg_local,
+                    &protocol,
+                    pool_count,
+                    previous_run_id.clone(),
+                    &mut did_login_once,
+                )
+                .await
+            {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     consecutive_err_count += 1;
                     warn!(attempt = %consecutive_err_count, error = %e, "Login failed (attempt {}): {}", consecutive_err_count, e);
@@ -934,565 +993,25 @@ impl Service {
                     continue;
                 }
             };
-            let yamux = yamux_session.map(std::sync::Arc::new);
+
             // Store for explicit cleanup before next reconnect (Go frp compat d486018).
             #[cfg(feature = "tcp-mux")]
             {
-                prev_yamux = yamux.clone();
+                prev_yamux = ctx.yamux.clone();
             }
-            #[cfg(feature = "quic")]
-            let quic_conn = quic_conn.map(std::sync::Arc::new);
-            previous_run_id = run_id.clone();
-            // Session established — mark its start for backoff reset.
-            session_started_at = Some(Instant::now());
-            let v2 = cfg_local.v2;
-            info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
+            previous_run_id = ctx.run_id.clone();
 
-            // --- Heartbeat state: single arm point ---
-            // `last_pong` is initialized at login success so the heartbeat
-            // watchdog bounds the REGISTRATION phase too: no Ping is sent
-            // until the message loop starts, so a server that stays
-            // connected but never answers NewProxy is detected within
-            // heartbeat_timeout instead of hanging the client in
-            // registration forever (Go frp's heartbeat timer also runs
-            // continuously while proxies register in their own goroutines).
-            // The message loop below reuses these same variables — this is
-            // the only initialization point (the watchdog must not be
-            // double-armed with a fresh timer after registration).
-            let mut ping_interval = if cfg_local.heartbeat_interval > 0 {
-                let secs = cfg_local.heartbeat_interval as u64;
-                info!(interval = %secs, "Heartbeat interval: {}s", secs);
-                Some(tokio::time::interval(Duration::from_secs(secs)))
-            } else {
-                info!("Heartbeat: explicitly disabled (heartbeat_interval <= 0)");
-                None
-            };
-            let mut last_pong = Instant::now();
-            let hb_timeout = cfg_local.heartbeat_timeout;
-            let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
-            // The watchdog only makes sense while the ping loop is active:
-            // with heartbeat_interval <= 0 the client never sends Pings, so
-            // no Pong can ever arrive and an active watchdog would fire right
-            // after login and reconnect forever (Go frp gates its heartbeat
-            // on the interval too).
-            let hb_watchdog_active = hb_timeout > 0 && ping_interval.is_some();
-
-            let session_alive = Arc::new(AtomicBool::new(true));
-
-            // Shared pool/work-conn configuration. Both the registration read
-            // loop (below) and the on-demand ReqWorkConn handler in the message
-            // loop build a byte-identical WorkConnConfig differing only in
-            // `pool_id`. Collapse into one macro (defined here so its free
-            // identifier references resolve against the locals in scope).
-            let client_scopes: Vec<String> = cfg_local
-                .auth
-                .as_ref()
-                .map(|a| a.additional_auth_scopes.clone())
-                .unwrap_or_default();
-            let server_scopes = self.server_auth_scopes.read().await.clone();
-            // Bind local UDP sockets for UDP proxies.
-
-            macro_rules! work_conn_config {
-                ($pool_id:expr) => {{
-                    #[cfg(feature = "quic")]
-                    let quic_arg = quic_conn.clone();
-                    #[cfg(not(feature = "quic"))]
-                    let quic_arg = ();
-                    crate::work_conn::WorkConnConfig {
-                        server_addr: wc_server_addr.clone(),
-                        server_port: wc_server_port,
-                        protocol: protocol.clone(),
-                        run_id: run_id.clone(),
-                        proxy_info_map: self.proxy_info_map.clone(),
-                        enc_key: self.encryption_key,
-                        pool_id: $pool_id,
-                        auth_cfg: self.auth_cfg.clone(),
-                        tls_enable: wc_tls_enable,
-                        tls_server_name: wc_tls_server_name.clone(),
-                        tls_ca_file: wc_tls_ca_file.clone(),
-                        tls_cert_file: wc_tls_cert_file.clone(),
-                        tls_key_file: wc_tls_key_file.clone(),
-                        dns_server: wc_dns_server.clone(),
-                        yamux: yamux.clone(),
-                        quic_conn: quic_arg,
-                        v2,
-                        oidc_client: self.oidc_client.clone(),
-                        udp_packet_size: wc_udp_packet_size,
-                        proxy_metrics: self.proxy_metrics.clone(),
-                        client_auth_scopes: client_scopes.clone(),
-                        server_auth_scopes: server_scopes.clone(),
-                        disable_custom_tls_first_byte: wc_disable_custom_tls_first_byte,
-                        keepalive_secs: wc_keepalive_secs,
-                        bind_addr: wc_bind_addr.clone(),
-                        proxy_url: wc_proxy_url.clone(),
-                        dial_timeout_secs: wc_dial_timeout_secs,
-                        xtcp_tx: xtcp_tx.clone(),
-                        session_alive: session_alive.clone(),
-                        spawned_counter: None,
-                        #[cfg(feature = "vnet")]
-                        vnet_tuns: self.vnet_tuns.clone(),
-                        #[cfg(feature = "vnet")]
-                        vnet_controller: self.vnet_controller.clone(),
-                        #[cfg(feature = "vnet")]
-                        vnet_tun_tx: self.vnet_tun_tx.clone(),
-                    }
-                }};
-            }
-
-            // Go frp compat: work connections are created ONLY in response to
-            // ReqWorkConn messages from the server (pool pre-warm sent right
-            // after LoginResp, NewVisitorConn acks, and on-demand requests —
-            // handled in the registration read loop below and the message loop
-            // further down). Do NOT eagerly spawn pool_count connections here;
-            // pool_count is sent to the server via Login so it knows how many
-            // ReqWorkConn messages to issue.
-            let handle_req_work_conn = || {
-                // Go frp v0.70.1 spawns each ReqWorkConn handler asynchronously
-                // with no client-side in-flight cap (client/control.go:
-                // handleReqWorkConn). Spawn directly so a burst of requests
-                // cannot overflow a queue or tear down the control session;
-                // each work conn's dial/StartWorkConn read is still bounded by
-                // its own timeout in work_conn.rs.
-                debug!("Received ReqWorkConn, spawning work connection");
-                crate::work_conn::spawn_work_conn(work_conn_config!(-1));
-            };
-
-            // Register proxies using IoStream directly (supports TCP and TLS).
-            // Pipelined: write ALL NewProxy frames first, then collect the
-            // responses in a single read loop — N proxies no longer cost N
-            // sequential network round-trips (Go frpc registers each proxy in
-            // its own goroutine, so Go frps may answer out of order; each
-            // response is matched to its proxy by wire proxy_name). ReqWorkConn
-            // frames arriving in this window (pool pre-warm, or a user conn
-            // hitting the server mid-registration) are handled here instead of
-            // dropped: skipping them left the pool empty after login and let
-            // the server's work-conn wait stall for up to 10s.
-            let mut pending_proxies: Vec<(String, usize)> = Vec::new();
-            let mut write_failed = false;
-            for (idx, p) in proxies.iter().enumerate() {
-                let local_addr = self
-                    .proxy_info_map
-                    .read()
-                    .await
-                    .get(&wire_proxy_name(&cfg_local.user, &p.name))
-                    .map(|info| info.local_addr.clone())
-                    .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-                let np = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_local.user);
-                debug!(
-                    name = %p.name,
-                    proxy_type = %p.proxy_type,
-                    remote_port = p.remote_port,
-                    encrypted = p.use_encryption,
-                    compressed = p.use_compression,
-                    "NewProxy message prepared"
-                );
-                info!(name = %p.name, proxy_type = %p.proxy_type, remote_port = %p.remote_port, local_addr = %local_addr,
-                    "Registering proxy '{}' type={} remote_port={} local={}",
-                    p.name, p.proxy_type, p.remote_port, local_addr);
-                let wire_name = wire_proxy_name(&cfg_local.user, &p.name);
-                let write_result = if v2 {
-                    control_stream.write_v2_frame(&np).await
-                } else {
-                    control_stream.write_v1_frame(&np).await
-                };
-                if let Err(e) = write_result {
-                    // A failed write leaves the stream state undefined; record
-                    // the failure, mark the proxy failed, and skip the response
-                    // phase entirely (responses for the unwritten requests may
-                    // never arrive — see `write_failed`/`aborted` below).
-                    write_failed = true;
-                    warn!(proxy_name = %p.name, error = %e, "Failed to register proxy '{}': {}", p.name, e);
-                    let mut map = self.proxy_info_map.write().await;
-                    if let Some(info) = map.get_mut(&wire_name) {
-                        info.err = e.to_string();
-                        info.phase = ProxyPhase::StartErr(e.to_string());
-                    }
-                    continue;
-                }
-                pending_proxies.push((wire_name, idx));
-            }
-
-            // Register STCP/XTCP visitors on the control connection.
-            // Go frps v0.69.1 requires visitor registration before NatHoleVisitor
-            // can be sent on the control connection (otherwise: "auth failed").
-            // Pipelined like the proxies: write all NewVisitorConn frames, then
-            // resolve them in the shared read loop below.
-            let session_visitors_cfg = self.cfg.read().await.visitors.clone();
-            let session_visitors: Vec<&frp_core::config::VisitorConfig> = session_visitors_cfg
-                .iter()
-                .filter(|v| v.enabled && v.bind_port != 0)
-                .collect();
-            let mut pending_visitors: Vec<(String, usize)> = Vec::new();
-            for (idx, v) in session_visitors.iter().enumerate() {
-                let nvc = crate::proxy::create_visitor_conn_msg(
-                    &v.server_name,
-                    &v.secret_key,
-                    v.use_encryption,
-                    v.use_compression,
-                    Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
-                    Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
-                    Some(run_id.as_str()).filter(|s| !s.is_empty()),
-                );
-                debug!(
-                    server_name = %v.server_name,
-                    encrypted = v.use_encryption,
-                    compressed = v.use_compression,
-                    "NewVisitorConn message prepared"
-                );
-                info!(visitor_name = %v.name, proxy_name = %v.server_name, "Registering visitor '{}' for proxy '{}'", v.name, v.server_name);
-                let wire_name = crate::proxy::visitor_wire_name(
-                    Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
-                    Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
-                    &v.server_name,
-                );
-                let write_result = if v2 {
-                    control_stream.write_v2_frame(&nvc).await
-                } else {
-                    control_stream.write_v1_frame(&nvc).await
-                };
-                if let Err(e) = write_result {
-                    write_failed = true;
-                    warn!(visitor_name = %v.name, error = %e, "Failed to register visitor '{}': {}", v.name, e);
-                    continue;
-                }
-                pending_visitors.push((wire_name, idx));
-            }
-
-            // Collect responses. NewProxyResp/NewVisitorConnResp are matched to
-            // their request by wire proxy_name — the server answers
-            // synchronously in request order, but matching by name keeps this
-            // robust regardless of response order. ReqWorkConn spawns a work
-            // connection (pool pre-warm — written by the server immediately
-            // after LoginResp, BEFORE any registration response — a
-            // NewVisitorConn success ack, or an on-demand user conn that
-            // arrived while the client was still registering).
-            let mut aborted = write_failed;
-            let mut unexpected = 0u32;
-            // False until the first NewProxyResp / NewVisitorConnResp /
-            // visitor-ack ReqWorkConn has been handled. The server's pool
-            // pre-warm ReqWorkConns always precede every registration
-            // response on the wire (see I2), so anonymous ReqWorkConns
-            // received before this point can never be visitor acks.
-            let mut seen_registration_response = false;
-            // Anonymous ReqWorkConns consumed so far — bounds the pool
-            // pre-warm when no proxy registration exists to mark its end.
-            let mut req_work_conns_seen = 0usize;
-            while !aborted && (!pending_proxies.is_empty() || !pending_visitors.is_empty()) {
-                // Go frp v0.70.1 never acks control-channel NewVisitorConn —
-                // its stcp/xtcp visitors register per user connection when the
-                // connection arrives, not at startup. A pure-visitor client
-                // must therefore not wait forever for a visitor ack the server
-                // will never send. Once every proxy response is in, give the
-                // remaining visitor acks a 2s grace period — our server writes
-                // its ack in the same control iteration as the pool conns (ms
-                // under load, ~200x headroom) — then assume the un-acked
-                // visitors registered (Go frps semantics) and stop reading.
-                // Any frames the server still writes afterwards are handled by
-                // the session's main read loop.
-                // Heartbeat watchdog during registration: `last_pong` was
-                // armed at login success, and no Ping is sent during
-                // registration (pings start with the message loop), so no
-                // Pong can arrive — the deadline is the full hb_timeout from
-                // login. A server that stays connected but never answers is
-                // therefore detected within heartbeat_timeout (Go frp's
-                // heartbeat timer also runs continuously while its proxies
-                // register in goroutines). With the heartbeat disabled
-                // (hb_watchdog_active false) the watchdog must never fire:
-                // sleep for ~136 years so both branches share the same Sleep
-                // type, leaving the per-read deadlines below as the bound.
-                let watchdog = tokio::time::sleep(if hb_watchdog_active {
-                    hb_timeout_dur.saturating_sub(last_pong.elapsed())
-                } else {
-                    Duration::from_secs(u32::MAX as u64)
-                });
-                tokio::pin!(watchdog);
-                let resp_msg = if pending_proxies.is_empty() && !pending_visitors.is_empty() {
-                    let read = async {
-                        if v2 {
-                            control_stream.read_v2_frame().await
-                        } else {
-                            control_stream.read_v1_frame().await
-                        }
-                    };
-                    tokio::select! {
-                        r = tokio::time::timeout(Duration::from_millis(2000), read) => {
-                            match r {
-                                Ok(Ok(m)) => m,
-                                Ok(Err(e)) => {
-                                    warn!(error = %e, "Registration response read failed: {}", e);
-                                    aborted = true;
-                                    continue;
-                                }
-                                Err(_elapsed) => {
-                                    // The server will not ack the remaining visitors
-                                    // (Go frps semantics: NewVisitorConn succeeds
-                                    // silently; per-user connections register
-                                    // themselves when they arrive). FIFO-drain them
-                                    // as registered — same semantics as the
-                                    // ReqWorkConn attribution above, but with no
-                                    // server response at all.
-                                    while !pending_visitors.is_empty() {
-                                        let (_, idx) = pending_visitors.remove(0);
-                                        let v = session_visitors[idx];
-                                        info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}' (no registration response — assumed registered)", v.name, v.server_name);
-                                        #[cfg(feature = "vnet")]
-                                        advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        _ = &mut watchdog => {
-                            warn!(timeout = %hb_timeout, "Heartbeat timeout ({}s) during registration, reconnecting...", hb_timeout);
-                            aborted = true;
-                            // Break the registration loop: `aborted` skips the
-                            // session continuation (writer task, visitor
-                            // listeners, message loop) below and the session
-                            // goes straight to teardown + reconnect — same
-                            // path a message-loop heartbeat timeout takes.
-                            break;
-                        }
-                    }
-                } else {
-                    // Proxies (or proxies + visitors) pending: each response
-                    // read is bounded by REGISTRATION_RESPONSE_TIMEOUT so a
-                    // server that accepted Login but never answers NewProxy
-                    // cannot block the client forever (vs Go frps ~90s
-                    // idle-timeout; vs custom servers: permanent silent
-                    // hang). On timeout the pending proxies are marked
-                    // StartErr and re-registered by the message loop's 30s
-                    // retry — the session itself is NOT torn down (Go frp
-                    // tolerates slow registration). Divergence with the
-                    // heartbeat disabled (heartbeat_interval <= 0): this
-                    // timeout is the only bound — the session survives with
-                    // StartErr proxies and the retry arm keeps re-registering
-                    // them. With a default heartbeat the same silent server
-                    // (which never Pongs either — no Pings are sent during
-                    // registration) trips the watchdog above first and the
-                    // whole session is torn down for a reconnect at
-                    // hb_timeout.
-                    let read = async {
-                        if v2 {
-                            control_stream.read_v2_frame().await
-                        } else {
-                            control_stream.read_v1_frame().await
-                        }
-                    };
-                    tokio::select! {
-                        r = tokio::time::timeout(REGISTRATION_RESPONSE_TIMEOUT, read) => {
-                            match r {
-                                Ok(Ok(m)) => m,
-                                Ok(Err(e)) => {
-                                    warn!(error = %e, "Registration response read failed: {}", e);
-                                    aborted = true;
-                                    continue;
-                                }
-                                Err(_elapsed) => {
-                                    // The server never answered the pending
-                                    // requests. Mark them StartErr with a
-                                    // clear message and drop them from the
-                                    // pending set so the registration phase
-                                    // finishes; the message loop's retry then
-                                    // re-registers them (their phase is
-                                    // StartErr) while the session keeps
-                                    // running.
-                                    let msg = format!(
-                                        "registration timed out (no response within {}s)",
-                                        REGISTRATION_RESPONSE_TIMEOUT.as_secs()
-                                    );
-                                    warn!(
-                                        proxies = %pending_proxies.len(),
-                                        timeout = %REGISTRATION_RESPONSE_TIMEOUT.as_secs(),
-                                        "Registration response timeout; marking {} pending proxies as failed",
-                                        pending_proxies.len()
-                                    );
-                                    for (wire_name, _) in pending_proxies.drain(..) {
-                                        let mut map = self.proxy_info_map.write().await;
-                                        if let Some(info) = map.get_mut(&wire_name) {
-                                            info.err = msg.clone();
-                                            info.phase = ProxyPhase::StartErr(msg.clone());
-                                        }
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                        _ = &mut watchdog => {
-                            warn!(timeout = %hb_timeout, "Heartbeat timeout ({}s) during registration, reconnecting...", hb_timeout);
-                            aborted = true;
-                            // Break the registration loop: `aborted` skips the
-                            // session continuation (writer task, visitor
-                            // listeners, message loop) below and the session
-                            // goes straight to teardown + reconnect — same
-                            // path a message-loop heartbeat timeout takes.
-                            break;
-                        }
-                    }
-                };
-                match resp_msg {
-                    FrpMessage::NewProxyResp(resp) => {
-                        seen_registration_response = true;
-                        // Match by wire proxy_name: responses may arrive in any
-                        // order relative to the requests they answer.
-                        let Some(pos) = pending_proxies
-                            .iter()
-                            .position(|(name, _)| *name == resp.proxy_name)
-                        else {
-                            unexpected += 1;
-                            warn!(proxy_name = %resp.proxy_name, "NewProxyResp for proxy not in this registration batch");
-                            continue;
-                        };
-                        let (_, idx) = pending_proxies.swap_remove(pos);
-                        let p = &proxies[idx];
-                        if let Some(err) = resp.error {
-                            warn!(proxy_name = %p.name, error = %err, "Failed to register proxy '{}': {}", p.name, err);
-                            let mut map = self.proxy_info_map.write().await;
-                            if let Some(info) =
-                                map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
-                            {
-                                info.err = err.clone();
-                                info.phase = ProxyPhase::StartErr(err);
-                            }
-                        } else {
-                            let remote = resp
-                                .remote_addr
-                                .unwrap_or_else(|| format!("0.0.0.0:{}", p.remote_port));
-                            info!(proxy_name = %p.name, remote = %remote, "Proxy '{}' registered on remote port {}", p.name, remote);
-                            // Update runtime info for admin API
-                            let mut map = self.proxy_info_map.write().await;
-                            if let Some(info) =
-                                map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
-                            {
-                                info.remote_addr = remote;
-                                info.err.clear();
-                                info.phase = ProxyPhase::Running;
-                            }
-
-                            #[cfg(feature = "vnet")]
-                            if vnet_tun_params(p, &cfg_local.virtual_net.address).is_some() {
-                                if let Err(e) = self.open_vnet_tun_for_proxy(p, &cfg_local).await {
-                                    warn!(proxy_name = %p.name, error = %e, "TUN open/register failed (need root/CAP_NET_ADMIN?)");
-                                }
-                            }
-                        }
-                    }
-                    FrpMessage::NewVisitorConnResp(resp) => {
-                        seen_registration_response = true;
-                        let Some(pos) = pending_visitors
-                            .iter()
-                            .position(|(name, _)| *name == resp.proxy_name)
-                        else {
-                            unexpected += 1;
-                            // Defensive: an out-of-batch response is almost
-                            // always a REJECTED visitor whose earlier
-                            // ReqWorkConn ack was misattributed (e.g. a pool
-                            // pre-warm conn consumed as its success signal),
-                            // leaving the failure unnamed and discarded here.
-                            // Resolve the wire name against the configured
-                            // visitor list and surface the error so a future
-                            // ordering change cannot silently swallow an auth
-                            // failure.
-                            let configured = session_visitors.iter().find(|v| {
-                                crate::proxy::visitor_wire_name(
-                                    Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
-                                    Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
-                                    &v.server_name,
-                                ) == resp.proxy_name
-                            });
-                            match configured {
-                                Some(v) => {
-                                    warn!(visitor_name = %v.name, proxy_name = %resp.proxy_name, error = ?resp.error, "NewVisitorConnResp for visitor '{}' (wire '{}') not in this registration batch: {:?}", v.name, resp.proxy_name, resp.error)
-                                }
-                                None => {
-                                    warn!(proxy_name = %resp.proxy_name, "NewVisitorConnResp for visitor not in this registration batch")
-                                }
-                            }
-                            continue;
-                        };
-                        let (_, idx) = pending_visitors.swap_remove(pos);
-                        let v = session_visitors[idx];
-                        if let Some(err) = resp.error {
-                            warn!(visitor_name = %v.name, error = %err, "Failed to register visitor '{}': {}", v.name, err);
-                        } else {
-                            info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
-                            // Virtual-net visitors advertise their destination IP
-                            // as a host route instead of binding a local listener.
-                            #[cfg(feature = "vnet")]
-                            advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
-                        }
-                    }
-                    FrpMessage::ReqWorkConn(_) => {
-                        handle_req_work_conn();
-                        // Go frps v0.69.1 acks a successful NewVisitorConn on
-                        // the control channel with an anonymous ReqWorkConn
-                        // (no proxy_name; failures get a named
-                        // NewVisitorConnResp{error}). While visitors are
-                        // still pending, attribute the ack to the oldest one
-                        // (FIFO — the server answers registrations in request
-                        // order, so acks arrive in visitor order).
-                        //
-                        // The server writes its pool pre-warm ReqWorkConns
-                        // immediately after LoginResp, BEFORE it processes any
-                        // registration frame, so they always precede every
-                        // NewProxyResp/NewVisitorConnResp on the wire. An
-                        // anonymous ReqWorkConn can therefore only be a
-                        // visitor success ack once a registration response has
-                        // been seen. (With no proxies there is no NewProxyResp
-                        // to mark the pool's end; the client's own pool_count
-                        // bounds it instead — the server never sends more pool
-                        // conns than the client asked for.) Without this gate
-                        // the pool conns were FIFO-attributed to the oldest
-                        // pending visitors, marking them registered (and
-                        // advertising vnet routes) before the server had even
-                        // seen their NewVisitorConn — a rejected visitor's
-                        // real response then hit the out-of-batch branch above
-                        // and was silently discarded.
-                        let pool_conns_done = seen_registration_response
-                            || (pending_proxies.is_empty()
-                                && req_work_conns_seen >= pool_count.max(1) as usize);
-                        if pool_conns_done && !pending_visitors.is_empty() {
-                            let (_, idx) = pending_visitors.remove(0);
-                            let v = session_visitors[idx];
-                            info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}' (Go frps compat: ReqWorkConn after NewVisitorConn)", v.name, v.server_name);
-                            #[cfg(feature = "vnet")]
-                            advertise_vnet_visitor_route(&mut control_stream, v2, v).await;
-                        }
-                        req_work_conns_seen += 1;
-                    }
-                    other => {
-                        unexpected += 1;
-                        warn!(
-                            type_byte = other.v1_type_byte(),
-                            "Unexpected message during registration"
-                        );
-                    }
-                }
-                if unexpected >= 100 {
-                    warn!("Registration aborted: too many unexpected messages");
-                    aborted = true;
-                }
-            }
-
-            // Any request still pending here never got an answer (write
-            // failure, read error, or too many unexpected frames). Mark the
-            // proxies failed and log the unresolved visitors; the session
-            // continues — registration errors do not abort the client
-            // (login_fail_exit only governs the login phase).
-            if !pending_proxies.is_empty() || !pending_visitors.is_empty() {
-                warn!(proxies = %pending_proxies.len(), visitors = %pending_visitors.len(), "Registration aborted; marking still-pending proxies/visitors as failed");
-                for (wire_name, _) in pending_proxies.drain(..) {
-                    let mut map = self.proxy_info_map.write().await;
-                    if let Some(info) = map.get_mut(&wire_name) {
-                        info.err = "registration aborted (no response)".to_string();
-                        info.phase =
-                            ProxyPhase::StartErr("registration aborted (no response)".to_string());
-                    }
-                }
-                for (_, idx) in pending_visitors.drain(..) {
-                    let v = session_visitors[idx];
-                    warn!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registration unresolved", v.name);
-                }
-            }
+            // Phase 4: pipelined NewProxy/NewVisitorConn registration + the
+            // registration response read loop (2s visitor grace +
+            // REGISTRATION_RESPONSE_TIMEOUT + heartbeat watchdog races), vnet
+            // TUN opens, and the StartErr drain — extracted into
+            // register_proxies. Returns false when the registration phase
+            // aborted (a read error or the heartbeat watchdog fired); the
+            // session continuation below is then skipped and the session
+            // goes straight to teardown + reconnect.
+            let aborted = !self
+                .register_proxies(&mut ctx, &cfg_local, &proxies, pool_count)
+                .await;
 
             // Control writes are funneled through a bounded channel to a
             // single dedicated writer task (audit v0.70.1 P1-A1): producers
@@ -1504,17 +1023,20 @@ impl Service {
             let (control_tx, control_rx) = tokio::sync::mpsc::channel::<(FrpMessage, bool)>(1024);
             let control_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let control_notify = Arc::new(tokio::sync::Notify::new());
-            let writer = Arc::new(ControlWriter {
+            ctx.writer = Some(Arc::new(ControlWriter {
                 tx: control_tx,
                 failed: control_failed.clone(),
                 notify: control_notify.clone(),
-            });
+            }));
+            ctx.control_rx = Some(control_rx);
+            ctx.control_failed = Some(control_failed);
+            ctx.control_notify = Some(control_notify);
 
             // Shared graceful shutdown signal for all visitor listener tasks.
             // Set to true at session end so tasks exit cleanly (Fix 8).
             // Declared here (outside the continuation guard) because the
             // teardown below uses it even when the continuation was skipped.
-            let visitor_shutdown = Arc::new(AtomicBool::new(false));
+            ctx.visitor_shutdown = Some(Arc::new(AtomicBool::new(false)));
 
             // Session continuation: split the stream, spawn the writer task
             // and vnet controllers, spawn visitor listeners, then run the
@@ -1525,1032 +1047,85 @@ impl Service {
             // timeout takes. An aborted session has no spawned visitors or
             // writer task to clean up; the teardown below handles both.
             if !aborted {
-                // Split control stream for reading and writing.
-                let (mut reader, raw_writer) = control_stream.into_split()?;
-
-                {
-                    let failed = control_failed.clone();
-                    let notify = control_notify.clone();
-                    tokio::spawn(async move {
-                        let mut rx = control_rx;
-                        let mut w = raw_writer;
-                        while let Some((msg, v2)) = rx.recv().await {
-                            if let Err(e) = write_msg(&mut w, &msg, v2).await {
-                                tracing::error!(error = %e, "Control writer failed: {}", e);
-                                failed.store(true, std::sync::atomic::Ordering::SeqCst);
-                                notify.notify_waiters();
-                                break;
-                            }
-                        }
-                    });
-                }
-
-                // Spawn VnetControllers for all vnet proxies now that the
-                // control connection writer is available.
-                #[cfg(feature = "vnet")]
-                for p in &proxies {
-                    if vnet_tun_params(p, &cfg_local.virtual_net.address).is_none() {
-                        continue;
-                    }
-                    if spawn_vnet_tun_controller(
-                        &self.vnet_tuns,
-                        &self.vnet_tun_tx,
-                        &self.vnet_tun_cancels,
-                        &self.vnet_controller,
-                        &p.name,
-                        &p.virtual_net,
-                        &writer,
-                        v2,
-                    )
-                    .await
-                    .is_some()
-                    {
-                        send_vnet_route_advertise(&writer, v2, p).await;
-                    }
-                }
-
-                // Cancel old visitor listener tasks from a previous session.
-                // Signal gracefully and wait briefly for the previous session's
-                // visitors to exit, instead of aborting them (Go frp compat:
-                // visitor_manager.Close() closes each visitor cleanly). The
-                // previous session's visitor_shutdown was already set when the
-                // session ended; tasks should exit on their own. Any listener
-                // still stuck in accept() after the grace period is force-aborted
-                // so the bind port is released for the new session.
-                self.shutdown_visitor_tasks(std::mem::take(&mut visitor_handles))
-                    .await;
-
-                // Spawn STCP/XTCP visitor listeners
-                let session_visitors = self.cfg.read().await.visitors.clone();
-                for v in &session_visitors {
-                    if !v.enabled {
-                        continue;
-                    }
-                    if v.bind_port == 0 {
-                        continue;
-                    }
-                    // Virtual_net visitors do not bind a local listener; they
-                    // establish a persistent STCP/XTCP tunnel and register their
-                    // destinationIP host route with the client vnet controller.
-                    if v.plugin
-                        .as_ref()
-                        .is_some_and(|p| p.plugin_type == VISITOR_PLUGIN_VIRTUAL_NET)
-                    {
-                        #[cfg(feature = "vnet")]
-                        {
-                            if let Some(adv) = virtual_net_visitor_route_adv(v) {
-                                let sa = cfg_local.server_addr.clone();
-                                let sp = cfg_local.server_port;
-                                let pt = protocol.clone();
-                                let server_name = v.server_name.clone();
-                                let server_user = v.server_user.clone();
-                                let secret_key = v.secret_key.clone();
-                                let use_enc = v.use_encryption;
-                                let use_comp = v.use_compression;
-                                let name = v.name.clone();
-                                let tls_enable = cfg_local.tls_enable;
-                                let tls_server_name = cfg_local.tls_server_name.clone();
-                                let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
-                                let transport_proxy_url =
-                                    opt_if_empty!(cfg_local.proxy_url.clone());
-                                let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
-                                let transport_bind =
-                                    opt_if_empty!(cfg_local.connect_server_local_ip.clone());
-                                let transport_tls_cert =
-                                    opt_if_empty!(cfg_local.tls_cert_file.clone());
-                                let transport_tls_key =
-                                    opt_if_empty!(cfg_local.tls_key_file.clone());
-                                let transport_tcp_mux = cfg_local.tcp_mux;
-                                let transport_tcp_mux_keepalive =
-                                    cfg_local.tcp_mux_keepalive_interval;
-                                let transport_dial_timeout =
-                                    cfg_local.dial_server_timeout.max(1) as u64;
-                                let transport_keepalive =
-                                    cfg_local.dial_server_keepalive.max(0) as u64;
-                                let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
-                                let user = cfg_local.user.clone();
-                                let rid = run_id.clone();
-                                let controller = self.vnet_controller.clone();
-                                let vnet_tun_tx = self.vnet_tun_tx.clone();
-                                let tun_subnets = self.vnet_tun_subnets.clone();
-                                let shutdown = visitor_shutdown.clone();
-                                let handle = tokio::spawn(async move {
-                                    crate::visitor::run_virtual_net_visitor(
-                                        crate::visitor::VirtualNetVisitorConfig {
-                                            server_addr: sa,
-                                            server_port: sp,
-                                            protocol: pt,
-                                            server_name,
-                                            server_user,
-                                            secret_key,
-                                            use_encryption: use_enc,
-                                            use_compression: use_comp,
-                                            name,
-                                            tls_enable,
-                                            tls_server_name,
-                                            tls_ca_file,
-                                            user,
-                                            run_id: rid,
-                                            tcp_mux: transport_tcp_mux,
-                                            tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
-                                            proxy_url: transport_proxy_url.clone(),
-                                            dns_server: transport_dns.clone(),
-                                            dial_timeout_secs: transport_dial_timeout,
-                                            keepalive_secs: transport_keepalive,
-                                            connect_bind_addr: transport_bind.clone(),
-                                            disable_custom_tls_first_byte: transport_nocustomtls,
-                                            tls_cert_file: transport_tls_cert.clone(),
-                                            tls_key_file: transport_tls_key.clone(),
-                                            v2,
-                                            destination_cidr: adv.subnet,
-                                            controller,
-                                            vnet_tun_tx,
-                                            tun_subnets,
-                                            shutdown,
-                                        },
-                                    )
-                                    .await;
-                                });
-                                visitor_handles.push(handle);
-                            }
-                        }
-                        continue;
-                    }
-                    let sa = cfg_local.server_addr.clone();
-                    let sp = cfg_local.server_port;
-                    let pt = protocol.clone();
-                    let server_name = v.server_name.clone();
-                    let server_user = v.server_user.clone();
-                    let secret_key = v.secret_key.clone();
-                    let bind_addr = format!("{}:{}", v.bind_addr, v.bind_port);
-                    let use_enc = v.use_encryption;
-                    let use_comp = v.use_compression;
-                    let name = v.name.clone();
-                    let tls_enable = cfg_local.tls_enable;
-                    let tls_server_name = cfg_local.tls_server_name.clone();
-                    let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
-                    let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
-                    let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
-                    let transport_bind = opt_if_empty!(cfg_local.connect_server_local_ip.clone());
-                    let transport_tls_cert = opt_if_empty!(cfg_local.tls_cert_file.clone());
-                    let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
-                    let transport_tcp_mux = cfg_local.tcp_mux;
-                    let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
-                    let transport_dial_timeout = cfg_local.dial_server_timeout.max(1) as u64;
-                    let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
-                    let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
-                    let visitor_type = v.visitor_type.clone();
-                    let fallback_timeout_ms = v.fallback_timeout_ms;
-                    let keep_tunnel_open = v.keep_tunnel_open;
-                    let max_retries_an_hour = v.max_retries_an_hour;
-                    let min_retry_interval = v.min_retry_interval;
-                    let stun_server = nat_hole_stun_server.clone();
-                    let fallback_to = v.fallback_to.clone();
-                    let disable_assisted_addrs = v.disable_assisted_addrs;
-                    let p2p_protocol = v.protocol.clone();
-                    let user = cfg_local.user.clone();
-                    let rid = run_id.clone();
-                    let vtx = self.visitor_tx.clone();
-                    let shutdown = visitor_shutdown.clone();
-                    let handle = tokio::spawn(async move {
-                        crate::visitor::run_visitor_listener(
-                            crate::visitor::VisitorListenerConfig {
-                                server_addr: sa,
-                                server_port: sp,
-                                protocol: pt,
-                                server_name,
-                                server_user,
-                                secret_key,
-                                bind_addr,
-                                use_encryption: use_enc,
-                                use_compression: use_comp,
-                                name,
-                                tls_enable,
-                                tls_server_name,
-                                tls_ca_file,
-                                visitor_type,
-                                fallback_timeout_ms,
-                                keep_tunnel_open,
-                                max_retries_an_hour,
-                                min_retry_interval,
-                                stun_server,
-                                p2p_protocol,
-                                visitor_tx: vtx,
-                                fallback_to,
-                                disable_assisted_addrs,
-                                shutdown,
-                                user,
-                                run_id: rid,
-                                tcp_mux: transport_tcp_mux,
-                                tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
-                                proxy_url: transport_proxy_url.clone(),
-                                dns_server: transport_dns.clone(),
-                                dial_timeout_secs: transport_dial_timeout,
-                                keepalive_secs: transport_keepalive,
-                                connect_bind_addr: transport_bind.clone(),
-                                disable_custom_tls_first_byte: transport_nocustomtls,
-                                tls_cert_file: transport_tls_cert.clone(),
-                                tls_key_file: transport_tls_key.clone(),
-                                v2,
-                            },
-                        )
-                        .await;
-                    });
-                    visitor_handles.push(handle);
-                }
-
-                // --- Message loop ---
-                // Map sid -> proxy_name for XTCP NatHoleResp routing (provider side).
-                let mut pending_xtcp: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                // Map sid -> STUN UDP socket for XTCP P2P hole punching.
-                let xtcp_sockets: std::sync::Arc<
-                    tokio::sync::Mutex<
-                        std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
-                    >,
-                > = Default::default();
-                // Map sid -> oneshot sender for visitor NatHoleResp routing (Go frps compat).
-                let mut visitor_pending: std::collections::HashMap<
-                    String,
-                    oneshot::Sender<Result<msg::NatHoleResp, String>>,
-                > = std::collections::HashMap::new();
-                // STUN discovery runs off the control loop (two STUN round-trips can
-                // stall up to ~10s). The finished NatHoleClient is sent back here so
-                // the write + pending_xtcp bookkeeping stay on the loop, preserving
-                // the write-before-NatHoleResp ordering. A separate cleanup channel
-                // lets a timeout task reclaim stale xtcp_sockets/pending_xtcp entries
-                // when the server never sends NatHoleResp.
-                struct StunResult {
-                    sid: String,
-                    proxy_name: String,
-                    msg: FrpMessage,
-                }
-                let (stun_result_tx, mut stun_result_rx) = mpsc::channel::<StunResult>(64);
-                let (xtcp_cleanup_tx, mut xtcp_cleanup_rx) = mpsc::channel::<String>(64);
-
-                // Proxy retry interval: every 30s, re-register proxies stuck in
-                // StartErr (or in WaitStart past one interval — see the retry arm).
-                // Matches Go frp's proxy_wrapper.checkWorker (default startErrTimeout 30s).
-                let mut proxy_retry_interval = tokio::time::interval(PROXY_RETRY_INTERVAL);
-                proxy_retry_interval.tick().await; // Skip first immediate tick
-
-                // When each proxy last entered WaitStart (initial registration or a
-                // retry send). A proxy whose NewProxy is never answered (a silent
-                // server that still Pongs) stays in WaitStart forever — the StartErr
-                // transition happens only on a NewProxyResp error — so the retry arm
-                // tracks this to re-send after one full interval (Go frp parity:
-                // proxy_wrapper re-arms startErrTimeout while in waitStart and
-                // retries indefinitely). Pruned when the proxy leaves WaitStart.
-                let mut waitstart_seen: HashMap<String, Instant> = HashMap::new();
+                // Phase 5: split the stream, spawn the writer task and vnet
+                // controllers, cancel the previous session's visitor
+                // listeners, and spawn the current session's visitors.
+                self.spawn_session_tasks(
+                    &mut ctx,
+                    &cfg_local,
+                    &proxies,
+                    &protocol,
+                    &nat_hole_stun_server,
+                )
+                .await?;
 
                 // The message loop handles config reloads (try_reload), which
                 // take the config write lock — the snapshot read guard must be
-                // dropped first. `user` is the only snapshot field the loop still
-                // needs; copy it here.
-                let cfg_user = cfg_local.user.clone();
+                // dropped first. `user` is the only snapshot field the loop
+                // still needs; copy it here.
+                ctx.cfg_user = cfg_local.user.clone();
                 drop(cfg_local);
 
-                loop {
-                    tokio::select! {
-                        msg = read_msg(&mut reader, v2) => {
-                            match msg {
-                                Ok(FrpMessage::ReqWorkConn(_)) => {
-                                    // Shared with the registration read loop above.
-                                    handle_req_work_conn();
-                                }
-                                Ok(FrpMessage::Pong(pong)) => {
-                                    if let Some(ref err) = pong.error {
-                                        if !err.is_empty() {
-                                            warn!(error = %err, "Pong contains error: {}", err);
-                                            break;
-                                        }
-                                    }
-                                    debug!("Pong received");
-                                    last_pong = Instant::now();
-                                }
-                                Ok(FrpMessage::Ping(_)) => {
-                                    // Answer an unsolicited server Ping with Pong
-                                    // (Go frp client parity). Previously inbound
-                                    // Ping fell into the ignored-messages bucket, so
-                                    // a server that probes liveness with Ping would
-                                    // have its watchdog kill a healthy connection.
-                                    let pong = FrpMessage::Pong(msg::Pong { error: None });
-                                    if let Err(e) = writer.send(pong, v2) {
-                                        debug!(error = %e, "Pong reply to server Ping failed: {}", e);
-                                    }
-                                }
-                                Ok(FrpMessage::CloseProxy(cp)) => {
-                                    info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
-                                    // Cancel health check task and remove map entry.
-                                    let mut cancels = health_cancels.lock().await;
-                                    if let Some(cancel) = cancels.get(&cp.proxy_name) {
-                                        cancel.store(true, Ordering::Relaxed);
-                                    }
-                                    cancels.remove(&cp.proxy_name);
-                                }
-                                Ok(FrpMessage::CloseProxyResp(cpr)) => {
-                                    info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);
-                                    // Do NOT cancel/remove health check here. This response comes from
-                                    // our CloseProxy (health check failure → CloseProxy → server → CloseProxyResp).
-                                    // The health check monitor keeps running for recovery detection (Go frp compat).
-                                }
-                                Ok(FrpMessage::Error(err)) => {
-                                    warn!(error = %err.error, "Server error: {}", err.error);
-                                }
-                                Ok(FrpMessage::NatHoleClient(nhc)) => {
-                                    self.handle_nat_hole_client(*nhc, &writer, v2, session_alive.clone()).await;
-                                }
-                                Ok(FrpMessage::NatHoleResp(resp)) => {
-                                    self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets, &writer, session_alive.clone()).await;
-                                }
-                                Ok(FrpMessage::NewProxyResp(resp)) => {
-                                    let is_error = resp.error.as_ref().is_some_and(|e| !e.is_empty());
-                                    if is_error {
-                                        let err = resp
-                                            .error
-                                            .as_ref()
-                                            .expect("is_some_and guard above guarantees Some");
-                                        warn!(proxy_name = %resp.proxy_name, error = %err, "Proxy '{}' registration error: {}", resp.proxy_name, err);
-                                        // Update phase if proxy was being retried (WaitStart -> StartErr).
-                                        let mut map = self.proxy_info_map.write().await;
-                                        if let Some(info) = map.get_mut(&resp.proxy_name) {
-                                            if info.phase == ProxyPhase::WaitStart {
-                                                info.err = err.clone();
-                                                info.phase = ProxyPhase::StartErr(err.clone());
-                                            }
-                                        }
-                                    } else {
-                                        // Successful registration from retry path.
-                                        // Accept it from WaitStart (normal) or
-                                        // StartErr (a healthy response that just
-                                        // missed the 30s retry deadline must not
-                                        // be thrown away — Go frp keeps
-                                        // re-registering until the response
-                                        // lands).
-                                        let mut map = self.proxy_info_map.write().await;
-                                        if let Some(info) = map.get_mut(&resp.proxy_name) {
-                                            if info.phase == ProxyPhase::WaitStart
-                                                || matches!(info.phase, ProxyPhase::StartErr(_))
-                                            {
-                                                if let Some(ref remote) = resp.remote_addr {
-                                                    info.remote_addr.clone_from(remote);
-                                                }
-                                                info.err.clear();
-                                                info.phase = ProxyPhase::Running;
-                                                info!(proxy_name = %resp.proxy_name, "Proxy '{}' re-registered", resp.proxy_name);
-                                            }
-                                        }
-                                    }
-                                }
-                                #[cfg(feature = "vnet")]
-                                Ok(FrpMessage::VnetRouteAdvertise(adv)) => {
-                                    // Isolation: only accept routes for virtual nets
-                                    // this client participates in. Advertisements for
-                                    // other vnets are ignored (design spec: different
-                                    // virtual nets have isolated routing tables).
-                                    let vnet = adv.virtual_net.clone().unwrap_or_default();
-                                    if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
-                                        debug!(
-                                            vnet,
-                                            proxy_name = %adv.proxy_name,
-                                            "ignoring vnet route advertisement for unknown virtual net"
-                                        );
-                                    } else {
-                                        info!(vnet, subnet = %adv.subnet, proxy_name = %adv.proxy_name, "peer vnet route advertisement received");
-                                        // Update the shared route table (TX direction lookup).
-                                        {
-                                            let route_table = self.vnet_controller.route_table();
-                                            let mut routes = route_table.write().await;
-                                            if let Err(e) =
-                                                routes.insert(&vnet, &adv.proxy_name, &adv.subnet)
-                                            {
-                                                warn!(%e, "failed to add vnet route");
-                                            }
-                                        }
-                                        // Inject OS route so the kernel sends matching packets
-                                        // through the TUN device instead of the default gateway.
-                                        // vnet_tun_names is keyed by *local* proxy name, while
-                                        // adv.proxy_name is the *remote* peer's name — so match
-                                        // by virtual_net (the route's isolation domain, already
-                                        // validated above) instead of by name. The local vnet
-                                        // proxy owning that virtual net is the one whose TUN must
-                                        // carry this route; with no local TUN for the net (e.g.
-                                        // this client is only a visitor) there is nothing to
-                                        // inject, which is correct — the old code grabbed an
-                                        // arbitrary TUN and silently misrouted.
-                                        #[cfg(any(target_os = "linux", target_os = "macos"))]
-                                        {
-                                            let local_tun_proxy: Option<String> = {
-                                                let cfg = self.cfg.read().await;
-                                                cfg.proxies
-                                                    .iter()
-                                                    .find(|p| {
-                                                        p.proxy_type == "vnet" && p.virtual_net == vnet
-                                                    })
-                                                    .map(|p| p.name.clone())
-                                            };
-                                            let names = self.vnet_tun_names.lock().await;
-                                            if let Some(tun_name) =
-                                                local_tun_proxy.as_deref().and_then(|n| names.get(n))
-                                            {
-                                                add_os_route(&adv.subnet, tun_name);
-                                                self.vnet_peer_routes.lock().await.insert(
-                                                    adv.proxy_name.clone(),
-                                                    (
-                                                        adv.subnet.clone(),
-                                                        tun_name.clone(),
-                                                        vnet.clone(),
-                                                    ),
-                                                );
-                                            } else {
-                                                debug!(
-                                                    vnet,
-                                                    proxy_name = %adv.proxy_name,
-                                                    "vnet route advertise: no local TUN for virtual net '{}' — skipping OS route",
-                                                    vnet
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                #[cfg(feature = "vnet")]
-                                Ok(FrpMessage::VnetPacket(vpkt)) => {
-                                    match frp_core::base64::decode(&vpkt.data) {
-                                        Ok(packet) => {
-                                            // Virtual_net visitors first: deliver into
-                                            // the visitor's STCP/XTCP tunnel. TUN-backed
-                                            // vnet proxies fall back to their TUN channel
-                                            // only when no visitor consumed the packet
-                                            // (Err returns the packet untouched).
-                                            match self
-                                                .vnet_controller
-                                                .deliver_visitor_packet(&vpkt.proxy_name, packet)
-                                            {
-                                                Ok(()) => {}
-                                                Err(packet) => {
-                                                    let txs = self
-                                                        .vnet_tun_tx
-                                                        .lock()
-                                                        .unwrap_or_else(|e| e.into_inner());
-                                                    if let Some(tx) = txs.get(&vpkt.proxy_name) {
-                                                        if tx.try_send(packet).is_err() {
-                                                            warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
-                                                        }
-                                                    } else {
-                                                        debug!(proxy_name = %vpkt.proxy_name, "vnet packet dropped: no visitor or TUN target");
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(%e, "VnetPacket base64 decode error");
-                                        }
-                                    }
-                                }
-                                #[cfg(feature = "vnet")]
-                                Ok(FrpMessage::VnetRouteRemove(adv)) => {
-                                    // Isolation: mirror the advertise handler — only
-                                    // accept removals for virtual nets this client
-                                    // participates in. Removals for other vnets are
-                                    // ignored (defensive symmetry; in practice there
-                                    // is no matching route to clean up anyway).
-                                    let vnet = adv.virtual_net.clone().unwrap_or_default();
-                                    if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
-                                        debug!(
-                                            vnet,
-                                            proxy_name = %adv.proxy_name,
-                                            "ignoring vnet route removal for unknown virtual net"
-                                        );
-                                    } else {
-                                        info!(vnet, proxy_name = %adv.proxy_name, "peer vnet route removed");
-                                        if let Some((subnet, tun_name, _)) = self
-                                            .vnet_peer_routes
-                                            .lock()
-                                            .await
-                                            .remove(&adv.proxy_name)
-                                        {
-                                            remove_os_route(&subnet, &tun_name);
-                                        }
-                                        self.vnet_controller
-                                            .route_table()
-                                            .write()
-                                            .await
-                                            .remove(&vnet, &adv.proxy_name);
-                                        self.vnet_controller
-                                            .unregister_visitor_route(&adv.proxy_name)
-                                            .await;
-                                    }
-                                }
-                                Ok(_) => {
-                                    // Other messages are ignored
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Control read error: {}. Reconnecting...", e);
-                                    break;
-                                }
-                            }
-                        }
-
-                        _ = async {
-                            if let Some(ref mut interval) = ping_interval {
-                                interval.tick().await;
-                            } else {
-                                std::future::pending::<()>().await;
-                            }
-                        } => {
-                            let mut ping_msg = msg::Ping {
-                                privilege_key: None,
-                                timestamp: None,
-                            };
-                            // Auth scopes: unioning the client's own scopes with the
-                            // server-advertised scopes is a Rust-to-Rust extension.
-                            // Go v0.70.1's TokenAuthSetterVerifier.SetPing checks only
-                            // the client's own additionalAuthScopes
-                            // (pkg/auth/token.go:44-51); Go has no
-                            // serverAdditionalAuthScopes field in LoginResp, so the
-                            // server side of this union is ignored by Go peers.
-                            let send_auth = crate::backoff::heartbeat_requires_auth(
-                                &client_scopes,
-                                &server_scopes,
-                            );
-                            if send_auth {
-                                if let Some(ref oidc) = self.oidc_client {
-                                    if let Err(e) = oidc.set_ping(&mut ping_msg).await {
-                                        warn!(error = %e, "OIDC ping token failed: {}. Reconnecting...", e);
-                                        break;
-                                    }
-                                } else {
-                                    let ts = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as i64;
-                                    match self.auth_cfg.try_generate_login_key(ts) {
-                                        Ok(key) => {
-                                            ping_msg.privilege_key = Some(key);
-                                            ping_msg.timestamp = Some(ts);
-                                        }
-                                        Err(e) => {
-                                            warn!(error = %e, "Ping token source failed: {}. Reconnecting...", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            let ping = FrpMessage::Ping(ping_msg);
-                            if let Err(e) = writer.send(ping, v2) {
-                                warn!(error = %e, "Ping write failed: {}", e);
-                                // Non-fatal: heartbeat timeout will detect actual dead connection.
-                            } else {
-                                debug!("Ping sent");
-                            }
-                        }
-
-                        _ = proxy_retry_interval.tick() => {
-                            let mut to_retry: Vec<(String, String)> = {
-                                let map = self.proxy_info_map.read().await;
-                                map.iter()
-                                    .filter(|(_, info)| matches!(info.phase, ProxyPhase::StartErr(_)))
-                                    .map(|(name, info)| (name.clone(), info.local_addr.clone()))
-                                    .collect()
-                            };
-                            // Fold proxies stuck in WaitStart past one full retry
-                            // interval into the retry set. A NewProxy that is never
-                            // answered (a silent server that still Pongs) keeps the
-                            // proxy in WaitStart — the StartErr transition happens
-                            // only on a NewProxyResp error, so without this check a
-                            // single unanswered retry would stop the retries
-                            // forever. Go frp parity: proxy_wrapper re-arms
-                            // startErrTimeout while in waitStart and retries
-                            // indefinitely. `waitstart_seen` records when each
-                            // proxy last entered WaitStart (initial registration or
-                            // a retry send) and is pruned once it leaves WaitStart
-                            // (registered, errored, or closed).
-                            {
-                                let map = self.proxy_info_map.read().await;
-                                let now = Instant::now();
-                                waitstart_seen.retain(|name, _| {
-                                    map.get(name).is_some_and(|info| {
-                                        info.phase == ProxyPhase::WaitStart
-                                    })
-                                });
-                                for (name, info) in map.iter() {
-                                    if info.phase == ProxyPhase::WaitStart
-                                        && !waitstart_seen.contains_key(name)
-                                    {
-                                        // First observed in WaitStart at this tick
-                                        // (e.g. the initial registration left it
-                                        // pending past retry setup): start its
-                                        // clock now.
-                                        waitstart_seen.insert(name.clone(), now);
-                                    }
-                                }
-                                to_retry.extend(map.iter().filter_map(|(name, info)| {
-                                    if info.phase == ProxyPhase::WaitStart
-                                        && waitstart_seen.get(name).is_some_and(|first_seen| {
-                                            now.duration_since(*first_seen)
-                                                >= PROXY_RETRY_INTERVAL - PROXY_RETRY_GRACE
-                                        })
-                                    {
-                                        Some((name.clone(), info.local_addr.clone()))
-                                    } else {
-                                        None
-                                    }
-                                }));
-                            }
-                            if !to_retry.is_empty() {
-                                // Retry candidates come from the LIVE proxy set:
-                                // try_reload refreshes self.proxies, so a proxy
-                                // ADDED by a reload that failed to register
-                                // (StartErr) is retried too — the session-start
-                                // `proxies` snapshot (still used by the
-                                // registration loop above) would miss it.
-                                // Lock order: proxies read then cfg read (the
-                                // session loop takes them in the opposite order).
-                                // Not a deadlock: both locks' writers (try_reload)
-                                // run only in this message-loop task, so these read
-                                // guards never contend with a writer across tasks.
-                                let all_proxies = Arc::clone(&*self.proxies.read().await);
-                                let retry_candidates =
-                                    filter_active_proxies(&*self.cfg.read().await, &all_proxies);
-                                for (name, local_addr) in to_retry {
-                                    let bare_name = if cfg_user.is_empty() { name.as_str() } else {
-                                        name.strip_prefix(&format!("{}.", cfg_user)).unwrap_or(&name)
-                                    };
-                                    if let Some(p) = retry_candidates.iter().find(|p| p.name == bare_name) {
-                                        let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_user);
-                                        if let Err(e) = writer.send(new_proxy, v2) {
-                                            warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
-                                        } else {
-                                            info!(proxy_name = %name, "Proxy '{}' retry: sent NewProxy", name);
-                                            let mut map = self.proxy_info_map.write().await;
-                                            if let Some(info) = map.get_mut(&name) {
-                                                info.phase = ProxyPhase::WaitStart;
-                                            }
-                                            // Re-arm the WaitStart clock at the send
-                                            // (Go frp's proxy_wrapper re-arms
-                                            // startErrTimeout per NewProxy send).
-                                            waitstart_seen.insert(name.clone(), Instant::now());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        Some(event) = health_rx.recv() => {
-                            match event {
-                                HealthEvent::Close(proxy_name) => {
-                                    info!(proxy_name = %proxy_name, "Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
-                                    // Set phase to CheckFailed before sending CloseProxy
-                                    // (Go frp compat: PhaseCheckFailed is an explicit state in proxy lifecycle).
-                                    {
-                                        let mut map = self.proxy_info_map.write().await;
-                                        if let Some(info) = map.get_mut(&proxy_name) {
-                                            info.phase = ProxyPhase::CheckFailed;
-                                        }
-                                    }
-                                    let close = FrpMessage::CloseProxy(msg::CloseProxy {
-                                        proxy_name: proxy_name.clone(),
-                                    });
-                                    if let Err(e) = writer.send(close, v2) {
-                                        warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
-                                    }
-                                    // Keep health check running -- monitor for recovery (Go frp compat).
-                                }
-                                HealthEvent::Recover(proxy_name) => {
-                                    info!(proxy_name = %proxy_name, "Health check recovered for '{}', re-registering", proxy_name);
-                                    // Look up proxy config and send NewProxy to re-register.
-                                    let need_send = {
-                                        let configs = self.health_proxy_configs.lock().await;
-                                        configs.get(&proxy_name).cloned()
-                                    };
-                                    if let Some(cfg) = need_send {
-                                        let local_addr = self.proxy_info_map.read().await
-                                            .get(&proxy_name)
-                                            .map(|info| info.local_addr.clone())
-                                            .unwrap_or_else(|| format!("{}:{}", cfg.local_ip, cfg.local_port));
-                                        // Set phase to WaitStart so NewProxyResp handler
-                                        // transitions it to Running on success (Go frp compat:
-                                        // CheckFailed -> re-register -> Running).
-                                        {
-                                            let mut map = self.proxy_info_map.write().await;
-                                            if let Some(info) = map.get_mut(&proxy_name) {
-                                                info.phase = ProxyPhase::WaitStart;
-                                            }
-                                        }
-                                        let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr, &cfg_user);
-                                        if let Err(e) = writer.send(new_proxy, v2) {
-                                            warn!(proxy_name = %proxy_name, error = %e, "Failed to re-register proxy on health recovery: {}", e);
-                                        } else {
-                                            info!(proxy_name = %proxy_name, "Health recovery: re-registered proxy '{}'", proxy_name);
-                                        }
-                                    } else {
-                                        warn!(proxy_name = %proxy_name, "Health check recovered but no config found for '{}'", proxy_name);
-                                    }
-                                }
-                            }
-                        }
-
-                        Some(req) = reload_rx.recv() => {
-                            let result = match &self.config_file {
-                                Some(path) => self.try_reload(path, req.strict, &writer).await,
-                                None => Err("no config file path stored".into()),
-                            };
-                            if result.is_ok()
-                                && self.visitor_reload_needed.swap(false, Ordering::AcqRel)
-                            {
-                                // Visitor changes require a clean session restart.
-                                tracing::info!("Visitor config changed — restarting session");
-                                let _ = req.reply.send(Ok("reload success: visitor changes applied on session restart".into()));
-                                break;
-                            }
-                            let _ = req.reply.send(result);
-                        }
-
-                        Some(xtcp_notif) = xtcp_rx.recv() => {
-                            let XtcpNotification { sid, proxy_name } = xtcp_notif;
-                            info!(proxy_name = %proxy_name, "XTCP provider: received NatHoleSid for '{}'", proxy_name);
-                            // STUN discovery runs off the control loop: two STUN
-                            // round-trips can stall up to ~10s and would block the
-                            // message loop (heartbeats, work conns, reloads). The
-                            // spawned task does the STUN, persists the socket, and
-                            // hands the finished NatHoleClient back for the loop to
-                            // write + bookkeep, preserving the write-before-NatHoleResp
-                            // ordering.
-                            let stun_server = nat_hole_stun_server.clone();
-                            let stun_sockets = Arc::clone(&xtcp_sockets);
-                            let stun_tx = stun_result_tx.clone();
-                            tokio::spawn(async move {
-                                // 1. Do STUN discovery on a persistent UDP socket.
-                                //    Go frps needs ≥2 mapped addresses for NAT classification.
-                                let mut mapped_addrs = Vec::new();
-                                let stun_socket = match frp_core::stun::stun_binding_with_details(&stun_server).await {
-                                    Ok((sock, result1)) => {
-                                        let addr1 = result1.mapped_addr;
-                                        debug!(addr = %addr1, "XTCP STUN #1: {}", addr1);
-                                        mapped_addrs.push(addr1);
-                                        // Use OTHER-ADDRESS as second STUN target if available
-                                        // (Go frp v0.70 discovery.go:137 dual-server probing).
-                                        // This gives the server a second mapped address for NAT
-                                        // classification (RFC 5780, detects endpoint-independent
-                                        // vs address-dependent mapping).
-                                        let second_target =
-                                            result1.other_addr.as_deref().unwrap_or(&stun_server);
-                                        match frp_core::stun::stun_binding_on_socket(&sock, second_target).await {
-                                            Ok(addr2) => {
-                                                debug!(addr = %addr2, "XTCP STUN #2 from '{}': {}", second_target, addr2);
-                                                // Go frps NAT classifier needs ≥2 addresses.
-                                                // Always push — Go frp doesn't dedup.
-                                                mapped_addrs.push(addr2);
-                                            }
-                                            Err(e) => warn!(error = %e, "XTCP STUN #2 failed: {}", e),
-                                        }
-                                        Some(sock)
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "XTCP STUN failed: {}", e);
-                                        None
-                                    }
-                                };
-                                // Get the local port from the STUN socket for assisted_addrs.
-                                // Go frp compat: assisted_addrs = local IPs + STUN port, NOT STUN
-                                // mapped addresses. The server uses assisted_addrs as localIPs
-                                // parameter to ClassifyNATFeature — STUN addresses would never
-                                // match local interfaces, causing misclassification.
-                                let local_port = stun_socket
-                                    .as_ref()
-                                    .and_then(|sock| sock.local_addr().ok())
-                                    .map(|addr| addr.port());
-                                // Save socket for later UDP+KCP hole punch.
-                                if let Some(sock) = stun_socket {
-                                    stun_sockets
-                                        .lock()
-                                        .await
-                                        .insert(sid.clone(), std::sync::Arc::new(sock));
-                                }
-                                // Build assisted_addrs from local IPs + STUN port.
-                                // Go frp v0.69.1: ListLocalIPsForNatHole returns non-loopback
-                                // IPv4 addresses filtered from all network interfaces.
-                                let assisted_addrs: Option<Vec<String>> = local_port.and_then(|port| {
-                                    let local_ips = crate::nat_hole::list_local_ips_for_nat_hole(10);
-                                    if local_ips.is_empty() {
-                                        None
-                                    } else {
-                                        Some(
-                                            local_ips
-                                                .iter()
-                                                .map(|ip| format!("{}:{}", ip, port))
-                                                .collect(),
-                                        )
-                                    }
-                                });
-                                // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
-                                // Use a unique transaction_id per request (Go frp compat: UUID).
-                                let txn_id = uuid::Uuid::new_v4().to_string();
-                                let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
-                                    transaction_id: txn_id.clone(),
-                                    proxy_name: proxy_name.clone(),
-                                    sid: Some(sid.clone()),
-                                    protocol: Some("kcp".to_string()),
-                                    mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
-                                    assisted_addrs,
-                                    visitor_addr: None,
-                                }));
-                                // Hand the finished message back to the control loop.
-                                if stun_tx
-                                    .send(StunResult { sid, proxy_name, msg: client_msg })
-                                    .await
-                                    .is_err()
-                                {
-                                    warn!("XTCP: control loop dropped STUN result channel");
-                                }
-                            });
-                        }
-
-                        // STUN finished off-loop: write NatHoleClient on the control
-                        // connection and track sid→proxy_name for NatHoleResp routing.
-                        Some(stun_result) = stun_result_rx.recv() => {
-                            let StunResult { sid, proxy_name, msg } = stun_result;
-                            if let Err(e) = writer.send(msg, v2) {
-                                warn!(error = %e, "XTCP: failed to send NatHoleClient: {}", e);
-                                // The STUN socket was stored in xtcp_sockets but no
-                                // pending_xtcp entry was created; reclaim it now so it
-                                // does not sit until control-loop teardown.
-                                xtcp_sockets.lock().await.remove(&sid);
-                            } else {
-                                pending_xtcp.insert(sid.clone(), proxy_name);
-                                // Defensive cleanup: if the server never sends
-                                // NatHoleResp for this sid, the socket + pending_xtcp
-                                // entry would leak until the control loop tears down.
-                                // Reclaim them after the server's NAT session window
-                                // (NAT_HOLE_TIMEOUT = 10s) plus margin. If NatHoleResp
-                                // arrives in time, handle_nat_hole_resp already removed
-                                // both entries and these removes are no-ops.
-                                let cleanup_sockets = Arc::clone(&xtcp_sockets);
-                                let cleanup_tx = xtcp_cleanup_tx.clone();
-                                let cleanup_sid = sid.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_secs(15)).await;
-                                    cleanup_sockets.lock().await.remove(&cleanup_sid);
-                                    let _ = cleanup_tx.send(cleanup_sid).await;
-                                });
-                            }
-                        }
-
-                        // A NatHoleResp never arrived within the timeout window:
-                        // reclaim the pending provider-side entry (socket already
-                        // removed) and any residual visitor-side sender. `cleanup_sid`
-                        // carries either a provider sid or a visitor txn_id; the two
-                        // namespaces are independent, so reclaiming from both is
-                        // always safe (see reclaim_stale_xtcp_entry).
-                        Some(cleanup_sid) = xtcp_cleanup_rx.recv() => {
-                            if reclaim_stale_xtcp_entry(&mut pending_xtcp, &mut visitor_pending, &cleanup_sid) {
-                                debug!(sid = %cleanup_sid, "XTCP: reclaimed stale entry for '{}'", cleanup_sid);
-                            }
-                        }
-
-                        // Visitor requests: send NatHoleVisitor on control connection.
-                        // Go frps v0.69.1 only handles NatHoleVisitor on the control
-                        // connection path, not on fresh TCP connections.
-                        Some(vreq) = visitor_rx.recv() => {
-                            let txn_id = vreq.nhv.transaction_id.clone();
-                            let nhv = FrpMessage::NatHoleVisitor(vreq.nhv);
-                            match writer.send(nhv, v2) {
-                                Ok(()) => {
-                                    debug!(sid = %txn_id, "Visitor: sent NatHoleVisitor on control, sid={}", txn_id);
-                                    visitor_pending.insert(txn_id.clone(), vreq.reply);
-                                    // Defensive cleanup: if the server never sends a
-                                    // NatHoleResp for this txn, the visitor_pending
-                                    // entry would otherwise sit until control-loop
-                                    // teardown. Reclaim it after 20s. Why 20s: the
-                                    // visitor side gives up after its own 15s timeout
-                                    // (visitor.rs), so by the time we run the
-                                    // receiver is already dropped and the entry is
-                                    // only reclaimed after the visitor stopped
-                                    // waiting — we never preempt a slow-but-valid
-                                    // response. The server's NAT session window is
-                                    // 10s plus network latency, well under 20s. If
-                                    // NatHoleResp arrives in time,
-                                    // handle_nat_hole_resp already removed the entry
-                                    // and this is a no-op.
-                                    let cleanup_tx = xtcp_cleanup_tx.clone();
-                                    let cleanup_key = txn_id.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(Duration::from_secs(20)).await;
-                                        // Channel closed (control loop exited) — ignore.
-                                        let _ = cleanup_tx.send(cleanup_key).await;
-                                    });
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Visitor: failed to send NatHoleVisitor on control: {}", e);
-                                    let _ = vreq.reply.send(Err(format!("send failed: {e}")));
-                                }
-                            }
-                        }
-
-                        Some(()) = stop_rx.recv() => {
-                            info!("Stop requested, shutting down");
-                            shutdown_flag.store(true, Ordering::SeqCst);
-                            break;
-                        }
-
-                        // Heartbeat timeout watchdog: triggers reconnect if no Pong
-                        // received within heartbeat_timeout seconds (Go frp compat).
-                        // Event-driven: sleeps until the deadline (last_pong +
-                        // hb_timeout_dur) instead of polling every second, so each
-                        // Pong arrival naturally reschedules the wakeup. Uses sleep
-                        // so the timer is only active when hb_timeout > 0. Explicit
-                        // negative values disable it independently of tcp_mux.
-                        // Gated on the ping loop being active (hb_watchdog_active):
-                        // with heartbeat_interval <= 0 no Pong can ever arrive.
-                        _ = tokio::time::sleep(hb_timeout_dur.saturating_sub(last_pong.elapsed())), if hb_watchdog_active => {
-                            warn!("Heartbeat timeout ({}s), reconnecting...", hb_timeout);
-                            break;
-                        }
-                        // The dedicated writer task hit a write failure (peer
-                        // dead / connection reset on the control path). Tear down
-                        // and reconnect, mirroring the read-error branch.
-                        _ = writer.wait_failed() => {
-                            warn!("Control writer failed, reconnecting...");
-                            break;
-                        }
-                    }
-                }
-            }
-            // Clean up vnet routes advertised by virtual_net visitors before
-            // dropping the control connection. The server also removes routes
-            // during control teardown; this mirrors Go frp's explicit
-            // VnetRouteRemove from the visitor plugin Close().
-            #[cfg(feature = "vnet")]
-            {
-                // Remove OS routes learned from peers and clear their route
-                // table entries so a reconnect starts from a clean slate.
+                // Phase 6: the message loop, until the session ends.
+                match self
+                    .run_message_loop(
+                        &mut ctx,
+                        &mut health_rx,
+                        &mut reload_rx,
+                        &mut xtcp_rx,
+                        &mut visitor_rx,
+                        &mut stop_rx,
+                        &health_cancels,
+                        &nat_hole_stun_server,
+                    )
+                    .await
                 {
-                    let peer_routes = self.vnet_peer_routes.lock().await;
-                    for (proxy_name, (subnet, tun_name, vnet)) in peer_routes.iter() {
-                        remove_os_route(subnet, tun_name);
-                        self.vnet_controller
-                            .route_table()
-                            .write()
+                    // A stop was requested (admin API / signal): tear down
+                    // and exit — the session must not reconnect.
+                    LoopExit::Shutdown => {
+                        self.teardown_session(
+                            &mut ctx,
+                            #[cfg(feature = "tcp-mux")]
+                            &mut prev_yamux,
+                            &health_cancels,
+                            &mut admin_handle,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    // The session died: tear down, then reconnect with backoff.
+                    LoopExit::Reconnect => {
+                        if self
+                            .teardown_session(
+                                &mut ctx,
+                                #[cfg(feature = "tcp-mux")]
+                                &mut prev_yamux,
+                                &health_cancels,
+                                &mut admin_handle,
+                            )
                             .await
-                            .remove(vnet, proxy_name);
-                    }
-                }
-                self.vnet_peer_routes.lock().await.clear();
-
-                let session_visitors = self.cfg.read().await.visitors.clone();
-                for v in &session_visitors {
-                    if v.plugin.as_ref().is_none() || !v.enabled {
-                        continue;
-                    }
-                    if let Some(adv) = virtual_net_visitor_route_adv(v) {
-                        self.vnet_controller.unregister_visitor_route(&v.name).await;
-                        let rem = msg::VnetRouteRemove {
-                            proxy_name: adv.proxy_name,
-                            virtual_net: adv.virtual_net,
-                        };
-                        let msg = FrpMessage::VnetRouteRemove(rem);
-                        if let Err(e) = writer.send(msg, v2) {
-                            warn!(visitor_name = %v.name, error = %e, "failed to remove vnet route for visitor '{}'", v.name);
-                        } else {
-                            info!(visitor_name = %v.name, "vnet route removed for visitor '{}'", v.name);
+                        {
+                            return Ok(());
                         }
                     }
                 }
-            }
-
-            // Go frp GracefulClose ordering: close proxies first, then visitors,
-            // then the control connection. See /tmp/frp-source/client/control.go:203-210.
-            // Step 1: Signal work connection pool to stop replenishment cascade.
-            session_alive.store(false, Ordering::Release);
-
-            // Step 2: Signal visitor listeners to stop accepting new connections
-            // (Go frp compat: vm.Close() closes all visitors before session is torn down).
-            visitor_shutdown.store(true, Ordering::Release);
-
-            // Step 3: Drop the control connection (Go frp compat: closeSession()).
-            // Dropping prev_yamux closes the underlying TCP socket so the background
-            // yamux task exits before we attempt to reconnect. This prevents
-            // dual-yamux-session leaks through a half-open TCP mux connection.
-            #[cfg(feature = "tcp-mux")]
-            drop(prev_yamux.take());
-
-            // Wait briefly for visitor tasks to notice the shutdown signal and
-            // exit gracefully (timeout so we never block reconnection).
-            // Any listener still blocked in accept() after the grace period is
-            // force-aborted so the bind port is released for the next session.
-            self.shutdown_visitor_tasks(std::mem::take(&mut visitor_handles))
-                .await;
-
-            // Check if admin stop was requested
-            if shutdown_flag.load(Ordering::SeqCst) {
-                info!("frpc shutting down");
-                // Cancel health check tasks and abort the admin HTTP server
-                // before returning. Both are detached tokio tasks; without
-                // this they keep running after run() exits (holding bind
-                // ports and channels until process exit).
-                self.cancel_detached_tasks(&health_cancels, admin_handle)
-                    .await;
-                return Ok(());
+            } else {
+                // Registration aborted (read error or heartbeat watchdog):
+                // no writer task or visitors were spawned; tear down and
+                // reconnect. teardown_session returns true only when a stop
+                // was requested (shutdown_flag set).
+                if self
+                    .teardown_session(
+                        &mut ctx,
+                        #[cfg(feature = "tcp-mux")]
+                        &mut prev_yamux,
+                        &health_cancels,
+                        &mut admin_handle,
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
             }
 
             // Session dropped — reconnect with Go frp dev two-phase fast-backoff.
@@ -2558,10 +1133,8 @@ impl Service {
             // Reset the consecutive-error count when the previous session was
             // healthy for ≥5 minutes, so a stable connection followed by an
             // occasional blip reconnects from Phase 1 instead of the 20s cap.
-            if let Some(started) = session_started_at {
-                if started.elapsed() > Duration::from_secs(300) {
-                    consecutive_err_count = 0;
-                }
+            if ctx.session_started_at.elapsed() > Duration::from_secs(300) {
+                consecutive_err_count = 0;
             }
             let delay = crate::backoff::reconnect_delay_after_session(
                 &mut consecutive_err_count,
@@ -2574,13 +1147,1933 @@ impl Service {
             tokio::select! {
                 Some(()) = stop_rx.recv() => {
                     info!("Stop requested while waiting to reconnect, shutting down");
-                    shutdown_flag.store(true, Ordering::SeqCst);
+                    ctx.shutdown_flag.store(true, Ordering::SeqCst);
                     self.cancel_detached_tasks(&health_cancels, admin_handle).await;
                     return Ok(());
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
         }
+    }
+
+    /// Phases 1-3 of one connection attempt: snapshot the work-conn config
+    /// fields from the current client config, dial + login a new control
+    /// connection, wrap the stream in AES-128-CFB, and initialize the
+    /// per-session state (yamux handle, heartbeat watchdog, auth scopes,
+    /// shutdown flag) that registration and the message loop build on.
+    ///
+    /// Returns the per-session state on success; on failure returns the
+    /// error so run() can apply backoff + reconnect exactly as before.
+    /// Backoff counters (consecutive_err_count, fast_retry_timestamps,
+    /// previous_run_id) stay in run() scope — `did_login_once` is passed in
+    /// so it is set at login success (before the encryption wrap), matching
+    /// the previous ordering where a wrap failure still saw did_login_once
+    /// already true.
+    async fn connect_and_login(
+        &self,
+        cfg_local: &ClientConfig,
+        protocol: &TransportProtocol,
+        pool_count: i32,
+        previous_run_id: String,
+        did_login_once: &mut bool,
+    ) -> Result<SessionCtx, frp_core::Error> {
+        // Owned copies of the snapshot fields the work-conn config needs.
+        // `handle_req_work_conn` (which builds the same config) also runs from
+        // the message loop, where the snapshot guard is no longer held, so the
+        // fields are stored on SessionCtx instead of read from the guard.
+        // Keeps the snapshot semantics (fields fixed at connection start)
+        // without cloning the whole ClientConfig.
+        let wc_server_addr = cfg_local.server_addr.clone();
+        let wc_server_port = cfg_local.server_port;
+        let wc_tls_enable = cfg_local.tls_enable;
+        let wc_tls_server_name = cfg_local.tls_server_name.clone();
+        let wc_tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+        let wc_tls_cert_file = opt_if_empty!(cfg_local.tls_cert_file);
+        let wc_tls_key_file = opt_if_empty!(cfg_local.tls_key_file);
+        let wc_dns_server = opt_if_empty!(cfg_local.dns_server);
+        let wc_udp_packet_size = cfg_local.udp_packet_size.max(0) as usize;
+        let wc_disable_custom_tls_first_byte = cfg_local.disable_custom_tls_first_byte;
+        let wc_keepalive_secs = cfg_local.dial_server_keepalive.max(0) as u64;
+        let wc_bind_addr = opt_if_empty!(cfg_local.connect_server_local_ip);
+        let wc_proxy_url = cfg_local.proxy_url.clone();
+        let wc_dial_timeout_secs = cfg_local.dial_server_timeout.max(1) as u64;
+
+        let mut ctl = ControlConnection::new(
+            cfg_local.server_addr.clone(),
+            cfg_local.server_port,
+            self.auth_cfg.clone(),
+            protocol.clone(),
+            pool_count,
+            cfg_local.user.clone(),
+            cfg_local.client_id.clone(),
+            cfg_local.tls_enable,
+            cfg_local.tls_server_name.clone(),
+            opt_if_empty!(cfg_local.tls_ca_file),
+            opt_if_empty!(cfg_local.tls_cert_file),
+            opt_if_empty!(cfg_local.tls_key_file),
+            opt_if_empty!(cfg_local.dns_server),
+            cfg_local.tcp_mux,
+            cfg_local.disable_custom_tls_first_byte,
+            cfg_local.dial_server_keepalive.max(0) as u64,
+            cfg_local.tcp_mux_keepalive_interval,
+            opt_if_empty!(cfg_local.connect_server_local_ip),
+            cfg_local.v2,
+            self.oidc_client.clone(),
+            cfg_local.metas.clone(),
+            cfg_local.proxy_url.clone(),
+            previous_run_id.clone(),
+            Some(ClientSpec {
+                client_type: Some("frpc".into()),
+                always_auth_pass: None,
+            }),
+            cfg_local.dial_server_timeout,
+            #[cfg(feature = "quic")]
+            frp_core::quic::quic_params_from_option_values(
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.keepalive_period)
+                    .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.max_idle_timeout)
+                    .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.max_incoming_streams)
+                    .unwrap_or(0),
+            ),
+        );
+
+        // Initialized to None: the post-login Ok arm overwrites it, and
+        // the error path (below) diverges before it can be read.
+        #[cfg(feature = "quic")]
+        let mut quic_conn: Option<QuicConnection> = None;
+
+        // Login and the post-login encryption wrap funnel into one Result:
+        // `into_encrypted` can fail when the transport carries unconsumed
+        // read-ahead bytes (remote-triggerable: a proxy injecting junk
+        // after its CONNECT response), and that failure must take the
+        // same retry/exit path as a login error — never panic (release
+        // binaries build with panic=abort).
+        let enc_result = match ctl.login().await {
+            Ok(r) => {
+                *did_login_once = true;
+                *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
+                // After login, wrap control stream in AES-128-CFB encryption.
+                // Go frps v0.69.1 always encrypts the control connection for V1.
+                #[cfg(feature = "quic")]
+                let (stream, run_id, yamux, quic) = r;
+                #[cfg(not(feature = "quic"))]
+                let (stream, run_id, yamux) = r;
+                let enc_key = encryption::derive_key(&self.auth_cfg.token);
+                #[cfg(feature = "quic")]
+                {
+                    quic_conn = quic;
+                }
+                stream
+                    .into_encrypted(enc_key)
+                    .map(|stream| (stream, run_id, yamux))
+                    .map_err(frp_core::Error::from)
+            }
+            Err(e) => Err(e),
+        };
+        let (control_stream, run_id, yamux_session) = match enc_result {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+        let yamux = yamux_session.map(std::sync::Arc::new);
+        #[cfg(feature = "quic")]
+        let quic_conn = quic_conn.map(std::sync::Arc::new);
+        let v2 = cfg_local.v2;
+        info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
+
+        // --- Heartbeat state: single arm point ---
+        // `last_pong` is initialized at login success so the heartbeat
+        // watchdog bounds the REGISTRATION phase too: no Ping is sent
+        // until the message loop starts, so a server that stays
+        // connected but never answers NewProxy is detected within
+        // heartbeat_timeout instead of hanging the client in
+        // registration forever (Go frp's heartbeat timer also runs
+        // continuously while proxies register in their own goroutines).
+        // The message loop below reuses these same variables — this is
+        // the only initialization point (the watchdog must not be
+        // double-armed with a fresh timer after registration).
+        let ping_interval = if cfg_local.heartbeat_interval > 0 {
+            let secs = cfg_local.heartbeat_interval as u64;
+            info!(interval = %secs, "Heartbeat interval: {}s", secs);
+            Some(tokio::time::interval(Duration::from_secs(secs)))
+        } else {
+            info!("Heartbeat: explicitly disabled (heartbeat_interval <= 0)");
+            None
+        };
+        let last_pong = Instant::now();
+        let hb_timeout = cfg_local.heartbeat_timeout;
+        let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
+        // The watchdog only makes sense while the ping loop is active:
+        // with heartbeat_interval <= 0 the client never sends Pings, so
+        // no Pong can ever arrive and an active watchdog would fire right
+        // after login and reconnect forever (Go frp gates its heartbeat
+        // on the interval too).
+        let hb_watchdog_active = hb_timeout > 0 && ping_interval.is_some();
+
+        let session_alive = Arc::new(AtomicBool::new(true));
+
+        let client_scopes: Vec<String> = cfg_local
+            .auth
+            .as_ref()
+            .map(|a| a.additional_auth_scopes.clone())
+            .unwrap_or_default();
+        let server_scopes = self.server_auth_scopes.read().await.clone();
+
+        Ok(SessionCtx {
+            control_stream: Some(control_stream),
+            run_id,
+            yamux,
+            v2,
+            #[cfg(feature = "quic")]
+            quic_conn,
+            ping_interval,
+            last_pong,
+            hb_timeout,
+            hb_timeout_dur,
+            hb_watchdog_active,
+            session_alive,
+            wc_server_addr,
+            wc_server_port,
+            wc_tls_enable,
+            wc_tls_server_name,
+            wc_tls_ca_file,
+            wc_tls_cert_file,
+            wc_tls_key_file,
+            wc_dns_server,
+            wc_udp_packet_size,
+            wc_disable_custom_tls_first_byte,
+            wc_keepalive_secs,
+            wc_bind_addr,
+            wc_proxy_url,
+            wc_dial_timeout_secs,
+            protocol: protocol.clone(),
+            client_scopes,
+            server_scopes,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            session_started_at: Instant::now(),
+            pending_proxies: Vec::new(),
+            pending_visitors: Vec::new(),
+            write_failed: false,
+            seen_registration_response: false,
+            req_work_conns_seen: 0,
+            writer: None,
+            control_rx: None,
+            control_failed: None,
+            control_notify: None,
+            reader: None,
+            visitor_shutdown: None,
+            visitor_handles: Vec::new(),
+            pending_xtcp: std::collections::HashMap::new(),
+            xtcp_sockets: Default::default(),
+            visitor_pending: std::collections::HashMap::new(),
+            stun_result_tx: None,
+            stun_result_rx: None,
+            xtcp_cleanup_rx: None,
+            proxy_retry_interval: None,
+            waitstart_seen: HashMap::new(),
+            cfg_user: String::new(),
+        })
+    }
+
+    /// Phase 4 of one connection attempt: pipelined NewProxy/NewVisitorConn
+    /// writes (all frames first, then the responses in a single read loop),
+    /// the registration response read loop (2s visitor grace +
+    /// REGISTRATION_RESPONSE_TIMEOUT + heartbeat watchdog races), vnet TUN
+    /// opens, and the StartErr drain for still-pending proxies/visitors.
+    ///
+    /// Returns false when the registration phase aborted (a write/read
+    /// error, the heartbeat watchdog, or too many unexpected messages): the
+    /// caller then skips the session continuation (writer task, visitor
+    /// listeners, message loop) and goes straight to teardown + reconnect —
+    /// the same path a message-loop heartbeat timeout takes. Registration
+    /// errors do NOT abort the session itself; the message loop's 30s retry
+    /// re-registers StartErr proxies (login_fail_exit only governs login).
+    async fn register_proxies(
+        &self,
+        ctx: &mut SessionCtx,
+        cfg_local: &ClientConfig,
+        proxies: &[frp_core::config::ProxyConfig],
+        pool_count: i32,
+    ) -> bool {
+        // Register proxies using IoStream directly (supports TCP and TLS).
+        // Pipelined: write ALL NewProxy frames first, then collect the
+        // responses in a single read loop — N proxies no longer cost N
+        // sequential network round-trips (Go frpc registers each proxy in
+        // its own goroutine, so Go frps may answer out of order; each
+        // response is matched to its proxy by wire proxy_name). ReqWorkConn
+        // frames arriving in this window (pool pre-warm, or a user conn
+        // hitting the server mid-registration) are handled here instead of
+        // dropped: skipping them left the pool empty after login and let
+        // the server's work-conn wait stall for up to 10s.
+        for (idx, p) in proxies.iter().enumerate() {
+            let local_addr = self
+                .proxy_info_map
+                .read()
+                .await
+                .get(&wire_proxy_name(&cfg_local.user, &p.name))
+                .map(|info| info.local_addr.clone())
+                .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
+            let np = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_local.user);
+            debug!(
+                name = %p.name,
+                proxy_type = %p.proxy_type,
+                remote_port = p.remote_port,
+                encrypted = p.use_encryption,
+                compressed = p.use_compression,
+                "NewProxy message prepared"
+            );
+            info!(name = %p.name, proxy_type = %p.proxy_type, remote_port = %p.remote_port, local_addr = %local_addr,
+                "Registering proxy '{}' type={} remote_port={} local={}",
+                p.name, p.proxy_type, p.remote_port, local_addr);
+            let wire_name = wire_proxy_name(&cfg_local.user, &p.name);
+            let write_result = if ctx.v2 {
+                ctx.control_stream
+                    .as_mut()
+                    .expect("control_stream available before split")
+                    .write_v2_frame(&np)
+                    .await
+            } else {
+                ctx.control_stream
+                    .as_mut()
+                    .expect("control_stream available before split")
+                    .write_v1_frame(&np)
+                    .await
+            };
+            if let Err(e) = write_result {
+                // A failed write leaves the stream state undefined; record
+                // the failure, mark the proxy failed, and skip the response
+                // phase entirely (responses for the unwritten requests may
+                // never arrive — see `ctx.write_failed`/`aborted` below).
+                ctx.write_failed = true;
+                warn!(proxy_name = %p.name, error = %e, "Failed to register proxy '{}': {}", p.name, e);
+                let mut map = self.proxy_info_map.write().await;
+                if let Some(info) = map.get_mut(&wire_name) {
+                    info.err = e.to_string();
+                    info.phase = ProxyPhase::StartErr(e.to_string());
+                }
+                continue;
+            }
+            ctx.pending_proxies.push((wire_name, idx));
+        }
+
+        // Register STCP/XTCP visitors on the control connection.
+        // Go frps v0.69.1 requires visitor registration before NatHoleVisitor
+        // can be sent on the control connection (otherwise: "auth failed").
+        // Pipelined like the proxies: write all NewVisitorConn frames, then
+        // resolve them in the shared read loop below.
+        let session_visitors_cfg = self.cfg.read().await.visitors.clone();
+        let session_visitors: Vec<&frp_core::config::VisitorConfig> = session_visitors_cfg
+            .iter()
+            .filter(|v| v.enabled && v.bind_port != 0)
+            .collect();
+        for (idx, v) in session_visitors.iter().enumerate() {
+            let nvc = crate::proxy::create_visitor_conn_msg(
+                &v.server_name,
+                &v.secret_key,
+                v.use_encryption,
+                v.use_compression,
+                Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
+                Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
+                Some(ctx.run_id.as_str()).filter(|s| !s.is_empty()),
+            );
+            debug!(
+                server_name = %v.server_name,
+                encrypted = v.use_encryption,
+                compressed = v.use_compression,
+                "NewVisitorConn message prepared"
+            );
+            info!(visitor_name = %v.name, proxy_name = %v.server_name, "Registering visitor '{}' for proxy '{}'", v.name, v.server_name);
+            let wire_name = crate::proxy::visitor_wire_name(
+                Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
+                Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
+                &v.server_name,
+            );
+            let write_result = if ctx.v2 {
+                ctx.control_stream
+                    .as_mut()
+                    .expect("control_stream available before split")
+                    .write_v2_frame(&nvc)
+                    .await
+            } else {
+                ctx.control_stream
+                    .as_mut()
+                    .expect("control_stream available before split")
+                    .write_v1_frame(&nvc)
+                    .await
+            };
+            if let Err(e) = write_result {
+                ctx.write_failed = true;
+                warn!(visitor_name = %v.name, error = %e, "Failed to register visitor '{}': {}", v.name, e);
+                continue;
+            }
+            ctx.pending_visitors.push((wire_name, idx));
+        }
+
+        // Collect responses. NewProxyResp/NewVisitorConnResp are matched to
+        // their request by wire proxy_name — the server answers
+        // synchronously in request order, but matching by name keeps this
+        // robust regardless of response order. ReqWorkConn spawns a work
+        // connection (pool pre-warm — written by the server immediately
+        // after LoginResp, BEFORE any registration response — a
+        // NewVisitorConn success ack, or an on-demand user conn that
+        // arrived while the client was still registering).
+        let mut aborted = ctx.write_failed;
+        let mut unexpected = 0u32;
+        while !aborted && (!ctx.pending_proxies.is_empty() || !ctx.pending_visitors.is_empty()) {
+            // Go frp v0.70.1 never acks control-channel NewVisitorConn —
+            // its stcp/xtcp visitors register per user connection when the
+            // connection arrives, not at startup. A pure-visitor client
+            // must therefore not wait forever for a visitor ack the server
+            // will never send. Once every proxy response is in, give the
+            // remaining visitor acks a 2s grace period — our server writes
+            // its ack in the same control iteration as the pool conns (ms
+            // under load, ~200x headroom) — then assume the un-acked
+            // visitors registered (Go frps semantics) and stop reading.
+            // Any frames the server still writes afterwards are handled by
+            // the session's main read loop.
+            // Heartbeat watchdog during registration: `last_pong` was
+            // armed at login success, and no Ping is sent during
+            // registration (pings start with the message loop), so no
+            // Pong can arrive — the deadline is the full hb_timeout from
+            // login. A server that stays connected but never answers is
+            // therefore detected within heartbeat_timeout (Go frp's
+            // heartbeat timer also runs continuously while its proxies
+            // register in goroutines). With the heartbeat disabled
+            // (hb_watchdog_active false) the watchdog must never fire:
+            // sleep for ~136 years so both branches share the same Sleep
+            // type, leaving the per-read deadlines below as the bound.
+            let watchdog = tokio::time::sleep(if ctx.hb_watchdog_active {
+                ctx.hb_timeout_dur.saturating_sub(ctx.last_pong.elapsed())
+            } else {
+                Duration::from_secs(u32::MAX as u64)
+            });
+            tokio::pin!(watchdog);
+            let resp_msg = if ctx.pending_proxies.is_empty() && !ctx.pending_visitors.is_empty() {
+                let read = async {
+                    if ctx.v2 {
+                        ctx.control_stream
+                            .as_mut()
+                            .expect("control_stream available before split")
+                            .read_v2_frame()
+                            .await
+                    } else {
+                        ctx.control_stream
+                            .as_mut()
+                            .expect("control_stream available before split")
+                            .read_v1_frame()
+                            .await
+                    }
+                };
+                tokio::select! {
+                    r = tokio::time::timeout(Duration::from_millis(2000), read) => {
+                        match r {
+                            Ok(Ok(m)) => m,
+                            Ok(Err(e)) => {
+                                warn!(error = %e, "Registration response read failed: {}", e);
+                                aborted = true;
+                                continue;
+                            }
+                            Err(_elapsed) => {
+                                // The server will not ack the remaining visitors
+                                // (Go frps semantics: NewVisitorConn succeeds
+                                // silently; per-user connections register
+                                // themselves when they arrive). FIFO-drain them
+                                // as registered — same semantics as the
+                                // ReqWorkConn attribution above, but with no
+                                // server response at all.
+                                while !ctx.pending_visitors.is_empty() {
+                                    let (_, idx) = ctx.pending_visitors.remove(0);
+                                    let v = session_visitors[idx];
+                                    info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}' (no registration response — assumed registered)", v.name, v.server_name);
+                                    #[cfg(feature = "vnet")]
+                                    advertise_vnet_visitor_route(
+                                        ctx.control_stream
+                                            .as_mut()
+                                            .expect("control_stream available before split"),
+                                        ctx.v2,
+                                        v,
+                                    )
+                                    .await;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut watchdog => {
+                        warn!(timeout = %ctx.hb_timeout, "Heartbeat timeout ({}s) during registration, reconnecting...", ctx.hb_timeout);
+                        aborted = true;
+                        // Break the registration loop: `aborted` skips the
+                        // session continuation (writer task, visitor
+                        // listeners, message loop) below and the session
+                        // goes straight to teardown + reconnect — same
+                        // path a message-loop heartbeat timeout takes.
+                        break;
+                    }
+                }
+            } else {
+                // Proxies (or proxies + visitors) pending: each response
+                // read is bounded by REGISTRATION_RESPONSE_TIMEOUT so a
+                // server that accepted Login but never answers NewProxy
+                // cannot block the client forever (vs Go frps ~90s
+                // idle-timeout; vs custom servers: permanent silent
+                // hang). On timeout the pending proxies are marked
+                // StartErr and re-registered by the message loop's 30s
+                // retry — the session itself is NOT torn down (Go frp
+                // tolerates slow registration). Divergence with the
+                // heartbeat disabled (heartbeat_interval <= 0): this
+                // timeout is the only bound — the session survives with
+                // StartErr proxies and the retry arm keeps re-registering
+                // them. With a default heartbeat the same silent server
+                // (which never Pongs either — no Pings are sent during
+                // registration) trips the watchdog above first and the
+                // whole session is torn down for a reconnect at
+                // hb_timeout.
+                let read = async {
+                    if ctx.v2 {
+                        ctx.control_stream
+                            .as_mut()
+                            .expect("control_stream available before split")
+                            .read_v2_frame()
+                            .await
+                    } else {
+                        ctx.control_stream
+                            .as_mut()
+                            .expect("control_stream available before split")
+                            .read_v1_frame()
+                            .await
+                    }
+                };
+                tokio::select! {
+                    r = tokio::time::timeout(REGISTRATION_RESPONSE_TIMEOUT, read) => {
+                        match r {
+                            Ok(Ok(m)) => m,
+                            Ok(Err(e)) => {
+                                warn!(error = %e, "Registration response read failed: {}", e);
+                                aborted = true;
+                                continue;
+                            }
+                            Err(_elapsed) => {
+                                // The server never answered the pending
+                                // requests. Mark them StartErr with a
+                                // clear message and drop them from the
+                                // pending set so the registration phase
+                                // finishes; the message loop's retry then
+                                // re-registers them (their phase is
+                                // StartErr) while the session keeps
+                                // running.
+                                let msg = format!(
+                                    "registration timed out (no response within {}s)",
+                                    REGISTRATION_RESPONSE_TIMEOUT.as_secs()
+                                );
+                                warn!(
+                                    proxies = %ctx.pending_proxies.len(),
+                                    timeout = %REGISTRATION_RESPONSE_TIMEOUT.as_secs(),
+                                    "Registration response timeout; marking {} pending proxies as failed",
+                                    ctx.pending_proxies.len()
+                                );
+                                for (wire_name, _) in ctx.pending_proxies.drain(..) {
+                                    let mut map = self.proxy_info_map.write().await;
+                                    if let Some(info) = map.get_mut(&wire_name) {
+                                        info.err = msg.clone();
+                                        info.phase = ProxyPhase::StartErr(msg.clone());
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    _ = &mut watchdog => {
+                        warn!(timeout = %ctx.hb_timeout, "Heartbeat timeout ({}s) during registration, reconnecting...", ctx.hb_timeout);
+                        aborted = true;
+                        // Break the registration loop: `aborted` skips the
+                        // session continuation (writer task, visitor
+                        // listeners, message loop) below and the session
+                        // goes straight to teardown + reconnect — same
+                        // path a message-loop heartbeat timeout takes.
+                        break;
+                    }
+                }
+            };
+            match resp_msg {
+                FrpMessage::NewProxyResp(resp) => {
+                    ctx.seen_registration_response = true;
+                    // Match by wire proxy_name: responses may arrive in any
+                    // order relative to the requests they answer.
+                    let Some(pos) = ctx
+                        .pending_proxies
+                        .iter()
+                        .position(|(name, _)| *name == resp.proxy_name)
+                    else {
+                        unexpected += 1;
+                        warn!(proxy_name = %resp.proxy_name, "NewProxyResp for proxy not in this registration batch");
+                        continue;
+                    };
+                    let (_, idx) = ctx.pending_proxies.swap_remove(pos);
+                    let p = &proxies[idx];
+                    if let Some(err) = resp.error {
+                        warn!(proxy_name = %p.name, error = %err, "Failed to register proxy '{}': {}", p.name, err);
+                        let mut map = self.proxy_info_map.write().await;
+                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
+                        {
+                            info.err = err.clone();
+                            info.phase = ProxyPhase::StartErr(err);
+                        }
+                    } else {
+                        let remote = resp
+                            .remote_addr
+                            .unwrap_or_else(|| format!("0.0.0.0:{}", p.remote_port));
+                        info!(proxy_name = %p.name, remote = %remote, "Proxy '{}' registered on remote port {}", p.name, remote);
+                        // Update runtime info for admin API
+                        let mut map = self.proxy_info_map.write().await;
+                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
+                        {
+                            info.remote_addr = remote;
+                            info.err.clear();
+                            info.phase = ProxyPhase::Running;
+                        }
+
+                        #[cfg(feature = "vnet")]
+                        if vnet_tun_params(p, &cfg_local.virtual_net.address).is_some() {
+                            if let Err(e) = self.open_vnet_tun_for_proxy(p, cfg_local).await {
+                                warn!(proxy_name = %p.name, error = %e, "TUN open/register failed (need root/CAP_NET_ADMIN?)");
+                            }
+                        }
+                    }
+                }
+                FrpMessage::NewVisitorConnResp(resp) => {
+                    ctx.seen_registration_response = true;
+                    let Some(pos) = ctx
+                        .pending_visitors
+                        .iter()
+                        .position(|(name, _)| *name == resp.proxy_name)
+                    else {
+                        unexpected += 1;
+                        // Defensive: an out-of-batch response is almost
+                        // always a REJECTED visitor whose earlier
+                        // ReqWorkConn ack was misattributed (e.g. a pool
+                        // pre-warm conn consumed as its success signal),
+                        // leaving the failure unnamed and discarded here.
+                        // Resolve the wire name against the configured
+                        // visitor list and surface the error so a future
+                        // ordering change cannot silently swallow an auth
+                        // failure.
+                        let configured = session_visitors.iter().find(|v| {
+                            crate::proxy::visitor_wire_name(
+                                Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
+                                Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
+                                &v.server_name,
+                            ) == resp.proxy_name
+                        });
+                        match configured {
+                            Some(v) => {
+                                warn!(visitor_name = %v.name, proxy_name = %resp.proxy_name, error = ?resp.error, "NewVisitorConnResp for visitor '{}' (wire '{}') not in this registration batch: {:?}", v.name, resp.proxy_name, resp.error)
+                            }
+                            None => {
+                                warn!(proxy_name = %resp.proxy_name, "NewVisitorConnResp for visitor not in this registration batch")
+                            }
+                        }
+                        continue;
+                    };
+                    let (_, idx) = ctx.pending_visitors.swap_remove(pos);
+                    let v = session_visitors[idx];
+                    if let Some(err) = resp.error {
+                        warn!(visitor_name = %v.name, error = %err, "Failed to register visitor '{}': {}", v.name, err);
+                    } else {
+                        info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
+                        // Virtual-net visitors advertise their destination IP
+                        // as a host route instead of binding a local listener.
+                        #[cfg(feature = "vnet")]
+                        advertise_vnet_visitor_route(
+                            ctx.control_stream
+                                .as_mut()
+                                .expect("control_stream available before split"),
+                            ctx.v2,
+                            v,
+                        )
+                        .await;
+                    }
+                }
+                FrpMessage::ReqWorkConn(_) => {
+                    self.handle_req_work_conn(ctx);
+                    // Go frps v0.69.1 acks a successful NewVisitorConn on
+                    // the control channel with an anonymous ReqWorkConn
+                    // (no proxy_name; failures get a named
+                    // NewVisitorConnResp{error}). While visitors are
+                    // still pending, attribute the ack to the oldest one
+                    // (FIFO — the server answers registrations in request
+                    // order, so acks arrive in visitor order).
+                    //
+                    // The server writes its pool pre-warm ReqWorkConns
+                    // immediately after LoginResp, BEFORE it processes any
+                    // registration frame, so they always precede every
+                    // NewProxyResp/NewVisitorConnResp on the wire. An
+                    // anonymous ReqWorkConn can therefore only be a
+                    // visitor success ack once a registration response has
+                    // been seen. (With no proxies there is no NewProxyResp
+                    // to mark the pool's end; the client's own pool_count
+                    // bounds it instead — the server never sends more pool
+                    // conns than the client asked for.) Without this gate
+                    // the pool conns were FIFO-attributed to the oldest
+                    // pending visitors, marking them registered (and
+                    // advertising vnet routes) before the server had even
+                    // seen their NewVisitorConn — a rejected visitor's
+                    // real response then hit the out-of-batch branch above
+                    // and was silently discarded.
+                    let pool_conns_done = ctx.seen_registration_response
+                        || (ctx.pending_proxies.is_empty()
+                            && ctx.req_work_conns_seen >= pool_count.max(1) as usize);
+                    if pool_conns_done && !ctx.pending_visitors.is_empty() {
+                        let (_, idx) = ctx.pending_visitors.remove(0);
+                        let v = session_visitors[idx];
+                        info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}' (Go frps compat: ReqWorkConn after NewVisitorConn)", v.name, v.server_name);
+                        #[cfg(feature = "vnet")]
+                        advertise_vnet_visitor_route(
+                            ctx.control_stream
+                                .as_mut()
+                                .expect("control_stream available before split"),
+                            ctx.v2,
+                            v,
+                        )
+                        .await;
+                    }
+                    ctx.req_work_conns_seen += 1;
+                }
+                other => {
+                    unexpected += 1;
+                    warn!(
+                        type_byte = other.v1_type_byte(),
+                        "Unexpected message during registration"
+                    );
+                }
+            }
+            if unexpected >= 100 {
+                warn!("Registration aborted: too many unexpected messages");
+                aborted = true;
+            }
+        }
+
+        // Any request still pending here never got an answer (write
+        // failure, read error, or too many unexpected frames). Mark the
+        // proxies failed and log the unresolved visitors; the session
+        // continues — registration errors do not abort the client
+        // (login_fail_exit only governs the login phase).
+        if !ctx.pending_proxies.is_empty() || !ctx.pending_visitors.is_empty() {
+            warn!(proxies = %ctx.pending_proxies.len(), visitors = %ctx.pending_visitors.len(), "Registration aborted; marking still-pending proxies/visitors as failed");
+            for (wire_name, _) in ctx.pending_proxies.drain(..) {
+                let mut map = self.proxy_info_map.write().await;
+                if let Some(info) = map.get_mut(&wire_name) {
+                    info.err = "registration aborted (no response)".to_string();
+                    info.phase =
+                        ProxyPhase::StartErr("registration aborted (no response)".to_string());
+                }
+            }
+            for (_, idx) in ctx.pending_visitors.drain(..) {
+                let v = session_visitors[idx];
+                warn!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registration unresolved", v.name);
+            }
+        }
+
+        !aborted
+    }
+
+    /// Phase 5 of one connection attempt: split the control stream into
+    /// reader/writer halves, spawn the dedicated writer task (bounded
+    /// channel — producers never block on a slow peer, the raw write half is
+    /// owned by exactly one task, and a write failure wakes the control loop
+    /// to tear down and reconnect), spawn VnetControllers for vnet proxies,
+    /// cancel the previous session's visitor listener tasks, and spawn the
+    /// current session's virtual_net / STCP / XTCP visitor listeners. Only
+    /// called when the registration phase did not abort (the session
+    /// continuation guard in run()).
+    ///
+    /// A split failure propagates to run() as a session error (matching the
+    /// original `into_split()?` in run(), which returned from run() itself).
+    async fn spawn_session_tasks(
+        &self,
+        ctx: &mut SessionCtx,
+        cfg_local: &ClientConfig,
+        #[cfg_attr(not(feature = "vnet"), allow(unused_variables))]
+        proxies: &[frp_core::config::ProxyConfig],
+        protocol: &TransportProtocol,
+        nat_hole_stun_server: &str,
+    ) -> std::io::Result<()> {
+        // Split control stream for reading and writing.
+        let (reader, raw_writer) = ctx
+            .control_stream
+            .take()
+            .expect("control_stream available before split")
+            .into_split()?;
+        ctx.reader = Some(reader);
+
+        {
+            let failed = ctx
+                .control_failed
+                .as_ref()
+                .expect("control_failed available before split")
+                .clone();
+            let notify = ctx
+                .control_notify
+                .as_ref()
+                .expect("control_notify available before split")
+                .clone();
+            let control_rx = ctx
+                .control_rx
+                .take()
+                .expect("control_rx available before split");
+            tokio::spawn(async move {
+                let mut rx = control_rx;
+                let mut w = raw_writer;
+                while let Some((msg, v2)) = rx.recv().await {
+                    if let Err(e) = write_msg(&mut w, &msg, v2).await {
+                        tracing::error!(error = %e, "Control writer failed: {}", e);
+                        failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        notify.notify_waiters();
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Spawn VnetControllers for all vnet proxies now that the
+        // control connection writer is available.
+        #[cfg(feature = "vnet")]
+        for p in proxies {
+            if vnet_tun_params(p, &cfg_local.virtual_net.address).is_none() {
+                continue;
+            }
+            let writer = ctx
+                .writer
+                .as_ref()
+                .expect("writer available before vnet controller spawn");
+            if spawn_vnet_tun_controller(
+                &self.vnet_tuns,
+                &self.vnet_tun_tx,
+                &self.vnet_tun_cancels,
+                &self.vnet_controller,
+                &p.name,
+                &p.virtual_net,
+                writer,
+                ctx.v2,
+            )
+            .await
+            .is_some()
+            {
+                send_vnet_route_advertise(writer, ctx.v2, p).await;
+            }
+        }
+
+        // Cancel old visitor listener tasks from a previous session.
+        // Signal gracefully and wait briefly for the previous session's
+        // visitors to exit, instead of aborting them (Go frp compat:
+        // visitor_manager.Close() closes each visitor cleanly). The
+        // previous session's visitor_shutdown was already set when the
+        // session ended; tasks should exit on their own. Any listener
+        // still stuck in accept() after the grace period is force-aborted
+        // so the bind port is released for the new session.
+        self.shutdown_visitor_tasks(std::mem::take(&mut ctx.visitor_handles))
+            .await;
+
+        // Spawn STCP/XTCP visitor listeners
+        let session_visitors = self.cfg.read().await.visitors.clone();
+        for v in &session_visitors {
+            if !v.enabled {
+                continue;
+            }
+            if v.bind_port == 0 {
+                continue;
+            }
+            // Virtual_net visitors do not bind a local listener; they
+            // establish a persistent STCP/XTCP tunnel and register their
+            // destinationIP host route with the client vnet controller.
+            if v.plugin
+                .as_ref()
+                .is_some_and(|p| p.plugin_type == VISITOR_PLUGIN_VIRTUAL_NET)
+            {
+                #[cfg(feature = "vnet")]
+                {
+                    if let Some(adv) = virtual_net_visitor_route_adv(v) {
+                        let sa = cfg_local.server_addr.clone();
+                        let sp = cfg_local.server_port;
+                        let pt = protocol.clone();
+                        let server_name = v.server_name.clone();
+                        let server_user = v.server_user.clone();
+                        let secret_key = v.secret_key.clone();
+                        let use_enc = v.use_encryption;
+                        let use_comp = v.use_compression;
+                        let name = v.name.clone();
+                        let tls_enable = cfg_local.tls_enable;
+                        let tls_server_name = cfg_local.tls_server_name.clone();
+                        let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+                        let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
+                        let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
+                        let transport_bind =
+                            opt_if_empty!(cfg_local.connect_server_local_ip.clone());
+                        let transport_tls_cert = opt_if_empty!(cfg_local.tls_cert_file.clone());
+                        let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
+                        let transport_tcp_mux = cfg_local.tcp_mux;
+                        let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
+                        let transport_dial_timeout = cfg_local.dial_server_timeout.max(1) as u64;
+                        let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
+                        let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
+                        let user = cfg_local.user.clone();
+                        let rid = ctx.run_id.clone();
+                        let v2 = ctx.v2;
+                        let controller = self.vnet_controller.clone();
+                        let vnet_tun_tx = self.vnet_tun_tx.clone();
+                        let tun_subnets = self.vnet_tun_subnets.clone();
+                        let shutdown = ctx
+                            .visitor_shutdown
+                            .as_ref()
+                            .expect("visitor_shutdown available before visitor spawn")
+                            .clone();
+                        let handle = tokio::spawn(async move {
+                            crate::visitor::run_virtual_net_visitor(
+                                crate::visitor::VirtualNetVisitorConfig {
+                                    server_addr: sa,
+                                    server_port: sp,
+                                    protocol: pt,
+                                    server_name,
+                                    server_user,
+                                    secret_key,
+                                    use_encryption: use_enc,
+                                    use_compression: use_comp,
+                                    name,
+                                    tls_enable,
+                                    tls_server_name,
+                                    tls_ca_file,
+                                    user,
+                                    run_id: rid,
+                                    tcp_mux: transport_tcp_mux,
+                                    tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
+                                    proxy_url: transport_proxy_url.clone(),
+                                    dns_server: transport_dns.clone(),
+                                    dial_timeout_secs: transport_dial_timeout,
+                                    keepalive_secs: transport_keepalive,
+                                    connect_bind_addr: transport_bind.clone(),
+                                    disable_custom_tls_first_byte: transport_nocustomtls,
+                                    tls_cert_file: transport_tls_cert.clone(),
+                                    tls_key_file: transport_tls_key.clone(),
+                                    v2,
+                                    destination_cidr: adv.subnet,
+                                    controller,
+                                    vnet_tun_tx,
+                                    tun_subnets,
+                                    shutdown,
+                                },
+                            )
+                            .await;
+                        });
+                        ctx.visitor_handles.push(handle);
+                    }
+                }
+                continue;
+            }
+            let sa = cfg_local.server_addr.clone();
+            let sp = cfg_local.server_port;
+            let pt = protocol.clone();
+            let server_name = v.server_name.clone();
+            let server_user = v.server_user.clone();
+            let secret_key = v.secret_key.clone();
+            let bind_addr = format!("{}:{}", v.bind_addr, v.bind_port);
+            let use_enc = v.use_encryption;
+            let use_comp = v.use_compression;
+            let name = v.name.clone();
+            let tls_enable = cfg_local.tls_enable;
+            let tls_server_name = cfg_local.tls_server_name.clone();
+            let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+            let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
+            let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
+            let transport_bind = opt_if_empty!(cfg_local.connect_server_local_ip.clone());
+            let transport_tls_cert = opt_if_empty!(cfg_local.tls_cert_file.clone());
+            let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
+            let transport_tcp_mux = cfg_local.tcp_mux;
+            let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
+            let transport_dial_timeout = cfg_local.dial_server_timeout.max(1) as u64;
+            let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
+            let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
+            let visitor_type = v.visitor_type.clone();
+            let fallback_timeout_ms = v.fallback_timeout_ms;
+            let keep_tunnel_open = v.keep_tunnel_open;
+            let max_retries_an_hour = v.max_retries_an_hour;
+            let min_retry_interval = v.min_retry_interval;
+            // nat_hole_stun_server is a &str param here (was a String local in
+            // run()); to_string() keeps the String-typed visitor field unchanged.
+            let stun_server = nat_hole_stun_server.to_string();
+            let fallback_to = v.fallback_to.clone();
+            let disable_assisted_addrs = v.disable_assisted_addrs;
+            let p2p_protocol = v.protocol.clone();
+            let user = cfg_local.user.clone();
+            let rid = ctx.run_id.clone();
+            let v2 = ctx.v2;
+            let vtx = self.visitor_tx.clone();
+            let shutdown = ctx
+                .visitor_shutdown
+                .as_ref()
+                .expect("visitor_shutdown available before visitor spawn")
+                .clone();
+            let handle = tokio::spawn(async move {
+                crate::visitor::run_visitor_listener(crate::visitor::VisitorListenerConfig {
+                    server_addr: sa,
+                    server_port: sp,
+                    protocol: pt,
+                    server_name,
+                    server_user,
+                    secret_key,
+                    bind_addr,
+                    use_encryption: use_enc,
+                    use_compression: use_comp,
+                    name,
+                    tls_enable,
+                    tls_server_name,
+                    tls_ca_file,
+                    visitor_type,
+                    fallback_timeout_ms,
+                    keep_tunnel_open,
+                    max_retries_an_hour,
+                    min_retry_interval,
+                    stun_server,
+                    p2p_protocol,
+                    visitor_tx: vtx,
+                    fallback_to,
+                    disable_assisted_addrs,
+                    shutdown,
+                    user,
+                    run_id: rid,
+                    tcp_mux: transport_tcp_mux,
+                    tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
+                    proxy_url: transport_proxy_url.clone(),
+                    dns_server: transport_dns.clone(),
+                    dial_timeout_secs: transport_dial_timeout,
+                    keepalive_secs: transport_keepalive,
+                    connect_bind_addr: transport_bind.clone(),
+                    disable_custom_tls_first_byte: transport_nocustomtls,
+                    tls_cert_file: transport_tls_cert.clone(),
+                    tls_key_file: transport_tls_key.clone(),
+                    v2,
+                })
+                .await;
+            });
+            ctx.visitor_handles.push(handle);
+        }
+
+        Ok(())
+    }
+
+    /// Phase 6 of one connection attempt: the message loop. Reads control
+    /// frames, ticks the heartbeat ping, retries StartErr proxies every 30s,
+    /// and handles health / reload / XTCP / visitor / stop events until the
+    /// session ends. Returns how it ended: `Shutdown` when a stop was
+    /// requested (run() must not reconnect), `Reconnect` when the session
+    /// died (run() tears down and reconnects).
+    ///
+    /// The session-agnostic receivers and handles are parameters: they are
+    /// created once in run() and outlive sessions.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_message_loop(
+        &self,
+        ctx: &mut SessionCtx,
+        health_rx: &mut mpsc::Receiver<HealthEvent>,
+        reload_rx: &mut mpsc::Receiver<ReloadRequest>,
+        xtcp_rx: &mut mpsc::Receiver<XtcpNotification>,
+        visitor_rx: &mut mpsc::Receiver<VisitorRequest>,
+        stop_rx: &mut mpsc::Receiver<()>,
+        health_cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+        nat_hole_stun_server: &str,
+    ) -> LoopExit {
+        // The message loop owns the split reader half.
+        let mut reader = ctx
+            .reader
+            .take()
+            .expect("reader available before message loop");
+
+        // Control writes are funneled through the writer handle
+        // (always set by phase 5 before the loop starts).
+        let writer = ctx
+            .writer
+            .as_ref()
+            .expect("writer available before message loop")
+            .clone();
+
+        // --- Message loop ---
+        // Map sid -> proxy_name for XTCP NatHoleResp routing (provider side).
+        // Map sid -> STUN UDP socket for XTCP P2P hole punching.
+        // Map sid -> oneshot sender for visitor NatHoleResp routing (Go frps compat).
+        // (All three maps live on SessionCtx, as do waitstart_seen and
+        // cfg_user — see the field docs.)
+        // STUN discovery runs off the control loop (two STUN round-trips can
+        // stall up to ~10s). The finished NatHoleClient is sent back here so
+        // the write + pending_xtcp bookkeeping stay on the loop, preserving
+        // the write-before-NatHoleResp ordering. A separate cleanup channel
+        // lets a timeout task reclaim stale xtcp_sockets/pending_xtcp entries
+        // when the server never sends NatHoleResp.
+        let (stun_result_tx, stun_result_rx) = mpsc::channel::<StunResult>(64);
+        ctx.stun_result_tx = Some(stun_result_tx);
+        ctx.stun_result_rx = Some(stun_result_rx);
+        let (xtcp_cleanup_tx, xtcp_cleanup_rx) = mpsc::channel::<String>(64);
+        ctx.xtcp_cleanup_rx = Some(xtcp_cleanup_rx);
+
+        // Proxy retry interval: every 30s, re-register proxies stuck in
+        // StartErr (or in WaitStart past one interval — see the retry arm).
+        // Matches Go frp's proxy_wrapper.checkWorker (default startErrTimeout 30s).
+        let mut proxy_retry_interval = tokio::time::interval(PROXY_RETRY_INTERVAL);
+        proxy_retry_interval.tick().await; // Skip first immediate tick
+        ctx.proxy_retry_interval = Some(proxy_retry_interval);
+
+        loop {
+            tokio::select! {
+                msg = read_msg(&mut reader, ctx.v2) => {
+                    match msg {
+                        Ok(FrpMessage::ReqWorkConn(_)) => {
+                            // Shared with the registration read loop above.
+                            self.handle_req_work_conn(ctx);
+                        }
+                        Ok(FrpMessage::Pong(pong)) => {
+                            if let Some(ref err) = pong.error {
+                                if !err.is_empty() {
+                                    warn!(error = %err, "Pong contains error: {}", err);
+                                    return LoopExit::Reconnect;
+                                }
+                            }
+                            debug!("Pong received");
+                            ctx.last_pong = Instant::now();
+                        }
+                        Ok(FrpMessage::Ping(_)) => {
+                            // Answer an unsolicited server Ping with Pong
+                            // (Go frp client parity). Previously inbound
+                            // Ping fell into the ignored-messages bucket, so
+                            // a server that probes liveness with Ping would
+                            // have its watchdog kill a healthy connection.
+                            let pong = FrpMessage::Pong(msg::Pong { error: None });
+                            if let Err(e) = writer.send(pong, ctx.v2) {
+                                debug!(error = %e, "Pong reply to server Ping failed: {}", e);
+                            }
+                        }
+                        Ok(FrpMessage::CloseProxy(cp)) => {
+                            info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
+                            // Cancel health check task and remove map entry.
+                            let mut cancels = health_cancels.lock().await;
+                            if let Some(cancel) = cancels.get(&cp.proxy_name) {
+                                cancel.store(true, Ordering::Relaxed);
+                            }
+                            cancels.remove(&cp.proxy_name);
+                        }
+                        Ok(FrpMessage::CloseProxyResp(cpr)) => {
+                            info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);
+                            // Do NOT cancel/remove health check here. This response comes from
+                            // our CloseProxy (health check failure → CloseProxy → server → CloseProxyResp).
+                            // The health check monitor keeps running for recovery detection (Go frp compat).
+                        }
+                        Ok(FrpMessage::Error(err)) => {
+                            warn!(error = %err.error, "Server error: {}", err.error);
+                        }
+                        Ok(FrpMessage::NatHoleClient(nhc)) => {
+                            self.handle_nat_hole_client(*nhc, &writer, ctx.v2, ctx.session_alive.clone()).await;
+                        }
+                        Ok(FrpMessage::NatHoleResp(resp)) => {
+                            self.handle_nat_hole_resp(*resp, &mut ctx.pending_xtcp, &mut ctx.visitor_pending, &ctx.xtcp_sockets, &writer, ctx.session_alive.clone()).await;
+                        }
+                        Ok(FrpMessage::NewProxyResp(resp)) => {
+                            let is_error = resp.error.as_ref().is_some_and(|e| !e.is_empty());
+                            if is_error {
+                                let err = resp
+                                    .error
+                                    .as_ref()
+                                    .expect("is_some_and guard above guarantees Some");
+                                warn!(proxy_name = %resp.proxy_name, error = %err, "Proxy '{}' registration error: {}", resp.proxy_name, err);
+                                // Update phase if proxy was being retried (WaitStart -> StartErr).
+                                let mut map = self.proxy_info_map.write().await;
+                                if let Some(info) = map.get_mut(&resp.proxy_name) {
+                                    if info.phase == ProxyPhase::WaitStart {
+                                        info.err = err.clone();
+                                        info.phase = ProxyPhase::StartErr(err.clone());
+                                    }
+                                }
+                            } else {
+                                // Successful registration from retry path.
+                                // Accept it from WaitStart (normal) or
+                                // StartErr (a healthy response that just
+                                // missed the 30s retry deadline must not
+                                // be thrown away — Go frp keeps
+                                // re-registering until the response
+                                // lands).
+                                let mut map = self.proxy_info_map.write().await;
+                                if let Some(info) = map.get_mut(&resp.proxy_name) {
+                                    if info.phase == ProxyPhase::WaitStart
+                                        || matches!(info.phase, ProxyPhase::StartErr(_))
+                                    {
+                                        if let Some(ref remote) = resp.remote_addr {
+                                            info.remote_addr.clone_from(remote);
+                                        }
+                                        info.err.clear();
+                                        info.phase = ProxyPhase::Running;
+                                        info!(proxy_name = %resp.proxy_name, "Proxy '{}' re-registered", resp.proxy_name);
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(feature = "vnet")]
+                        Ok(FrpMessage::VnetRouteAdvertise(adv)) => {
+                            // Isolation: only accept routes for virtual nets
+                            // this client participates in. Advertisements for
+                            // other vnets are ignored (design spec: different
+                            // virtual nets have isolated routing tables).
+                            let vnet = adv.virtual_net.clone().unwrap_or_default();
+                            if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
+                                debug!(
+                                    vnet,
+                                    proxy_name = %adv.proxy_name,
+                                    "ignoring vnet route advertisement for unknown virtual net"
+                                );
+                            } else {
+                                info!(vnet, subnet = %adv.subnet, proxy_name = %adv.proxy_name, "peer vnet route advertisement received");
+                                // Update the shared route table (TX direction lookup).
+                                {
+                                    let route_table = self.vnet_controller.route_table();
+                                    let mut routes = route_table.write().await;
+                                    if let Err(e) =
+                                        routes.insert(&vnet, &adv.proxy_name, &adv.subnet)
+                                    {
+                                        warn!(%e, "failed to add vnet route");
+                                    }
+                                }
+                                // Inject OS route so the kernel sends matching packets
+                                // through the TUN device instead of the default gateway.
+                                // vnet_tun_names is keyed by *local* proxy name, while
+                                // adv.proxy_name is the *remote* peer's name — so match
+                                // by virtual_net (the route's isolation domain, already
+                                // validated above) instead of by name. The local vnet
+                                // proxy owning that virtual net is the one whose TUN must
+                                // carry this route; with no local TUN for the net (e.g.
+                                // this client is only a visitor) there is nothing to
+                                // inject, which is correct — the old code grabbed an
+                                // arbitrary TUN and silently misrouted.
+                                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                {
+                                    let local_tun_proxy: Option<String> = {
+                                        let cfg = self.cfg.read().await;
+                                        cfg.proxies
+                                            .iter()
+                                            .find(|p| {
+                                                p.proxy_type == "vnet" && p.virtual_net == vnet
+                                            })
+                                            .map(|p| p.name.clone())
+                                    };
+                                    let names = self.vnet_tun_names.lock().await;
+                                    if let Some(tun_name) =
+                                        local_tun_proxy.as_deref().and_then(|n| names.get(n))
+                                    {
+                                        add_os_route(&adv.subnet, tun_name);
+                                        self.vnet_peer_routes.lock().await.insert(
+                                            adv.proxy_name.clone(),
+                                            (
+                                                adv.subnet.clone(),
+                                                tun_name.clone(),
+                                                vnet.clone(),
+                                            ),
+                                        );
+                                    } else {
+                                        debug!(
+                                            vnet,
+                                            proxy_name = %adv.proxy_name,
+                                            "vnet route advertise: no local TUN for virtual net '{}' — skipping OS route",
+                                            vnet
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(feature = "vnet")]
+                        Ok(FrpMessage::VnetPacket(vpkt)) => {
+                            match frp_core::base64::decode(&vpkt.data) {
+                                Ok(packet) => {
+                                    // Virtual_net visitors first: deliver into
+                                    // the visitor's STCP/XTCP tunnel. TUN-backed
+                                    // vnet proxies fall back to their TUN channel
+                                    // only when no visitor consumed the packet
+                                    // (Err returns the packet untouched).
+                                    match self
+                                        .vnet_controller
+                                        .deliver_visitor_packet(&vpkt.proxy_name, packet)
+                                    {
+                                        Ok(()) => {}
+                                        Err(packet) => {
+                                            let txs = self
+                                                .vnet_tun_tx
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            if let Some(tx) = txs.get(&vpkt.proxy_name) {
+                                                if tx.try_send(packet).is_err() {
+                                                    warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
+                                                }
+                                            } else {
+                                                debug!(proxy_name = %vpkt.proxy_name, "vnet packet dropped: no visitor or TUN target");
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(%e, "VnetPacket base64 decode error");
+                                }
+                            }
+                        }
+                        #[cfg(feature = "vnet")]
+                        Ok(FrpMessage::VnetRouteRemove(adv)) => {
+                            // Isolation: mirror the advertise handler — only
+                            // accept removals for virtual nets this client
+                            // participates in. Removals for other vnets are
+                            // ignored (defensive symmetry; in practice there
+                            // is no matching route to clean up anyway).
+                            let vnet = adv.virtual_net.clone().unwrap_or_default();
+                            if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
+                                debug!(
+                                    vnet,
+                                    proxy_name = %adv.proxy_name,
+                                    "ignoring vnet route removal for unknown virtual net"
+                                );
+                            } else {
+                                info!(vnet, proxy_name = %adv.proxy_name, "peer vnet route removed");
+                                if let Some((subnet, tun_name, _)) = self
+                                    .vnet_peer_routes
+                                    .lock()
+                                    .await
+                                    .remove(&adv.proxy_name)
+                                {
+                                    remove_os_route(&subnet, &tun_name);
+                                }
+                                self.vnet_controller
+                                    .route_table()
+                                    .write()
+                                    .await
+                                    .remove(&vnet, &adv.proxy_name);
+                                self.vnet_controller
+                                    .unregister_visitor_route(&adv.proxy_name)
+                                    .await;
+                            }
+                        }
+                        Ok(_) => {
+                            // Other messages are ignored
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Control read error: {}. Reconnecting...", e);
+                            return LoopExit::Reconnect;
+                        }
+                    }
+                }
+
+                _ = async {
+                    if let Some(ref mut interval) = ctx.ping_interval {
+                        interval.tick().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    let mut ping_msg = msg::Ping {
+                        privilege_key: None,
+                        timestamp: None,
+                    };
+                    // Auth scopes: unioning the client's own scopes with the
+                    // server-advertised scopes is a Rust-to-Rust extension.
+                    // Go v0.70.1's TokenAuthSetterVerifier.SetPing checks only
+                    // the client's own additionalAuthScopes
+                    // (pkg/auth/token.go:44-51); Go has no
+                    // serverAdditionalAuthScopes field in LoginResp, so the
+                    // server side of this union is ignored by Go peers.
+                    let send_auth = crate::backoff::heartbeat_requires_auth(
+                        &ctx.client_scopes,
+                        &ctx.server_scopes,
+                    );
+                    if send_auth {
+                        if let Some(ref oidc) = self.oidc_client {
+                            if let Err(e) = oidc.set_ping(&mut ping_msg).await {
+                                warn!(error = %e, "OIDC ping token failed: {}. Reconnecting...", e);
+                                return LoopExit::Reconnect;
+                            }
+                        } else {
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as i64;
+                            match self.auth_cfg.try_generate_login_key(ts) {
+                                Ok(key) => {
+                                    ping_msg.privilege_key = Some(key);
+                                    ping_msg.timestamp = Some(ts);
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Ping token source failed: {}. Reconnecting...", e);
+                                    return LoopExit::Reconnect;
+                                }
+                            }
+                        }
+                    }
+                    let ping = FrpMessage::Ping(ping_msg);
+                    if let Err(e) = writer.send(ping, ctx.v2) {
+                        warn!(error = %e, "Ping write failed: {}", e);
+                        // Non-fatal: heartbeat timeout will detect actual dead connection.
+                    } else {
+                        debug!("Ping sent");
+                    }
+                }
+
+                _ = ctx
+                    .proxy_retry_interval
+                    .as_mut()
+                    .expect("proxy retry interval available")
+                    .tick() => {
+                    let mut to_retry: Vec<(String, String)> = {
+                        let map = self.proxy_info_map.read().await;
+                        map.iter()
+                            .filter(|(_, info)| matches!(info.phase, ProxyPhase::StartErr(_)))
+                            .map(|(name, info)| (name.clone(), info.local_addr.clone()))
+                            .collect()
+                    };
+                    // Fold proxies stuck in WaitStart past one full retry
+                    // interval into the retry set. A NewProxy that is never
+                    // answered (a silent server that still Pongs) keeps the
+                    // proxy in WaitStart — the StartErr transition happens
+                    // only on a NewProxyResp error, so without this check a
+                    // single unanswered retry would stop the retries
+                    // forever. Go frp parity: proxy_wrapper re-arms
+                    // startErrTimeout while in waitStart and retries
+                    // indefinitely. `waitstart_seen` records when each
+                    // proxy last entered WaitStart (initial registration or
+                    // a retry send) and is pruned once it leaves WaitStart
+                    // (registered, errored, or closed).
+                    {
+                        let map = self.proxy_info_map.read().await;
+                        let now = Instant::now();
+                        ctx.waitstart_seen.retain(|name, _| {
+                            map.get(name).is_some_and(|info| {
+                                info.phase == ProxyPhase::WaitStart
+                            })
+                        });
+                        for (name, info) in map.iter() {
+                            if info.phase == ProxyPhase::WaitStart
+                                && !ctx.waitstart_seen.contains_key(name)
+                            {
+                                // First observed in WaitStart at this tick
+                                // (e.g. the initial registration left it
+                                // pending past retry setup): start its
+                                // clock now.
+                                ctx.waitstart_seen.insert(name.clone(), now);
+                            }
+                        }
+                        to_retry.extend(map.iter().filter_map(|(name, info)| {
+                            if info.phase == ProxyPhase::WaitStart
+                                && ctx.waitstart_seen.get(name).is_some_and(|first_seen| {
+                                    now.duration_since(*first_seen)
+                                        >= PROXY_RETRY_INTERVAL - PROXY_RETRY_GRACE
+                                })
+                            {
+                                Some((name.clone(), info.local_addr.clone()))
+                            } else {
+                                None
+                            }
+                        }));
+                    }
+                    if !to_retry.is_empty() {
+                        // Retry candidates come from the LIVE proxy set:
+                        // try_reload refreshes self.proxies, so a proxy
+                        // ADDED by a reload that failed to register
+                        // (StartErr) is retried too — the session-start
+                        // `proxies` snapshot (still used by the
+                        // registration loop above) would miss it.
+                        // Lock order: proxies read then cfg read (the
+                        // session loop takes them in the opposite order).
+                        // Not a deadlock: both locks' writers (try_reload)
+                        // run only in this message-loop task, so these read
+                        // guards never contend with a writer across tasks.
+                        let all_proxies = Arc::clone(&*self.proxies.read().await);
+                        let retry_candidates =
+                            filter_active_proxies(&*self.cfg.read().await, &all_proxies);
+                        for (name, local_addr) in to_retry {
+                            let bare_name = if ctx.cfg_user.is_empty() { name.as_str() } else {
+                                name.strip_prefix(&format!("{}.", ctx.cfg_user)).unwrap_or(&name)
+                            };
+                            if let Some(p) = retry_candidates.iter().find(|p| p.name == bare_name) {
+                                let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &ctx.cfg_user);
+                                if let Err(e) = writer.send(new_proxy, ctx.v2) {
+                                    warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
+                                } else {
+                                    info!(proxy_name = %name, "Proxy '{}' retry: sent NewProxy", name);
+                                    let mut map = self.proxy_info_map.write().await;
+                                    if let Some(info) = map.get_mut(&name) {
+                                        info.phase = ProxyPhase::WaitStart;
+                                    }
+                                    // Re-arm the WaitStart clock at the send
+                                    // (Go frp's proxy_wrapper re-arms
+                                    // startErrTimeout per NewProxy send).
+                                    ctx.waitstart_seen.insert(name.clone(), Instant::now());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Some(event) = health_rx.recv() => {
+                    match event {
+                        HealthEvent::Close(proxy_name) => {
+                            info!(proxy_name = %proxy_name, "Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
+                            // Set phase to CheckFailed before sending CloseProxy
+                            // (Go frp compat: PhaseCheckFailed is an explicit state in proxy lifecycle).
+                            {
+                                let mut map = self.proxy_info_map.write().await;
+                                if let Some(info) = map.get_mut(&proxy_name) {
+                                    info.phase = ProxyPhase::CheckFailed;
+                                }
+                            }
+                            let close = FrpMessage::CloseProxy(msg::CloseProxy {
+                                proxy_name: proxy_name.clone(),
+                            });
+                            if let Err(e) = writer.send(close, ctx.v2) {
+                                warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
+                            }
+                            // Keep health check running -- monitor for recovery (Go frp compat).
+                        }
+                        HealthEvent::Recover(proxy_name) => {
+                            info!(proxy_name = %proxy_name, "Health check recovered for '{}', re-registering", proxy_name);
+                            // Look up proxy config and send NewProxy to re-register.
+                            let need_send = {
+                                let configs = self.health_proxy_configs.lock().await;
+                                configs.get(&proxy_name).cloned()
+                            };
+                            if let Some(cfg) = need_send {
+                                let local_addr = self.proxy_info_map.read().await
+                                    .get(&proxy_name)
+                                    .map(|info| info.local_addr.clone())
+                                    .unwrap_or_else(|| format!("{}:{}", cfg.local_ip, cfg.local_port));
+                                // Set phase to WaitStart so NewProxyResp handler
+                                // transitions it to Running on success (Go frp compat:
+                                // CheckFailed -> re-register -> Running).
+                                {
+                                    let mut map = self.proxy_info_map.write().await;
+                                    if let Some(info) = map.get_mut(&proxy_name) {
+                                        info.phase = ProxyPhase::WaitStart;
+                                    }
+                                }
+                                let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr, &ctx.cfg_user);
+                                if let Err(e) = writer.send(new_proxy, ctx.v2) {
+                                    warn!(proxy_name = %proxy_name, error = %e, "Failed to re-register proxy on health recovery: {}", e);
+                                } else {
+                                    info!(proxy_name = %proxy_name, "Health recovery: re-registered proxy '{}'", proxy_name);
+                                }
+                            } else {
+                                warn!(proxy_name = %proxy_name, "Health check recovered but no config found for '{}'", proxy_name);
+                            }
+                        }
+                    }
+                }
+
+                Some(req) = reload_rx.recv() => {
+                    let result = match &self.config_file {
+                        Some(path) => self.try_reload(path, req.strict, &writer).await,
+                        None => Err("no config file path stored".into()),
+                    };
+                    if result.is_ok()
+                        && self.visitor_reload_needed.swap(false, Ordering::AcqRel)
+                    {
+                        // Visitor changes require a clean session restart.
+                        tracing::info!("Visitor config changed — restarting session");
+                        let _ = req.reply.send(Ok("reload success: visitor changes applied on session restart".into()));
+                        return LoopExit::Reconnect;
+                    }
+                    let _ = req.reply.send(result);
+                }
+
+                Some(xtcp_notif) = xtcp_rx.recv() => {
+                    let XtcpNotification { sid, proxy_name } = xtcp_notif;
+                    info!(proxy_name = %proxy_name, "XTCP provider: received NatHoleSid for '{}'", proxy_name);
+                    // STUN discovery runs off the control loop: two STUN
+                    // round-trips can stall up to ~10s and would block the
+                    // message loop (heartbeats, work conns, reloads). The
+                    // spawned task does the STUN, persists the socket, and
+                    // hands the finished NatHoleClient back for the loop to
+                    // write + bookkeep, preserving the write-before-NatHoleResp
+                    // ordering.
+                    let stun_server = nat_hole_stun_server.to_string();
+                    let stun_sockets = Arc::clone(&ctx.xtcp_sockets);
+                    let stun_tx = ctx
+                        .stun_result_tx
+                        .as_ref()
+                        .expect("stun_result_tx available before STUN spawn")
+                        .clone();
+                    tokio::spawn(async move {
+                        // 1. Do STUN discovery on a persistent UDP socket.
+                        //    Go frps needs ≥2 mapped addresses for NAT classification.
+                        let mut mapped_addrs = Vec::new();
+                        let stun_socket = match frp_core::stun::stun_binding_with_details(&stun_server).await {
+                            Ok((sock, result1)) => {
+                                let addr1 = result1.mapped_addr;
+                                debug!(addr = %addr1, "XTCP STUN #1: {}", addr1);
+                                mapped_addrs.push(addr1);
+                                // Use OTHER-ADDRESS as second STUN target if available
+                                // (Go frp v0.70 discovery.go:137 dual-server probing).
+                                // This gives the server a second mapped address for NAT
+                                // classification (RFC 5780, detects endpoint-independent
+                                // vs address-dependent mapping).
+                                let second_target =
+                                    result1.other_addr.as_deref().unwrap_or(&stun_server);
+                                match frp_core::stun::stun_binding_on_socket(&sock, second_target).await {
+                                    Ok(addr2) => {
+                                        debug!(addr = %addr2, "XTCP STUN #2 from '{}': {}", second_target, addr2);
+                                        // Go frps NAT classifier needs ≥2 addresses.
+                                        // Always push — Go frp doesn't dedup.
+                                        mapped_addrs.push(addr2);
+                                    }
+                                    Err(e) => warn!(error = %e, "XTCP STUN #2 failed: {}", e),
+                                }
+                                Some(sock)
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "XTCP STUN failed: {}", e);
+                                None
+                            }
+                        };
+                        // Get the local port from the STUN socket for assisted_addrs.
+                        // Go frp compat: assisted_addrs = local IPs + STUN port, NOT STUN
+                        // mapped addresses. The server uses assisted_addrs as localIPs
+                        // parameter to ClassifyNATFeature — STUN addresses would never
+                        // match local interfaces, causing misclassification.
+                        let local_port = stun_socket
+                            .as_ref()
+                            .and_then(|sock| sock.local_addr().ok())
+                            .map(|addr| addr.port());
+                        // Save socket for later UDP+KCP hole punch.
+                        if let Some(sock) = stun_socket {
+                            stun_sockets
+                                .lock()
+                                .await
+                                .insert(sid.clone(), std::sync::Arc::new(sock));
+                        }
+                        // Build assisted_addrs from local IPs + STUN port.
+                        // Go frp v0.69.1: ListLocalIPsForNatHole returns non-loopback
+                        // IPv4 addresses filtered from all network interfaces.
+                        let assisted_addrs: Option<Vec<String>> = local_port.and_then(|port| {
+                            let local_ips = crate::nat_hole::list_local_ips_for_nat_hole(10);
+                            if local_ips.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    local_ips
+                                        .iter()
+                                        .map(|ip| format!("{}:{}", ip, port))
+                                        .collect(),
+                                )
+                            }
+                        });
+                        // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
+                        // Use a unique transaction_id per request (Go frp compat: UUID).
+                        let txn_id = uuid::Uuid::new_v4().to_string();
+                        let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
+                            transaction_id: txn_id.clone(),
+                            proxy_name: proxy_name.clone(),
+                            sid: Some(sid.clone()),
+                            protocol: Some("kcp".to_string()),
+                            mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
+                            assisted_addrs,
+                            visitor_addr: None,
+                        }));
+                        // Hand the finished message back to the control loop.
+                        if stun_tx
+                            .send(StunResult { sid, proxy_name, msg: client_msg })
+                            .await
+                            .is_err()
+                        {
+                            warn!("XTCP: control loop dropped STUN result channel");
+                        }
+                    });
+                }
+
+                // STUN finished off-loop: write NatHoleClient on the control
+                // connection and track sid→proxy_name for NatHoleResp routing.
+                Some(stun_result) = ctx
+                    .stun_result_rx
+                    .as_mut()
+                    .expect("stun_result_rx available before STUN result recv")
+                    .recv() => {
+                    let StunResult { sid, proxy_name, msg } = stun_result;
+                    if let Err(e) = writer.send(msg, ctx.v2) {
+                        warn!(error = %e, "XTCP: failed to send NatHoleClient: {}", e);
+                        // The STUN socket was stored in xtcp_sockets but no
+                        // pending_xtcp entry was created; reclaim it now so it
+                        // does not sit until control-loop teardown.
+                        ctx.xtcp_sockets.lock().await.remove(&sid);
+                    } else {
+                        ctx.pending_xtcp.insert(sid.clone(), proxy_name);
+                        // Defensive cleanup: if the server never sends
+                        // NatHoleResp for this sid, the socket + pending_xtcp
+                        // entry would leak until the control loop tears down.
+                        // Reclaim them after the server's NAT session window
+                        // (NAT_HOLE_TIMEOUT = 10s) plus margin. If NatHoleResp
+                        // arrives in time, handle_nat_hole_resp already removed
+                        // both entries and these removes are no-ops.
+                        let cleanup_sockets = Arc::clone(&ctx.xtcp_sockets);
+                        let cleanup_tx = xtcp_cleanup_tx.clone();
+                        let cleanup_sid = sid.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(15)).await;
+                            cleanup_sockets.lock().await.remove(&cleanup_sid);
+                            let _ = cleanup_tx.send(cleanup_sid).await;
+                        });
+                    }
+                }
+
+                // A NatHoleResp never arrived within the timeout window:
+                // reclaim the pending provider-side entry (socket already
+                // removed) and any residual visitor-side sender. `cleanup_sid`
+                // carries either a provider sid or a visitor txn_id; the two
+                // namespaces are independent, so reclaiming from both is
+                // always safe (see reclaim_stale_xtcp_entry).
+                Some(cleanup_sid) = ctx
+                    .xtcp_cleanup_rx
+                    .as_mut()
+                    .expect("xtcp_cleanup_rx available before cleanup recv")
+                    .recv() => {
+                    if reclaim_stale_xtcp_entry(
+                        &mut ctx.pending_xtcp,
+                        &mut ctx.visitor_pending,
+                        &cleanup_sid,
+                    ) {
+                        debug!(sid = %cleanup_sid, "XTCP: reclaimed stale entry for '{}'", cleanup_sid);
+                    }
+                }
+
+                // Visitor requests: send NatHoleVisitor on control connection.
+                // Go frps v0.69.1 only handles NatHoleVisitor on the control
+                // connection path, not on fresh TCP connections.
+                Some(vreq) = visitor_rx.recv() => {
+                    let txn_id = vreq.nhv.transaction_id.clone();
+                    let nhv = FrpMessage::NatHoleVisitor(vreq.nhv);
+                    match writer.send(nhv, ctx.v2) {
+                        Ok(()) => {
+                            debug!(sid = %txn_id, "Visitor: sent NatHoleVisitor on control, sid={}", txn_id);
+                            ctx.visitor_pending.insert(txn_id.clone(), vreq.reply);
+                            // Defensive cleanup: if the server never sends a
+                            // NatHoleResp for this txn, the visitor_pending
+                            // entry would otherwise sit until control-loop
+                            // teardown. Reclaim it after 20s. Why 20s: the
+                            // visitor side gives up after its own 15s timeout
+                            // (visitor.rs), so by the time we run the
+                            // receiver is already dropped and the entry is
+                            // only reclaimed after the visitor stopped
+                            // waiting — we never preempt a slow-but-valid
+                            // response. The server's NAT session window is
+                            // 10s plus network latency, well under 20s. If
+                            // NatHoleResp arrives in time,
+                            // handle_nat_hole_resp already removed the entry
+                            // and this is a no-op.
+                            let cleanup_tx = xtcp_cleanup_tx.clone();
+                            let cleanup_key = txn_id.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(20)).await;
+                                // Channel closed (control loop exited) — ignore.
+                                let _ = cleanup_tx.send(cleanup_key).await;
+                            });
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Visitor: failed to send NatHoleVisitor on control: {}", e);
+                            let _ = vreq.reply.send(Err(format!("send failed: {e}")));
+                        }
+                    }
+                }
+
+                Some(()) = stop_rx.recv() => {
+                    info!("Stop requested, shutting down");
+                    ctx.shutdown_flag.store(true, Ordering::SeqCst);
+                    return LoopExit::Shutdown;
+                }
+
+                // Heartbeat timeout watchdog: triggers reconnect if no Pong
+                // received within heartbeat_timeout seconds (Go frp compat).
+                // Event-driven: sleeps until the deadline (last_pong +
+                // hb_timeout_dur) instead of polling every second, so each
+                // Pong arrival naturally reschedules the wakeup. Uses sleep
+                // so the timer is only active when hb_timeout > 0. Explicit
+                // negative values disable it independently of tcp_mux.
+                // Gated on the ping loop being active (hb_watchdog_active):
+                // with heartbeat_interval <= 0 no Pong can ever arrive.
+                _ = tokio::time::sleep(ctx.hb_timeout_dur.saturating_sub(ctx.last_pong.elapsed())), if ctx.hb_watchdog_active => {
+                    warn!("Heartbeat timeout ({}s), reconnecting...", ctx.hb_timeout);
+                    return LoopExit::Reconnect;
+                }
+                // The dedicated writer task hit a write failure (peer
+                // dead / connection reset on the control path). Tear down
+                // and reconnect, mirroring the read-error branch.
+                _ = writer.wait_failed() => {
+                    warn!("Control writer failed, reconnecting...");
+                    return LoopExit::Reconnect;
+                }
+            }
+        }
+    }
+
+    /// Phase 7 of one connection attempt: tear down the session — remove
+    /// vnet routes advertised by virtual_net visitors, signal the work-conn
+    /// pool and visitor listeners to stop, drop the yamux handle, and wait
+    /// briefly for visitor tasks to exit. Returns true when a stop was
+    /// requested during the session (shutdown_flag set); run() then exits
+    /// instead of reconnecting.
+    async fn teardown_session(
+        &self,
+        ctx: &mut SessionCtx,
+        #[cfg(feature = "tcp-mux")] prev_yamux: &mut Option<
+            std::sync::Arc<frp_core::mux::YamuxSession>,
+        >,
+        health_cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+        admin_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    ) -> bool {
+        // Clean up vnet routes advertised by virtual_net visitors before
+        // dropping the control connection. The server also removes routes
+        // during control teardown; this mirrors Go frp's explicit
+        // VnetRouteRemove from the visitor plugin Close().
+        #[cfg(feature = "vnet")]
+        {
+            let writer = ctx
+                .writer
+                .as_ref()
+                .expect("writer available before teardown")
+                .clone();
+            // Remove OS routes learned from peers and clear their route
+            // table entries so a reconnect starts from a clean slate.
+            {
+                let peer_routes = self.vnet_peer_routes.lock().await;
+                for (proxy_name, (subnet, tun_name, vnet)) in peer_routes.iter() {
+                    remove_os_route(subnet, tun_name);
+                    self.vnet_controller
+                        .route_table()
+                        .write()
+                        .await
+                        .remove(vnet, proxy_name);
+                }
+            }
+            self.vnet_peer_routes.lock().await.clear();
+
+            let session_visitors = self.cfg.read().await.visitors.clone();
+            for v in &session_visitors {
+                if v.plugin.as_ref().is_none() || !v.enabled {
+                    continue;
+                }
+                if let Some(adv) = virtual_net_visitor_route_adv(v) {
+                    self.vnet_controller.unregister_visitor_route(&v.name).await;
+                    let rem = msg::VnetRouteRemove {
+                        proxy_name: adv.proxy_name,
+                        virtual_net: adv.virtual_net,
+                    };
+                    let msg = FrpMessage::VnetRouteRemove(rem);
+                    if let Err(e) = writer.send(msg, ctx.v2) {
+                        warn!(visitor_name = %v.name, error = %e, "failed to remove vnet route for visitor '{}'", v.name);
+                    } else {
+                        info!(visitor_name = %v.name, "vnet route removed for visitor '{}'", v.name);
+                    }
+                }
+            }
+        }
+
+        // Go frp GracefulClose ordering: close proxies first, then visitors,
+        // then the control connection. See /tmp/frp-source/client/control.go:203-210.
+        // Step 1: Signal work connection pool to stop replenishment cascade.
+        ctx.session_alive.store(false, Ordering::Release);
+
+        // Step 2: Signal visitor listeners to stop accepting new connections
+        // (Go frp compat: vm.Close() closes all visitors before session is torn down).
+        ctx.visitor_shutdown
+            .as_ref()
+            .expect("visitor_shutdown available before teardown")
+            .store(true, Ordering::Release);
+
+        // Step 3: Drop the control connection (Go frp compat: closeSession()).
+        // Dropping prev_yamux closes the underlying TCP socket so the background
+        // yamux task exits before we attempt to reconnect. This prevents
+        // dual-yamux-session leaks through a half-open TCP mux connection.
+        #[cfg(feature = "tcp-mux")]
+        drop(prev_yamux.take());
+
+        // Wait briefly for visitor tasks to notice the shutdown signal and
+        // exit gracefully (timeout so we never block reconnection).
+        // Any listener still blocked in accept() after the grace period is
+        // force-aborted so the bind port is released for the next session.
+        self.shutdown_visitor_tasks(std::mem::take(&mut ctx.visitor_handles))
+            .await;
+
+        // Check if admin stop was requested
+        if ctx.shutdown_flag.load(Ordering::SeqCst) {
+            info!("frpc shutting down");
+            // Cancel health check tasks and abort the admin HTTP server
+            // before returning. Both are detached tokio tasks; without
+            // this they keep running after run() exits (holding bind
+            // ports and channels until process exit).
+            self.cancel_detached_tasks(health_cancels, admin_handle.take())
+                .await;
+            return true;
+        }
+        false
+    }
+
+    /// Spawn a work connection in response to a ReqWorkConn message from the
+    /// server (pool pre-warm sent right after LoginResp, NewVisitorConn acks,
+    /// and on-demand requests — handled in the registration read loop and the
+    /// message loop). Go frp compat: work connections are created ONLY in
+    /// response to ReqWorkConn messages; pool_count is sent to the server via
+    /// Login so it knows how many ReqWorkConn messages to issue, and the
+    /// client never eagerly spawns pool connections.
+    fn handle_req_work_conn(&self, ctx: &SessionCtx) {
+        // Go frp v0.70.1 spawns each ReqWorkConn handler asynchronously
+        // with no client-side in-flight cap (client/control.go:
+        // handleReqWorkConn). Spawn directly so a burst of requests
+        // cannot overflow a queue or tear down the control session;
+        // each work conn's dial/StartWorkConn read is still bounded by
+        // its own timeout in work_conn.rs.
+        debug!("Received ReqWorkConn, spawning work connection");
+        #[cfg(feature = "quic")]
+        let quic_arg = ctx.quic_conn.clone();
+        #[cfg(not(feature = "quic"))]
+        let quic_arg = ();
+        crate::work_conn::spawn_work_conn(crate::work_conn::WorkConnConfig {
+            server_addr: ctx.wc_server_addr.clone(),
+            server_port: ctx.wc_server_port,
+            protocol: ctx.protocol.clone(),
+            run_id: ctx.run_id.clone(),
+            proxy_info_map: self.proxy_info_map.clone(),
+            enc_key: self.encryption_key,
+            pool_id: -1,
+            auth_cfg: self.auth_cfg.clone(),
+            tls_enable: ctx.wc_tls_enable,
+            tls_server_name: ctx.wc_tls_server_name.clone(),
+            tls_ca_file: ctx.wc_tls_ca_file.clone(),
+            tls_cert_file: ctx.wc_tls_cert_file.clone(),
+            tls_key_file: ctx.wc_tls_key_file.clone(),
+            dns_server: ctx.wc_dns_server.clone(),
+            yamux: ctx.yamux.clone(),
+            quic_conn: quic_arg,
+            v2: ctx.v2,
+            oidc_client: self.oidc_client.clone(),
+            udp_packet_size: ctx.wc_udp_packet_size,
+            proxy_metrics: self.proxy_metrics.clone(),
+            client_auth_scopes: ctx.client_scopes.clone(),
+            server_auth_scopes: ctx.server_scopes.clone(),
+            disable_custom_tls_first_byte: ctx.wc_disable_custom_tls_first_byte,
+            keepalive_secs: ctx.wc_keepalive_secs,
+            bind_addr: ctx.wc_bind_addr.clone(),
+            proxy_url: ctx.wc_proxy_url.clone(),
+            dial_timeout_secs: ctx.wc_dial_timeout_secs,
+            xtcp_tx: self.xtcp_tx.clone(),
+            session_alive: ctx.session_alive.clone(),
+            spawned_counter: None,
+            #[cfg(feature = "vnet")]
+            vnet_tuns: self.vnet_tuns.clone(),
+            #[cfg(feature = "vnet")]
+            vnet_controller: self.vnet_controller.clone(),
+            #[cfg(feature = "vnet")]
+            vnet_tun_tx: self.vnet_tun_tx.clone(),
+        });
     }
 
     /// Spawn per-proxy health check tasks (once, outside reconnect loop).
