@@ -581,6 +581,15 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
         // A backend without a semaphore is unlimited — forward with
         // permit None. A backend at cap is dropped here, mirroring the
         // local path's behavior.
+        //
+        // Window: the backend may unregister (control closed, reload)
+        // between the `get()` above and the `try_send` below. The permit
+        // then rides a `ProxyUserConn` for a dead proxy; the receiving
+        // handler's control loop is shutting down, so the permit is
+        // dropped (returning to the semaphore) once that control's
+        // shutdown drains the channel — bounded and self-releasing, and
+        // the proxy_manager `get()` returning `None` already covers the
+        // common unregister-before-get case. No leak either way.
         let forwarded_permit = match ctx.state.proxy_manager.get(&target_proxy).await {
             Some(p) => match p.user_conn_sem.clone() {
                 Some(sem) => match sem.try_acquire_owned() {

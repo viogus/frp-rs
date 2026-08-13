@@ -2461,3 +2461,102 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
+#[tokio::test]
+async fn test_connect_ws_raw_rejects_accept_mismatch() {
+    // A server that answers the upgrade with a WRONG Sec-WebSocket-Accept
+    // must fail the connect — the peer did not complete the WebSocket
+    // handshake, and sending the frp control stream to it would leak the
+    // stream to an arbitrary HTTP endpoint. (Positive path: real WS
+    // dials are covered end-to-end by the compat suite; this pins the
+    // rejection branch.)
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(sock);
+        // Consume the request line + headers.
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await.unwrap();
+            assert!(n > 0, "request ended early");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        let mut sock = reader.into_inner();
+        // Wrong accept value (valid base64, not the SHA1-derived one).
+        let resp = "HTTP/1.1 101 Switching Protocols\r\n\
+                        Upgrade: websocket\r\n\
+                        Connection: Upgrade\r\n\
+                        Sec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\
+                        \r\n";
+        use tokio::io::AsyncWriteExt;
+        sock.write_all(resp.as_bytes()).await.unwrap();
+        // Keep the socket open briefly so the client can read the
+        // response before we drop it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let err = connect_ws_raw(
+        TcpStream::connect(addr).await.unwrap(),
+        "127.0.0.1",
+        addr.port(),
+        "/",
+        "http",
+    )
+    .await
+    .expect_err("WS upgrade with wrong Sec-WebSocket-Accept must fail");
+    assert!(
+        err.to_string().contains("Sec-WebSocket-Accept mismatch"),
+        "expected mismatch error, got: {err}"
+    );
+    srv.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_connect_ws_raw_rejects_missing_accept_header() {
+    // A server answering 101 WITHOUT the Sec-WebSocket-Accept header must
+    // also fail the connect (missing -> not a completed handshake).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(sock);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await.unwrap();
+            assert!(n > 0, "request ended early");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        let mut sock = reader.into_inner();
+        // 101 without any Sec-WebSocket-Accept header.
+        let resp = "HTTP/1.1 101 Switching Protocols\r\n\
+                        Upgrade: websocket\r\n\
+                        Connection: Upgrade\r\n\
+                        \r\n";
+        use tokio::io::AsyncWriteExt;
+        sock.write_all(resp.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let err = connect_ws_raw(
+        TcpStream::connect(addr).await.unwrap(),
+        "127.0.0.1",
+        addr.port(),
+        "/",
+        "http",
+    )
+    .await
+    .expect_err("WS upgrade missing Sec-WebSocket-Accept must fail");
+    assert!(
+        err.to_string().contains("missing Sec-WebSocket-Accept"),
+        "expected missing-header error, got: {err}"
+    );
+    srv.await.unwrap();
+}

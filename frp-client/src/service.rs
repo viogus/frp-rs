@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 #[cfg(all(feature = "vnet", test))]
 use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -128,15 +128,35 @@ pub(crate) const VISITOR_PLUGIN_VIRTUAL_NET: &str = "virtual_net";
 /// and tolerates slow registration — this is the frp-rs equivalent with
 /// headroom for N pipelined requests and the `remote_addr` round-trip. On
 /// timeout the pending proxies are marked StartErr and the message loop's
-/// 30s retry re-registers them; the session itself is NOT torn down.
-pub(crate) const REGISTRATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// retry re-registers them; the session itself is NOT torn down.
+///
+/// Overridable via env `FRP_REGISTRATION_RESPONSE_TIMEOUT_MS` (milliseconds)
+/// — used by the integration tests to shrink the 30s wall-clock cadence.
+pub(crate) static REGISTRATION_RESPONSE_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    std::env::var("FRP_REGISTRATION_RESPONSE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(30))
+});
 
-/// Proxy retry cadence for the message-loop retry arm: every 30s,
-/// re-register proxies stuck in StartErr — or in WaitStart for a full
-/// interval (a NewProxy that is never answered keeps the phase in
-/// WaitStart; see the retry arm). Matches Go frp's
+/// Proxy retry cadence for the message-loop retry arm: re-register proxies
+/// stuck in StartErr (anchored on the last StartErr time — Go frp's
+/// `lastStartErr.Add(startErrTimeout)`, so a proxy that errors right after a
+/// tick is not re-sent until a full interval has elapsed since ITS error) —
+/// or in WaitStart for a full interval (a NewProxy that is never answered
+/// keeps the phase in WaitStart; see the retry arm). Matches Go frp's
 /// proxy_wrapper.checkWorker (default startErrTimeout 30s).
-pub(crate) const PROXY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+///
+/// Overridable via env `FRP_PROXY_RETRY_INTERVAL_MS` (milliseconds) — used
+/// by the integration tests to shrink the 30s wall-clock cadence.
+pub(crate) static PROXY_RETRY_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    std::env::var("FRP_PROXY_RETRY_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(30))
+});
 
 /// Tolerance for the WaitStart-stuck check in the retry arm. The stuck
 /// elapsed time compares two wall-clock `Instant`s (first-seen vs tick), so
@@ -1192,11 +1212,16 @@ impl Service {
                 // Heartbeat watchdog during registration: `last_pong` was
                 // armed at login success, and no Ping is sent during
                 // registration (pings start with the message loop), so no
-                // Pong can arrive — the deadline is the full hb_timeout from
-                // login. A server that stays connected but never answers is
-                // therefore detected within heartbeat_timeout (Go frp's
-                // heartbeat timer also runs continuously while its proxies
-                // register in goroutines). With the heartbeat disabled
+                // Pong can arrive — the deadline starts as the full
+                // hb_timeout from login, and is re-armed on every
+                // registration response below (a response proves the server
+                // is alive, so a server answering NewProxy steadily — even
+                // when many proxies total more than hb_timeout — must not be
+                // torn down mid-registration). A server that stays connected
+                // but never answers is therefore detected within
+                // heartbeat_timeout of its last response (Go frp's heartbeat
+                // timer also runs continuously while its proxies register in
+                // goroutines). With the heartbeat disabled
                 // (hb_watchdog_active false) the watchdog must never fire:
                 // sleep for ~136 years so both branches share the same Sleep
                 // type, leaving the per-read deadlines below as the bound.
@@ -1279,7 +1304,7 @@ impl Service {
                         }
                     };
                     tokio::select! {
-                        r = tokio::time::timeout(REGISTRATION_RESPONSE_TIMEOUT, read) => {
+                        r = tokio::time::timeout(*REGISTRATION_RESPONSE_TIMEOUT, read) => {
                             match r {
                                 Ok(Ok(m)) => m,
                                 Ok(Err(e)) => {
@@ -1332,6 +1357,11 @@ impl Service {
                 match resp_msg {
                     FrpMessage::NewProxyResp(resp) => {
                         seen_registration_response = true;
+                        // The server answered — it is provably alive, so the
+                        // registration watchdog restarts from here instead of
+                        // counting from login (a slow-but-steady registration
+                        // must not be torn down).
+                        last_pong = Instant::now();
                         // Match by wire proxy_name: responses may arrive in any
                         // order relative to the requests they answer.
                         let Some(pos) = pending_proxies
@@ -1378,6 +1408,9 @@ impl Service {
                     }
                     FrpMessage::NewVisitorConnResp(resp) => {
                         seen_registration_response = true;
+                        // Same liveness proof as NewProxyResp: any server
+                        // response during registration re-arms the watchdog.
+                        last_pong = Instant::now();
                         let Some(pos) = pending_visitors
                             .iter()
                             .position(|(name, _)| *name == resp.proxy_name)
@@ -1791,7 +1824,7 @@ impl Service {
                 // Proxy retry interval: every 30s, re-register proxies stuck in
                 // StartErr (or in WaitStart past one interval — see the retry arm).
                 // Matches Go frp's proxy_wrapper.checkWorker (default startErrTimeout 30s).
-                let mut proxy_retry_interval = tokio::time::interval(PROXY_RETRY_INTERVAL);
+                let mut proxy_retry_interval = tokio::time::interval(*PROXY_RETRY_INTERVAL);
                 proxy_retry_interval.tick().await; // Skip first immediate tick
 
                 // When each proxy last entered WaitStart (initial registration or a
@@ -1802,6 +1835,23 @@ impl Service {
                 // proxy_wrapper re-arms startErrTimeout while in waitStart and
                 // retries indefinitely). Pruned when the proxy leaves WaitStart.
                 let mut waitstart_seen: HashMap<String, Instant> = HashMap::new();
+
+                // When each proxy last entered StartErr (message-loop
+                // NewProxyResp error). Go frp's proxy_wrapper anchors the
+                // StartErr retry on the error time (`lastStartErr.Add(
+                // startErrTimeout)`), so a proxy that errors right before a
+                // tick must NOT be re-sent at the tick — that would re-arm
+                // the error immediately and, for a permanently-rejected
+                // proxy (e.g. remote_port in use), hammer the server with a
+                // NewProxy every tick while staying in StartErr. The retry
+                // arm gates StartErr proxies on
+                // `now - last_start_err >= PROXY_RETRY_INTERVAL`, mirroring
+                // Go's `startErrTimeout` anchored on the error. Proxies that
+                // entered StartErr during the REGISTRATION phase (before the
+                // message loop) have no entry here — treated as eligible at
+                // the first tick, preserving the pre-loop behavior. Pruned
+                // when the proxy leaves StartErr.
+                let mut last_start_err: HashMap<String, Instant> = HashMap::new();
 
                 // The message loop handles config reloads (try_reload), which
                 // take the config write lock — the snapshot read guard must be
@@ -1877,6 +1927,14 @@ impl Service {
                                             if info.phase == ProxyPhase::WaitStart {
                                                 info.err = err.clone();
                                                 info.phase = ProxyPhase::StartErr(err.clone());
+                                                // Anchor the StartErr retry on the error
+                                                // time (Go frp: lastStartErr.Add(
+                                                // startErrTimeout)) so the next tick
+                                                // does not immediately re-send.
+                                                last_start_err.insert(
+                                                    resp.proxy_name.clone(),
+                                                    Instant::now(),
+                                                );
                                             }
                                         }
                                     } else {
@@ -2106,10 +2164,27 @@ impl Service {
                         }
 
                         _ = proxy_retry_interval.tick() => {
+                            let now = Instant::now();
                             let mut to_retry: Vec<(String, String)> = {
                                 let map = self.proxy_info_map.read().await;
                                 map.iter()
                                     .filter(|(_, info)| matches!(info.phase, ProxyPhase::StartErr(_)))
+                                    // Go frp parity: a StartErr proxy is retried only
+                                    // once a full interval has elapsed since ITS last
+                                    // error (lastStartErr.Add(startErrTimeout)) — not
+                                    // on the tick boundary. A permanently-rejected
+                                    // proxy therefore gets at most one NewProxy per
+                                    // interval instead of one per tick (which, when
+                                    // an error lands just before a tick, re-arms the
+                                    // error and re-sends immediately — hammering the
+                                    // server). Proxies that entered StartErr during
+                                    // registration have no entry here; they are
+                                    // eligible at the first tick (pre-loop behavior).
+                                    .filter(|(name, _)| {
+                                        last_start_err
+                                            .get(*name)
+                                            .is_none_or(|t| now.duration_since(*t) >= *PROXY_RETRY_INTERVAL)
+                                    })
                                     .map(|(name, info)| (name.clone(), info.local_addr.clone()))
                                     .collect()
                             };
@@ -2127,10 +2202,17 @@ impl Service {
                             // (registered, errored, or closed).
                             {
                                 let map = self.proxy_info_map.read().await;
-                                let now = Instant::now();
                                 waitstart_seen.retain(|name, _| {
                                     map.get(name).is_some_and(|info| {
                                         info.phase == ProxyPhase::WaitStart
+                                    })
+                                });
+                                // Prune StartErr anchors for proxies that left
+                                // StartErr (registered, closed, or re-entered
+                                // WaitStart via a retry send below).
+                                last_start_err.retain(|name, _| {
+                                    map.get(name).is_some_and(|info| {
+                                        matches!(info.phase, ProxyPhase::StartErr(_))
                                     })
                                 });
                                 for (name, info) in map.iter() {
@@ -2148,7 +2230,7 @@ impl Service {
                                     if info.phase == ProxyPhase::WaitStart
                                         && waitstart_seen.get(name).is_some_and(|first_seen| {
                                             now.duration_since(*first_seen)
-                                                >= PROXY_RETRY_INTERVAL - PROXY_RETRY_GRACE
+                                                >= *PROXY_RETRY_INTERVAL - PROXY_RETRY_GRACE
                                         })
                                     {
                                         Some((name.clone(), info.local_addr.clone()))
