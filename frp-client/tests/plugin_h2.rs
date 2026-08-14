@@ -227,6 +227,16 @@ async fn start_tls_capture_backend(
                 let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
                 let _ = tls.write_all(resp).await;
                 let _ = tls.flush().await;
+                // Explicit TLS close (close_notify + flush of the response
+                // record) instead of dropping the TlsStream: tokio-rustls
+                // buffers plaintext on the write side (BufWriter semantics —
+                // see tokio-rustls src/lib.rs), and dropping the stream
+                // right after flush() can race with the peer's read, which
+                // then sees a bare FIN (no close_notify) and fails the read.
+                // This made the https2https test flaky (expected 200, got 502
+                // on ~50% of runs). shutdown() flushes everything and sends
+                // close_notify, matching how real TLS HTTP backends close.
+                let _ = tls.shutdown().await;
             }
         }
     });
