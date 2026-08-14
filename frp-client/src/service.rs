@@ -155,6 +155,10 @@ pub(crate) static PROXY_RETRY_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
+        // Clamp to >= 1ms: tokio::time::interval panics on a zero period,
+        // and the WaitStart-stuck check saturating_sub already tolerates
+        // sub-grace intervals — a 0ms override must degrade, not panic.
+        .map(|d| d.max(Duration::from_millis(1)))
         .unwrap_or(Duration::from_secs(30))
 });
 
@@ -1701,7 +1705,7 @@ impl Service {
                                 );
                                 warn!(
                                     proxies = %ctx.pending_proxies.len(),
-                                    timeout = %REGISTRATION_RESPONSE_TIMEOUT.as_millis(),
+                                    timeout_ms = REGISTRATION_RESPONSE_TIMEOUT.as_millis(),
                                     "Registration response timeout; marking {} pending proxies as failed",
                                     ctx.pending_proxies.len()
                                 );
@@ -2651,10 +2655,10 @@ impl Service {
                         to_retry.extend(map.iter().filter_map(|(name, info)| {
                             if info.phase == ProxyPhase::WaitStart
                                 && ctx.waitstart_seen.get(name).is_some_and(|first_seen| {
+                                    // saturating_sub: an env-shrunk
+                                    // interval below the 100ms grace must
+                                    // not underflow (panic).
                                     now.duration_since(*first_seen)
-                                        // saturating_sub: an env-shrunk
-                                        // interval below the 100ms grace must
-                                        // not underflow (panic).
                                         >= (*PROXY_RETRY_INTERVAL)
                                             .saturating_sub(PROXY_RETRY_GRACE)
                                 })
