@@ -23,7 +23,13 @@
 //!
 //! The env vars MUST be set before `Service` is constructed: the cadence is
 //! read once into a `LazyLock` at first use (same pattern as
-//! `FRP_BRIDGE_BUF_KB`).
+//! `FRP_BRIDGE_BUF_KB`). This file deliberately contains exactly ONE test
+//! binary (one `#[tokio::test]`), so the process-global `set_var` + read-once
+//! LazyLock cannot be frozen at the 30s default by a sibling test running
+//! first. If a second test is ever added here, move the cadence setup into a
+//! shared per-binary init that runs before any `Service` is constructed
+//! (e.g. `common::init_cadence()` called from every test), or pass the
+//! cadence through a `Service` constructor instead of env vars.
 
 mod common;
 
