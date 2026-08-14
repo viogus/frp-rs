@@ -120,6 +120,21 @@ use crate::work_conn::XtcpNotification;
 /// Go frp v0.70.1 visitor plugin type for virtual-net host routes.
 pub(crate) const VISITOR_PLUGIN_VIRTUAL_NET: &str = "virtual_net";
 
+// Read an env-overridable millisecond duration knob (used by the
+// integration tests to shrink the 30s wall-clock cadence) and clamp it to
+// >= 1ms. A 0ms override must degrade rather than panic — tokio::time::interval
+// panics on a zero period, and a zero timeout makes every registration
+// response time out instantly, turning frpc into a 1k msg/s NewProxy flood
+// against its server (the LOW finding that prompted this helper).
+fn env_duration_ms(var: &str, default: Duration) -> Duration {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .map(|d| d.max(Duration::from_millis(1)))
+        .unwrap_or(default)
+}
+
 /// Bounds each registration-response read in the registration phase.
 ///
 /// A server that accepts Login but never answers NewProxy (stays connected,
@@ -129,15 +144,11 @@ pub(crate) const VISITOR_PLUGIN_VIRTUAL_NET: &str = "virtual_net";
 /// headroom for N pipelined requests and the `remote_addr` round-trip. On
 /// timeout the pending proxies are marked StartErr and the message loop's
 /// retry re-registers them; the session itself is NOT torn down.
-///
-/// Overridable via env `FRP_REGISTRATION_RESPONSE_TIMEOUT_MS` (milliseconds)
-/// — used by the integration tests to shrink the 30s wall-clock cadence.
 pub(crate) static REGISTRATION_RESPONSE_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
-    std::env::var("FRP_REGISTRATION_RESPONSE_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(30))
+    env_duration_ms(
+        "FRP_REGISTRATION_RESPONSE_TIMEOUT_MS",
+        Duration::from_secs(30),
+    )
 });
 
 /// Proxy retry cadence for the message-loop retry arm: re-register proxies
@@ -147,20 +158,8 @@ pub(crate) static REGISTRATION_RESPONSE_TIMEOUT: LazyLock<Duration> = LazyLock::
 /// or in WaitStart for a full interval (a NewProxy that is never answered
 /// keeps the phase in WaitStart; see the retry arm). Matches Go frp's
 /// proxy_wrapper.checkWorker (default startErrTimeout 30s).
-///
-/// Overridable via env `FRP_PROXY_RETRY_INTERVAL_MS` (milliseconds) — used
-/// by the integration tests to shrink the 30s wall-clock cadence.
-pub(crate) static PROXY_RETRY_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
-    std::env::var("FRP_PROXY_RETRY_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        // Clamp to >= 1ms: tokio::time::interval panics on a zero period,
-        // and the WaitStart-stuck check saturating_sub already tolerates
-        // sub-grace intervals — a 0ms override must degrade, not panic.
-        .map(|d| d.max(Duration::from_millis(1)))
-        .unwrap_or(Duration::from_secs(30))
-});
+pub(crate) static PROXY_RETRY_INTERVAL: LazyLock<Duration> =
+    LazyLock::new(|| env_duration_ms("FRP_PROXY_RETRY_INTERVAL_MS", Duration::from_secs(30)));
 
 /// Tolerance for the WaitStart-stuck check in the retry arm. The stuck
 /// elapsed time compares two wall-clock `Instant`s (first-seen vs tick), so
@@ -2336,12 +2335,7 @@ impl Service {
                             self.handle_nat_hole_resp(*resp, &mut ctx.pending_xtcp, &mut ctx.visitor_pending, &ctx.xtcp_sockets, &writer, ctx.session_alive.clone()).await;
                         }
                         Ok(FrpMessage::NewProxyResp(resp)) => {
-                            let is_error = resp.error.as_ref().is_some_and(|e| !e.is_empty());
-                            if is_error {
-                                let err = resp
-                                    .error
-                                    .as_ref()
-                                    .expect("is_some_and guard above guarantees Some");
+                            if let Some(err) = resp.error.as_ref().filter(|e| !e.is_empty()) {
                                 warn!(proxy_name = %resp.proxy_name, error = %err, "Proxy '{}' registration error: {}", resp.proxy_name, err);
                                 // Update phase if proxy was being retried (WaitStart -> StartErr).
                                 let mut map = self.proxy_info_map.write().await;
@@ -2684,9 +2678,17 @@ impl Service {
                         let all_proxies = Arc::clone(&*self.proxies.read().await);
                         let retry_candidates =
                             filter_active_proxies(&*self.cfg.read().await, &all_proxies);
+                        // Hoist the wire-name prefix (format! allocates); it is
+                        // loop-invariant within this tick.
+                        let cfg_user_prefix = if ctx.cfg_user.is_empty() {
+                            None
+                        } else {
+                            Some(format!("{}.", ctx.cfg_user))
+                        };
                         for (name, local_addr) in to_retry {
-                            let bare_name = if ctx.cfg_user.is_empty() { name.as_str() } else {
-                                name.strip_prefix(&format!("{}.", ctx.cfg_user)).unwrap_or(&name)
+                            let bare_name = match &cfg_user_prefix {
+                                Some(prefix) => name.strip_prefix(prefix).unwrap_or(&name),
+                                None => name.as_str(),
                             };
                             if let Some(p) = retry_candidates.iter().find(|p| p.name == bare_name) {
                                 let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &ctx.cfg_user);
@@ -3047,12 +3049,25 @@ impl Service {
             self.vnet_peer_routes.lock().await.clear();
 
             let session_visitors = self.cfg.read().await.visitors.clone();
+            // The VnetRouteRemove below rides the control writer channel.
+            // That channel is only consumed by the dedicated writer task,
+            // which is spawned with the message loop (`control_rx.take()`).
+            // On the registration-abort teardown path no writer task exists,
+            // so a send would enqueue into a never-consumed channel and the
+            // `info!` success log would be misleading — skip it (the local
+            // route removal above already ran, and the server also removes
+            // routes during control teardown).
+            let writer_task_active = ctx.control_rx.is_none();
             for v in &session_visitors {
                 if v.plugin.as_ref().is_none() || !v.enabled {
                     continue;
                 }
                 if let Some(adv) = virtual_net_visitor_route_adv(v) {
                     self.vnet_controller.unregister_visitor_route(&v.name).await;
+                    if !writer_task_active {
+                        debug!(visitor_name = %v.name, "vnet route removal skipped (no control writer task on registration-abort teardown)");
+                        continue;
+                    }
                     let rem = msg::VnetRouteRemove {
                         proxy_name: adv.proxy_name,
                         virtual_net: adv.virtual_net,
