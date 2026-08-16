@@ -228,6 +228,13 @@ pub(super) fn default_authentication_timeout() -> i64 {
     // both skipped, so a sniffed Login frame can be replayed for the token's
     // lifetime. Deliberate divergence from Go for a safer default; set
     // `authenticationTimeout = 0` explicitly to restore Go behaviour.
+    //
+    // frp-rs-only hardening: Go frp v0.71.0 does MD5 equality only
+    // (pkg/auth/token.go), no freshness check and no replay table. The
+    // 90s window + replay table here is a Rust-side addition — normal Go
+    // clients pass (timestamps classified <1e12 as seconds; same-second
+    // reconnects are allowed); only a clock skew > 90s between client and
+    // server drops the connection.
     90
 }
 pub(super) fn default_token_auth_timeout() -> bool {
@@ -487,7 +494,12 @@ pub struct ExecEnvVar {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthServerConfig {
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "authentication_method",
+        alias = "auth_method",
+        alias = "authMethod"
+    )]
     pub method: String,
     #[serde(default)]
     pub token: String,
@@ -501,9 +513,19 @@ pub struct AuthServerConfig {
     pub oidc_audience: String,
     #[serde(default)]
     pub oidc_token_endpoint: String,
-    #[serde(default, alias = "oidcSkipExpiry", alias = "oidcSkipExpiryCheck")]
+    #[serde(
+        default,
+        alias = "oidcSkipExpiry",
+        alias = "oidcSkipExpiryCheck",
+        alias = "oidc_skip_expiry_check"
+    )]
     pub oidc_skip_expiry: bool,
-    #[serde(default, alias = "oidcSkipIssuer", alias = "oidcSkipIssuerCheck")]
+    #[serde(
+        default,
+        alias = "oidcSkipIssuer",
+        alias = "oidcSkipIssuerCheck",
+        alias = "oidc_skip_issuer_check"
+    )]
     pub oidc_skip_issuer: bool,
     #[serde(default, alias = "oidcSkipNbf")]
     pub oidc_skip_nbf: bool,

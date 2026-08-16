@@ -3490,6 +3490,16 @@ fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Er
     Ok(cfg)
 }
 
+/// Same for server configs.
+fn load_server_ini(content: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let mut value = super::format::parse_to_toml_value(content, super::format::ConfigFormat::Ini)?;
+    super::normalize::normalize_server_config(&mut value);
+    let cfg: ServerConfig = serde_json::from_value(super::normalize::toml_to_json(value))
+        .map_err(|e| format!("config validation error: {e}"))?;
+    super::validate_server_config(&cfg)?;
+    Ok(cfg)
+}
+
 /// Go legacy INI proxy sections: [web]/[ssh] become [proxies] entries,
 /// [range:xxx] expands to per-port proxies, [plugin:xxx] keeps its prefix,
 /// and role=visitor sections land in [visitors].
@@ -3672,4 +3682,76 @@ remote_port = 16000
     assert_eq!(cfg.proxies[0].name, "single_0");
     assert_eq!(cfg.proxies[0].local_port, 6000);
     assert_eq!(cfg.proxies[0].remote_port, 16000);
+}
+
+/// Go legacy INI server keys: authentication_method -> [auth].method (the
+/// BLOCKER from the audit — OIDC silently fell back to token), server-side
+/// authenticate_* -> additional_auth_scopes, top-level tcp_keepalive and
+/// quic_* -> [transport], and [plugin.xxx] sections -> http_plugins.
+#[test]
+fn test_legacy_ini_server_gaps_round2() {
+    let cfg: ServerConfig = load_server_ini(
+        r#"bind_port = 7000
+authentication_method = oidc
+authenticate_heartbeats = true
+authenticate_new_work_conns = true
+tcp_keepalive = 7200
+quic_keepalive_period = 15
+quic_max_idle_timeout = 45
+quic_max_incoming_streams = 200
+
+[plugin.http_proxy]
+addr = "127.0.0.1:8888"
+path = "/handler"
+ops = ["login"]
+
+[plugin.static_file]
+addr = "http://127.0.0.1:9999"
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.auth.method, "oidc");
+    let scopes = cfg.auth.additional_auth_scopes;
+    assert!(
+        scopes.contains(&"HeartBeats".to_string()),
+        "scopes: {scopes:?}"
+    );
+    assert!(
+        scopes.contains(&"NewWorkConns".to_string()),
+        "scopes: {scopes:?}"
+    );
+    assert_eq!(cfg.transport.tcp_keepalive, 7200);
+    let quic = cfg.transport.quic_options.as_ref().expect("quic options");
+    assert_eq!(quic.keepalive_period, 15);
+    assert_eq!(quic.max_idle_timeout, 45);
+    assert_eq!(quic.max_incoming_streams, 200);
+    assert_eq!(cfg.http_plugins.len(), 2);
+    let hp = cfg
+        .http_plugins
+        .iter()
+        .find(|p| p.name == "http_proxy")
+        .unwrap();
+    assert_eq!(hp.addr, "127.0.0.1:8888");
+    assert_eq!(hp.path, "/handler");
+    assert_eq!(hp.ops, vec!["login"]);
+    let sf = cfg
+        .http_plugins
+        .iter()
+        .find(|p| p.name == "static_file")
+        .unwrap();
+    assert_eq!(sf.addr, "http://127.0.0.1:9999");
+}
+
+/// The `authentication_method` serde alias also works on the canonical
+/// [auth] section (defense in depth beyond the normalize mapping).
+#[test]
+fn test_auth_method_alias_authentication_method() {
+    let cfg: ServerConfig = load_server_config_from_str(
+        r#"bind_port = 7000
+[auth]
+authentication_method = "oidc"
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.auth.method, "oidc");
 }

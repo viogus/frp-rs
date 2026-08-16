@@ -63,7 +63,11 @@ pub struct AuthClientConfig {
     pub oidc_client_secret: String,
     #[serde(default, alias = "oidcAudience")]
     pub oidc_audience: String,
-    #[serde(default, alias = "oidcTokenEndpoint")]
+    #[serde(
+        default,
+        alias = "oidcTokenEndpoint",
+        alias = "oidc_token_endpoint_url"
+    )]
     pub oidc_token_endpoint: String,
     #[serde(default, alias = "oidcScope")]
     pub oidc_scope: String,

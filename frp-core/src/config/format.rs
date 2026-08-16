@@ -213,6 +213,16 @@ fn infer_ini_value(s: &str) -> toml::Value {
         _ => {}
     }
 
+    // ["a", "b"] array literal (Go ini.v1 []string syntax) → Array
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        let parts: Vec<toml::Value> = inner
+            .split(',')
+            .map(|p| infer_ini_value(p.trim()))
+            .collect();
+        return toml::Value::Array(parts);
+    }
+
     // Comma-separated → Array (type-infer each element)
     if s.contains(',') {
         let parts: Vec<toml::Value> = s.split(',').map(|p| infer_ini_value(p.trim())).collect();
