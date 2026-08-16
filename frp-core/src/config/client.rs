@@ -145,6 +145,15 @@ pub struct VirtualNetConfig {
     pub address: String,
 }
 
+/// One HTTP header for a proxy health check (Go frp `HTTPHeader{name,value}`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct HealthCheckHttpHeader {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub server_addr: String,
@@ -486,7 +495,7 @@ pub struct ProxyConfig {
     pub health_check_url: String,
     /// Custom HTTP headers for health check requests (Go frp compat: healthCheckHttpHeaders).
     #[serde(default, alias = "healthCheckHttpHeaders")]
-    pub health_check_http_headers: std::collections::HashMap<String, String>,
+    pub health_check_http_headers: Vec<HealthCheckHttpHeader>,
     #[serde(default = "default_health_check_interval_seconds")]
     pub health_check_interval_seconds: u64,
     #[serde(default = "default_health_check_timeout_seconds")]

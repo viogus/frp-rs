@@ -289,7 +289,7 @@ impl TestHarness {
                 vnet_ip: String::new(),
                 vnet_netmask: String::new(),
                 vnet_mtu: 1420,
-                health_check_http_headers: std::collections::HashMap::new(),
+                health_check_http_headers: Vec::new(),
                 proxy_protocol_version: String::new(),
                 enabled: true,
                 disable_assisted_addrs: false,

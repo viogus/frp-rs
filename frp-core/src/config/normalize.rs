@@ -595,30 +595,11 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             }
         }
 
-        // MEDIUM-6: Normalize http_plugins[*].addr + .path → .url
-        if let Some(toml::Value::Array(plugins)) = table.get_mut("http_plugins") {
-            for plugin_val in plugins.iter_mut() {
-                if let Some(ref mut pt) = plugin_val.as_table_mut() {
-                    if !pt.contains_key("url") {
-                        let addr = pt.get("addr").and_then(|v| v.as_str()).map(String::from);
-                        let path = pt.get("path").and_then(|v| v.as_str()).map(String::from);
-                        if let Some(addr) = addr {
-                            let url = if let Some(p) = path {
-                                let p = if p.starts_with('/') {
-                                    p
-                                } else {
-                                    format!("/{}", p)
-                                };
-                                format!("{}{}", addr.trim_end_matches('/'), p)
-                            } else {
-                                addr
-                            };
-                            pt.insert("url".to_string(), toml::Value::String(url));
-                        }
-                    }
-                }
-            }
-        }
+        // (removed MEDIUM-6: http_plugins[*].addr+path → url back-fill. The
+        // canonical form is now Go's addr+path; the legacy single `url` field
+        // is handled by the `url` serde alias on HttpPluginConfig.addr —
+        // emitting a synthesized "url" key alongside addr would duplicate the
+        // field.)
 
         // Normalize camelCase section names to snake_case
         if let Some(ssh_section) = table.remove("sshTunnelGateway") {
@@ -996,22 +977,10 @@ fn normalize_proxies(table: &mut toml::Table) {
                     other => other,
                 };
                 let value = if k == "httpHeaders" {
-                    match v {
-                        Value::Array(items) => {
-                            let mut map = toml::Table::new();
-                            for item in items {
-                                if let Some(t) = item.as_table() {
-                                    let name =
-                                        t.get("name").and_then(Value::as_str).unwrap_or_default();
-                                    let value =
-                                        t.get("value").and_then(Value::as_str).unwrap_or_default();
-                                    map.insert(name.to_string(), Value::String(value.to_string()));
-                                }
-                            }
-                            Value::Table(map)
-                        }
-                        other => other,
-                    }
+                    // Go frp: healthCheck.httpHeaders is an ARRAY of
+                    // {name,value} (HTTPHeader) — keep it as-is so the
+                    // canonical Vec<HealthCheckHttpHeader> deserializes it.
+                    v
                 } else {
                     v
                 };

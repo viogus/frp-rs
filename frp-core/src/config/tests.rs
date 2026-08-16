@@ -688,8 +688,9 @@ enabled = false
     assert_eq!(
         proxy
             .health_check_http_headers
-            .get("X-Token")
-            .map(String::as_str),
+            .iter()
+            .find(|h| h.name == "X-Token")
+            .map(|h| h.value.as_str()),
         Some("abc")
     );
     let plugin = proxy.plugin.as_ref().expect("plugin");
@@ -2301,7 +2302,8 @@ addr = "http://127.0.0.1:4000"
 path = "/handler"
 "#;
     let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
-    assert_eq!(cfg.http_plugins[0].url, "http://127.0.0.1:4000/handler");
+    assert_eq!(cfg.http_plugins[0].addr, "http://127.0.0.1:4000");
+    assert_eq!(cfg.http_plugins[0].path, "/handler");
 }
 
 // ── MEDIUM-8: custom_404_page normalization ────────────────────────

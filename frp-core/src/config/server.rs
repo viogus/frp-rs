@@ -651,6 +651,9 @@ pub struct WebServerTlsConfig {
     pub key_file: String,
     #[serde(default, alias = "trustedCaFile")]
     pub trusted_ca_file: String,
+    /// TLS server name (Go WebServerConfig.TLS.serverName).
+    #[serde(default, alias = "serverName")]
+    pub server_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -753,8 +756,15 @@ pub struct HttpPluginConfig {
     /// Plugin name for logging.
     #[serde(default)]
     pub name: String,
-    /// URL of the plugin server (e.g. "http://127.0.0.1:4000/handler").
-    pub url: String,
+    /// Plugin server host:port (Go HTTPPluginOptions.Addr). May carry an
+    /// http:// or https:// scheme prefix; a bare host:port gets "http://".
+    /// Canonical Go field; `url` remains as an alias for legacy frp-rs
+    /// configs.
+    #[serde(default, alias = "url")]
+    pub addr: String,
+    /// Plugin URL path (Go HTTPPluginOptions.Path). Appended after `addr`.
+    #[serde(default)]
+    pub path: String,
     /// Operation this plugin handles: "login", "new_proxy", "close_proxy".
     /// Empty means all operations.
     #[serde(default)]

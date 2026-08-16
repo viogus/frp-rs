@@ -92,7 +92,7 @@ impl HttpPluginManager {
         let plugins = configs
             .into_iter()
             .map(|cfg| {
-                let client = if cfg.url.starts_with("https://") && !cfg.tls_verify {
+                let client = if cfg.addr.starts_with("https://") && !cfg.tls_verify {
                     // Go compat: tlsVerify=false → InsecureSkipVerify.
                     match frp_core::http_client::HttpClientBuilder::new()
                         .tls_skip_verify(true)
@@ -173,10 +173,11 @@ impl HttpPluginManager {
 
             // Go http.go do(): POST {url}?version=0.1.0&op=Login with X-Frp-Reqid.
             let reqid = uuid::Uuid::new_v4().to_string();
-            let url = format!(
-                "{}?version={}&op={}",
-                plugin.cfg.url, PLUGIN_API_VERSION, go_op
-            );
+            let mut base = format!("{}{}", plugin.cfg.addr, plugin.cfg.path);
+            if !base.starts_with("http://") && !base.starts_with("https://") {
+                base = format!("http://{base}");
+            }
+            let url = format!("{}?version={}&op={}", base, PLUGIN_API_VERSION, go_op);
             let mut headers = HeaderMap::new();
             headers.insert(
                 "X-Frp-Reqid",

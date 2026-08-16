@@ -299,7 +299,9 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
         }
 
         // Validate health check HTTP headers too (same CR/LF risk)
-        for (name, value) in &p.health_check_http_headers {
+        for h in &p.health_check_http_headers {
+            let name = &h.name;
+            let value = &h.value;
             if name.contains('\r') || name.contains('\n') {
                 return Err(format!(
                     "proxy '{}': health check header name contains CR/LF: {name:?}",

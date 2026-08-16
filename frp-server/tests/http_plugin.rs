@@ -76,7 +76,8 @@ async fn start_mock_plugin(state: SharedState) -> u16 {
 fn plugin_cfg(port: u16, ops: Vec<&str>, enable_control: bool) -> HttpPluginConfig {
     HttpPluginConfig {
         name: format!("mock-{port}"),
-        url: format!("http://127.0.0.1:{port}/handler"),
+        addr: format!("http://127.0.0.1:{port}"),
+        path: "/handler".to_string(),
         ops: ops.into_iter().map(String::from).collect(),
         timeout: 3,
         enable_control,

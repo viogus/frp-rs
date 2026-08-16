@@ -400,7 +400,16 @@ impl fmt::Display for UdpAddr {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UDPPacket {
-    #[serde(rename = "c", serialize_with = "b64_ser", deserialize_with = "b64_de")]
+    // Go frp v0.71.0: Content []byte `json:"c,omitempty"` — an empty datagram
+    // OMITS "c"; default lets us deserialize it (missing field 'c' would
+    // otherwise fail) and skip_serializing_if keeps Rust->Go byte-identical.
+    #[serde(
+        rename = "c",
+        default,
+        serialize_with = "b64_ser",
+        deserialize_with = "b64_de",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub content: Vec<u8>,
     #[serde(rename = "l", skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<UdpAddr>,
@@ -479,7 +488,9 @@ pub struct NatHoleClient {
     /// NAT hole session ID (Go frp v0.69.1 compat: sid).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
-    /// NAT traversal protocol: "quic" or "tcp" (Go frp v0.69.1 compat).
+    /// NAT traversal protocol: "quic" or "tcp" (Rust frp extension; not in
+    /// Go v0.71.0 NatHoleClient — Go's NatHoleResp carries `protocol`, which
+    /// is the likely confusion source).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     /// Provider/visitor addresses discovered via STUN.
