@@ -42,6 +42,8 @@ pub(crate) struct VisitorListenerConfig {
     pub min_retry_interval: i64,
     pub stun_server: String,
     /// XTCP P2P data plane protocol: "quic" (default, Go parity) or "kcp".
+    /// "quic" requires BOTH the `quic` and `kcp` features (the QUIC data
+    /// plane reuses the KCP hole-punch machinery).
     /// Both data planes are implemented; "kcp" is the default (Go compat
     /// matrix forces kcp), "quic" requires the `quic` feature.
     pub p2p_protocol: String,
@@ -665,10 +667,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 let assisted = resp.assisted_addrs.clone().unwrap_or_default();
                                 let behavior = resp.detect_behavior.clone();
                                 // Data-plane dispatch: the configured
-                                // `p2p_protocol` ("kcp" default, "quic" for the
-                                // QUIC data plane, Go v0.70.1 compat) selects the
-                                // transport. The visitor is the QUIC client /
-                                // yamux client (opens the stream).
+                                // `p2p_protocol` ("quic" default, Go v0.70.1
+                                // parity; "kcp" for the KCP data plane) selects
+                                // the transport. The visitor is the QUIC client
+                                // / yamux client (opens the stream). Both the
+                                // quic AND kcp features are required for the
+                                // QUIC data plane (it reuses the KCP
+                                // hole-punch machinery).
                                 let p2p_stream: Result<
                                     Box<dyn frp_core::xtcp_p2p::P2pStream>,
                                     String,

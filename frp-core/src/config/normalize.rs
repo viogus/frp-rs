@@ -399,22 +399,13 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             ],
         );
 
-        // Go legacy INI: dashboard_tls_mode (bool) -> [web_server] tls.enable.
-        if let Some(v) = table.remove("dashboard_tls_mode") {
-            if v.as_bool() == Some(true) {
-                let ws = table
-                    .entry("web_server".to_string())
-                    .or_insert_with(|| Value::Table(Default::default()));
-                if let Value::Table(w) = ws {
-                    let tls = w
-                        .entry("tls".to_string())
-                        .or_insert_with(|| Value::Table(Default::default()));
-                    if let Value::Table(t) = tls {
-                        t.insert("enable".to_string(), Value::Boolean(true));
-                    }
-                }
-            }
-        }
+        // Go legacy INI: dashboard_tls_mode (bool) is a TLS enable switch. In
+        // frp-rs the dashboard TLS is driven by non-empty cert/key (there is
+        // no separate enable flag), so the key is consumed as a no-op —
+        // removing it keeps strict mode from rejecting a valid Go key. When
+        // dashboard_tls_cert_file/key_file are also set, TLS is enabled by
+        // them regardless of this switch (same effective behavior as Go).
+        let _ = table.remove("dashboard_tls_mode");
 
         // Rename canonical Go camelCase section names.
         if let Some(v) = table.remove("webServer") {
@@ -717,7 +708,7 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
                     .unwrap_or_default();
                 scopes.extend(extra_scopes);
                 auth.insert(
-                    "additional_scopes".to_string(),
+                    "additional_auth_scopes".to_string(),
                     Value::Array(scopes.into_iter().map(Value::String).collect()),
                 );
             }
@@ -744,7 +735,8 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
         }
 
         // Go legacy INI: oidc_additional_endpoint_params (flattened map keys
-        // prefixed `oidc_additional_`) -> [auth.oidc] additional_endpoint_params.
+        // prefixed `oidc_additional_`) -> [auth] additional_endpoint_params
+        // (top-level, matching the MEDIUM-5 flatten target).
         let oidc_params: Vec<(String, Value)> = table
             .iter()
             .filter(|(k, _)| k.starts_with("oidc_additional_"))
@@ -763,23 +755,18 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
                 .entry("auth".to_string())
                 .or_insert_with(|| Value::Table(Default::default()));
             if let Value::Table(auth) = auth_table {
-                let oidc = auth
-                    .entry("oidc".to_string())
-                    .or_insert_with(|| Value::Table(Default::default()));
-                if let Value::Table(o) = oidc {
-                    let mut params = o
-                        .get("additional_endpoint_params")
-                        .and_then(Value::as_table)
-                        .cloned()
-                        .unwrap_or_default();
-                    for (k, v) in oidc_params {
-                        params.insert(k, v);
-                    }
-                    o.insert(
-                        "additional_endpoint_params".to_string(),
-                        Value::Table(params),
-                    );
+                let mut params = auth
+                    .get("additional_endpoint_params")
+                    .and_then(Value::as_table)
+                    .cloned()
+                    .unwrap_or_default();
+                for (k, v) in oidc_params {
+                    params.insert(k, v);
                 }
+                auth.insert(
+                    "additional_endpoint_params".to_string(),
+                    Value::Table(params),
+                );
             }
         }
 

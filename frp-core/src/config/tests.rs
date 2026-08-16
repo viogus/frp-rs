@@ -3383,3 +3383,96 @@ fn test_log_disable_print_color_parsed() {
             .unwrap();
     assert!(cfg.log.disable_print_color);
 }
+
+/// Go legacy INI client keys are mapped to their canonical locations
+/// (Go pkg/config/legacy conversion.go).
+#[test]
+fn test_legacy_ini_client_gaps_mapped() {
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+token = "t"
+authenticate_heartbeats = true
+authenticate_new_work_conns = true
+http_proxy = "http://proxy.example:8080"
+disable_log_color = true
+oidc_additional_foo = "bar"
+oidc_additional_aud = "baz"
+"#,
+    )
+    .unwrap();
+    let scopes = cfg
+        .auth
+        .as_ref()
+        .map(|a| a.additional_auth_scopes.clone())
+        .unwrap_or_default();
+    assert!(
+        scopes.contains(&"HeartBeats".to_string()),
+        "scopes: {scopes:?}"
+    );
+    assert!(
+        scopes.contains(&"NewWorkConns".to_string()),
+        "scopes: {scopes:?}"
+    );
+    assert_eq!(cfg.proxy_url, "http://proxy.example:8080");
+    assert!(cfg.log.disable_print_color);
+    let oidc_params = cfg
+        .auth
+        .as_ref()
+        .map(|a| a.additional_endpoint_params.clone())
+        .unwrap_or_default();
+    assert_eq!(oidc_params.get("foo"), Some(&"bar".to_string()));
+    assert_eq!(oidc_params.get("aud"), Some(&"baz".to_string()));
+}
+
+/// Go legacy INI server keys (pprof_enable, dashboard_tls_mode, and the
+/// dashboard_* -> web_server migration) are accepted without strict-mode
+/// rejection and land in the canonical fields.
+#[test]
+fn test_legacy_ini_server_gaps_mapped() {
+    let cfg: ServerConfig = load_server_config_from_str(
+        r#"bind_port = 7000
+token = "t"
+dashboard_addr = "127.0.0.1"
+dashboard_port = 7500
+dashboard_user = "admin"
+dashboard_pwd = "pw"
+dashboard_tls_cert_file = "/tmp/cert.pem"
+dashboard_tls_key_file = "/tmp/key.pem"
+dashboard_tls_mode = true
+pprof_enable = true
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+    assert_eq!(cfg.web_server.port, 7500);
+    assert_eq!(cfg.web_server.user, "admin");
+    assert_eq!(cfg.web_server.password, "pw");
+    assert_eq!(cfg.web_server.tls_cert(), "/tmp/cert.pem");
+    assert_eq!(cfg.web_server.tls_key(), "/tmp/key.pem");
+    assert!(cfg.web_server.pprof_enable);
+    // dashboard_tls_mode is consumed as a no-op (TLS driven by cert/key).
+    assert!(cfg.web_server.tls_cert_file.contains("cert.pem"));
+}
+
+/// The new web_server whitelist keys are accepted in strict mode.
+#[test]
+fn test_strict_accepts_web_server_tls_ca_and_server_name() {
+    let cfg: ServerConfig = load_server_config_from_str(
+        r#"bind_port = 7000
+token = "t"
+[web_server]
+addr = "127.0.0.1"
+port = 7500
+tls_cert_file = "/tmp/c.pem"
+tls_key_file = "/tmp/k.pem"
+trustedCaFile = "/tmp/ca.pem"
+serverName = "example.com"
+custom404Page = "<h1>nope</h1>"
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.web_server.tls_ca_file, "/tmp/ca.pem");
+    assert_eq!(cfg.web_server.tls_server_name, "example.com");
+    assert_eq!(cfg.web_server.custom_404_page, "<h1>nope</h1>");
+}
