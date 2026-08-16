@@ -55,7 +55,10 @@ pub fn verify_token(token: &str, timestamp: i64, expected_hex: &str) -> bool {
 /// server's duplicate-detection table; Go frpc sends seconds). A timestamp is
 /// fresh if EITHER interpretation fits the window, so both clients work.
 ///
-/// Go frp compat: matches the `authentication_timeout` check in `AuthConfig::validate_login`.
+/// Called from the server Login handler (`frp-server/src/control/login.rs`)
+/// when `token_auth_timeout` + `authentication_timeout` are enabled — NOT from
+/// `AuthConfig::validate_login_with_token`: the token path matches Go frp and
+/// checks only MD5(token+timestamp) equality, no freshness.
 pub fn validate_timestamp_freshness(timestamp: i64, timeout_secs: i64) -> Result<(), String> {
     if timeout_secs <= 0 {
         return Ok(());
