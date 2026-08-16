@@ -57,6 +57,27 @@ struct PluginResponse {
 ///
 /// On lifecycle events (login, new_proxy, close_proxy), notifies
 /// matching plugins via HTTP POST. Plugins with `enable_control: true`
+/// Join an HTTP plugin addr + path into a base URL, forgiving style:
+/// - trailing '/' on addr is trimmed (the `http://` scheme is preserved);
+/// - a path without a leading '/' gets one (so host:port + handler never
+///   becomes host:porthandler or host:port//handler);
+/// - a missing scheme defaults to http://.
+fn join_plugin_base(addr: &str, path: &str) -> String {
+    let addr = addr.trim_end_matches('/');
+    let base = if path.is_empty() {
+        addr.to_string()
+    } else if path.starts_with('/') {
+        format!("{addr}{path}")
+    } else {
+        format!("{addr}/{path}")
+    };
+    if base.starts_with("http://") || base.starts_with("https://") {
+        base
+    } else {
+        format!("http://{base}")
+    }
+}
+
 /// can approve or reject operations.
 pub struct HttpPluginManager {
     plugins: Arc<Vec<PluginDef>>,
@@ -92,7 +113,8 @@ impl HttpPluginManager {
         let plugins = configs
             .into_iter()
             .map(|cfg| {
-                let client = if cfg.addr.starts_with("https://") && !cfg.tls_verify {
+                let base = join_plugin_base(&cfg.addr, &cfg.path);
+                let client = if base.starts_with("https://") && !cfg.tls_verify {
                     // Go compat: tlsVerify=false → InsecureSkipVerify.
                     match frp_core::http_client::HttpClientBuilder::new()
                         .tls_skip_verify(true)
@@ -172,19 +194,16 @@ impl HttpPluginManager {
             };
 
             // Go http.go do(): POST {url}?version=0.1.0&op=Login with X-Frp-Reqid.
+            // Forgiving join (join_plugin_base): trims a trailing '/' from
+            // addr (never the http:// scheme), adds a leading '/' to a bare
+            // path, and defaults a missing scheme to http://.
             let reqid = uuid::Uuid::new_v4().to_string();
-            let mut base = format!("{}{}", plugin.cfg.addr, plugin.cfg.path);
-            // Forgiving join: a path without a leading slash gets one (the
-            // removed MEDIUM-6 normalize used to canonicalize this), and a
-            // trailing slash on addr is trimmed so host:port + /handler
-            // never becomes host:port//handler.
-            if !plugin.cfg.path.is_empty() && !plugin.cfg.path.starts_with('/') {
-                base = format!("{}/{}", plugin.cfg.addr, plugin.cfg.path);
-            }
-            if !base.starts_with("http://") && !base.starts_with("https://") {
-                base = format!("http://{base}");
-            }
-            let url = format!("{}?version={}&op={}", base, PLUGIN_API_VERSION, go_op);
+            let url = format!(
+                "{}?version={}&op={}",
+                join_plugin_base(&plugin.cfg.addr, &plugin.cfg.path),
+                PLUGIN_API_VERSION,
+                go_op
+            );
             let mut headers = HeaderMap::new();
             headers.insert(
                 "X-Frp-Reqid",
@@ -295,5 +314,44 @@ impl HttpPluginManager {
             }
         }
         Ok(mutated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_plugin_base;
+
+    #[test]
+    fn test_join_plugin_base_variants() {
+        // Canonical Go form: addr + path with leading slash.
+        assert_eq!(
+            join_plugin_base("http://127.0.0.1:4000", "/handler"),
+            "http://127.0.0.1:4000/handler"
+        );
+        // Trailing slash on addr must not double the separator.
+        assert_eq!(
+            join_plugin_base("http://127.0.0.1:4000/", "/handler"),
+            "http://127.0.0.1:4000/handler"
+        );
+        // Bare path without leading slash gets one (no host:porthandler).
+        assert_eq!(
+            join_plugin_base("http://127.0.0.1:4000", "handler"),
+            "http://127.0.0.1:4000/handler"
+        );
+        // addr trailing slash + bare path: single separator.
+        assert_eq!(
+            join_plugin_base("http://127.0.0.1:4000/", "handler"),
+            "http://127.0.0.1:4000/handler"
+        );
+        // Missing scheme defaults to http://.
+        assert_eq!(
+            join_plugin_base("127.0.0.1:4000", ""),
+            "http://127.0.0.1:4000"
+        );
+        // Empty path keeps addr as-is.
+        assert_eq!(
+            join_plugin_base("http://127.0.0.1:4000/handler", ""),
+            "http://127.0.0.1:4000/handler"
+        );
     }
 }

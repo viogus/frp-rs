@@ -471,9 +471,11 @@ pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
     // An http_plugins entry with neither addr nor path would produce a
     // malformed "http://?version=..." request at runtime — fail at load time.
     for plugin in &cfg.http_plugins {
-        if plugin.addr.is_empty() && plugin.path.is_empty() {
+        if plugin.addr.is_empty() {
+            // A path alone would produce the malformed "http:///x" — Go's
+            // HTTPPluginOptions.Addr is required.
             return Err(format!(
-                "server config: http_plugins entry '{}' has no addr/path",
+                "server config: http_plugins entry '{}' has no addr",
                 plugin.name
             ));
         }
