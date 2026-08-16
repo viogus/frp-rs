@@ -511,7 +511,7 @@ pub struct AuthServerConfig {
     pub oidc_issuer: String,
     #[serde(default)]
     pub oidc_audience: String,
-    #[serde(default)]
+    #[serde(default, alias = "oidc_token_endpoint_url")]
     pub oidc_token_endpoint: String,
     #[serde(
         default,
