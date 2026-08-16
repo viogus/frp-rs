@@ -640,6 +640,14 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
             }
         }
 
+        // Go legacy INI proxy/visitor sections: [web], [ssh], [range:xxx],
+        // [plugin:xxx]. A top-level section table carrying a `type` key is a
+        // proxy (or a visitor when role=visitor). [range:xxx] templates are
+        // expanded into per-port proxies {prefix}_{i} (Go
+        // renderRangeProxyTemplates — local/remote port lists must match in
+        // length).
+        collect_legacy_ini_proxy_sections(table);
+
         // Go legacy INI keys: top-level admin_* -> [web_server] (Go
         // pkg/config/legacy conversion.go AdminAddr/Port/User/Pwd/...).
         // Runs AFTER the [common] merge so keys from [common] migrate too.
@@ -932,6 +940,133 @@ fn normalize_web_server_section(table: &mut toml::Table) {
 /// - `[proxies.loadBalancer]` → flat fields (group, groupKey)
 /// - `[proxies.requestHeaders.set]` → `headers.*`
 /// - `[proxies.responseHeaders.set]` → `response_headers.*`
+///
+/// Expand "6000-6006,6007" into the sorted list of individual ports.
+/// Matches Go `util.ParseRangeNumbers` semantics.
+fn ini_range_numbers(s: &str) -> Option<Vec<u16>> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let lo: u16 = a.trim().parse().ok()?;
+            let hi: u16 = b.trim().parse().ok()?;
+            if lo > hi {
+                return None;
+            }
+            out.extend(lo..=hi);
+        } else {
+            out.push(part.parse().ok()?);
+        }
+    }
+    Some(out)
+}
+
+/// Collect Go legacy INI proxy/visitor sections into `[proxies]`/`[visitors]`.
+fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
+    use toml::Value;
+
+    let sections: Vec<String> = table
+        .keys()
+        .filter(|k| matches!(table.get(*k), Some(Value::Table(t)) if t.contains_key("type")))
+        .cloned()
+        .collect();
+
+    for section_name in sections {
+        let Value::Table(mut st) = table.remove(&section_name).unwrap() else {
+            continue;
+        };
+
+        // Go ini.v1 []string fields: a scalar value becomes a one-element
+        // array (comma-separated values were already split by ini_to_toml).
+        for list_key in ["custom_domains", "locations", "allow_users"] {
+            if let Some(Value::String(s)) = st.get(list_key) {
+                let items: Vec<Value> = s
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| Value::String(p.to_string()))
+                    .collect();
+                if !items.is_empty() {
+                    st.insert(list_key.to_string(), Value::Array(items));
+                }
+            }
+        }
+
+        if let Some(prefix) = section_name.strip_prefix("range:") {
+            // Expand into {prefix}_{i} per-port proxies (Go renderRangeProxyTemplates).
+            let Some(local_ports) = st
+                .get("local_port")
+                .and_then(Value::as_str)
+                .and_then(ini_range_numbers)
+            else {
+                tracing::warn!(
+                    section = %section_name,
+                    "legacy INI [range:...] section: missing or invalid local_port; skipped"
+                );
+                continue;
+            };
+            let Some(remote_ports) = st
+                .get("remote_port")
+                .and_then(Value::as_str)
+                .and_then(ini_range_numbers)
+            else {
+                tracing::warn!(
+                    section = %section_name,
+                    "legacy INI [range:...] section: missing or invalid remote_port; skipped"
+                );
+                continue;
+            };
+            if local_ports.len() != remote_ports.len() {
+                tracing::warn!(
+                    section = %section_name,
+                    local = local_ports.len(),
+                    remote = remote_ports.len(),
+                    "legacy INI [range:...] section: local/remote port counts differ; skipped"
+                );
+                continue;
+            }
+            for (i, (lp, rp)) in local_ports.into_iter().zip(remote_ports).enumerate() {
+                let mut t = st.clone();
+                t.insert("name".to_string(), Value::String(format!("{prefix}_{i}")));
+                t.insert("local_port".to_string(), Value::Integer(i64::from(lp)));
+                t.insert("remote_port".to_string(), Value::Integer(i64::from(rp)));
+                let proxies = table
+                    .entry("proxies".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(arr) = proxies {
+                    arr.push(Value::Table(t));
+                }
+            }
+            continue;
+        }
+
+        // Regular section: name = section name (Go keeps the full name,
+        // including the "plugin:" prefix).
+        st.insert("name".to_string(), Value::String(section_name.clone()));
+
+        let role = st
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("server")
+            .to_string();
+        st.remove("role");
+        let target_key = if role == "visitor" {
+            "visitors"
+        } else {
+            "proxies"
+        };
+        let arr = table
+            .entry(target_key.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Value::Array(arr) = arr {
+            arr.push(Value::Table(st));
+        }
+    }
+}
+
 fn normalize_proxies(table: &mut toml::Table) {
     use toml::Value;
 

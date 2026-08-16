@@ -3478,3 +3478,115 @@ custom404Page = "<h1>nope</h1>"
     assert_eq!(cfg.web_server.tls_server_name, "example.com");
     assert_eq!(cfg.web_server.custom_404_page, "<h1>nope</h1>");
 }
+
+/// Load a Go legacy INI config through the real INI parser + normalize
+/// pipeline (ini_to_toml rejects nothing, so [range:x] headers are legal).
+fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let mut value = super::format::parse_to_toml_value(content, super::format::ConfigFormat::Ini)?;
+    super::normalize::normalize_client_config(&mut value);
+    let cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
+        .map_err(|e| format!("config validation error: {e}"))?;
+    super::validate_client_config(&cfg)?;
+    Ok(cfg)
+}
+
+/// Go legacy INI proxy sections: [web]/[ssh] become [proxies] entries,
+/// [range:xxx] expands to per-port proxies, [plugin:xxx] keeps its prefix,
+/// and role=visitor sections land in [visitors].
+#[test]
+fn test_legacy_ini_proxy_sections() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+token = "t"
+
+[web]
+type = "http"
+local_port = 80
+custom_domains = "web.example.com"
+
+[ssh]
+type = "tcp"
+local_port = 22
+remote_port = 6000
+
+[range:test_tcp]
+type = "tcp"
+local_port = "6000-6002"
+remote_port = "16000-16002"
+
+[plugin:http2https]
+type = "https"
+remote_port = 443
+custom_domains = "plugin.example.com"
+plugin = "http2https"
+plugin_local_addr = "127.0.0.1:80"
+
+[xtcp_visitor]
+type = "xtcp"
+role = "visitor"
+server_name = "xtcp_proxy"
+sk = "abc123"
+bind_addr = "127.0.0.1"
+bind_port = 9000
+"#,
+    )
+    .unwrap();
+
+    let proxies = &cfg.proxies;
+    let names: Vec<&str> = proxies.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"web"), "proxies: {names:?}");
+    assert!(names.contains(&"ssh"), "proxies: {names:?}");
+
+    // range:test_tcp expands to test_tcp_0/1/2 with individual ports.
+    let range_names: Vec<&str> = names
+        .iter()
+        .filter(|n| n.starts_with("test_tcp_"))
+        .copied()
+        .collect();
+    assert_eq!(range_names, vec!["test_tcp_0", "test_tcp_1", "test_tcp_2"]);
+    let p0 = proxies.iter().find(|p| p.name == "test_tcp_0").unwrap();
+    assert_eq!(p0.local_port, 6000);
+    assert_eq!(p0.remote_port, 16000);
+
+    // plugin: prefix is kept (Go parity); plugin_* keys nested into plugin.
+    let ph = proxies
+        .iter()
+        .find(|p| p.name == "plugin:http2https")
+        .unwrap();
+    assert_eq!(ph.proxy_type, "https");
+    let plugin = ph.plugin.as_ref().expect("plugin config");
+    assert_eq!(plugin.plugin_type, "http2https");
+    assert_eq!(plugin.local_addr, "127.0.0.1:80");
+
+    // role=visitor lands in visitors with sk preserved.
+    let visitors = &cfg.visitors;
+    assert_eq!(visitors.len(), 1, "visitors: {visitors:?}");
+    assert_eq!(visitors[0].name, "xtcp_visitor");
+    assert_eq!(visitors[0].secret_key, "abc123");
+    assert_eq!(visitors[0].bind_port, 9000);
+}
+
+/// Legacy INI range template with mismatched port counts is skipped (warn),
+/// not fatal, and does not corrupt the remaining proxies.
+#[test]
+fn test_legacy_ini_range_mismatch_skipped() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+
+[good]
+type = "tcp"
+local_port = 8080
+remote_port = 8081
+
+[range:bad]
+type = "tcp"
+local_port = "6000-6002"
+remote_port = "16000"
+"#,
+    )
+    .unwrap();
+    let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["good"]);
+}
