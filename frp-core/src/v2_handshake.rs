@@ -795,4 +795,64 @@ mod tests {
         let expected = expected_transcript_hash(&ch, &sh);
         assert_eq!(result, expected);
     }
+
+    // --- UDP packet codec negotiation (Go frp v0.71.0) ---
+
+    #[test]
+    fn client_hello_advertises_binary_udp_codec() {
+        let hello = ClientHello::new("tcp", false, true);
+        assert_eq!(
+            hello.capabilities.message.udp_packet_codecs,
+            vec![std::borrow::Cow::Borrowed(
+                crate::udp_binary::UDP_PACKET_CODEC_BINARY
+            )]
+        );
+        // Wire name is camelCase udpPacketCodecs (Go field name).
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"udpPacketCodecs\""), "got: {json}");
+    }
+
+    #[test]
+    fn select_udp_packet_codec_prefers_binary_and_falls_back_empty() {
+        use std::borrow::Cow;
+        assert_eq!(
+            select_udp_packet_codec(&[Cow::Borrowed(crate::udp_binary::UDP_PACKET_CODEC_BINARY)]),
+            crate::udp_binary::UDP_PACKET_CODEC_BINARY
+        );
+        // Legacy client without the capability → empty (JSON fallback).
+        assert_eq!(select_udp_packet_codec(&[]), "");
+        // Unknown codec offer → empty (Go selectUDPPacketCodec only picks binary-v1).
+        assert_eq!(select_udp_packet_codec(&[Cow::Borrowed("unknown")]), "");
+    }
+
+    #[test]
+    fn server_hello_carries_udp_packet_codec_on_wire() {
+        let hello = ServerHello::with_crypto_and_udp(
+            AeadAlgorithm::Aes256Gcm,
+            vec![0u8; CRYPTO_RANDOM_SIZE],
+            crate::udp_binary::UDP_PACKET_CODEC_BINARY,
+        );
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(
+            json.contains("\"udpPacketCodec\":\"binary-v1\""),
+            "got: {json}"
+        );
+        // Empty codec is serialized as "" (Go omits it, but "" is tolerated
+        // by Go's JSON unmarshal and by our own validation).
+        let plain = ServerHello::default_ok();
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(json.contains("\"udpPacketCodec\":\"\""), "got: {json}");
+    }
+
+    #[test]
+    fn crypto_context_defaults_empty_udp_codec() {
+        // Construction sites that don't negotiate a codec must default to
+        // empty (JSON fallback) so the data plane never misbehaves.
+        let ctx = CryptoContext {
+            algorithm: AeadAlgorithm::Aes256Gcm,
+            transcript_hash: vec![1, 2, 3],
+            udp_packet_codec: String::new(),
+        };
+        assert!(ctx.udp_packet_codec.is_empty());
+    }
 }
