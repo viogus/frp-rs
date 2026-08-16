@@ -2161,6 +2161,9 @@ impl Service {
                 .as_ref()
                 .expect("visitor_shutdown available before visitor spawn")
                 .clone();
+            // Clone the negotiated UDPPacket codec before `ctx` moves into
+            // the spawn (Go frp v0.71.0 sessionCtx.UDPPacketCodec).
+            let ctx_udp_packet_codec = ctx.wc_udp_packet_codec.clone();
             let handle = tokio::spawn(async move {
                 crate::visitor::run_visitor_listener(crate::visitor::VisitorListenerConfig {
                     server_addr: sa,
@@ -2200,6 +2203,12 @@ impl Service {
                     tls_cert_file: transport_tls_cert.clone(),
                     tls_key_file: transport_tls_key.clone(),
                     v2,
+                    // Negotiated UDPPacket codec (Go frp v0.71.0): the SUDP
+                    // visitor data plane must match the provider segment's
+                    // packet codec so the server keeps the zero-copy
+                    // byte-stream bridge; mismatches fall back to the
+                    // message-level transcoding bridge.
+                    udp_packet_codec: ctx_udp_packet_codec.clone(),
                 })
                 .await;
             });

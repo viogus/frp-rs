@@ -32,6 +32,7 @@ fn match_internal_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
             visitor_conn,
             visitor_use_encryption,
             visitor_use_compression,
+            visitor_v2,
         } => Box::pin(super::pool::handle_visitor_conn(
             ctx,
             ctl,
@@ -40,6 +41,7 @@ fn match_internal_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
             visitor_conn,
             visitor_use_encryption,
             visitor_use_compression,
+            visitor_v2,
         )),
         InternalMsg::ProxyUserConn {
             proxy_name,

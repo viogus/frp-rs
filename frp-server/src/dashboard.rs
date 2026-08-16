@@ -2578,6 +2578,7 @@ mod v2 {
                 bandwidth_limit_mode: String::new(),
                 user: String::new(),
                 user_conn_sem: None,
+                udp_packet_codec: String::new(),
             }
         }
 

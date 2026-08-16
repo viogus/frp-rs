@@ -548,6 +548,12 @@ pub(crate) async fn authenticate(
     };
 
     // Insert new ControlTx while holding run_mu.
+    // Negotiated UDPPacket codec flows into the session registry so SUDP
+    // visitor routing can inherit it (Go frp v0.71.0 admitVisitorByRunID).
+    let udp_packet_codec = crypto_ctx
+        .as_ref()
+        .map(|c| c.udp_packet_codec.clone())
+        .unwrap_or_default();
     state.run_id_to_ctl_tx.insert(
         run_id.clone(),
         ControlTx {
@@ -564,6 +570,8 @@ pub(crate) async fn authenticate(
             // retain the claimed user for Go wire compatibility.
             user: authenticated_user.clone(),
             control_id,
+            // Negotiated UDPPacket codec (Go frp v0.71.0 sessionCtx).
+            udp_packet_codec: udp_packet_codec.clone(),
         },
     );
 

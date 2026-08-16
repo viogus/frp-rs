@@ -264,6 +264,11 @@ pub(crate) async fn handle_visitor_conn_inner(
                     visitor_conn: stream,
                     visitor_use_encryption,
                     visitor_use_compression,
+                    // Wire protocol of this visitor connection (V2 frame
+                    // detection) — the SUDP bridge uses it to pick the
+                    // visitor-side packet codec (Go frp v0.71.0
+                    // RegisterVisitorConn wireProtocol).
+                    visitor_v2: v2,
                 })
                 .await
                 .is_err()

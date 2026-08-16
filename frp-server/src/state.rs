@@ -49,6 +49,11 @@ pub enum InternalMsg {
         /// when encryption is also on — snappy inner, CFB outer, matching Go's
         /// `WithCompression` + `WithEncryption` order).
         visitor_use_compression: bool,
+        /// Wire protocol of the visitor's connection (V2 frame detection).
+        /// Go frp v0.71.0 `RegisterVisitorConn` records the visitor conn's
+        /// wireProtocol; the SUDP bridge needs it to pick the visitor-side
+        /// packet codec (and to detect mixed SUDP packet encodings).
+        visitor_v2: bool,
     },
     ProxyUserConn {
         proxy_name: String,
@@ -158,6 +163,11 @@ pub struct ControlTx {
     /// Monotonically increasing control generation ID.
     /// Distinguished old vs new control connections with the same run_id.
     pub control_id: u64,
+    /// Negotiated UDPPacket codec (`"binary-v1"` or empty) for this control
+    /// session (Go frp v0.71.0 sessionCtx.UDPPacketCodec). Used by SUDP
+    /// visitor routing to inherit the provider's packet codec (Go
+    /// `admitVisitorByRunID`) and by proxy registration metadata.
+    pub udp_packet_codec: String,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -1025,6 +1035,7 @@ mod tests {
                 pool_stats: Arc::new(PoolStats::default()),
                 user: String::new(),
                 control_id: 1,
+                udp_packet_codec: String::new(),
             },
         );
         rx

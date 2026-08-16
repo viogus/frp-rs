@@ -388,3 +388,124 @@ async fn test_sudp_e2e_reconnect() {
     let after = udp_roundtrip(&client, visitor_addr, b"after-restart").await;
     assert_eq!(after, b"after-restart".to_vec());
 }
+
+/// Wire protocol v2 end-to-end: provider and visitor in one frpc sharing the
+/// negotiated UDPPacket binary codec (Go frp v0.71.0 `binary-v1`). Both
+/// segments use identical packet encoding, so the server keeps the
+/// byte-stream bridge (regression: visitor segment used to be hard-coded V1,
+/// which broke SUDP under V2 — "unexpected V2 frame type").
+#[tokio::test]
+async fn test_sudp_e2e_v2_roundtrip() {
+    let echo_port = allocate_udp_port();
+    let server_port = allocate_port();
+    let visitor_port = allocate_udp_port();
+
+    let _echo_handle = start_udp_echo_server(echo_port);
+    let _server_handle = start_frps(server_port, "test-token").await;
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server port ready");
+
+    let client_cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port,
+        token: "test-token".into(),
+        login_fail_exit: false,
+        tcp_mux: false,
+        tls_enable: false,
+        pool_count: 2,
+        v2: true,
+        proxies: vec![sudp_proxy("sudp-echo", echo_port)],
+        visitors: vec![sudp_visitor("sudp-visitor", "sudp-echo", visitor_port)],
+        ..Default::default()
+    };
+    let client_service = ClientService::new(client_cfg, None)
+        .await
+        .expect("create client service");
+    tokio::spawn(async move {
+        let _ = client_service.run().await;
+    });
+
+    let visitor_addr: SocketAddr = format!("127.0.0.1:{}", visitor_port).parse().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    wait_for_udp_tunnel(&client, visitor_addr, Duration::from_secs(15))
+        .await
+        .expect("SUDP V2 tunnel ready");
+
+    let payload = b"v2-sudp-roundtrip";
+    let echoed = udp_roundtrip(&client, visitor_addr, payload).await;
+    assert_eq!(echoed, payload.to_vec());
+}
+
+/// Mixed packet encodings end-to-end: V1/JSON visitor + V2/binary provider.
+/// The server detects the mismatch and routes the pair through the
+/// message-level transcoding bridge (Go frp v0.71.0 joinSUDPMessageBridge) —
+/// without it the provider would misparse the visitor's V1 frames.
+#[tokio::test]
+async fn test_sudp_e2e_mixed_codec() {
+    let echo_port = allocate_udp_port();
+    let server_port = allocate_port();
+    let visitor_port = allocate_udp_port();
+
+    let _echo_handle = start_udp_echo_server(echo_port);
+    let _server_handle = start_frps(server_port, "test-token").await;
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server port ready");
+
+    // Provider frpc: wire protocol v2 (negotiates binary-v1).
+    let provider_cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port,
+        token: "test-token".into(),
+        login_fail_exit: false,
+        tcp_mux: false,
+        tls_enable: false,
+        pool_count: 2,
+        v2: true,
+        proxies: vec![sudp_proxy("sudp-echo", echo_port)],
+        ..Default::default()
+    };
+    let provider_service = ClientService::new(provider_cfg, None)
+        .await
+        .expect("create provider service");
+    tokio::spawn(async move {
+        let _ = provider_service.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Visitor frpc: wire protocol v1 (JSON) — server must transcode.
+    let visitor_cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port,
+        token: "test-token".into(),
+        login_fail_exit: false,
+        tcp_mux: false,
+        tls_enable: false,
+        v2: false,
+        visitors: vec![sudp_visitor("sudp-visitor", "sudp-echo", visitor_port)],
+        ..Default::default()
+    };
+    let visitor_service = ClientService::new(visitor_cfg, None)
+        .await
+        .expect("create visitor service");
+    tokio::spawn(async move {
+        let _ = visitor_service.run().await;
+    });
+
+    let visitor_addr: SocketAddr = format!("127.0.0.1:{}", visitor_port).parse().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    wait_for_udp_tunnel(&client, visitor_addr, Duration::from_secs(15))
+        .await
+        .expect("SUDP mixed-codec tunnel ready");
+
+    let payload = b"mixed-codec-roundtrip";
+    let echoed = udp_roundtrip(&client, visitor_addr, payload).await;
+    assert_eq!(echoed, payload.to_vec());
+}

@@ -326,6 +326,14 @@ async fn build_proxy_info(
             .get(run_id)
             .map(|c| c.user.clone())
             .unwrap_or_default(),
+        // Provider-segment UDPPacket codec (Go frp v0.71.0): inherited from
+        // the registering control's negotiated ServerHello codec. The SUDP
+        // message bridge compares this against the visitor segment's codec.
+        udp_packet_codec: state
+            .run_id_to_ctl_tx
+            .get(run_id)
+            .map(|c| c.udp_packet_codec.clone())
+            .unwrap_or_default(),
         user_conn_sem: (state.max_conns_per_proxy > 0).then(|| {
             Arc::new(tokio::sync::Semaphore::new(
                 state.max_conns_per_proxy as usize,
@@ -2346,6 +2354,7 @@ pub(crate) mod unregister_generation_tests {
                 pool_stats: Arc::new(crate::state::PoolStats::default()),
                 user: String::new(),
                 control_id,
+                udp_packet_codec: String::new(),
             },
         );
         rx
@@ -2379,6 +2388,7 @@ pub(crate) mod unregister_generation_tests {
             multiplexer: String::new(),
             bandwidth_limit: String::new(),
             bandwidth_limit_mode: String::new(),
+            udp_packet_codec: String::new(),
             user: String::new(),
             user_conn_sem: None,
         }

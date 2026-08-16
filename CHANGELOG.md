@@ -36,6 +36,16 @@ All notable changes to frp-rs.
   TlsStream (tokio-rustls buffers plaintext on the write side; dropping
   after `flush()` could leave the peer reading a bare FIN without
   close_notify, producing ~50% spurious 502s).
+- **SUDP under wire protocol v2** (Go frp v0.71.0 `joinSUDPMessageBridge`
+  parity): the SUDP visitor data plane now speaks the negotiated wire
+  protocol (V2 magic + `binary-v1` codec) instead of being hard-coded to
+  V1/JSON. When the visitor and provider segments negotiate different
+  packet encodings (e.g. a V1/JSON visitor talking to a V2/binary provider
+  during an upgrade), the server routes the pair through a message-level
+  bridge that decodes and re-encodes every `UDPPacket` per side; identical
+  encodings keep the zero-copy byte-stream relay. Previously a V2 provider
+  misparsed the V1 visitor's frames ("unexpected V2 frame type"), breaking
+  the tunnel.
 
 ### Compatibility
 - `compat-test.sh` now targets the **Go frp v0.71.0** pre-built binaries by
