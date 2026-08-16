@@ -308,10 +308,12 @@ pub struct StartWorkConn {
     pub dst_port: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Whether encryption is enabled for the data bridge (Go frp compat).
+    /// Whether encryption is enabled for the data bridge (Rust frp extension;
+    /// not in Go v0.71.0 StartWorkConn — Go ignores unknown JSON fields).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_encryption: Option<bool>,
-    /// Whether compression is enabled for the data bridge (Go frp compat).
+    /// Whether compression is enabled for the data bridge (Rust frp extension;
+    /// not in Go v0.71.0 StartWorkConn — Go ignores unknown JSON fields).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_compression: Option<bool>,
     /// XTCP visitor session ID for hole-punch notification (Rust frp extension).
@@ -398,7 +400,16 @@ impl fmt::Display for UdpAddr {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UDPPacket {
-    #[serde(rename = "c", serialize_with = "b64_ser", deserialize_with = "b64_de")]
+    // Go frp v0.71.0: Content []byte `json:"c,omitempty"` — an empty datagram
+    // OMITS "c"; default lets us deserialize it (missing field 'c' would
+    // otherwise fail) and skip_serializing_if keeps Rust->Go byte-identical.
+    #[serde(
+        rename = "c",
+        default,
+        serialize_with = "b64_ser",
+        deserialize_with = "b64_de",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub content: Vec<u8>,
     #[serde(rename = "l", skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<UdpAddr>,
@@ -477,7 +488,9 @@ pub struct NatHoleClient {
     /// NAT hole session ID (Go frp v0.69.1 compat: sid).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
-    /// NAT traversal protocol: "quic" or "tcp" (Go frp v0.69.1 compat).
+    /// NAT traversal protocol: "quic" or "tcp" (Rust frp extension; not in
+    /// Go v0.71.0 NatHoleClient — Go's NatHoleResp carries `protocol`, which
+    /// is the likely confusion source).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     /// Provider/visitor addresses discovered via STUN.
@@ -1158,6 +1171,21 @@ mod tests {
         assert_eq!(back.local_addr.as_ref().unwrap().port, 53);
         assert_eq!(back.remote_addr.as_ref().unwrap().ip, "10.0.0.1");
         assert_eq!(back.remote_addr.as_ref().unwrap().port, 9999);
+    }
+
+    #[test]
+    fn test_udp_packet_empty_datagram_go_compat() {
+        // Go frp omits "c" (json:"c,omitempty") on empty datagrams and may
+        // omit "l"/"r" (nil addrs). All three must deserialize cleanly.
+        let json = r#"{}"#;
+        let pkt: UDPPacket = serde_json::from_str(json).expect("empty packet");
+        assert!(pkt.content.is_empty());
+        assert!(pkt.local_addr.is_none());
+        assert!(pkt.remote_addr.is_none());
+
+        // And Rust->Go stays byte-identical: empty content is NOT serialized.
+        let out = serde_json::to_string(&pkt).expect("serialize");
+        assert_eq!(out, r#"{}"#);
     }
 
     #[test]

@@ -492,9 +492,10 @@ pub(crate) async fn write_msg_v2_inner<W: AsyncWriteExt + Unpin>(
 /// Write a FrpMessage using Go-compatible V2 framing.
 /// Frame: type=16(Message) flags=0, payload = type_id(2 BE) + JSON.
 ///
-/// NOTE: V2 type IDs 19 (CloseProxyResp) and 20 (Error) are Rust-only
-/// extensions. Go frp v0.70.0 treats unknown type IDs as errors.
-/// These MUST NOT be sent to Go peers. See msg.rs lines 59-62.
+/// NOTE: V2 type IDs 21 (CloseProxyResp) and 22 (Error) are Rust-only
+/// extensions (renumbered off 19/20 after Go frp v0.71.0 assigned 19 to
+/// UDPPacketBinary). Go frp treats unknown type IDs as errors — these MUST
+/// NOT be sent to Go peers. See msg.rs lines 59-68.
 ///
 /// Flush is called after write to support buffered transports (TLS, KCP,
 /// WebSocket, yamux). For callers that manage flush themselves (e.g.

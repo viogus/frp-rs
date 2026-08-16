@@ -651,6 +651,9 @@ pub struct WebServerTlsConfig {
     pub key_file: String,
     #[serde(default, alias = "trustedCaFile")]
     pub trusted_ca_file: String,
+    /// TLS server name (Go WebServerConfig.TLS.serverName).
+    #[serde(default, alias = "serverName")]
+    pub server_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -683,10 +686,18 @@ pub struct WebServerConfig {
     /// tls_cert_file/tls_key_file fields.
     #[serde(default, rename = "tls")]
     pub tls: WebServerTlsConfig,
+    /// TLS CA file for the dashboard/admin HTTPS server (Go
+    /// WebServerConfig.TLS.trustedCaFile; flattened by normalize).
+    #[serde(default, alias = "trustedCaFile")]
+    pub tls_ca_file: String,
+    /// TLS server name (Go WebServerConfig.TLS.serverName; flattened by
+    /// normalize).
+    #[serde(default, alias = "serverName")]
+    pub tls_server_name: String,
     /// Custom 404 page body (HTML). When non-empty, VHost and TCPMux
     /// 404 responses include this content with Content-Type: text/html.
     /// Go frp compat: custom_404_page.
-    #[serde(default)]
+    #[serde(default, alias = "custom404Page")]
     pub custom_404_page: String,
 }
 
@@ -725,6 +736,8 @@ impl Default for WebServerConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             tls: WebServerTlsConfig::default(),
+            tls_ca_file: String::new(),
+            tls_server_name: String::new(),
             custom_404_page: String::new(),
         }
     }
@@ -743,8 +756,15 @@ pub struct HttpPluginConfig {
     /// Plugin name for logging.
     #[serde(default)]
     pub name: String,
-    /// URL of the plugin server (e.g. "http://127.0.0.1:4000/handler").
-    pub url: String,
+    /// Plugin server host:port (Go HTTPPluginOptions.Addr). May carry an
+    /// http:// or https:// scheme prefix; a bare host:port gets "http://".
+    /// Canonical Go field; `url` remains as an alias for legacy frp-rs
+    /// configs.
+    #[serde(default, alias = "url")]
+    pub addr: String,
+    /// Plugin URL path (Go HTTPPluginOptions.Path). Appended after `addr`.
+    #[serde(default)]
+    pub path: String,
     /// Operation this plugin handles: "login", "new_proxy", "close_proxy".
     /// Empty means all operations.
     #[serde(default)]
@@ -823,8 +843,6 @@ pub struct ServerTransportConfig {
     pub max_pool_count: i64,
     /// TCP keepalive interval in seconds for server-side connections.
     /// Go frp v0.70.1 compat: tcpKeepalive. Go default: 7200.
-    /// frp-rs production default: 300 (paired with aggressive probe
-    /// interval/retries so dead peers release fds sooner).
     #[serde(default = "default_tcp_keepalive", alias = "tcpKeepalive")]
     pub tcp_keepalive: i64,
     /// QUIC protocol options.
@@ -849,7 +867,7 @@ pub(super) fn default_heartbeat_timeout() -> i64 {
     90
 }
 fn default_tcp_keepalive() -> i64 {
-    300
+    7200
 }
 fn default_max_pool_count() -> i64 {
     5

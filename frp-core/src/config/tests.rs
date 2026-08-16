@@ -50,9 +50,12 @@ fn test_parse_client_store_defaults_to_none() {
 }
 
 #[test]
-fn test_xtcp_visitor_defaults_to_kcp() {
+fn test_xtcp_visitor_defaults_to_quic() {
     let visitor = VisitorConfig::default();
-    assert_eq!(visitor.protocol, "kcp", "XTCP visitor must advertise KCP");
+    assert_eq!(
+        visitor.protocol, "quic",
+        "XTCP visitor must default to quic (Go frp v0.70.1)"
+    );
 }
 
 #[test]
@@ -685,8 +688,9 @@ enabled = false
     assert_eq!(
         proxy
             .health_check_http_headers
-            .get("X-Token")
-            .map(String::as_str),
+            .iter()
+            .find(|h| h.name == "X-Token")
+            .map(|h| h.value.as_str()),
         Some("abc")
     );
     let plugin = proxy.plugin.as_ref().expect("plugin");
@@ -940,7 +944,7 @@ fn test_parse_allow_ports_edge_cases() {
 fn test_parse_bandwidth_limit_edge_cases() {
     // Empty → Some(0) (no limit, Go compat)
     assert_eq!(parse_bandwidth_limit(""), Some(0));
-    // Bare number without suffix → None (Go requires "KB"/"MB"/"GB")
+    // Bare number without suffix → None (Go requires "KB"/"MB")
     assert_eq!(parse_bandwidth_limit("0"), None);
 
     // KB variant (binary: 1KB = 1024)
@@ -961,9 +965,13 @@ fn test_parse_bandwidth_limit_edge_cases() {
     // Bare number → None (Go requires a suffix)
     assert_eq!(parse_bandwidth_limit("500"), None);
 
-    // Case insensitive (input uppercased internally)
-    assert_eq!(parse_bandwidth_limit("1mb"), Some(1_048_576));
-    assert_eq!(parse_bandwidth_limit("1kb"), Some(1024));
+    // Case-SENSITIVE suffix (Go strings.CutSuffix): "mb"/"kb" are rejected.
+    assert_eq!(parse_bandwidth_limit("1mb"), None);
+    assert_eq!(parse_bandwidth_limit("1kb"), None);
+    // 0 / negative number with a valid suffix → Some(0) (no limit, Go
+    // NewBandwidthLimiter returns nil for bytes <= 0).
+    assert_eq!(parse_bandwidth_limit("0KB"), Some(0));
+    assert_eq!(parse_bandwidth_limit("-1MB"), Some(0));
 
     // Garbage → None
     assert_eq!(parse_bandwidth_limit("not-a-number"), None);
@@ -1128,10 +1136,10 @@ token = "test-token"
 "#;
     let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
     assert!(cfg.tcp_mux);
-    // dial_server_keepalive defaults to 300 (frp-rs production default) via
-    // the serde default fn — a plain `#[serde(default)]` would yield 0
-    // (disabled), silently diverging from the documented default.
-    assert_eq!(cfg.dial_server_keepalive, 300);
+    // dial_server_keepalive defaults to 7200 (Go frp default) via the serde
+    // default fn — a plain `#[serde(default)]` would yield 0 (disabled),
+    // silently diverging from the documented default.
+    assert_eq!(cfg.dial_server_keepalive, 7200);
     // An explicit 0 still disables.
     let cfg0: ClientConfig = load_client_config_from_str(
         "server_addr = '127.0.0.1'\n[transport]\ndial_server_keepalive = 0",
@@ -2294,7 +2302,8 @@ addr = "http://127.0.0.1:4000"
 path = "/handler"
 "#;
     let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
-    assert_eq!(cfg.http_plugins[0].url, "http://127.0.0.1:4000/handler");
+    assert_eq!(cfg.http_plugins[0].addr, "http://127.0.0.1:4000");
+    assert_eq!(cfg.http_plugins[0].path, "/handler");
 }
 
 // ── MEDIUM-8: custom_404_page normalization ────────────────────────
@@ -3375,4 +3384,292 @@ fn test_log_disable_print_color_parsed() {
         load_server_config_from_str("bind_port = 7000\n[log]\ndisable_print_color = true\n")
             .unwrap();
     assert!(cfg.log.disable_print_color);
+}
+
+/// Go legacy INI client keys are mapped to their canonical locations
+/// (Go pkg/config/legacy conversion.go).
+#[test]
+fn test_legacy_ini_client_gaps_mapped() {
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+token = "t"
+authenticate_heartbeats = true
+authenticate_new_work_conns = true
+http_proxy = "http://proxy.example:8080"
+disable_log_color = true
+oidc_additional_foo = "bar"
+oidc_additional_aud = "baz"
+"#,
+    )
+    .unwrap();
+    let scopes = cfg
+        .auth
+        .as_ref()
+        .map(|a| a.additional_auth_scopes.clone())
+        .unwrap_or_default();
+    assert!(
+        scopes.contains(&"HeartBeats".to_string()),
+        "scopes: {scopes:?}"
+    );
+    assert!(
+        scopes.contains(&"NewWorkConns".to_string()),
+        "scopes: {scopes:?}"
+    );
+    assert_eq!(cfg.proxy_url, "http://proxy.example:8080");
+    assert!(cfg.log.disable_print_color);
+    let oidc_params = cfg
+        .auth
+        .as_ref()
+        .map(|a| a.additional_endpoint_params.clone())
+        .unwrap_or_default();
+    assert_eq!(oidc_params.get("foo"), Some(&"bar".to_string()));
+    assert_eq!(oidc_params.get("aud"), Some(&"baz".to_string()));
+}
+
+/// Go legacy INI server keys (pprof_enable, dashboard_tls_mode, and the
+/// dashboard_* -> web_server migration) are accepted without strict-mode
+/// rejection and land in the canonical fields.
+#[test]
+fn test_legacy_ini_server_gaps_mapped() {
+    let cfg: ServerConfig = load_server_config_from_str(
+        r#"bind_port = 7000
+token = "t"
+dashboard_addr = "127.0.0.1"
+dashboard_port = 7500
+dashboard_user = "admin"
+dashboard_pwd = "pw"
+dashboard_tls_cert_file = "/tmp/cert.pem"
+dashboard_tls_key_file = "/tmp/key.pem"
+dashboard_tls_mode = true
+pprof_enable = true
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+    assert_eq!(cfg.web_server.port, 7500);
+    assert_eq!(cfg.web_server.user, "admin");
+    assert_eq!(cfg.web_server.password, "pw");
+    assert_eq!(cfg.web_server.tls_cert(), "/tmp/cert.pem");
+    assert_eq!(cfg.web_server.tls_key(), "/tmp/key.pem");
+    assert!(cfg.web_server.pprof_enable);
+    // dashboard_tls_mode is consumed as a no-op (TLS driven by cert/key).
+    assert!(cfg.web_server.tls_cert_file.contains("cert.pem"));
+}
+
+/// The new web_server whitelist keys are accepted in strict mode.
+#[test]
+fn test_strict_accepts_web_server_tls_ca_and_server_name() {
+    let cfg: ServerConfig = load_server_config_from_str(
+        r#"bind_port = 7000
+token = "t"
+[web_server]
+addr = "127.0.0.1"
+port = 7500
+tls_cert_file = "/tmp/c.pem"
+tls_key_file = "/tmp/k.pem"
+trustedCaFile = "/tmp/ca.pem"
+serverName = "example.com"
+custom404Page = "<h1>nope</h1>"
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.web_server.tls_ca_file, "/tmp/ca.pem");
+    assert_eq!(cfg.web_server.tls_server_name, "example.com");
+    assert_eq!(cfg.web_server.custom_404_page, "<h1>nope</h1>");
+}
+
+/// Load a Go legacy INI config through the real INI parser + normalize
+/// pipeline (ini_to_toml rejects nothing, so [range:x] headers are legal).
+fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let mut value = super::format::parse_to_toml_value(content, super::format::ConfigFormat::Ini)?;
+    super::normalize::normalize_client_config(&mut value);
+    let cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
+        .map_err(|e| format!("config validation error: {e}"))?;
+    super::validate_client_config(&cfg)?;
+    Ok(cfg)
+}
+
+/// Go legacy INI proxy sections: [web]/[ssh] become [proxies] entries,
+/// [range:xxx] expands to per-port proxies, [plugin:xxx] keeps its prefix,
+/// and role=visitor sections land in [visitors].
+#[test]
+fn test_legacy_ini_proxy_sections() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+token = "t"
+
+[web]
+type = "http"
+local_port = 80
+custom_domains = "web.example.com"
+
+[ssh]
+type = "tcp"
+local_port = 22
+remote_port = 6000
+
+[range:test_tcp]
+type = "tcp"
+local_port = "6000-6002"
+remote_port = "16000-16002"
+
+[plugin:http2https]
+type = "https"
+remote_port = 443
+custom_domains = "plugin.example.com"
+plugin = "http2https"
+plugin_local_addr = "127.0.0.1:80"
+
+[xtcp_visitor]
+type = "xtcp"
+role = "visitor"
+server_name = "xtcp_proxy"
+sk = "abc123"
+bind_addr = "127.0.0.1"
+bind_port = 9000
+"#,
+    )
+    .unwrap();
+
+    let proxies = &cfg.proxies;
+    let names: Vec<&str> = proxies.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"web"), "proxies: {names:?}");
+    assert!(names.contains(&"ssh"), "proxies: {names:?}");
+
+    // range:test_tcp expands to test_tcp_0/1/2 with individual ports.
+    let range_names: Vec<&str> = names
+        .iter()
+        .filter(|n| n.starts_with("test_tcp_"))
+        .copied()
+        .collect();
+    assert_eq!(range_names, vec!["test_tcp_0", "test_tcp_1", "test_tcp_2"]);
+    let p0 = proxies.iter().find(|p| p.name == "test_tcp_0").unwrap();
+    assert_eq!(p0.local_port, 6000);
+    assert_eq!(p0.remote_port, 16000);
+
+    // plugin: prefix is kept (Go parity); plugin_* keys nested into plugin.
+    let ph = proxies
+        .iter()
+        .find(|p| p.name == "plugin:http2https")
+        .unwrap();
+    assert_eq!(ph.proxy_type, "https");
+    let plugin = ph.plugin.as_ref().expect("plugin config");
+    assert_eq!(plugin.plugin_type, "http2https");
+    assert_eq!(plugin.local_addr, "127.0.0.1:80");
+
+    // role=visitor lands in visitors with sk preserved.
+    let visitors = &cfg.visitors;
+    assert_eq!(visitors.len(), 1, "visitors: {visitors:?}");
+    assert_eq!(visitors[0].name, "xtcp_visitor");
+    assert_eq!(visitors[0].secret_key, "abc123");
+    assert_eq!(visitors[0].bind_port, 9000);
+}
+
+/// Legacy INI range template with mismatched port counts is skipped (warn),
+/// not fatal, and does not corrupt the remaining proxies.
+#[test]
+fn test_legacy_ini_range_mismatch_skipped() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+
+[good]
+type = "tcp"
+local_port = 8080
+remote_port = 8081
+
+[range:bad]
+type = "tcp"
+local_port = "6000-6002"
+remote_port = "16000"
+"#,
+    )
+    .unwrap();
+    let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["good"]);
+}
+
+/// A known top-level section carrying a `type` key is NOT collected as a
+/// legacy INI proxy (KNOWN_SECTIONS guard).
+#[test]
+fn test_legacy_ini_known_section_with_type_not_collected() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+
+[log]
+type = "custom"
+disable_print_color = true
+
+[real_proxy]
+type = "tcp"
+local_port = 8080
+remote_port = 8081
+"#,
+    )
+    .unwrap();
+    // [log] with a type key stays a log section (not a proxy);
+    // [real_proxy] is collected normally.
+    assert_eq!(cfg.proxies.len(), 1, "proxies: {:?}", cfg.proxies);
+    assert_eq!(cfg.proxies[0].name, "real_proxy");
+    assert!(cfg.log.disable_print_color);
+}
+
+/// httpHeaders in legacy map form ({X = "y"}) is converted to the canonical
+/// [{name,value}] array (Vec<HealthCheckHttpHeader>).
+#[test]
+fn test_health_headers_map_form_converted() {
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+
+[[proxies]]
+name = "web"
+type = "http"
+local_port = 8080
+custom_domains = ["web.example.com"]
+
+[proxies.healthCheck]
+type = "http"
+url = "http://127.0.0.1/"
+httpHeaders = { X-Token = "abc", X-Other = "def" }
+"#,
+    )
+    .unwrap();
+    let hdrs = &cfg.proxies[0].health_check_http_headers;
+    let mut pairs: Vec<(String, String)> = hdrs
+        .iter()
+        .map(|h| (h.name.clone(), h.value.clone()))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("X-Other".to_string(), "def".to_string()),
+            ("X-Token".to_string(), "abc".to_string()),
+        ]
+    );
+}
+
+/// [range:...] with an unquoted single port (Integer) expands like Go
+/// ParseRangeNumbers, instead of being skipped.
+#[test]
+fn test_legacy_ini_range_unquoted_single_port() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+
+[range:single]
+type = "tcp"
+local_port = 6000
+remote_port = 16000
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].name, "single_0");
+    assert_eq!(cfg.proxies[0].local_port, 6000);
+    assert_eq!(cfg.proxies[0].remote_port, 16000);
 }

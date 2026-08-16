@@ -17,27 +17,30 @@ use crate::feature_gate::VIRTUAL_NET;
 /// an empty bandwidth limit field means "no limit" (effectively 0). Callers that
 /// need to distinguish "not set" from "set to 0" should check `is_empty()` before
 /// calling this function.
+/// Parse a bandwidth limit like Go frp `types.BandwidthQuantity`:
+/// - case-SENSITIVE "KB"/"MB" suffix ("kb"/"mb" are rejected like Go's
+///   "unit not support");
+/// - bare numbers and other suffixes are invalid;
+/// - an empty string, or a non-positive number, means NO limit
+///   (returns Some(0); Go's limiter treats bytes <= 0 as no limiter).
 pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
+    let s = s.trim();
     if s.is_empty() {
         return Some(0);
     }
-    let s = s.trim();
     let (num_str, mult) = {
-        let end = s.len();
-        if end > 2 && s[(end - 2)..].eq_ignore_ascii_case("MB") {
-            (s[..(end - 2)].trim(), 1_048_576u64)
-        } else if end > 2 && s[(end - 2)..].eq_ignore_ascii_case("KB") {
-            // Go requires a suffix; bare numbers and single-letter suffixes are invalid.
-            // Returns None when "KB" suffix is absent, rejecting bare numbers ("500")
-            // and single-letter ("500K").
-            (s[..(end - 2)].trim(), 1024u64)
+        if let Some(fstr) = s.strip_suffix("MB") {
+            (fstr.trim(), 1_048_576u64)
         } else {
-            return None;
+            let fstr = s.strip_suffix("KB")?;
+            (fstr.trim(), 1024u64)
         }
     };
     let num: f64 = num_str.parse().ok()?;
     if num <= 0.0 {
-        return None;
+        // Go: 0 / negative values mean no limit (NewBandwidthLimiter returns
+        // nil for bytes <= 0).
+        return Some(0);
     }
     Some((num * mult as f64) as u64)
 }
@@ -295,7 +298,9 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
         }
 
         // Validate health check HTTP headers too (same CR/LF risk)
-        for (name, value) in &p.health_check_http_headers {
+        for h in &p.health_check_http_headers {
+            let name = &h.name;
+            let value = &h.value;
             if name.contains('\r') || name.contains('\n') {
                 return Err(format!(
                     "proxy '{}': health check header name contains CR/LF: {name:?}",
@@ -461,6 +466,24 @@ pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
             "server config: invalid transport.maxPoolCount {}, must be non-negative",
             cfg.transport.max_pool_count
         ));
+    }
+    // An http_plugins entry with neither addr nor path would produce a
+    // malformed "http://?version=..." request at runtime — fail at load time.
+    for plugin in &cfg.http_plugins {
+        // A path alone would produce the malformed "http:///x" — Go's
+        // HTTPPluginOptions.Addr is required. Also reject degenerate addrs
+        // like "http://" or "/" that strip to nothing after the scheme.
+        let bare = plugin
+            .addr
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_matches('/');
+        if plugin.addr.is_empty() || bare.is_empty() {
+            return Err(format!(
+                "server config: http_plugins entry '{}' has no addr",
+                plugin.name
+            ));
+        }
     }
     // Go frp compat: invalid allow_ports entries are config errors, not a
     // silent disable of the restriction (validation/PortsRange).

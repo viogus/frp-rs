@@ -145,6 +145,15 @@ pub struct VirtualNetConfig {
     pub address: String,
 }
 
+/// One HTTP header for a proxy health check (Go frp `HTTPHeader{name,value}`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct HealthCheckHttpHeader {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub server_addr: String,
@@ -301,7 +310,7 @@ impl Default for ClientConfig {
             heartbeat_interval: default_heartbeat_interval(),
             heartbeat_timeout: default_heartbeat_timeout(),
             dns_server: String::new(),
-            dial_server_keepalive: 300,
+            dial_server_keepalive: default_dial_server_keepalive(),
             dial_server_timeout: default_dial_server_timeout(),
             connect_server_local_ip: String::new(),
             tcp_mux: default_tcp_mux(),
@@ -420,11 +429,9 @@ pub(super) fn default_dial_server_timeout() -> i64 {
     10
 }
 
-/// frp-rs production default for the outbound TCP keepalive idle time.
-/// 300s pairs with the aggressive probe interval/retries so dead peers
-/// release fds sooner (Go frp default is 7200).
+/// Outbound TCP keepalive idle time (Go frp default: 7200s).
 pub(super) fn default_dial_server_keepalive() -> i64 {
-    300
+    7200
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -488,7 +495,7 @@ pub struct ProxyConfig {
     pub health_check_url: String,
     /// Custom HTTP headers for health check requests (Go frp compat: healthCheckHttpHeaders).
     #[serde(default, alias = "healthCheckHttpHeaders")]
-    pub health_check_http_headers: std::collections::HashMap<String, String>,
+    pub health_check_http_headers: Vec<HealthCheckHttpHeader>,
     #[serde(default = "default_health_check_interval_seconds")]
     pub health_check_interval_seconds: u64,
     #[serde(default = "default_health_check_timeout_seconds")]
@@ -543,10 +550,10 @@ pub struct VisitorConfig {
     /// Shared secret key — must match the STCP proxy's `sk`.
     #[serde(default, alias = "secretKey", alias = "sk")]
     pub secret_key: String,
-    /// Protocol for XTCP P2P connections: "kcp" (default) or "quic".
-    /// Both data planes are implemented; "kcp" is the default because the Go
-    /// compat matrix forces kcp, while "quic" matches Go frp v0.70.1's default
-    /// (Go XTCP visitors default to "quic") and requires the `quic` feature.
+    /// Protocol for XTCP P2P connections: "quic" (default, matching Go frp
+    /// v0.70.1) or "kcp". Both data planes are implemented; "quic" requires
+    /// BOTH the `quic` and `kcp` features (the QUIC data plane reuses the
+    /// KCP hole-punch machinery).
     #[serde(default = "default_xtcp_protocol", alias = "protocol")]
     pub protocol: String,
     /// Optional server user for auth matching.
@@ -657,7 +664,8 @@ fn default_min_retry_interval() -> i64 {
     90
 }
 fn default_xtcp_protocol() -> String {
-    "kcp".into()
+    // Go frp v0.70.1 XTCP visitors default to "quic".
+    "quic".into()
 }
 fn default_vnet_netmask() -> String {
     "255.255.255.0".to_string()

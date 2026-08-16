@@ -395,8 +395,17 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 ("dashboard_assets_dir", "assets_dir"),
                 ("dashboard_tls_cert_file", "tls_cert_file"),
                 ("dashboard_tls_key_file", "tls_key_file"),
+                ("pprof_enable", "pprof_enable"),
             ],
         );
+
+        // Go legacy INI: dashboard_tls_mode (bool) is a TLS enable switch. In
+        // frp-rs the dashboard TLS is driven by non-empty cert/key (there is
+        // no separate enable flag), so the key is consumed as a no-op —
+        // removing it keeps strict mode from rejecting a valid Go key. When
+        // dashboard_tls_cert_file/key_file are also set, TLS is enabled by
+        // them regardless of this switch (same effective behavior as Go).
+        let _ = table.remove("dashboard_tls_mode");
 
         // Rename canonical Go camelCase section names.
         if let Some(v) = table.remove("webServer") {
@@ -586,30 +595,11 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             }
         }
 
-        // MEDIUM-6: Normalize http_plugins[*].addr + .path → .url
-        if let Some(toml::Value::Array(plugins)) = table.get_mut("http_plugins") {
-            for plugin_val in plugins.iter_mut() {
-                if let Some(ref mut pt) = plugin_val.as_table_mut() {
-                    if !pt.contains_key("url") {
-                        let addr = pt.get("addr").and_then(|v| v.as_str()).map(String::from);
-                        let path = pt.get("path").and_then(|v| v.as_str()).map(String::from);
-                        if let Some(addr) = addr {
-                            let url = if let Some(p) = path {
-                                let p = if p.starts_with('/') {
-                                    p
-                                } else {
-                                    format!("/{}", p)
-                                };
-                                format!("{}{}", addr.trim_end_matches('/'), p)
-                            } else {
-                                addr
-                            };
-                            pt.insert("url".to_string(), toml::Value::String(url));
-                        }
-                    }
-                }
-            }
-        }
+        // (removed MEDIUM-6: http_plugins[*].addr+path → url back-fill. The
+        // canonical form is now Go's addr+path; the legacy single `url` field
+        // is handled by the `url` serde alias on HttpPluginConfig.addr —
+        // emitting a synthesized "url" key alongside addr would duplicate the
+        // field.)
 
         // Normalize camelCase section names to snake_case
         if let Some(ssh_section) = table.remove("sshTunnelGateway") {
@@ -650,6 +640,14 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
             }
         }
 
+        // Go legacy INI proxy/visitor sections: [web], [ssh], [range:xxx],
+        // [plugin:xxx]. A top-level section table carrying a `type` key is a
+        // proxy (or a visitor when role=visitor). [range:xxx] templates are
+        // expanded into per-port proxies {prefix}_{i} (Go
+        // renderRangeProxyTemplates — local/remote port lists must match in
+        // length).
+        collect_legacy_ini_proxy_sections(table);
+
         // Go legacy INI keys: top-level admin_* -> [web_server] (Go
         // pkg/config/legacy conversion.go AdminAddr/Port/User/Pwd/...).
         // Runs AFTER the [common] merge so keys from [common] migrate too.
@@ -664,6 +662,102 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
                 ("pprof_enable", "pprof_enable"),
             ],
         );
+
+        // Go legacy INI: authenticate_heartbeats / authenticate_new_work_conns
+        // -> [auth] additional_scopes (Go conversion.go AdditionalScopes).
+        let mut extra_scopes: Vec<String> = Vec::new();
+        if table
+            .remove("authenticate_heartbeats")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            extra_scopes.push("HeartBeats".to_string());
+        }
+        if table
+            .remove("authenticate_new_work_conns")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            extra_scopes.push("NewWorkConns".to_string());
+        }
+        if !extra_scopes.is_empty() {
+            let auth_table = table
+                .entry("auth".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(auth) = auth_table {
+                let mut scopes: Vec<String> = auth
+                    .get("additional_auth_scopes")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                scopes.extend(extra_scopes);
+                auth.insert(
+                    "additional_auth_scopes".to_string(),
+                    Value::Array(scopes.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+
+        // Go legacy INI: http_proxy -> [transport] proxy_url.
+        if let Some(v) = table.remove("http_proxy") {
+            let tr = table
+                .entry("transport".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(t) = tr {
+                t.entry("proxy_url".to_string()).or_insert(v);
+            }
+        }
+
+        // Go legacy INI: disable_log_color -> [log] disable_print_color.
+        if let Some(v) = table.remove("disable_log_color") {
+            let lg = table
+                .entry("log".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(l) = lg {
+                l.entry("disable_print_color".to_string()).or_insert(v);
+            }
+        }
+
+        // Go legacy INI: oidc_additional_endpoint_params (flattened map keys
+        // prefixed `oidc_additional_`) -> [auth] additional_endpoint_params
+        // (top-level, matching the MEDIUM-5 flatten target).
+        let oidc_params: Vec<(String, Value)> = table
+            .iter()
+            .filter(|(k, _)| k.starts_with("oidc_additional_"))
+            .map(|(k, v)| {
+                (
+                    k.trim_start_matches("oidc_additional_").to_string(),
+                    v.clone(),
+                )
+            })
+            .collect();
+        if !oidc_params.is_empty() {
+            for k in oidc_params.iter().map(|(k, _)| k.clone()) {
+                let _ = table.remove(&format!("oidc_additional_{k}"));
+            }
+            let auth_table = table
+                .entry("auth".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(auth) = auth_table {
+                let mut params = auth
+                    .get("additional_endpoint_params")
+                    .and_then(Value::as_table)
+                    .cloned()
+                    .unwrap_or_default();
+                for (k, v) in oidc_params {
+                    params.insert(k, v);
+                }
+                auth.insert(
+                    "additional_endpoint_params".to_string(),
+                    Value::Table(params),
+                );
+            }
+        }
 
         // Rename protocol → transport_protocol (Go frp uses "protocol")
         if let Some(v) = table.remove("protocol") {
@@ -846,6 +940,159 @@ fn normalize_web_server_section(table: &mut toml::Table) {
 /// - `[proxies.loadBalancer]` → flat fields (group, groupKey)
 /// - `[proxies.requestHeaders.set]` → `headers.*`
 /// - `[proxies.responseHeaders.set]` → `response_headers.*`
+///
+/// Expand "6000-6006,6007" into the sorted list of individual ports.
+/// Matches Go `util.ParseRangeNumbers` semantics.
+fn ini_range_numbers(s: &str) -> Option<Vec<u16>> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let lo: u16 = a.trim().parse().ok()?;
+            let hi: u16 = b.trim().parse().ok()?;
+            if lo > hi {
+                return None;
+            }
+            out.extend(lo..=hi);
+        } else {
+            out.push(part.parse().ok()?);
+        }
+    }
+    Some(out)
+}
+
+/// Collect Go legacy INI proxy/visitor sections into `[proxies]`/`[visitors]`.
+fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
+    use toml::Value;
+
+    // Known non-proxy top-level sections are never collected even if they
+    // happen to carry a `type` key.
+    const KNOWN_SECTIONS: &[&str] = &[
+        "common",
+        "proxies",
+        "visitors",
+        "web_server",
+        "auth",
+        "log",
+        "transport",
+        "plugins",
+        "http_plugins",
+        "feature",
+        "featureGates",
+        "includes",
+        "ssh_tunnel_gateway",
+        "observability",
+        "vnet",
+        "store",
+    ];
+    let sections: Vec<String> = table
+        .keys()
+        .filter(|k| {
+            !KNOWN_SECTIONS.contains(&k.as_str())
+                && matches!(table.get(*k), Some(Value::Table(t)) if t.contains_key("type"))
+        })
+        .cloned()
+        .collect();
+
+    for section_name in sections {
+        let Value::Table(mut st) = table.remove(&section_name).unwrap() else {
+            continue;
+        };
+
+        // Go ini.v1 []string fields: a scalar value becomes a one-element
+        // array (comma-separated values were already split by ini_to_toml).
+        for list_key in ["custom_domains", "locations", "allow_users"] {
+            if let Some(Value::String(s)) = st.get(list_key) {
+                let items: Vec<Value> = s
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| Value::String(p.to_string()))
+                    .collect();
+                if !items.is_empty() {
+                    st.insert(list_key.to_string(), Value::Array(items));
+                }
+            }
+        }
+
+        if let Some(prefix) = section_name.strip_prefix("range:") {
+            // Expand into {prefix}_{i} per-port proxies (Go renderRangeProxyTemplates).
+            // local_port/remote_port accept a quoted string ("6000-6002") or
+            // an unquoted single port (6000 — ini_to_toml makes it Integer).
+            fn ini_port_numbers(v: &Value) -> Option<Vec<u16>> {
+                match v {
+                    Value::String(s) => ini_range_numbers(s),
+                    Value::Integer(i) if *i >= 0 && *i <= i64::from(u16::MAX) => {
+                        Some(vec![*i as u16])
+                    }
+                    _ => None,
+                }
+            }
+            let Some(local_ports) = st.get("local_port").and_then(ini_port_numbers) else {
+                tracing::warn!(
+                    section = %section_name,
+                    "legacy INI [range:...] section: missing or invalid local_port; skipped"
+                );
+                continue;
+            };
+            let Some(remote_ports) = st.get("remote_port").and_then(ini_port_numbers) else {
+                tracing::warn!(
+                    section = %section_name,
+                    "legacy INI [range:...] section: missing or invalid remote_port; skipped"
+                );
+                continue;
+            };
+            if local_ports.len() != remote_ports.len() {
+                tracing::warn!(
+                    section = %section_name,
+                    local = local_ports.len(),
+                    remote = remote_ports.len(),
+                    "legacy INI [range:...] section: local/remote port counts differ; skipped"
+                );
+                continue;
+            }
+            for (i, (lp, rp)) in local_ports.into_iter().zip(remote_ports).enumerate() {
+                let mut t = st.clone();
+                t.insert("name".to_string(), Value::String(format!("{prefix}_{i}")));
+                t.insert("local_port".to_string(), Value::Integer(i64::from(lp)));
+                t.insert("remote_port".to_string(), Value::Integer(i64::from(rp)));
+                let proxies = table
+                    .entry("proxies".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(arr) = proxies {
+                    arr.push(Value::Table(t));
+                }
+            }
+            continue;
+        }
+
+        // Regular section: name = section name (Go keeps the full name,
+        // including the "plugin:" prefix).
+        st.insert("name".to_string(), Value::String(section_name.clone()));
+
+        let role = st
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("server")
+            .to_string();
+        st.remove("role");
+        let target_key = if role == "visitor" {
+            "visitors"
+        } else {
+            "proxies"
+        };
+        let arr = table
+            .entry(target_key.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Value::Array(arr) = arr {
+            arr.push(Value::Table(st));
+        }
+    }
+}
+
 fn normalize_proxies(table: &mut toml::Table) {
     use toml::Value;
 
@@ -891,19 +1138,22 @@ fn normalize_proxies(table: &mut toml::Table) {
                     other => other,
                 };
                 let value = if k == "httpHeaders" {
+                    // Go frp: healthCheck.httpHeaders is an ARRAY of
+                    // {name,value} (HTTPHeader). A legacy frp-rs map form
+                    // ({X = "y"}) is converted into the array shape.
                     match v {
-                        Value::Array(items) => {
-                            let mut map = toml::Table::new();
-                            for item in items {
-                                if let Some(t) = item.as_table() {
-                                    let name =
-                                        t.get("name").and_then(Value::as_str).unwrap_or_default();
-                                    let value =
-                                        t.get("value").and_then(Value::as_str).unwrap_or_default();
-                                    map.insert(name.to_string(), Value::String(value.to_string()));
-                                }
-                            }
-                            Value::Table(map)
+                        Value::Array(_) => v,
+                        Value::Table(map) => {
+                            let items: Vec<Value> = map
+                                .into_iter()
+                                .map(|(name, value)| {
+                                    let mut t = toml::Table::new();
+                                    t.insert("name".to_string(), Value::String(name));
+                                    t.insert("value".to_string(), value);
+                                    Value::Table(t)
+                                })
+                                .collect();
+                            Value::Array(items)
                         }
                         other => other,
                     }

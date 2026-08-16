@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +25,7 @@ pub(crate) struct HealthCheckConfig {
     pub local_addr: String,
     pub check_type: String,
     pub check_url: String,
-    pub hc_headers: HashMap<String, String>,
+    pub hc_headers: Vec<frp_core::config::HealthCheckHttpHeader>,
     pub interval: Duration,
     pub timeout: Duration,
     pub max_failed: u32,
@@ -223,7 +222,7 @@ pub(crate) async fn run_http_check(
     addr: &str,
     url: &str,
     timeout: Duration,
-    headers: &HashMap<String, String>,
+    headers: &[frp_core::config::HealthCheckHttpHeader],
 ) -> Result<(), String> {
     let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
         .await
@@ -235,20 +234,20 @@ pub(crate) async fn run_http_check(
     // Support custom Host header override from user-configured headers (Go frp compat).
     let host = headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-        .map(|(_, v)| v.as_str())
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .map(|h| h.value.as_str())
         .unwrap_or(default_host);
     // Use HTTP/1.1 (Go frp compat: http.NewRequestWithContext defaults to HTTP/1.1).
     let mut req = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close",
         url, host
     );
-    for (key, value) in headers {
+    for h in headers {
         // Skip Host header — already included above with the resolved host value.
-        if key.eq_ignore_ascii_case("host") {
+        if h.name.eq_ignore_ascii_case("host") {
             continue;
         }
-        req.push_str(&format!("\r\n{}: {}", key, value));
+        req.push_str(&format!("\r\n{}: {}", h.name, h.value));
     }
     req.push_str("\r\n\r\n");
 

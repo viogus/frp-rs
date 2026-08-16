@@ -315,7 +315,12 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
             "tls_key_file",
             "certFile",
             "keyFile",
+            "tls_ca_file",
+            "tls_server_name",
+            "trustedCaFile",
+            "serverName",
             "custom_404_page",
+            "custom404Page",
         ],
         "transport" => &[
             "tcp_mux",

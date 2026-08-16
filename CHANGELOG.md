@@ -65,6 +65,23 @@ All notable changes to frp-rs.
   registers. Previously the proxy registered immediately and was only
   unregistered after `max_failed` consecutive failures.
 
+### Changed
+- **TCP keepalive defaults aligned with Go frp**: `dial_server_keepalive`
+  and `transport.tcpKeepalive` now default to **7200s** (was 300s). Dead-peer
+  fd release now follows the OS/Go cadence instead of the former aggressive
+  300s idle probe.
+- **XTCP visitor `protocol` defaults to `quic`** (Go frp v0.70.1 parity;
+  was `kcp`). Explicitly configured `protocol = "kcp"` is unchanged.
+- **`bandwidthLimit` parsing now matches Go `types.BandwidthQuantity`**:
+  the `KB`/`MB` suffix is case-sensitive (`kb`/`mb` rejected), and a `0` or
+  negative value means no limit (previously rejected).
+- **Legacy INI keys**: `authenticate_heartbeats`/`authenticate_new_work_conns`
+  → `[auth] additional_scopes`, `http_proxy` → `[transport] proxy_url`,
+  `disable_log_color` → `[log] disable_print_color`, server `pprof_enable`,
+  `dashboard_tls_mode` (no-op — frp-rs drives dashboard TLS from non-empty
+  cert/key; the key is accepted and consumed to keep strict mode green),
+  `oidc_additional_*` → `[auth.oidc] additional_endpoint_params`.
+
 ### Compatibility
 - `compat-test.sh` now targets the **Go frp v0.71.0** pre-built binaries by
   default (was 0.70.1); full cross-compat suite green (77 scenarios).
