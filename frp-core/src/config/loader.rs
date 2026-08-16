@@ -31,10 +31,9 @@ pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
     let (num_str, mult) = {
         if let Some(fstr) = s.strip_suffix("MB") {
             (fstr.trim(), 1_048_576u64)
-        } else if let Some(fstr) = s.strip_suffix("KB") {
-            (fstr.trim(), 1024u64)
         } else {
-            return None;
+            let fstr = s.strip_suffix("KB")?;
+            (fstr.trim(), 1024u64)
         }
     };
     let num: f64 = num_str.parse().ok()?;
