@@ -1284,9 +1284,15 @@ async fn run_sudp_message_bridge(
                 FrpMessage::UDPPacket(pkt) => {
                     metrics.record_traffic(0, pkt.content.len() as u64);
                 }
-                FrpMessage::Ping(_) | FrpMessage::Pong(_) => {
-                    // Go forwards SUDP pings provider→visitor; frp-rs data
-                    // planes treat them as keepalive. Forward unchanged.
+                FrpMessage::Ping(_) => {
+                    // Go forwards SUDP pings provider→visitor
+                    // (bridgeSUDPProxyToVisitor).
+                }
+                FrpMessage::Pong(_) => {
+                    // Pong is never forwarded (Go has no Pong in this
+                    // direction; frp-rs data planes treat Ping/Pong as
+                    // keepalive and ignore them).
+                    continue;
                 }
                 other => {
                     warn!(

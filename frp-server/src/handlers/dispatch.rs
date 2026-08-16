@@ -217,6 +217,13 @@ pub(crate) async fn handle_visitor_conn_inner(
     // same wire protocol as the control session that run_id names
     // (RegisterVisitorConn "visitor connection wire protocol mismatch"). A
     // mixed-protocol visitor conn would be misparsed by the provider bridge.
+    //
+    // NOTE (intentional asymmetry): only the v2-visitor + v1-control combo is
+    // rejected here. The reverse (v1 visitor + v2 control) is served through
+    // the SUDP message-level transcoding bridge (V1 JSON <-> V2 binary) — a
+    // deliberate frp-rs extension that lets an older V1 visitor talk to a V2
+    // provider during upgrades (Go would reject it; the compat suite covers
+    // this scenario in go-to-rust-sudp-v2-v1).
     if v2 {
         if let Some(rid) = msg.run_id.as_deref().filter(|r| !r.is_empty()) {
             if let Some(ctl) = state.run_id_to_ctl_tx.get(rid) {

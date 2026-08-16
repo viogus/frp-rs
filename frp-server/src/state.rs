@@ -459,7 +459,6 @@ pub type PortReservationMap = std::collections::HashMap<String, (u16, bool, std:
 /// subsequent members only join the member list after the group_key and
 /// routing params (domain/location/route_by_http_user) match.
 pub(crate) struct HttpGroup {
-    group: String,
     group_key: String,
     domain: String,
     location: String,
@@ -468,6 +467,11 @@ pub(crate) struct HttpGroup {
     members: RwLock<Vec<String>>,
     /// Round-robin cursor (Go `atomic.Uint64` index).
     index: AtomicU64,
+    /// The FIRST member to register — it owns the shared vhost route
+    /// (vhost_manager's by_proxy index keys on this name). When the group
+    /// empties, the route must be unregistered with THIS name, not the
+    /// last member that happened to leave.
+    route_owner: String,
 }
 
 pub(crate) struct HttpGroupController {
@@ -488,6 +492,8 @@ impl HttpGroupController {
     /// Returns `(group, is_first_member)` on success, Err(String) on
     /// mismatch/repeat. The caller registers the shared vhost route only for
     /// the first member.
+    /// Lock ordering: `groups` write lock is always acquired BEFORE any
+    /// `members` lock (never the reverse), so nested awaits cannot deadlock.
     pub async fn register_member(
         &self,
         group: &str,
@@ -501,8 +507,9 @@ impl HttpGroupController {
         if let Some(g) = groups.get(group) {
             // Existing group: validate params (Go ErrGroupParamsInvalid /
             // ErrGroupAuthFailed).
-            if g.group != group
-                || g.domain != domain
+            // group name matches by construction (registry key); validate the
+            // routing params (Go ErrGroupParamsInvalid).
+            if g.domain != domain
                 || g.location != location
                 || g.route_by_http_user != route_by_http_user
             {
@@ -528,35 +535,38 @@ impl HttpGroupController {
             return Ok((g.clone(), false));
         }
         let g = Arc::new(HttpGroup {
-            group: group.to_string(),
             group_key: group_key.to_string(),
             domain: domain.to_string(),
             location: location.to_string(),
             route_by_http_user: route_by_http_user.to_string(),
             members: RwLock::new(vec![proxy_name.to_string()]),
             index: AtomicU64::new(0),
+            route_owner: proxy_name.to_string(),
         });
         groups.insert(group.to_string(), g.clone());
         Ok((g, true))
     }
 
-    /// Remove a member. Returns `true` if the group became empty (the caller
-    /// must then drop the shared vhost route and remove the group), `false`
-    /// if the group still has members or did not exist.
-    pub async fn unregister_member(&self, group: &str, proxy_name: &str) -> bool {
+    /// Remove a member. Returns `Some(route_owner)` when the group became
+    /// empty — the caller must then drop the shared vhost route using the
+    /// OWNER's name (the first member registered it) and the group is
+    /// removed. Returns `None` when the group still has members or did not
+    /// exist.
+    pub async fn unregister_member(&self, group: &str, proxy_name: &str) -> Option<String> {
         let mut groups = self.groups.write().await;
-        let Some(g) = groups.get(group) else {
-            return false;
-        };
+        let g = groups.get(group)?;
         let empty = {
             let mut members = g.members.write().await;
             members.retain(|m| m != proxy_name);
             members.is_empty()
         };
         if empty {
+            let owner = g.route_owner.clone();
             groups.remove(group);
+            Some(owner)
+        } else {
+            None
         }
-        empty
     }
 
     /// Round-robin pick a member proxy name (Go HTTPGroup.chooseEndpoint).

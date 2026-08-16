@@ -134,13 +134,15 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         if is_http_group_member {
             let fresh = ctx.state.proxy_manager.get(&cp.proxy_name).await;
             let gname = fresh.and_then(|i| i.group.clone()).unwrap_or_default();
-            let empty = ctx
+            if let Some(owner) = ctx
                 .state
                 .http_group_ctl
                 .unregister_member(&gname, &cp.proxy_name)
-                .await;
-            if empty {
-                ctx.state.vhost_manager.unregister(&cp.proxy_name).await;
+                .await
+            {
+                // The shared route is keyed on the FIRST member's name; the
+                // group just emptied, so drop it with the owner's name.
+                ctx.state.vhost_manager.unregister(&owner).await;
             }
         } else {
             ctx.state.vhost_manager.unregister(&cp.proxy_name).await;

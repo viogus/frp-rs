@@ -259,3 +259,92 @@ async fn test_http_group_round_robin() {
         "unbalanced round-robin: A={served_a} B={served_b}"
     );
 }
+
+/// Regression: when the FIRST member of an http group leaves while the group
+/// still has members, and the LAST member leaves afterwards, the shared vhost
+/// route must be dropped (keyed on the first member's name — not the last
+/// member that emptied the group). Previously the route leaked and requests
+/// kept failing with 502/404.
+#[tokio::test]
+async fn test_http_group_route_cleaned_when_last_member_leaves() {
+    let bind_port = allocate_port();
+    let vhost_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        vhost_http_port: vhost_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+    let vhost: SocketAddr = format!("127.0.0.1:{vhost_port}").parse().unwrap();
+
+    // Two members; A (first) registers the shared route.
+    let (mut ctl_a, resp_a) = login_with_test_token(addr).await.expect("login A");
+    let _run_id_a = resp_a.run_id.expect("run_id A");
+    assert!(register_proxy(
+        &mut ctl_a,
+        http_group_proxy("grp-a", "webgrp", "secret-key", "app.example.com"),
+    )
+    .await
+    .is_none());
+    let (mut ctl_b, resp_b) = login_with_test_token(addr).await.expect("login B");
+    let run_id_b = resp_b.run_id.expect("run_id B");
+    assert!(register_proxy(
+        &mut ctl_b,
+        http_group_proxy("grp-b", "webgrp", "secret-key", "app.example.com"),
+    )
+    .await
+    .is_none());
+
+    // Member A (route owner) closes FIRST while B is still in the group —
+    // the route must survive for B.
+    // Go frp does not send CloseProxyResp — send and let the server process.
+    write_msg_v1(
+        &mut ctl_a,
+        &FrpMessage::CloseProxy(msg::CloseProxy {
+            proxy_name: "grp-a".into(),
+        }),
+    )
+    .await
+    .expect("send CloseProxy A");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // B still serves (route alive, single member).
+    let mut work_b = open_work_conn(addr, &run_id_b).await;
+    let req = tokio::spawn(http_request(vhost, "app.example.com"));
+    assert!(
+        read_work_head(&mut work_b).await.is_some(),
+        "member B should still serve after A (owner) left"
+    );
+    let body = "member-B";
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+        len = body.len()
+    );
+    work_b.write_all(resp.as_bytes()).await.expect("serve");
+    let resp_body = req.await.expect("request task");
+    assert!(resp_body.contains("member-B"));
+
+    // Now B (the last member) closes -> the shared route must be dropped.
+    write_msg_v1(
+        &mut ctl_b,
+        &FrpMessage::CloseProxy(msg::CloseProxy {
+            proxy_name: "grp-b".into(),
+        }),
+    )
+    .await
+    .expect("send CloseProxy B");
+    // Give the control loop a moment to process the unregister.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The route is gone: a request to the domain now gets 404 (not 502 from
+    // a zombie dispatch to a dead member).
+    let resp_body = http_request(vhost, "app.example.com").await;
+    assert!(
+        resp_body.contains("404"),
+        "route should be removed after the last member leaves, got: {resp_body:?}"
+    );
+}

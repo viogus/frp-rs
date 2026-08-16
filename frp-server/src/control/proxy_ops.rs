@@ -2146,9 +2146,11 @@ pub(crate) async fn unregister_control(
             && p.group.as_deref().filter(|g| !g.is_empty()).is_some();
         if is_http_group {
             let gname = p.group.as_deref().unwrap_or_default();
-            let empty = state.http_group_ctl.unregister_member(gname, &p.name).await;
-            if empty {
-                state.vhost_manager.unregister(&p.name).await;
+            // unregister_member returns the route OWNER (first member) when
+            // the group empties — the shared route is keyed on that name, so
+            // unregistering with a later member's name would leak it.
+            if let Some(owner) = state.http_group_ctl.unregister_member(gname, &p.name).await {
+                state.vhost_manager.unregister(&owner).await;
             }
         } else {
             state.vhost_manager.unregister(&p.name).await;
