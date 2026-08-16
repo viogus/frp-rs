@@ -102,14 +102,11 @@ pub(crate) fn fast_backoff_delay(
     } else {
         previous_delay
     };
-    let mut duration = base.saturating_mul(2); // Factor = 2
-    if duration > Duration::from_secs(20) {
-        duration = Duration::from_secs(20);
-    } else {
-        // Go Jitter: ±10% multiplicative, then cap.
-        let jitter = rng.gen_range(0.9..=1.1);
-        let ms = (duration.as_millis() as f64 * jitter) as u64;
-        duration = Duration::from_millis(ms.min(20_000));
-    }
-    duration
+    // Go fastBackoffImpl order: Factor(2) → Jitter(±10%) → MaxDuration cap.
+    // (Jittering BEFORE the cap keeps the cap neighborhood spread; capping
+    // first would pin the last step at exactly 20s with no jitter.)
+    let duration = base.saturating_mul(2); // Factor = 2
+    let jitter = rng.gen_range(0.9..=1.1);
+    let ms = (duration.as_millis() as f64 * jitter) as u64;
+    Duration::from_millis(ms.min(20_000))
 }

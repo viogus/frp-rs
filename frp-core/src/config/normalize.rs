@@ -373,11 +373,20 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
 }
 
 pub(super) fn normalize_server_config(value: &mut toml::Value) {
-    // Go legacy INI keys: top-level dashboard_* -> [web_server] (Go
-    // pkg/config/legacy conversion.go DashboardAddr/Port/User/Pwd/...).
-    if let toml::Value::Table(t) = value {
+    use toml::Value;
+    if let Some(table) = value.as_table_mut() {
+        // Handle [common] section: merge into top level
+        if let Some(Value::Table(common_table)) = table.remove("common") {
+            for (k, v) in common_table {
+                table.entry(k).or_insert(v);
+            }
+        }
+
+        // Go legacy INI keys: top-level dashboard_* -> [web_server] (Go
+        // pkg/config/legacy conversion.go DashboardAddr/Port/User/Pwd/...).
+        // Runs AFTER the [common] merge so keys from [common] migrate too.
         legacy_web_server_keys(
-            t,
+            table,
             &[
                 ("dashboard_addr", "addr"),
                 ("dashboard_port", "port"),
@@ -388,16 +397,6 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 ("dashboard_tls_key_file", "tls_key_file"),
             ],
         );
-    }
-
-    use toml::Value;
-    if let Some(table) = value.as_table_mut() {
-        // Handle [common] section: merge into top level
-        if let Some(Value::Table(common_table)) = table.remove("common") {
-            for (k, v) in common_table {
-                table.entry(k).or_insert(v);
-            }
-        }
 
         // Rename canonical Go camelCase section names.
         if let Some(v) = table.remove("webServer") {
@@ -642,11 +641,20 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
 }
 
 pub(super) fn normalize_client_config(value: &mut toml::Value) {
-    // Go legacy INI keys: top-level admin_* -> [web_server] (Go
-    // pkg/config/legacy conversion.go AdminAddr/Port/User/Pwd/...).
-    if let toml::Value::Table(t) = value {
+    use toml::Value;
+    if let Some(table) = value.as_table_mut() {
+        // Handle [common] section
+        if let Some(Value::Table(common_table)) = table.remove("common") {
+            for (k, v) in common_table {
+                table.entry(k).or_insert(v);
+            }
+        }
+
+        // Go legacy INI keys: top-level admin_* -> [web_server] (Go
+        // pkg/config/legacy conversion.go AdminAddr/Port/User/Pwd/...).
+        // Runs AFTER the [common] merge so keys from [common] migrate too.
         legacy_web_server_keys(
-            t,
+            table,
             &[
                 ("admin_addr", "addr"),
                 ("admin_port", "port"),
@@ -656,16 +664,6 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
                 ("pprof_enable", "pprof_enable"),
             ],
         );
-    }
-
-    use toml::Value;
-    if let Some(table) = value.as_table_mut() {
-        // Handle [common] section
-        if let Some(Value::Table(common_table)) = table.remove("common") {
-            for (k, v) in common_table {
-                table.entry(k).or_insert(v);
-            }
-        }
 
         // Rename protocol → transport_protocol (Go frp uses "protocol")
         if let Some(v) = table.remove("protocol") {

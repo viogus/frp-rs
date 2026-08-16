@@ -56,6 +56,15 @@ All notable changes to frp-rs.
   TCP-group load balancing is unaffected (its group LB is restricted to
   tcp proxies — http groups are selected by the vhost router).
 
+### Changed
+- **Health-checked proxies register only after the first healthy probe**
+  (Go frp `proxy_wrapper` parity): a proxy with `health_check_type`
+  configured is no longer registered immediately at startup — the client
+  waits until the first successful health check (or a subsequent recovery)
+  before sending `NewProxy`. A persistently-unhealthy proxy therefore never
+  registers. Previously the proxy registered immediately and was only
+  unregistered after `max_failed` consecutive failures.
+
 ### Compatibility
 - `compat-test.sh` now targets the **Go frp v0.71.0** pre-built binaries by
   default (was 0.70.1); full cross-compat suite green (77 scenarios).
