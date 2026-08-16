@@ -9,7 +9,9 @@ use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
-use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::protocol::{
+    read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v1, write_msg_v2_with_udp_codec,
+};
 use frp_core::transport::{
     dial_server, split_work_conn_halves, BoxedReadHalf, BoxedWriteHalf, DialOptions, IoStream,
     TransportProtocol,
@@ -65,6 +67,11 @@ pub(crate) struct VisitorListenerConfig {
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
     pub v2: bool,
+    /// Negotiated UDPPacket codec (`"binary-v1"` or empty) of this frpc's
+    /// control session (Go frp v0.71.0). The SUDP visitor data plane uses it
+    /// so the visitor segment matches the provider segment's packet codec
+    /// when wire protocol v2 is negotiated; empty means JSON framing.
+    pub udp_packet_codec: String,
 }
 
 /// Configuration for a no-bind `virtual_net` visitor tunnel.
@@ -324,6 +331,9 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         tls_cert_file,
         tls_key_file,
         v2,
+        // SUDP-only: the STCP TCP accept path ignores the negotiated
+        // UDPPacket codec.
+        udp_packet_codec: _,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -1085,6 +1095,7 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         tls_cert_file,
         tls_key_file,
         v2,
+        udp_packet_codec,
     } = config;
 
     // Go frp v0.70.1 three-stage model: the visitor segment is encrypted
@@ -1251,6 +1262,7 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
             use_compression,
             &user,
             &run_id,
+            v2,
         )
         .await
         {
@@ -1276,6 +1288,8 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
             use_encryption,
             use_compression,
             &secret_key,
+            v2,
+            &udp_packet_codec,
         )
         .await;
         // Worker ended (disconnect / idle timeout): back to the wait state.
@@ -1329,6 +1343,7 @@ async fn connect_sudp_visitor_stream(
     use_compression: bool,
     user: &str,
     run_id: &str,
+    v2: bool,
 ) -> Option<IoStream> {
     let plan = plan_visitor_dial(
         server_addr,
@@ -1366,7 +1381,21 @@ async fn connect_sudp_visitor_stream(
         Some(user).filter(|s| !s.is_empty()),
         Some(run_id).filter(|s| !s.is_empty()),
     );
-    if let Err(e) = server_conn.write_v1_frame(&nvc).await {
+    // V2: write the connection magic before the NewVisitorConn frame (Go frp
+    // messageConnector.Connect → WriteMagicIfV2; work conns do the same).
+    // The server's accept loop consumes the magic, detects V2, and routes the
+    // frame to handle_visitor_conn_inner; all subsequent frames on the
+    // connection are magic-less V2 frames.
+    let send_result = async {
+        if v2 {
+            frp_core::protocol::write_v2_magic(&mut server_conn).await?;
+            server_conn.write_v2_frame(&nvc).await
+        } else {
+            server_conn.write_v1_frame(&nvc).await
+        }
+    }
+    .await;
+    if let Err(e) = send_result {
         warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
         return None;
     }
@@ -1374,7 +1403,12 @@ async fn connect_sudp_visitor_stream(
     // work_conn.rs): a silent server must not leave the tunnel connect
     // hanging — the dispatcher falls back to waiting for the next datagram.
     let resp_timeout = Duration::from_secs(transport.dial_timeout_secs.max(1));
-    match tokio::time::timeout(resp_timeout, server_conn.read_v1_frame()).await {
+    let read_resp = if v2 {
+        tokio::time::timeout(resp_timeout, server_conn.read_v2_frame()).await
+    } else {
+        tokio::time::timeout(resp_timeout, server_conn.read_v1_frame()).await
+    };
+    match read_resp {
         Ok(Ok(FrpMessage::NewVisitorConnResp(resp))) => {
             if let Some(err) = resp.error {
                 warn!(visitor_name = %visitor_name, error = %err, "SUDP visitor '{}': server error: {}", visitor_name, err);
@@ -1430,7 +1464,18 @@ async fn run_sudp_worker(
     use_encryption: bool,
     use_compression: bool,
     secret_key: &str,
+    v2: bool,
+    udp_packet_codec: &str,
 ) {
+    // Negotiated UDPPacket codec (Go frp v0.71.0): `"binary-v1"` when the
+    // control session negotiated it (wire protocol v2), empty otherwise.
+    // The visitor segment must use the same codec as the provider segment
+    // or the server bridges the two message-level (transcoding).
+    let udp_codec_opt = if v2 && !udp_packet_codec.is_empty() {
+        Some(udp_packet_codec)
+    } else {
+        None
+    };
     let (srv_r, srv_w) = match split_work_conn_halves(server_conn) {
         Ok(pair) => pair,
         Err(e) => {
@@ -1472,7 +1517,18 @@ async fn run_sudp_worker(
     // Buffer frame reads: read_msg_v1 issues two read_exact calls per message.
     let mut srv_r = tokio::io::BufReader::with_capacity(16 * 1024, srv_r);
     // The first packet (which triggered the connect) is written immediately.
-    if let Err(e) = write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(first_pkt)).await {
+    let first_write = if v2 {
+        write_msg_v2_with_udp_codec(
+            &mut srv_w,
+            &FrpMessage::UDPPacket(first_pkt),
+            udp_codec_opt,
+            false,
+        )
+        .await
+    } else {
+        write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(first_pkt)).await
+    };
+    if let Err(e) = first_write {
         warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write first UDPPacket failed: {}", visitor_name, e);
         return;
     }
@@ -1505,7 +1561,18 @@ async fn run_sudp_worker(
             pkt = send_rx.recv() => {
                 match pkt {
                     Some(p) => {
-                        if let Err(e) = write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(p)).await {
+                        let write = if v2 {
+                            write_msg_v2_with_udp_codec(
+                                &mut srv_w,
+                                &FrpMessage::UDPPacket(p),
+                                udp_codec_opt,
+                                false,
+                            )
+                            .await
+                        } else {
+                            write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(p)).await
+                        };
+                        if let Err(e) = write {
                             debug!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write UDPPacket failed: {}", visitor_name, e);
                             break;
                         }
@@ -1517,7 +1584,13 @@ async fn run_sudp_worker(
                     }
                 }
             }
-            msg_result = read_msg_v1(&mut srv_r) => {
+            msg_result = async {
+                if v2 {
+                    read_msg_v2_with_udp_codec(&mut srv_r, udp_codec_opt).await
+                } else {
+                    read_msg_v1(&mut srv_r).await
+                }
+            } => {
                 match msg_result {
                     Ok(FrpMessage::UDPPacket(up)) => {
                         idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);

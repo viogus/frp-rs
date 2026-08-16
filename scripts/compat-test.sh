@@ -2016,6 +2016,111 @@ test_r2g_udp() {
 }
 
 # =============================================================================
+# Test: Go frpc (V2 wire protocol, binary-v1 UDP codec) -> Rust frps, UDP proxy
+# Verifies the Go frp v0.71.0 binary UDPPacket codec (V2TypeUDPPacketBinary=19)
+# end-to-end against the Rust frps data plane (regression coverage: the codec
+# previously had no cross-implementation e2e test).
+# =============================================================================
+test_g2r_udp_v2() {
+    local name="go-to-rust-udp-v2"
+    should_run_test "$name" || return 0
+
+    ensure_go_frp_v2 || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-udp-v2"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Rust frps (auto-detects V2)
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Go frpc (V2) with UDP proxy
+    write_frpc_config_udp go "$frps_port" "$token" "$echo_port" "$proxy_port" "udp-echo" "$TEST_DIR/$name/frpc.toml" ""
+    sed -i.bak '/^transport\.tls\.enable/i\
+transport.wireProtocol = "v2"
+' "$TEST_DIR/$name/frpc.toml"
+    rm -f "$TEST_DIR/$name/frpc.toml.bak"
+    run_go "$GO_FRPC_V2" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 1
+
+    local result
+    result=$(send_and_expect_udp "$proxy_port" "udp-v2-g2r-test" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc (V2 wire protocol, binary-v1 UDP codec) -> Go frps, UDP proxy
+# Reverse direction of the binary codec cross-implementation check.
+# =============================================================================
+test_r2g_udp_v2() {
+    local name="rust-to-go-udp-v2"
+    should_run_test "$name" || return 0
+
+    ensure_go_frp_v2 || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-udp-v2"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Go frps
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Start Rust frpc (V2) with UDP proxy
+    write_frpc_config_udp rust "$frps_port" "$token" "$echo_port" "$proxy_port" "udp-echo" "$TEST_DIR/$name/frpc.toml" ""
+    # Insert v2 = true BEFORE the top-level tls_enable key (Rust config).
+    sed -i.bak '/^tls_enable/i\
+v2 = true
+' "$TEST_DIR/$name/frpc.toml"
+    rm -f "$TEST_DIR/$name/frpc.toml.bak"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    local result
+    result=$(send_and_expect_udp "$proxy_port" "udp-v2-r2g-test" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Go frpc -> Rust frps, HTTP proxy (VHost)
 # =============================================================================
 test_g2r_http() {
@@ -2094,6 +2199,128 @@ TOML
         pass_test "$name"
     else
         fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc HTTP group (loadBalancer.group) -> Rust frps
+# Two Go http proxies share one vhost route; the server dispatches requests
+# round-robin across the group members (Go frp v0.71.0 HTTPGroupController).
+# =============================================================================
+test_g2r_http_group() {
+    local name="go-to-rust-http-group"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_port=$(random_port)
+    local echo1_port=$(random_port)
+    local echo2_port=$(random_port)
+    local token="test-token-g2r-http-group"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Two HTTP echo servers with distinct body prefixes (to tell members apart)
+    start_http_echo_server "$echo1_port" "grpA:"
+    start_http_echo_server "$echo2_port" "grpB:"
+    wait_for_port 127.0.0.1 "$echo1_port" 3 || {
+        fail_test "$name" "echo1 did not start"
+        return
+    }
+    wait_for_port 127.0.0.1 "$echo2_port" 3 || {
+        fail_test "$name" "echo2 did not start"
+        return
+    }
+
+    # Start Rust frps with VHost HTTP port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+vhost_http_port = $vhost_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$vhost_port" 5 || {
+        fail_test "$name" "VHost HTTP port $vhost_port not reachable"
+        return
+    }
+
+    # Start Go frpc with two HTTP proxies in one group
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "grp-http-1"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo1_port
+customDomains = ["grp.example.com"]
+loadBalancer.group = "httpgrp"
+loadBalancer.groupKey = "grp-key"
+
+[[proxies]]
+name = "grp-http-2"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo2_port
+customDomains = ["grp.example.com"]
+loadBalancer.group = "httpgrp"
+loadBalancer.groupKey = "grp-key"
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 3
+
+    # Send 6 requests; round-robin must serve BOTH members (grpA:/grpB:).
+    local saw_a=0 saw_b=0
+    local i
+    for i in 1 2 3 4 5 6; do
+        local resp
+        resp=$(SE_VHOST="$vhost_port" SE_HOST="grp.example.com" SE_TO="5" python3 -c '
+import os, socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(float(os.environ["SE_TO"]))
+s.connect(("127.0.0.1", int(os.environ["SE_VHOST"])))
+s.sendall(b"POST /test HTTP/1.1\r\nHost: " + os.environ["SE_HOST"].encode() + b"\r\nContent-Length: 5\r\n\r\nhello")
+data = s.recv(4096)
+s.close()
+if b"grpA:hello" in data:
+    print("A")
+elif b"grpB:hello" in data:
+    print("B")
+else:
+    print("FAIL:" + repr(data[:120]))
+' 2>&1)
+        case "$resp" in
+            A) saw_a=1 ;;
+            B) saw_b=1 ;;
+            *) fail_test "$name" "unexpected response on request $i: $resp"; return ;;
+        esac
+    done
+    if [[ "$saw_a" == "1" && "$saw_b" == "1" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "round-robin did not hit both members (A=$saw_a B=$saw_b)"
     fi
 }
 
@@ -3248,7 +3475,7 @@ test_g2r_stcp() {
 
     # Start Rust frps
     write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
-    RUST_LOG=debug "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
     wait_for_port 127.0.0.1 "$frps_port" 5 || {
@@ -3426,7 +3653,7 @@ test_g2r_stcp_encrypted() {
 
     # Start Rust frps
     write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
-    RUST_LOG=debug "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
     wait_for_port 127.0.0.1 "$frps_port" 5 || {
@@ -5113,6 +5340,8 @@ run_test test_r2g_mux_tls_encrypt
 # Phase 4: Other proxy types
 run_test test_g2r_udp
 run_test test_r2g_udp
+run_test test_g2r_udp_v2
+run_test test_r2g_udp_v2
 run_test test_g2r_udp_encrypted
 run_test test_r2g_udp_encrypted
 # SUDP cross-compat (go->rust only): Go frp v0.70.1 sudp is a client-side half
@@ -5122,6 +5351,7 @@ run_test test_r2g_udp_encrypted
 run_test test_g2r_sudp
 run_test test_g2r_sudp_encrypted
 run_test test_g2r_http
+run_test test_g2r_http_group
 run_test test_r2g_http
 run_test test_g2r_https
 run_test test_r2g_https
@@ -6577,6 +6807,322 @@ test_r2g_quic_encrypted() {
 }
 
 # =============================================================================
+# Test: Go frpc SUDP visitor (V2) -> Rust frps (V2) -> Rust frpc SUDP provider (V2)
+# Both segments negotiate the binary-v1 UDPPacket codec, so the server keeps
+# the zero-copy byte-stream relay. Go frp v0.71.0: Go visitors send their
+# controller's run_id, and the server inherits the visitor's own session codec
+# (admitVisitorByRunID) — matching frp-rs, whose V2 visitor data plane speaks
+# binary-v1. Regression: the visitor segment used to be hard-coded V1, which
+# broke SUDP under V2 ("unexpected V2 frame type").
+# =============================================================================
+test_g2r_sudp_v2() {
+    local name="go-to-rust-sudp-v2"
+    should_run_test "$name" || return 0
+
+    ensure_go_frp_v2 || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local sudp_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-g2r-sudp-v2"
+    local sk="sudp-secret-key-v2-53"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Rust frps with SUDP port + V2 wire protocol
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+sudpPort = $sudp_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    # Rust frps auto-detects V2 from the connection magic (no v2 config key;
+    # the key exists only in Go frps configs).
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Rust frpc provider (SUDP, V2 wire protocol → binary-v1)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+tls_enable = false
+login_fail_exit = true
+pool_count = 1
+v2 = true
+
+[[proxies]]
+name = "sudp-echo"
+type = "sudp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+sk = "$sk"
+TOML
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+
+    # Start Go frpc visitor (SUDP, V2 wire protocol)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.wireProtocol = "v2"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-visitor-$name.log"
+log.level = "debug"
+
+[[visitors]]
+name = "sudp-visitor"
+type = "sudp"
+serverName = "sudp-echo"
+secretKey = "$sk"
+bindAddr = "127.0.0.1"
+bindPort = $visitor_port
+TOML
+    run_go "$GO_FRPC_V2" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    sleep 2
+
+    local result
+    result=$(send_and_expect_udp "$visitor_port" "sudp-v2-data" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc SUDP visitor (V1/JSON) -> Rust frps (V2) -> Rust frpc SUDP
+#       provider (V2/binary)
+# Mixed packet encodings across the two segments: the server detects the
+# mismatch and routes the pair through the message-level transcoding bridge
+# (Go frp v0.71.0 joinSUDPMessageBridge). Regression: a byte-stream relay
+# made the V2 provider misparse the V1 visitor's frames.
+# =============================================================================
+test_g2r_sudp_mixed() {
+    local name="go-to-rust-sudp-mixed"
+    should_run_test "$name" || return 0
+
+    ensure_go_frp_v2 || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local sudp_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-g2r-sudp-mixed"
+    local sk="sudp-secret-key-mixed-54"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Rust frps with SUDP port + V2 wire protocol
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+sudpPort = $sudp_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    # Rust frps auto-detects V2 from the connection magic (no v2 config key;
+    # the key exists only in Go frps configs).
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Rust frpc provider (SUDP, V2 wire protocol → binary-v1)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+tls_enable = false
+login_fail_exit = true
+pool_count = 1
+v2 = true
+
+[[proxies]]
+name = "sudp-echo"
+type = "sudp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+sk = "$sk"
+TOML
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+
+    # Start Go frpc visitor (SUDP, V1 wire protocol → JSON frames)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-visitor-$name.log"
+log.level = "debug"
+
+[[visitors]]
+name = "sudp-visitor"
+type = "sudp"
+serverName = "sudp-echo"
+secretKey = "$sk"
+bindAddr = "127.0.0.1"
+bindPort = $visitor_port
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    sleep 2
+
+    local result
+    result=$(send_and_expect_udp "$visitor_port" "sudp-mixed-data" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc SUDP visitor (V2/binary) -> Rust frps -> Rust frpc SUDP
+#       provider (V1/JSON)
+# Upgrade transition: the visitor's frpc runs wire protocol v2 (binary-v1),
+# the provider's frpc is still V1. The visitor inherits its OWN control
+# session's codec via its run_id (Go admitVisitorByRunID) — not the
+# provider's — so the server sees mixed encodings and bridges the pair
+# message-level (V2 binary <-> V1 JSON).
+# =============================================================================
+test_g2r_sudp_v2_visitor_v1_provider() {
+    local name="go-to-rust-sudp-v2-v1"
+    should_run_test "$name" || return 0
+
+    ensure_go_frp_v2 || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local sudp_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-g2r-sudp-v2v1"
+    local sk="sudp-secret-key-v2v1-55"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Rust frps with SUDP port (auto-detects V2)
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+sudpPort = $sudp_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Rust frpc provider (SUDP, V1 wire protocol -> JSON frames)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+tls_enable = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "sudp-echo"
+type = "sudp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+sk = "$sk"
+TOML
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+
+    # Start Go frpc visitor (SUDP, V2 wire protocol -> binary-v1)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.wireProtocol = "v2"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-visitor-$name.log"
+log.level = "debug"
+
+[[visitors]]
+name = "sudp-visitor"
+type = "sudp"
+serverName = "sudp-echo"
+secretKey = "$sk"
+bindAddr = "127.0.0.1"
+bindPort = $visitor_port
+TOML
+    run_go "$GO_FRPC_V2" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    sleep 2
+
+    local result
+    result=$(send_and_expect_udp "$visitor_port" "sudp-v2v1-data" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Go frpc (V2 wire protocol) -> Rust frps
 # =============================================================================
 test_g2r_v2_tcp() {
@@ -6960,6 +7506,9 @@ run_test test_r2g_quic_encrypted
 # Go frp v0.70.1+ pre-built binaries include V2 protocol support.
 # Both g2r and r2g V2 tests use the pre-built binary.
 if ensure_go_frp_v2; then
+    run_test test_g2r_sudp_v2
+    run_test test_g2r_sudp_mixed
+    run_test test_g2r_sudp_v2_visitor_v1_provider
     run_test test_g2r_v2_tcp
     run_test test_r2g_v2_tcp
 else

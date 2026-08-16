@@ -24,6 +24,12 @@ mod vhost_h2c;
 pub struct VhostRoute {
     pub proxy_name: Arc<str>,
     pub run_id: Arc<str>,
+    /// Non-empty when this route belongs to an HTTP/HTTPS group (Go frp
+    /// v0.71.0 HTTPGroup): requests are dispatched round-robin across the
+    /// group's members instead of always to `proxy_name`. The route is
+    /// created by the group's first member; `proxy_name`/`run_id` carry the
+    /// first member's identity for fallback (e.g. route_by_http_user miss).
+    pub group: Arc<str>,
     /// Location prefixes for this proxy (empty = host-only routing).
     pub locations: Vec<String>,
     /// Rewrite Host header to this value before forwarding (Go frp compat).
@@ -47,6 +53,9 @@ pub struct VhostRoute {
 pub struct VhostRouteMatch {
     pub proxy_name: Arc<str>,
     pub run_id: Arc<str>,
+    /// Non-empty when the matched route belongs to an HTTP group; the
+    /// request must be dispatched round-robin across the group members.
+    pub group: Arc<str>,
     pub host_header_rewrite: Arc<str>,
     pub http_user: Arc<str>,
     pub http_pwd: Arc<str>,
@@ -60,6 +69,7 @@ impl VhostRouteMatch {
         Self {
             proxy_name: Arc::clone(&route.proxy_name),
             run_id: Arc::clone(&route.run_id),
+            group: Arc::clone(&route.group),
             host_header_rewrite: Arc::clone(&route.host_header_rewrite),
             http_user: Arc::clone(&route.http_user),
             http_pwd: Arc::clone(&route.http_pwd),
@@ -201,10 +211,12 @@ impl VhostManager {
         http_pwd: &str,
         route_by_http_user: &str,
         headers: &[(String, String)],
+        group: &str,
     ) -> Result<(), RouterConfigConflict> {
         let route = VhostRoute {
             proxy_name: proxy_name.into(),
             run_id: run_id.into(),
+            group: group.into(),
             locations: locations.to_vec(),
             host_header_rewrite: host_header_rewrite.into(),
             http_user: http_user.into(),
@@ -781,6 +793,42 @@ pub(crate) async fn resolve_vhost_request(
         }
     }
 
+    // HTTP/HTTPS group routing (Go frp v0.71.0 HTTPGroup.chooseEndpoint):
+    // when the matched route belongs to a group, pick a member round-robin.
+    // The chosen member becomes the fallback target; route_by_http_user
+    // (below) may override it with a user-specific proxy when configured.
+    let (group_proxy_name, group_run_id) = if route.group.is_empty() {
+        (route.proxy_name.to_string(), route.run_id.to_string())
+    } else {
+        match state.http_group_ctl.choose_endpoint(&route.group).await {
+            Some(member) => match state.proxy_manager.get(&member).await {
+                Some(info) => {
+                    debug!(
+                        host = %host, path = %path, group = %route.group, member = %member,
+                        "{} VHost group '{}' -> member '{}'", scheme, route.group, member
+                    );
+                    (member, info.run_id.clone())
+                }
+                None => {
+                    // Member gone between choose and lookup — fall back to
+                    // the route's recorded proxy (first member).
+                    warn!(
+                        group = %route.group, member = %member,
+                        "{} VHost: group member '{}' not registered, falling back to '{}'",
+                        scheme, member, route.proxy_name
+                    );
+                    (route.proxy_name.to_string(), route.run_id.to_string())
+                }
+            },
+            None => {
+                // Group has no members (all unregistered) — route the
+                // request to the first member anyway; the control dispatch
+                // will fail cleanly if it is gone too.
+                (route.proxy_name.to_string(), route.run_id.to_string())
+            }
+        }
+    };
+
     // Per-user routing (Go frp compat): when route_by_http_user is set,
     // extract the Basic Auth username and look up proxy
     // `{route_by_http_user}.{username}` in the proxy manager.
@@ -801,16 +849,16 @@ pub(crate) async fn resolve_vhost_request(
                 debug!(
                     user_proxy = %user_proxy,
                     "{} VHost: user-based proxy '{}' not found, falling back to '{}'",
-                    scheme, user_proxy, route.proxy_name
+                    scheme, user_proxy, group_proxy_name
                 );
-                (route.proxy_name.to_string(), route.run_id.to_string())
+                (group_proxy_name, group_run_id)
             }
         } else {
             // No Authorization header — fall through to route's proxy.
-            (route.proxy_name.to_string(), route.run_id.to_string())
+            (group_proxy_name, group_run_id)
         }
     } else {
-        (route.proxy_name.to_string(), route.run_id.to_string())
+        (group_proxy_name, group_run_id)
     };
 
     // Apply host_header_rewrite if configured

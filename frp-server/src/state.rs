@@ -49,6 +49,16 @@ pub enum InternalMsg {
         /// when encryption is also on — snappy inner, CFB outer, matching Go's
         /// `WithCompression` + `WithEncryption` order).
         visitor_use_compression: bool,
+        /// Wire protocol of the visitor's connection (V2 frame detection).
+        /// Go frp v0.71.0 `RegisterVisitorConn` records the visitor conn's
+        /// wireProtocol; the SUDP bridge needs it to pick the visitor-side
+        /// packet codec (and to detect mixed SUDP packet encodings).
+        visitor_v2: bool,
+        /// Visitor-segment UDPPacket codec (`"binary-v1"` or empty),
+        /// determined at accept time (Go frp v0.71.0 `admitVisitorByRunID`:
+        /// V2 visitors inherit their own control session's negotiated codec;
+        /// V1 visitors use JSON).
+        visitor_udp_packet_codec: String,
     },
     ProxyUserConn {
         proxy_name: String,
@@ -158,6 +168,15 @@ pub struct ControlTx {
     /// Monotonically increasing control generation ID.
     /// Distinguished old vs new control connections with the same run_id.
     pub control_id: u64,
+    /// Negotiated UDPPacket codec (`"binary-v1"` or empty) for this control
+    /// session (Go frp v0.71.0 sessionCtx.UDPPacketCodec). Used by SUDP
+    /// visitor routing to inherit the provider's packet codec (Go
+    /// `admitVisitorByRunID`) and by proxy registration metadata.
+    pub udp_packet_codec: String,
+    /// Wire protocol of this control session (true = v2). Go frp v0.71.0
+    /// enforces that work connections and run_id-bearing visitor connections
+    /// use the same wire protocol as the control they reference.
+    pub wire_v2: bool,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -430,6 +449,141 @@ impl RateLimiter {
 /// (proxy_name) → (port, is_udp, closed_at) for the 24h port reservation.
 pub type PortReservationMap = std::collections::HashMap<String, (u16, bool, std::time::Instant)>;
 
+/// HTTP/HTTPS group shared-route load balancing (Go frp v0.71.0
+/// `server/group/http.go` HTTPGroupController). Group members share one
+/// vhost route; HTTP requests hitting the route are dispatched round-robin
+/// across the members (Go `HTTPGroup.chooseEndpoint`).
+///
+/// The first member to register creates the group and (through
+/// `register_http_vhost`/`register_https_vhost`) the shared vhost route;
+/// subsequent members only join the member list after the group_key and
+/// routing params (domain/location/route_by_http_user) match.
+pub(crate) struct HttpGroup {
+    group_key: String,
+    domain: String,
+    location: String,
+    route_by_http_user: String,
+    /// Member proxy names, in registration order (round-robin).
+    members: RwLock<Vec<String>>,
+    /// Round-robin cursor (Go `atomic.Uint64` index).
+    index: AtomicU64,
+    /// The FIRST member to register — it owns the shared vhost route
+    /// (vhost_manager's by_proxy index keys on this name). When the group
+    /// empties, the route must be unregistered with THIS name, not the
+    /// last member that happened to leave.
+    route_owner: String,
+}
+
+pub(crate) struct HttpGroupController {
+    groups: RwLock<HashMap<String, Arc<HttpGroup>>>,
+}
+
+impl HttpGroupController {
+    pub fn new() -> Self {
+        Self {
+            groups: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a group member. The FIRST member creates the group (the
+    /// caller then registers the shared vhost route); subsequent members
+    /// are validated against the existing group (Go HTTPGroup.Register):
+    /// group_key must match and routing params must be identical.
+    /// Returns `(group, is_first_member)` on success, Err(String) on
+    /// mismatch/repeat. The caller registers the shared vhost route only for
+    /// the first member.
+    /// Lock ordering: `groups` write lock is always acquired BEFORE any
+    /// `members` lock (never the reverse), so nested awaits cannot deadlock.
+    pub async fn register_member(
+        &self,
+        group: &str,
+        group_key: &str,
+        domain: &str,
+        location: &str,
+        route_by_http_user: &str,
+        proxy_name: &str,
+    ) -> Result<(Arc<HttpGroup>, bool), String> {
+        let mut groups = self.groups.write().await;
+        if let Some(g) = groups.get(group) {
+            // Existing group: validate params (Go ErrGroupParamsInvalid /
+            // ErrGroupAuthFailed).
+            // group name matches by construction (registry key); validate the
+            // routing params (Go ErrGroupParamsInvalid).
+            if g.domain != domain
+                || g.location != location
+                || g.route_by_http_user != route_by_http_user
+            {
+                return Err(format!(
+                    "http group [{}] params mismatch (domain/location/routeByHTTPUser must match the group's first member)",
+                    group
+                ));
+            }
+            if g.group_key != group_key {
+                return Err(format!(
+                    "http group [{}] auth failed: group_key mismatch",
+                    group
+                ));
+            }
+            let mut members = g.members.write().await;
+            if members.iter().any(|m| m == proxy_name) {
+                return Err(format!(
+                    "proxy [{}] is already a member of http group [{}]",
+                    proxy_name, group
+                ));
+            }
+            members.push(proxy_name.to_string());
+            return Ok((g.clone(), false));
+        }
+        let g = Arc::new(HttpGroup {
+            group_key: group_key.to_string(),
+            domain: domain.to_string(),
+            location: location.to_string(),
+            route_by_http_user: route_by_http_user.to_string(),
+            members: RwLock::new(vec![proxy_name.to_string()]),
+            index: AtomicU64::new(0),
+            route_owner: proxy_name.to_string(),
+        });
+        groups.insert(group.to_string(), g.clone());
+        Ok((g, true))
+    }
+
+    /// Remove a member. Returns `Some(route_owner)` when the group became
+    /// empty — the caller must then drop the shared vhost route using the
+    /// OWNER's name (the first member registered it) and the group is
+    /// removed. Returns `None` when the group still has members or did not
+    /// exist.
+    pub async fn unregister_member(&self, group: &str, proxy_name: &str) -> Option<String> {
+        let mut groups = self.groups.write().await;
+        let g = groups.get(group)?;
+        let empty = {
+            let mut members = g.members.write().await;
+            members.retain(|m| m != proxy_name);
+            members.is_empty()
+        };
+        if empty {
+            let owner = g.route_owner.clone();
+            groups.remove(group);
+            Some(owner)
+        } else {
+            None
+        }
+    }
+
+    /// Round-robin pick a member proxy name (Go HTTPGroup.chooseEndpoint).
+    /// Returns None when the group has no members.
+    pub async fn choose_endpoint(&self, group: &str) -> Option<String> {
+        let groups = self.groups.read().await;
+        let g = groups.get(group)?;
+        let members = g.members.read().await;
+        if members.is_empty() {
+            return None;
+        }
+        let idx = g.index.fetch_add(1, AtomicOrdering::Relaxed) as usize % members.len();
+        Some(members[idx].clone())
+    }
+}
+
+/// Shared state for cross-task communication
 pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
     /// (proxy_name) → (port, is_udp, closed_at) for the 24h port reservation.
@@ -479,6 +633,10 @@ pub struct AppState {
     /// TCP group shared listener management (Go frp dev compat).
     /// Groups proxies that share the same remote port with round-robin dispatch.
     pub(crate) tcp_group_ctl: TcpGroupCtl,
+    /// HTTP/HTTPS group shared-route load balancing (Go frp v0.71.0
+    /// server/group/http.go). Groups of http/https proxies share one vhost
+    /// route; requests are dispatched round-robin across members.
+    pub(crate) http_group_ctl: HttpGroupController,
     pub vhost_http_timeout: u64,
     pub user_conn_timeout: u64,
     pub tcp_mux_passthrough: bool,
@@ -656,6 +814,7 @@ impl AppState {
             client_ports_used: Arc::new(RwLock::new(std::collections::HashMap::new())),
             sudp_port,
             tcp_group_ctl: TcpGroupCtl::new(),
+            http_group_ctl: HttpGroupController::new(),
             vhost_http_timeout,
             user_conn_timeout,
             tcp_mux_passthrough,
@@ -1025,6 +1184,8 @@ mod tests {
                 pool_stats: Arc::new(PoolStats::default()),
                 user: String::new(),
                 control_id: 1,
+                udp_packet_codec: String::new(),
+                wire_v2: false,
             },
         );
         rx

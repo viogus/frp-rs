@@ -213,6 +213,53 @@ pub(crate) async fn handle_visitor_conn_inner(
         }
     }
 
+    // Go frp v0.71.0: a visitor connection carrying a run_id must use the
+    // same wire protocol as the control session that run_id names
+    // (RegisterVisitorConn "visitor connection wire protocol mismatch"). A
+    // mixed-protocol visitor conn would be misparsed by the provider bridge.
+    //
+    // NOTE (intentional asymmetry): only the v2-visitor + v1-control combo is
+    // rejected here. The reverse (v1 visitor + v2 control) is served through
+    // the SUDP message-level transcoding bridge (V1 JSON <-> V2 binary) — a
+    // deliberate frp-rs extension that lets an older V1 visitor talk to a V2
+    // provider during upgrades (Go would reject it; the compat suite covers
+    // this scenario in go-to-rust-sudp-v2-v1).
+    if v2 {
+        if let Some(rid) = msg.run_id.as_deref().filter(|r| !r.is_empty()) {
+            if let Some(ctl) = state.run_id_to_ctl_tx.get(rid) {
+                if !ctl.wire_v2 {
+                    warn!(
+                        visitor_run_id = ?rid, proxy_name = %proxy_name,
+                        "Visitor connection wire protocol mismatch: visitor uses v2 but control {} is v1; rejecting",
+                        rid
+                    );
+                    let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                        proxy_name: proxy_name.clone(),
+                        error: Some("visitor connection wire protocol mismatch".into()),
+                    });
+                    let _ = write_msg(&mut stream, &resp, v2).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    // Visitor-segment UDPPacket codec (Go frp v0.71.0 `admitVisitorByRunID`):
+    // a V2 visitor connection inherits the negotiated codec of the control
+    // session its run_id names — the visitor's own frpc session, which is
+    // also the provider in the single-frpc deployment (Go frpc sends its
+    // controller's run_id in NewVisitorConn; a cross-frpc visitor keeps its
+    // own session's codec, NOT the provider's). V1 visitors always use JSON
+    // (empty codec).
+    let visitor_udp_packet_codec = if v2 {
+        msg.run_id
+            .as_deref()
+            .and_then(|rid| state.run_id_to_ctl_tx.get(rid))
+            .map(|c| c.udp_packet_codec.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // Check for graceful shutdown before proceeding — if the server is shutting
     // down, the control handler may no longer be accepting messages and the
     // visitor connection would be silently dropped. Return an error immediately
@@ -264,6 +311,12 @@ pub(crate) async fn handle_visitor_conn_inner(
                     visitor_conn: stream,
                     visitor_use_encryption,
                     visitor_use_compression,
+                    // Wire protocol of this visitor connection (V2 frame
+                    // detection) — the SUDP bridge uses it to pick the
+                    // visitor-side packet codec (Go frp v0.71.0
+                    // RegisterVisitorConn wireProtocol).
+                    visitor_v2: v2,
+                    visitor_udp_packet_codec,
                 })
                 .await
                 .is_err()
@@ -952,7 +1005,7 @@ async fn dispatch_v2_message_inner(
             }
         }
         FrpMessage::NewWorkConn(nwc) => {
-            handle_work_conn_inner(io, nwc, state).await;
+            handle_work_conn_inner(io, nwc, state, true).await;
         }
         FrpMessage::NewVisitorConn(vc) => {
             handle_visitor_conn_inner(io, vc, state, true, Some(addr)).await;
@@ -986,7 +1039,7 @@ pub(crate) async fn dispatch_v1_message(
             control::handle_control(io, *login, state, addr, incoming, false, None, false).await;
         }
         Ok(Ok(FrpMessage::NewWorkConn(nwc))) => {
-            handle_work_conn_inner(io, nwc, state).await;
+            handle_work_conn_inner(io, nwc, state, false).await;
         }
         Ok(Ok(FrpMessage::NewVisitorConn(nvc))) => {
             handle_visitor_conn_inner(io, nvc, state, false, addr).await;
@@ -1096,6 +1149,7 @@ pub(crate) async fn handle_work_conn_inner(
     stream: IoStream,
     msg: msg::NewWorkConn,
     state: Arc<AppState>,
+    v2: bool,
 ) {
     let run_id = match &msg.run_id {
         Some(id) => id.clone(),
@@ -1108,6 +1162,25 @@ pub(crate) async fn handle_work_conn_inner(
     if let Err(e) = validate_new_work_conn_auth(&msg, &run_id, &state).await {
         warn!(run_id = %run_id, error = %e, "Work conn auth failed for run_id {}: {}", run_id, e);
         return;
+    }
+
+    // Go frp v0.71.0: the work connection's wire protocol must match the
+    // control session it references ("work connection wire protocol
+    // mismatch"). A mixed-protocol work conn would be misparsed by the
+    // control's frame reader.
+    if let Some(ctl) = state.run_id_to_ctl_tx.get(&run_id) {
+        if ctl.wire_v2 != v2 {
+            warn!(
+                run_id = %run_id,
+                work_wire = if v2 { "v2" } else { "v1" },
+                control_wire = if ctl.wire_v2 { "v2" } else { "v1" },
+                "Work conn wire protocol mismatch for run_id {} (work={}, control={}); rejecting",
+                run_id,
+                if v2 { "v2" } else { "v1" },
+                if ctl.wire_v2 { "v2" } else { "v1" }
+            );
+            return;
+        }
     }
 
     // NewWorkConn plugin hook — control-enabled plugins can reject

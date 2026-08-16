@@ -714,6 +714,7 @@ impl<R: AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWri
 /// so the spawn site is a plain call and the bridge logic lives in its own
 /// state machine instead of a 54 KiB inline closure.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 async fn run_work_bridge(
     mut work_conn: IoStream,
     req: PendingRequest,
@@ -722,6 +723,7 @@ async fn run_work_bridge(
     metrics: Arc<frp_core::metrics::ProxyMetrics>,
     header_timeout: Option<std::time::Duration>,
     state: Arc<AppState>,
+    v2: bool,
 ) {
     let _guard = ConnGuard::new(metrics.clone());
     let _drain = ActiveGuard::new(&state);
@@ -734,6 +736,46 @@ async fn run_work_bridge(
     // (SUDP compression stays off — see `comp_key` below.)
     let is_sudp = proxy_info.as_ref().is_some_and(|p| p.proxy_type == "sudp");
     let use_enc = req.use_encryption;
+
+    // SUDP data plane: when the visitor and provider segments use the same
+    // wire protocol + packet codec, the byte-stream bridge below is
+    // correct (Go `libio.Join`); when they differ, Go frp v0.71.0 routes
+    // the pair through `joinSUDPMessageBridge`, which decodes and re-encodes
+    // every packet on each side. The mismatch happens during upgrades —
+    // e.g. a V1/JSON visitor talking to a V2/binary provider — and a plain
+    // byte-stream relay would make the provider misparse the visitor's
+    // frames ("unexpected V2 frame type"). Route mismatches to the
+    // message-level bridge; identical encodings keep the zero-copy path.
+    if is_sudp {
+        let provider_codec = proxy_info
+            .as_ref()
+            .map(|p| p.udp_packet_codec.clone())
+            .unwrap_or_default();
+        let visitor_codec = req.visitor_udp_packet_codec.as_str();
+        let mixed = normalize_wire_protocol(v2) != normalize_wire_protocol(req.visitor_v2)
+            || provider_codec != visitor_codec;
+        if mixed {
+            tracing::info!(
+                proxy_name = %req.proxy_name,
+                provider_wire = %normalize_wire_protocol(v2),
+                provider_codec = %provider_codec,
+                visitor_wire = %normalize_wire_protocol(req.visitor_v2),
+                visitor_codec = %visitor_codec,
+                "bridging mixed SUDP packet encodings (message-level bridge)"
+            );
+            return run_sudp_message_bridge(
+                work_conn,
+                req,
+                proxy_info,
+                encryption_key,
+                metrics,
+                state,
+                v2,
+                &provider_codec,
+            )
+            .await;
+        }
+    }
 
     // Visitor segment (user conn): sk-based encryption when the visitor
     // declared `use_encryption` in NewVisitorConn (Go three-stage model,
@@ -1052,6 +1094,237 @@ async fn run_work_bridge(
     debug!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);
 }
 
+/// Go frp v0.71.0 `normalizeWireProtocol`: "" and "v1" both normalize to
+/// "v1"; only "v2" stays "v2".
+fn normalize_wire_protocol(v2: bool) -> &'static str {
+    if v2 {
+        "v2"
+    } else {
+        "v1"
+    }
+}
+
+/// Message-level SUDP bridge (Go frp v0.71.0 `joinSUDPMessageBridge`).
+///
+/// Used when the visitor segment and the provider segment negotiate
+/// different packet encodings (e.g. a V1/JSON visitor talking to a
+/// V2/binary provider during an upgrade). A plain byte-stream relay would
+/// make the provider misparse the visitor's frames as its own protocol
+/// ("unexpected V2 frame type"), so every `UDPPacket` is decoded on the
+/// source side and re-encoded on the destination side.
+///
+/// Direction semantics match Go:
+/// - visitor → provider: `UDPPacket` forwarded, `Ping` dropped
+///   (`bridgeSUDPVisitorToProxy`);
+/// - provider → visitor: `UDPPacket` forwarded, `Ping` forwarded
+///   (`bridgeSUDPProxyToVisitor`).
+///
+/// `Pong` is ignored on both sides (frp-rs UDP data planes treat
+/// Ping/Pong as keepalive and never forward them); any other message type
+/// is a protocol violation and closes the pair.
+#[allow(clippy::too_many_arguments)]
+async fn run_sudp_message_bridge(
+    work_conn: IoStream,
+    req: PendingRequest,
+    proxy_info: Option<Arc<crate::proxy::ProxyInfo>>,
+    encryption_key: [u8; 16],
+    metrics: Arc<frp_core::metrics::ProxyMetrics>,
+    state: Arc<AppState>,
+    provider_v2: bool,
+    provider_codec: &str,
+) {
+    let _guard = ConnGuard::new(metrics.clone());
+    let _drain = ActiveGuard::new(&state);
+    let visitor_v2 = req.visitor_v2;
+    let visitor_codec = req.visitor_udp_packet_codec.as_str();
+
+    // Visitor-segment encryption/compression (Go 三段式第 1 段): identical
+    // decision to the byte-stream bridge — sk-derived key when the visitor
+    // declared use_encryption and the proxy has a secret key.
+    let visitor_enc_key = if req.visitor_use_encryption {
+        match proxy_info
+            .as_ref()
+            .and_then(|p| p.sk.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            Some(sk) => Some(derive_key(sk)),
+            None => {
+                warn!(
+                    proxy_name = %req.proxy_name,
+                    "SUDP message bridge: visitor declared use_encryption but proxy '{}' has no secret_key; bridging visitor segment in plaintext",
+                    req.proxy_name
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (v_r, mut v_w) =
+        match split_user_side(visitor_enc_key, req.visitor_use_compression, req.user_conn) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                warn!("{msg}");
+                return;
+            }
+        };
+    // Provider-segment encryption (token-derived key) wraps the work halves
+    // before the message loop, matching the byte-stream bridge.
+    let (w_r, w_w) = match split_work_conn_halves(work_conn) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            warn!("{msg}");
+            return;
+        }
+    };
+    let w_r: frp_core::transport::BoxedReadHalf = if req.use_encryption {
+        Box::new(CipherReader::new(w_r, encryption_key))
+    } else {
+        w_r
+    };
+    let mut w_w: frp_core::transport::BoxedWriteHalf = if req.use_encryption {
+        Box::new(CipherWriter::new(w_w, encryption_key))
+    } else {
+        w_w
+    };
+    // Frame reads issue two read_exact calls per message; buffer them.
+    let mut v_r = tokio::io::BufReader::with_capacity(16 * 1024, v_r);
+    let mut w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
+
+    let visitor_codec_opt = if visitor_codec.is_empty() {
+        None
+    } else {
+        Some(visitor_codec)
+    };
+    let provider_codec_opt = if provider_codec.is_empty() {
+        None
+    } else {
+        Some(provider_codec)
+    };
+    let proxy_name = req.proxy_name.clone();
+
+    // Direction 1: visitor → provider. Ping is dropped (Go
+    // bridgeSUDPVisitorToProxy).
+    let visitor_to_provider = async {
+        loop {
+            let read = if visitor_v2 {
+                read_msg_v2_with_udp_codec(&mut v_r, visitor_codec_opt).await
+            } else {
+                read_msg_v1(&mut v_r).await
+            };
+            let msg = match read {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(
+                        proxy_name = %proxy_name,
+                        error = %e,
+                        "SUDP message bridge: visitor read closed: {}",
+                        e
+                    );
+                    break;
+                }
+            };
+            match &msg {
+                FrpMessage::UDPPacket(pkt) => {
+                    metrics.record_traffic(pkt.content.len() as u64, 0);
+                }
+                FrpMessage::Ping(_) | FrpMessage::Pong(_) => {
+                    // Go drops SUDP pings on the visitor→proxy leg.
+                    continue;
+                }
+                other => {
+                    warn!(
+                        proxy_name = %proxy_name,
+                        type_byte = %other.v1_type_byte(),
+                        "SUDP message bridge: unexpected visitor message 0x{:02x}",
+                        other.v1_type_byte()
+                    );
+                    break;
+                }
+            }
+            let write = if provider_v2 {
+                write_msg_v2_with_udp_codec(&mut w_w, &msg, provider_codec_opt, false).await
+            } else {
+                write_msg_v1(&mut w_w, &msg).await
+            };
+            if let Err(e) = write {
+                debug!(
+                    proxy_name = %proxy_name,
+                    error = %e,
+                    "SUDP message bridge: provider write failed: {}",
+                    e
+                );
+                break;
+            }
+        }
+    };
+
+    // Direction 2: provider → visitor. Ping is forwarded (Go
+    // bridgeSUDPProxyToVisitor).
+    let provider_to_visitor = async {
+        loop {
+            let read = if provider_v2 {
+                read_msg_v2_with_udp_codec(&mut w_r, provider_codec_opt).await
+            } else {
+                read_msg_v1(&mut w_r).await
+            };
+            let msg = match read {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(
+                        proxy_name = %proxy_name,
+                        error = %e,
+                        "SUDP message bridge: provider read closed: {}",
+                        e
+                    );
+                    break;
+                }
+            };
+            match &msg {
+                FrpMessage::UDPPacket(pkt) => {
+                    metrics.record_traffic(0, pkt.content.len() as u64);
+                }
+                FrpMessage::Ping(_) => {
+                    // Go forwards SUDP pings provider→visitor
+                    // (bridgeSUDPProxyToVisitor).
+                }
+                FrpMessage::Pong(_) => {
+                    // Pong is never forwarded (Go has no Pong in this
+                    // direction; frp-rs data planes treat Ping/Pong as
+                    // keepalive and ignore them).
+                    continue;
+                }
+                other => {
+                    warn!(
+                        proxy_name = %proxy_name,
+                        type_byte = %other.v1_type_byte(),
+                        "SUDP message bridge: unexpected provider message 0x{:02x}",
+                        other.v1_type_byte()
+                    );
+                    break;
+                }
+            }
+            let write = if visitor_v2 {
+                write_msg_v2_with_udp_codec(&mut v_w, &msg, visitor_codec_opt, false).await
+            } else {
+                write_msg_v1(&mut v_w, &msg).await
+            };
+            if let Err(e) = write {
+                debug!(
+                    proxy_name = %proxy_name,
+                    error = %e,
+                    "SUDP message bridge: visitor write failed: {}",
+                    e
+                );
+                break;
+            }
+        }
+    };
+
+    tokio::join!(visitor_to_provider, provider_to_visitor);
+    debug!(proxy_name = %proxy_name, "SUDP message bridge completed");
+}
+
 /// Assign `req` to `work_conn`, starting the bridge.
 ///
 /// Returns `Ok(())` once the bridge task is spawned (work_conn and req are
@@ -1185,6 +1458,7 @@ pub(crate) async fn assign_work_to_proxy(
                     metrics,
                     header_timeout,
                     state_for_bridge,
+                    v2,
                 ) => {}
                 _ = shutdown.cancelled() => {}
             }

@@ -1405,7 +1405,7 @@ async fn wait_detect_on_any(
 /// a UDP send, and candidate-port scanning also sleeps 2 ms per port).
 /// These are upper bounds far above anything the NAT analyzer emits, so
 /// legitimate behaviors are unaffected.
-const MAX_LISTEN_RANDOM_PORTS: i32 = 64; // extra receiver listener sockets
+const MAX_LISTEN_RANDOM_PORTS: i32 = 256; // extra receiver listener sockets (Go NAT analyzer recommends up to 256)
 const MAX_CANDIDATE_PORT_PROBES: u64 = 2048; // total candidate-port-range probes
 
 /// Go `MakeHole` full-feature hole punch (owned socket variant).

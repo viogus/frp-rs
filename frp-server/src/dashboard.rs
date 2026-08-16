@@ -879,8 +879,22 @@ async fn handle_store_proxy_delete(
     if let Some(key) = proxy.sk_index_key() {
         state.xtcp.sk_index.write().await.remove(key);
     }
-    // Clean up VHost and TCPMux routes
-    state.vhost_manager.unregister(&name).await;
+    // Clean up VHost and TCPMux routes. HTTP/HTTPS group members share one
+    // route: remove from the group first, drop the route with the OWNER's
+    // name when the group empties (same lifecycle as handle_close_proxy).
+    if (proxy.proxy_type == "http" || proxy.proxy_type == "https")
+        && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some()
+    {
+        if let Some(owner) = state
+            .http_group_ctl
+            .unregister_member(proxy.group.as_deref().unwrap_or_default(), &proxy.name)
+            .await
+        {
+            state.vhost_manager.unregister(&owner).await;
+        }
+    } else {
+        state.vhost_manager.unregister(&name).await;
+    }
     state.tcpmux_manager.unregister(&name).await;
     state.proxy_metrics.remove(&name).await;
     // Decrement the SNI-sniff gate count only when the proxy was actually
@@ -930,7 +944,19 @@ async fn handle_proxies_delete(
             if let Some(key) = proxy.sk_index_key() {
                 state.xtcp.sk_index.write().await.remove(key);
             }
-            state.vhost_manager.unregister(name).await;
+            if (proxy.proxy_type == "http" || proxy.proxy_type == "https")
+                && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some()
+            {
+                if let Some(owner) = state
+                    .http_group_ctl
+                    .unregister_member(proxy.group.as_deref().unwrap_or_default(), &proxy.name)
+                    .await
+                {
+                    state.vhost_manager.unregister(&owner).await;
+                }
+            } else {
+                state.vhost_manager.unregister(name).await;
+            }
             state.tcpmux_manager.unregister(name).await;
             state.proxy_metrics.remove(name).await;
             // Decrement the SNI-sniff gate count only when the proxy was
@@ -2578,6 +2604,7 @@ mod v2 {
                 bandwidth_limit_mode: String::new(),
                 user: String::new(),
                 user_conn_sem: None,
+                udp_packet_codec: String::new(),
             }
         }
 

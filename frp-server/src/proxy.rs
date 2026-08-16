@@ -63,6 +63,11 @@ pub struct ProxyInfo {
     pub allow_users: Vec<String>,
     /// PROXY protocol version (v1, v2, or empty).
     pub proxy_protocol_version: String,
+    /// Negotiated UDPPacket codec of the registering control (`"binary-v1"`
+    /// or empty, Go frp v0.71.0). The SUDP message bridge uses this as the
+    /// provider-segment codec when the visitor segment uses a different
+    /// packet encoding.
+    pub udp_packet_codec: String,
     /// Response headers to inject into HTTP responses.
     pub response_headers: std::collections::HashMap<String, String>,
     /// Custom domains for HTTP vhost routing.
@@ -993,6 +998,7 @@ mod tests {
             multiplexer: String::new(),
             bandwidth_limit: String::new(),
             bandwidth_limit_mode: String::new(),
+            udp_packet_codec: String::new(),
             user: String::new(),
             user_conn_sem: None,
         }

@@ -105,6 +105,16 @@ pub(crate) struct PendingRequest {
     /// the visitor conn in a Snappy stream (inside the CFB layer when
     /// visitor-segment encryption is also on — snappy inner, CFB outer).
     pub(crate) visitor_use_compression: bool,
+    /// Wire protocol of the visitor's connection (V2 frame detection). The
+    /// SUDP message bridge needs it (with `visitor_udp_packet_codec`) to
+    /// detect a mixed packet encoding between the visitor and provider
+    /// segments (Go frp v0.71.0 `isMixedSUDPPacketEncoding`).
+    pub(crate) visitor_v2: bool,
+    /// Visitor-segment UDPPacket codec (`"binary-v1"` or empty). Inherited
+    /// from the provider control's negotiated codec for V2 visitor
+    /// connections; empty for V1 visitors (JSON) — Go frp v0.71.0
+    /// `admitVisitorByRunID` semantics.
+    pub(crate) visitor_udp_packet_codec: String,
     pub(crate) created_at: Instant,
     /// Per-proxy user-conn cap permit (audit D2-2). Held for the connection's
     /// full lifetime: dropped when this request is bridged and completes, or
@@ -419,6 +429,7 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
 }
 
 /// Handle a visitor connection for STCP (secret TCP) proxy.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
     ctx: &mut ControlContext,
     ctl: &mut ControlState,
@@ -427,6 +438,8 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
     visitor_conn: IoStream,
     visitor_use_encryption: bool,
     visitor_use_compression: bool,
+    visitor_v2: bool,
+    visitor_udp_packet_codec: String,
 ) -> Result<(), ()> {
     // NewUserConn plugin hook — control-enabled plugins can reject.
     // Skip payload construction when no plugins are configured (the
@@ -455,6 +468,8 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
         .as_ref()
         .map(|p| (p.use_encryption, p.use_compression))
         .unwrap_or((false, false));
+    // Visitor-segment UDPPacket codec was determined at accept time (Go
+    // frp v0.71.0 admitVisitorByRunID) and carried in the InternalMsg.
     assign_or_queue(
         &mut ctl.work_pool,
         &mut ctl.pending_requests,
@@ -468,6 +483,8 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
             use_compression: comp,
             visitor_use_encryption,
             visitor_use_compression,
+            visitor_v2,
+            visitor_udp_packet_codec,
             created_at: Instant::now(),
             // STCP/XTCP visitors are not bounded by the provider's
             // user-conn cap (Go semantics: visitor conns are peer-initiated
@@ -546,8 +563,16 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             // settles (pre-existing livelock fix). Route directly.
             (proxy_name.clone(), ctx.run_id.clone(), p)
         } else {
+            // Group LB applies ONLY to TCP groups (shared listener
+            // dispatch). HTTP/HTTPS group members are selected by the vhost
+            // router (Go HTTPGroup.chooseEndpoint) before the conn reaches
+            // here — the incoming proxy_name already IS the chosen member,
+            // so re-running selection would bounce the conn between
+            // members (and the vhost route stays on the first member's
+            // control, which is not necessarily the selected member's).
             let group = p
                 .as_ref()
+                .filter(|p| p.proxy_type == "tcp")
                 .and_then(|p| p.group.clone())
                 .filter(|g| !g.is_empty());
             let group_key = p
@@ -709,6 +734,10 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             // apply here.
             visitor_use_encryption: false,
             visitor_use_compression: false,
+            // Group forwarder carries a provider-side conn — not a visitor
+            // conn — so visitor wire protocol/codec never apply here.
+            visitor_v2: false,
+            visitor_udp_packet_codec: String::new(),
             created_at: Instant::now(),
             user_conn_permit,
             proxy_info,
@@ -877,6 +906,8 @@ mod tests {
             use_compression: false,
             visitor_use_encryption: false,
             visitor_use_compression: false,
+            visitor_v2: false,
+            visitor_udp_packet_codec: String::new(),
             created_at: Instant::now(),
             user_conn_permit: None,
             proxy_info: None,
@@ -930,6 +961,8 @@ mod tests {
                 pool_stats: Arc::new(crate::state::PoolStats::default()),
                 user: String::new(),
                 control_id,
+                udp_packet_codec: String::new(),
+                wire_v2: false,
             },
         );
         rx

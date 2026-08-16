@@ -1,5 +1,6 @@
 #![cfg(feature = "dashboard")]
 use common::FrpsHandle;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod common;
 
@@ -322,4 +323,219 @@ async fn test_dashboard_offline_clients_listed() {
         offline_seen,
         "offline client never appeared in /api/clients"
     );
+}
+
+/// Dashboard proxy-delete paths must honor http-group route ownership (same
+/// lifecycle as handle_close_proxy):
+/// - deleting the route OWNER while other members remain keeps the shared
+///   route alive (remaining members keep serving);
+/// - deleting the last member removes the shared route (requests 404).
+///
+/// Regression for the review finding: the dashboard's single/bulk delete
+/// handlers used to unregister the route with the DELETED member's name,
+/// which leaked the route (keyed on the owner) or dropped it early (owner
+/// deleted first).
+#[tokio::test]
+async fn test_dashboard_delete_http_group_route_owner_semantics() {
+    use frp_core::msg::{self, FrpMessage, NewProxy};
+    use frp_core::protocol::{read_msg_v1, write_msg_v1};
+
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let vhost_port = common::allocate_port();
+    let cfg = format!(
+        r#"bind_addr = "127.0.0.1"
+bind_port = {bind_port}
+vhost_http_port = {vhost_port}
+
+[auth]
+method = "token"
+token = "test-token"
+
+[transport]
+tcp_mux = false
+
+[web_server]
+addr = "127.0.0.1"
+port = {dashboard_port}
+user = "admin"
+password = "admin"
+"#,
+        bind_port = bind_port,
+        dashboard_port = dashboard_port,
+        vhost_port = vhost_port,
+    );
+    let frps = FrpsHandle::start(&cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+    let vhost: std::net::SocketAddr = format!("127.0.0.1:{vhost_port}").parse().unwrap();
+    let client = auth_client();
+
+    fn grp_proxy(name: &str) -> NewProxy {
+        NewProxy {
+            proxy_name: name.into(),
+            proxy_type: "http".into(),
+            sk: None,
+            use_encryption: None,
+            use_compression: None,
+            group: Some("webgrp".into()),
+            group_key: Some("secret-key".into()),
+            local_str: Some("127.0.0.1:8080".into()),
+            remote_port: Some(0),
+            custom_domains: Some(vec!["app.example.com".into()]),
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: None,
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        }
+    }
+
+    // Register two members: grp-a is the route owner (first).
+    let (mut ctl_a, _resp_a) = common::login_with_test_token(addr).await.expect("login A");
+    {
+        write_msg_v1(
+            &mut ctl_a,
+            &FrpMessage::NewProxy(Box::new(grp_proxy("grp-a"))),
+        )
+        .await
+        .expect("send NewProxy A");
+        match read_msg_v1(&mut ctl_a).await.expect("NewProxyResp A") {
+            FrpMessage::NewProxyResp(ref r) => assert!(r.error.is_none(), "{:?}", r.error),
+            other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+        }
+    }
+    let (mut ctl_b, resp_b) = common::login_with_test_token(addr).await.expect("login B");
+    let run_id_b_holder = resp_b.run_id.expect("run_id B");
+    {
+        write_msg_v1(
+            &mut ctl_b,
+            &FrpMessage::NewProxy(Box::new(grp_proxy("grp-b"))),
+        )
+        .await
+        .expect("send NewProxy B");
+        match read_msg_v1(&mut ctl_b).await.expect("NewProxyResp B") {
+            FrpMessage::NewProxyResp(ref r) => assert!(r.error.is_none(), "{:?}", r.error),
+            other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+        }
+    }
+    // Dashboard deletes the route OWNER (grp-a) while grp-b remains.
+    let resp = client
+        .delete(frps.dashboard_url(&format!("/api/store/proxy/{}", "grp-a")))
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "owner delete should succeed");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // grp-b still serves: pool a work conn and request the vhost domain.
+    let mut work = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("work conn");
+    write_msg_v1(
+        &mut work,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id_b_holder.clone()),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+    let req = tokio::spawn(async move {
+        let mut c = tokio::net::TcpStream::connect(vhost)
+            .await
+            .expect("vhost connect");
+        c.write_all(b"GET / HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("send");
+        let mut buf = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(3), c.read_to_end(&mut buf)).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    // grp-b's work conn receives StartWorkConn + the request head.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    while head.len() < 4096 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if tokio::time::timeout(remaining, work.read_exact(&mut byte))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        head.push(byte[0]);
+    }
+    assert!(
+        !head.is_empty() && head.windows(4).any(|w| w == b"\r\n\r\n"),
+        "grp-b should still receive requests after owner deleted, head len={}",
+        head.len()
+    );
+    let body = "member-B";
+    work.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+            len = body.len()
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("serve");
+    let resp_body = req.await.expect("request task");
+    assert!(
+        resp_body.contains("member-B"),
+        "remaining member should serve after owner delete: {resp_body:?}"
+    );
+
+    // Bulk-delete the last member (grp-b) -> shared route must be dropped.
+    let resp = client
+        .delete(frps.dashboard_url("/api/proxies"))
+        .basic_auth("admin", Some("admin"))
+        .json(&serde_json::json!({ "proxies": ["grp-b"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "bulk delete should succeed");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let resp_body = http_get_vhost(vhost, "app.example.com").await;
+    assert!(
+        resp_body.contains("404"),
+        "route should be removed after last member deleted: {resp_body:?}"
+    );
+}
+
+/// Minimal HTTP GET to the vhost port; returns the raw response text.
+async fn http_get_vhost(vhost: std::net::SocketAddr, host: &str) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut c = tokio::net::TcpStream::connect(vhost)
+        .await
+        .expect("vhost connect");
+    c.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .expect("send");
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), c.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf).into_owned()
 }

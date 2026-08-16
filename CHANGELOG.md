@@ -36,6 +36,34 @@ All notable changes to frp-rs.
   TlsStream (tokio-rustls buffers plaintext on the write side; dropping
   after `flush()` could leave the peer reading a bare FIN without
   close_notify, producing ~50% spurious 502s).
+- **SUDP under wire protocol v2** (Go frp v0.71.0 `joinSUDPMessageBridge`
+  parity): the SUDP visitor data plane now speaks the negotiated wire
+  protocol (V2 magic + `binary-v1` codec) instead of being hard-coded to
+  V1/JSON. When the visitor and provider segments negotiate different
+  packet encodings (e.g. a V1/JSON visitor talking to a V2/binary provider
+  during an upgrade), the server routes the pair through a message-level
+  bridge that decodes and re-encodes every `UDPPacket` per side; identical
+  encodings keep the zero-copy byte-stream relay. Previously a V2 provider
+  misparsed the V1 visitor's frames ("unexpected V2 frame type"), breaking
+  the tunnel.
+- **HTTP/HTTPS group load balancing** (Go frp v0.71.0
+  `HTTPGroupController` parity): http/https proxies sharing the same
+  `group`/`groupKey` and domain now register one shared vhost route and
+  dispatch requests round-robin across the members (previously the second
+  member was rejected with a vhost route conflict). groupKey mismatches
+  and routing-param mismatches are rejected (Go `ErrGroupAuthFailed` /
+  `ErrGroupParamsInvalid`). Members may live on different frpc controls.
+  TCP-group load balancing is unaffected (its group LB is restricted to
+  tcp proxies — http groups are selected by the vhost router).
+
+### Changed
+- **Health-checked proxies register only after the first healthy probe**
+  (Go frp `proxy_wrapper` parity): a proxy with `health_check_type`
+  configured is no longer registered immediately at startup — the client
+  waits until the first successful health check (or a subsequent recovery)
+  before sending `NewProxy`. A persistently-unhealthy proxy therefore never
+  registers. Previously the proxy registered immediately and was only
+  unregistered after `max_failed` consecutive failures.
 
 ### Compatibility
 - `compat-test.sh` now targets the **Go frp v0.71.0** pre-built binaries by
