@@ -261,6 +261,28 @@ async fn verify_login_auth(
             }
         }
 
+        // --- Validate run_id (Go frp v0.71.0 ValidateRunID) ---
+        // Go 0.71.0 server/service.go rejects a client-supplied run id that is
+        // empty, longer than 64 bytes, or contains non-printable characters
+        // before it enters routing tables / logs / dashboards. frp-rs
+        // normalizes a missing run_id to a generated UUID below, but a
+        // client-supplied oversized or control-character run_id must be
+        // rejected to match Go behavior (and to keep log lines and map keys
+        // well-formed). Rust Strings are always valid UTF-8, so only the
+        // length and printable-character checks apply.
+        if let Some(rid) = login.run_id.as_deref() {
+            if !rid.is_empty() && (rid.len() > 64 || rid.chars().any(|c| c.is_control())) {
+                warn!(peer = ?peer, run_id_len = %rid.len(), "Login rejected: invalid run_id (max 64 printable bytes)");
+                send_login_error(
+                    stream,
+                    "invalid run id: must be at most 64 printable bytes".into(),
+                    v2,
+                )
+                .await;
+                return Err(());
+            }
+        }
+
         // --- Replay protection: timestamp freshness + duplicate detection ---
         if auth_cfg.token_auth_timeout && auth_cfg.authentication_timeout > 0 {
             if let Some(ts) = login.timestamp {
