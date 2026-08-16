@@ -105,6 +105,10 @@ pub(crate) struct ControlContext {
     /// Go frp keeps the client-claimed `login.user` here even with OIDC; the
     /// verified OIDC subject is used only for NewWorkConn/Ping verification.
     pub authenticated_user: String,
+    /// Negotiated UDPPacket codec for this session's V2 data plane:
+    /// `"binary-v1"` or empty (JSON fallback). Go frp v0.71.0
+    /// `udpPacketCodec` from the ServerHello handshake.
+    pub udp_packet_codec: String,
     /// Keeps the per-run_id lifecycle mutex entry alive for this control
     /// session and reclaims it after cleanup.
     pub(crate) _run_mu_guard: crate::state::RunMuGuard,

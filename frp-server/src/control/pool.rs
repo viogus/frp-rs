@@ -365,6 +365,9 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                     .get(&proxy_name)
                     .cloned()
                     .unwrap_or_else(|| ctl.udp_cancel.clone()),
+                // Negotiated UDP packet codec from the V2 handshake
+                // (Go frp v0.71.0 binary-v1 or empty JSON fallback).
+                ctx.udp_packet_codec.clone(),
             )
             .await;
         } else {
@@ -846,6 +849,7 @@ mod tests {
             internal_tx,
             peer: None,
             authenticated_user: String::new(),
+            udp_packet_codec: String::new(),
             _run_mu_guard: run_mu_guard,
         };
         let ctl = ControlState {

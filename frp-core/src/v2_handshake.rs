@@ -91,6 +91,12 @@ pub struct BootstrapInfo {
 pub struct MessageCapabilities {
     #[serde(default)]
     pub codecs: Vec<Cow<'static, str>>,
+    /// UDPPacket payload codecs (Go frp v0.71.0: `udpPacketCodecs`).
+    /// frp-rs advertises `binary-v1` like Go 0.71.0; when the server selects
+    /// it, UDPPacket messages on V2 work connections use the compact binary
+    /// codec (type 19) instead of JSON (type 13).
+    #[serde(default, rename = "udpPacketCodecs")]
+    pub udp_packet_codecs: Vec<Cow<'static, str>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -127,6 +133,10 @@ pub struct ClientHello {
 pub struct MessageSelection {
     #[serde(default)]
     pub codec: Cow<'static, str>,
+    /// Selected UDPPacket codec (Go frp v0.71.0: `udpPacketCodec`).
+    /// Empty when the peer did not advertise `binary-v1` (JSON fallback).
+    #[serde(default, rename = "udpPacketCodec")]
+    pub udp_packet_codec: Cow<'static, str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -171,6 +181,11 @@ pub struct ServerHello {
 pub struct CryptoContext {
     pub algorithm: AeadAlgorithm,
     pub transcript_hash: Vec<u8>,
+    /// Negotiated UDPPacket codec: `"binary-v1"` or empty (JSON fallback).
+    /// Go frp v0.71.0 `udpPacketCodec` from ServerHello. Immutable for the
+    /// lifetime of the session; the UDP/SUDP data plane selects the packet
+    /// codec from this value.
+    pub udp_packet_codec: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +239,9 @@ impl ClientHello {
             capabilities: ClientCapabilities {
                 message: MessageCapabilities {
                     codecs: vec!["json".into()],
+                    // Advertise the UDP packet binary codec, matching Go frp
+                    // v0.71.0's clientHelloWithCryptoRandom.
+                    udp_packet_codecs: vec![crate::udp_binary::UDP_PACKET_CODEC_BINARY.into()],
                 },
                 crypto: CryptoCapabilities {
                     algorithms: preferred_aead_algorithms(),
@@ -244,6 +262,7 @@ impl ClientHello {
             capabilities: ClientCapabilities {
                 message: MessageCapabilities {
                     codecs: vec!["json".into()],
+                    udp_packet_codecs: vec![crate::udp_binary::UDP_PACKET_CODEC_BINARY.into()],
                 },
                 crypto: CryptoCapabilities {
                     algorithms: vec![],
@@ -260,6 +279,7 @@ impl ServerHello {
             selected: ServerSelection {
                 message: MessageSelection {
                     codec: Cow::Borrowed("json"),
+                    udp_packet_codec: Cow::Borrowed(""),
                 },
                 crypto: None,
             },
@@ -269,10 +289,21 @@ impl ServerHello {
 
     /// Build a ServerHello with AEAD crypto selection.
     pub fn with_crypto(algorithm: AeadAlgorithm, server_random: Vec<u8>) -> Self {
+        Self::with_crypto_and_udp(algorithm, server_random, "")
+    }
+
+    /// Build a ServerHello with AEAD crypto selection and a negotiated
+    /// UDPPacket codec (`"binary-v1"` or empty for JSON fallback).
+    pub fn with_crypto_and_udp(
+        algorithm: AeadAlgorithm,
+        server_random: Vec<u8>,
+        udp_packet_codec: &str,
+    ) -> Self {
         Self {
             selected: ServerSelection {
                 message: MessageSelection {
                     codec: Cow::Borrowed("json"),
+                    udp_packet_codec: Cow::Owned(udp_packet_codec.to_string()),
                 },
                 crypto: Some(CryptoSelection {
                     algorithm: algorithm.as_str().to_string(),
@@ -288,11 +319,25 @@ impl ServerHello {
             selected: ServerSelection {
                 message: MessageSelection {
                     codec: Cow::Borrowed("json"),
+                    udp_packet_codec: Cow::Borrowed(""),
                 },
                 crypto: None,
             },
             error: Some(err.into()),
         }
+    }
+}
+
+/// Select a UDPPacket codec from the client's advertised list, mirroring Go
+/// frp v0.71.0 `selectUDPPacketCodec`: `binary-v1` if advertised, else "".
+pub fn select_udp_packet_codec(codecs: &[Cow<'static, str>]) -> &'static str {
+    if codecs
+        .iter()
+        .any(|c| c == crate::udp_binary::UDP_PACKET_CODEC_BINARY)
+    {
+        crate::udp_binary::UDP_PACKET_CODEC_BINARY
+    } else {
+        ""
     }
 }
 
@@ -427,6 +472,32 @@ pub async fn v2_handshake_client_recv_hello(
                     .into(),
                 ));
             }
+            // Validate the negotiated UDPPacket codec (Go frp v0.71.0
+            // ValidateServerHelloForClient): it must be empty or `binary-v1`,
+            // and if set it must have been advertised by us.
+            let udp_packet_codec = server_hello.selected.message.udp_packet_codec.to_string();
+            if !udp_packet_codec.is_empty() {
+                if udp_packet_codec != crate::udp_binary::UDP_PACKET_CODEC_BINARY {
+                    return Err(crate::Error::Protocol(
+                        format!("server selected unsupported UDP packet codec: {udp_packet_codec}")
+                            .into(),
+                    ));
+                }
+                if !hello
+                    .capabilities
+                    .message
+                    .udp_packet_codecs
+                    .iter()
+                    .any(|c| c == &udp_packet_codec)
+                {
+                    return Err(crate::Error::Protocol(
+                        format!(
+                            "server selected UDP packet codec not advertised by client: {udp_packet_codec}"
+                        )
+                        .into(),
+                    ));
+                }
+            }
 
             // If server selected crypto, validate and build context
             if let Some(ref crypto_sel) = server_hello.selected.crypto {
@@ -468,6 +539,7 @@ pub async fn v2_handshake_client_recv_hello(
                 Ok(Some(CryptoContext {
                     algorithm,
                     transcript_hash,
+                    udp_packet_codec,
                 }))
             } else {
                 Ok(None)
@@ -615,7 +687,12 @@ pub async fn v2_handshake_server(
 
                 let mut server_random = vec![0u8; CRYPTO_RANDOM_SIZE];
                 rand::rngs::OsRng.fill_bytes(&mut server_random);
-                let server_hello = ServerHello::with_crypto(algorithm, server_random);
+                // Negotiate the UDPPacket codec: mirror Go frp v0.71.0
+                // NewServerHello (selectUDPPacketCodec over client's offers).
+                let udp_codec =
+                    select_udp_packet_codec(&client_hello.capabilities.message.udp_packet_codecs);
+                let server_hello =
+                    ServerHello::with_crypto_and_udp(algorithm, server_random, udp_codec);
 
                 let server_hello_json = serde_json::to_vec(&server_hello).map_err(|e| {
                     crate::Error::Protocol(format!("serialize ServerHello: {e}").into())
@@ -630,12 +707,17 @@ pub async fn v2_handshake_server(
                     Some(CryptoContext {
                         algorithm,
                         transcript_hash,
+                        udp_packet_codec: udp_codec.to_string(),
                     }),
                 ))
             } else {
                 // No crypto: send plain ServerHello
                 tracing::debug!(client_algorithms = ?client_algorithms, "[V2-HS] No crypto negotiated (client offered {:?})", client_algorithms);
-                let server_hello = ServerHello::default_ok();
+                let udp_codec =
+                    select_udp_packet_codec(&client_hello.capabilities.message.udp_packet_codecs);
+                let mut server_hello = ServerHello::default_ok();
+                server_hello.selected.message.udp_packet_codec =
+                    std::borrow::Cow::Borrowed(udp_codec);
                 let json = serde_json::to_vec(&server_hello).map_err(|e| {
                     crate::Error::Protocol(format!("serialize ServerHello: {e}").into())
                 })?;
@@ -712,5 +794,65 @@ mod tests {
         let result = compute_transcript_hash(&ch, &sh);
         let expected = expected_transcript_hash(&ch, &sh);
         assert_eq!(result, expected);
+    }
+
+    // --- UDP packet codec negotiation (Go frp v0.71.0) ---
+
+    #[test]
+    fn client_hello_advertises_binary_udp_codec() {
+        let hello = ClientHello::new("tcp", false, true);
+        assert_eq!(
+            hello.capabilities.message.udp_packet_codecs,
+            vec![std::borrow::Cow::Borrowed(
+                crate::udp_binary::UDP_PACKET_CODEC_BINARY
+            )]
+        );
+        // Wire name is camelCase udpPacketCodecs (Go field name).
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"udpPacketCodecs\""), "got: {json}");
+    }
+
+    #[test]
+    fn select_udp_packet_codec_prefers_binary_and_falls_back_empty() {
+        use std::borrow::Cow;
+        assert_eq!(
+            select_udp_packet_codec(&[Cow::Borrowed(crate::udp_binary::UDP_PACKET_CODEC_BINARY)]),
+            crate::udp_binary::UDP_PACKET_CODEC_BINARY
+        );
+        // Legacy client without the capability → empty (JSON fallback).
+        assert_eq!(select_udp_packet_codec(&[]), "");
+        // Unknown codec offer → empty (Go selectUDPPacketCodec only picks binary-v1).
+        assert_eq!(select_udp_packet_codec(&[Cow::Borrowed("unknown")]), "");
+    }
+
+    #[test]
+    fn server_hello_carries_udp_packet_codec_on_wire() {
+        let hello = ServerHello::with_crypto_and_udp(
+            AeadAlgorithm::Aes256Gcm,
+            vec![0u8; CRYPTO_RANDOM_SIZE],
+            crate::udp_binary::UDP_PACKET_CODEC_BINARY,
+        );
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(
+            json.contains("\"udpPacketCodec\":\"binary-v1\""),
+            "got: {json}"
+        );
+        // Empty codec is serialized as "" (Go omits it, but "" is tolerated
+        // by Go's JSON unmarshal and by our own validation).
+        let plain = ServerHello::default_ok();
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(json.contains("\"udpPacketCodec\":\"\""), "got: {json}");
+    }
+
+    #[test]
+    fn crypto_context_defaults_empty_udp_codec() {
+        // Construction sites that don't negotiate a codec must default to
+        // empty (JSON fallback) so the data plane never misbehaves.
+        let ctx = CryptoContext {
+            algorithm: AeadAlgorithm::Aes256Gcm,
+            transcript_hash: vec![1, 2, 3],
+            udp_packet_codec: String::new(),
+        };
+        assert!(ctx.udp_packet_codec.is_empty());
     }
 }

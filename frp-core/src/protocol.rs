@@ -557,6 +557,113 @@ pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
     }
 }
 
+/// Read a V2 message on a connection where a UDP packet binary codec may be
+/// negotiated (Go frp v0.71.0). When `udp_packet_codec` is `Some("binary-v1")`,
+/// a frame with type ID 19 (`V2_TYPE_UDP_PACKET_BINARY`) is decoded with the
+/// binary codec into a `FrpMessage::UDPPacket`; a JSON `UDPPacket` (type 13)
+/// after binary negotiation is a protocol error, matching Go
+/// `V2BinaryUDPPacketReadWriter`. When `udp_packet_codec` is `None`/empty,
+/// this is exactly `read_msg_v2`.
+pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    udp_packet_codec: Option<&str>,
+) -> Result<FrpMessage, crate::Error> {
+    let (frame_type, _flags, payload_len) = read_v2_frame_header(reader).await?;
+    if frame_type != V2_FRAME_TYPE_MESSAGE {
+        return Err(crate::Error::Protocol(
+            format!(
+                "unexpected V2 frame type: {frame_type}, expected {} (Message)",
+                V2_FRAME_TYPE_MESSAGE
+            )
+            .into(),
+        ));
+    }
+    if payload_len < 2 {
+        return Err(crate::Error::Protocol(
+            "V2 message payload too short".into(),
+        ));
+    }
+
+    // Read the payload into a Vec (this path is UDP data-plane only; the
+    // buffer-pool fast path of read_msg_v2 is not worth duplicating here
+    // since UDP payloads are typically small and the frame is short-lived).
+    let mut payload = vec![0u8; payload_len];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+
+    let binary = udp_packet_codec == Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY);
+    if type_id == msg::V2_TYPE_UDP_PACKET_BINARY {
+        if !binary {
+            return Err(crate::Error::Protocol(
+                format!(
+                    "received binary UDP packet (type {}) without negotiated codec",
+                    msg::V2_TYPE_UDP_PACKET_BINARY
+                )
+                .into(),
+            ));
+        }
+        let packet = crate::udp_binary::decode_udp_packet_binary(&payload[2..])
+            .map_err(|e| crate::Error::Protocol(format!("decode binary UDP packet: {e}").into()))?;
+        return Ok(FrpMessage::UDPPacket(packet));
+    }
+    if binary && type_id == msg::V2_TYPE_UDP_PACKET {
+        // Go: received JSON UDP packet after binary codec negotiation.
+        return Err(crate::Error::Protocol(
+            "received JSON UDP packet after binary codec negotiation".into(),
+        ));
+    }
+    deserialize_v2(type_id, &payload[2..])
+}
+
+/// Write a V2 message frame, using the binary UDP packet codec for
+/// `UDPPacket` messages when `udp_packet_codec` is `Some("binary-v1")`
+/// (Go frp v0.71.0). Non-UDPPacket messages always use JSON framing.
+/// When `udp_packet_codec` is `None`/empty this is exactly
+/// `write_msg_v2_inner`.
+///
+/// `no_flush` mirrors `write_msg_v2_nof`: skip the trailing flush syscall for
+/// raw TcpStream data planes where TCP_NODELAY already flushes per write.
+pub async fn write_msg_v2_with_udp_codec<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+    udp_packet_codec: Option<&str>,
+    no_flush: bool,
+) -> Result<(), crate::Error> {
+    let binary = udp_packet_codec == Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY);
+    if binary {
+        if let FrpMessage::UDPPacket(packet) = msg {
+            let body = crate::udp_binary::encode_udp_packet_binary(packet).map_err(|e| {
+                crate::Error::Protocol(format!("encode binary UDP packet: {e}").into())
+            })?;
+            let mut payload = Vec::with_capacity(2 + body.len());
+            payload.extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
+            payload.extend_from_slice(&body);
+            write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await?;
+            // Flush unless the caller manages it (raw TcpStream + TCP_NODELAY,
+            // or a CipherWriter that must flush to emit its IV). Without this,
+            // buffered transports (TLS, yamux, WebSocket) and encrypted
+            // streams leave binary UDP frames stuck in the buffer.
+            if !no_flush {
+                writer.flush().await.map_err(|e| {
+                    crate::Error::Protocol(format!("flush after binary UDP packet: {e}").into())
+                })?;
+            }
+            return Ok(());
+        }
+    }
+    write_msg_v2_inner(writer, msg).await?;
+    if !no_flush {
+        writer
+            .flush()
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("flush after write_msg_v2: {e}").into()))?;
+    }
+    Ok(())
+}
+
 /// Protocol-aware message read: dispatches to V1 or V2 framing based on the `v2` flag.
 pub async fn read_msg<R: AsyncReadExt + Unpin>(
     reader: &mut R,
@@ -1546,6 +1653,133 @@ mod tests {
                 "near-magic should be replayed, not consumed"
             );
             assert_eq!(replay.unwrap(), bytes.to_vec());
+        }
+
+        // --- UDP packet binary codec (Go frp v0.71.0) ---
+
+        fn sample_udp_packet() -> crate::msg::UDPPacket {
+            crate::msg::UDPPacket {
+                content: b"hello udp".to_vec(),
+                local_addr: None,
+                remote_addr: Some(crate::msg::UdpAddr {
+                    ip: "10.1.2.3".into(),
+                    port: 9999,
+                    zone: String::new(),
+                }),
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn udp_codec_binary_roundtrip_v2() {
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+
+            // Write a UDPPacket with the binary codec, read it back.
+            let pkt = FrpMessage::UDPPacket(sample_udp_packet());
+            write_msg_v2_with_udp_codec(
+                &mut w,
+                &pkt,
+                Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+                false,
+            )
+            .await
+            .unwrap();
+
+            let got = read_msg_v2_with_udp_codec(
+                &mut r,
+                Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+            )
+            .await
+            .unwrap();
+            match got {
+                FrpMessage::UDPPacket(p) => {
+                    assert_eq!(p.content, b"hello udp");
+                    assert_eq!(p.remote_addr.as_ref().unwrap().ip, "10.1.2.3");
+                    assert_eq!(p.remote_addr.as_ref().unwrap().port, 9999);
+                }
+                other => panic!("expected UDPPacket, got {:?}", other.v1_type_byte()),
+            }
+
+            // The frame must carry type ID 19 (binary), not 13 (JSON).
+            let (ft, _f, payload) = write_and_capture_frame(&pkt).await;
+            assert_eq!(ft, V2_FRAME_TYPE_MESSAGE);
+            let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+            assert_eq!(type_id, msg::V2_TYPE_UDP_PACKET_BINARY);
+        }
+
+        async fn write_and_capture_frame(pkt: &FrpMessage) -> (u16, u16, Vec<u8>) {
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+            write_msg_v2_with_udp_codec(
+                &mut w,
+                pkt,
+                Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+                false,
+            )
+            .await
+            .unwrap();
+            let (ft, flags, payload) = read_v2_frame_raw(&mut r).await.unwrap();
+            (ft, flags, payload)
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn udp_codec_json_fallback_when_not_negotiated() {
+            // Without a codec, UDPPacket stays JSON type 13 and a binary
+            // frame (type 19) is rejected.
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+            let pkt = FrpMessage::UDPPacket(sample_udp_packet());
+            write_msg_v2_with_udp_codec(&mut w, &pkt, None, false)
+                .await
+                .unwrap();
+            let got = read_msg_v2(&mut r).await.unwrap();
+            assert!(matches!(got, FrpMessage::UDPPacket(_)));
+
+            // JSON UDPPacket read on a binary-negotiated connection is an
+            // error (Go V2BinaryUDPPacketReadWriter semantics).
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+            write_msg_v2_with_udp_codec(&mut w, &pkt, None, false)
+                .await
+                .unwrap();
+            let err = read_msg_v2_with_udp_codec(
+                &mut r,
+                Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("JSON UDP packet after binary"));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn udp_codec_no_flush_skips_flush_only_for_raw() {
+            // no_flush=true path: binary write must still work (raw TcpStream
+            // caller manages flushing); the JSON path with no_flush=false
+            // flushes (covered by roundtrip above).
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+            let pkt = FrpMessage::UDPPacket(sample_udp_packet());
+            write_msg_v2_with_udp_codec(
+                &mut w,
+                &pkt,
+                Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+                true,
+            )
+            .await
+            .unwrap();
+            // The frame is fully written even without flush on a duplex.
+            let got = read_msg_v2_with_udp_codec(
+                &mut r,
+                Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(got, FrpMessage::UDPPacket(_)));
         }
     }
 }
