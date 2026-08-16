@@ -516,6 +516,8 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 "oidc_audience",
                 "oidc_token_endpoint",
                 "oidc_token_endpoint_url",
+                "oidc_skip_expiry_check",
+                "oidc_skip_issuer_check",
             ],
             "auth",
             // Only `auth_` is stripped: the serde fields are oidc_* (they keep

@@ -3809,3 +3809,37 @@ ops = []
     let p = cfg.http_plugins.iter().find(|p| p.name == "empty").unwrap();
     assert!(p.ops.is_empty(), "ops: {:?}", p.ops);
 }
+
+/// Strict mode accepts the audit-added legacy keys inside [auth]
+/// (authentication_method, oidc_skip_*_check snake_case) — these were only
+/// whitelisted at top level before, so strict rejected them.
+#[test]
+fn test_strict_auth_accepts_legacy_keys() {
+    let cfg: ServerConfig = load_server_config_from_str(
+        r#"bind_port = 7000
+[auth]
+authentication_method = "oidc"
+oidc_skip_expiry_check = true
+oidc_skip_issuer_check = true
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.auth.method, "oidc");
+    assert!(cfg.auth.oidc_skip_expiry);
+    assert!(cfg.auth.oidc_skip_issuer);
+}
+
+/// Go legacy INI top-level oidc_skip_expiry_check / oidc_skip_issuer_check
+/// fold into [auth] (the serde alias only covers the [auth] section form).
+#[test]
+fn test_legacy_ini_top_level_oidc_skip_check_keys() {
+    let cfg: ServerConfig = load_server_ini(
+        r#"bind_port = 7000
+oidc_skip_expiry_check = true
+oidc_skip_issuer_check = true
+"#,
+    )
+    .unwrap();
+    assert!(cfg.auth.oidc_skip_expiry);
+    assert!(cfg.auth.oidc_skip_issuer);
+}
