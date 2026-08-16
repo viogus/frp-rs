@@ -78,7 +78,8 @@ All notable changes to frp-rs.
 - **Legacy INI keys**: `authenticate_heartbeats`/`authenticate_new_work_conns`
   → `[auth] additional_scopes`, `http_proxy` → `[transport] proxy_url`,
   `disable_log_color` → `[log] disable_print_color`, server `pprof_enable`,
-  `dashboard_tls_mode` → `[web_server] tls.enable`,
+  `dashboard_tls_mode` (no-op — frp-rs drives dashboard TLS from non-empty
+  cert/key; the key is accepted and consumed to keep strict mode green),
   `oidc_additional_*` → `[auth.oidc] additional_endpoint_params`.
 
 ### Compatibility

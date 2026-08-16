@@ -3616,3 +3616,60 @@ remote_port = 8081
     assert_eq!(cfg.proxies[0].name, "real_proxy");
     assert!(cfg.log.disable_print_color);
 }
+
+/// httpHeaders in legacy map form ({X = "y"}) is converted to the canonical
+/// [{name,value}] array (Vec<HealthCheckHttpHeader>).
+#[test]
+fn test_health_headers_map_form_converted() {
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+
+[[proxies]]
+name = "web"
+type = "http"
+local_port = 8080
+custom_domains = ["web.example.com"]
+
+[proxies.healthCheck]
+type = "http"
+url = "http://127.0.0.1/"
+httpHeaders = { X-Token = "abc", X-Other = "def" }
+"#,
+    )
+    .unwrap();
+    let hdrs = &cfg.proxies[0].health_check_http_headers;
+    let mut pairs: Vec<(String, String)> = hdrs
+        .iter()
+        .map(|h| (h.name.clone(), h.value.clone()))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("X-Other".to_string(), "def".to_string()),
+            ("X-Token".to_string(), "abc".to_string()),
+        ]
+    );
+}
+
+/// [range:...] with an unquoted single port (Integer) expands like Go
+/// ParseRangeNumbers, instead of being skipped.
+#[test]
+fn test_legacy_ini_range_unquoted_single_port() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+
+[range:single]
+type = "tcp"
+local_port = 6000
+remote_port = 16000
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].name, "single_0");
+    assert_eq!(cfg.proxies[0].local_port, 6000);
+    assert_eq!(cfg.proxies[0].remote_port, 16000);
+}

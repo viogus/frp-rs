@@ -468,6 +468,16 @@ pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
             cfg.transport.max_pool_count
         ));
     }
+    // An http_plugins entry with neither addr nor path would produce a
+    // malformed "http://?version=..." request at runtime — fail at load time.
+    for plugin in &cfg.http_plugins {
+        if plugin.addr.is_empty() && plugin.path.is_empty() {
+            return Err(format!(
+                "server config: http_plugins entry '{}' has no addr/path",
+                plugin.name
+            ));
+        }
+    }
     // Go frp compat: invalid allow_ports entries are config errors, not a
     // silent disable of the restriction (validation/PortsRange).
     if !cfg.allow_ports.trim().is_empty() {

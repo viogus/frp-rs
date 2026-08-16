@@ -174,6 +174,13 @@ impl HttpPluginManager {
             // Go http.go do(): POST {url}?version=0.1.0&op=Login with X-Frp-Reqid.
             let reqid = uuid::Uuid::new_v4().to_string();
             let mut base = format!("{}{}", plugin.cfg.addr, plugin.cfg.path);
+            // Forgiving join: a path without a leading slash gets one (the
+            // removed MEDIUM-6 normalize used to canonicalize this), and a
+            // trailing slash on addr is trimmed so host:port + /handler
+            // never becomes host:port//handler.
+            if !plugin.cfg.path.is_empty() && !plugin.cfg.path.starts_with('/') {
+                base = format!("{}/{}", plugin.cfg.addr, plugin.cfg.path);
+            }
             if !base.starts_with("http://") && !base.starts_with("https://") {
                 base = format!("http://{base}");
             }

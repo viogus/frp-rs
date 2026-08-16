@@ -1020,22 +1020,25 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
 
         if let Some(prefix) = section_name.strip_prefix("range:") {
             // Expand into {prefix}_{i} per-port proxies (Go renderRangeProxyTemplates).
-            let Some(local_ports) = st
-                .get("local_port")
-                .and_then(Value::as_str)
-                .and_then(ini_range_numbers)
-            else {
+            // local_port/remote_port accept a quoted string ("6000-6002") or
+            // an unquoted single port (6000 — ini_to_toml makes it Integer).
+            fn ini_port_numbers(v: &Value) -> Option<Vec<u16>> {
+                match v {
+                    Value::String(s) => ini_range_numbers(s),
+                    Value::Integer(i) if *i >= 0 && *i <= i64::from(u16::MAX) => {
+                        Some(vec![*i as u16])
+                    }
+                    _ => None,
+                }
+            }
+            let Some(local_ports) = st.get("local_port").and_then(ini_port_numbers) else {
                 tracing::warn!(
                     section = %section_name,
                     "legacy INI [range:...] section: missing or invalid local_port; skipped"
                 );
                 continue;
             };
-            let Some(remote_ports) = st
-                .get("remote_port")
-                .and_then(Value::as_str)
-                .and_then(ini_range_numbers)
-            else {
+            let Some(remote_ports) = st.get("remote_port").and_then(ini_port_numbers) else {
                 tracing::warn!(
                     section = %section_name,
                     "legacy INI [range:...] section: missing or invalid remote_port; skipped"
@@ -1136,9 +1139,24 @@ fn normalize_proxies(table: &mut toml::Table) {
                 };
                 let value = if k == "httpHeaders" {
                     // Go frp: healthCheck.httpHeaders is an ARRAY of
-                    // {name,value} (HTTPHeader) — keep it as-is so the
-                    // canonical Vec<HealthCheckHttpHeader> deserializes it.
-                    v
+                    // {name,value} (HTTPHeader). A legacy frp-rs map form
+                    // ({X = "y"}) is converted into the array shape.
+                    match v {
+                        Value::Array(_) => v,
+                        Value::Table(map) => {
+                            let items: Vec<Value> = map
+                                .into_iter()
+                                .map(|(name, value)| {
+                                    let mut t = toml::Table::new();
+                                    t.insert("name".to_string(), Value::String(name));
+                                    t.insert("value".to_string(), value);
+                                    Value::Table(t)
+                                })
+                                .collect();
+                            Value::Array(items)
+                        }
+                        other => other,
+                    }
                 } else {
                     v
                 };
