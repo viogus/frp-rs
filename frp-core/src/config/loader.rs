@@ -471,9 +471,15 @@ pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
     // An http_plugins entry with neither addr nor path would produce a
     // malformed "http://?version=..." request at runtime — fail at load time.
     for plugin in &cfg.http_plugins {
-        if plugin.addr.is_empty() {
-            // A path alone would produce the malformed "http:///x" — Go's
-            // HTTPPluginOptions.Addr is required.
+        // A path alone would produce the malformed "http:///x" — Go's
+        // HTTPPluginOptions.Addr is required. Also reject degenerate addrs
+        // like "http://" or "/" that strip to nothing after the scheme.
+        let bare = plugin
+            .addr
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_matches('/');
+        if plugin.addr.is_empty() || bare.is_empty() {
             return Err(format!(
                 "server config: http_plugins entry '{}' has no addr",
                 plugin.name
