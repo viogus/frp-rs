@@ -20,9 +20,10 @@ type LoginRet = (
     String,
     Option<YamuxSession>,
     Option<QuicConnection>,
+    String,
 );
 #[cfg(not(feature = "quic"))]
-type LoginRet = (IoStream, String, Option<YamuxSession>);
+type LoginRet = (IoStream, String, Option<YamuxSession>, String);
 
 /// Whether the control connection should wrap its transport stream in yamux
 /// when `tcp_mux` is enabled. Go frp v0.70.1 applies yamux over TCP, KCP,
@@ -490,11 +491,25 @@ impl ControlConnection {
                 info!(run_id = %self.run_id, "Logged in. run_id: {}", self.run_id);
                 #[cfg(feature = "quic")]
                 {
-                    Ok((io_stream, self.run_id.clone(), yamux_session, quic_conn))
+                    let udp_codec = crypto_ctx
+                        .as_ref()
+                        .map(|c| c.udp_packet_codec.clone())
+                        .unwrap_or_default();
+                    Ok((
+                        io_stream,
+                        self.run_id.clone(),
+                        yamux_session,
+                        quic_conn,
+                        udp_codec,
+                    ))
                 }
                 #[cfg(not(feature = "quic"))]
                 {
-                    Ok((io_stream, self.run_id.clone(), yamux_session))
+                    let udp_codec = crypto_ctx
+                        .as_ref()
+                        .map(|c| c.udp_packet_codec.clone())
+                        .unwrap_or_default();
+                    Ok((io_stream, self.run_id.clone(), yamux_session, udp_codec))
                 }
             }
             _ => Err(frp_core::Error::Protocol(

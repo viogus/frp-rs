@@ -228,6 +228,10 @@ struct SessionCtx {
     wc_tls_key_file: Option<String>,
     wc_dns_server: Option<String>,
     wc_udp_packet_size: usize,
+    /// Negotiated UDPPacket codec (`"binary-v1"` or empty; Go frp v0.71.0).
+    /// Snapshot from the V2 ServerHello handshake, forwarded to UDP/SUDP
+    /// work-conn bridges.
+    wc_udp_packet_codec: String,
     wc_disable_custom_tls_first_byte: bool,
     wc_keepalive_secs: u64,
     wc_bind_addr: Option<String>,
@@ -1288,9 +1292,9 @@ impl Service {
                 // After login, wrap control stream in AES-128-CFB encryption.
                 // Go frps v0.69.1 always encrypts the control connection for V1.
                 #[cfg(feature = "quic")]
-                let (stream, run_id, yamux, quic) = r;
+                let (stream, run_id, yamux, quic, udp_codec) = r;
                 #[cfg(not(feature = "quic"))]
-                let (stream, run_id, yamux) = r;
+                let (stream, run_id, yamux, udp_codec) = r;
                 let enc_key = encryption::derive_key(&self.auth_cfg.token);
                 #[cfg(feature = "quic")]
                 {
@@ -1298,12 +1302,12 @@ impl Service {
                 }
                 stream
                     .into_encrypted(enc_key)
-                    .map(|stream| (stream, run_id, yamux))
+                    .map(|stream| (stream, run_id, yamux, udp_codec))
                     .map_err(frp_core::Error::from)
             }
             Err(e) => Err(e),
         };
-        let (control_stream, run_id, yamux_session) = match enc_result {
+        let (control_stream, run_id, yamux_session, udp_codec) = match enc_result {
             Ok(r) => r,
             Err(e) => return Err(e),
         };
@@ -1373,6 +1377,7 @@ impl Service {
             wc_tls_key_file,
             wc_dns_server,
             wc_udp_packet_size,
+            wc_udp_packet_codec: udp_codec,
             wc_disable_custom_tls_first_byte,
             wc_keepalive_secs,
             wc_bind_addr,
@@ -3171,6 +3176,7 @@ impl Service {
             dial_timeout_secs: ctx.wc_dial_timeout_secs,
             xtcp_tx: self.xtcp_tx.clone(),
             session_alive: ctx.session_alive.clone(),
+            udp_packet_codec: ctx.wc_udp_packet_codec.clone(),
             spawned_counter: None,
             #[cfg(feature = "vnet")]
             vnet_tuns: self.vnet_tuns.clone(),

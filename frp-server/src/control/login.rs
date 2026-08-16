@@ -243,6 +243,24 @@ async fn verify_login_auth(
             return Err(());
         }
 
+        // --- Reject negative pool_count (Go frp v0.71.0 fix) ---
+        // Go frp 0.71.0 fixed a server panic / remote DoS caused by a client
+        // sending a negative pool_count: negative values are rejected before
+        // work-connection pool resources are allocated. frp-rs previously
+        // clamped to 1 (no panic), but reject to match Go behavior.
+        if let Some(pc) = login.pool_count {
+            if pc < 0 {
+                warn!(peer = ?peer, pool_count = %pc, "Login rejected: negative pool_count {}", pc);
+                send_login_error(
+                    stream,
+                    format!("invalid pool count {pc}: must be non-negative"),
+                    v2,
+                )
+                .await;
+                return Err(());
+            }
+        }
+
         // --- Replay protection: timestamp freshness + duplicate detection ---
         if auth_cfg.token_auth_timeout && auth_cfg.authentication_timeout > 0 {
             if let Some(ts) = login.timestamp {
@@ -809,6 +827,13 @@ pub(crate) async fn authenticate(
             internal_tx: internal_tx.clone(),
             peer,
             authenticated_user,
+            // Go frp v0.71.0: the negotiated UDPPacket codec flows from the
+            // V2 ServerHello (via CryptoContext) into the session context so
+            // UDP/SUDP data planes can pick the packet codec.
+            udp_packet_codec: crypto_ctx
+                .as_ref()
+                .map(|c| c.udp_packet_codec.clone())
+                .unwrap_or_default(),
             _run_mu_guard: run_mu_guard,
         },
         ControlState {

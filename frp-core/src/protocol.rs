@@ -557,6 +557,103 @@ pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
     }
 }
 
+/// Read a V2 message on a connection where a UDP packet binary codec may be
+/// negotiated (Go frp v0.71.0). When `udp_packet_codec` is `Some("binary-v1")`,
+/// a frame with type ID 19 (`V2_TYPE_UDP_PACKET_BINARY`) is decoded with the
+/// binary codec into a `FrpMessage::UDPPacket`; a JSON `UDPPacket` (type 13)
+/// after binary negotiation is a protocol error, matching Go
+/// `V2BinaryUDPPacketReadWriter`. When `udp_packet_codec` is `None`/empty,
+/// this is exactly `read_msg_v2`.
+pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    udp_packet_codec: Option<&str>,
+) -> Result<FrpMessage, crate::Error> {
+    let (frame_type, _flags, payload_len) = read_v2_frame_header(reader).await?;
+    if frame_type != V2_FRAME_TYPE_MESSAGE {
+        return Err(crate::Error::Protocol(
+            format!(
+                "unexpected V2 frame type: {frame_type}, expected {} (Message)",
+                V2_FRAME_TYPE_MESSAGE
+            )
+            .into(),
+        ));
+    }
+    if payload_len < 2 {
+        return Err(crate::Error::Protocol(
+            "V2 message payload too short".into(),
+        ));
+    }
+
+    // Read the payload into a Vec (this path is UDP data-plane only; the
+    // buffer-pool fast path of read_msg_v2 is not worth duplicating here
+    // since UDP payloads are typically small and the frame is short-lived).
+    let mut payload = vec![0u8; payload_len];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+
+    let binary = udp_packet_codec == Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY);
+    if type_id == msg::V2_TYPE_UDP_PACKET_BINARY {
+        if !binary {
+            return Err(crate::Error::Protocol(
+                format!(
+                    "received binary UDP packet (type {}) without negotiated codec",
+                    msg::V2_TYPE_UDP_PACKET_BINARY
+                )
+                .into(),
+            ));
+        }
+        let packet = crate::udp_binary::decode_udp_packet_binary(&payload[2..])
+            .map_err(|e| crate::Error::Protocol(format!("decode binary UDP packet: {e}").into()))?;
+        return Ok(FrpMessage::UDPPacket(packet));
+    }
+    if binary && type_id == msg::V2_TYPE_UDP_PACKET {
+        // Go: received JSON UDP packet after binary codec negotiation.
+        return Err(crate::Error::Protocol(
+            "received JSON UDP packet after binary codec negotiation".into(),
+        ));
+    }
+    deserialize_v2(type_id, &payload[2..])
+}
+
+/// Write a V2 message frame, using the binary UDP packet codec for
+/// `UDPPacket` messages when `udp_packet_codec` is `Some("binary-v1")`
+/// (Go frp v0.71.0). Non-UDPPacket messages always use JSON framing.
+/// When `udp_packet_codec` is `None`/empty this is exactly
+/// `write_msg_v2_inner`.
+///
+/// `no_flush` mirrors `write_msg_v2_nof`: skip the trailing flush syscall for
+/// raw TcpStream data planes where TCP_NODELAY already flushes per write.
+pub async fn write_msg_v2_with_udp_codec<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+    udp_packet_codec: Option<&str>,
+    no_flush: bool,
+) -> Result<(), crate::Error> {
+    let binary = udp_packet_codec == Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY);
+    if binary {
+        if let FrpMessage::UDPPacket(packet) = msg {
+            let body = crate::udp_binary::encode_udp_packet_binary(packet).map_err(|e| {
+                crate::Error::Protocol(format!("encode binary UDP packet: {e}").into())
+            })?;
+            let mut payload = Vec::with_capacity(2 + body.len());
+            payload.extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
+            payload.extend_from_slice(&body);
+            return write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await;
+        }
+    }
+    write_msg_v2_inner(writer, msg).await?;
+    if !no_flush {
+        writer
+            .flush()
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("flush after write_msg_v2: {e}").into()))?;
+    }
+    Ok(())
+}
+
 /// Protocol-aware message read: dispatches to V1 or V2 framing based on the `v2` flag.
 pub async fn read_msg<R: AsyncReadExt + Unpin>(
     reader: &mut R,

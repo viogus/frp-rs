@@ -585,8 +585,11 @@ async fn rollback_tcp_bind_failure(
 /// Checks port range, proxy_name length/control chars, custom_domains length,
 /// and subdomain length. Extracted from the async state machine to reduce
 /// the number of `.await` points in `handle_new_proxy`.
+/// `sub_domain_host` is the server's configured subDomainHost ("" = disabled);
+/// it is needed for the case-insensitive custom_domains conflict check
+/// (Go frp v0.71.0 `validateDomainConfigForServer`).
 #[inline(never)]
-fn validate_new_proxy(np: &msg::NewProxy) -> Result<(), String> {
+fn validate_new_proxy(np: &msg::NewProxy, sub_domain_host: &str) -> Result<(), String> {
     let raw_port = np.remote_port.unwrap_or(0);
     if raw_port < 0 || raw_port > u16::MAX as i32 {
         return Err(format!(
@@ -649,6 +652,29 @@ fn validate_new_proxy(np: &msg::NewProxy) -> Result<(), String> {
                 "subdomain '{}' is not a valid RFC 1123 DNS label (letters, digits, '-'; no leading/trailing '-' or '.')",
                 subdomain
             ));
+        }
+    }
+    // Case-insensitive custom_domains vs subDomainHost conflict check
+    // (Go frp v0.71.0 fix: a mixed-case domain under the configured
+    // subDomainHost previously bypassed validation). A custom domain that
+    // ends with "." + subDomainHost (more labels than the host itself) is
+    // rejected, mirroring Go validateDomainConfigForServer.
+    if !sub_domain_host.is_empty() {
+        let sub_host_lower = sub_domain_host.to_ascii_lowercase();
+        let sub_host_labels = sub_host_lower.split('.').count();
+        if let Some(ref domains) = np.custom_domains {
+            for domain in domains {
+                let canonical = domain.to_ascii_lowercase();
+                let domain_labels = canonical.split('.').count();
+                if domain_labels > sub_host_labels
+                    && canonical.ends_with(&format!(".{sub_host_lower}"))
+                {
+                    return Err(format!(
+                        "custom domain '{}' should not belong to subdomain host '{}'",
+                        domain, sub_domain_host
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -1133,7 +1159,7 @@ pub(crate) async fn handle_new_proxy(
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     v2: bool,
 ) -> bool {
-    if let Err(e) = validate_new_proxy(&np) {
+    if let Err(e) = validate_new_proxy(&np, &state.sub_domain_host) {
         reject_new_proxy(writer, &np.proxy_name, e, v2).await;
         return false;
     }

@@ -19,7 +19,10 @@ use frp_core::encryption;
 use frp_core::metrics::ProxyMetricsRegistry;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
-use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
+use frp_core::protocol::{
+    read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v1, write_msg_v2,
+    write_msg_v2_with_udp_codec,
+};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
 use frp_core::transport::{
@@ -263,6 +266,9 @@ pub(crate) struct WorkConnConfig {
     pub dial_timeout_secs: u64,
     pub xtcp_tx: mpsc::Sender<XtcpNotification>,
     pub session_alive: Arc<AtomicBool>,
+    /// Negotiated UDPPacket codec for V2 data planes (`"binary-v1"` or
+    /// empty; Go frp v0.71.0). Passed to UDP/SUDP work-conn bridges.
+    pub udp_packet_codec: String,
     /// Test-only probe: each spawned work-conn task increments this counter when
     /// it starts. Always `None` in production configs.
     pub spawned_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -525,6 +531,9 @@ async fn run_udp_work_conn(
     udp_keepalive_secs: u64,
     bw_rate: u64,
     bw_mode: String,
+    // Negotiated UDPPacket codec (`"binary-v1"` or empty; Go frp v0.71.0).
+    // When set on a V2 work conn, UDPPacket frames use the binary codec.
+    udp_packet_codec: String,
 ) {
     let local_addr = match local_addr_str.parse::<SocketAddr>() {
         Ok(a) => a,
@@ -585,6 +594,7 @@ async fn run_udp_work_conn(
     let session_alive_r = session_alive.clone();
     let local_addr_str_r = local_addr_str.clone();
     let mut reader_cancel = cancel_rx.clone();
+    let reader_udp_codec = udp_packet_codec.clone();
     let mut read_lim = if bw_rate > 0 && apply_read {
         Some(BandwidthLimiter::new(bw_rate))
     } else {
@@ -611,7 +621,16 @@ async fn run_udp_work_conn(
                     if changed.is_err() || *reader_cancel.borrow() { break; }
                 }
                 result = async {
-                    if v2 { read_msg_v2(&mut w_r).await } else { read_msg_v1(&mut w_r).await }
+                    if v2 {
+                        let codec_opt = if reader_udp_codec.is_empty() {
+                            None
+                        } else {
+                            Some(reader_udp_codec.as_str())
+                        };
+                        read_msg_v2_with_udp_codec(&mut w_r, codec_opt).await
+                    } else {
+                        read_msg_v1(&mut w_r).await
+                    }
                 } => {
                     match result {
                         Ok(FrpMessage::UDPPacket(up)) => {
@@ -880,7 +899,12 @@ async fn run_udp_work_conn(
                         lim.consume(pkt_len).await;
                     }
                     let result = if v2 {
-                        write_msg_v2(&mut w_w, &pkt).await
+                        let codec_opt = if udp_packet_codec.is_empty() {
+                            None
+                        } else {
+                            Some(udp_packet_codec.as_str())
+                        };
+                        write_msg_v2_with_udp_codec(&mut w_w, &pkt, codec_opt, false).await
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
@@ -1143,6 +1167,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             dial_timeout_secs,
             xtcp_tx,
             session_alive,
+            udp_packet_codec,
             spawned_counter: _spawned_counter,
             #[cfg(feature = "vnet")]
                 vnet_tuns: _vnet_tuns,
@@ -1543,6 +1568,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         cfg.keepalive_secs,
                         info.bandwidth_limit,
                         info.bandwidth_limit_mode.clone(),
+                        udp_packet_codec.clone(),
                     )
                     .await;
                 } else {
@@ -1686,6 +1712,7 @@ mod tests {
             dial_timeout_secs: 1,
             xtcp_tx,
             session_alive,
+            udp_packet_codec: String::new(),
             spawned_counter,
             #[cfg(feature = "vnet")]
             vnet_tuns: Arc::new(Mutex::new(HashMap::new())),
@@ -1768,6 +1795,7 @@ mod tests {
             0,
             0,
             String::new(),
+            String::new(),
         ));
         drop(peer);
 
@@ -1803,6 +1831,7 @@ mod tests {
             String::new(),
             0,
             0,
+            String::new(),
             String::new(),
         ));
 
@@ -1851,6 +1880,7 @@ mod tests {
             String::new(),
             0,
             0,
+            String::new(),
             String::new(),
         ));
 
@@ -1914,6 +1944,7 @@ mod tests {
             String::new(),
             0,
             0,
+            String::new(),
             String::new(),
         ));
 

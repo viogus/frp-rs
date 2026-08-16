@@ -1361,6 +1361,7 @@ mod vnet_route_tests {
             internal_tx,
             peer: None,
             authenticated_user: String::new(),
+            udp_packet_codec: String::new(),
             _run_mu_guard: run_mu_guard,
         };
         let ctl = ControlState {

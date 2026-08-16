@@ -11,7 +11,9 @@ use frp_core::cipher_stream::{CipherReader, CipherWriter};
 use frp_core::encryption::derive_key;
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
+use frp_core::protocol::{
+    read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v1, write_msg_v2_with_udp_codec,
+};
 use frp_core::snappy_stream::{SnappyStreamReader, SnappyStreamWriter};
 use frp_core::transport::{split_work_conn_halves, IoStream};
 
@@ -193,34 +195,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
     }
 }
 
-/// Write a V2 message without flushing the writer.
-///
-/// `frp_core::protocol::write_msg_v2_inner` is `pub(crate)` and not reachable
-/// from frp-server, so this composes the same frame from public APIs:
-/// type_id (2 BE bytes) + JSON, framed via `write_v2_frame_raw` (write_all only,
-/// no flush). The UDP work conn write half is a raw TcpStream with TCP_NODELAY,
-/// so the per-packet flush in `write_msg_v2` is a redundant syscall.
-async fn write_msg_v2_nof<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    msg: &FrpMessage,
-) -> Result<(), frp_core::Error> {
-    use frp_core::protocol::{write_v2_frame_raw, V2_FRAME_TYPE_MESSAGE, V2_MAX_FRAME_PAYLOAD};
-    let type_id = msg.v2_type_id();
-    let mut payload = Vec::with_capacity(2 + 512);
-    payload.extend_from_slice(&type_id.to_be_bytes());
-    serde_json::to_writer(&mut payload, msg)?;
-    if payload.len() > V2_MAX_FRAME_PAYLOAD as usize {
-        return Err(frp_core::Error::Protocol(
-            format!(
-                "V2 payload too large: {} > {V2_MAX_FRAME_PAYLOAD}",
-                payload.len()
-            )
-            .into(),
-        ));
-    }
-    write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_udp_work_conn(
     work_conn: IoStream,
@@ -234,12 +208,20 @@ async fn run_udp_work_conn(
     bw_rate: u64,
     bw_mode: String,
     cancel: tokio_util::sync::CancellationToken,
+    // Negotiated UDPPacket codec (`"binary-v1"` or empty). When set, UDP
+    // packets on this V2 work conn use the binary codec (Go frp v0.71.0).
+    udp_packet_codec: String,
 ) {
     // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
     // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
     // frames in flight without flush — and a CipherWriter must flush to emit
     // its IV.
     let no_flush = work_conn.try_tcp().is_some() && !use_enc;
+    let udp_codec_opt = if udp_packet_codec.is_empty() {
+        None
+    } else {
+        Some(udp_packet_codec.as_str())
+    };
     let (w_r, w_w) = match split_work_conn_halves(work_conn) {
         Ok(pair) => pair,
         Err(msg) => {
@@ -296,7 +278,11 @@ async fn run_udp_work_conn(
                     continue;
                 }
                 result = async {
-                    if v2 { read_msg_v2(&mut w_r).await } else { read_msg_v1(&mut w_r).await }
+                    if v2 {
+                        read_msg_v2_with_udp_codec(&mut w_r, udp_codec_opt).await
+                    } else {
+                        read_msg_v1(&mut w_r).await
+                    }
                 } => result,
             };
             match result {
@@ -374,11 +360,7 @@ async fn run_udp_work_conn(
                         lim.consume(n).await;
                     }
                     let result = if v2 {
-                        if no_flush {
-                            write_msg_v2_nof(&mut w_w, &pkt).await
-                        } else {
-                            write_msg_v2(&mut w_w, &pkt).await
-                        }
+                        write_msg_v2_with_udp_codec(&mut w_w, &pkt, udp_codec_opt, no_flush).await
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
@@ -462,6 +444,7 @@ pub(crate) async fn assign_udp_work_conn(
     bw_rate: u64,
     bw_mode: String,
     cancel: tokio_util::sync::CancellationToken,
+    udp_packet_codec: String,
 ) {
     let mut work_conn = work_conn;
     let sock = match udp_sockets.get(proxy_name) {
@@ -523,6 +506,7 @@ pub(crate) async fn assign_udp_work_conn(
             bw_rate,
             bw_mode,
             cancel,
+            udp_packet_codec,
         ));
         if let Err(e) = handle.await {
             if e.is_panic() {
@@ -1280,6 +1264,7 @@ mod tests {
             0,
             String::new(),
             tokio_util::sync::CancellationToken::new(),
+            String::new(),
         ));
         drop(peer);
 
@@ -1319,6 +1304,7 @@ mod tests {
             0,
             String::new(),
             tokio_util::sync::CancellationToken::new(),
+            String::new(),
         ));
         sender.send_to(b"force-write", socket_addr).await.unwrap();
 
@@ -1352,6 +1338,7 @@ mod tests {
             0,
             String::new(),
             tokio_util::sync::CancellationToken::new(),
+            String::new(),
         ));
 
         peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
@@ -1420,6 +1407,7 @@ mod tests {
             0,
             String::new(),
             bridge_cancel,
+            String::new(),
         ));
 
         // Let both bridge tasks reach their blocking points.

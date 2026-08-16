@@ -26,8 +26,7 @@ pub const TYPE_NAT_HOLE_REPORT: u8 = b'6';
 /// Rust-only V1 extension — Go frp v0.70.0 does NOT recognize type 7.
 pub const TYPE_CLOSE_PROXY_RESP: u8 = b'7';
 /// Rust-only V1 extension — Go frp v0.70.0 does NOT recognize type 8.
-pub const TYPE_ERROR: u8 = b'8';
-// VNet (L3 VPN) message types
+pub const TYPE_ERROR: u8 = b'8'; // VNet (L3 VPN) message types
 #[cfg(feature = "vnet")]
 pub const TYPE_VNET_ROUTE_ADVERTISE: u8 = 0x40;
 #[cfg(feature = "vnet")]
@@ -56,10 +55,17 @@ pub const V2_TYPE_NAT_HOLE_CLIENT: u16 = 15;
 pub const V2_TYPE_NAT_HOLE_RESP: u16 = 16;
 pub const V2_TYPE_NAT_HOLE_SID: u16 = 17;
 pub const V2_TYPE_NAT_HOLE_REPORT: u16 = 18;
-/// Rust-only V2 extension — Go frp v0.70.0 does NOT recognize type 19.
-pub const V2_TYPE_CLOSE_PROXY_RESP: u16 = 19;
-/// Rust-only V2 extension — Go frp v0.70.0 does NOT recognize type 20.
-pub const V2_TYPE_ERROR: u16 = 20;
+/// UDPPacket with a dedicated binary codec, negotiated via the V2 handshake
+/// (`udpPacketCodecs` capability). Go frp v0.71.0. V1 stays JSON; V2 falls
+/// back to JSON `UDPPacket` (type 13) when the peer did not negotiate the
+/// capability. See `frp_core::udp_binary`.
+pub const V2_TYPE_UDP_PACKET_BINARY: u16 = 19;
+/// Rust-only V2 extension — renumbered to 21 (was 19) because Go frp v0.71.0
+/// assigned type 19 to `V2TypeUDPPacketBinary`. Go frp does NOT recognize 21.
+pub const V2_TYPE_CLOSE_PROXY_RESP: u16 = 21;
+/// Rust-only V2 extension — renumbered to 22 (was 20) to stay clear of Go
+/// frp v0.71.0's new type 19. Go frp does NOT recognize 22.
+pub const V2_TYPE_ERROR: u16 = 22;
 // VNet (L3 VPN) message types
 #[cfg(feature = "vnet")]
 pub const V2_TYPE_VNET_ROUTE_ADVERTISE: u16 = 42;
@@ -364,7 +370,7 @@ pub struct NewVisitorConnResp {
 }
 
 /// UDP address matching Go frp v0.69.1 `net.UDPAddr` JSON representation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UdpAddr {
     #[serde(rename = "IP")]
     pub ip: String,

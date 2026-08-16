@@ -27,7 +27,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 VPS_USER="${XTCP_VPS_USER:-frp-test}"
-GO_FRP_VERSION="${GO_FRP_VERSION:-0.70.1}"
+GO_FRP_VERSION="${GO_FRP_VERSION:-0.71.0}"
 # VPS target is always linux/amd64
 GO_FRP_ARCH="linux_amd64"
 REMOTE_DIR="/tmp/frp-xtcp-test"
