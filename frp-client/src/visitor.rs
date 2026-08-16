@@ -42,10 +42,9 @@ pub(crate) struct VisitorListenerConfig {
     pub min_retry_interval: i64,
     pub stun_server: String,
     /// XTCP P2P data plane protocol: "quic" (default, Go parity) or "kcp".
-    /// "quic" requires BOTH the `quic` and `kcp` features (the QUIC data
-    /// plane reuses the KCP hole-punch machinery).
-    /// Both data planes are implemented; "kcp" is the default (Go compat
-    /// matrix forces kcp), "quic" requires the `quic` feature.
+    /// Both data planes are implemented; "quic" requires BOTH the `quic` and
+    /// `kcp` features (the QUIC data plane reuses the KCP hole-punch
+    /// machinery).
     pub p2p_protocol: String,
     pub visitor_tx: mpsc::Sender<crate::service::VisitorRequest>,
     pub fallback_to: String,

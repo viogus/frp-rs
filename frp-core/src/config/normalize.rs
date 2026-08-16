@@ -697,7 +697,7 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
                 .or_insert_with(|| Value::Table(Default::default()));
             if let Value::Table(auth) = auth_table {
                 let mut scopes: Vec<String> = auth
-                    .get("additional_scopes")
+                    .get("additional_auth_scopes")
                     .and_then(Value::as_array)
                     .map(|arr| {
                         arr.iter()
