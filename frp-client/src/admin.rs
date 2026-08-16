@@ -200,21 +200,23 @@ fn store_or_error(state: &AdminState) -> Result<Arc<StoreSource>, (StatusCode, S
 }
 
 fn proxy_to_json(proxy: &ProxyConfig) -> Result<serde_json::Value, (StatusCode, String)> {
-    serde_json::to_value(proxy).map_err(|e| {
+    let value = serde_json::to_value(proxy).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to serialize proxy: {e}"),
         )
-    })
+    })?;
+    Ok(redact_json_sensitive(value))
 }
 
 fn visitor_to_json(visitor: &VisitorConfig) -> Result<serde_json::Value, (StatusCode, String)> {
-    serde_json::to_value(visitor).map_err(|e| {
+    let value = serde_json::to_value(visitor).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to serialize visitor: {e}"),
         )
-    })
+    })?;
+    Ok(redact_json_sensitive(value))
 }
 
 async fn handle_list_store_proxies(
@@ -748,6 +750,31 @@ fn redact_value(value: toml::Value) -> toml::Value {
     }
 }
 
+/// Recursively redact sensitive values in JSON (mirror of [`redact_sensitive`]
+/// for the serde_json side). Used by the `/api/.../config` and store JSON
+/// endpoints so proxy/visitor secrets (`sk`, `http_pwd`, `group_key`,
+/// `secret_key`) never leak over the admin API.
+fn redact_json_sensitive(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, val) in map {
+                let redacted_val = if SENSITIVE_KEYS.contains(&key.as_str()) {
+                    serde_json::Value::String("***".into())
+                } else {
+                    redact_json_sensitive(val)
+                };
+                redacted.insert(key, redacted_val);
+            }
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(redact_json_sensitive).collect())
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,5 +926,49 @@ mod tests {
             std::env::temp_dir().join(format!("frpc_admin_store_{}.json", std::process::id()));
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn proxy_and_visitor_json_redact_secrets() {
+        use frp_core::config::{ProxyConfig, VisitorConfig};
+        // A TCP proxy with secret_key/http_pwd/sk set.
+        let proxy: ProxyConfig = serde_json::from_value(serde_json::json!({
+            "name": "p",
+            "type": "stcp",
+            "local_ip": "127.0.0.1",
+            "local_port": 8080,
+            "sk": "secret-key-abc",
+            "http_pwd": "pw-xyz",
+            "group_key": "grp-key"
+        }))
+        .unwrap();
+        let pj = proxy_to_json(&proxy).unwrap();
+        assert_eq!(pj["sk"], "***", "proxy sk must be redacted");
+        assert_eq!(pj["http_pwd"], "***", "proxy http_pwd must be redacted");
+        assert_eq!(pj["group_key"], "***", "proxy group_key must be redacted");
+        let pj_str = pj.to_string();
+        assert!(
+            !pj_str.contains("secret-key-abc") && !pj_str.contains("pw-xyz"),
+            "proxy secrets leaked into config JSON: {pj_str}"
+        );
+
+        // A visitor with secret_key set.
+        let visitor: VisitorConfig = serde_json::from_value(serde_json::json!({
+            "name": "v",
+            "type": "xtcp",
+            "server_name": "s",
+            "secret_key": "visitor-secret-key"
+        }))
+        .unwrap();
+        let vj = visitor_to_json(&visitor).unwrap();
+        assert_eq!(
+            vj["secret_key"], "***",
+            "visitor secret_key must be redacted"
+        );
+        let vj_str = vj.to_string();
+        assert!(
+            !vj_str.contains("visitor-secret-key"),
+            "visitor secret leaked into config JSON: {vj_str}"
+        );
     }
 }

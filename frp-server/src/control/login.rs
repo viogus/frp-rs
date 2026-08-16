@@ -915,6 +915,8 @@ mod auth_signal_tests {
             true,
             30,
             7200,
+            0,
+            0,
             90,
             1500,
             false,

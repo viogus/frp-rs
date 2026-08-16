@@ -285,10 +285,13 @@ impl IncomingStreams {
 #[cfg(feature = "tcp-mux")]
 #[derive(Clone)]
 pub struct YamuxSession {
-    /// Shared yamux connection. open_stream() polls poll_new_outbound
-    /// directly on it — no background-task round trip through a request
-    /// channel. The background driver task holds the same Arc.
-    conn: Arc<Mutex<Connection<Box<dyn MuxSocket>>>>,
+    /// Request channel to the background driver task. `open_stream()` sends
+    /// a one-shot request here and awaits the result; opening a stream does
+    /// NOT take the shared Connection lock (the driver task owns driving the
+    /// connection's I/O), so a session handle never blocks a worker thread
+    /// behind an in-flight connection poll.
+    open_tx:
+        mpsc::UnboundedSender<oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>>,
     /// Set false when the background driver exits (I/O error, keepalive
     /// bound, or session drop). open_stream() checks it to fail fast
     /// instead of polling a connection whose driver is gone.
@@ -297,8 +300,8 @@ pub struct YamuxSession {
     /// is never lost — if the driver is mid-iteration (processing inbound
     /// I/O) when the send happens, its next `changed()` resolves
     /// immediately. A plain `Notify` would drop a wakeup fired while no
-    /// waiter was registered, leaving the new stream's queued frames
-    /// (SYN flag / initial window update) unflushed until the next
+    /// waiter was registered, leaving the new open request (and its queued
+    /// SYN flag / initial window update frames) unflushed until the next
     /// keepalive tick (30s default) or inbound traffic.
     opened: Arc<watch::Sender<()>>,
     /// When the last YamuxSession reference is dropped, this sender drops,
@@ -313,34 +316,36 @@ impl YamuxSession {
     /// Open a new yamux stream on the shared session.
     /// Returns `None` if the yamux session is closed/dropped.
     pub async fn open_stream(&self) -> Option<YamuxStream> {
-        // Fail fast when the driver has exited: poll_new_outbound on a
-        // driver-less connection would succeed, but the new stream's frames
-        // could never be flushed to the wire.
+        // Fail fast when the driver has exited: a request would otherwise
+        // sit unserved (the fresh sender would never be polled to output and
+        // the frames never flushed).
         if !self.alive.load(Ordering::Acquire) {
             return None;
         }
-        let c = self.conn.clone();
-        let result = poll_fn(move |cx| {
-            c.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .poll_new_outbound(cx)
-        })
-        .await;
-        let stream = match result {
-            Ok(s) => Some(s.compat()),
-            Err(e) => {
+        let (tx, rx) = oneshot::channel();
+        if self.open_tx.send(tx).is_err() {
+            // Driver has exited (channel closed) between the alive check and
+            // here.
+            return None;
+        }
+        // Wake the driver so it processes the open request. The watch send
+        // is stateful: it also wakes the driver if the send lands while the
+        // driver is mid-select-iteration (a Notify would lose it), so the new
+        // stream's queued frames (SYN flag / initial window update) get
+        // flushed promptly rather than waiting for the next keepalive tick.
+        let _ = self.opened.send(());
+        let stream = match rx.await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 warn!(error = %e, "yamux client: open stream failed: {e}");
-                None
+                return None;
+            }
+            Err(_) => {
+                // Driver dropped the sender without answering (shutdown).
+                return None;
             }
         };
-        // Wake the driver so it re-polls and flushes the new stream's queued
-        // frames: the stream's command channel was just registered with the
-        // connection and no waker has observed it yet, so a write on the
-        // stream would otherwise sit until the next keepalive tick. The
-        // watch send is stateful: it also wakes the driver if the send lands
-        // while the driver is mid-select-iteration (a Notify would lose it).
-        let _ = self.opened.send(());
-        stream
+        Some(stream.compat())
     }
 }
 
@@ -598,6 +603,12 @@ where
     let bg_alive = alive.clone();
     let (opened_tx, mut bg_opened) = watch::channel(());
     let opened = Arc::new(opened_tx);
+    // Channel over which open_stream() requests a new outbound stream. The
+    // driver owns the Connection and opens the stream on request, so the
+    // session handle never contends on the Connection lock.
+    let (open_tx, mut bg_open_rx) = mpsc::unbounded_channel::<
+        oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
+    >();
     let keepalive = normalized_keepalive_interval(mux_cfg.keepalive_interval);
     // Dead-session bound in wall-clock time — see server_mux for why the
     // configured interval cannot be used alone as the dead bound.
@@ -712,6 +723,20 @@ where
                     bg_alive.store(false, Ordering::Release);
                     break;
                 }
+                // A session handle requested a new outbound stream. Open it
+                // on the connection and answer the requester. If the caller
+                // has dropped the request (session torn down), the send fails
+                // and the stream is discarded.
+                Some(req) = bg_open_rx.recv() => {
+                    let result = poll_fn(|cx| {
+                        bg_conn
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .poll_new_outbound(cx)
+                    })
+                    .await;
+                    let _ = req.send(result);
+                }
                 // A stream was opened from open_stream() — wake so the I/O
                 // branch re-polls and flushes the new stream's queued frames
                 // (SYN flag / initial window update) to the wire. watch's
@@ -727,7 +752,7 @@ where
     Ok((
         control_compat,
         YamuxSession {
-            conn,
+            open_tx,
             alive,
             opened,
             shutdown_tx,

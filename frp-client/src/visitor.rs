@@ -176,12 +176,15 @@ fn plan_visitor_dial(
         tls_enable,
         tls_server_name: tls_server_name.to_string(),
         tls_ca_file: tls_ca_file.clone(),
+        tls_skip_verify: false,
         tls_cert_file: transport.tls_cert_file.clone(),
         tls_key_file: transport.tls_key_file.clone(),
         dns_server: transport.dns_server.clone(),
         disable_custom_tls_first_byte: transport.disable_custom_tls_first_byte,
         keepalive_secs: transport.keepalive_secs,
         bind_addr: transport.connect_bind_addr.clone(),
+        tcp_send_buffer_size: 0,
+        tcp_recv_buffer_size: 0,
         proxy_url: transport.proxy_url.clone(),
         dial_timeout_secs: transport.dial_timeout_secs,
         v2: transport.v2,
@@ -1541,6 +1544,9 @@ async fn run_sudp_worker(
     // NOT a fresh sleep() per loop iteration, which would never fire (the
     // 100ms shutdown poll would always win the select and restart it).
     let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // Reusable payload buffer for the V2 UDP read path (avoids a heap alloc
+    // per UDP packet).
+    let mut scratch = Vec::new();
     loop {
         // Fast-path shutdown check: the 100ms wait_sudp_shutdown poll below
         // can be starved under sustained bidirectional traffic (unbiased
@@ -1590,7 +1596,7 @@ async fn run_sudp_worker(
             }
             msg_result = async {
                 if v2 {
-                    read_msg_v2_with_udp_codec(&mut srv_r, udp_codec_opt).await
+                    read_msg_v2_with_udp_codec(&mut srv_r, udp_codec_opt, &mut scratch).await
                 } else {
                     read_msg_v1(&mut srv_r).await
                 }

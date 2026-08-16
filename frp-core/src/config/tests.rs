@@ -3372,6 +3372,54 @@ tcp_mux = true
 }
 
 #[test]
+fn test_tls_skip_verify_client_config_parsed() {
+    // Both snake_case and the Go-inspired camel alias map to tls_skip_verify
+    // (default false preserves Go-compatible behavior — no CA ⇒ skip).
+    let snake: ClientConfig =
+        load_client_config_from_str("server_addr = '127.0.0.1'\ntls_skip_verify = true\n").unwrap();
+    assert!(snake.tls_skip_verify);
+
+    let camel: ClientConfig =
+        load_client_config_from_str("server_addr = '127.0.0.1'\ntlsSkipVerify = true\n").unwrap();
+    assert!(camel.tls_skip_verify);
+
+    // Default is false.
+    let def: ClientConfig = load_client_config_from_str("server_addr = '127.0.0.1'\n").unwrap();
+    assert!(!def.tls_skip_verify);
+}
+
+#[test]
+fn test_tcp_socket_buffer_client_config_parsed() {
+    // tcpSendBuffer/tcpRecvBuffer (frp-rs extension) map to the socket
+    // buffer size fields; defaults are 0 (OS default).
+    let snake: ClientConfig = load_client_config_from_str(
+        "server_addr = '127.0.0.1'\ntcp_send_buffer_size = 262144\ntcp_recv_buffer_size = 524288\n",
+    )
+    .unwrap();
+    assert_eq!(snake.tcp_send_buffer_size, 262144);
+    assert_eq!(snake.tcp_recv_buffer_size, 524288);
+
+    let camel: ClientConfig = load_client_config_from_str(
+        "server_addr = '127.0.0.1'\ntcpSendBuffer = 131072\ntcpRecvBuffer = 65536\n",
+    )
+    .unwrap();
+    assert_eq!(camel.tcp_send_buffer_size, 131072);
+    assert_eq!(camel.tcp_recv_buffer_size, 65536);
+
+    let def: ClientConfig = load_client_config_from_str("server_addr = '127.0.0.1'\n").unwrap();
+    assert_eq!(def.tcp_send_buffer_size, 0);
+    assert_eq!(def.tcp_recv_buffer_size, 0);
+
+    // Server side.
+    let srv: ServerConfig = load_server_config_from_str(
+        "bind_port = 7000\ntcpSendBuffer = 1048576\ntcpRecvBuffer = 1048576\n",
+    )
+    .unwrap();
+    assert_eq!(srv.transport.tcp_send_buffer_size, 1048576);
+    assert_eq!(srv.transport.tcp_recv_buffer_size, 1048576);
+}
+
+#[test]
 fn test_log_disable_print_color_parsed() {
     // log.disablePrintColor must be honored from the config file (audit task
     // 9 finding 9 — wired into resolve_ansi by the frps/frpc binaries).

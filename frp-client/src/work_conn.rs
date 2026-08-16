@@ -614,6 +614,9 @@ async fn run_udp_work_conn(
         // remote misses the shared map, re-creates the session, and replaces
         // the entry.
         let mut reader_socks: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
+        // Reusable payload buffer for the V2 UDP read path (avoids a heap
+        // alloc per UDP packet).
+        let mut read_scratch: Vec<u8> = Vec::new();
         loop {
             tokio::select! {
                 biased;
@@ -627,7 +630,7 @@ async fn run_udp_work_conn(
                         } else {
                             Some(reader_udp_codec.as_str())
                         };
-                        read_msg_v2_with_udp_codec(&mut w_r, codec_opt).await
+                        read_msg_v2_with_udp_codec(&mut w_r, codec_opt, &mut read_scratch).await
                     } else {
                         read_msg_v1(&mut w_r).await
                     }

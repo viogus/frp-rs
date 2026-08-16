@@ -358,11 +358,15 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
         payload.len()
     );
 
-    let mut out = Vec::with_capacity(V2_FRAME_HEADER_LEN + payload.len());
-    out.extend_from_slice(&header);
-    out.extend_from_slice(payload);
+    // Two writes instead of one merged Vec: avoids a heap allocation and a
+    // full payload memcpy per frame. The reader side is buffered on every
+    // transport we use, so this does not add a syscall.
     writer
-        .write_all(&out)
+        .write_all(&header)
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
+    writer
+        .write_all(payload)
         .await
         .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
     Ok(())
@@ -568,6 +572,7 @@ pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
 pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     udp_packet_codec: Option<&str>,
+    scratch: &mut Vec<u8>,
 ) -> Result<FrpMessage, crate::Error> {
     let (frame_type, _flags, payload_len) = read_v2_frame_header(reader).await?;
     if frame_type != V2_FRAME_TYPE_MESSAGE {
@@ -585,15 +590,18 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
         ));
     }
 
-    // Read the payload into a Vec (this path is UDP data-plane only; the
-    // buffer-pool fast path of read_msg_v2 is not worth duplicating here
-    // since UDP payloads are typically small and the frame is short-lived).
-    let mut payload = vec![0u8; payload_len];
+    // Read the payload into the caller-supplied scratch (this path is UDP
+    // data-plane only; the buffer-pool fast path of read_msg_v2 is not worth
+    // duplicating here since UDP payloads are typically small). The caller
+    // holds `scratch` outside its message loop and reuses it across frames,
+    // avoiding a heap allocation per UDP packet.
+    scratch.clear();
+    scratch.resize(payload_len, 0);
     reader
-        .read_exact(&mut payload)
+        .read_exact(scratch.as_mut_slice())
         .await
         .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
-    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+    let type_id = u16::from_be_bytes([scratch[0], scratch[1]]);
 
     let binary = udp_packet_codec == Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY);
     if type_id == msg::V2_TYPE_UDP_PACKET_BINARY {
@@ -606,7 +614,7 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
                 .into(),
             ));
         }
-        let packet = crate::udp_binary::decode_udp_packet_binary(&payload[2..])
+        let packet = crate::udp_binary::decode_udp_packet_binary(&scratch[2..])
             .map_err(|e| crate::Error::Protocol(format!("decode binary UDP packet: {e}").into()))?;
         return Ok(FrpMessage::UDPPacket(packet));
     }
@@ -616,7 +624,7 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
             "received JSON UDP packet after binary codec negotiation".into(),
         ));
     }
-    deserialize_v2(type_id, &payload[2..])
+    deserialize_v2(type_id, &scratch[2..])
 }
 
 /// Write a V2 message frame, using the binary UDP packet codec for
@@ -1690,6 +1698,7 @@ mod tests {
             let got = read_msg_v2_with_udp_codec(
                 &mut r,
                 Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+                &mut Vec::new(),
             )
             .await
             .unwrap();
@@ -1750,6 +1759,7 @@ mod tests {
             let err = read_msg_v2_with_udp_codec(
                 &mut r,
                 Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+                &mut Vec::new(),
             )
             .await
             .unwrap_err();
@@ -1777,6 +1787,7 @@ mod tests {
             let got = read_msg_v2_with_udp_codec(
                 &mut r,
                 Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+                &mut Vec::new(),
             )
             .await
             .unwrap();

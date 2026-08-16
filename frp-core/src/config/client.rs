@@ -217,6 +217,17 @@ pub struct ClientConfig {
     pub tls_key_file: String,
     #[serde(default)]
     pub tls_ca_file: String,
+    /// Explicitly skip TLS server-certificate verification (Go frp's
+    /// InsecureSkipVerify=true). Default `false` preserves the Go-compatible
+    /// behavior: with `tls_ca_file` set the server cert is verified against
+    /// it; without it, verification is skipped (the frp-rs default for
+    /// auto-generated self-signed certs, matching Go frp). Set `true` to
+    /// force-skip verification even when `tls_ca_file` is configured — for
+    /// operators who want the decision explicit. This is a security
+    /// downgrade; prefer setting `tls_ca_file` to a trusted CA instead.
+    /// Go frp compat: insecureSkipVerify (frp-rs ships the safer default).
+    #[serde(default, alias = "tlsSkipVerify")]
+    pub tls_skip_verify: bool,
     #[serde(default, alias = "tlsServerName")]
     pub tls_server_name: String,
     /// Disable the custom TLS head byte (0x17) written before the TLS handshake.
@@ -263,6 +274,14 @@ pub struct ClientConfig {
     /// Go frp compat: transport.tcpMuxKeepaliveInterval.
     #[serde(default, alias = "tcpMuxKeepaliveInterval")]
     pub tcp_mux_keepalive_interval: i64,
+    /// TCP send-buffer size in bytes on outbound connections (SO_SNDBUF).
+    /// 0 = OS default. frp-rs extension for high-BDP links.
+    #[serde(default, alias = "tcpSendBuffer")]
+    pub tcp_send_buffer_size: u32,
+    /// TCP receive-buffer size in bytes on outbound connections (SO_RCVBUF).
+    /// 0 = OS default. frp-rs extension for high-BDP links.
+    #[serde(default, alias = "tcpRecvBuffer")]
+    pub tcp_recv_buffer_size: u32,
     #[serde(default)]
     pub v2: bool,
     /// QUIC protocol options.
@@ -311,6 +330,7 @@ impl Default for ClientConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             tls_ca_file: String::new(),
+            tls_skip_verify: false,
             tls_server_name: String::new(),
             disable_custom_tls_first_byte: true,
             log: LogConfig::default(),
@@ -324,6 +344,8 @@ impl Default for ClientConfig {
             connect_server_local_ip: String::new(),
             tcp_mux: default_tcp_mux(),
             tcp_mux_keepalive_interval: 30,
+            tcp_send_buffer_size: 0,
+            tcp_recv_buffer_size: 0,
             v2: false,
             quic_options: None,
             proxies: vec![],
