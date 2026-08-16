@@ -543,7 +543,8 @@ pub struct VisitorConfig {
     pub secret_key: String,
     /// Protocol for XTCP P2P connections: "quic" (default, matching Go frp
     /// v0.70.1) or "kcp". Both data planes are implemented; "quic" requires
-    /// the `quic` feature.
+    /// BOTH the `quic` and `kcp` features (the QUIC data plane reuses the
+    /// KCP hole-punch machinery).
     #[serde(default = "default_xtcp_protocol", alias = "protocol")]
     pub protocol: String,
     /// Optional server user for auth matching.
