@@ -3590,3 +3590,29 @@ remote_port = "16000"
     let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, vec!["good"]);
 }
+
+/// A known top-level section carrying a `type` key is NOT collected as a
+/// legacy INI proxy (KNOWN_SECTIONS guard).
+#[test]
+fn test_legacy_ini_known_section_with_type_not_collected() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+
+[log]
+type = "custom"
+disable_print_color = true
+
+[real_proxy]
+type = "tcp"
+local_port = 8080
+remote_port = 8081
+"#,
+    )
+    .unwrap();
+    // [log] with a type key stays a log section (not a proxy);
+    // [real_proxy] is collected normally.
+    assert_eq!(cfg.proxies.len(), 1, "proxies: {:?}", cfg.proxies);
+    assert_eq!(cfg.proxies[0].name, "real_proxy");
+    assert!(cfg.log.disable_print_color);
+}
