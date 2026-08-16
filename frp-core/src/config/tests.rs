@@ -3490,6 +3490,16 @@ fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Er
     Ok(cfg)
 }
 
+/// Same for server configs.
+fn load_server_ini(content: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let mut value = super::format::parse_to_toml_value(content, super::format::ConfigFormat::Ini)?;
+    super::normalize::normalize_server_config(&mut value);
+    let cfg: ServerConfig = serde_json::from_value(super::normalize::toml_to_json(value))
+        .map_err(|e| format!("config validation error: {e}"))?;
+    super::validate_server_config(&cfg)?;
+    Ok(cfg)
+}
+
 /// Go legacy INI proxy sections: [web]/[ssh] become [proxies] entries,
 /// [range:xxx] expands to per-port proxies, [plugin:xxx] keeps its prefix,
 /// and role=visitor sections land in [visitors].
@@ -3672,4 +3682,220 @@ remote_port = 16000
     assert_eq!(cfg.proxies[0].name, "single_0");
     assert_eq!(cfg.proxies[0].local_port, 6000);
     assert_eq!(cfg.proxies[0].remote_port, 16000);
+}
+
+/// Go legacy INI server keys: authentication_method -> [auth].method (the
+/// BLOCKER from the audit — OIDC silently fell back to token), server-side
+/// authenticate_* -> additional_auth_scopes, top-level tcp_keepalive and
+/// quic_* -> [transport], and [plugin.xxx] sections -> http_plugins.
+#[test]
+fn test_legacy_ini_server_gaps_round2() {
+    let cfg: ServerConfig = load_server_ini(
+        r#"bind_port = 7000
+authentication_method = oidc
+authenticate_heartbeats = true
+authenticate_new_work_conns = true
+tcp_keepalive = 7200
+quic_keepalive_period = 15
+quic_max_idle_timeout = 45
+quic_max_incoming_streams = 200
+
+[plugin.http_proxy]
+addr = "127.0.0.1:8888"
+path = "/handler"
+ops = ["login"]
+
+[plugin.static_file]
+addr = "http://127.0.0.1:9999"
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.auth.method, "oidc");
+    let scopes = cfg.auth.additional_auth_scopes;
+    assert!(
+        scopes.contains(&"HeartBeats".to_string()),
+        "scopes: {scopes:?}"
+    );
+    assert!(
+        scopes.contains(&"NewWorkConns".to_string()),
+        "scopes: {scopes:?}"
+    );
+    assert_eq!(cfg.transport.tcp_keepalive, 7200);
+    let quic = cfg.transport.quic_options.as_ref().expect("quic options");
+    assert_eq!(quic.keepalive_period, 15);
+    assert_eq!(quic.max_idle_timeout, 45);
+    assert_eq!(quic.max_incoming_streams, 200);
+    assert_eq!(cfg.http_plugins.len(), 2);
+    let hp = cfg
+        .http_plugins
+        .iter()
+        .find(|p| p.name == "http_proxy")
+        .unwrap();
+    assert_eq!(hp.addr, "127.0.0.1:8888");
+    assert_eq!(hp.path, "/handler");
+    assert_eq!(hp.ops, vec!["login"]);
+    let sf = cfg
+        .http_plugins
+        .iter()
+        .find(|p| p.name == "static_file")
+        .unwrap();
+    assert_eq!(sf.addr, "http://127.0.0.1:9999");
+}
+
+/// The `authentication_method` serde alias also works on the canonical
+/// [auth] section (defense in depth beyond the normalize mapping).
+#[test]
+fn test_auth_method_alias_authentication_method() {
+    let cfg: ServerConfig = load_server_config_from_str(
+        r#"bind_port = 7000
+[auth]
+authentication_method = "oidc"
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.auth.method, "oidc");
+}
+
+/// Client-side legacy INI authentication_method (mirror of the server fix):
+/// frpc.ini [common] authentication_method = oidc must not silently fall
+/// back to token.
+#[test]
+fn test_legacy_ini_client_authentication_method() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+authentication_method = oidc
+oidc_client_id = "frpc-test"
+oidc_issuer = "https://idp.example"
+oidc_token_endpoint_url = "https://idp.example/token"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.auth.as_ref().map(|a| a.method.as_str()).unwrap_or(""),
+        "oidc"
+    );
+
+    // Canonical [auth] section alias too.
+    let cfg2: ClientConfig = load_client_config_from_str(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+[auth]
+authentication_method = "oidc"
+[auth.oidc]
+clientID = "frpc-test"
+issuer = "https://idp.example"
+tokenEndpointUrl = "https://idp.example/token"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg2.auth.as_ref().map(|a| a.method.as_str()).unwrap_or(""),
+        "oidc"
+    );
+}
+
+/// ini_to_toml empty array literal: ops = [] -> [] (not [""]).
+#[test]
+fn test_ini_empty_array_literal() {
+    let cfg: ServerConfig = load_server_ini(
+        r#"bind_port = 7000
+[plugin.empty]
+addr = "127.0.0.1:9000"
+ops = []
+"#,
+    )
+    .unwrap();
+    let p = cfg.http_plugins.iter().find(|p| p.name == "empty").unwrap();
+    assert!(p.ops.is_empty(), "ops: {:?}", p.ops);
+}
+
+/// Strict mode accepts the audit-added legacy keys inside [auth]
+/// (authentication_method, oidc_skip_*_check snake_case, camelCase
+/// oidcSkip*Check) — exercised through the REAL strict path (file load with
+/// strict_config=true -> run_strict_check), plus a negative assertion that an
+/// unknown [auth] key is still rejected.
+#[test]
+fn test_strict_auth_accepts_legacy_keys() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"bind_port = 7000
+[auth]
+authentication_method = "oidc"
+oidc_skip_expiry_check = true
+oidc_skip_issuer_check = true
+"#,
+    )
+    .unwrap();
+    let cfg: ServerConfig =
+        super::file::load_server_config(f.path().to_str().unwrap(), true).unwrap();
+    assert_eq!(cfg.auth.method, "oidc");
+    assert!(cfg.auth.oidc_skip_expiry);
+    assert!(cfg.auth.oidc_skip_issuer);
+
+    // camelCase variants are whitelisted too (serde aliases oidcSkip*Check).
+    let mut cc = tempfile::NamedTempFile::new().unwrap();
+    cc.write_all(
+        br#"bind_port = 7000
+[auth]
+oidcSkipExpiryCheck = true
+oidcSkipIssuerCheck = true
+"#,
+    )
+    .unwrap();
+    let cfg_cc: ServerConfig =
+        super::file::load_server_config(cc.path().to_str().unwrap(), true).unwrap();
+    assert!(cfg_cc.auth.oidc_skip_expiry);
+    assert!(cfg_cc.auth.oidc_skip_issuer);
+
+    // Negative: an unknown [auth] key still fails strict.
+    let mut bad = tempfile::NamedTempFile::new().unwrap();
+    bad.write_all(
+        br#"bind_port = 7000
+[auth]
+method = "token"
+not_a_real_auth_key = 1
+"#,
+    )
+    .unwrap();
+    let err = super::file::load_server_config(bad.path().to_str().unwrap(), true).unwrap_err();
+    assert!(
+        format!("{err}").contains("not_a_real_auth_key"),
+        "err: {err}"
+    );
+}
+
+/// Go legacy INI top-level oidc_skip_expiry_check / oidc_skip_issuer_check
+/// fold into [auth] (the serde alias only covers the [auth] section form).
+#[test]
+fn test_legacy_ini_top_level_oidc_skip_check_keys() {
+    let cfg: ServerConfig = load_server_ini(
+        r#"bind_port = 7000
+oidc_skip_expiry_check = true
+oidc_skip_issuer_check = true
+"#,
+    )
+    .unwrap();
+    assert!(cfg.auth.oidc_skip_expiry);
+    assert!(cfg.auth.oidc_skip_issuer);
+}
+
+/// [auth] token_source (frp-rs native snake_case) is whitelisted in strict
+/// mode alongside the Go camelCase tokenSource.
+#[test]
+fn test_strict_auth_accepts_token_source_snake_case() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"bind_port = 7000
+[auth]
+method = "token"
+[auth.token_source]
+type = "file"
+file.path = "/tmp/frp-token"
+"#,
+    )
+    .unwrap();
+    let cfg: ServerConfig =
+        super::file::load_server_config(f.path().to_str().unwrap(), true).unwrap();
+    assert!(cfg.auth.token_source.is_some());
 }

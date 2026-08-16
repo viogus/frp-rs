@@ -444,7 +444,9 @@ pub struct NatHoleVisitor {
 /// Go frp v0.69.1 compat.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PortsRange {
+    #[serde(default)]
     pub from: i32,
+    #[serde(default)]
     pub to: i32,
 }
 

@@ -382,6 +382,60 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             }
         }
 
+        // Go legacy INI uses `authentication_method` (not `auth_method`) —
+        // map it into [auth].method before the auth flatten pass so OIDC
+        // auth does not silently fall back to token.
+        if let Some(v) = table.remove("authentication_method") {
+            let auth_table = table
+                .entry("auth".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(auth) = auth_table {
+                auth.entry("method".to_string()).or_insert(v);
+            }
+        }
+
+        // Go legacy INI server keys authenticate_heartbeats /
+        // authenticate_new_work_conns -> [auth] additional_auth_scopes
+        // (Go conversion.go AdditionalScopes). Client-side equivalents live
+        // in normalize_client_config.
+        let mut extra_scopes: Vec<String> = Vec::new();
+        if table
+            .remove("authenticate_heartbeats")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            extra_scopes.push("HeartBeats".to_string());
+        }
+        if table
+            .remove("authenticate_new_work_conns")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            extra_scopes.push("NewWorkConns".to_string());
+        }
+        if !extra_scopes.is_empty() {
+            let auth_table = table
+                .entry("auth".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(auth) = auth_table {
+                let mut scopes: Vec<String> = auth
+                    .get("additional_auth_scopes")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                scopes.extend(extra_scopes);
+                auth.insert(
+                    "additional_auth_scopes".to_string(),
+                    Value::Array(scopes.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+
         // Go legacy INI keys: top-level dashboard_* -> [web_server] (Go
         // pkg/config/legacy conversion.go DashboardAddr/Port/User/Pwd/...).
         // Runs AFTER the [common] merge so keys from [common] migrate too.
@@ -461,9 +515,15 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 "oidc_issuer",
                 "oidc_audience",
                 "oidc_token_endpoint",
+                "oidc_token_endpoint_url",
+                "oidc_skip_expiry_check",
+                "oidc_skip_issuer_check",
             ],
             "auth",
-            &["auth_", "oidc_"],
+            // Only `auth_` is stripped: the serde fields are oidc_* (they keep
+            // their prefix), so stripping "oidc_" produced auth.client_id /
+            // auth.issuer which no field matches — silently dropped.
+            &["auth_"],
         );
         flatten_to_table(
             table,
@@ -535,10 +595,94 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 "max_pool_count",
                 "heartbeatTimeout",
                 "maxPoolCount",
+                "tcp_keepalive",
+                "tcpKeepalive",
             ],
             "transport",
             &[],
         );
+
+        // Go legacy INI server [plugin.xxx] sections -> [http_plugins] array
+        // (Go legacy/server.go loadHTTPPluginOpt).
+        let plugin_sections: Vec<String> = table
+            .keys()
+            .filter(|k| k.starts_with("plugin."))
+            .cloned()
+            .collect();
+        if !plugin_sections.is_empty() {
+            let mut plugins: Vec<toml::Value> = Vec::new();
+            for name in plugin_sections {
+                let Value::Table(mut st) = table.remove(&name).unwrap() else {
+                    continue;
+                };
+                st.insert(
+                    "name".to_string(),
+                    Value::String(name.trim_start_matches("plugin.").to_string()),
+                );
+                plugins.push(Value::Table(st));
+            }
+            let arr = table
+                .entry("http_plugins".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            match arr {
+                Value::Array(a) => a.extend(plugins),
+                other => {
+                    tracing::warn!(
+                        "legacy INI [plugin.xxx]: existing 'http_plugins' is not an array                          ({:?}); plugin sections skipped",
+                        other
+                    );
+                }
+            }
+        }
+
+        // Go legacy INI top-level quic_* keys -> [transport.quic]
+        // (Go legacy server.go QUICKeepalivePeriod/QUICMaxIdleTimeout/
+        // QUICMaxIncomingStreams). Runs after the transport fold above.
+        let quic_keys: Vec<String> = table
+            .keys()
+            .filter(|k| k.starts_with("quic_"))
+            .cloned()
+            .collect();
+        if !quic_keys.is_empty() {
+            // Detach the values first so the [transport.quic] borrow below
+            // does not overlap a table.remove().
+            let mut folded: Vec<(String, toml::Value)> = Vec::new();
+            let mut kept: Vec<(String, toml::Value)> = Vec::new();
+            for k in quic_keys {
+                let Some(v) = table.remove(&k) else { continue };
+                // Only the three documented legacy keys are folded; unknown
+                // quic_* keys stay top-level so strict mode reports them
+                // clearly instead of hiding them.
+                let flat_key = match k.as_str() {
+                    "quic_keepalive_period" => Some("keepalive_period"),
+                    "quic_max_idle_timeout" => Some("max_idle_timeout"),
+                    "quic_max_incoming_streams" => Some("max_incoming_streams"),
+                    _ => None,
+                };
+                match flat_key {
+                    Some(fk) => folded.push((fk.to_string(), v)),
+                    None => kept.push((k, v)),
+                }
+            }
+            if !folded.is_empty() {
+                let tr = table
+                    .entry("transport".to_string())
+                    .or_insert_with(|| Value::Table(Default::default()));
+                if let Value::Table(transport) = tr {
+                    let quic = transport
+                        .entry("quic".to_string())
+                        .or_insert_with(|| Value::Table(Default::default()));
+                    if let Value::Table(q) = quic {
+                        for (k, v) in folded {
+                            q.entry(k).or_insert(v);
+                        }
+                    }
+                }
+            }
+            for (k, v) in kept {
+                table.insert(k, v);
+            }
+        }
 
         // Normalize canonical Go frp camelCase keys inside [transport] to
         // snake_case so serde aliases and presence tracking see one shape.
@@ -662,6 +806,17 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
                 ("pprof_enable", "pprof_enable"),
             ],
         );
+
+        // Go legacy INI uses `authentication_method` (not `auth_method`) —
+        // map it into [auth].method (mirrors the server-side fix).
+        if let Some(v) = table.remove("authentication_method") {
+            let auth_table = table
+                .entry("auth".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(auth) = auth_table {
+                auth.entry("method".to_string()).or_insert(v);
+            }
+        }
 
         // Go legacy INI: authenticate_heartbeats / authenticate_new_work_conns
         // -> [auth] additional_scopes (Go conversion.go AdditionalScopes).
@@ -788,13 +943,15 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
                 "oidc_issuer",
                 "oidc_audience",
                 "oidc_token_endpoint",
+                "oidc_token_endpoint_url",
                 "oidc_client_id",
                 "oidc_client_secret",
                 "oidc_scope",
                 "oidc_proxy_url",
             ],
             "auth",
-            &["auth_", "oidc_"],
+            // Only `auth_` is stripped (oidc_* fields keep their prefix).
+            &["auth_"],
         );
 
         // Also copy token from [auth] to top-level for backward compat
