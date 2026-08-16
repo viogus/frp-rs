@@ -49,7 +49,12 @@ fn default_health_check_interval_seconds() -> u64 {
 /// Mirrors Go frp v0.69.1 AuthClientConfig.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthClientConfig {
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "authentication_method",
+        alias = "auth_method",
+        alias = "authMethod"
+    )]
     pub method: String,
     #[serde(default)]
     pub token: String,

@@ -515,9 +515,13 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 "oidc_issuer",
                 "oidc_audience",
                 "oidc_token_endpoint",
+                "oidc_token_endpoint_url",
             ],
             "auth",
-            &["auth_", "oidc_"],
+            // Only `auth_` is stripped: the serde fields are oidc_* (they keep
+            // their prefix), so stripping "oidc_" produced auth.client_id /
+            // auth.issuer which no field matches — silently dropped.
+            &["auth_"],
         );
         flatten_to_table(
             table,
@@ -618,8 +622,14 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             let arr = table
                 .entry("http_plugins".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()));
-            if let Value::Array(a) = arr {
-                a.extend(plugins);
+            match arr {
+                Value::Array(a) => a.extend(plugins),
+                other => {
+                    tracing::warn!(
+                        "legacy INI [plugin.xxx]: existing 'http_plugins' is not an array                          ({:?}); plugin sections skipped",
+                        other
+                    );
+                }
             }
         }
 
@@ -634,28 +644,41 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
         if !quic_keys.is_empty() {
             // Detach the values first so the [transport.quic] borrow below
             // does not overlap a table.remove().
-            let quic_items: Vec<(String, toml::Value)> = quic_keys
-                .iter()
-                .filter_map(|k| table.remove(k).map(|v| (k.clone(), v)))
-                .collect();
-            let tr = table
-                .entry("transport".to_string())
-                .or_insert_with(|| Value::Table(Default::default()));
-            if let Value::Table(transport) = tr {
-                let quic = transport
-                    .entry("quic".to_string())
+            let mut folded: Vec<(String, toml::Value)> = Vec::new();
+            let mut kept: Vec<(String, toml::Value)> = Vec::new();
+            for k in quic_keys {
+                let Some(v) = table.remove(&k) else { continue };
+                // Only the three documented legacy keys are folded; unknown
+                // quic_* keys stay top-level so strict mode reports them
+                // clearly instead of hiding them.
+                let flat_key = match k.as_str() {
+                    "quic_keepalive_period" => Some("keepalive_period"),
+                    "quic_max_idle_timeout" => Some("max_idle_timeout"),
+                    "quic_max_incoming_streams" => Some("max_incoming_streams"),
+                    _ => None,
+                };
+                match flat_key {
+                    Some(fk) => folded.push((fk.to_string(), v)),
+                    None => kept.push((k, v)),
+                }
+            }
+            if !folded.is_empty() {
+                let tr = table
+                    .entry("transport".to_string())
                     .or_insert_with(|| Value::Table(Default::default()));
-                if let Value::Table(q) = quic {
-                    for (k, v) in quic_items {
-                        let flat_key = match k.as_str() {
-                            "quic_keepalive_period" => "keepalive_period",
-                            "quic_max_idle_timeout" => "max_idle_timeout",
-                            "quic_max_incoming_streams" => "max_incoming_streams",
-                            other => other,
-                        };
-                        q.entry(flat_key.to_string()).or_insert(v);
+                if let Value::Table(transport) = tr {
+                    let quic = transport
+                        .entry("quic".to_string())
+                        .or_insert_with(|| Value::Table(Default::default()));
+                    if let Value::Table(q) = quic {
+                        for (k, v) in folded {
+                            q.entry(k).or_insert(v);
+                        }
                     }
                 }
+            }
+            for (k, v) in kept {
+                table.insert(k, v);
             }
         }
 
@@ -782,6 +805,17 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
             ],
         );
 
+        // Go legacy INI uses `authentication_method` (not `auth_method`) —
+        // map it into [auth].method (mirrors the server-side fix).
+        if let Some(v) = table.remove("authentication_method") {
+            let auth_table = table
+                .entry("auth".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(auth) = auth_table {
+                auth.entry("method".to_string()).or_insert(v);
+            }
+        }
+
         // Go legacy INI: authenticate_heartbeats / authenticate_new_work_conns
         // -> [auth] additional_scopes (Go conversion.go AdditionalScopes).
         let mut extra_scopes: Vec<String> = Vec::new();
@@ -907,13 +941,15 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
                 "oidc_issuer",
                 "oidc_audience",
                 "oidc_token_endpoint",
+                "oidc_token_endpoint_url",
                 "oidc_client_id",
                 "oidc_client_secret",
                 "oidc_scope",
                 "oidc_proxy_url",
             ],
             "auth",
-            &["auth_", "oidc_"],
+            // Only `auth_` is stripped (oidc_* fields keep their prefix).
+            &["auth_"],
         );
 
         // Also copy token from [auth] to top-level for backward compat

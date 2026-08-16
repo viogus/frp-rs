@@ -48,6 +48,7 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         // Go compat normalization aliases
         "common",
         "auth_method",
+        "authentication_method",
         "auth_token",
         "token",
         "oidc_issuer",
@@ -173,6 +174,7 @@ pub(super) fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "tlsServerName",
         // Client-side auth flat field normalization aliases
         "auth_method",
+        "authentication_method",
         "auth_token",
         "oidc_client_id",
         "oidc_client_secret",

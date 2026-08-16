@@ -3755,3 +3755,57 @@ authentication_method = "oidc"
     .unwrap();
     assert_eq!(cfg.auth.method, "oidc");
 }
+
+/// Client-side legacy INI authentication_method (mirror of the server fix):
+/// frpc.ini [common] authentication_method = oidc must not silently fall
+/// back to token.
+#[test]
+fn test_legacy_ini_client_authentication_method() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+authentication_method = oidc
+oidc_client_id = "frpc-test"
+oidc_issuer = "https://idp.example"
+oidc_token_endpoint_url = "https://idp.example/token"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.auth.as_ref().map(|a| a.method.as_str()).unwrap_or(""),
+        "oidc"
+    );
+
+    // Canonical [auth] section alias too.
+    let cfg2: ClientConfig = load_client_config_from_str(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+[auth]
+authentication_method = "oidc"
+[auth.oidc]
+clientID = "frpc-test"
+issuer = "https://idp.example"
+tokenEndpointUrl = "https://idp.example/token"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg2.auth.as_ref().map(|a| a.method.as_str()).unwrap_or(""),
+        "oidc"
+    );
+}
+
+/// ini_to_toml empty array literal: ops = [] -> [] (not [""]).
+#[test]
+fn test_ini_empty_array_literal() {
+    let cfg: ServerConfig = load_server_ini(
+        r#"bind_port = 7000
+[plugin.empty]
+addr = "127.0.0.1:9000"
+ops = []
+"#,
+    )
+    .unwrap();
+    let p = cfg.http_plugins.iter().find(|p| p.name == "empty").unwrap();
+    assert!(p.ops.is_empty(), "ops: {:?}", p.ops);
+}
