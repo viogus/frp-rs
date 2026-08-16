@@ -46,6 +46,15 @@ All notable changes to frp-rs.
   encodings keep the zero-copy byte-stream relay. Previously a V2 provider
   misparsed the V1 visitor's frames ("unexpected V2 frame type"), breaking
   the tunnel.
+- **HTTP/HTTPS group load balancing** (Go frp v0.71.0
+  `HTTPGroupController` parity): http/https proxies sharing the same
+  `group`/`groupKey` and domain now register one shared vhost route and
+  dispatch requests round-robin across the members (previously the second
+  member was rejected with a vhost route conflict). groupKey mismatches
+  and routing-param mismatches are rejected (Go `ErrGroupAuthFailed` /
+  `ErrGroupParamsInvalid`). Members may live on different frpc controls.
+  TCP-group load balancing is unaffected (its group LB is restricted to
+  tcp proxies — http groups are selected by the vhost router).
 
 ### Compatibility
 - `compat-test.sh` now targets the **Go frp v0.71.0** pre-built binaries by

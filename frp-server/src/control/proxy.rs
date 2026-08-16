@@ -79,6 +79,13 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     let is_tcp_group = info.as_ref().is_some_and(|i| {
         i.proxy_type == "tcp" && i.group.as_deref().filter(|g| !g.is_empty()).is_some()
     });
+    // HTTP/HTTPS group member (Go frp v0.71.0 HTTPGroup): shares one vhost
+    // route with the other members — close removes it from the group and
+    // only drops the route when the group empties.
+    let is_http_group_member = info.as_ref().is_some_and(|i| {
+        (i.proxy_type == "http" || i.proxy_type == "https")
+            && i.group.as_deref().filter(|g| !g.is_empty()).is_some()
+    });
     let group_name = info
         .as_ref()
         .and_then(|i| i.group.clone())
@@ -121,8 +128,23 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         if let Some(key) = info.sk_index_key() {
             ctx.state.xtcp.sk_index.write().await.remove(key);
         }
-        // Clean up VHost routes
-        ctx.state.vhost_manager.unregister(&cp.proxy_name).await;
+        // Clean up VHost routes — HTTP/HTTPS group members share one route:
+        // remove the member from the group first; only drop the shared
+        // route when the group becomes empty (Go HTTPGroup.UnRegister).
+        if is_http_group_member {
+            let fresh = ctx.state.proxy_manager.get(&cp.proxy_name).await;
+            let gname = fresh.and_then(|i| i.group.clone()).unwrap_or_default();
+            let empty = ctx
+                .state
+                .http_group_ctl
+                .unregister_member(&gname, &cp.proxy_name)
+                .await;
+            if empty {
+                ctx.state.vhost_manager.unregister(&cp.proxy_name).await;
+            }
+        } else {
+            ctx.state.vhost_manager.unregister(&cp.proxy_name).await;
+        }
         ctx.state.proxy_metrics.remove(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
         {

@@ -563,8 +563,16 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             // settles (pre-existing livelock fix). Route directly.
             (proxy_name.clone(), ctx.run_id.clone(), p)
         } else {
+            // Group LB applies ONLY to TCP groups (shared listener
+            // dispatch). HTTP/HTTPS group members are selected by the vhost
+            // router (Go HTTPGroup.chooseEndpoint) before the conn reaches
+            // here — the incoming proxy_name already IS the chosen member,
+            // so re-running selection would bounce the conn between
+            // members (and the vhost route stays on the first member's
+            // control, which is not necessarily the selected member's).
             let group = p
                 .as_ref()
+                .filter(|p| p.proxy_type == "tcp")
                 .and_then(|p| p.group.clone())
                 .filter(|g| !g.is_empty());
             let group_key = p

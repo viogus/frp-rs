@@ -2098,6 +2098,128 @@ TOML
 }
 
 # =============================================================================
+# Test: Go frpc HTTP group (loadBalancer.group) -> Rust frps
+# Two Go http proxies share one vhost route; the server dispatches requests
+# round-robin across the group members (Go frp v0.71.0 HTTPGroupController).
+# =============================================================================
+test_g2r_http_group() {
+    local name="go-to-rust-http-group"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_port=$(random_port)
+    local echo1_port=$(random_port)
+    local echo2_port=$(random_port)
+    local token="test-token-g2r-http-group"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Two HTTP echo servers with distinct body prefixes (to tell members apart)
+    start_http_echo_server "$echo1_port" "grpA:"
+    start_http_echo_server "$echo2_port" "grpB:"
+    wait_for_port 127.0.0.1 "$echo1_port" 3 || {
+        fail_test "$name" "echo1 did not start"
+        return
+    }
+    wait_for_port 127.0.0.1 "$echo2_port" 3 || {
+        fail_test "$name" "echo2 did not start"
+        return
+    }
+
+    # Start Rust frps with VHost HTTP port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+vhost_http_port = $vhost_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$vhost_port" 5 || {
+        fail_test "$name" "VHost HTTP port $vhost_port not reachable"
+        return
+    }
+
+    # Start Go frpc with two HTTP proxies in one group
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "grp-http-1"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo1_port
+customDomains = ["grp.example.com"]
+loadBalancer.group = "httpgrp"
+loadBalancer.groupKey = "grp-key"
+
+[[proxies]]
+name = "grp-http-2"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo2_port
+customDomains = ["grp.example.com"]
+loadBalancer.group = "httpgrp"
+loadBalancer.groupKey = "grp-key"
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 3
+
+    # Send 6 requests; round-robin must serve BOTH members (grpA:/grpB:).
+    local saw_a=0 saw_b=0
+    local i
+    for i in 1 2 3 4 5 6; do
+        local resp
+        resp=$(SE_VHOST="$vhost_port" SE_HOST="grp.example.com" SE_TO="5" python3 -c '
+import os, socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(float(os.environ["SE_TO"]))
+s.connect(("127.0.0.1", int(os.environ["SE_VHOST"])))
+s.sendall(b"POST /test HTTP/1.1\r\nHost: " + os.environ["SE_HOST"].encode() + b"\r\nContent-Length: 5\r\n\r\nhello")
+data = s.recv(4096)
+s.close()
+if b"grpA:hello" in data:
+    print("A")
+elif b"grpB:hello" in data:
+    print("B")
+else:
+    print("FAIL:" + repr(data[:120]))
+' 2>&1)
+        case "$resp" in
+            A) saw_a=1 ;;
+            B) saw_b=1 ;;
+            *) fail_test "$name" "unexpected response on request $i: $resp"; return ;;
+        esac
+    done
+    if [[ "$saw_a" == "1" && "$saw_b" == "1" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "round-robin did not hit both members (A=$saw_a B=$saw_b)"
+    fi
+}
+
+# =============================================================================
 # Test: Rust frpc -> Go frps, HTTP proxy (VHost)
 # =============================================================================
 test_r2g_http() {
@@ -5122,6 +5244,7 @@ run_test test_r2g_udp_encrypted
 run_test test_g2r_sudp
 run_test test_g2r_sudp_encrypted
 run_test test_g2r_http
+run_test test_g2r_http_group
 run_test test_r2g_http
 run_test test_g2r_https
 run_test test_r2g_https

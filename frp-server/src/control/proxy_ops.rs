@@ -733,6 +733,112 @@ async fn register_http_vhost(
     let rubu = np.route_by_http_user.as_deref().unwrap_or("");
     let headers: Vec<(String, String)> =
         np.headers.clone().unwrap_or_default().into_iter().collect();
+
+    // HTTP group (Go frp v0.71.0 HTTPGroupController): members share one
+    // vhost route (domain+location+routeByHTTPUser) with round-robin
+    // dispatch. The first member creates the group and registers the shared
+    // route; subsequent members join after group_key/params validation.
+    let group_name = np.group.as_deref().unwrap_or("");
+    if !group_name.is_empty() {
+        // Go frp default: an empty location list means catch-all path "".
+        // The group route requires exactly one (domain, location) pair.
+        if locations.is_empty() {
+            locations.push(String::new());
+        }
+        if domains.len() != 1 || locations.len() != 1 {
+            rollback_vhost_conflict(state, run_id, port, false).await;
+            state.proxy_manager.remove(&np.proxy_name).await;
+            reject_new_proxy(
+                writer,
+                &np.proxy_name,
+                err_msg(
+                    state.detailed_errors_to_client,
+                    "http group proxies must configure exactly one custom_domain and one location (Go frp HTTPGroup semantics)".into(),
+                    "http group params invalid",
+                ),
+                v2,
+            )
+            .await;
+            return false;
+        }
+        let domain = &domains[0];
+        let location = &locations[0];
+        match state
+            .http_group_ctl
+            .register_member(
+                group_name,
+                np.group_key.as_deref().unwrap_or(""),
+                domain,
+                location,
+                rubu,
+                &np.proxy_name,
+            )
+            .await
+        {
+            Ok((_group, is_first)) => {
+                // Only the first member registers the shared vhost route
+                // (tagged with the group name); later members just joined
+                // the group's member list.
+                if is_first {
+                    if let Err(conflict) = state
+                        .vhost_manager
+                        .register(
+                            &np.proxy_name,
+                            &domains,
+                            &locations,
+                            run_id,
+                            hhr,
+                            http_user,
+                            http_pwd,
+                            rubu,
+                            &headers,
+                            group_name,
+                        )
+                        .await
+                    {
+                        state
+                            .http_group_ctl
+                            .unregister_member(group_name, &np.proxy_name)
+                            .await;
+                        rollback_vhost_conflict(state, run_id, port, false).await;
+                        state.proxy_manager.remove(&np.proxy_name).await;
+                        reject_new_proxy(
+                            writer,
+                            &np.proxy_name,
+                            err_msg(
+                                state.detailed_errors_to_client,
+                                conflict.to_string(),
+                                "vhost route config conflict",
+                            ),
+                            v2,
+                        )
+                        .await;
+                        return false;
+                    }
+                }
+            }
+            Err(e) => {
+                rollback_vhost_conflict(state, run_id, port, false).await;
+                state.proxy_manager.remove(&np.proxy_name).await;
+                reject_new_proxy(
+                    writer,
+                    &np.proxy_name,
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        e,
+                        "http group registration failed",
+                    ),
+                    v2,
+                )
+                .await;
+                return false;
+            }
+        }
+        info!(proxy_name = %np.proxy_name, group = %group_name, domain = %domains[0], location = %locations[0], rubu = %rubu,
+            "HTTP proxy '{}' registered in group '{}' (route {} {})", np.proxy_name, group_name, domains[0], locations[0]);
+        return true;
+    }
+
     if let Err(conflict) = state
         .vhost_manager
         .register(
@@ -745,6 +851,7 @@ async fn register_http_vhost(
             http_pwd,
             rubu,
             &headers,
+            "",
         )
         .await
     {
@@ -810,6 +917,100 @@ async fn register_https_vhost(
     let rubu = np.route_by_http_user.as_deref().unwrap_or("");
     let headers: Vec<(String, String)> =
         np.headers.clone().unwrap_or_default().into_iter().collect();
+
+    // HTTPS group (Go frp v0.71.0 HTTPGroupController, SNI routing).
+    let group_name = np.group.as_deref().unwrap_or("");
+    if !group_name.is_empty() {
+        if domains.len() != 1 {
+            rollback_vhost_conflict(state, run_id, port, false).await;
+            state.proxy_manager.remove(&np.proxy_name).await;
+            reject_new_proxy(
+                writer,
+                &np.proxy_name,
+                err_msg(
+                    state.detailed_errors_to_client,
+                    "https group proxies must configure exactly one custom_domain (Go frp HTTPGroup semantics)".into(),
+                    "https group params invalid",
+                ),
+                v2,
+            )
+            .await;
+            return false;
+        }
+        let domain = &domains[0];
+        match state
+            .http_group_ctl
+            .register_member(
+                group_name,
+                np.group_key.as_deref().unwrap_or(""),
+                domain,
+                "",
+                rubu,
+                &np.proxy_name,
+            )
+            .await
+        {
+            Ok((_group, is_first)) => {
+                if is_first {
+                    if let Err(conflict) = state
+                        .vhost_manager
+                        .register(
+                            &np.proxy_name,
+                            &domains,
+                            &[], // no locations for HTTPS SNI routing
+                            run_id,
+                            hhr,
+                            http_user,
+                            http_pwd,
+                            rubu,
+                            &headers,
+                            group_name,
+                        )
+                        .await
+                    {
+                        state
+                            .http_group_ctl
+                            .unregister_member(group_name, &np.proxy_name)
+                            .await;
+                        rollback_vhost_conflict(state, run_id, port, false).await;
+                        state.proxy_manager.remove(&np.proxy_name).await;
+                        reject_new_proxy(
+                            writer,
+                            &np.proxy_name,
+                            err_msg(
+                                state.detailed_errors_to_client,
+                                conflict.to_string(),
+                                "vhost route config conflict",
+                            ),
+                            v2,
+                        )
+                        .await;
+                        return false;
+                    }
+                }
+            }
+            Err(e) => {
+                rollback_vhost_conflict(state, run_id, port, false).await;
+                state.proxy_manager.remove(&np.proxy_name).await;
+                reject_new_proxy(
+                    writer,
+                    &np.proxy_name,
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        e,
+                        "https group registration failed",
+                    ),
+                    v2,
+                )
+                .await;
+                return false;
+            }
+        }
+        info!(proxy_name = %np.proxy_name, group = %group_name, domain = %domains[0], rubu = %rubu,
+            "HTTPS proxy '{}' registered in group '{}' (SNI {})", np.proxy_name, group_name, domains[0]);
+        return true;
+    }
+
     if let Err(conflict) = state
         .vhost_manager
         .register(
@@ -822,6 +1023,7 @@ async fn register_https_vhost(
             http_pwd,
             rubu,
             &headers,
+            "",
         )
         .await
     {
@@ -1937,7 +2139,20 @@ pub(crate) async fn unregister_control(
         {
             continue;
         }
-        state.vhost_manager.unregister(&p.name).await;
+        // HTTP/HTTPS group members share one vhost route: remove from the
+        // group first; only drop the route when the group empties (Go
+        // HTTPGroup.UnRegister). Non-group proxies drop their own route.
+        let is_http_group = (p.proxy_type == "http" || p.proxy_type == "https")
+            && p.group.as_deref().filter(|g| !g.is_empty()).is_some();
+        if is_http_group {
+            let gname = p.group.as_deref().unwrap_or_default();
+            let empty = state.http_group_ctl.unregister_member(gname, &p.name).await;
+            if empty {
+                state.vhost_manager.unregister(&p.name).await;
+            }
+        } else {
+            state.vhost_manager.unregister(&p.name).await;
+        }
         state.tcpmux_manager.unregister(&p.name).await;
         state.proxy_metrics.remove(&p.name).await;
     }
