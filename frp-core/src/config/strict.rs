@@ -256,6 +256,7 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
             "method",
             "token",
             "tokenSource",
+            "token_source",
             "authentication_method",
             "auth_method",
             "authMethod",

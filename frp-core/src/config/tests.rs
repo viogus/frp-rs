@@ -3879,3 +3879,23 @@ oidc_skip_issuer_check = true
     assert!(cfg.auth.oidc_skip_expiry);
     assert!(cfg.auth.oidc_skip_issuer);
 }
+
+/// [auth] token_source (frp-rs native snake_case) is whitelisted in strict
+/// mode alongside the Go camelCase tokenSource.
+#[test]
+fn test_strict_auth_accepts_token_source_snake_case() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"bind_port = 7000
+[auth]
+method = "token"
+[auth.token_source]
+type = "file"
+file.path = "/tmp/frp-token"
+"#,
+    )
+    .unwrap();
+    let cfg: ServerConfig =
+        super::file::load_server_config(f.path().to_str().unwrap(), true).unwrap();
+    assert!(cfg.auth.token_source.is_some());
+}
