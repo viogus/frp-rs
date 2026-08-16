@@ -3811,12 +3811,15 @@ ops = []
 }
 
 /// Strict mode accepts the audit-added legacy keys inside [auth]
-/// (authentication_method, oidc_skip_*_check snake_case) — these were only
-/// whitelisted at top level before, so strict rejected them.
+/// (authentication_method, oidc_skip_*_check snake_case, camelCase
+/// oidcSkip*Check) — exercised through the REAL strict path (file load with
+/// strict_config=true -> run_strict_check), plus a negative assertion that an
+/// unknown [auth] key is still rejected.
 #[test]
 fn test_strict_auth_accepts_legacy_keys() {
-    let cfg: ServerConfig = load_server_config_from_str(
-        r#"bind_port = 7000
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"bind_port = 7000
 [auth]
 authentication_method = "oidc"
 oidc_skip_expiry_check = true
@@ -3824,9 +3827,42 @@ oidc_skip_issuer_check = true
 "#,
     )
     .unwrap();
+    let cfg: ServerConfig =
+        super::file::load_server_config(f.path().to_str().unwrap(), true).unwrap();
     assert_eq!(cfg.auth.method, "oidc");
     assert!(cfg.auth.oidc_skip_expiry);
     assert!(cfg.auth.oidc_skip_issuer);
+
+    // camelCase variants are whitelisted too (serde aliases oidcSkip*Check).
+    let mut cc = tempfile::NamedTempFile::new().unwrap();
+    cc.write_all(
+        br#"bind_port = 7000
+[auth]
+oidcSkipExpiryCheck = true
+oidcSkipIssuerCheck = true
+"#,
+    )
+    .unwrap();
+    let cfg_cc: ServerConfig =
+        super::file::load_server_config(cc.path().to_str().unwrap(), true).unwrap();
+    assert!(cfg_cc.auth.oidc_skip_expiry);
+    assert!(cfg_cc.auth.oidc_skip_issuer);
+
+    // Negative: an unknown [auth] key still fails strict.
+    let mut bad = tempfile::NamedTempFile::new().unwrap();
+    bad.write_all(
+        br#"bind_port = 7000
+[auth]
+method = "token"
+not_a_real_auth_key = 1
+"#,
+    )
+    .unwrap();
+    let err = super::file::load_server_config(bad.path().to_str().unwrap(), true).unwrap_err();
+    assert!(
+        format!("{err}").contains("not_a_real_auth_key"),
+        "err: {err}"
+    );
 }
 
 /// Go legacy INI top-level oidc_skip_expiry_check / oidc_skip_issuer_check
