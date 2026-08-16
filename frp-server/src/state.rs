@@ -54,6 +54,11 @@ pub enum InternalMsg {
         /// wireProtocol; the SUDP bridge needs it to pick the visitor-side
         /// packet codec (and to detect mixed SUDP packet encodings).
         visitor_v2: bool,
+        /// Visitor-segment UDPPacket codec (`"binary-v1"` or empty),
+        /// determined at accept time (Go frp v0.71.0 `admitVisitorByRunID`:
+        /// V2 visitors inherit their own control session's negotiated codec;
+        /// V1 visitors use JSON).
+        visitor_udp_packet_codec: String,
     },
     ProxyUserConn {
         proxy_name: String,

@@ -439,6 +439,7 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
     visitor_use_encryption: bool,
     visitor_use_compression: bool,
     visitor_v2: bool,
+    visitor_udp_packet_codec: String,
 ) -> Result<(), ()> {
     // NewUserConn plugin hook — control-enabled plugins can reject.
     // Skip payload construction when no plugins are configured (the
@@ -467,17 +468,8 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
         .as_ref()
         .map(|p| (p.use_encryption, p.use_compression))
         .unwrap_or((false, false));
-    // Visitor-segment UDPPacket codec: V2 visitor connections inherit the
-    // provider control's negotiated codec (Go frp v0.71.0
-    // admitVisitorByRunID); V1 visitors always use JSON (empty codec).
-    let visitor_udp_packet_codec = if visitor_v2 {
-        proxy_info
-            .as_ref()
-            .map(|p| p.udp_packet_codec.clone())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // Visitor-segment UDPPacket codec was determined at accept time (Go
+    // frp v0.71.0 admitVisitorByRunID) and carried in the InternalMsg.
     assign_or_queue(
         &mut ctl.work_pool,
         &mut ctl.pending_requests,

@@ -213,6 +213,22 @@ pub(crate) async fn handle_visitor_conn_inner(
         }
     }
 
+    // Visitor-segment UDPPacket codec (Go frp v0.71.0 `admitVisitorByRunID`):
+    // a V2 visitor connection inherits the negotiated codec of the control
+    // session its run_id names — the visitor's own frpc session, which is
+    // also the provider in the single-frpc deployment (Go frpc sends its
+    // controller's run_id in NewVisitorConn; a cross-frpc visitor keeps its
+    // own session's codec, NOT the provider's). V1 visitors always use JSON
+    // (empty codec).
+    let visitor_udp_packet_codec = if v2 {
+        msg.run_id
+            .as_deref()
+            .and_then(|rid| state.run_id_to_ctl_tx.get(rid))
+            .map(|c| c.udp_packet_codec.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // Check for graceful shutdown before proceeding — if the server is shutting
     // down, the control handler may no longer be accepting messages and the
     // visitor connection would be silently dropped. Return an error immediately
@@ -269,6 +285,7 @@ pub(crate) async fn handle_visitor_conn_inner(
                     // visitor-side packet codec (Go frp v0.71.0
                     // RegisterVisitorConn wireProtocol).
                     visitor_v2: v2,
+                    visitor_udp_packet_codec,
                 })
                 .await
                 .is_err()
