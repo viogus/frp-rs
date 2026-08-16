@@ -2,6 +2,45 @@
 
 All notable changes to frp-rs.
 
+## v0.71.0 (2026-08-16)
+
+### Features
+- **UDP packet binary codec (Go frp v0.71.0 parity)**: under wire protocol
+  v2, `UDPPacket` payloads now use a compact binary codec (`binary-v1`,
+  frame type 19) when negotiated via the V2 handshake's `udpPacketCodecs`
+  capability — mirroring Go frp v0.71.0 (`pkg/msg/udp_binary.go`). V1 stays
+  JSON; V2 falls back to JSON `UDPPacket` (type 13) when the peer did not
+  negotiate the capability. Codec lives in `frp-core/src/udp_binary.rs`
+  (IPv4/IPv6+zone addresses, 65507-byte payload cap, strict validation);
+  negotiation in `v2_handshake.rs`; the V2 UDP/SUDP work-conn data planes
+  select the codec per session (`read_msg_v2_with_udp_codec` /
+  `write_msg_v2_with_udp_codec`). Cross-verified both directions against the
+  Go frp v0.71.0 pre-built binary.
+- **Version alignment**: frp-rs now tracks Go frp **v0.71.0** (all crates
+  `0.71.0`, `frp-core::VERSION`, download script default, README/CLAUDE.md).
+- The Rust-only V2 extension message types were renumbered **19/20 → 21/22**
+  to stay clear of Go frp v0.71.0's new `V2TypeUDPPacketBinary` (19).
+
+### Fixes
+- **Negative `pool_count` rejected at login** (Go frp v0.71.0 server DoS
+  fix): a client sending a negative pool_count is now rejected before
+  work-connection pool resources are allocated (previously clamped to 1).
+- **Case-insensitive `customDomains` vs `subDomainHost` check** (Go frp
+  v0.71.0 validation fix): mixed-case domains under the configured
+  subDomainHost can no longer bypass the conflict check.
+- **`run_id` validation at login** (Go frp v0.71.0 `ValidateRunID` parity):
+  client-supplied run ids longer than 64 bytes or with control characters
+  are rejected; a missing run_id still falls back to a generated UUID.
+- **plugin_h2 https2https flaky test**: the test's TLS capture backend now
+  closes with an explicit `tls.shutdown()` instead of dropping the
+  TlsStream (tokio-rustls buffers plaintext on the write side; dropping
+  after `flush()` could leave the peer reading a bare FIN without
+  close_notify, producing ~50% spurious 502s).
+
+### Compatibility
+- `compat-test.sh` now targets the **Go frp v0.71.0** pre-built binaries by
+  default (was 0.70.1); full cross-compat suite green (77 scenarios).
+
 ## v0.70.1 (2026-08-11)
 
 ### Features
