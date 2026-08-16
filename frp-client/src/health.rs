@@ -158,7 +158,12 @@ impl HealthState {
     fn new() -> Self {
         HealthState {
             failures: 0,
-            was_failed: false,
+            // Go frp v0.71.0 proxy_wrapper: a health-checked proxy starts with
+            // health=1 ("failed") and is NOT registered until the FIRST
+            // successful probe flips it healthy. Initial was_failed=true makes
+            // that first success emit a Recover event, which registers the
+            // proxy (mirroring Go's statusOKFn clearing pw.health).
+            was_failed: true,
             was_healthy: false,
         }
     }
@@ -293,6 +298,10 @@ mod tests {
     #[test]
     fn success_tick_after_recovery_emits_recover_but_not_close() {
         let mut st = HealthState::new();
+        // Go v0.71.0: a health-checked proxy starts "failed" (health=1), so
+        // the FIRST success emits Recover and registers the proxy.
+        assert_eq!(st.on_check(true, 2), HealthAction::Recover);
+        st.confirm_recover();
         // Healthy baseline: no events.
         assert_eq!(st.on_check(true, 2), HealthAction::None);
         // Failure 1: below max_failed, no event.
@@ -337,10 +346,14 @@ mod tests {
     #[test]
     fn never_healthy_proxy_is_not_closed() {
         let mut st = HealthState::new();
+        // A never-healthy proxy is never closed (Go frp statusOK gate).
         assert_eq!(st.on_check(false, 1), HealthAction::None);
         assert_eq!(st.on_check(false, 1), HealthAction::None);
         assert_eq!(st.on_check(false, 1), HealthAction::None);
-        // First ever success: nothing to recover from.
+        // First ever success registers the proxy (Recover; Go health=1 → 0).
+        assert_eq!(st.on_check(true, 1), HealthAction::Recover);
+        st.confirm_recover();
+        // Healthy afterwards: no events.
         assert_eq!(st.on_check(true, 1), HealthAction::None);
     }
 }

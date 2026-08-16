@@ -572,6 +572,9 @@ pub(crate) async fn authenticate(
             control_id,
             // Negotiated UDPPacket codec (Go frp v0.71.0 sessionCtx).
             udp_packet_codec: udp_packet_codec.clone(),
+            // Wire protocol of this control (Go v0.71.0 work/visitor conn
+            // wire-protocol enforcement).
+            wire_v2: v2,
         },
     );
 

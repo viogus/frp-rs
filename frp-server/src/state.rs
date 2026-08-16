@@ -173,6 +173,10 @@ pub struct ControlTx {
     /// visitor routing to inherit the provider's packet codec (Go
     /// `admitVisitorByRunID`) and by proxy registration metadata.
     pub udp_packet_codec: String,
+    /// Wire protocol of this control session (true = v2). Go frp v0.71.0
+    /// enforces that work connections and run_id-bearing visitor connections
+    /// use the same wire protocol as the control they reference.
+    pub wire_v2: bool,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -1171,6 +1175,7 @@ mod tests {
                 user: String::new(),
                 control_id: 1,
                 udp_packet_codec: String::new(),
+                wire_v2: false,
             },
         );
         rx

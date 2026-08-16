@@ -23,11 +23,12 @@ pub(crate) fn heartbeat_requires_auth(client_scopes: &[String], server_scopes: &
 pub(crate) fn reconnect_delay_after_session(
     consecutive_err_count: &mut u32,
     fast_retry_timestamps: &mut Vec<Instant>,
+    previous_delay: Duration,
 ) -> Duration {
     *consecutive_err_count += 1;
     fast_retry_timestamps.push(Instant::now());
     let window_count = prune_fast_retry_count(fast_retry_timestamps);
-    fast_backoff_delay(*consecutive_err_count, window_count)
+    fast_backoff_delay(*consecutive_err_count, window_count, previous_delay)
 }
 
 /// Count errors in the 60s fast-retry sliding window, pruning expired timestamps.
@@ -72,6 +73,7 @@ pub(crate) fn prune_fast_retry_count(timestamps: &mut Vec<Instant>) -> u32 {
 pub(crate) fn fast_backoff_delay(
     consecutive_err_count: u32,
     counts_in_fast_retry_window: u32,
+    previous_delay: Duration,
 ) -> Duration {
     let mut rng = rand::thread_rng();
 
@@ -85,26 +87,29 @@ pub(crate) fn fast_backoff_delay(
         return Duration::from_millis(ms as u64);
     }
 
-    // Phase 2: exponential backoff
-    // Go frp: InitDurationIfFail(1s) * Factor(2) → 2s on first error, then compounds.
-    // Matches Go frp dev wait.FastBackoffImpl.Backoff():
-    //   consecutiveErrCount=1 → InitDurationIfFail(1s) * Factor(2) = 2s + jitter
-    //   consecutiveErrCount=2 → previousDuration(2s) * Factor(2) = 4s + jitter
-    //   etc.
-    let mut duration_ms = 1000u64; // InitDurationIfFail = 1 second base
-    for _ in 0..consecutive_err_count {
-        duration_ms = duration_ms.saturating_mul(2);
-        if duration_ms >= 20_000 {
-            duration_ms = 20_000;
-            break;
-        }
+    // Phase 2: exponential backoff anchored to the PREVIOUS ACTUAL delay,
+    // matching Go frp dev wait.FastBackoffImpl.Backoff():
+    //   consecutiveErrCount==1 → InitDurationIfFail (1s)
+    //   else → previousDuration (the last returned delay, jitter included)
+    //   then × Factor(2) + Jitter(±10%) capped at MaxDuration (20s).
+    // Anchoring to the previous (jittered) delay — instead of recomputing a
+    // pure 1s·2^n sequence — makes the cap converge more slowly and keeps
+    // consecutive delays consistent (Go semantics; previously ~5 retries hit
+    // the 20s cap, Go takes longer because each step compounds the jittered
+    // value rather than the theoretical base).
+    let base = if consecutive_err_count == 1 || previous_delay.is_zero() {
+        Duration::from_secs(1) // InitDurationIfFail
+    } else {
+        previous_delay
+    };
+    let mut duration = base.saturating_mul(2); // Factor = 2
+    if duration > Duration::from_secs(20) {
+        duration = Duration::from_secs(20);
+    } else {
+        // Go Jitter: ±10% multiplicative, then cap.
+        let jitter = rng.gen_range(0.9..=1.1);
+        let ms = (duration.as_millis() as f64 * jitter) as u64;
+        duration = Duration::from_millis(ms.min(20_000));
     }
-    // Full jitter: base × random(0.5, 1.5), capped at 20s. The phase-1
-    // mean dropped slightly (250ms → 200ms) but the order of magnitude
-    // and phase structure are unchanged; the spread replaces the old
-    // ±10% additive band — at the 20s cap clients no longer all fire
-    // within the same 20-22s window.
-    let duration_ms = ((duration_ms as f64 * rng.gen_range(0.5..=1.5)) as u64).min(20_000);
-
-    Duration::from_millis(duration_ms)
+    duration
 }

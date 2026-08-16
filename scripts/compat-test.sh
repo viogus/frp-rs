@@ -2016,6 +2016,111 @@ test_r2g_udp() {
 }
 
 # =============================================================================
+# Test: Go frpc (V2 wire protocol, binary-v1 UDP codec) -> Rust frps, UDP proxy
+# Verifies the Go frp v0.71.0 binary UDPPacket codec (V2TypeUDPPacketBinary=19)
+# end-to-end against the Rust frps data plane (regression coverage: the codec
+# previously had no cross-implementation e2e test).
+# =============================================================================
+test_g2r_udp_v2() {
+    local name="go-to-rust-udp-v2"
+    should_run_test "$name" || return 0
+
+    ensure_go_frp_v2 || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-udp-v2"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Rust frps (auto-detects V2)
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Go frpc (V2) with UDP proxy
+    write_frpc_config_udp go "$frps_port" "$token" "$echo_port" "$proxy_port" "udp-echo" "$TEST_DIR/$name/frpc.toml" ""
+    sed -i.bak '/^transport\.tls\.enable/i\
+transport.wireProtocol = "v2"
+' "$TEST_DIR/$name/frpc.toml"
+    rm -f "$TEST_DIR/$name/frpc.toml.bak"
+    run_go "$GO_FRPC_V2" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 1
+
+    local result
+    result=$(send_and_expect_udp "$proxy_port" "udp-v2-g2r-test" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc (V2 wire protocol, binary-v1 UDP codec) -> Go frps, UDP proxy
+# Reverse direction of the binary codec cross-implementation check.
+# =============================================================================
+test_r2g_udp_v2() {
+    local name="rust-to-go-udp-v2"
+    should_run_test "$name" || return 0
+
+    ensure_go_frp_v2 || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-udp-v2"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start UDP echo server
+    start_udp_echo_server "$echo_port"
+
+    # Start Go frps
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Start Rust frpc (V2) with UDP proxy
+    write_frpc_config_udp rust "$frps_port" "$token" "$echo_port" "$proxy_port" "udp-echo" "$TEST_DIR/$name/frpc.toml" ""
+    # Insert v2 = true BEFORE the top-level tls_enable key (Rust config).
+    sed -i.bak '/^tls_enable/i\
+v2 = true
+' "$TEST_DIR/$name/frpc.toml"
+    rm -f "$TEST_DIR/$name/frpc.toml.bak"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    local result
+    result=$(send_and_expect_udp "$proxy_port" "udp-v2-r2g-test" 15)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Go frpc -> Rust frps, HTTP proxy (VHost)
 # =============================================================================
 test_g2r_http() {
@@ -5235,6 +5340,8 @@ run_test test_r2g_mux_tls_encrypt
 # Phase 4: Other proxy types
 run_test test_g2r_udp
 run_test test_r2g_udp
+run_test test_g2r_udp_v2
+run_test test_r2g_udp_v2
 run_test test_g2r_udp_encrypted
 run_test test_r2g_udp_encrypted
 # SUDP cross-compat (go->rust only): Go frp v0.70.1 sudp is a client-side half

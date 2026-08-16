@@ -637,6 +637,22 @@ pub struct ObservabilityConfig {
     pub service_name: String,
 }
 
+/// Go frp v0.71.0 compat: the nested `webServer.tls` section
+/// (`tls.enable` / `tls.certFile` / `tls.keyFile` / `tls.trustedCaFile`).
+/// Merged with the flat `tls_cert_file`/`tls_key_file` fields — the nested
+/// values take precedence when both are set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebServerTlsConfig {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default, alias = "certFile")]
+    pub cert_file: String,
+    #[serde(default, alias = "keyFile")]
+    pub key_file: String,
+    #[serde(default, alias = "trustedCaFile")]
+    pub trusted_ca_file: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebServerConfig {
     /// Dashboard/admin listen address. Default: "127.0.0.1" (Go frp compat,
@@ -662,11 +678,38 @@ pub struct WebServerConfig {
     /// TLS private key file path.
     #[serde(default, alias = "keyFile")]
     pub tls_key_file: String,
+    /// Go frp v0.71.0 nested `webServer.tls` section (enable/certFile/
+    /// keyFile/trustedCaFile). Takes precedence over the flat
+    /// tls_cert_file/tls_key_file fields.
+    #[serde(default, rename = "tls")]
+    pub tls: WebServerTlsConfig,
     /// Custom 404 page body (HTML). When non-empty, VHost and TCPMux
     /// 404 responses include this content with Content-Type: text/html.
     /// Go frp compat: custom_404_page.
     #[serde(default)]
     pub custom_404_page: String,
+}
+
+impl WebServerConfig {
+    /// Effective TLS certificate path: nested `tls.cert_file` first, then
+    /// the flat `tls_cert_file`.
+    pub fn tls_cert(&self) -> &str {
+        if !self.tls.cert_file.is_empty() {
+            &self.tls.cert_file
+        } else {
+            &self.tls_cert_file
+        }
+    }
+
+    /// Effective TLS key path: nested `tls.key_file` first, then the flat
+    /// `tls_key_file`.
+    pub fn tls_key(&self) -> &str {
+        if !self.tls.key_file.is_empty() {
+            &self.tls.key_file
+        } else {
+            &self.tls_key_file
+        }
+    }
 }
 
 impl Default for WebServerConfig {
@@ -681,6 +724,7 @@ impl Default for WebServerConfig {
             pprof_enable: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
+            tls: WebServerTlsConfig::default(),
             custom_404_page: String::new(),
         }
     }

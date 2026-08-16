@@ -145,6 +145,26 @@ impl FeatureGate {
         Ok(())
     }
 
+    /// Validate a feature map WITHOUT mutating state (Go featuregate
+    /// SetFromMap semantics: unrecognized keys are errors, locked features
+    /// must keep their default). Used by config validation so a bad config
+    /// fails at load time without side effects.
+    pub fn validate_keys(&self, m: &HashMap<String, bool>) -> Result<(), String> {
+        let known = self.known.read().map_err(|e| format!("lock: {e}"))?;
+        for (k, &v) in m {
+            let feature_spec = known
+                .get(k.as_str())
+                .ok_or_else(|| format!("unrecognized feature gate: {k}"))?;
+            if feature_spec.lock_to_default && feature_spec.default != v {
+                return Err(format!(
+                    "cannot set feature gate {k} to {v}, feature is locked to {}",
+                    feature_spec.default
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Add features to the feature gate.
     ///
     /// Returns an error if a feature with the same name but different spec
@@ -229,6 +249,12 @@ pub fn enabled(name: Feature) -> bool {
 /// Set feature gate values from a map in the default feature gates.
 pub fn set_from_map(m: &HashMap<String, bool>) -> Result<(), String> {
     DEFAULT_FEATURE_GATES.set_from_map(m)
+}
+
+/// Validate feature keys without mutating the global registry (config
+/// validation path).
+pub fn validate_keys(m: &HashMap<String, bool>) -> Result<(), String> {
+    DEFAULT_FEATURE_GATES.validate_keys(m)
 }
 
 /// Return known non-GA features from the default feature gates.

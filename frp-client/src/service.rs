@@ -935,6 +935,9 @@ impl Service {
         // de-synchronize instead of re-clustering in a narrow band).
         let mut did_login_once = false;
         let mut consecutive_err_count: u32 = 0;
+        // Last computed reconnect delay — the Go fast-backoff anchors Phase 2
+        // to this value (previousDuration) instead of recomputing 1s·2^n.
+        let mut previous_delay: std::time::Duration = std::time::Duration::ZERO;
         let mut fast_retry_timestamps: Vec<Instant> = Vec::new();
         // When a session runs healthily for a long time, the consecutive
         // error count is reset so an occasional blip doesn't reconnect with
@@ -1001,7 +1004,13 @@ impl Service {
                         fast_retry_timestamps.push(Instant::now());
                         let window_count =
                             crate::backoff::prune_fast_retry_count(&mut fast_retry_timestamps);
-                        crate::backoff::fast_backoff_delay(consecutive_err_count, window_count)
+                        let d = crate::backoff::fast_backoff_delay(
+                            consecutive_err_count,
+                            window_count,
+                            previous_delay,
+                        );
+                        previous_delay = d;
+                        d
                     } else {
                         // Initial login: pure exponential, no fast retry phase.
                         // Matches Go frp's loopLoginUntilSuccess (FastBackoffOptions
@@ -1166,7 +1175,9 @@ impl Service {
             let delay = crate::backoff::reconnect_delay_after_session(
                 &mut consecutive_err_count,
                 &mut fast_retry_timestamps,
+                previous_delay,
             );
+            previous_delay = delay;
             warn!(delay_ms = %delay.as_millis(), attempt = %consecutive_err_count, "Session ended, reconnecting in {}ms (attempt {})...",
                 delay.as_millis(), consecutive_err_count);
             // Race the backoff against a stop request: an admin/signal stop
@@ -1443,6 +1454,14 @@ impl Service {
         // dropped: skipping them left the pool empty after login and let
         // the server's work-conn wait stall for up to 10s.
         for (idx, p) in proxies.iter().enumerate() {
+            // Go frp v0.71.0: a health-checked proxy is NOT registered until
+            // its FIRST successful probe (proxy_wrapper health=1 → CheckFailed
+            // → no NewProxy). The health monitor's first Recover event
+            // registers it. Non-health proxies register immediately below.
+            if !p.health_check_type.is_empty() {
+                debug!(name = %p.name, "Skipping initial registration of health-checked proxy '{}' (registers on first healthy probe)", p.name);
+                continue;
+            }
             let local_addr = self
                 .proxy_info_map
                 .read()
@@ -2550,6 +2569,9 @@ impl Service {
                         privilege_key: None,
                         timestamp: None,
                     };
+                    // Go frp v0.71.0: ping auth failures skip this heartbeat
+                    // instead of tearing the session down.
+                    let mut skip_ping = false;
                     // Auth scopes: unioning the client's own scopes with the
                     // server-advertised scopes is a Rust-to-Rust extension.
                     // Go v0.70.1's TokenAuthSetterVerifier.SetPing checks only
@@ -2564,8 +2586,14 @@ impl Service {
                     if send_auth {
                         if let Some(ref oidc) = self.oidc_client {
                             if let Err(e) = oidc.set_ping(&mut ping_msg).await {
-                                warn!(error = %e, "OIDC ping token failed: {}. Reconnecting...", e);
-                                return LoopExit::Reconnect;
+                                // Go frp v0.71.0: ping auth failure only
+                                // SKIPS this heartbeat — the session stays
+                                // up and the next heartbeat retries
+                                // (client/control.go "skip sending ping
+                                // message"). A full reconnect is wasted when
+                                // the control link is healthy.
+                                warn!(error = %e, "OIDC ping token failed, skipping this ping");
+                                skip_ping = true;
                             }
                         } else {
                             let ts = std::time::SystemTime::now()
@@ -2578,11 +2606,14 @@ impl Service {
                                     ping_msg.timestamp = Some(ts);
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, "Ping token source failed: {}. Reconnecting...", e);
-                                    return LoopExit::Reconnect;
+                                    warn!(error = %e, "Ping token source failed, skipping this ping");
+                                    skip_ping = true;
                                 }
                             }
                         }
+                    }
+                    if skip_ping {
+                        continue;
                     }
                     let ping = FrpMessage::Ping(ping_msg);
                     if let Err(e) = writer.send(ping, ctx.v2) {
@@ -3324,15 +3355,15 @@ impl Service {
             };
             let admin_auth_user = cfg_snapshot.web_server.user.clone();
             let admin_auth_pwd = cfg_snapshot.web_server.password.clone();
-            let admin_tls_cert = if cfg_snapshot.web_server.tls_cert_file.is_empty() {
+            let admin_tls_cert = if cfg_snapshot.web_server.tls_cert().is_empty() {
                 None
             } else {
-                Some(cfg_snapshot.web_server.tls_cert_file.clone())
+                Some(cfg_snapshot.web_server.tls_cert().to_string())
             };
-            let admin_tls_key = if cfg_snapshot.web_server.tls_key_file.is_empty() {
+            let admin_tls_key = if cfg_snapshot.web_server.tls_key().is_empty() {
                 None
             } else {
-                Some(cfg_snapshot.web_server.tls_key_file.clone())
+                Some(cfg_snapshot.web_server.tls_key().to_string())
             };
             let handle = tokio::spawn(async move {
                 if let Err(e) = crate::admin::run_admin_server(
@@ -4030,20 +4061,33 @@ mod tests {
         let mut errors = 0;
         let mut retries = Vec::new();
         let fast_delays = (0..3)
-            .map(|_| crate::backoff::reconnect_delay_after_session(&mut errors, &mut retries))
+            .map(|_| {
+                crate::backoff::reconnect_delay_after_session(
+                    &mut errors,
+                    &mut retries,
+                    std::time::Duration::ZERO,
+                )
+            })
             .collect::<Vec<_>>();
         // Phase 1 stays sub-second (100-300ms).
         assert!(fast_delays
             .iter()
             .all(|delay| *delay < Duration::from_secs(1)));
-        fn mean_level(consecutive: u32, window: u32) -> f64 {
+        fn mean_level(consecutive: u32, window: u32, prev_secs: u64) -> f64 {
             (0..200)
-                .map(|_| crate::backoff::fast_backoff_delay(consecutive, window).as_millis() as f64)
+                .map(|_| {
+                    crate::backoff::fast_backoff_delay(
+                        consecutive,
+                        window,
+                        std::time::Duration::from_secs(prev_secs),
+                    )
+                    .as_millis() as f64
+                })
                 .sum::<f64>()
                 / 200.0
         }
-        let m4 = mean_level(4, 4); // phase 2, 16s base (partially capped at 20s)
-        let m5 = mean_level(5, 5); // phase 2, 20s capped base
+        let m4 = mean_level(4, 4, 8); // phase 2, 16s anchored from 8s
+        let m5 = mean_level(5, 5, 16); // phase 2, 20s capped
         assert!(m5 > m4, "phase-2 mean should escalate: {m5} > {m4}");
         assert_eq!(errors, 3);
     }
@@ -4054,7 +4098,7 @@ mod tests {
         // 200ms × full jitter (0.5-1.5) → 100ms-300ms.
         for i in 1..=3u32 {
             for _ in 0..100 {
-                let delay = crate::backoff::fast_backoff_delay(i, i);
+                let delay = crate::backoff::fast_backoff_delay(i, i, std::time::Duration::ZERO);
                 let ms = delay.as_millis();
                 assert!(ms >= 100, "delay {ms}ms too low for fast retry {i}");
                 assert!(ms <= 300, "delay {ms}ms too high for fast retry {i}");
@@ -4065,54 +4109,59 @@ mod tests {
     #[test]
     fn fast_backoff_delay_phase2_base_first() {
         // After fast retries (counts_in_fast_retry_window > 3), consecutive_err_count=1
-        // Go frp: InitDurationIfFail(1s) * Factor(2) = 2s × full jitter (0.5-1.5)
-        // -> 1000-3000ms
+        // Go frp: InitDurationIfFail(1s) * Factor(2) = 2s × jitter (±10%)
+        // -> 1800-2200ms
         for _ in 0..100 {
-            let delay = crate::backoff::fast_backoff_delay(1, 4);
+            let delay = crate::backoff::fast_backoff_delay(1, 4, std::time::Duration::ZERO);
             let ms = delay.as_millis();
-            assert!(ms >= 1000, "delay {ms}ms below 1s for phase2 first");
-            assert!(ms <= 3000, "delay {ms}ms above 3s for phase2 first");
+            assert!(ms >= 1800, "delay {ms}ms below 1.8s for phase2 first");
+            assert!(ms <= 2200, "delay {ms}ms above 2.2s for phase2 first");
         }
     }
 
     #[test]
     fn fast_backoff_delay_phase2_exponential() {
-        // consecutive_err_count=4, counts_in_fast_retry_window=5 -> 1s*2^4=16s
-        // × full jitter (0.5-1.5) -> 8000-24000ms, capped at 20000ms
+        // Anchored to the PREVIOUS actual delay (Go fastBackoffImpl):
+        // previous ≈ 8s × Factor(2) ± 10% → 14.4-17.6s (capped at 20s).
         for _ in 0..100 {
-            let delay = crate::backoff::fast_backoff_delay(4, 5);
+            let delay = crate::backoff::fast_backoff_delay(4, 5, std::time::Duration::from_secs(8));
             let ms = delay.as_millis();
-            assert!(ms >= 8000, "delay {ms}ms below 8s for err=4");
-            assert!(ms <= 20000, "delay {ms}ms above 20s cap for err=4");
+            assert!(ms >= 14000, "delay {ms}ms below 14s for prev=8s");
+            assert!(ms <= 20000, "delay {ms}ms above 20s cap");
         }
     }
 
     #[test]
     fn fast_backoff_delay_phase2_caps_at_20s() {
-        // High consecutive_err_count caps the base at 20s; full jitter then
-        // spreads it to 10-20s (never above the cap).
+        // A previous delay near the cap stays capped at 20s.
         for _ in 0..100 {
-            let delay = crate::backoff::fast_backoff_delay(20, 20);
+            let delay =
+                crate::backoff::fast_backoff_delay(20, 20, std::time::Duration::from_secs(20));
             let ms = delay.as_millis();
-            assert!(ms >= 10000, "delay {ms}ms below 10s at the 20s cap");
             assert!(ms <= 20000, "delay {ms}ms above 20s cap");
         }
     }
 
     #[test]
     fn fast_backoff_delay_monotonic_in_mean() {
-        // Mean delay should increase with consecutive_err_count
-        fn mean_delay(consecutive: u32, window: u32) -> f64 {
-            (0..50)
-                .map(|_| crate::backoff::fast_backoff_delay(consecutive, window).as_millis() as f64)
-                .sum::<f64>()
-                / 50.0
+        // Anchored mean grows with each retry.
+        fn chained_delays(count: u32) -> f64 {
+            let mut prev = std::time::Duration::ZERO;
+            let mut sum = 0.0;
+            for c in 1..=count {
+                let d = crate::backoff::fast_backoff_delay(c, 10, prev);
+                sum += d.as_millis() as f64;
+                prev = d;
+            }
+            sum / count as f64
         }
-        let m1 = mean_delay(1, 4); // phase2, 2s
-        let m2 = mean_delay(2, 5); // phase2, 4s
-        let m5 = mean_delay(5, 6); // phase2, 20s (capped)
+        // Simulate one run per count: average of the first N chained delays
+        // must grow as N grows (cap flattens the tail).
+        let m1 = chained_delays(1); // ~2s
+        let m2 = chained_delays(2); // ~(2s+4s)/2
+        let m6 = chained_delays(6); // grows toward 20s cap
         assert!(m2 > m1, "mean delay should grow: {m2} > {m1}");
-        assert!(m5 > m2, "mean delay should grow: {m5} > {m2}");
+        assert!(m6 > m2, "mean delay should grow: {m6} > {m2}");
     }
 
     #[cfg(feature = "vnet")]

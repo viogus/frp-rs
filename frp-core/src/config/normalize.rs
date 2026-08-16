@@ -291,6 +291,28 @@ fn parse_port_num(s: &str) -> Option<u32> {
 
 /// Move matching top-level keys into a sub-table, optionally stripping known prefixes.
 /// e.g. `flatten_to_table(t, &["log_file","log_level"], "log", &["log_"])`
+/// Move legacy top-level keys into the `web_server` sub-table (Go
+/// pkg/config/legacy conversion: admin_*/dashboard_* → WebServer.*).
+fn legacy_web_server_keys(table: &mut toml::Table, mappings: &[(&str, &str)]) {
+    let mut items: Vec<(String, toml::Value)> = Vec::new();
+    for (from, to) in mappings {
+        if let Some(v) = table.remove(*from) {
+            items.push(((*to).to_string(), v));
+        }
+    }
+    if !items.is_empty() {
+        let target_table = table
+            .entry("web_server".to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        if let toml::Value::Table(ref mut t) = target_table {
+            // Existing explicit [web_server] values take precedence.
+            for (k, v) in items {
+                t.entry(k).or_insert(v);
+            }
+        }
+    }
+}
+
 fn flatten_to_table(table: &mut toml::Table, keys: &[&str], target: &str, strip_prefixes: &[&str]) {
     let mut items: Vec<(String, toml::Value)> = Vec::new();
     for &key in keys {
@@ -351,6 +373,23 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
 }
 
 pub(super) fn normalize_server_config(value: &mut toml::Value) {
+    // Go legacy INI keys: top-level dashboard_* -> [web_server] (Go
+    // pkg/config/legacy conversion.go DashboardAddr/Port/User/Pwd/...).
+    if let toml::Value::Table(t) = value {
+        legacy_web_server_keys(
+            t,
+            &[
+                ("dashboard_addr", "addr"),
+                ("dashboard_port", "port"),
+                ("dashboard_user", "user"),
+                ("dashboard_pwd", "password"),
+                ("dashboard_assets_dir", "assets_dir"),
+                ("dashboard_tls_cert_file", "tls_cert_file"),
+                ("dashboard_tls_key_file", "tls_key_file"),
+            ],
+        );
+    }
+
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
         // Handle [common] section: merge into top level
@@ -603,6 +642,22 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
 }
 
 pub(super) fn normalize_client_config(value: &mut toml::Value) {
+    // Go legacy INI keys: top-level admin_* -> [web_server] (Go
+    // pkg/config/legacy conversion.go AdminAddr/Port/User/Pwd/...).
+    if let toml::Value::Table(t) = value {
+        legacy_web_server_keys(
+            t,
+            &[
+                ("admin_addr", "addr"),
+                ("admin_port", "port"),
+                ("admin_user", "user"),
+                ("admin_pwd", "password"),
+                ("assets_dir", "assets_dir"),
+                ("pprof_enable", "pprof_enable"),
+            ],
+        );
+    }
+
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
         // Handle [common] section
@@ -832,6 +887,9 @@ fn normalize_proxies(table: &mut toml::Table) {
                     "intervalSeconds" => "health_check_interval_seconds",
                     "timeoutSeconds" => "health_check_timeout_seconds",
                     "maxFailed" => "health_check_max_failed",
+                    // Go legacy INI keys (pkg/config/legacy/proxy.go).
+                    "health_check_interval_s" => "health_check_interval_seconds",
+                    "health_check_timeout_s" => "health_check_timeout_seconds",
                     other => other,
                 };
                 let value = if k == "httpHeaders" {

@@ -909,7 +909,7 @@ impl Service {
                                                                     }
                                                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                                         tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS+yamux NewWorkConn from {}", peer);
-                                                                        crate::handlers::handle_work_conn_inner(io, nwc, state).await;
+                                                                        crate::handlers::handle_work_conn_inner(io, nwc, state, false).await;
                                                                     }
                                                                     Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
                                                                         tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS+yamux NewVisitorConn from {}", peer);
@@ -1024,7 +1024,7 @@ impl Service {
                                                                 }
                                                                 Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS NewWorkConn from {}", peer);
-                                                                    crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                                                                    crate::handlers::handle_work_conn_inner(ctl, nwc, state, false).await;
                                                                 }
                                                                 Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
                                                                     tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS NewVisitorConn from {}", peer);
@@ -1117,7 +1117,7 @@ impl Service {
                                                             }
                                                             Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                                 tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP yamux NewWorkConn from {}", peer);
-                                                                crate::handlers::handle_work_conn_inner(io, nwc, state).await;
+                                                                crate::handlers::handle_work_conn_inner(io, nwc, state, false).await;
                                                             }
                                                             Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
                                                                 tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP yamux NewVisitorConn from {}", peer);
@@ -1150,7 +1150,7 @@ impl Service {
                                                 }
                                                 Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP NewWorkConn from {}", peer);
-                                                    crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                                                    crate::handlers::handle_work_conn_inner(ctl, nwc, state, false).await;
                                                 }
                                                 Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
                                                     tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP NewVisitorConn from {}", peer);
@@ -1365,15 +1365,15 @@ impl Service {
             let dash_state = self.state.clone();
             let dash_user = self.cfg.web_server.user.clone();
             let dash_pwd = self.cfg.web_server.password.clone();
-            let dash_tls_cert = if self.cfg.web_server.tls_cert_file.is_empty() {
+            let dash_tls_cert = if self.cfg.web_server.tls_cert().is_empty() {
                 None
             } else {
-                Some(self.cfg.web_server.tls_cert_file.clone())
+                Some(self.cfg.web_server.tls_cert().to_string())
             };
-            let dash_tls_key = if self.cfg.web_server.tls_key_file.is_empty() {
+            let dash_tls_key = if self.cfg.web_server.tls_key().is_empty() {
                 None
             } else {
-                Some(self.cfg.web_server.tls_key_file.clone())
+                Some(self.cfg.web_server.tls_key().to_string())
             };
             let enable_prom = self.cfg.web_server.enable_prometheus;
             let dash_assets = self.cfg.web_server.assets_dir.clone();

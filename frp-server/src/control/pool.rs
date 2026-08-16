@@ -962,6 +962,7 @@ mod tests {
                 user: String::new(),
                 control_id,
                 udp_packet_codec: String::new(),
+                wire_v2: false,
             },
         );
         rx

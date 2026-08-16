@@ -1339,6 +1339,7 @@ mod vnet_route_tests {
                 user: String::new(),
                 control_id: 1,
                 udp_packet_codec: String::new(),
+                wire_v2: false,
             },
         );
         rx

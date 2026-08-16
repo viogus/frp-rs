@@ -449,6 +449,19 @@ fn validate_oidc_client_config(auth: &AuthClientConfig) -> Result<(), String> {
 
 pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
     validate_auth_token_source(&cfg.auth.token, &cfg.auth.token_source)?;
+    // Go frp v0.71.0: unknown feature gates are config errors, not a silent
+    // fail-open (featuregate SetFromMap "unrecognized feature gate").
+    if !cfg.feature.gates.is_empty() {
+        crate::feature_gate::validate_keys(&cfg.feature.gates)
+            .map_err(|e| format!("server config: {e}"))?;
+    }
+    // Go frp v0.71.0: a negative transport.maxPoolCount is invalid.
+    if cfg.transport.max_pool_count < 0 {
+        return Err(format!(
+            "server config: invalid transport.maxPoolCount {}, must be non-negative",
+            cfg.transport.max_pool_count
+        ));
+    }
     // Go frp compat: invalid allow_ports entries are config errors, not a
     // silent disable of the restriction (validation/PortsRange).
     if !cfg.allow_ports.trim().is_empty() {
@@ -462,6 +475,12 @@ pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
 pub(super) fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
     validate_proxy_configs(&cfg.proxies)?;
     validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
+    // Go frp v0.71.0: unknown feature gates are config errors (featuregate
+    // SetFromMap "unrecognized feature gate").
+    if !cfg.feature.gates.is_empty() {
+        crate::feature_gate::validate_keys(&cfg.feature.gates)
+            .map_err(|e| format!("client config: {e}"))?;
+    }
     if let Some(auth) = &cfg.auth {
         let token = if cfg.token.is_empty() {
             auth.token.as_str()

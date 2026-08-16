@@ -1715,7 +1715,7 @@ pub(crate) async fn handle_quic_stream(
                     }
                 }
                 Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                    crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                    crate::handlers::handle_work_conn_inner(ctl, nwc, state, false).await;
                 }
                 Ok(other) => {
                     tracing::warn!(other = ?other.v1_type_byte(), "Unexpected QUIC message: {:?}", other.v1_type_byte());
@@ -1790,28 +1790,28 @@ fn spawn_quic_drain(
                                     };
                                     if w_is_v2 {
                                         match wc.read_v2_frame().await {
-                                            Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => Ok((wc, nwc)),
+                                            Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => Ok((wc, nwc, true)),
                                             Ok(other) => Err(frp_core::Error::Protocol(format!("unexpected QUIC V2 message {:?}", other.v2_type_id()).into())),
                                             Err(e) => Err(e),
                                         }
                                     } else {
                                         wc = frp_core::transport::IoStream::BufferedRead(wmagic.to_vec(), 0, Box::new(wc));
                                         match frp_core::protocol::read_msg_v1(&mut wc).await {
-                                            Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => Ok((wc, nwc)),
+                                            Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => Ok((wc, nwc, false)),
                                             Ok(other) => Err(frp_core::Error::Protocol(format!("unexpected QUIC V1 message {:?}", other.v1_type_byte()).into())),
                                             Err(e) => Err(e),
                                         }
                                     }
                                 }).await;
                                 match request {
-                                    Ok(Ok((wc, nwc))) => {
+                                    Ok(Ok((wc, nwc, wv2))) => {
                                         drop(preauth_permit);
                                         let Ok(_authenticated_permit) =
                                             authenticated_limiter.acquire_owned().await
                                         else {
                                             return;
                                         };
-                                        crate::handlers::handle_work_conn_inner(wc, nwc, s).await
+                                        crate::handlers::handle_work_conn_inner(wc, nwc, s, wv2).await
                                     },
                                     Ok(Err(e)) => tracing::warn!(error = %e, "QUIC drain: invalid first frame"),
                                     Err(_) => tracing::warn!(timeout_secs = QUIC_FIRST_FRAME_TIMEOUT.as_secs(), "QUIC work stream first-frame timeout"),
