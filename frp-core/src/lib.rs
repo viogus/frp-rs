@@ -348,7 +348,7 @@ impl Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// frp version string.
-pub const VERSION: &str = "0.70.1";
+pub const VERSION: &str = "0.71.0";
 
 /// Return the user agent string used in login.
 pub fn version_str() -> String {

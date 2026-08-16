@@ -65,22 +65,22 @@ Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `ht
 
 ### Go frp Compatibility Notes
 
-frp-rs targets protocol compatibility with Go frp v0.70.1. The full Go frp
-v0.70.1 cross-compatibility suite runs in CI (including the XTCP pairwise
-matrix on VPS and V2 over the v0.70.1 pre-built binaries). Coverage is broad
+frp-rs targets protocol compatibility with Go frp v0.71.0. The full Go frp
+v0.71.0 cross-compatibility suite runs in CI (including the XTCP pairwise
+matrix on VPS and V2 over the v0.71.0 pre-built binaries). Coverage is broad
 but not literally 100% — see "Known limitations" below.
 
 - **V1 wire protocol**: Fully compatible. All message types, authentication, encryption (AES-128-CFB),
-  compression (Snappy) — wire-compatible with Go frp v0.70.1.
+  compression (Snappy) — wire-compatible with Go frp v0.71.0.
 - **V2 wire protocol**: Full AEAD encryption + capability negotiation, verified against the
-  Go frp v0.70.1 pre-built binary (V2 is included since v0.70.1).
+  Go frp v0.71.0 pre-built binary (V2 is included since v0.71.0).
 - **All transports**: TCP, WebSocket, TLS, KCP, QUIC — full interop verified.
 - **All 10 client plugins**: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`,
   `https2http`, `https2https`, `http2http`, `tls2raw`, `virtual_net`.
 - **XTCP**: Cross-compat with Go frp (requires public internet for STUN/NAT probes).
   Both P2P data planes are supported — KCP+yamux (default) and QUIC
   (`protocol="quic"`, `quic` feature is default ON). Go visitors using the
-  default `protocol="quic"` interoperate with Rust providers: Go frp v0.70.1
+  default `protocol="quic"` interoperate with Rust providers: Go frp v0.71.0
   sends the peer `"ip:port"` as the QUIC TLS SNI, which upstream rustls 0.23
   rejects as an invalid server name — frp-rs vendors rustls with a one-line
   server-side patch treating an invalid SNI as "no SNI" (equivalent to the
@@ -90,7 +90,7 @@ but not literally 100% — see "Known limitations" below.
   [2026-08-04-xtcp-quic-sni-compat.md](docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md)).
   See [full audit](docs/go-frp-compat-audit.md) for details.
 
-### Known limitations (as of frp-rs 0.70.1)
+### Known limitations (as of frp-rs 0.71.0)
 
 - **HTTP vhost reverse-proxy semantics**: frps forwards HTTP vhost traffic at
   the byte level (X-Forwarded-For and requestHeaders are injected, Host
@@ -107,7 +107,7 @@ but not literally 100% — see "Known limitations" below.
   `http2https` are plaintext HTTP/1.1 only and have no such field (Go parity).
 - **`pprof` endpoints**: `/debug/pprof/*` is a placeholder (no Go-style CPU
   profiles); `/healthz` and pprof are outside auth, matching Go.
-- **UDP bandwidth limiting**: frp-rs extension — Go v0.70.1's UDP forwarder
+- **UDP bandwidth limiting**: frp-rs extension — Go v0.71.0's UDP forwarder
   has no limiter. `bandwidthLimit` / `bandwidthLimitMode` now throttle the
   UDP data plane too, with the same direction semantics as the TCP bridge
   ("server" limits both directions on frps; "client" limits upload on frpc;
@@ -273,7 +273,7 @@ tcp_mux_keepalive_interval = 30
 | `web_server.assets_dir` | `""` | Custom dashboard `index.html` directory (read once at startup; empty = built-in page) |
 | `transport.tcp_mux` | `true` | Enable TCP multiplexing |
 | `transport.tcp_mux_keepalive_interval` | `30` | Keepalive interval (seconds) for mux |
-| `transport.heartbeat_timeout` | `-1` | Heartbeat timeout in seconds; `-1` disables it under tcp_mux (Go v0.70.1 default) |
+| `transport.heartbeat_timeout` | `-1` | Heartbeat timeout in seconds; `-1` disables it under tcp_mux (Go v0.71.0 default) |
 | `allow_port_start` | `1` | Start of auto-assigned port range |
 | `allow_port_end` | `65535` | End of auto-assigned port range |
 | `udp_packet_size` | `1500` | UDP packet buffer size in bytes |
@@ -328,7 +328,7 @@ use_compression = false
 | `web_server.port` | `0` | Admin API port (0 = disabled) |
 | `web_server.user` | `""` | Admin API Basic Auth username |
 | `web_server.password` | `""` | Admin API Basic Auth password |
-| `heartbeat_interval` | `-1` | Ping interval in seconds; `-1` disables it under tcp_mux (Go v0.70.1 default) |
+| `heartbeat_interval` | `-1` | Ping interval in seconds; `-1` disables it under tcp_mux (Go v0.71.0 default) |
 | `proxy_url` | `""` | Upstream HTTP/SOCKS5 proxy for control connection |
 | `auth.oidc.proxyURL` | `""` | OIDC token/discovery HTTP proxy (HTTP CONNECT or SOCKS5; Go frp `proxyURL` compat) |
 | `start` | `[]` | Selective proxy start: only start proxies named in this list |
@@ -490,7 +490,7 @@ buffer defaults to 32 KiB (matching Go frp) and can be tuned via the
 
 **Smaller and lighter than Go frp.** Rust compiles to native code with no runtime, no GC, and aggressive size optimizations:
 
-| Metric | Go frp v0.70.1 | frp-rs (default) | frp-rs (`tiny`) | frp-rs (`micro`) |
+| Metric | Go frp v0.71.0 | frp-rs (default) | frp-rs (`tiny`) | frp-rs (`micro`) |
 |--------|---------------|------------------|-----------------|-------------------|
 | frps binary | ~14 MB | ~5.1 MB | ~3.2 MB | ~2.2 MB |
 | frpc binary | ~12 MB | ~4.0 MB | ~3.1 MB | ~2.1 MB |
@@ -522,7 +522,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 ### frp-rs 核心优势
 
-**协议兼容。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 76 项常规兼容性测试加 17 项 XTCP 两两矩阵测试（含 QUIC 数据面）。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
+**协议兼容。** 完全兼容 Go frp v0.71.0 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 76 项常规兼容性测试加 17 项 XTCP 两两矩阵测试（含 QUIC 数据面）。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
 **体积与内存。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.1 MB，frpc ~4.0 MB（含 QUIC/KCP/SSH 等全部默认 feature，声明 release profile 实测），约为 Go frp 的 1/3，且仍在持续收缩（`strip=true` + fat-LTO + `opt-level=z`）。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
@@ -570,7 +570,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 - **[Developer Guide](docs/developing.md)** — Architecture deep-dive, debugging, testing, release process
 
 - **[Technical Details](docs/technical-details.md)** — Architecture, wire protocol (V1/V2 framing, message types, lifecycle, auth, encryption, compression), and project structure
-- **[Go frp Compatibility Audit](docs/go-frp-compat-audit.md)** — Full cross-compat analysis against Go frp v0.70.1
+- **[Go frp Compatibility Audit](docs/go-frp-compat-audit.md)** — Full cross-compat analysis against Go frp v0.71.0
 
 ---
 
