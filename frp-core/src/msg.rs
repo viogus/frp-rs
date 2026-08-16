@@ -308,10 +308,12 @@ pub struct StartWorkConn {
     pub dst_port: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Whether encryption is enabled for the data bridge (Go frp compat).
+    /// Whether encryption is enabled for the data bridge (Rust frp extension;
+    /// not in Go v0.71.0 StartWorkConn — Go ignores unknown JSON fields).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_encryption: Option<bool>,
-    /// Whether compression is enabled for the data bridge (Go frp compat).
+    /// Whether compression is enabled for the data bridge (Rust frp extension;
+    /// not in Go v0.71.0 StartWorkConn — Go ignores unknown JSON fields).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_compression: Option<bool>,
     /// XTCP visitor session ID for hole-punch notification (Rust frp extension).

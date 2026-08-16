@@ -50,9 +50,12 @@ fn test_parse_client_store_defaults_to_none() {
 }
 
 #[test]
-fn test_xtcp_visitor_defaults_to_kcp() {
+fn test_xtcp_visitor_defaults_to_quic() {
     let visitor = VisitorConfig::default();
-    assert_eq!(visitor.protocol, "kcp", "XTCP visitor must advertise KCP");
+    assert_eq!(
+        visitor.protocol, "quic",
+        "XTCP visitor must default to quic (Go frp v0.70.1)"
+    );
 }
 
 #[test]
@@ -940,7 +943,7 @@ fn test_parse_allow_ports_edge_cases() {
 fn test_parse_bandwidth_limit_edge_cases() {
     // Empty → Some(0) (no limit, Go compat)
     assert_eq!(parse_bandwidth_limit(""), Some(0));
-    // Bare number without suffix → None (Go requires "KB"/"MB"/"GB")
+    // Bare number without suffix → None (Go requires "KB"/"MB")
     assert_eq!(parse_bandwidth_limit("0"), None);
 
     // KB variant (binary: 1KB = 1024)
@@ -961,9 +964,13 @@ fn test_parse_bandwidth_limit_edge_cases() {
     // Bare number → None (Go requires a suffix)
     assert_eq!(parse_bandwidth_limit("500"), None);
 
-    // Case insensitive (input uppercased internally)
-    assert_eq!(parse_bandwidth_limit("1mb"), Some(1_048_576));
-    assert_eq!(parse_bandwidth_limit("1kb"), Some(1024));
+    // Case-SENSITIVE suffix (Go strings.CutSuffix): "mb"/"kb" are rejected.
+    assert_eq!(parse_bandwidth_limit("1mb"), None);
+    assert_eq!(parse_bandwidth_limit("1kb"), None);
+    // 0 / negative number with a valid suffix → Some(0) (no limit, Go
+    // NewBandwidthLimiter returns nil for bytes <= 0).
+    assert_eq!(parse_bandwidth_limit("0KB"), Some(0));
+    assert_eq!(parse_bandwidth_limit("-1MB"), Some(0));
 
     // Garbage → None
     assert_eq!(parse_bandwidth_limit("not-a-number"), None);
@@ -1128,10 +1135,10 @@ token = "test-token"
 "#;
     let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
     assert!(cfg.tcp_mux);
-    // dial_server_keepalive defaults to 300 (frp-rs production default) via
-    // the serde default fn — a plain `#[serde(default)]` would yield 0
-    // (disabled), silently diverging from the documented default.
-    assert_eq!(cfg.dial_server_keepalive, 300);
+    // dial_server_keepalive defaults to 7200 (Go frp default) via the serde
+    // default fn — a plain `#[serde(default)]` would yield 0 (disabled),
+    // silently diverging from the documented default.
+    assert_eq!(cfg.dial_server_keepalive, 7200);
     // An explicit 0 still disables.
     let cfg0: ClientConfig = load_client_config_from_str(
         "server_addr = '127.0.0.1'\n[transport]\ndial_server_keepalive = 0",

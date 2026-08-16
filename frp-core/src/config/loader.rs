@@ -17,27 +17,31 @@ use crate::feature_gate::VIRTUAL_NET;
 /// an empty bandwidth limit field means "no limit" (effectively 0). Callers that
 /// need to distinguish "not set" from "set to 0" should check `is_empty()` before
 /// calling this function.
+/// Parse a bandwidth limit like Go frp `types.BandwidthQuantity`:
+/// - case-SENSITIVE "KB"/"MB" suffix ("kb"/"mb" are rejected like Go's
+///   "unit not support");
+/// - bare numbers and other suffixes are invalid;
+/// - an empty string, or a non-positive number, means NO limit
+///   (returns Some(0); Go's limiter treats bytes <= 0 as no limiter).
 pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
+    let s = s.trim();
     if s.is_empty() {
         return Some(0);
     }
-    let s = s.trim();
     let (num_str, mult) = {
-        let end = s.len();
-        if end > 2 && s[(end - 2)..].eq_ignore_ascii_case("MB") {
-            (s[..(end - 2)].trim(), 1_048_576u64)
-        } else if end > 2 && s[(end - 2)..].eq_ignore_ascii_case("KB") {
-            // Go requires a suffix; bare numbers and single-letter suffixes are invalid.
-            // Returns None when "KB" suffix is absent, rejecting bare numbers ("500")
-            // and single-letter ("500K").
-            (s[..(end - 2)].trim(), 1024u64)
+        if let Some(fstr) = s.strip_suffix("MB") {
+            (fstr.trim(), 1_048_576u64)
+        } else if let Some(fstr) = s.strip_suffix("KB") {
+            (fstr.trim(), 1024u64)
         } else {
             return None;
         }
     };
     let num: f64 = num_str.parse().ok()?;
     if num <= 0.0 {
-        return None;
+        // Go: 0 / negative values mean no limit (NewBandwidthLimiter returns
+        // nil for bytes <= 0).
+        return Some(0);
     }
     Some((num * mult as f64) as u64)
 }

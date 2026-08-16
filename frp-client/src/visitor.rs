@@ -41,7 +41,7 @@ pub(crate) struct VisitorListenerConfig {
     pub max_retries_an_hour: i32,
     pub min_retry_interval: i64,
     pub stun_server: String,
-    /// XTCP P2P data plane protocol: "kcp" (default) or "quic".
+    /// XTCP P2P data plane protocol: "quic" (default, Go parity) or "kcp".
     /// Both data planes are implemented; "kcp" is the default (Go compat
     /// matrix forces kcp), "quic" requires the `quic` feature.
     pub p2p_protocol: String,

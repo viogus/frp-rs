@@ -395,8 +395,26 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 ("dashboard_assets_dir", "assets_dir"),
                 ("dashboard_tls_cert_file", "tls_cert_file"),
                 ("dashboard_tls_key_file", "tls_key_file"),
+                ("pprof_enable", "pprof_enable"),
             ],
         );
+
+        // Go legacy INI: dashboard_tls_mode (bool) -> [web_server] tls.enable.
+        if let Some(v) = table.remove("dashboard_tls_mode") {
+            if v.as_bool() == Some(true) {
+                let ws = table
+                    .entry("web_server".to_string())
+                    .or_insert_with(|| Value::Table(Default::default()));
+                if let Value::Table(w) = ws {
+                    let tls = w
+                        .entry("tls".to_string())
+                        .or_insert_with(|| Value::Table(Default::default()));
+                    if let Value::Table(t) = tls {
+                        t.insert("enable".to_string(), Value::Boolean(true));
+                    }
+                }
+            }
+        }
 
         // Rename canonical Go camelCase section names.
         if let Some(v) = table.remove("webServer") {
@@ -664,6 +682,106 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
                 ("pprof_enable", "pprof_enable"),
             ],
         );
+
+        // Go legacy INI: authenticate_heartbeats / authenticate_new_work_conns
+        // -> [auth] additional_scopes (Go conversion.go AdditionalScopes).
+        let mut extra_scopes: Vec<String> = Vec::new();
+        if table
+            .remove("authenticate_heartbeats")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            extra_scopes.push("HeartBeats".to_string());
+        }
+        if table
+            .remove("authenticate_new_work_conns")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            extra_scopes.push("NewWorkConns".to_string());
+        }
+        if !extra_scopes.is_empty() {
+            let auth_table = table
+                .entry("auth".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(auth) = auth_table {
+                let mut scopes: Vec<String> = auth
+                    .get("additional_scopes")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                scopes.extend(extra_scopes);
+                auth.insert(
+                    "additional_scopes".to_string(),
+                    Value::Array(scopes.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+
+        // Go legacy INI: http_proxy -> [transport] proxy_url.
+        if let Some(v) = table.remove("http_proxy") {
+            let tr = table
+                .entry("transport".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(t) = tr {
+                t.entry("proxy_url".to_string()).or_insert(v);
+            }
+        }
+
+        // Go legacy INI: disable_log_color -> [log] disable_print_color.
+        if let Some(v) = table.remove("disable_log_color") {
+            let lg = table
+                .entry("log".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(l) = lg {
+                l.entry("disable_print_color".to_string()).or_insert(v);
+            }
+        }
+
+        // Go legacy INI: oidc_additional_endpoint_params (flattened map keys
+        // prefixed `oidc_additional_`) -> [auth.oidc] additional_endpoint_params.
+        let oidc_params: Vec<(String, Value)> = table
+            .iter()
+            .filter(|(k, _)| k.starts_with("oidc_additional_"))
+            .map(|(k, v)| {
+                (
+                    k.trim_start_matches("oidc_additional_").to_string(),
+                    v.clone(),
+                )
+            })
+            .collect();
+        if !oidc_params.is_empty() {
+            for k in oidc_params.iter().map(|(k, _)| k.clone()) {
+                let _ = table.remove(&format!("oidc_additional_{k}"));
+            }
+            let auth_table = table
+                .entry("auth".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(auth) = auth_table {
+                let oidc = auth
+                    .entry("oidc".to_string())
+                    .or_insert_with(|| Value::Table(Default::default()));
+                if let Value::Table(o) = oidc {
+                    let mut params = o
+                        .get("additional_endpoint_params")
+                        .and_then(Value::as_table)
+                        .cloned()
+                        .unwrap_or_default();
+                    for (k, v) in oidc_params {
+                        params.insert(k, v);
+                    }
+                    o.insert(
+                        "additional_endpoint_params".to_string(),
+                        Value::Table(params),
+                    );
+                }
+            }
+        }
 
         // Rename protocol → transport_protocol (Go frp uses "protocol")
         if let Some(v) = table.remove("protocol") {
