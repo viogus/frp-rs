@@ -986,6 +986,7 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
         "ssh_tunnel_gateway",
         "observability",
         "vnet",
+        "store",
     ];
     let sections: Vec<String> = table
         .keys()
