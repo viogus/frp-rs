@@ -968,9 +968,31 @@ fn ini_range_numbers(s: &str) -> Option<Vec<u16>> {
 fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
     use toml::Value;
 
+    // Known non-proxy top-level sections are never collected even if they
+    // happen to carry a `type` key.
+    const KNOWN_SECTIONS: &[&str] = &[
+        "common",
+        "proxies",
+        "visitors",
+        "web_server",
+        "auth",
+        "log",
+        "transport",
+        "plugins",
+        "http_plugins",
+        "feature",
+        "featureGates",
+        "includes",
+        "ssh_tunnel_gateway",
+        "observability",
+        "vnet",
+    ];
     let sections: Vec<String> = table
         .keys()
-        .filter(|k| matches!(table.get(*k), Some(Value::Table(t)) if t.contains_key("type")))
+        .filter(|k| {
+            !KNOWN_SECTIONS.contains(&k.as_str())
+                && matches!(table.get(*k), Some(Value::Table(t)) if t.contains_key("type"))
+        })
         .cloned()
         .collect();
 

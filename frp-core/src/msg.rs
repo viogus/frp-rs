@@ -1174,6 +1174,21 @@ mod tests {
     }
 
     #[test]
+    fn test_udp_packet_empty_datagram_go_compat() {
+        // Go frp omits "c" (json:"c,omitempty") on empty datagrams and may
+        // omit "l"/"r" (nil addrs). All three must deserialize cleanly.
+        let json = r#"{}"#;
+        let pkt: UDPPacket = serde_json::from_str(json).expect("empty packet");
+        assert!(pkt.content.is_empty());
+        assert!(pkt.local_addr.is_none());
+        assert!(pkt.remote_addr.is_none());
+
+        // And Rust->Go stays byte-identical: empty content is NOT serialized.
+        let out = serde_json::to_string(&pkt).expect("serialize");
+        assert_eq!(out, r#"{}"#);
+    }
+
+    #[test]
     fn test_frp_message_v1_type_bytes() {
         // Verify every known type byte maps to the correct variant
         let cases: Vec<(u8, &str)> = vec![
