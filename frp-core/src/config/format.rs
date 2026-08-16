@@ -213,17 +213,23 @@ fn infer_ini_value(s: &str) -> toml::Value {
         _ => {}
     }
 
-    // ["a", "b"] array literal (Go ini.v1 []string syntax) → Array
+    // ["a", "b"] array literal (Go ini.v1 []string syntax) → Array.
+    // Only when the inner content looks like a list: quoted elements or at
+    // least one comma. A bare "[::1]" (IPv6 literal) falls through to the
+    // string branch instead of becoming the one-element array "["::1"]".
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len() - 1];
         if inner.trim().is_empty() {
             return toml::Value::Array(Vec::new());
         }
-        let parts: Vec<toml::Value> = inner
-            .split(',')
-            .map(|p| infer_ini_value(p.trim()))
-            .collect();
-        return toml::Value::Array(parts);
+        let looks_like_list = inner.contains('"') || inner.contains('\'') || inner.contains(',');
+        if looks_like_list {
+            let parts: Vec<toml::Value> = inner
+                .split(',')
+                .map(|p| infer_ini_value(p.trim()))
+                .collect();
+            return toml::Value::Array(parts);
+        }
     }
 
     // Comma-separated → Array (type-infer each element)

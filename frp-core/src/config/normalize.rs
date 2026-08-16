@@ -612,7 +612,15 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
         if !plugin_sections.is_empty() {
             let mut plugins: Vec<toml::Value> = Vec::new();
             for name in plugin_sections {
-                let Value::Table(mut st) = table.remove(&name).unwrap() else {
+                let Some(removed) = table.remove(&name) else {
+                    continue;
+                };
+                let Value::Table(mut st) = removed else {
+                    tracing::warn!(
+                        "legacy INI [plugin.xxx]: section '{}' is not a table; kept verbatim",
+                        name
+                    );
+                    table.insert(name, removed);
                     continue;
                 };
                 st.insert(

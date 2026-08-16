@@ -3899,3 +3899,34 @@ file.path = "/tmp/frp-token"
         super::file::load_server_config(f.path().to_str().unwrap(), true).unwrap();
     assert!(cfg.auth.token_source.is_some());
 }
+
+/// ini_to_toml: a bare "[::1]" (IPv6 literal) is NOT treated as an array —
+/// it must parse as a plain string.
+#[test]
+fn test_ini_ipv6_literal_not_array() {
+    let cfg: ServerConfig = load_server_ini(
+        r#"bind_port = 7000
+[plugin.ipv6]
+addr = "http://[::1]:9000"
+"#,
+    )
+    .unwrap();
+    let p = cfg.http_plugins.iter().find(|p| p.name == "ipv6").unwrap();
+    assert_eq!(p.addr, "http://[::1]:9000");
+}
+
+/// ini_to_toml: an array literal with quoted elements still parses as an
+/// array (regression guard for the looks-like-list heuristic).
+#[test]
+fn test_ini_quoted_array_literal_still_array() {
+    let cfg: ServerConfig = load_server_ini(
+        r#"bind_port = 7000
+[plugin.arr]
+addr = "127.0.0.1:9000"
+ops = ["login", "new_proxy"]
+"#,
+    )
+    .unwrap();
+    let p = cfg.http_plugins.iter().find(|p| p.name == "arr").unwrap();
+    assert_eq!(p.ops, vec!["login", "new_proxy"]);
+}
