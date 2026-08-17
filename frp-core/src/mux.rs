@@ -241,23 +241,28 @@ fn normalized_keepalive_interval(configured: Duration) -> Duration {
 #[cfg(feature = "tcp-mux")]
 fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     let mut cfg = Config::default();
-    // Match Go frp's hashicorp/yamux settings for compatibility.
-    // Go frp sets MaxStreamWindowSize = 6 MB which controls per-stream
-    // receive window. yamux-rs 0.14 hardcodes the initial per-stream
-    // window at 256 KiB (DEFAULT_CREDIT) but grows it dynamically via
-    // BDP-based auto-tuning. To allow each stream to grow to the
-    // configured max_stream_window_size without allowing all 256
-    // streams to simultaneously consume their full window (which
-    // would risk OOM at 1.5 GiB), set the connection receive window
-    // to max_stream_window_size * 32 = 192 MiB — moderate increase
-    // from old 128 MiB, still accommodates the larger per-stream
-    // window without memory exhaustion risk.
+    // Match Go frp's hashicorp/yamux settings for compatibility:
+    // Go frp sets MaxStreamWindowSize = 6 MB per stream and MaxStreams
+    // = 0 (unlimited). yamux-rs 0.14 hardcodes the initial per-stream
+    // window at 256 KiB (DEFAULT_CREDIT) and grows it via BDP
+    // auto-tuning, but its default stream cap is 512 — NOT 8192 (the
+    // old comment here was wrong). Hitting the cap is asymmetric: a
+    // client open fails cleanly (TooManyStreams), but a server-side SYN
+    // at the cap sends GoAway and kills the ENTIRE mux connection
+    // (control channel + all work streams). Go has no such cliff.
+    // 1024 streams removes the cliff for realistic workloads while
+    // keeping the OOM surface bounded.
+    //
+    // yamux-rs asserts conn_window >= max_streams * 256 KiB (reserved
+    // per-stream credit) — 1024 * 256 KiB = 256 MiB. The old
+    // stream_window * 32 (192 MiB) is below that floor, so raise to
+    // 384 MiB: 256 MiB reserved + 128 MiB shared auto-tune growth
+    // budget (fixes per-stream throttling below Go's 6 MiB/stream
+    // once >=16 streams share one mux connection).
     let stream_window = tcp_mux_cfg.max_stream_window_size as usize;
-    cfg.set_max_connection_receive_window(Some(stream_window * 32));
+    cfg.set_max_num_streams(1024);
+    cfg.set_max_connection_receive_window(Some((stream_window * 32).max(384 * 1024 * 1024)));
     // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
-    // max_num_streams not set — uses yamux-rs default (8192) vs Go's unlimited.
-    // 8192 accommodates high concurrent workloads (HTTP proxy, long-lived streams)
-    // without capping at 256 which would reject streams under load.
     // Keepalive is instead implemented via timeout-based poll loops in
     // server_mux and client_mux background tasks.
     let _ = tcp_mux_cfg.keepalive_interval;
@@ -627,10 +632,11 @@ where
                 // Without the second poll, frames sit in pending_write_frame until
                 // the next wake-up — which may never arrive.
                 //
-                // Guard: only double-poll when there might be pending frames.
-                // Without this guard, two successive Pending results on the same cx
-                // can cause a tight re-poll loop (the second poll re-registers the
-                // same waker, and the runtime may re-wake immediately).
+                // Second poll flushes pending frames to the socket (same
+                // structure as the server loop). Two successive Pending
+                // results cannot spin: mio waker registration is last-wins,
+                // so a re-poll loop needs two distinct ready resources in
+                // one iteration — which is real work, not a spin.
                 //
                 // Streams opened from open_stream() are flushed by the `opened`
                 // wakeup branch below, which wakes this poll so the double-poll
