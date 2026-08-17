@@ -254,6 +254,12 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // window without memory exhaustion risk.
     let stream_window = tcp_mux_cfg.max_stream_window_size as usize;
     cfg.set_max_connection_receive_window(Some(stream_window * 32));
+    // 32 KiB data frames (yamux-rs default 16 KiB): halves the frame
+    // count for the bridge's 64 KiB chunks, i.e. halves per-frame
+    // header writes/reads and waker round trips. Go's hashicorp yamux
+    // splits only at the stream window (6 MiB), so 32 KiB is still
+    // conservative and wire-legal (frame body <= receive window).
+    cfg.set_split_send_size(32 * 1024);
     // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
     // max_num_streams not set — uses yamux-rs default (8192) vs Go's unlimited.
     // 8192 accommodates high concurrent workloads (HTTP proxy, long-lived streams)
@@ -620,32 +626,35 @@ where
             tokio::select! {
                 // Drive connection I/O.
                 //
-                // Double-poll is required because yamux Active::poll processes
-                // StreamCommand::SendFrame (step 3) AFTER flushing pending_write_frame
-                // (step 1). The first poll picks up queued stream writes into
-                // pending_write_frame; the second poll actually sends them on the wire.
-                // Without the second poll, frames sit in pending_write_frame until
-                // the next wake-up — which may never arrive.
+                // Double-poll: with the vendored yamux the first poll already
+                // puts frames on the wire — Active::poll drains stream frames
+                // into the socket's batched write queue and, having drained
+                // anything, continues to poll_ready within the same call, so a
+                // whole batch is flushed before the call returns (there is no
+                // pending_write_frame anymore; nothing is deferred). The second
+                // poll is a harmless no-op that re-registers the same wakers
+                // and returns Pending again.
                 //
-                // Guard: only double-poll when there might be pending frames.
-                // Without this guard, two successive Pending results on the same cx
-                // can cause a tight re-poll loop (the second poll re-registers the
-                // same waker, and the runtime may re-wake immediately).
+                // Keep the double-poll anyway: it is not wrong and it is nearly
+                // free (the first poll leaves nothing queued, so the second
+                // does no work), and it insulates us against any future yamux
+                // change that defers writes to a later poll.
                 //
                 // Streams opened from open_stream() are flushed by the `opened`
                 // wakeup branch below, which wakes this poll so the double-poll
                 // picks up the new stream's queued frames.
                 result = poll_fn(|cx| {
                     let mut conn = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
-                    // First poll: process stream commands → collect SendFrame
-                    // into pending_write_frame, read incoming data → route to streams.
+                    // First poll: drain stream commands and reads; batched
+                    // writes are flushed within this same call.
                     let first = conn.poll_next_inbound(cx);
                     match first {
                         Poll::Ready(r) => return Poll::Ready(r),
                         Poll::Pending => {}
                     }
-                    // Second poll: send pending_write_frame to socket, read again.
-                    debug!("yamux client: flushing pending frames");
+                    // Second poll: no-op with the vendored yamux (the first
+                    // poll already flushed the batch); kept as insurance.
+                    debug!("yamux client: second poll (batch already flushed)");
                     conn.poll_next_inbound(cx)
                 }) => {
                     match result {

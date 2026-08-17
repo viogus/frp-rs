@@ -1,0 +1,20 @@
+[package]
+name = "yamux"
+version = "0.14.0"
+edition = "2021"
+description = "Multiplexer over reliable, ordered connections"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/paritytech/yamux"
+
+[lib]
+name = "yamux"
+path = "src/lib.rs"
+
+[dependencies]
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+log = "0.4"
+nohash-hasher = "0.2"
+parking_lot = "0.12"
+pin-project = "1"
+static_assertions = "1"
+web-time = "1"
