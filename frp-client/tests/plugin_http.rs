@@ -201,7 +201,7 @@ async fn test_https2https_accepts_self_signed_backend() {
         .expect("start https2https plugin");
 
     // Tunnel-side TLS client that skips verification (plugin cert is self-signed).
-    let connector = frp_core::transport::build_tls_connector_skip_verify(None, None, None)
+    let connector = frp_core::transport::build_tls_connector_skip_verify(None, None, None, false)
         .expect("tls connector");
     let tcp = TcpStream::connect(handle.local_addr).await.unwrap();
     let server_name = ServerName::try_from("127.0.0.1".to_string()).unwrap();

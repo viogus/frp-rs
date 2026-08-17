@@ -410,8 +410,9 @@ mod tests {
     ) -> tokio_rustls::client::TlsStream<TcpStream> {
         let mut tcp = TcpStream::connect(plugin_addr).await.unwrap();
         tcp.write_all(header).await.unwrap();
-        let connector = frp_core::transport::build_tls_connector_skip_verify(None, None, None)
-            .expect("tls connector");
+        let connector =
+            frp_core::transport::build_tls_connector_skip_verify(None, None, None, false)
+                .expect("tls connector");
         let server_name = ServerName::try_from("127.0.0.1".to_string()).unwrap();
         connector
             .connect(server_name, tcp)

@@ -867,6 +867,14 @@ pub struct ServerTransportConfig {
     /// Go frp v0.70.1 compat: tcpKeepalive. Go default: 7200.
     #[serde(default = "default_tcp_keepalive", alias = "tcpKeepalive")]
     pub tcp_keepalive: i64,
+    /// TCP send buffer size in bytes for server-side accepted sockets
+    /// (SO_SNDBUF). 0 = OS default. frp-rs extension.
+    #[serde(default, alias = "tcpSendBuffer")]
+    pub tcp_send_buffer_size: u32,
+    /// TCP receive buffer size in bytes for server-side accepted sockets
+    /// (SO_RCVBUF). 0 = OS default. frp-rs extension.
+    #[serde(default, alias = "tcpRecvBuffer")]
+    pub tcp_recv_buffer_size: u32,
     /// QUIC protocol options.
     #[serde(default, rename = "quic")]
     pub quic_options: Option<QuicOptions>,
@@ -880,6 +888,8 @@ impl Default for ServerTransportConfig {
             heartbeat_timeout: default_heartbeat_timeout(),
             max_pool_count: default_max_pool_count(),
             tcp_keepalive: default_tcp_keepalive(),
+            tcp_send_buffer_size: 0,
+            tcp_recv_buffer_size: 0,
             quic_options: None,
         }
     }

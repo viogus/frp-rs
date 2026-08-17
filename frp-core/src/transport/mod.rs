@@ -571,6 +571,11 @@ pub struct DialOptions {
     pub tls_enable: bool,
     pub tls_server_name: String,
     pub tls_ca_file: Option<String>,
+    /// Force-skip TLS certificate verification (even when `tls_ca_file` is
+    /// set). Default `false` → Go-compatible behavior: `tls_ca_file` set ⇒
+    /// verify; unset ⇒ skip (self-signed default). See
+    /// [`crate::config`] `tls.skip_verify`.
+    pub tls_skip_verify: bool,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
     pub dns_server: Option<String>,
@@ -580,6 +585,12 @@ pub struct DialOptions {
     pub keepalive_secs: u64,
     /// Local IP address to bind before dialing. None = system default.
     pub bind_addr: Option<String>,
+    /// TCP send-buffer size in bytes (SO_SNDBUF). 0 = leave OS default.
+    /// frp-rs extension; helps high-BDP single connections fill the pipe.
+    pub tcp_send_buffer_size: u32,
+    /// TCP receive-buffer size in bytes (SO_RCVBUF). 0 = leave OS default.
+    /// frp-rs extension; see [`Self::tcp_send_buffer_size`].
+    pub tcp_recv_buffer_size: u32,
     /// Upstream proxy URL. Supports http:// and socks5:// schemes.
     /// When set, the TCP connection goes through the proxy instead of
     /// connecting directly. Empty = direct connection.
@@ -599,6 +610,7 @@ impl Default for DialOptions {
             tls_enable: false,
             tls_server_name: String::new(),
             tls_ca_file: None,
+            tls_skip_verify: false,
             tls_cert_file: None,
             tls_key_file: None,
             dns_server: None,
@@ -606,6 +618,8 @@ impl Default for DialOptions {
             disable_custom_tls_first_byte: false,
             keepalive_secs: 0,
             bind_addr: None,
+            tcp_send_buffer_size: 0,
+            tcp_recv_buffer_size: 0,
             proxy_url: None,
             v2: false,
         }
@@ -866,6 +880,13 @@ async fn connect_direct(
     // Disable Nagle for low-latency small-message RTT (Go frp parity).
     crate::transport::set_nodelay(&stream);
 
+    // Optional non-default socket buffers (0 = OS default). frp-rs extension.
+    crate::transport::set_send_recv_buffer(
+        &stream,
+        opts.tcp_send_buffer_size,
+        opts.tcp_recv_buffer_size,
+    );
+
     Ok(stream)
 }
 
@@ -920,6 +941,27 @@ pub fn set_keepalive(stream: &tokio::net::TcpStream, secs: u64) {
     if let Err(e) = keepalive.set_tcp_keepalive(&ka) {
         tracing::debug!(error = %e, keepalive_secs = secs,
             "set_keepalive failed (continuing without keepalive)");
+    }
+}
+
+/// Set TCP send/receive buffer sizes on a stream (SO_SNDBUF / SO_RCVBUF).
+/// 0 leaves the OS default untouched. A failed (or unsupported) socket
+/// option is logged at debug and ignored — consistent with the
+/// `set_keepalive`/`set_nodelay` error-handling policy. frp-rs extension;
+/// helps high-BDP single connections fill the pipe.
+pub fn set_send_recv_buffer(stream: &tokio::net::TcpStream, send_bytes: u32, recv_bytes: u32) {
+    let s = socket2::SockRef::from(stream);
+    if send_bytes > 0 {
+        if let Err(e) = s.set_send_buffer_size(send_bytes as usize) {
+            tracing::debug!(error = %e, send_bytes,
+                "set_send_buffer_size failed (continuing with OS default)");
+        }
+    }
+    if recv_bytes > 0 {
+        if let Err(e) = s.set_recv_buffer_size(recv_bytes as usize) {
+            tracing::debug!(error = %e, recv_bytes,
+                "set_recv_buffer_size failed (continuing with OS default)");
+        }
     }
 }
 
@@ -1352,6 +1394,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         opts.tls_ca_file.as_deref(),
                         opts.tls_cert_file.as_deref(),
                         opts.tls_key_file.as_deref(),
+                        opts.tls_skip_verify,
                     )?;
                     let server_name = if !opts.tls_server_name.is_empty() {
                         opts.tls_server_name.clone()
@@ -1445,6 +1488,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         opts.tls_ca_file.as_deref(),
                         opts.tls_cert_file.as_deref(),
                         opts.tls_key_file.as_deref(),
+                        opts.tls_skip_verify,
                     )?;
                     let server_name = if !opts.tls_server_name.is_empty() {
                         opts.tls_server_name.clone()
@@ -1498,6 +1542,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         opts.tls_ca_file.as_deref(),
                         opts.tls_cert_file.as_deref(),
                         opts.tls_key_file.as_deref(),
+                        opts.tls_skip_verify,
                     )?;
                     let server_name = if !opts.tls_server_name.is_empty() {
                         opts.tls_server_name.clone()

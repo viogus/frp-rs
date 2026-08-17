@@ -488,11 +488,18 @@ struct ConnectorKey {
     ca: Option<(String, Option<[u8; 32]>)>,
     cert: Option<(String, Option<[u8; 32]>)>,
     key: Option<(String, Option<[u8; 32]>)>,
+    /// Whether verification is force-skipped. Distinct skip-verify and
+    /// verify configs must never share a cached connector (the verifier
+    /// selected differs).
+    skip_verify: bool,
 }
 
 impl PartialEq for ConnectorKey {
     fn eq(&self, other: &Self) -> bool {
-        self.ca == other.ca && self.cert == other.cert && self.key == other.key
+        self.ca == other.ca
+            && self.cert == other.cert
+            && self.key == other.key
+            && self.skip_verify == other.skip_verify
     }
 }
 
@@ -600,11 +607,13 @@ fn connector_key(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
     key_file: Option<&str>,
+    skip_verify: bool,
 ) -> ConnectorKey {
     ConnectorKey {
         ca: non_empty(ca_file).map(|p| (p.to_string(), file_hash(p))),
         cert: non_empty(cert_file).map(|p| (p.to_string(), file_hash(p))),
         key: non_empty(key_file).map(|p| (p.to_string(), file_hash(p))),
+        skip_verify,
     }
 }
 
@@ -706,26 +715,30 @@ fn file_read_count() -> usize {
     FILE_READ_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Build a TLS client connector with certificate verification skipped when no
-/// CA file is given (InsecureSkipVerify=true, matching Go frp's default for
-/// auto-generated self-signed certs). With `ca_file`, verify against it
-/// (mTLS when client cert/key are also provided). The most recent connector
-/// is cached per (path, content hash) — see [`ConnectorKey`]. When no CA file
-/// is configured, a per-connection MITM warning is logged (see the fn body).
+/// Build a TLS client connector. Without a CA file and with `skip_verify`
+/// unset, certificate verification is skipped (InsecureSkipVerify=true,
+/// matching Go frp's default for auto-generated self-signed certs). With
+/// `ca_file`, verification runs against it (mTLS when client cert/key are
+/// also provided). Setting `skip_verify=true` forces verification off even
+/// when a CA file is configured. The most recent connector is cached per
+/// (path, content hash) — see [`ConnectorKey`]. When verification is skipped,
+/// a rate-limited MITM warning is logged (see the fn body).
 pub fn build_tls_connector_skip_verify(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
     key_file: Option<&str>,
+    skip_verify: bool,
 ) -> Result<TlsConnector, crate::Error> {
     // Warn per TLS-enabled connection (not once per process at connector
     // build — the connector is cached, so the build-time log was easy to
     // miss). Fires for every dial that lands on the insecure skip-verify
-    // default, i.e. whenever no CA file is configured. Rate-limited so busy
-    // deployments get the first occurrence at error level but no flood.
-    if non_empty(ca_file).is_none() {
+    // path, i.e. whenever no CA file is configured (or skip_verify is
+    // forced). Rate-limited so busy deployments get the first occurrence at
+    // error level but no flood.
+    if non_empty(ca_file).is_none() || skip_verify {
         warn_skip_verify_rate_limited();
     }
-    let key = connector_key(ca_file, cert_file, key_file);
+    let key = connector_key(ca_file, cert_file, key_file, skip_verify);
     if let Some((cached_key, cached)) = CONNECTOR_CACHE
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -736,7 +749,8 @@ pub fn build_tls_connector_skip_verify(
         }
     }
 
-    let connector = build_tls_connector_skip_verify_inner(ca_file, cert_file, key_file)?;
+    let connector =
+        build_tls_connector_skip_verify_inner(ca_file, cert_file, key_file, skip_verify)?;
     #[cfg(test)]
     CONNECTOR_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     *CONNECTOR_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some((key, connector.clone()));
@@ -747,14 +761,20 @@ fn build_tls_connector_skip_verify_inner(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
     key_file: Option<&str>,
+    skip_verify: bool,
 ) -> Result<TlsConnector, crate::Error> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     let root_store = build_root_store(ca_file)?;
 
-    let config = if let Some(store) = root_store {
+    // Force-skip when requested; otherwise verify whenever a CA store is
+    // available, and fall back to skip-verify only when none is configured
+    // (Go frp's auto-generated self-signed default).
+    let verify = !skip_verify && root_store.is_some();
+    let config = if verify {
         // Custom CA provided: verify against it normally.
+        let store = root_store.expect("verify requires a root store");
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
             if !cert_path.is_empty() && !key_path.is_empty() {
                 let cert_bytes = std::fs::read(cert_path).map_err(|e| {
@@ -1053,8 +1073,8 @@ mod connector_cache_tests {
     fn cache_behavior() {
         // 1) Cache hit: identical args must not rebuild.
         let before = connector_build_count();
-        let _ = build_tls_connector_skip_verify(None, None, None).unwrap();
-        let _ = build_tls_connector_skip_verify(None, None, None).unwrap();
+        let _ = build_tls_connector_skip_verify(None, None, None, false).unwrap();
+        let _ = build_tls_connector_skip_verify(None, None, None, false).unwrap();
         assert_eq!(
             connector_build_count(),
             before + 1,
@@ -1067,8 +1087,8 @@ mod connector_cache_tests {
         std::fs::write(&ca_path, dummy_ca_pem()).unwrap();
         let ca = ca_path.to_str().unwrap().to_string();
         let before = connector_build_count();
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
         assert_eq!(
             connector_build_count(),
             before + 1,
@@ -1088,7 +1108,7 @@ mod connector_cache_tests {
             f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
                 .unwrap();
         }
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
         assert_eq!(
             connector_build_count(),
             before + 2,
@@ -1098,8 +1118,14 @@ mod connector_cache_tests {
         // 3) A failing build must not be cached (and a missing-file key must
         //    not collide with the no-CA entry from step 1).
         let before = connector_build_count();
-        assert!(build_tls_connector_skip_verify(Some("/nonexistent/ca.pem"), None, None).is_err());
-        assert!(build_tls_connector_skip_verify(Some("/nonexistent/ca.pem"), None, None).is_err());
+        assert!(
+            build_tls_connector_skip_verify(Some("/nonexistent/ca.pem"), None, None, false)
+                .is_err()
+        );
+        assert!(
+            build_tls_connector_skip_verify(Some("/nonexistent/ca.pem"), None, None, false)
+                .is_err()
+        );
         assert_eq!(
             connector_build_count(),
             before,
@@ -1119,13 +1145,13 @@ mod connector_cache_tests {
             f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
                 .unwrap();
         }
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
         assert_eq!(
             file_read_count(),
             before_reads + 1,
             "a stat change must re-read the file exactly once to re-hash it"
         );
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
         assert_eq!(
             file_read_count(),
             before_reads + 1,
@@ -1135,6 +1161,16 @@ mod connector_cache_tests {
             connector_build_count(),
             before_builds,
             "unchanged content after a stat change must still hit the connector cache"
+        );
+        // 5) skip_verify=true with a CA must NOT reuse the CA-verified
+        //    connector cached above: the key differs by skip_verify, so it
+        //    rebuilds (the insecure verifier is installed).
+        let before_sv_builds = connector_build_count();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, true).unwrap();
+        assert_eq!(
+            connector_build_count(),
+            before_sv_builds + 1,
+            "skip_verify=true must not reuse a verify=false cached connector"
         );
     }
 }

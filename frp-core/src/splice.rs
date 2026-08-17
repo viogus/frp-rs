@@ -13,8 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::unix::AsyncFd;
 
-/// Default pipe capacity (Linux kernel pipe max, 64 KiB).
-const PIPE_CAPACITY: usize = 65536;
+/// Pipe capacity. 1 MiB = the default `/proc/sys/fs/pipe-max-size`; a larger
+/// pipe lets each `splice(src → pipe)` move up to 16x more bytes per syscall,
+/// cutting epoll round-trips on bulk transfers. The actual capacity is set
+/// via `F_SETPIPE_SZ` in `create_pipe_pair`; this constant must match it so
+/// the `splice` length argument never under-requests.
+const PIPE_CAPACITY: usize = 1024 * 1024;
 
 /// Create a non-blocking pipe pair, returning `(read_end, write_end)`.
 ///
@@ -32,6 +36,17 @@ fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>)> {
     // SAFETY: pipe2 returned 0, so fds[0] and fds[1] are valid open fds.
     let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    // Grow both ends to PIPE_CAPACITY. F_SETPIPE_SZ fails with EPERM when the
+    // requested size exceeds the kernel's pipe-max-size (or the process's
+    // soft limit); on failure the kernel default stays and splice simply
+    // moves up to the smaller pipe, so the fallback is safe (never EAGAIN
+    // early — a full pipe still reports partial progress, not an error).
+    for fd in [fds[0], fds[1]] {
+        // SAFETY: fds[0]/fds[1] are valid fds from pipe2 above; fcntl does
+        // not take ownership. The return value is intentionally ignored —
+        // the size is a throughput hint, not a correctness requirement.
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_CAPACITY as libc::c_int) };
+    }
     let read_async = AsyncFd::new(read)?;
     let write_async = AsyncFd::new(write)?;
     Ok((read_async, write_async))

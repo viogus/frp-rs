@@ -210,6 +210,8 @@ impl Service {
             cfg.transport.tcp_mux.unwrap_or(true),
             cfg.transport.tcp_mux_keepalive_interval,
             cfg.transport.tcp_keepalive,
+            cfg.transport.tcp_send_buffer_size,
+            cfg.transport.tcp_recv_buffer_size,
             cfg.transport.heartbeat_timeout,
             cfg.udp_packet_size,
             cfg.tls_only,
@@ -1591,6 +1593,11 @@ impl Service {
                             self.state.tcp_keepalive as u64,
                         );
                     }
+                    frp_core::transport::set_send_recv_buffer(
+                        &stream,
+                        self.state.tcp_send_buffer_size,
+                        self.state.tcp_recv_buffer_size,
+                    );
                     let state = self.state.clone();
 
                     let permit = state.conn_semaphore.as_ref()

@@ -269,6 +269,9 @@ async fn run_udp_work_conn(
     };
     let reader = async move {
         debug!(proxy_name = %reader_name, "UDP work conn reader task started for '{}'", reader_name);
+        // Reusable payload buffer for the V2 UDP read path (avoids a heap
+        // alloc per UDP packet).
+        let mut scratch: Vec<u8> = Vec::new();
         loop {
             let result = tokio::select! {
                 biased;
@@ -279,7 +282,7 @@ async fn run_udp_work_conn(
                 }
                 result = async {
                     if v2 {
-                        read_msg_v2_with_udp_codec(&mut w_r, udp_codec_opt).await
+                        read_msg_v2_with_udp_codec(&mut w_r, udp_codec_opt, &mut scratch).await
                     } else {
                         read_msg_v1(&mut w_r).await
                     }
@@ -1204,11 +1207,16 @@ async fn run_sudp_message_bridge(
     let proxy_name = req.proxy_name.clone();
 
     // Direction 1: visitor → provider. Ping is dropped (Go
-    // bridgeSUDPVisitorToProxy).
+    // bridgeSUDPVisitorToProxy). Traffic is accumulated locally and reported
+    // once after the loop (metrics.record_traffic does an atomic add + a
+    // clock_gettime day-bookkeeping on every call).
     let visitor_to_provider = async {
+        // Reusable payload buffer for the V2 UDP read path.
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut fwd_in: u64 = 0;
         loop {
             let read = if visitor_v2 {
-                read_msg_v2_with_udp_codec(&mut v_r, visitor_codec_opt).await
+                read_msg_v2_with_udp_codec(&mut v_r, visitor_codec_opt, &mut scratch).await
             } else {
                 read_msg_v1(&mut v_r).await
             };
@@ -1226,7 +1234,7 @@ async fn run_sudp_message_bridge(
             };
             match &msg {
                 FrpMessage::UDPPacket(pkt) => {
-                    metrics.record_traffic(pkt.content.len() as u64, 0);
+                    fwd_in += pkt.content.len() as u64;
                 }
                 FrpMessage::Ping(_) | FrpMessage::Pong(_) => {
                     // Go drops SUDP pings on the visitor→proxy leg.
@@ -1257,14 +1265,20 @@ async fn run_sudp_message_bridge(
                 break;
             }
         }
+        metrics.record_traffic(fwd_in, 0);
     };
 
     // Direction 2: provider → visitor. Ping is forwarded (Go
-    // bridgeSUDPProxyToVisitor).
+    // bridgeSUDPProxyToVisitor). Traffic is accumulated locally and reported
+    // once after the loop, mirroring direction 1.
     let provider_to_visitor = async {
+        // Reusable payload buffer for the V2 UDP read path (own buffer; the
+        // two directions run concurrently via tokio::join!).
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut fwd_out: u64 = 0;
         loop {
             let read = if provider_v2 {
-                read_msg_v2_with_udp_codec(&mut w_r, provider_codec_opt).await
+                read_msg_v2_with_udp_codec(&mut w_r, provider_codec_opt, &mut scratch).await
             } else {
                 read_msg_v1(&mut w_r).await
             };
@@ -1282,7 +1296,7 @@ async fn run_sudp_message_bridge(
             };
             match &msg {
                 FrpMessage::UDPPacket(pkt) => {
-                    metrics.record_traffic(0, pkt.content.len() as u64);
+                    fwd_out += pkt.content.len() as u64;
                 }
                 FrpMessage::Ping(_) => {
                     // Go forwards SUDP pings provider→visitor
@@ -1319,6 +1333,7 @@ async fn run_sudp_message_bridge(
                 break;
             }
         }
+        metrics.record_traffic(0, fwd_out);
     };
 
     tokio::join!(visitor_to_provider, provider_to_visitor);

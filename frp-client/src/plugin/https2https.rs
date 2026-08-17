@@ -65,7 +65,7 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
     let tls_acceptor = build_tls_acceptor_with_alpn(&cfg.crt_file, &cfg.key_file, None, alpn)?;
     // Go frp compat (https2https.go:45): the HTTPS backend is connected with
     // InsecureSkipVerify — frp does not validate the backend certificate.
-    let tls_connector = build_tls_connector_skip_verify(None, None, None).map_err(|e| {
+    let tls_connector = build_tls_connector_skip_verify(None, None, None, false).map_err(|e| {
         frp_core::Error::Transport(format!("https2https plugin: TLS connector: {e}").into())
     })?;
     let (backend_host, backend_port) = split_host_port(&target_addr);
