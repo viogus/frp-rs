@@ -4,9 +4,10 @@
 //! call. Under high proxy connection churn, this creates sustained allocator
 //! pressure. This pool recycles those buffers.
 //!
-//! Thread-safe (crossbeam lock-free `ArrayQueue` — the bridge hot path takes
-//! one acquire + one release per chunk, and concurrent releases during
-//! connection churn must not serialize on a mutex). Fixed capacity:
+//! Thread-safe (crossbeam lock-free `ArrayQueue` — the bridge acquires one
+//! guard per connection (reused across all chunks of that bridge), and
+//! concurrent releases during connection churn must not serialize on a
+//! mutex). Fixed capacity:
 //! `MAX_POOLED_BUFFERS` (128, env-overridable via `FRP_BRIDGE_POOL_MAX`).
 //! Excess buffers are dropped.
 
