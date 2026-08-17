@@ -42,6 +42,23 @@ type Aes128CfbDec = cfb_mode::Decryptor<aes::Aes128>;
 #[cfg(feature = "compression")]
 const MAX_DECOMPRESSED_OUTPUT: usize = 1024 * 1024;
 
+/// Maximum wire chunk length (4-byte header + body) accepted by the
+/// streaming decompressor, in bytes. A single chunk can declare at most
+/// 128 KiB of decompressed output.
+#[cfg(feature = "compression")]
+const MAX_SNAPPY_CHUNK: usize = 128 * 1024;
+/// Cap on bytes retained in the pending buffer across feed calls.
+#[cfg(feature = "compression")]
+const MAX_SNAPPY_PENDING: usize = 16 * 1024 * 1024;
+/// Maximum number of frames processed per feed call (bounded work budget).
+#[cfg(feature = "compression")]
+const MAX_FRAMES_PER_CALL: usize = 1024;
+/// Snappy frame-format block size: the compressor splits input into blocks
+/// of this size, one frame per block (matches Go frp's `golang/snappy` and
+/// the `snap` crate, which both use 65536-byte blocks).
+#[cfg(feature = "compression")]
+const SNAPPY_BLOCK_SIZE: usize = 64 * 1024;
+
 /// Derive an AES-128 key from a token using PBKDF2-SHA1.
 /// Matches Go frp v0.69.1 binary: pbkdf2.Key(token, "frp", 64, 16, sha1.New)
 ///
@@ -129,21 +146,35 @@ pub fn compress_into(data: &[u8], buf: &mut Vec<u8>) -> Result<(), String> {
 
 /// Reusable Snappy stream compressor for high-throughput data-plane paths.
 ///
-/// The wrapped [`snap::write::FrameEncoder`] is created once for the
-/// connection lifetime and reused across chunks, eliminating the ~128 KiB
-/// allocation (64 KiB source buffer + 64 KiB destination scratch) the encoder
-/// pays on every construction.
+/// Frames are written directly by this struct: each ≤64 KiB block is
+/// compressed with a reused [`snap::raw::Encoder`] (its hash table is
+/// heap-allocated once and zeroed per block — no per-chunk allocation),
+/// checksummed with the in-tree [`crate::crc32c`] module, and the frame is
+/// appended straight into the caller's `out` buffer. Steady-state
+/// compression therefore performs no heap allocation and copies only the
+/// compressed bytes once per block (versus the `snap::write::FrameEncoder`
+/// path, which additionally staged the input through its 64 KiB source
+/// buffer on every chunk).
 ///
-/// Wire format: the 10-byte `sNaPpY` stream identifier is emitted only by the
-/// first compressed chunk; subsequent chunks are plain Snappy data frames.
-/// This is valid Snappy stream framing — the identifier may legally appear
-/// once, at stream start — and is byte-compatible with both the per-chunk
-/// [`compress_into`] output (which repeats the identifier on every chunk) and
-/// Go frp's `snappy.Writer` output. Streaming decoders such as
-/// [`SnappyDecompressor`] and Go's `snappy.Reader` accept either form.
+/// Wire format: the 10-byte `sNaPpY` stream identifier is emitted once,
+/// before the first frame that carries data; subsequent chunks are plain
+/// Snappy data frames. This is valid Snappy stream framing (the identifier
+/// may legally appear once, at stream start, or before every chunk) and is
+/// verified byte-for-byte against `snap::write::FrameEncoder` output in the
+/// byte-parity tests. Streaming decoders such as [`SnappyDecompressor`] and
+/// Go's `snappy.Reader` accept either form. Like snap's reference encoder,
+/// an empty input emits nothing at all.
 #[cfg(feature = "compression")]
 pub struct SnappyCompressor {
-    encoder: snap::write::FrameEncoder<Vec<u8>>,
+    /// Raw Snappy block encoder, reused across chunks. Its internal hash
+    /// table is allocated once on first use and reused for every block.
+    encoder: snap::raw::Encoder,
+    /// Scratch buffer for one compressed block
+    /// (`snap::raw::max_compress_len(64 KiB)` = 76490 bytes), sized once and
+    /// reused so the per-chunk resize cost is paid a single time.
+    scratch: Vec<u8>,
+    /// Whether the 0xFF `sNaPpY` stream identifier has been emitted.
+    ident_emitted: bool,
 }
 
 #[cfg(feature = "compression")]
@@ -157,26 +188,71 @@ impl Default for SnappyCompressor {
 impl SnappyCompressor {
     pub fn new() -> Self {
         Self {
-            encoder: snap::write::FrameEncoder::new(Vec::new()),
+            encoder: snap::raw::Encoder::new(),
+            scratch: Vec::new(),
+            ident_emitted: false,
         }
     }
 
     /// Compress `data`, replacing the contents of `out` with the framed
     /// output.
     ///
-    /// The encoder's internal sink is swapped with the caller's `out`
-    /// allocation, so both buffers keep their capacity and steady-state
-    /// compression performs no heap allocation per chunk.
+    /// `out` is cleared and refilled; its allocation is retained (and grown
+    /// once to the worst-case compressed size) so steady-state compression
+    /// performs no heap allocation per chunk. The stream identifier is
+    /// emitted once, before the first frame that carries data — a later
+    /// chunk with empty `data` writes nothing, exactly like the reference
+    /// encoders.
     pub fn compress(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
-        use std::io::Write;
-        self.encoder.get_mut().clear();
-        self.encoder
-            .write_all(data)
-            .map_err(|e| format!("snappy compress: {e}"))?;
-        self.encoder
-            .flush()
-            .map_err(|e| format!("snappy flush: {e}"))?;
-        std::mem::swap(out, self.encoder.get_mut());
+        out.clear();
+        // Worst case: 10-byte stream identifier + 8-byte headers (type,
+        // 24-bit length, masked CRC) + raw bodies. `len + len/6` covers the
+        // per-block headers for any number of 64 KiB blocks; 32 covers the
+        // identifier and small-input slack. (snap uses the same bound for
+        // its 76490-byte compressed-block buffer.)
+        out.reserve(32 + data.len() + data.len() / 6);
+        if data.is_empty() {
+            // No frames → nothing to write. Go's snappy.Writer and snap's
+            // FrameEncoder also defer the stream identifier until the first
+            // frame with actual data.
+            return Ok(());
+        }
+        if !self.ident_emitted {
+            out.extend_from_slice(b"\xff\x06\x00\x00sNaPpY");
+            self.ident_emitted = true;
+        }
+        if self.scratch.len() < snap::raw::max_compress_len(SNAPPY_BLOCK_SIZE) {
+            self.scratch
+                .resize(snap::raw::max_compress_len(SNAPPY_BLOCK_SIZE), 0);
+        }
+        for block in data.chunks(SNAPPY_BLOCK_SIZE) {
+            let checksum = crate::crc32c::crc32c_masked(block);
+            let compress_len = self
+                .encoder
+                .compress(block, &mut self.scratch)
+                .map_err(|e| format!("snappy compress: {e}"))?;
+            if compress_len >= block.len() - block.len() / 8 {
+                // Compression did not win (snap's compress_frame threshold):
+                // emit an uncompressed frame — body = masked CRC + raw block.
+                out.extend_from_slice(&[
+                    0x01,
+                    ((block.len() + 4) & 0xff) as u8,
+                    (((block.len() + 4) >> 8) & 0xff) as u8,
+                    (((block.len() + 4) >> 16) & 0xff) as u8,
+                ]);
+                out.extend_from_slice(&checksum.to_le_bytes());
+                out.extend_from_slice(block);
+            } else {
+                out.extend_from_slice(&[
+                    0x00,
+                    ((compress_len + 4) & 0xff) as u8,
+                    (((compress_len + 4) >> 8) & 0xff) as u8,
+                    (((compress_len + 4) >> 16) & 0xff) as u8,
+                ]);
+                out.extend_from_slice(&checksum.to_le_bytes());
+                out.extend_from_slice(&self.scratch[..compress_len]);
+            }
+        }
         Ok(())
     }
 }
@@ -370,9 +446,22 @@ impl SnappyDecompressor {
     }
 
     fn feed_into_step(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
-        const MAX_SNAPPY_CHUNK: usize = 128 * 1024;
-        const MAX_SNAPPY_PENDING: usize = 16 * 1024 * 1024;
-        const MAX_FRAMES_PER_CALL: usize = 1024;
+        // Fast path: with nothing pending, frames are parsed directly from
+        // `data` — at most one data frame is decoded straight into `out` and
+        // only the untouched tail is staged into `self.buf`. This eliminates
+        // the staging copy (input → buf) and the scratch copy (decode → out)
+        // the staged path pays on every frame. The fast path runs before the
+        // drain below; its empty-`buf` precondition makes that compaction
+        // unnecessary. Any incomplete frame, pending bytes, or error falls
+        // through to the staged path unchanged (state is untouched on
+        // fall-through and on error).
+        if self.offset == 0
+            && self.buf.is_empty()
+            && !data.is_empty()
+            && self.feed_into_step_fast(data, out)?
+        {
+            return Ok(());
+        }
 
         // Note: `out` is *not* cleared here. Callers decide replace vs append
         // semantics: feed_into_progress clears before calling, while
@@ -512,6 +601,132 @@ impl SnappyDecompressor {
             self.offset = 0;
         }
 
+        Ok(())
+    }
+
+    /// Fast path: parse frames directly from `data` when nothing is pending
+    /// (`self.offset == 0 && self.buf.is_empty()` — the caller's precondition).
+    ///
+    /// Consumes metadata frames (0xFF identifier, 0xFE padding, 0x80-0xFD
+    /// skippable) within the shared [`MAX_FRAMES_PER_CALL`] budget, then
+    /// processes the first complete data frame (0x00 or 0x01) zero-copy:
+    /// uncompressed data is extended straight from `data`, compressed data is
+    /// decoded directly into `out`'s tail. The untouched remainder is staged
+    /// into `self.buf` (offset stays 0) so the next drain call continues from
+    /// it.
+    ///
+    /// Returns `Ok(true)` when the call was fully handled. Returns `Ok(false)`
+    /// when `data` does not contain a complete frame at the first unprocessed
+    /// position — nothing has been mutated, so the caller falls through to the
+    /// staged path. On `Err` the error mirrors the staged path's messages,
+    /// `out` is truncated back to its entry length, and no state was mutated.
+    fn feed_into_step_fast(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<bool, String> {
+        let mut remaining = data;
+        for _ in 0..MAX_FRAMES_PER_CALL {
+            if remaining.len() < 4 {
+                // Partial frame header — the staged path must handle it.
+                return Ok(false);
+            }
+            let chunk_type = remaining[0];
+            let chunk_len =
+                u32::from_le_bytes([remaining[1], remaining[2], remaining[3], 0]) as usize;
+            if chunk_len > MAX_SNAPPY_CHUNK {
+                return Err(format!(
+                    "snappy: chunk length {chunk_len} exceeds {MAX_SNAPPY_CHUNK} byte limit"
+                ));
+            }
+            let total = 4 + chunk_len;
+            if remaining.len() < total {
+                // Complete header but partial body — staged path tops it up.
+                return Ok(false);
+            }
+            match chunk_type {
+                0x00 => {
+                    // Compressed data: length field includes 4-byte CRC.
+                    // CRC32C is intentionally not verified — same documented
+                    // divergence as the staged path (encrypted-tunnel
+                    // integrity argument; the field is still consumed so
+                    // framing stays aligned).
+                    if chunk_len < 4 {
+                        return Err("snappy: compressed chunk length too small".into());
+                    }
+                    let compressed = &remaining[8..total];
+                    let decompressed_len = snap::raw::decompress_len(compressed)
+                        .map_err(|e| format!("snappy decompress: {e}"))?;
+                    if decompressed_len > MAX_SNAPPY_CHUNK {
+                        return Err(format!(
+                            "snappy: decompressed output {decompressed_len} exceeds per-chunk {MAX_SNAPPY_CHUNK} byte limit"
+                        ));
+                    }
+                    let old = out.len();
+                    out.resize(old + decompressed_len, 0);
+                    let mut decoder = snap::raw::Decoder::new();
+                    let written = match decoder.decompress(compressed, &mut out[old..]) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            out.truncate(old);
+                            return Err(format!("snappy decompress: {e}"));
+                        }
+                    };
+                    if written != decompressed_len {
+                        out.truncate(old);
+                        return Err("snappy: decompressed output length changed".into());
+                    }
+                    if let Err(e) = self.stage_remainder(&remaining[total..]) {
+                        out.truncate(old);
+                        return Err(e);
+                    }
+                    return Ok(true);
+                }
+                0x01 => {
+                    // Uncompressed data: length field includes 4-byte CRC.
+                    // CRC32C is intentionally not verified — same rationale
+                    // as the compressed arm above.
+                    if chunk_len < 4 {
+                        return Err("snappy: uncompressed chunk length too small".into());
+                    }
+                    let old = out.len();
+                    out.extend_from_slice(&remaining[8..total]);
+                    if let Err(e) = self.stage_remainder(&remaining[total..]) {
+                        out.truncate(old);
+                        return Err(e);
+                    }
+                    return Ok(true);
+                }
+                0xFF => {
+                    // Stream identifier: 4-byte header + body, NO CRC.
+                    let body = &remaining[4..total];
+                    if body != b"sNaPpY" {
+                        return Err(format!("snappy: bad stream identifier: {:?}", body));
+                    }
+                }
+                t if (0x02..=0x7F).contains(&t) => {
+                    // Reserved unskippable chunk — spec says return error.
+                    return Err(format!("snappy: reserved unskippable chunk type 0x{t:02x}"));
+                }
+                _ => {
+                    // Padding (0xFE) and reserved skippable (0x80-0xFD).
+                    // No CRC for these types.
+                }
+            }
+            remaining = &remaining[total..];
+        }
+        // Metadata work budget exhausted — stage what remains so the next
+        // drain call continues with bounded forward progress per call.
+        self.stage_remainder(remaining)?;
+        Ok(true)
+    }
+
+    /// Stage `remaining` bytes as the new pending buffer (offset back to 0).
+    /// Mirrors the staged path's pending-buffer cap; errors before mutating
+    /// any state.
+    fn stage_remainder(&mut self, remaining: &[u8]) -> Result<(), String> {
+        if remaining.len() > MAX_SNAPPY_PENDING {
+            return Err("snappy decompression buffer exhausted".into());
+        }
+        self.buf.clear();
+        self.buf.extend_from_slice(remaining);
+        self.offset = 0;
         Ok(())
     }
 
@@ -704,6 +919,124 @@ mod tests {
             reconstructed,
             b"first-chunk-datasecond-chunk-datathird-chunk-data"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_compressor_matches_frame_encoder_byte_for_byte() {
+        // Mode (a): our compressor wraps the same snap::raw::Encoder that
+        // FrameEncoder uses internally, plus our own framing and CRC32C, so
+        // the output must be byte-identical to snap's reference framing —
+        // 64 KiB chunk boundaries, the compressed/uncompressed decision
+        // (comp_len >= len - len/8), masked CRC, and the once-per-stream
+        // identifier. This is the ground-truth check for both the CRC and
+        // the frame format.
+        use snap::write::FrameEncoder;
+        use std::io::Write;
+
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut pseudo = |n: usize| -> Vec<u8> {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                v.push(x as u8);
+            }
+            v
+        };
+
+        let cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0x5a],
+            pseudo(64),
+            pseudo(1000),
+            vec![0u8; 65535],
+            vec![0u8; 65536],
+            vec![0u8; 65537],
+            pseudo(65535),
+            pseudo(65536),
+            pseudo(65537),
+            vec![0u8; 100_000],
+            pseudo(300_000),
+        ];
+
+        for input in cases {
+            let mut ours = SnappyCompressor::new();
+            let mut our_out = Vec::new();
+            ours.compress(&input, &mut our_out).unwrap();
+
+            let mut reference = Vec::new();
+            let mut enc = FrameEncoder::new(&mut reference);
+            enc.write_all(&input).unwrap();
+            enc.into_inner().unwrap();
+
+            assert_eq!(
+                our_out,
+                reference,
+                "byte parity with snap FrameEncoder for {} bytes",
+                input.len()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_compressor_multi_chunk_matches_fresh_frame_encoders() {
+        // Each compress call must behave like a fresh FrameEncoder fed that
+        // chunk alone (both emit the identifier on their first frame),
+        // while the compressor itself emits the identifier only once across
+        // its lifetime — the stream-level identifier behavior is covered by
+        // snappy_compressor_reuses_encoder_and_roundtrips_across_chunks.
+        use snap::write::FrameEncoder;
+        use std::io::Write;
+
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let mut pseudo = |n: usize| -> Vec<u8> {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                v.push(x as u8);
+            }
+            v
+        };
+
+        let chunks = [
+            b"chunk-one-data".as_slice(),
+            &pseudo(30_000),
+            &pseudo(70_000),
+            b"".as_slice(),
+            &pseudo(65_536),
+        ];
+        let mut comp = SnappyCompressor::new();
+        for input in chunks {
+            let mut our_out = Vec::new();
+            comp.compress(input, &mut our_out).unwrap();
+
+            let mut reference = Vec::new();
+            let mut enc = FrameEncoder::new(&mut reference);
+            enc.write_all(input).unwrap();
+            enc.into_inner().unwrap();
+
+            // The reused compressor emits the stream identifier only on its
+            // first frame; a fresh FrameEncoder emits one per stream. Strip
+            // the reference's identifier when ours did not emit one for this
+            // chunk (an empty chunk emits nothing on either side).
+            if !our_out.starts_with(b"\xff\x06\x00\x00sNaPpY") {
+                if let Some(stripped) = reference.strip_prefix(b"\xff\x06\x00\x00sNaPpY") {
+                    reference = stripped.to_vec();
+                }
+            }
+
+            assert_eq!(
+                our_out,
+                reference,
+                "byte parity for chunk of {} bytes",
+                input.len()
+            );
+        }
     }
 
     #[test]
