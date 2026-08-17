@@ -239,8 +239,8 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
                 tracing::debug!(error = %e, "bridge user_to_work: write error (compressed)");
                 break;
             }
-            // comp_buf is swapped with the compressor's internal sink on the
-            // next compress call, so its capacity is retained across chunks.
+            // comp_buf is cleared and refilled on each compress call, so its
+            // capacity is retained across chunks.
         } else {
             let slice = &mut buf.as_mut_slice()[..n];
             if let Some(ref mut lim) = write_limiter {
