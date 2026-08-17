@@ -1,9 +1,12 @@
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, warn};
+
+use futures_util::FutureExt;
 
 use frp_core::bandwidth::BandwidthLimiter;
 use frp_core::buffer_pool::BUFFER_SIZE;
@@ -1452,18 +1455,21 @@ pub(crate) async fn assign_work_to_proxy(
     // Spawn the bridge; select against the server shutdown token so a
     // graceful shutdown can interrupt half-open idle bridges instead of
     // waiting on TCP keepalive (2h) or yamux keepalive (90s) — audit D2-4.
-    // The outer task is fire-and-forget (bridges are connection-bounded and
-    // self-terminate; shutdown just accelerates teardown); the inner
-    // JoinHandle is awaited only to surface panics (audit round 5, MEDIUM).
+    // ONE task per bridged connection instead of the old nested spawn whose
+    // JoinHandle was awaited only to extract the panic payload (audit round
+    // 5, MEDIUM): the select is polled in-place and panics are surfaced via
+    // catch_unwind, halving the task allocations and wakeup registrations.
+    // The task is fire-and-forget (bridges are connection-bounded and
+    // self-terminate; shutdown just accelerates teardown). Note: in the
+    // release panic=abort profile the panic aborts before catch_unwind
+    // fires — exactly as the old JoinHandle-await also never fired there;
+    // in unwinding builds (tests) the payload still reaches log_bridge_panic
+    // and the RAII ConnGuard still releases the slot during unwind.
     let shutdown = state.shutdown_token.clone();
     let state_for_bridge = state.clone();
     let log_proxy_name = req.proxy_name.clone();
     tokio::spawn(async move {
-        // Await the bridge's JoinHandle instead of dropping it: if the task
-        // panics, JoinError carries the panic payload (audit round 5, MEDIUM).
-        // The RAII ConnGuard still releases the slot during unwind; this just
-        // preserves the panic cause in the logs.
-        let handle = tokio::spawn(async move {
+        let fut = async {
             tokio::select! {
                 _ = run_work_bridge(
                     work_conn,
@@ -1477,11 +1483,9 @@ pub(crate) async fn assign_work_to_proxy(
                 ) => {}
                 _ = shutdown.cancelled() => {}
             }
-        });
-        if let Err(e) = handle.await {
-            if e.is_panic() {
-                log_bridge_panic(&log_proxy_name, "bridge", e.into_panic());
-            }
+        };
+        if let Err(p) = AssertUnwindSafe(fut).catch_unwind().await {
+            log_bridge_panic(&log_proxy_name, "bridge", p);
         }
     });
     Ok(())

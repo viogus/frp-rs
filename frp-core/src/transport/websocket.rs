@@ -8,13 +8,16 @@
 //! 2026-08-09 (audit D1-1/D1-2/D1-3): it had no callers, and the manual
 //! path reuses buffers across frames (no per-frame allocation).
 
+use std::any::Any;
 use std::io;
+use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
-use super::{AsyncReadWrite, Transport};
+use super::{AsyncReadWrite, IoStream, Transport};
 
 /// Maximum WebSocket frame payload accepted by the raw decoder. The V2
 /// framing layer permits 64 KiB messages, so the transport must not clamp
@@ -45,6 +48,21 @@ pub struct WsByteStream {
     write_buf: Vec<u8>,
     write_pos: usize,
     needs_flush: bool,
+    /// Payload length of the frame currently held in `write_buf` (i.e. the
+    /// frame being drained after a partial write). A frame only enters
+    /// `write_buf` via a partial write of the caller's current buf, and the
+    /// AsyncWrite contract mandates that the caller re-polls with that same
+    /// buf until `poll_write` returns `Ok` — so the caller's buf IS the
+    /// payload of the frame being drained. The drain completion reports this
+    /// length as the bytes consumed; the payload must never be re-sent as a
+    /// fresh frame (that was the duplicate-frame bug).
+    pending_frame_payload_len: usize,
+    /// Set when a drain completes inside `poll_flush`, which cannot consume
+    /// the caller's buf (it has no buf argument). The next `poll_write` sees
+    /// this first and consumes the caller's re-polled buf by returning
+    /// `pending_frame_payload_len` — completing the frame without re-sending
+    /// its payload.
+    drain_completed: bool,
     /// When true, outgoing frames are masked (RFC 6455 §5.3 — client requirement).
     client_mode: bool,
     /// State machine for incremental WebSocket frame reads (Raw variant).
@@ -107,6 +125,44 @@ impl WsByteStream {
             frame.extend_from_slice(buf);
         }
     }
+
+    /// Encode the server-mode (unmasked) frame header for a payload of `len`
+    /// bytes into `hdr` (capacity ≥ 10) and return its length: 2 bytes for
+    /// `len < 126`, 4 for `len <= 65535`, 10 otherwise (RFC 6455 §5.2).
+    /// Mirrors the server branch of [`build_frame_into`] so the zero-copy
+    /// fast path emits byte-identical frames without touching write_buf.
+    fn build_server_frame_header(hdr: &mut [u8; 10], len: usize) -> usize {
+        hdr[0] = 0x82; // FIN + BINARY opcode
+        if len < 126 {
+            hdr[1] = len as u8;
+            2
+        } else if len <= 65535 {
+            hdr[1] = 126;
+            hdr[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+            4
+        } else {
+            hdr[1] = 127;
+            hdr[2..10].copy_from_slice(&(len as u64).to_be_bytes());
+            10
+        }
+    }
+}
+
+/// Downcast the erased inner stream to a raw `TcpStream`, if the innermost
+/// transport is raw TCP — the same downcast the splice(2) fast path uses
+/// (`IoStream::try_tcp_mut`, which returns `None` for TLS/QUIC/KCP-wrapped
+/// streams and for the leftover-`BufferedRead` accept variant). Server
+/// accept paths box an `IoStream`, so the erased `Box<dyn AsyncReadWrite>`
+/// is peeled via `Any` first (the trait is `'static`); client-side
+/// `PrependStream` boxes yield `None`, which is fine — the client path never
+/// uses this.
+fn inner_tcp_mut(inner: &mut Box<dyn AsyncReadWrite>) -> Option<&mut TcpStream> {
+    // Trait upcast `dyn AsyncReadWrite` → `dyn Any` (supertrait; trait
+    // upcasting is stable since Rust 1.86), then downcast to the concrete
+    // `IoStream` the accept paths boxed.
+    let any: &mut dyn Any = &mut **inner;
+    any.downcast_mut::<IoStream>()
+        .and_then(|io| io.try_tcp_mut())
 }
 
 /// XOR a payload with an RFC 6455 masking key.
@@ -231,6 +287,8 @@ impl WsByteStream {
             write_buf: Vec::new(),
             write_pos: 0,
             needs_flush: false,
+            pending_frame_payload_len: 0,
+            drain_completed: false,
             client_mode,
             raw_read_state: RawReadState::Idle,
             raw_frame_opcode: 0,
@@ -273,6 +331,8 @@ impl AsyncRead for WsByteStream {
             write_buf: _,
             write_pos: _,
             needs_flush: _,
+            pending_frame_payload_len: _,
+            drain_completed: _,
             client_mode: _,
             raw_read_state,
             raw_frame_opcode,
@@ -607,17 +667,89 @@ impl AsyncWrite for WsByteStream {
             write_buf,
             write_pos,
             needs_flush,
+            pending_frame_payload_len,
+            drain_completed,
             client_mode,
             ..
         } = this;
 
         let raw = inner;
         {
+            // A drain completed inside a previous poll_flush, which cannot
+            // consume the caller's buf. The buf the caller re-polls with IS
+            // the payload of the frame that just drained — consume it by
+            // reporting the recorded payload length. Never re-send it as a
+            // fresh frame: the peer already received that payload (re-sending
+            // was the duplicate-frame bug).
+            if *drain_completed {
+                *drain_completed = false;
+                // Invariant: the re-polled buf is the payload of the drained
+                // frame (every in-tree caller honors the same-buf-until-Ok
+                // AsyncWrite contract). Self-check in debug builds.
+                debug_assert_eq!(buf.len(), *pending_frame_payload_len);
+                return Poll::Ready(Ok(*pending_frame_payload_len));
+            }
             if !*needs_flush && !buf.is_empty() {
+                // Server-mode zero-copy fast path: no masking, so the payload
+                // never needs in-place mutation — emit [frame header, payload]
+                // as two iovecs straight to the raw TcpStream (real writev),
+                // skipping the per-chunk memcpy of the payload into write_buf
+                // (32 KiB per bridge chunk). The downcast is the same one the
+                // splice(2) fast path uses; TLS/QUIC/KCP-wrapped WS (and the
+                // leftover-BufferedRead accept variant) fall through to the
+                // combined-buffer path below. The writev goes DIRECTLY on the
+                // downcast TcpStream, never on the IoStream wrapper — its
+                // default poll_write_vectored writes only the first non-empty
+                // iovec.
+                if !*client_mode {
+                    if let Some(tcp) = inner_tcp_mut(raw) {
+                        let mut hdr = [0u8; 10];
+                        let hdr_len = WsByteStream::build_server_frame_header(&mut hdr, buf.len());
+                        let iovecs = [IoSlice::new(&hdr[..hdr_len]), IoSlice::new(buf)];
+                        return match Pin::new(tcp).poll_write_vectored(cx, &iovecs) {
+                            Poll::Ready(Ok(n)) if n >= hdr_len + buf.len() => {
+                                // Full frame accepted. Return the *input* bytes
+                                // consumed (buf.len()), per the AsyncWrite
+                                // contract — the WS frame overhead is not part
+                                // of the stream.
+                                Poll::Ready(Ok(buf.len()))
+                            }
+                            Poll::Ready(Ok(n)) => {
+                                // Partial write (rare): the frame is split
+                                // across the wire; retain the unwritten tail in
+                                // write_buf and hand off to the existing
+                                // needs_flush machinery — the next poll drains
+                                // write_buf via the unchanged path below (one
+                                // memcpy of the remainder only, not the whole
+                                // chunk). Record the frame's payload length so
+                                // the drain completion can consume the caller's
+                                // re-polled buf (which IS this payload) instead
+                                // of re-sending it as a new frame.
+                                write_buf.clear();
+                                if n < hdr_len {
+                                    write_buf.extend_from_slice(&hdr[n..hdr_len]);
+                                    write_buf.extend_from_slice(buf);
+                                } else {
+                                    write_buf.extend_from_slice(&buf[n - hdr_len..]);
+                                }
+                                *pending_frame_payload_len = buf.len();
+                                *write_pos = 0;
+                                *needs_flush = true;
+                                cx.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                            Poll::Pending => Poll::Pending,
+                        };
+                    }
+                }
                 // Build the frame directly into write_buf (capacity reused
                 // across chunks — no per-chunk frame allocation), then try
-                // to flush it immediately.
+                // to flush it immediately. Record the frame's payload length
+                // (the caller's buf) so a partial write's drain completion
+                // can consume the re-polled buf instead of re-sending it.
                 WsByteStream::build_frame_into(write_buf, buf, *client_mode);
+                *pending_frame_payload_len = buf.len();
                 match Pin::new(raw.as_mut()).poll_write(cx, write_buf) {
                     Poll::Ready(Ok(n)) if n >= write_buf.len() => {
                         write_buf.clear(); // keep capacity for next chunk
@@ -640,12 +772,15 @@ impl AsyncWrite for WsByteStream {
                     }
                 }
             } else if *needs_flush {
-                // Continue writing a partially-flushed frame. When the old
-                // frame finishes, the CURRENT buf has NOT been written — it
-                // must not be reported as written (returning Ok(buf.len())
-                // here would make write_all drop it → data loss). Return
-                // Pending; the caller re-polls with the same buf, which then
-                // builds and writes a fresh frame.
+                // Continue writing a partially-flushed frame. A frame enters
+                // write_buf only via a partial write of the caller's current
+                // buf, and AsyncWrite mandates that the caller re-polls with
+                // that same buf until poll_write returns Ok — so the buf IS
+                // the payload of the frame being drained. When the drain
+                // completes, report the recorded payload length as the bytes
+                // consumed (this consumes the caller's buf). Re-building a
+                // fresh frame from the same buf would deliver the payload to
+                // the peer TWICE — the duplicate-frame bug this fix removes.
                 let remaining = &write_buf[*write_pos..];
                 match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
                     Poll::Ready(Ok(0)) => {
@@ -655,21 +790,26 @@ impl AsyncWrite for WsByteStream {
                         // spin at 100% CPU until the inner makes progress.
                         // Mirrors CipherWriter's WriteZero handling.
                         *needs_flush = false;
+                        *drain_completed = false;
                         Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
                     }
                     Poll::Ready(Ok(n)) => {
                         *write_pos += n;
                         if *write_pos >= write_buf.len() {
+                            // The frame is fully on the wire — consume the
+                            // caller's re-polled buf directly (it is this
+                            // frame's payload).
                             *write_pos = 0;
                             *needs_flush = false;
-                            cx.waker().wake_by_ref();
+                            Poll::Ready(Ok(*pending_frame_payload_len))
                         } else {
                             cx.waker().wake_by_ref();
+                            Poll::Pending
                         }
-                        Poll::Pending
                     }
                     Poll::Ready(Err(e)) => {
                         *needs_flush = false;
+                        *drain_completed = false;
                         Poll::Ready(Err(e))
                     }
                     Poll::Pending => Poll::Pending,
@@ -688,6 +828,7 @@ impl AsyncWrite for WsByteStream {
             write_buf,
             write_pos,
             needs_flush,
+            drain_completed,
             ..
         } = this;
         let needs_flush_local = *needs_flush;
@@ -700,6 +841,7 @@ impl AsyncWrite for WsByteStream {
                     // progress on a non-empty remainder is a write-zero error,
                     // not a self-wake spin.
                     *needs_flush = false;
+                    *drain_completed = false;
                     Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
                 }
                 Poll::Ready(Ok(n)) => {
@@ -707,6 +849,11 @@ impl AsyncWrite for WsByteStream {
                     if *write_pos >= write_buf.len() {
                         *write_pos = 0;
                         *needs_flush = false;
+                        // poll_flush has no buf to consume, so record that
+                        // the frame completed; the next poll_write consumes
+                        // the caller's re-polled buf (returning the recorded
+                        // payload length) instead of re-sending it.
+                        *drain_completed = true;
                         Poll::Ready(Ok(()))
                     } else {
                         cx.waker().wake_by_ref();
@@ -715,6 +862,7 @@ impl AsyncWrite for WsByteStream {
                 }
                 Poll::Ready(Err(e)) => {
                     *needs_flush = false;
+                    *drain_completed = false;
                     Poll::Ready(Err(e))
                 }
                 Poll::Pending => Poll::Pending,
@@ -792,6 +940,84 @@ mod tests {
         // The transport frame cap must accept a full-size V2 frame plus the
         // AEAD overhead (tag + nonce), not just the plaintext cap.
         assert!(MAX_WS_FRAME_PAYLOAD >= crate::protocol::V2_MAX_FRAME_PAYLOAD as u64 + 128);
+    }
+
+    /// Real TCP socket pair (bind 127.0.0.1:0, connect, accept) — the
+    /// server-mode zero-copy fast path requires a raw TcpStream as the
+    /// innermost transport, so duplex streams won't exercise it.
+    async fn tcp_socket_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    /// All three server-mode header encodings (2/4/10 bytes) must be
+    /// byte-exact RFC 6455 unmasked frames.
+    #[test]
+    fn ws_server_frame_header_encoding() {
+        let mut hdr = [0u8; 10];
+        assert_eq!(WsByteStream::build_server_frame_header(&mut hdr, 0), 2);
+        assert_eq!(&hdr[..2], &[0x82, 0]);
+        assert_eq!(WsByteStream::build_server_frame_header(&mut hdr, 125), 2);
+        assert_eq!(&hdr[..2], &[0x82, 125]);
+        assert_eq!(WsByteStream::build_server_frame_header(&mut hdr, 126), 4);
+        assert_eq!(&hdr[..4], &[0x82, 126, 0x00, 126]);
+        assert_eq!(WsByteStream::build_server_frame_header(&mut hdr, 65535), 4);
+        assert_eq!(&hdr[..4], &[0x82, 126, 0xff, 0xff]);
+        assert_eq!(WsByteStream::build_server_frame_header(&mut hdr, 65536), 10);
+        assert_eq!(&hdr[..10], &[0x82, 127, 0, 0, 0, 0, 0, 1, 0, 0]);
+    }
+
+    /// MANDATORY frame-correctness check for the server-mode zero-copy
+    /// poll_write_vectored fast path: a WsByteStream over a real TcpStream
+    /// pair must emit the exact RFC 6455 unmasked server frame and report the
+    /// payload length as written. Covers the 2-byte header path (payload
+    /// < 126) and the 4-byte header path (126 <= payload <= 65535). The peer
+    /// reads concurrently so the frame reaches it even if the write splits.
+    #[tokio::test]
+    async fn ws_server_mode_fast_path_emits_exact_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 2-byte header path: payload < 126.
+        let (mut client, server) = tcp_socket_pair().await;
+        let mut ws = WsByteStream::from_raw(Box::new(IoStream::Tcp(server)), false);
+        let small = vec![0x11u8; 100];
+        let mut expected = vec![0x82, small.len() as u8];
+        expected.extend_from_slice(&small);
+        let expect_len = expected.len();
+        let reader = tokio::spawn(async move {
+            let mut got = vec![0u8; expect_len];
+            client.read_exact(&mut got).await.unwrap();
+            got
+        });
+        let n = ws.write(&small).await.unwrap();
+        assert_eq!(
+            n,
+            small.len(),
+            "write must report the payload bytes, not the frame bytes"
+        );
+        let got = reader.await.unwrap();
+        assert_eq!(&got, &expected, "peer must see the unmasked server frame");
+
+        // 4-byte header path: 126 <= payload <= 65535.
+        let (mut client, server) = tcp_socket_pair().await;
+        let mut ws = WsByteStream::from_raw(Box::new(IoStream::Tcp(server)), false);
+        let big = vec![0x22u8; 1000];
+        let mut expected = vec![0x82, 126];
+        expected.extend_from_slice(&(big.len() as u16).to_be_bytes());
+        expected.extend_from_slice(&big);
+        let expect_len = expected.len();
+        let reader = tokio::spawn(async move {
+            let mut got = vec![0u8; expect_len];
+            client.read_exact(&mut got).await.unwrap();
+            got
+        });
+        let n = ws.write(&big).await.unwrap();
+        assert_eq!(n, big.len());
+        let got = reader.await.unwrap();
+        assert_eq!(&got, &expected, "peer must see the unmasked server frame");
     }
 
     /// Go frps may send the first WS frame in the same TCP segment as the
@@ -1058,5 +1284,181 @@ mod tests {
             Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::WriteZero),
             other => panic!("expected WriteZero error, got {other:?}"),
         }
+    }
+
+    /// Regression test for the duplicate-frame bug: after a partial write,
+    /// the retained frame tail is drained to completion, and the caller's
+    /// re-polled buf (the SAME payload bytes) must be consumed — reported as
+    /// written — never re-sent as a fresh frame. The old code re-built a
+    /// frame from the re-polled buf after the drain completed, so the peer
+    /// received the payload twice (and for a buf larger than the socket
+    /// buffer, poll_write never returned Ok at all — the payload was re-sent
+    /// in an infinite duplicate loop).
+    ///
+    /// Real TCP pair with a small SO_SNDBUF on the writer side: the first
+    /// writev of a multi-MiB frame can only accept a few KiB, so the partial
+    /// write → retention → drain → completion → re-poll sequence is hit
+    /// deterministically. The peer must receive EXACTLY ONE unmasked server
+    /// frame.
+    #[tokio::test]
+    async fn ws_partial_write_drain_does_not_duplicate_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        // Server side (the writer) gets a 2 KiB SO_SNDBUF — set on the
+        // listening socket, which accepted sockets inherit on Linux; the
+        // kernel doubles it to ~4-8 KiB effective, far below the 4 MiB
+        // payload, so the first writev is always partial regardless of peer
+        // read timing.
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        sock.set_send_buffer_size(2048).unwrap();
+        let listener = sock.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut ws = WsByteStream::from_raw(Box::new(IoStream::Tcp(server)), false);
+
+        let payload = vec![0x5au8; 4 * 1024 * 1024];
+        // 4 MiB > 65535 → 10-byte extended-length header (0x82, 127, u64 len).
+        let expect_total = 10 + payload.len();
+        let wire_payload = payload.clone();
+
+        let writer = tokio::spawn(async move {
+            // Note: with the pre-fix code this future NEVER completes — the
+            // frame never fits the socket buffer, so poll_write keeps
+            // re-sending the payload as fresh frames and never returns Ok.
+            // The test does not await it: the reader's duplicate-evidence
+            // cap already has the answer, and runtime shutdown aborts it.
+            ws.write_all(&wire_payload).await.expect("ws write_all");
+            // ws drops here → FIN to the reader.
+        });
+
+        let received = timeout(Duration::from_secs(30), async {
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                match client.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break, // EOF: writer finished and closed
+                    Ok(n) => {
+                        received.extend_from_slice(&chunk[..n]);
+                        if received.len() >= 2 * expect_total {
+                            // Duplicate data arriving (pre-fix behavior) — no
+                            // need to read the infinite stream any further.
+                            break;
+                        }
+                    }
+                }
+            }
+            received
+        })
+        .await
+        .expect("reader must terminate");
+
+        // The writer must not be awaited: with the pre-fix code it hangs.
+        drop(writer);
+
+        assert_eq!(
+            received.len(),
+            expect_total,
+            "peer received {} bytes; expected exactly one frame ({} bytes) — \
+             the payload was sent more than once",
+            received.len(),
+            expect_total
+        );
+        // The single frame must parse as the exact unmasked server frame.
+        assert_eq!(received[..2], [0x82, 127], "FIN+BINARY, extended length");
+        assert_eq!(
+            u64::from_be_bytes(received[2..10].try_into().unwrap()),
+            payload.len() as u64
+        );
+        assert_eq!(&received[10..], &payload[..]);
+    }
+
+    /// The poll_flush drain-completion arm must set `drain_completed` so the
+    /// next poll_write consumes the caller's re-polled buf instead of
+    /// re-sending it. Deterministic unit version of the duplicate-frame
+    /// regression: a sink that accepts at most 7 bytes per poll forces the
+    /// partial write and a multi-poll drain; the re-polled buf must be
+    /// reported as written (Ok(32)) with exactly one frame on the wire.
+    #[test]
+    fn ws_poll_flush_drain_completion_consumes_repolled_buf() {
+        struct LimitedSink {
+            limit: usize,
+            sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl AsyncRead for LimitedSink {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for LimitedSink {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let n = buf.len().min(self.limit);
+                self.sent.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                Poll::Ready(Ok(n))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut ws = WsByteStream::from_raw(
+            Box::new(LimitedSink {
+                limit: 7,
+                sent: sent.clone(),
+            }),
+            false,
+        );
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let buf = vec![0x5au8; 32];
+
+        // Fresh frame write: 2-byte header + 32 payload = 34 frame bytes,
+        // but the sink accepts only 7 per poll → partial, needs_flush.
+        assert!(matches!(
+            Pin::new(&mut ws).poll_write(&mut cx, &buf),
+            Poll::Pending
+        ));
+
+        // Drain the retained frame to completion via poll_flush (re-polling
+        // after each Pending, as an executor would after the self-wake).
+        loop {
+            match Pin::new(&mut ws).poll_flush(&mut cx) {
+                Poll::Ready(Ok(())) => break,
+                Poll::Ready(Err(e)) => panic!("flush failed: {e}"),
+                Poll::Pending => {}
+            }
+        }
+
+        // The caller re-polls with the SAME buf: it must be consumed as the
+        // just-drained frame's payload — Ok(32) — not re-sent as a new frame.
+        match Pin::new(&mut ws).poll_write(&mut cx, &buf) {
+            Poll::Ready(Ok(n)) => assert_eq!(n, 32, "re-polled buf must be consumed"),
+            other => panic!("expected Ok(32) consuming the re-polled buf, got {other:?}"),
+        }
+
+        // Exactly one frame reached the wire: 2 header + 32 payload bytes.
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::Relaxed),
+            34,
+            "exactly one frame must be sent; the re-polled buf must not be re-sent"
+        );
     }
 }

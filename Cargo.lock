@@ -1247,6 +1247,7 @@ dependencies = [
  "dashmap",
  "frp-core",
  "frp-vnet",
+ "futures-util",
  "h2",
  "http",
  "jsonwebtoken",
