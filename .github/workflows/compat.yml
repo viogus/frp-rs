@@ -21,7 +21,7 @@ env:
 jobs:
   compat:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     strategy:
       fail-fast: false
 
@@ -64,3 +64,8 @@ jobs:
         env:
           GO_FRP_V2: "1"
         run: bash scripts/compat-test.sh --ci --go-version "$GO_FRP_VERSION"
+
+      - name: Protocol connectivity matrix
+        run: |
+          cargo build --release --manifest-path scripts/frp-stress/Cargo.toml
+          bash scripts/protocol-matrix.sh

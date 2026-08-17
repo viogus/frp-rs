@@ -322,6 +322,11 @@ impl AsyncRead for WsByteStream {
                             }
                             *filled += n;
                             if *filled < 2 {
+                                // Inner made progress but the header is
+                                // incomplete — same wake contract as the
+                                // payload arm: returning Pending here with no
+                                // registered waker parks the caller forever.
+                                cx.waker().wake_by_ref();
                                 return Poll::Pending;
                             }
                             let opcode = head[0] & 0x0f;
@@ -395,6 +400,8 @@ impl AsyncRead for WsByteStream {
                             }
                             *filled += n;
                             if *filled < 2 {
+                                // See the header arm: wake after progress.
+                                cx.waker().wake_by_ref();
                                 return Poll::Pending;
                             }
                             let payload_len = u16::from_be_bytes(*ext) as u64;
@@ -452,6 +459,8 @@ impl AsyncRead for WsByteStream {
                             }
                             *filled += n;
                             if *filled < 8 {
+                                // See the header arm: wake after progress.
+                                cx.waker().wake_by_ref();
                                 return Poll::Pending;
                             }
                             let payload_len = u64::from_be_bytes(*ext);
@@ -509,6 +518,8 @@ impl AsyncRead for WsByteStream {
                             }
                             *filled += n;
                             if *filled < 4 {
+                                // See the header arm: wake after progress.
+                                cx.waker().wake_by_ref();
                                 return Poll::Pending;
                             }
                             *raw_frame_mask_key = *mask_key;
@@ -554,6 +565,17 @@ impl AsyncRead for WsByteStream {
                             }
                             *filled += n;
                             if *filled < payload.len() {
+                                // Inner made progress (n > 0) but the frame
+                                // is incomplete. The inner layer returned
+                                // Ready without registering a waker (TLS may
+                                // have served this from buffered plaintext),
+                                // so returning Pending here would park the
+                                // caller with nothing to wake it. Self-wake
+                                // once: the re-poll consumes progress; if the
+                                // inner is truly idle it returns Pending and
+                                // registers its own waker. Bounded — one wake
+                                // per progress, no spin.
+                                cx.waker().wake_by_ref();
                                 return Poll::Pending;
                             }
                             if *raw_frame_masked {
