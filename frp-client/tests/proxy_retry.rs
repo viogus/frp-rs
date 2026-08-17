@@ -17,9 +17,10 @@
 //!
 //! Assert the mock receives >= 3 NewProxy frames (initial + two retries).
 //! The 30s production cadence is shrunk via the env overrides
-//! (`FRP_REGISTRATION_RESPONSE_TIMEOUT_MS` / `FRP_PROXY_RETRY_INTERVAL_MS`)
-//! so the test finishes in a couple of seconds instead of ~90s of wall
-//! clock, removing CI timer-drift flake.
+//! (`FRP_REGISTRATION_RESPONSE_TIMEOUT_MS` / `FRP_PROXY_RETRY_INTERVAL_MS`
+//! for the StartErr hop, `FRP_WAIT_START_RETRY_TIMEOUT_MS` for the
+//! WaitStart-stuck hop) so the test finishes in a couple of seconds instead
+//! of ~90s of wall clock, removing CI timer-drift flake.
 //!
 //! The env vars MUST be set before `Service` is constructed: the cadence is
 //! read once into a `LazyLock` at first use (same pattern as
@@ -45,16 +46,32 @@ use frp_core::transport::IoStream;
 
 use common::allocate_port;
 
-// Production cadence is 30s per hop. With the env overrides below each hop
-// costs 250ms, so the third NewProxy lands at ~750ms; allow 10s.
-const TEST_CADENCE_MS: &str = "250";
+// Production cadence is 30s per hop. Env overrides shrink each hop:
+// registration timeout 250ms, StartErr hop 250ms, WaitStart-stuck fold
+// 2000ms (minus the 100ms PROXY_RETRY_GRACE → fires 1900ms after the proxy
+// is first observed in WaitStart). Timeline: StartErr at ~250ms → re-send on
+// the ~250ms retry tick → fold re-send at ~2.4s. The deliberately UNEQUAL
+// fold and retry cadences pin WHICH timeout drives the third NewProxy: if
+// the fold regressed to `PROXY_RETRY_INTERVAL` timing, the third frame would
+// land at ~650ms instead of ~2.4s — caught by the `no_early_fold` assert
+// below (lower bound; slow CI machines only delay, never falsify it).
+const REG_MS: &str = "250";
+const RETRY_MS: &str = "250";
+const WAITSTART_MS: &str = "2000";
+const NO_EARLY_FOLD_DEADLINE: Duration = Duration::from_millis(1500);
 const ASSERT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn silent_server_never_answering_newproxy_is_retried_forever() {
     // Shrink the cadence BEFORE constructing the Service (LazyLock read-once).
-    std::env::set_var("FRP_REGISTRATION_RESPONSE_TIMEOUT_MS", TEST_CADENCE_MS);
-    std::env::set_var("FRP_PROXY_RETRY_INTERVAL_MS", TEST_CADENCE_MS);
+    std::env::set_var("FRP_REGISTRATION_RESPONSE_TIMEOUT_MS", REG_MS);
+    std::env::set_var("FRP_PROXY_RETRY_INTERVAL_MS", RETRY_MS);
+    // The third NewProxy lands via the WaitStart-stuck re-send, which runs
+    // on its own 20s default (`FRP_WAIT_START_RETRY_TIMEOUT_MS`) — shrink it
+    // too or the re-send would never fire within the assert window. Kept
+    // deliberately LONGER than RETRY_MS to pin that the fold is driven by
+    // the WaitStart timeout and not by the retry interval.
+    std::env::set_var("FRP_WAIT_START_RETRY_TIMEOUT_MS", WAITSTART_MS);
 
     common::init_tracing();
     let token = "proxy-retry-token";
@@ -146,9 +163,20 @@ async fn silent_server_never_answering_newproxy_is_retried_forever() {
         })
     };
 
-    // Registration times out after REGISTRATION_RESPONSE_TIMEOUT, and each
-    // retry hop costs one PROXY_RETRY_INTERVAL — both shrunk to 250ms here,
-    // so the third NewProxy lands at ~750ms. 10s is generous headroom.
+    // Pin WHICH timeout drives the WaitStart-stuck re-send: with the fold on
+    // WAITSTART_MS (2s) the third NewProxy lands at ~2.4s, so at 1.5s only
+    // the initial + StartErr retry frames may have arrived. A regression
+    // that reverted the fold to PROXY_RETRY_INTERVAL timing would land the
+    // third frame at ~650ms and fail this lower bound.
+    tokio::time::sleep(NO_EARLY_FOLD_DEADLINE).await;
+    let early = newproxy_count.load(Ordering::SeqCst);
+    assert!(
+        early < 3,
+        "fold re-send fired too early ({early} NewProxy frames before {NO_EARLY_FOLD_DEADLINE:?}): the WaitStart-stuck fold is no longer driven by WAIT_START_RETRY_TIMEOUT"
+    );
+
+    // Then the fold MUST fire (a proxy stuck in WaitStart is re-sent, not
+    // stranded). 10s is generous headroom over the ~2.4s expectation.
     tokio::time::timeout(ASSERT_TIMEOUT, async {
         while newproxy_count.load(Ordering::SeqCst) < 3 {
             tokio::time::sleep(Duration::from_millis(20)).await;

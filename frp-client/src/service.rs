@@ -151,15 +151,25 @@ pub(crate) static REGISTRATION_RESPONSE_TIMEOUT: LazyLock<Duration> = LazyLock::
     )
 });
 
-/// Proxy retry cadence for the message-loop retry arm: re-register proxies
-/// stuck in StartErr (anchored on the last StartErr time — Go frp's
+/// StartErr retry cadence for the message-loop retry arm: re-register
+/// proxies stuck in StartErr (anchored on the last StartErr time — Go frp's
 /// `lastStartErr.Add(startErrTimeout)`, so a proxy that errors right after a
-/// tick is not re-sent until a full interval has elapsed since ITS error) —
-/// or in WaitStart for a full interval (a NewProxy that is never answered
-/// keeps the phase in WaitStart; see the retry arm). Matches Go frp's
-/// proxy_wrapper.checkWorker (default startErrTimeout 30s).
+/// tick is not re-sent until a full interval has elapsed since ITS error).
+/// Matches Go frp's proxy_wrapper.checkWorker (default startErrTimeout 30s).
+/// The WaitStart-stuck re-send uses its own cadence,
+/// [`WAIT_START_RETRY_TIMEOUT`] (Go's waitResponseTimeout, 20s) — see the
+/// retry arm.
 pub(crate) static PROXY_RETRY_INTERVAL: LazyLock<Duration> =
     LazyLock::new(|| env_duration_ms("FRP_PROXY_RETRY_INTERVAL_MS", Duration::from_secs(30)));
+
+/// WaitStart-stuck re-send timeout for the message-loop retry arm: how long
+/// a proxy may sit in WaitStart (a NewProxy that is never answered — a
+/// silent server that still Pongs) before its NewProxy is re-sent. Go frp
+/// parity: client/proxy/proxy_wrapper.go `waitResponseTimeout` (20s) —
+/// distinct from `startErrTimeout` (30s, [`PROXY_RETRY_INTERVAL`]) used for
+/// StartErr retries.
+pub(crate) static WAIT_START_RETRY_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| env_duration_ms("FRP_WAIT_START_RETRY_TIMEOUT_MS", Duration::from_secs(20)));
 
 /// Tolerance for the WaitStart-stuck check in the retry arm. The stuck
 /// elapsed time compares two wall-clock `Instant`s (first-seen vs tick), so
@@ -2293,10 +2303,18 @@ impl Service {
         let (xtcp_cleanup_tx, xtcp_cleanup_rx) = mpsc::channel::<String>(64);
         ctx.xtcp_cleanup_rx = Some(xtcp_cleanup_rx);
 
-        // Proxy retry interval: every 30s, re-register proxies stuck in
-        // StartErr (or in WaitStart past one interval — see the retry arm).
-        // Matches Go frp's proxy_wrapper.checkWorker (default startErrTimeout 30s).
-        let mut proxy_retry_interval = tokio::time::interval(*PROXY_RETRY_INTERVAL);
+        // Proxy retry cadence: Go's proxy_wrapper.checkWorker ticks every
+        // statusCheckInterval (3s) and gates each condition on its own
+        // timeout (startErrTimeout 30s / waitResponseTimeout 20s). frp-rs
+        // folds both into one tick — the smaller of the two timeouts — and
+        // gates each retry class on its own anchor below (last_start_err /
+        // waitstart_seen). At defaults a StartErr retry fires 30–40s after
+        // its last error and a WaitStart re-send 20–40s after it was
+        // observed (anchor set at the first tick where the proxy is seen in
+        // WaitStart, so up to one tick late vs Go's 3s-tick 20–23s), staying
+        // consistent under env overrides.
+        let mut proxy_retry_interval =
+            tokio::time::interval(PROXY_RETRY_INTERVAL.min(*WAIT_START_RETRY_TIMEOUT));
         proxy_retry_interval.tick().await; // Skip first immediate tick
         ctx.proxy_retry_interval = Some(proxy_retry_interval);
 
@@ -2656,14 +2674,14 @@ impl Service {
                             .map(|(name, info)| (name.clone(), info.local_addr.clone()))
                             .collect()
                     };
-                    // Fold proxies stuck in WaitStart past one full retry
-                    // interval into the retry set. A NewProxy that is never
+                    // Fold proxies stuck in WaitStart past the
+                    // WaitStart response timeout into the retry set. A NewProxy that is never
                     // answered (a silent server that still Pongs) keeps the
                     // proxy in WaitStart — the StartErr transition happens
                     // only on a NewProxyResp error, so without this check a
                     // single unanswered retry would stop the retries
                     // forever. Go frp parity: proxy_wrapper re-arms
-                    // startErrTimeout while in waitStart and retries
+                    // waitResponseTimeout while in waitStart and retries
                     // indefinitely. `waitstart_seen` records when each
                     // proxy last entered WaitStart (initial registration or
                     // a retry send) and is pruned once it leaves WaitStart
@@ -2701,7 +2719,7 @@ impl Service {
                                     // interval below the 100ms grace must
                                     // not underflow (panic).
                                     now.duration_since(*first_seen)
-                                        >= (*PROXY_RETRY_INTERVAL)
+                                        >= (*WAIT_START_RETRY_TIMEOUT)
                                             .saturating_sub(PROXY_RETRY_GRACE)
                                 })
                             {
@@ -3789,7 +3807,17 @@ impl Service {
                             remote_addr: String::new(),
                             err,
                             config_snapshot: snapshot,
-                            phase: ProxyPhase::New,
+                            // NewProxy for this proxy is already in flight at
+                            // the commit point, so the proxy is waiting for
+                            // the server's response — WaitStart, not New.
+                            // The run_message_loop NewProxyResp arm then
+                            // transitions WaitStart → Running (or StartErr
+                            // on failure). `New` here would strand the proxy
+                            // forever: the message-loop arm only handles
+                            // WaitStart | StartErr, and the work-conn phase
+                            // gate (Go proxy_wrapper.go InWorkConn parity)
+                            // closes work conns unless phase == Running.
+                            phase: ProxyPhase::WaitStart,
                         },
                     );
                 }
