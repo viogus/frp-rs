@@ -258,7 +258,9 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // stream_window * 32 (192 MiB) is below that floor, so raise to
     // 384 MiB: 256 MiB reserved + 128 MiB shared auto-tune growth
     // budget (fixes per-stream throttling below Go's 6 MiB/stream
-    // once >=16 streams share one mux connection).
+    // until >=23 streams share one mux connection: each stream grown
+    // to Go's 6 MiB costs 6 MiB - 256 KiB ~= 5.75 MiB of the shared
+    // 128 MiB, so the 23rd stream is the first throttled).
     let stream_window = tcp_mux_cfg.max_stream_window_size as usize;
     cfg.set_max_num_streams(1024);
     cfg.set_max_connection_receive_window(Some((stream_window * 32).max(384 * 1024 * 1024)));
