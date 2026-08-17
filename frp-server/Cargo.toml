@@ -16,6 +16,9 @@ frp-vnet = { workspace = true, optional = true }
 # were previously forced into micro/tiny builds that never serve vhosts.
 h2 = { workspace = true, optional = true }
 http = { workspace = true }
+# catch_unwind for the single-spawn bridge panic surfacing (audit round 5,
+# MEDIUM); already a workspace dep (frp-core/frp-client) — no new crate.
+futures-util.workspace = true
 # Lock-free sharded map for run_id → control-channel routing (D3-3: eliminates
 # the global RwLock read-lock contention on every work-conn dispatch).
 dashmap.workspace = true

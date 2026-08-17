@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -106,8 +107,14 @@ impl std::str::FromStr for TransportProtocol {
 
 /// Helper trait bundling AsyncRead + AsyncWrite + Unpin + Send for
 /// use as a dyn-compatible trait object (Tls/SshChannel erasure).
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+///
+/// `Any` supertrait (implies `'static`): lets the WebSocket write fast path
+/// downcast the erased box back to the concrete `IoStream` it actually holds
+/// (server accept paths always box one) before reusing the `try_tcp_mut`
+/// downcast. All stored streams are owned/boxed, so the `'static` bound
+/// changes nothing in practice.
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send + Any {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncReadWrite for T {}
 
 // Transport trait — type-erased transport abstraction
 // -----------------------------------------------------------------

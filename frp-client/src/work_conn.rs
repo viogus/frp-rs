@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 #[cfg(feature = "vnet")]
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -385,22 +385,46 @@ async fn read_start_work_conn_with_timeout(
 /// from the session table so its ephemeral port is released.
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The same idle threshold in milliseconds, for the u64 epoch-millis
+/// liveness timestamps (kept in sync with `UDP_SESSION_IDLE_TIMEOUT`).
+const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = UDP_SESSION_IDLE_TIMEOUT.as_millis() as u64;
+
+/// Current time as u64 epoch milliseconds. The timestamp is only a liveness
+/// signal (all sites use Relaxed stores/loads, no happens-before needed), so
+/// wall-clock rather than monotonic time is fine; saturates to 0 if the
+/// clock is before the Unix epoch (unreachable in practice).
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// One remote visitor's UDP session: its own local socket (bound to a fresh
 /// ephemeral port on the local IP) plus bookkeeping.
+///
+/// `last_active` is an `Arc<AtomicU64>` holding epoch milliseconds, SHARED
+/// with the session's reader task (`run_udp_session`): the reader refreshes
+/// it per inbound packet with one lock-free Relaxed store, so the per-packet
+/// path never takes the shard lock (no mutex acquire, no hash lookup). The
+/// shard lock now guards only map insert/remove (per-session cold paths)
+/// and the reap sweep.
 struct UdpSession {
     socket: Arc<UdpSocket>,
-    last_active: Instant,
+    last_active: Arc<AtomicU64>,
     first_packet: bool,
 }
 
 /// Sharded remote-visitor session table (8 shards).
 ///
-/// The per-packet hot path (reader lookup/refresh + session reply refresh)
-/// locks only the shard of the packet's remote instead of one global mutex,
-/// so concurrent remotes do not serialize on a single cache line. Sweep and
-/// exit-removal iterate all shards (cold paths). std Mutex is fine: critical
-/// sections are short and never held across an await (bind/connect happen
-/// outside any lock).
+/// Per-packet liveness refresh is lock-free: the session reader task shares
+/// an `Arc<AtomicU64>` liveness timestamp with the table entry, so its
+/// per-packet path is one Relaxed store with no shard-lock acquire or hash
+/// lookup. The shard lock now guards only map insert/remove (per-session
+/// cold paths) and the reap sweep; the work-conn reader's per-packet socket
+/// lookup still takes the shard, so concurrent remotes never serialize on a
+/// single cache line. std Mutex is fine: critical sections are short and
+/// never held across an await (bind/connect happen outside any lock).
 struct UdpSessionTable {
     shards: [std::sync::Mutex<HashMap<SocketAddr, UdpSession>>; UDP_SESSION_SHARDS],
 }
@@ -435,6 +459,7 @@ impl UdpSessionTable {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_session(
     socket: Arc<UdpSocket>,
     remote: SocketAddr,
@@ -442,6 +467,7 @@ async fn run_udp_session(
     session_alive: Arc<AtomicBool>,
     udp_packet_size: usize,
     sessions: Arc<UdpSessionTable>,
+    last_active: Arc<AtomicU64>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut buf = vec![0u8; udp_packet_size.max(1)];
@@ -456,12 +482,12 @@ async fn run_udp_session(
             res = socket.recv_from(&mut buf) => {
                 match res {
                     Ok((n, _src)) => {
-                        // Refresh the shared entry's activity so inbound-heavy
-                        // remotes (rare/no replies) are not reaped.
-                        if let Some(entry) = sessions.shard(&remote).get_mut(&remote)
-                        {
-                            entry.last_active = Instant::now();
-                        }
+                        // Refresh the shared liveness timestamp so inbound-heavy
+                        // remotes (rare/no replies) are not reaped. The
+                        // per-packet path is lock-free: one Relaxed atomic
+                        // store into the Arc shared with the session table —
+                        // no shard-lock acquire, no hash lookup.
+                        last_active.store(now_epoch_ms(), Ordering::Relaxed);
                         let payload = buf[..n].to_vec();
                         if tx.send((remote, payload)).await.is_err() {
                             break;
@@ -480,10 +506,10 @@ async fn run_udp_session(
                 let idle_for = {
                     let map = sessions.shard(&remote);
                     map.get(&remote)
-                        .map(|e| e.last_active.elapsed())
-                        .unwrap_or(UDP_SESSION_IDLE_TIMEOUT)
+                        .map(|e| now_epoch_ms().saturating_sub(e.last_active.load(Ordering::Relaxed)))
+                        .unwrap_or(UDP_SESSION_IDLE_TIMEOUT_MS)
                 };
-                if idle_for > UDP_SESSION_IDLE_TIMEOUT {
+                if idle_for > UDP_SESSION_IDLE_TIMEOUT_MS {
                     debug!(remote = %remote, "UDP session idle for >60s, closing");
                     break;
                 }
@@ -675,7 +701,7 @@ async fn run_udp_work_conn(
                                 let mut map = sessions.shard(&remote);
                                 match map.get_mut(&remote) {
                                     Some(entry) => {
-                                        entry.last_active = Instant::now();
+                                        entry.last_active.store(now_epoch_ms(), Ordering::Relaxed);
                                         let mirror = reader_socks
                                             .get(&remote)
                                             .cloned()
@@ -736,6 +762,12 @@ async fn run_udp_work_conn(
                                             let stx = write_tx.clone();
                                             let s_alive = session_alive_r.clone();
                                             let sessions_for_task = sessions.clone();
+                                            // Shared liveness timestamp: the
+                                            // reader task refreshes it per
+                                            // packet without taking the shard
+                                            // lock (one Relaxed store).
+                                            let last_active =
+                                                Arc::new(AtomicU64::new(now_epoch_ms()));
                                             tokio::spawn(run_udp_session(
                                                 sock.clone(),
                                                 remote,
@@ -743,13 +775,14 @@ async fn run_udp_work_conn(
                                                 s_alive,
                                                 udp_packet_size,
                                                 sessions_for_task,
+                                                last_active.clone(),
                                                 reader_cancel.clone(),
                                             ));
                                             map.insert(
                                                 remote,
                                                 UdpSession {
                                                     socket: sock.clone(),
-                                                    last_active: Instant::now(),
+                                                    last_active,
                                                     first_packet: true,
                                                 },
                                             );
