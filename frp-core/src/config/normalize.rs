@@ -819,6 +819,17 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
             ],
         );
 
+        // Rename canonical Go camelCase section names (mirrors the server
+        // path above).
+        if let Some(v) = table.remove("webServer") {
+            table.entry("web_server").or_insert(v);
+        }
+        // Normalize canonical Go `[webServer.tls]` (nested certFile/keyFile)
+        // into the flat `web_server.tls_cert_file`/`tls_key_file` fields for
+        // the client admin server TLS too — without this the nested `tls`
+        // table is silently dropped by the ClientConfig deserializer.
+        normalize_web_server_section(table);
+
         // Go legacy INI uses `authentication_method` (not `auth_method`) —
         // map it into [auth].method (mirrors the server-side fix).
         if let Some(v) = table.remove("authentication_method") {

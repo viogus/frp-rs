@@ -7,6 +7,7 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
 use common::{
     allocate_port, login_with_test_token, raw_login_resp, start_test_server, test_auth_cfg,
+    TEST_TOKEN,
 };
 use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
 use frp_server::service::Service;
@@ -150,6 +151,77 @@ async fn test_ping_pong_no_auth() {
                 pong.error
             );
         }
+        other => panic!("expected Pong, got type byte: {:?}", other.v1_type_byte()),
+    }
+}
+
+/// Go frp v0.71.0 parity (server/control.go handlePing): a ping that fails
+/// auth — here "HeartBeats" is in additional_auth_scopes and the privilege
+/// key is wrong — gets a Pong{Error} but does NOT kill the control
+/// connection. The very next message on the same connection (a correctly
+/// authenticated ping) must still be answered. The pre-fix behavior
+/// (returning Err and tearing the session down) would make the second
+/// read/write fail with EOF.
+#[tokio::test]
+async fn test_ping_auth_failure_keeps_conn_alive() {
+    let port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: port,
+        auth: frp_core::config::AuthServerConfig {
+            method: "token".into(),
+            token: TEST_TOKEN.into(),
+            additional_auth_scopes: vec!["HeartBeats".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let (mut stream, _resp) = login_with_test_token(addr).await.expect("login");
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Ping with a WRONG privilege key: must yield Pong{Error} ...
+    let bad_key = auth::generate_token("wrong-secret", ts);
+    let bad_ping = FrpMessage::Ping(msg::Ping {
+        privilege_key: Some(bad_key),
+        timestamp: Some(ts),
+    });
+    write_msg_v1(&mut stream, &bad_ping)
+        .await
+        .expect("send bad ping");
+    match read_msg_v1(&mut stream).await.expect("read error pong") {
+        FrpMessage::Pong(pong) => assert!(
+            pong.error.is_some(),
+            "expected Pong with auth error, got: {:?}",
+            pong.error
+        ),
+        other => panic!("expected Pong, got type byte: {:?}", other.v1_type_byte()),
+    }
+
+    // ... but the connection must survive: the next ping with the CORRECT
+    // key still gets a clean Pong on the same stream. (Fresh timestamp:
+    // reuse could trip replay-protection duplicate detection instead of the
+    // survival check this test pins.)
+    let good_key = auth::generate_token(TEST_TOKEN, ts + 1);
+    let good_ping = FrpMessage::Ping(msg::Ping {
+        privilege_key: Some(good_key),
+        timestamp: Some(ts + 1),
+    });
+    write_msg_v1(&mut stream, &good_ping)
+        .await
+        .expect("send good ping");
+    match read_msg_v1(&mut stream).await.expect("read clean pong") {
+        FrpMessage::Pong(pong) => assert!(
+            pong.error.is_none(),
+            "expected clean Pong on surviving conn, got: {:?}",
+            pong.error
+        ),
         other => panic!("expected Pong, got type byte: {:?}", other.v1_type_byte()),
     }
 }

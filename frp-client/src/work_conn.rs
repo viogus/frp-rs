@@ -30,7 +30,7 @@ use frp_core::transport::{
 };
 
 use crate::proxy;
-use crate::proxy_runtime::ProxyRuntimeInfo;
+use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo};
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
@@ -1332,6 +1332,17 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         return;
                     }
                 };
+
+                // Go frp v0.71.0 parity (client/proxy/proxy_wrapper.go
+                // InWorkConn, lines 266-277): a work conn is bridged only
+                // when the proxy phase is Running — otherwise the conn is
+                // closed unbridged. A StartWorkConn racing a stop/reload
+                // (phase WaitStart/StartErr/Closed/...) must not bridge to
+                // the local service. Unknown proxies are handled above.
+                if info.phase != ProxyPhase::Running {
+                    warn!(label = %label, proxy_name = %proxy_name, phase = %info.phase.as_str(), "Work conn {}: proxy '{}' not running (phase {}), closing work conn", label, proxy_name, info.phase.as_str());
+                    return;
+                }
 
                 if info.proxy_type == "xtcp" {
                     // XTCP proxy: after StartWorkConn, the next data on the work

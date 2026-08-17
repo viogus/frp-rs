@@ -305,7 +305,12 @@ pub(crate) async fn handle_ping<W: AsyncWriteExt + Unpin>(
             )),
         });
         let _ = write_ctl_msg(writer, &pong, ctx.v2).await;
-        return Err(());
+        // Go frp v0.71.0 parity (server/control.go handlePing): an invalid
+        // ping gets a Pong{Error} and the handler returns nil — the control
+        // connection stays up and lastPing is NOT updated. Go tolerates a
+        // failed ping so a transient clock-skew/plugin auth failure survives
+        // to the next ping instead of reconnect-storming.
+        return Ok(());
     }
     ctl.last_ping = tokio::time::Instant::now();
     // Fire ping plugin hook (fire-and-forget — don't block control loop)

@@ -647,6 +647,29 @@ tlsVerify = true
 }
 
 #[test]
+fn test_go_client_web_server_tls_flatten() {
+    let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[webServer]
+addr = "127.0.0.1"
+port = 7400
+
+[webServer.tls]
+certFile = "/etc/frpc/admin.crt"
+keyFile = "/etc/frpc/admin.key"
+trustedCaFile = "/etc/frpc/ca.crt"
+serverName = "admin.example.com"
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+    assert_eq!(cfg.web_server.tls_cert_file, "/etc/frpc/admin.crt");
+    assert_eq!(cfg.web_server.tls_key_file, "/etc/frpc/admin.key");
+    assert_eq!(cfg.web_server.tls_ca_file, "/etc/frpc/ca.crt");
+    assert_eq!(cfg.web_server.tls_server_name, "admin.example.com");
+}
+
+#[test]
 fn test_go_extended_proxy_visitor_config_fields() {
     let toml_str = r#"
 serverAddr = "127.0.0.1"
