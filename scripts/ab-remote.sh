@@ -8,7 +8,9 @@
 # the already-built after/before release binaries + scripts/ab-matrix.sh into a
 # tarball, ships it to a VPS over SSH (reusing the XTCP VPS + frp-test user),
 # runs scripts/ab-matrix.sh there (loopback, exclusive CPU), and returns the
-# gate's pass/fail exit code.
+# gate's pass/fail exit code. A server-side flock (~/.ab-matrix.lock) prevents
+# concurrent runs (e.g. two PRs, or a PR colliding with the daily XTCP slot)
+# from overlapping on the same CPU and corrupting the numbers.
 #
 # Usage (env-driven, BASH 3.2 compatible):
 #   AFTER_ROOT=/path/to/after-root \
@@ -118,6 +120,7 @@ echo "Running A/B matrix gate on ${USER}@${HOST}" >&2
 set +e
 OUT=$(ssh "${SSH_COMMON[@]}" "$USER@$HOST" \
   "cd ~/$REMOTE_BASE && AFTER_ROOT=\$PWD/after BEFORE_ROOT=\$PWD/base \
+   flock -w 1800 ~/.ab-matrix.lock \
    bash scripts/ab-matrix.sh '$REPS' '$DUR' 2>&1")
 RC=$?
 set -e
