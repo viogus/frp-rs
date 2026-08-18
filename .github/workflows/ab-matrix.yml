@@ -77,6 +77,15 @@ jobs:
         with:
           ref: ${{ steps.refs.outputs.after }}
           fetch-depth: 0
+          # MUST NOT clean the workspace: the "before" state lives in ./base
+          # (a nested git repo created by the earlier checkout step). With the
+          # default clean:true the after-checkout runs `git clean -ffdx`,
+          # which deletes the untracked ./base directory (frp-rs runs on CI
+          # delete the nested repo's .git via `-ff`), so the "Build before"
+          # step loses base/scripts/frp-stress and fails. clean:false still
+          # applies the after ref (git reset --hard + checkout) but keeps
+          # ./base and the workspace-local .cargo/ intact.
+          clean: false
 
       # Same fast CI release profile for BOTH states so the before/after delta
       # is a pure code comparison (matches compat.yml / ci.yml dev builds).
