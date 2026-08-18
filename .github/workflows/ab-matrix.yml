@@ -1,17 +1,25 @@
 name: A/B Matrix (throughput gate)
 
 # Detects throughput regressions at two comparison granularities:
-#   1. Pull request: every PR to main is gated against its base.sha ("before")
-#      vs the PR head ("after") — catches whole-PR throughput regressions.
-#   2. Manual commit-vs-parent: workflow_dispatch with a COMMIT_REF compares
-#      COMMIT_REF~1 (parent, "before") vs COMMIT_REF ("after") — precisely
-#      gates a single data-plane commit before merge.
-# Either way scripts/ab-matrix.sh fails the job if any of the six bridge
-# configs regresses more than GATE_PCT (default 5%) from before to after.
+#   1. Pull request: every PR to main is measured against its base.sha
+#      ("before") vs the PR head ("after"). Runs for information only
+#      (continue-on-error) because shared-GitHub-runner throughput is noisy.
+#   2. Scheduled/manual: the true gate. Runs against main~1 vs main on a
+#      dedicated VPS (exclusive CPU) and FAILS on any >GATE_PCT regression.
+#      The measurement is shipped to and executed on the VPS (reusing the XTCP
+#      VPS + frp-test user) rather than on this runner, so the numbers are
+#      stable and comparable.
+#
+# Requires GitHub Secrets (same VPS as XTCP compat):
+#   XTCP_VPS_HOST     - VPS public IP or hostname
+#   XTCP_VPS_SSH_KEY  - SSH private key for the frp-test user on the VPS
+# If they are not set the job skips (a silent green would mask lost coverage).
 
 on:
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '30 4 * * *'   # daily off-peak, deliberately off XTCP's 03:17 slot
   workflow_dispatch:
     inputs:
       commit_ref:
@@ -28,7 +36,11 @@ env:
 jobs:
   ab-matrix:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # PR runs are informational only: shared-runner CPU renders the numbers
+    # too noisy to block a merge. The scheduled/manual run is the authoritative
+    # gate and must not silently pass.
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
 
     steps:
       # Full history so '~1' parent resolution works in both modes.
@@ -37,7 +49,7 @@ jobs:
           fetch-depth: 0
 
       # after = PR head for pull_requests, or the user-supplied commit_ref for
-      # the manual gate (default main).
+      # dispatch, or main for the scheduled run. before = base parent.
       - name: Resolve before/after refs
         id: refs
         run: |
@@ -50,9 +62,24 @@ jobs:
             echo "before=$(git rev-parse "$COMMIT~1")" >> "$GITHUB_OUTPUT"
           fi
 
-      # The "before" state lives in ./base; the "after" state is where the
-      # build step runs (workspace at HEAD for PR, or the dispatch commit).
+      - name: Check VPS secrets
+        id: vps
+        run: |
+          if [[ -n "${XTCP_VPS_HOST:-}" ]] && [[ -n "${XTCP_VPS_SSH_KEY:-}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "VPS configured: yes (measurement will run on the VPS)"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::XTCP_VPS_HOST or XTCP_VPS_SSH_KEY not set — A/B matrix gate SKIPPED (measurement would run on the noisy shared runner)."
+          fi
+        env:
+          XTCP_VPS_HOST: ${{ secrets.XTCP_VPS_HOST }}
+          XTCP_VPS_SSH_KEY: ${{ secrets.XTCP_VPS_SSH_KEY }}
+
+      # The "before" state lives in ./base; the "after" state is built at the
+      # workspace root (HEAD for PR, main/dispatch-commit otherwise).
       - name: Checkout before (base or parent)
+        if: steps.vps.outputs.available == 'true'
         uses: actions/checkout@v4
         with:
           path: base
@@ -60,8 +87,10 @@ jobs:
           fetch-depth: 0
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: steps.vps.outputs.available == 'true'
 
       - name: Cache cargo builds
+        if: steps.vps.outputs.available == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -73,16 +102,26 @@ jobs:
           restore-keys: ${{ runner.os }}-abmatrix-
 
       - name: Checkout after into workspace
+        if: steps.vps.outputs.available == 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.refs.outputs.after }}
           fetch-depth: 0
+          # MUST NOT clean the workspace: the "before" state lives in ./base
+          # (a nested git repo created by the earlier checkout step). With the
+          # default clean:true the after-checkout runs `git clean -ffdx`,
+          # which deletes the untracked ./base directory (frp-rs runs on CI
+          # delete the nested repo's .git via `-ff`), so the "Build before"
+          # step loses base/scripts/frp-stress and fails. clean:false still
+          # applies the after ref (git reset --hard + checkout) but keeps
+          # ./base and the workspace-local .cargo/ intact.
+          clean: false
 
       # Same fast CI release profile for BOTH states so the before/after delta
-      # is a pure code comparison (matches compat.yml / ci.yml dev builds).
-      # Configured after the checkout steps so actions/checkout does not
-      # wipe the workspace-local .cargo/config.toml on the "after" checkout.
+      # is a pure code comparison. Configured after the checkout steps so
+      # actions/checkout does not wipe the workspace-local .cargo/config.toml.
       - name: Configure fast CI release profile
+        if: steps.vps.outputs.available == 'true'
         run: |
           for d in . base; do
             mkdir -p "$d/.cargo"
@@ -90,21 +129,26 @@ jobs:
           done
 
       - name: Build after (PR head / target commit) binaries
+        if: steps.vps.outputs.available == 'true'
         run: |
           cargo build --release -p frps -p frpc
           (cd scripts/frp-stress && cargo build --release)
 
       - name: Build before (base / parent) binaries
+        if: steps.vps.outputs.available == 'true'
         run: |
           (cd base && cargo build --release -p frps -p frpc)
           (cd base/scripts/frp-stress && cargo build --release)
 
-      - name: Run A/B matrix gate
+      - name: Run A/B matrix gate on VPS
+        if: steps.vps.outputs.available == 'true'
         env:
           BEFORE_ROOT: ${{ github.workspace }}/base
           GATE_PCT: "5"
-        run: bash scripts/ab-matrix.sh 3 8
+          XTCP_VPS_HOST: ${{ secrets.XTCP_VPS_HOST }}
+          XTCP_VPS_SSH_KEY: ${{ secrets.XTCP_VPS_SSH_KEY }}
+        run: bash scripts/ab-remote.sh 3 8
 
-      - name: Clean up worktree of base checkout
+      - name: Clean up base checkout
         if: always()
         run: rm -rf base

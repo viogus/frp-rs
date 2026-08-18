@@ -540,7 +540,6 @@ impl SnappyDecompressor {
         Ok(())
     }
 
-
     #[cfg(test)]
     fn buffered_capacity(&self) -> usize {
         self.buf.capacity()

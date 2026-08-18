@@ -98,7 +98,7 @@ pub fn crc32c(data: &[u8]) -> u32 {
             rest = &rest[8..];
         }
         let c = !c;
-        if rest.len() == 0 {
+        if rest.is_empty() {
             return c;
         }
         crc32c_tail(c, rest)
@@ -237,7 +237,7 @@ mod tests {
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         // Deterministic byte generator (xorshift64* via LCG), so this test is
         // reproducible across runs.
-        let mut gen_bytes = |seed: &mut u64, n: usize| -> Vec<u8> {
+        let gen_bytes = |seed: &mut u64, n: usize| -> Vec<u8> {
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 *seed = seed
