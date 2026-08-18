@@ -39,6 +39,7 @@ REPS="${1:-3}"
 RDUR="${2:-10}"
 GATE_PCT="${GATE_PCT:-5}"
 SKIP_BUILD="${SKIP_BUILD:-0}"   # set to 1 to assume *_ROOT already built
+_WT_PATHS=()                     # REF worktrees to clean up on exit
 
 # --- provision a 'side' (before/after) binary root --------------------------
 # A side resolves to a directory carrying target/release/{frps,frpc} and
@@ -49,7 +50,7 @@ SKIP_BUILD="${SKIP_BUILD:-0}"   # set to 1 to assume *_ROOT already built
 #
 # commit-vs-commit usage (what the CI manual gate uses):
 #   BEFORE_REF=<commit>~1  AFTER_REF=<commit>  bash scripts/ab-matrix.sh
-build_side() {  # build_side <prefix> <root_env_value> <ref_env_value>
+build_side() {  # build_side <prefix> <root_env_value> <ref_env_value>; sets <prefix>_DIR
   local prefix="$1" root="$2" ref="$3"
   local dir=""
   if [[ -n "$root" ]]; then
@@ -59,6 +60,7 @@ build_side() {  # build_side <prefix> <root_env_value> <ref_env_value>
     if [[ "$SKIP_BUILD" != "1" ]]; then
       echo "Checking out '$ref' -> $dir" >&2
       git -C "$PROJECT_DIR" worktree add "$dir" "$ref" >/dev/null
+      _WT_PATHS+=("$dir")
       cargo build --release --manifest-path "$dir/Cargo.toml" -p frps -p frpc >&2
       (cd "$dir/scripts/frp-stress" && cargo build --release) >&2
     fi
@@ -72,13 +74,15 @@ build_side() {  # build_side <prefix> <root_env_value> <ref_env_value>
       exit 2
     fi
   done
-  printf '%s' "$dir"
+  # No nameref (macOS Bash 3.2); side effect via eval. `prefix` is only ever
+  # "AFTER"/"BEFORE" from callers below, so the variable name is trusted.
+  eval "${prefix}_DIR='$dir'"
 }
 
 AFTER_ROOT="${AFTER_ROOT:-}"
 AFTER_REF="${AFTER_REF:-}"
 if [[ -n "$AFTER_ROOT" || -n "$AFTER_REF" ]]; then
-  AFTER_DIR="$(build_side after "$AFTER_ROOT" "$AFTER_REF")"
+  build_side AFTER "$AFTER_ROOT" "$AFTER_REF"   # sets AFTER_DIR via eval
 else
   AFTER_DIR="$PROJECT_DIR"
 fi
@@ -86,7 +90,7 @@ fi
 BEFORE_ROOT="${BEFORE_ROOT:-}"
 BEFORE_REF="${BEFORE_REF:-}"
 if [[ -n "$BEFORE_ROOT" || -n "$BEFORE_REF" ]]; then
-  BEFORE_DIR="$(build_side before "$BEFORE_ROOT" "$BEFORE_REF")"
+  build_side BEFORE "$BEFORE_ROOT" "$BEFORE_REF"   # sets BEFORE_DIR via eval
 else
   echo "ERROR: set BEFORE_ROOT or BEFORE_REF to provide the 'before'/baseline" >&2
   exit 2
@@ -107,7 +111,12 @@ if [[ ! -f "$CERT" ]]; then
 fi
 
 PIDS=()
-cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; }
+cleanup() {
+  for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+  # Remove REF-mode worktrees this run created, so repeated invocations (e.g.
+  # CI cache warm-up) do not leak detached WORKTREEs.
+  for w in "${_WT_PATHS[@]}"; do git -C "$PROJECT_DIR" worktree remove --force "$w" 2>/dev/null || true; done
+}
 trap cleanup EXIT
 
 # run_side <label> <frps> <frpc> <stress> <mux> <enc> <comp> <tls> <reps> <dur>
