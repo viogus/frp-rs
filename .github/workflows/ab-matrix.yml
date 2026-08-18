@@ -28,7 +28,7 @@ env:
 jobs:
   ab-matrix:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       # Full history so '~1' parent resolution works in both modes.

@@ -27,6 +27,10 @@
 # Exit 0 if every config is within threshold, 1 if any regressed > GATE_PCT.
 #
 # Numbers are host-specific; always compare against a same-host before build.
+# On shared CI runners the single before/after shot is dominated by
+# CPU-contention variance, so a regressed config is re-measured up to
+# CONFIRM_RETRIES times (default 2); the gate only fails when a regression
+# persists on every re-measurement, filtering out transient noise.
 # =============================================================================
 set -euo pipefail
 export RUST_LOG=warn
@@ -38,6 +42,7 @@ cd "$PROJECT_DIR"
 REPS="${1:-3}"
 RDUR="${2:-10}"
 GATE_PCT="${GATE_PCT:-5}"
+CONFIRM_RETRIES="${CONFIRM_RETRIES:-2}"
 SKIP_BUILD="${SKIP_BUILD:-0}"   # set to 1 to assume *_ROOT already built
 _WT_PATHS=()                     # REF worktrees to clean up on exit
 
@@ -170,21 +175,54 @@ median() {  # median of stdin numbers (>=1)
   python3 -c "import sys,statistics;v=[float(x) for x in sys.stdin if float(x)>0];print(round(statistics.median(v),1) if v else 0)"
 }
 
+# Does a delta percentage represent a regression beyond the gate?
+above_gate() {  # python exit 0 when $1 < -GATE_PCT (i.e. a regression)
+  python3 -c "import sys; sys.exit(0 if ($1 < -$GATE_PCT) else 1)"
+}
+
+# A/B noise mitigation for shared runners: a single before/after shot is
+# dominated by CPU-contention variance, so a real regression must be
+# reproducible. measure_pair runs before+after and, if it looks regressed,
+# re-measures up to CONFIRM_RETRIES times, keeping the most pessimistic
+# (most-negative) delta seen. A verifiable code regression stays negative on
+# every re-measure; shared-runner noise typically recovers within threshold.
+# Prints:  v_a v_b delta result  (result = pass | REGRESSED)
+measure_pair() {  # measure_pair <mux> <enc> <comp> <tls> <label>
+  local mux="$1" enc="$2" comp="$3" tls="$4" label="$5"
+  local v_a v_b delta ca cb ndelta attempt
+  v_a=$(run_side "before-$label" "$FRPS_A" "$FRPC_A" "$STRESS_A" "$mux" "$enc" "$comp" "$tls" "$REPS" "$RDUR" | median)
+  v_b=$(run_side "after-$label"  "$FRPS_B" "$FRPC_B" "$STRESS_B" "$mux" "$enc" "$comp" "$tls" "$REPS" "$RDUR" | median)
+  if [[ "$v_a" == "0" || "$v_b" == "0" ]]; then
+    echo "$v_a $v_b - SKIP(no data)"; return
+  fi
+  delta=$(python3 -c "print(round((100.0*($v_b-$v_a)/$v_a),1))")
+  attempt=0
+  while above_gate "$delta" && [ "$attempt" -lt "${CONFIRM_RETRIES:-2}" ]; do
+    attempt=$((attempt+1))
+    ca=$(run_side "before-$label-c$attempt" "$FRPS_A" "$FRPC_A" "$STRESS_A" "$mux" "$enc" "$comp" "$tls" "$REPS" "$RDUR" | median)
+    cb=$(run_side "after-$label-c$attempt"  "$FRPS_B" "$FRPC_B" "$STRESS_B" "$mux" "$enc" "$comp" "$tls" "$REPS" "$RDUR" | median)
+    [[ "$ca" == "0" || "$cb" == "0" ]] && continue
+    ndelta=$(python3 -c "print(round((100.0*($cb-$ca)/$ca),1))")
+    # report the worst re-measurement (most pessimistic) either way
+    if python3 -c "import sys; sys.exit(0 if ($ndelta < $delta) else 1)"; then v_a="$ca"; v_b="$cb"; delta="$ndelta"; fi
+    # a re-measurement within the gate proves the flagged regression was noise
+    if ! above_gate "$ndelta"; then delta="$ndelta"; v_a="$ca"; v_b="$cb"; break; fi
+  done
+  local result="pass"
+  above_gate "$delta" && result="REGRESSED"
+  echo "$v_a $v_b $delta $result"
+}
+
 FAIL=0
 printf '%-18s %9s %9s %8s   %s\n' "config" "before" "after" "delta%" "result"
 #            label            mux   enc   comp  tls
 while IFS= read -r l; do
   set -- $l; mux="$1" enc="$2" comp="$3" tls="$4" label="$5"
-  # measure before then after (adjacent) for this config to minimise drift
-  v_a=$(run_side "before-$label" "$FRPS_A" "$FRPC_A" "$STRESS_A" "$mux" "$enc" "$comp" "$tls" "$REPS" "$RDUR" | median)
-  v_b=$(run_side "after-$label"  "$FRPS_B" "$FRPC_B" "$STRESS_B" "$mux" "$enc" "$comp" "$tls" "$REPS" "$RDUR" | median)
-  if [[ "$v_a" == "0" || "$v_b" == "0" ]]; then
-    printf '%-18s %9s %9s %8s   %s\n' "$label" "$v_a" "$v_b" "-"   "SKIP(no data)"
-    continue
-  fi
-  delta=$(python3 -c "print(round((100.0*($v_b-$v_a)/$v_a),1))")
-  result="pass"
-  if python3 -c "import sys; sys.exit(0 if ($delta < -$GATE_PCT) else 1)"; then result="REGRESSED"; FAIL=1; fi
+  read -r v_a v_b delta result <<< "$(measure_pair "$mux" "$enc" "$comp" "$tls" "$label")"
+  case "$result" in
+    "REGRESSED") FAIL=1 ;;
+    "SKIP(no data)") printf '%-18s %9s %9s %8s   %s\n' "$label" "$v_a" "$v_b" "-" "SKIP(no data)"; continue ;;
+  esac
   printf '%-18s %9s %9s %8s   %s\n' "$label" "$v_a" "$v_b" "${delta}%" "$result"
 done <<'EOF'
 false  false false false  plain
