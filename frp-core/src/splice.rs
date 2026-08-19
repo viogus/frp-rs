@@ -16,16 +16,19 @@ use tokio::io::unix::AsyncFd;
 /// Pipe capacity. 1 MiB = the default `/proc/sys/fs/pipe-max-size`; a larger
 /// pipe lets each `splice(src → pipe)` move up to 16x more bytes per syscall,
 /// cutting epoll round-trips on bulk transfers. The actual capacity is set
-/// via `F_SETPIPE_SZ` in `create_pipe_pair`; this constant must match it so
-/// the `splice` length argument never under-requests.
+/// via `F_SETPIPE_SZ` in `create_pipe_pair`; this constant is the *desired*
+/// capacity — the real one (returned by `create_pipe_pair` after the resize)
+/// may be smaller when the kernel or an rlimit refuses growth, and is what the
+/// `splice` length arguments must use.
 const PIPE_CAPACITY: usize = 1024 * 1024;
 
-/// Create a non-blocking pipe pair, returning `(read_end, write_end)`.
+/// Create a non-blocking pipe pair, returning `(read_end, write_end)` and the
+/// actual pipe capacity achieved (in bytes).
 ///
 /// Uses `pipe2()` with `O_NONBLOCK` so spliced I/O returns `EAGAIN`
 /// instead of blocking the task — readiness is managed exclusively
 /// through `AsyncFd`.
-fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>)> {
+fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>, usize)> {
     let mut fds: [i32; 2] = [0; 2];
     // SAFETY: pipe2 writes two valid file descriptors into `fds` on success.
     // We check the return value before wrapping them in OwnedFd.
@@ -38,18 +41,44 @@ fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>)> {
     let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     // Grow both ends to PIPE_CAPACITY. F_SETPIPE_SZ fails with EPERM when the
     // requested size exceeds the kernel's pipe-max-size (or the process's
-    // soft limit); on failure the kernel default stays and splice simply
-    // moves up to the smaller pipe, so the fallback is safe (never EAGAIN
-    // early — a full pipe still reports partial progress, not an error).
+    // pipe-pages soft rlimit — a non-root `User=frp` deployment with dozens
+    // of concurrent bridges can hit the 16k-page default and silently lose
+    // the size on every pipe after a few dozen). On failure the kernel
+    // default stays and splice simply moves up to the smaller pipe, so the
+    // fallback is safe (never EAGAIN early — a full pipe still reports
+    // partial progress, not an error).
+    let mut capacity = PIPE_CAPACITY;
     for fd in [fds[0], fds[1]] {
         // SAFETY: fds[0]/fds[1] are valid fds from pipe2 above; fcntl does
-        // not take ownership. The return value is intentionally ignored —
-        // the size is a throughput hint, not a correctness requirement.
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_CAPACITY as libc::c_int) };
+        // not take ownership.
+        let ret = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_CAPACITY as libc::c_int) };
+        // The resize is a throughput hint, not a correctness requirement —
+        // but when it fails how we learn the real size matters: log the
+        // outcome so a bounds-regressed deployment (EPERM under the pipe
+        // rlimit) is diagnosable instead of silently reverting to 64 KiB.
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EPERM) {
+                tracing::warn!(
+                    requested = PIPE_CAPACITY,
+                    "Linux splice: pipe resize to {}B failed with EPERM \
+                     (pipe rlimit reached); using the kernel default capacity",
+                    PIPE_CAPACITY
+                );
+            }
+        }
+        // Read back the true capacity so the splice length argument matches
+        // reality (a gracefully-resized pipe may still sit below 1 MiB if
+        // pipe-max-size is lower, and an EPERM pipe is back at 64 KiB).
+        // SAFETY: fd is a pipe end from pipe2; F_GETPIPE_SZ takes any pipe fd.
+        let actual = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+        if actual > 0 {
+            capacity = actual as usize;
+        }
     }
     let read_async = AsyncFd::new(read)?;
     let write_async = AsyncFd::new(write)?;
-    Ok((read_async, write_async))
+    Ok((read_async, write_async, capacity))
 }
 
 /// Propagate a source FIN after its buffered bytes have reached `dst`.
@@ -92,8 +121,9 @@ async fn splice_direction(
     pipe_wr: &AsyncFd<OwnedFd>,
     dst: &AsyncFd<OwnedFd>,
     counter: &AtomicU64,
+    pipe_capacity: usize,
 ) -> io::Result<()> {
-    let result = splice_direction_loop(src, pipe_rd, pipe_wr, dst, counter).await;
+    let result = splice_direction_loop(src, pipe_rd, pipe_wr, dst, counter, pipe_capacity).await;
     if result.is_err() {
         // Tell dst that no more bytes will follow so a peer waiting for our
         // EOF terminates instead of hanging on a live-but-silent conn.
@@ -135,6 +165,7 @@ async fn splice_direction_loop(
     pipe_wr: &AsyncFd<OwnedFd>,
     dst: &AsyncFd<OwnedFd>,
     counter: &AtomicU64,
+    pipe_capacity: usize,
 ) -> io::Result<()> {
     let flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as libc::c_uint;
 
@@ -155,7 +186,7 @@ async fn splice_direction_loop(
                     std::ptr::null_mut(),
                     pipe_wr_fd,
                     std::ptr::null_mut(),
-                    PIPE_CAPACITY,
+                    pipe_capacity,
                     flags,
                 )
             };
@@ -224,7 +255,7 @@ async fn splice_direction_loop(
                             std::ptr::null_mut(),
                             dst_fd,
                             std::ptr::null_mut(),
-                            PIPE_CAPACITY,
+                            pipe_capacity,
                             flags,
                         )
                     };
@@ -240,9 +271,16 @@ async fn splice_direction_loop(
                     let err = io::Error::last_os_error();
                     match err.raw_os_error() {
                         Some(libc::EAGAIN) => {
-                            // dst send buffer full — clear WRITABLE and
-                            // park until the peer reads.
+                            // The pipe is empty (nothing left to drain) — on
+                            // a non-blocking pipe, draining an EMPTY pipe
+                            // returns EAGAIN, not 0, so this is the real
+                            // "fully drained" exit. Without the `break`,
+                            // `dst.writable()` returns immediately for a
+                            // writable peer and the loop forever re-splices
+                            // an empty pipe → a 100%-CPU spin (#9). Clear
+                            // WRITABLE and leave the drain.
                             guard.clear_ready();
+                            break;
                         }
                         Some(libc::EINTR) => continue,
                         _ => return Err(err),
@@ -364,9 +402,11 @@ pub async fn bridge_splice(
     let user_async = AsyncFd::new(user_owned)?;
     let work_async = AsyncFd::new(work_owned)?;
 
-    // Step 3: Create two pipe pairs (one per direction).
-    let (u2w_r, u2w_w) = create_pipe_pair()?;
-    let (w2u_r, w2u_w) = create_pipe_pair()?;
+    // Step 3: Create two pipe pairs (one per direction). Each pair reports
+    // its achieved capacity so the splice length arguments use the real size
+    // (they may be smaller than PIPE_CAPACITY under a pipe rlimit).
+    let (u2w_r, u2w_w, u2w_cap) = create_pipe_pair()?;
+    let (w2u_r, w2u_w, w2u_cap) = create_pipe_pair()?;
 
     // Step 4: Shared byte counters.
     let u2w_count = AtomicU64::new(0);
@@ -374,8 +414,22 @@ pub async fn bridge_splice(
 
     // Step 5: Run both directions concurrently on the same task. First
     // completion wins; the loser is dropped when the select completes.
-    let u2w_fut = splice_direction(&user_async, &u2w_r, &u2w_w, &work_async, &u2w_count);
-    let w2u_fut = splice_direction(&work_async, &w2u_r, &w2u_w, &user_async, &w2u_count);
+    let u2w_fut = splice_direction(
+        &user_async,
+        &u2w_r,
+        &u2w_w,
+        &work_async,
+        &u2w_count,
+        u2w_cap,
+    );
+    let w2u_fut = splice_direction(
+        &work_async,
+        &w2u_r,
+        &w2u_w,
+        &user_async,
+        &w2u_count,
+        w2u_cap,
+    );
     // The pinned futures borrow the counters below; the block scopes them so
     // the pins (and their borrows) are dropped before the counts are read.
     {

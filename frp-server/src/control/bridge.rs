@@ -105,6 +105,12 @@ struct ResponseHeaderInjector<R> {
     headers: std::collections::HashMap<String, String>,
     buffer: Vec<u8>,
     buffer_offset: usize,
+    /// True once the `\r\n\r\n` terminator was seen and the configured
+    /// headers were injected (or the inner stream hit EOF). Until this is
+    /// true, `poll_read` never emits bytes to the caller: emission before the
+    /// boundary is known would corrupt the stream for headers spanning
+    /// multiple internal reads.
+    injected: bool,
     complete: bool,
     /// Persistent read buffer to avoid per-poll_read allocation.
     read_buf: [u8; 4096],
@@ -121,6 +127,7 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
             headers,
             buffer: Vec::new(),
             buffer_offset: 0,
+            injected: false,
             complete: false,
             read_buf: [0u8; 4096],
         }
@@ -140,16 +147,43 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
 
         let this = self.as_mut().get_mut();
 
-        // Read from inner into our buffer
+        // Drain any buffered (injected) bytes to the caller before reading
+        // more from `inner`. This is what keeps the injected header TAIL
+        // from being dropped: `complete` is only ever raised once the buffer
+        // is fully consumed (see the end of this function), never at the
+        // point injection happens — so a caller with a small `ReadBuf` gets
+        // every injected byte across subsequent polls.
+        if this.buffer_offset < this.buffer.len() {
+            let remaining = this.buffer.len() - this.buffer_offset;
+            let to_copy = remaining.min(buf.remaining());
+            buf.put_slice(&this.buffer[this.buffer_offset..this.buffer_offset + to_copy]);
+            this.buffer_offset += to_copy;
+            if this.buffer_offset >= this.buffer.len() {
+                this.complete = true;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Buffer is fully consumed and we have not injected yet — we must
+        // gather MORE of the response header before emitting: injection must
+        // happen before any body byte is handed to the caller, and the
+        // `\r\n\r\n` terminator may span several internal reads (a header
+        // bigger than one 4 KiB buffer, e.g. a large cookie/Set-Cookie set).
+        // Emitting bytes before the boundary is known would corrupt the
+        // stream, so we only ever serve from `buffer` once the boundary has
+        // been found (or EOF reached).
         let mut temp_buf = ReadBuf::new(&mut this.read_buf);
         match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
             Poll::Ready(Ok(())) => {
                 let n = temp_buf.filled().len();
                 if n == 0 {
+                    // EOF: no more header bytes will arrive; emit what we
+                    // buffered (no injection) and pass through from here.
                     this.complete = true;
                     return Poll::Ready(Ok(()));
                 }
-                // Guard against memory exhaustion from backends that never send \r\n\r\n
+                // Guard against memory exhaustion from backends that never
+                // send \r\n\r\n.
                 if this.buffer.len() + n > 65536 {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -160,37 +194,36 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
             }
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => {
-                if this.buffer.is_empty() {
-                    return Poll::Pending;
+                // Nothing buffered and inner not ready: park until data.
+                return Poll::Pending;
+            }
+        }
+
+        // Header buffer only grows up to the boundary; look for it.
+        if !this.injected {
+            if let Some(pos) = this.buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let mut injected = Vec::with_capacity(this.buffer.len() + 512);
+                injected.extend_from_slice(&this.buffer[..pos]);
+                for (k, v) in &this.headers {
+                    // Sanitize header names/values to prevent HTTP header injection.
+                    let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                    let safe_v: String = v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                    injected.extend_from_slice(format!("{}: {}\r\n", safe_k, safe_v).as_bytes());
                 }
+                injected.extend_from_slice(&this.buffer[pos..]);
+                this.buffer = injected;
+                this.injected = true;
             }
         }
 
-        // Check for end of HTTP headers
-        let header_end = this.buffer.windows(4).position(|w| w == b"\r\n\r\n");
-        if let Some(pos) = header_end {
-            let mut injected = Vec::with_capacity(this.buffer.len() + 512);
-            injected.extend_from_slice(&this.buffer[..pos]);
-            for (k, v) in &this.headers {
-                // Sanitize header names/values to prevent HTTP header injection.
-                let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
-                let safe_v: String = v.chars().filter(|&c| c != '\r' && c != '\n').collect();
-                injected.extend_from_slice(format!("{}: {}\r\n", safe_k, safe_v).as_bytes());
-            }
-            injected.extend_from_slice(&this.buffer[pos..]);
-            this.buffer = injected;
-            this.complete = true;
-        }
-
-        // Serve from buffer
-        if this.buffer_offset < this.buffer.len() {
-            let remaining = this.buffer.len() - this.buffer_offset;
-            let to_copy = remaining.min(buf.remaining());
-            buf.put_slice(&this.buffer[this.buffer_offset..this.buffer_offset + to_copy]);
-            this.buffer_offset += to_copy;
-        }
-
-        if this.buffer_offset >= this.buffer.len() {
+        // Serve whatever is now in the buffer (available since the boundary
+        // exists or will be drained). If not all fits in the caller's
+        // `ReadBuf`, `complete` stays false and the tail is served next poll.
+        let remaining = this.buffer.len() - this.buffer_offset;
+        let to_copy = remaining.min(buf.remaining());
+        buf.put_slice(&this.buffer[this.buffer_offset..this.buffer_offset + to_copy]);
+        this.buffer_offset += to_copy;
+        if this.injected && this.buffer_offset >= this.buffer.len() {
             this.complete = true;
         }
 
@@ -225,12 +258,8 @@ async fn run_udp_work_conn(
     } else {
         Some(udp_packet_codec.as_str())
     };
-    let (w_r, w_w) = match split_work_conn_halves(work_conn) {
-        Ok(pair) => pair,
-        Err(msg) => {
-            warn!("{msg}");
-            return;
-        }
+    let Some((w_r, w_w)) = try_split_work_halves(work_conn) else {
+        return;
     };
     // Provider-segment encryption (Go parity): when the UDP proxy configures
     // use_encryption, the work conn carries a CipherStream (AES-128-CFB,
@@ -293,14 +322,37 @@ async fn run_udp_work_conn(
             };
             match result {
                 Ok(FrpMessage::UDPPacket(up)) => {
-                    if let Some(lim) = &mut read_lim {
-                        lim.consume(up.content.len()).await;
-                    }
+                    // Rate-limit only bytes actually forwarded. Counting a
+                    // dropped (malformed, no remote_addr) packet against the
+                    // budget without delivering it would silently bill the
+                    // user for nothing — refund=true by consuming only here,
+                    // and log the drop for diagnosability.
                     if let Some(ref remote) = up.remote_addr {
-                        if let Err(e) = sock_reader.send_to(&up.content, remote.to_string()).await {
+                        if let Some(lim) = &mut read_lim {
+                            lim.consume(up.content.len()).await;
+                        }
+                        // Prefer a direct `SocketAddr` (no per-packet String
+                        // alloc + reparse of the destination, audit #14a); fall
+                        // back to the string form when the address carries an
+                        // IPv6 zone that `SocketAddr` cannot express.
+                        if let Some(dest) = udp_dest_socket_addr(remote) {
+                            if let Err(e) = sock_reader.send_to(&up.content, dest).await {
+                                debug!(proxy_name = %reader_name, error = %e,
+                                    "UDP send_to failed for '{}': {}", reader_name, e);
+                            }
+                        } else if let Err(e) =
+                            sock_reader.send_to(&up.content, remote.to_string()).await
+                        {
                             debug!(proxy_name = %reader_name, error = %e,
                                 "UDP send_to failed for '{}': {}", reader_name, e);
                         }
+                    } else {
+                        debug!(
+                            proxy_name = %reader_name,
+                            bytes = up.content.len(),
+                            "UDP work conn for '{}': dropped datagram with no remote_addr (malformed)",
+                            reader_name
+                        );
                     }
                 }
                 Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => continue,
@@ -395,7 +447,9 @@ async fn run_udp_work_conn(
     tokio::select! {
         _ = &mut reader => {
             debug!(proxy_name = %proxy_name, "UDP reader exited; draining then cancelling writer");
+            // Best-effort signal to the writer; a closed watch channel is fine.
             let _ = cancel_tx.send(true);
+            // Give the writer a bounded window to drain before we drop it.
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(100),
                 &mut writer,
@@ -404,7 +458,9 @@ async fn run_udp_work_conn(
         }
         _ = &mut writer => {
             debug!(proxy_name = %proxy_name, "UDP writer exited; draining then cancelling reader");
+            // Best-effort signal to the reader; a closed watch channel is fine.
             let _ = cancel_tx.send(true);
+            // Give the reader a bounded window to drain before we drop it.
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(100),
                 &mut reader,
@@ -676,6 +732,86 @@ fn split_user_side(
     }
 }
 
+/// Compute the visitor-segment encryption key from the proxy's `sk`
+/// (`derive_key(sk)`), when the visitor declared `use_encryption`. Empty sk is
+/// treated as "no key": we warn and bridge plaintext (robustness over exact
+/// Go parity — Go would PBKDF2 an empty string into a weak key). Shared by the
+/// byte-stream and SUDP message bridges so the logic (and its warn) cannot
+/// drift apart (audit #12).
+fn visitor_encryption_key(
+    proxy_info: Option<&std::sync::Arc<crate::proxy::ProxyInfo>>,
+    proxy_name: &str,
+    use_encryption: bool,
+) -> Option<[u8; 16]> {
+    if !use_encryption {
+        return None;
+    }
+    match proxy_info
+        .and_then(|p| p.sk.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        Some(sk) => Some(derive_key(sk)),
+        None => {
+            warn!(
+                proxy_name = %proxy_name,
+                "visitor declared use_encryption but proxy '{}' has no secret_key; \
+                 bridging visitor segment in plaintext",
+                proxy_name
+            );
+            None
+        }
+    }
+}
+
+/// Build a `SocketAddr` for `remote` without allocating, when the address is a
+/// plain IPv4/IPv6 (no zone). Returns `None` when the ip does not parse or the
+/// address carries an IPv6 scope zone — the caller falls back to the string
+/// form in that case. Hot-path helper for the UDP reader (audit #14a): avoids
+/// a `String` alloc + reparse per datagram in the common case.
+fn udp_dest_socket_addr(remote: &msg::UdpAddr) -> Option<std::net::SocketAddr> {
+    if !remote.zone.is_empty() {
+        return None;
+    }
+    let ip: std::net::IpAddr = remote.ip.parse().ok()?;
+    Some(std::net::SocketAddr::new(ip, remote.port))
+}
+
+/// Checked split of the user-side (visitor-segment) conn: calls `split_user_side`
+/// and turns the `Err(&'static str)` into a `warn!`-and-None, so call sites use
+/// `let Some((u_r, u_w)) = try_split_user_side(...) else { return };` instead of
+/// repeating the five-line warn-return match (audit #12 — the pattern drifted
+/// across SUDP and byte-stream bridges).
+fn try_split_user_side(
+    visitor_enc_key: Option<[u8; 16]>,
+    visitor_comp: bool,
+    user_conn: IoStream,
+) -> Option<UserBridgeHalves> {
+    match split_user_side(visitor_enc_key, visitor_comp, user_conn) {
+        Ok(pair) => Some(pair),
+        Err(msg) => {
+            warn!("{msg}");
+            None
+        }
+    }
+}
+
+/// Checked split of the work-conn halves: turns the `Err(&'static str)` into a
+/// `warn!`-and-None (audit #12, dedup of the repeated warn-return match).
+fn try_split_work_halves(
+    work_conn: IoStream,
+) -> Option<(
+    Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+)> {
+    match split_work_conn_halves(work_conn) {
+        Ok(pair) => Some(pair),
+        Err(msg) => {
+            warn!("{msg}");
+            None
+        }
+    }
+}
+
 /// Holds split user-side halves as one `AsyncRead`+`AsyncWrite` object so the
 /// XTCP STCP fallback can keep its `copy_bidirectional` semantics (both
 /// directions run to completion; the work side is only shut down after the
@@ -793,25 +929,11 @@ async fn run_work_bridge(
     // Empty sk: Go frp would still PBKDF2 an empty string and encrypt (the
     // key is just weak); we warn and bridge plaintext to keep the tunnel
     // usable (robustness over exact parity).
-    let visitor_enc_key = if req.visitor_use_encryption {
-        match proxy_info
-            .as_ref()
-            .and_then(|p| p.sk.as_deref())
-            .filter(|s| !s.is_empty())
-        {
-            Some(sk) => Some(derive_key(sk)),
-            None => {
-                warn!(
-                    proxy_name = %req.proxy_name,
-                    "visitor declared use_encryption but proxy '{}' has no secret_key; bridging visitor segment in plaintext",
-                    req.proxy_name
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let visitor_enc_key = visitor_encryption_key(
+        proxy_info.as_ref(),
+        &req.proxy_name,
+        req.visitor_use_encryption,
+    );
 
     // Whether visitor-segment encryption/compression is on. The user conn is
     // NOT split here — each bridge branch below calls
@@ -883,21 +1005,14 @@ async fn run_work_bridge(
     // which writes them through the CipherWriter (matching Go frp streaming CFB).
     if use_enc {
         let key = encryption_key;
-        let (u_r, u_w) = match split_user_side(visitor_enc_key, visitor_comp, req.user_conn) {
-            Ok(pair) => pair,
-            Err(msg) => {
-                warn!("{msg}");
-                return;
-            }
+        let Some((u_r, u_w)) = try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
+        else {
+            return;
         };
         // One boxed split for every IoStream variant — a single
         // monomorphization of bridge_encrypted instead of one per variant.
-        let (w_r, w_w) = match split_work_conn_halves(work_conn) {
-            Ok(pair) => pair,
-            Err(msg) => {
-                warn!("{msg}");
-                return;
-            }
+        let Some((w_r, w_w)) = try_split_work_halves(work_conn) else {
+            return;
         };
         // SUDP provider-segment compression stays off in BOTH bridge modes:
         // bridge_encrypted's Snappy stream would be misread by the provider's
@@ -906,7 +1021,13 @@ async fn run_work_bridge(
         // not unified here yet — this change is encryption-focused.
         let comp_key = req.use_compression && !is_sudp;
         if let Some(headers) = injector_headers {
-            let injector = ResponseHeaderInjector::new(w_r, headers);
+            // Response-header injection MUST observe plaintext (#2): the
+            // work conn carries AES-128-CFB ciphertext, so decrypt FIRST via
+            // CipherReader, THEN wrap in the injector. Passing this to
+            // bridge_encrypted with `read_is_decrypted=true` stops the bridge
+            // from re-wrapping (which would double-decrypt/corrupt).
+            let decrypted = CipherReader::new(w_r, key);
+            let injector = ResponseHeaderInjector::new(decrypted, headers);
             frp_core::bridge::bridge_encrypted(
                 u_r,
                 u_w,
@@ -915,10 +1036,11 @@ async fn run_work_bridge(
                 &key,
                 comp_key,
                 req.pre_read,
-                None,
-                None,
+                read_lim.as_mut(),
+                write_lim.as_mut(),
                 Some(metrics.clone()),
                 header_timeout,
+                true,
             )
             .await;
             // Matches the original inline closure: the injector path skips
@@ -937,6 +1059,7 @@ async fn run_work_bridge(
             write_lim.as_mut(),
             Some(metrics.clone()),
             header_timeout,
+            false,
         )
         .await;
     } else {
@@ -970,12 +1093,10 @@ async fn run_work_bridge(
         if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
             // Sized buffers so FRP_BRIDGE_BUF_KB governs the XTCP STCP
             // fallback path too.
-            let (u_r, u_w) = match split_user_side(visitor_enc_key, visitor_comp, req.user_conn) {
-                Ok(pair) => pair,
-                Err(msg) => {
-                    warn!("{msg}");
-                    return;
-                }
+            let Some((u_r, u_w)) =
+                try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
+            else {
+                return;
             };
             let mut user_side = UserSide { r: u_r, w: u_w };
             match tokio::io::copy_bidirectional_with_sizes(
@@ -995,19 +1116,13 @@ async fn run_work_bridge(
             }
         } else if read_lim.is_some() || write_lim.is_some() {
             // Bandwidth limiting active: use rate-limited plain bridge.
-            let (u_r, u_w) = match split_user_side(visitor_enc_key, visitor_comp, req.user_conn) {
-                Ok(pair) => pair,
-                Err(msg) => {
-                    warn!("{msg}");
-                    return;
-                }
+            let Some((u_r, u_w)) =
+                try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
+            else {
+                return;
             };
-            let (w_r, w_w) = match split_work_conn_halves(work_conn) {
-                Ok(pair) => pair,
-                Err(msg) => {
-                    warn!("{msg}");
-                    return;
-                }
+            let Some((w_r, w_w)) = try_split_work_halves(work_conn) else {
+                return;
             };
             if let Some(headers) = injector_headers {
                 let injector = ResponseHeaderInjector::new(w_r, headers);
@@ -1055,19 +1170,13 @@ async fn run_work_bridge(
         } else {
             // Slow path: compression, VHost pre-read, header injection, or
             // visitor-segment encryption.
-            let (u_r, u_w) = match split_user_side(visitor_enc_key, visitor_comp, req.user_conn) {
-                Ok(pair) => pair,
-                Err(msg) => {
-                    warn!("{msg}");
-                    return;
-                }
+            let Some((u_r, u_w)) =
+                try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
+            else {
+                return;
             };
-            let (w_r, w_w) = match split_work_conn_halves(work_conn) {
-                Ok(pair) => pair,
-                Err(msg) => {
-                    warn!("{msg}");
-                    return;
-                }
+            let Some((w_r, w_w)) = try_split_work_halves(work_conn) else {
+                return;
             };
             if let Some(headers) = injector_headers {
                 let injector = ResponseHeaderInjector::new(w_r, headers);
@@ -1146,42 +1255,20 @@ async fn run_sudp_message_bridge(
 
     // Visitor-segment encryption/compression (Go 三段式第 1 段): identical
     // decision to the byte-stream bridge — sk-derived key when the visitor
-    // declared use_encryption and the proxy has a secret key.
-    let visitor_enc_key = if req.visitor_use_encryption {
-        match proxy_info
-            .as_ref()
-            .and_then(|p| p.sk.as_deref())
-            .filter(|s| !s.is_empty())
-        {
-            Some(sk) => Some(derive_key(sk)),
-            None => {
-                warn!(
-                    proxy_name = %req.proxy_name,
-                    "SUDP message bridge: visitor declared use_encryption but proxy '{}' has no secret_key; bridging visitor segment in plaintext",
-                    req.proxy_name
-                );
-                None
-            }
-        }
-    } else {
-        None
+    let visitor_enc_key = visitor_encryption_key(
+        proxy_info.as_ref(),
+        &req.proxy_name,
+        req.visitor_use_encryption,
+    );
+    let Some((v_r, mut v_w)) =
+        try_split_user_side(visitor_enc_key, req.visitor_use_compression, req.user_conn)
+    else {
+        return;
     };
-    let (v_r, mut v_w) =
-        match split_user_side(visitor_enc_key, req.visitor_use_compression, req.user_conn) {
-            Ok(pair) => pair,
-            Err(msg) => {
-                warn!("{msg}");
-                return;
-            }
-        };
     // Provider-segment encryption (token-derived key) wraps the work halves
     // before the message loop, matching the byte-stream bridge.
-    let (w_r, w_w) = match split_work_conn_halves(work_conn) {
-        Ok(pair) => pair,
-        Err(msg) => {
-            warn!("{msg}");
-            return;
-        }
+    let Some((w_r, w_w)) = try_split_work_halves(work_conn) else {
+        return;
     };
     let w_r: frp_core::transport::BoxedReadHalf = if req.use_encryption {
         Box::new(CipherReader::new(w_r, encryption_key))
@@ -1210,13 +1297,17 @@ async fn run_sudp_message_bridge(
     let proxy_name = req.proxy_name.clone();
 
     // Direction 1: visitor → provider. Ping is dropped (Go
-    // bridgeSUDPVisitorToProxy). Traffic is accumulated locally and reported
-    // once after the loop (metrics.record_traffic does an atomic add + a
-    // clock_gettime day-bookkeeping on every call).
+    // bridgeSUDPVisitorToProxy). Traffic is accumulated locally and flushed
+    // to metrics periodically so the live dashboard/otel counters are not
+    // frozen at 0 for the whole (possibly long-lived) bridge — and so an
+    // aborted/joined-interrupted task does not lose the session's bytes or
+    // dump them wholesale into the teardown day's bucket (#4).
+    const SUDP_TRAFFIC_REPORT_EVERY: u32 = 64;
     let visitor_to_provider = async {
         // Reusable payload buffer for the V2 UDP read path.
         let mut scratch: Vec<u8> = Vec::new();
         let mut fwd_in: u64 = 0;
+        let mut report = 0u32;
         loop {
             let read = if visitor_v2 {
                 read_msg_v2_with_udp_codec(&mut v_r, visitor_codec_opt, &mut scratch).await
@@ -1267,18 +1358,26 @@ async fn run_sudp_message_bridge(
                 );
                 break;
             }
+            report += 1;
+            if report >= SUDP_TRAFFIC_REPORT_EVERY {
+                metrics.record_traffic(fwd_in, 0);
+                fwd_in = 0;
+                report = 0;
+            }
         }
         metrics.record_traffic(fwd_in, 0);
     };
 
     // Direction 2: provider → visitor. Ping is forwarded (Go
-    // bridgeSUDPProxyToVisitor). Traffic is accumulated locally and reported
-    // once after the loop, mirroring direction 1.
+    // bridgeSUDPProxyToVisitor). Traffic is accumulated locally and flushed
+    // periodically (see direction 1's rationale: live counters, no loss on
+    // abort, no single-day dump).
     let provider_to_visitor = async {
         // Reusable payload buffer for the V2 UDP read path (own buffer; the
         // two directions run concurrently via tokio::join!).
         let mut scratch: Vec<u8> = Vec::new();
         let mut fwd_out: u64 = 0;
+        let mut report = 0u32;
         loop {
             let read = if provider_v2 {
                 read_msg_v2_with_udp_codec(&mut w_r, provider_codec_opt, &mut scratch).await
@@ -1334,6 +1433,12 @@ async fn run_sudp_message_bridge(
                     e
                 );
                 break;
+            }
+            report += 1;
+            if report >= SUDP_TRAFFIC_REPORT_EVERY {
+                metrics.record_traffic(0, fwd_out);
+                fwd_out = 0;
+                report = 0;
             }
         }
         metrics.record_traffic(0, fwd_out);
@@ -1425,10 +1530,20 @@ pub(crate) async fn assign_work_to_proxy(
     // V2-aware: use V2 or V1 framing based on protocol version.
     if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
         let dummy = FrpMessage::NatHoleSid(msg::NatHoleSid::default());
-        if v2 {
-            let _ = work_conn.write_v2_frame(&dummy).await;
+        let write_result = if v2 {
+            work_conn.write_v2_frame(&dummy).await
         } else {
-            let _ = work_conn.write_v1_frame(&dummy).await;
+            work_conn.write_v1_frame(&dummy).await
+        };
+        // A failure to deliver the empty NatHoleSid marker means the Go frpc
+        // provider may not start its XTCP STCP fallback bridge; log it (unlike
+        // the StartWorkConn write above, this one didn't name the failing frame).
+        if let Err(e) = write_result {
+            debug!(
+                proxy_name = %req.proxy_name,
+                error = %e,
+                "failed to write dummy NatHoleSid frame to work conn: {e}"
+            );
         }
     }
 
@@ -1711,5 +1826,110 @@ mod tests {
             .await
             .expect("cancel must terminate the half-open UDP bridge task")
             .unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // ResponseHeaderInjector unit tests (regressions for #3a / #3b).
+    // ---------------------------------------------------------------------
+
+    async fn injector_read_all(
+        injector: &mut ResponseHeaderInjector<tokio::io::DuplexStream>,
+    ) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 7];
+        loop {
+            let n = injector.read(&mut chunk).await.expect("injector read");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+            // A deliberately small caller buffer exercises the "injected tail
+            // must survive a partial serve" path (#3b).
+        }
+        out
+    }
+
+    /// #3a: a response header longer than one internal 4 KiB buffer, whose
+    /// `\r\n\r\n` terminator spans two inner reads, must still be injected.
+    #[tokio::test]
+    async fn injector_headers_hspanning_reads_are_injected() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+
+        // Build a response whose header block is larger than the injector's
+        // 4096-byte read buffer, so the boundary lands in the second read.
+        let mut big_cookie = String::from("Set-Cookie: a=");
+        for _ in 0..900 {
+            big_cookie.push('x');
+        }
+        big_cookie.push_str(";\r\n");
+        let response = format!("HTTP/1.1 200 OK\r\n{big_cookie}\r\nbody-data");
+        inner_w.write_all(response.as_bytes()).await.expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("X-Injected: yes"),
+            "injected header must be present, got: {s:?}"
+        );
+        assert!(s.ends_with("body-data"), "body must survive, got: {s:?}");
+        assert!(
+            s.starts_with("HTTP/1.1 200 OK\r\n"),
+            "leading status line must be preserved"
+        );
+    }
+
+    /// #3b: the injected buffer is larger than the caller's `ReadBuf`, so the
+    /// injected header tail spans multiple polls — none of it may be dropped.
+    #[tokio::test]
+    async fn injector_injected_tail_not_dropped_across_small_reads() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        for i in 0..20 {
+            headers.insert(format!("X-{i}"), String::from("value-value-value-value"));
+        }
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+
+        let response = "HTTP/1.1 200 OK\r\n\r\nhello-body";
+        inner_w.write_all(response.as_bytes()).await.expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        let s = String::from_utf8_lossy(&out);
+        for i in 0..20 {
+            assert!(
+                s.contains(&format!("X-{i}: value-value-value-value\r\n")),
+                "injected header {i} missing (tail dropped?): {s:?}"
+            );
+        }
+        assert!(s.ends_with("hello-body"), "body must be intact");
+    }
+
+    /// No `\r\n\r\n` and EOF before it: bytes pass through unmodified.
+    #[tokio::test]
+    async fn injector_non_http_passthrough_on_eof() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+
+        inner_w
+            .write_all(b"no-header-terminator-here")
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(&out, b"no-header-terminator-here");
     }
 }

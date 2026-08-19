@@ -424,6 +424,7 @@ fn bench_bridge_pipeline(c: &mut Criterion) {
                             None,
                             None,
                             None,
+                            false,
                         )
                         .await;
                     });
@@ -461,6 +462,7 @@ fn bench_bridge_pipeline(c: &mut Criterion) {
                             None,
                             None,
                             None,
+                            false,
                         )
                         .await;
                     });

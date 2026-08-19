@@ -192,6 +192,13 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
         // Pre-read bytes (VHost HTTP parsing): write through WorkWriter.
         // CipherWriter variant encrypts automatically.
         let mut pre_read_buf = pre_read;
+        // Pre-read bytes must count against the same bandwidth limit as the
+        // main loop, or a rate-limited HTTP proxy flooded with small GETs
+        // (headers+body entirely in the pre-read) would sidestep the cap
+        // entirely (every connection's first ~4–8 KiB un-throttled).
+        if let Some(ref mut lim) = write_limiter {
+            lim.consume(pre_read_buf.len()).await;
+        }
         if let Err(e) = writer.write_bridge_all(&mut pre_read_buf).await {
             tracing::warn!(error = %e, "bridge user_to_work: pre_read write failed");
             return;
@@ -426,6 +433,8 @@ async fn bridge_work_to_user(
         if let Err(e) = dec.validate_partial_eof() {
             #[cfg(feature = "compression")]
             tracing::warn!(error = %e, "snappy EOF validation failed in bridge: {}", e);
+            // Without the compression feature the decompressor is a passthrough
+            // that cannot fail meaningfully; discard its (unreachable) error.
             #[cfg(not(feature = "compression"))]
             let _ = e;
         }
@@ -468,6 +477,7 @@ pub async fn bridge_encrypted_io(
         write_limiter,
         metrics,
         header_timeout,
+        false,
     )
     .await;
     Ok(())
@@ -486,11 +496,18 @@ pub async fn bridge_encrypted_io(
 /// CFB state.
 ///
 /// `read_limiter` limits work→user (download). `write_limiter` limits user→work (upload).
+///
+/// `read_is_decrypted`: when true, `work_r` is assumed to already be a
+/// plaintext stream (e.g. an injector wrapping a `CipherReader`) and is used
+/// as-is — `bridge_encrypted` does NOT wrap it in a second `CipherReader`.
+/// Used by frp-server's response-header-injector path so the injector sees
+/// decrypted (true) response bytes rather than ciphertext. All other callers
+/// pass false and keep the internal wrapping.
 #[allow(clippy::too_many_arguments)]
 pub async fn bridge_encrypted(
     user_r: impl AsyncReadExt + Unpin,
     user_w: impl AsyncWriteExt + Unpin,
-    work_r: impl AsyncReadExt + Unpin,
+    work_r: impl tokio::io::AsyncRead + Unpin + Send,
     work_w: impl AsyncWriteExt + Unpin,
     key: &[u8; 16],
     use_compression: bool,
@@ -499,6 +516,7 @@ pub async fn bridge_encrypted(
     write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     header_timeout: Option<Duration>,
+    read_is_decrypted: bool,
 ) {
     tracing::debug!(use_compression, "bridge_encrypted: starting");
     let mut enc_work_w = CipherWriter::new(work_w, *key);
@@ -514,7 +532,16 @@ pub async fn bridge_encrypted(
         return;
     }
 
-    let enc_work_r = CipherReader::new(work_r, *key);
+    // When the caller already supplies a decrypted (plaintext) work_r —
+    // e.g. the header injector wrapping its own CipherReader — do not wrap
+    // it again, or the stream would be doubly-decrypted (corrupt). Boxed as
+    // AsyncRead (not AsyncReadExt, which isn't dyn-compatible); the boxed
+    // reader still implements AsyncReadExt via the blanket impl.
+    let work_r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if read_is_decrypted {
+        Box::new(work_r)
+    } else {
+        Box::new(CipherReader::new(work_r, *key))
+    };
 
     let user_to_work = bridge_user_to_work(
         user_r,
@@ -525,7 +552,7 @@ pub async fn bridge_encrypted(
         metrics.clone(),
     );
     let work_to_user = bridge_work_to_user(
-        enc_work_r,
+        work_r,
         user_w,
         use_compression,
         read_limiter,
@@ -711,6 +738,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await;
         });
@@ -746,6 +774,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await;
         });
@@ -782,6 +811,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await;
         });
