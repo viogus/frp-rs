@@ -390,6 +390,8 @@ async fn run_udp_work_conn(
         // the per-packet Vec *allocation* is not. take/return keeps the
         // capacity across packets (audit D1-4).
         let mut spare: Vec<u8> = Vec::with_capacity(udp_packet_size);
+        // Reused binary-codec wire buffer: type ID + encoded packet.
+        let mut wire_scratch: Vec<u8> = Vec::with_capacity(udp_packet_size + 48);
         loop {
             let received = tokio::select! {
                 biased;
@@ -418,7 +420,14 @@ async fn run_udp_work_conn(
                         lim.consume(n).await;
                     }
                     let result = if v2 {
-                        write_msg_v2_with_udp_codec(&mut w_w, &pkt, udp_codec_opt, no_flush).await
+                        write_msg_v2_with_udp_codec(
+                            &mut w_w,
+                            &pkt,
+                            udp_codec_opt,
+                            no_flush,
+                            &mut wire_scratch,
+                        )
+                        .await
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
@@ -1306,6 +1315,9 @@ async fn run_sudp_message_bridge(
     let visitor_to_provider = async {
         // Reusable payload buffer for the V2 UDP read path.
         let mut scratch: Vec<u8> = Vec::new();
+        // Reusable binary-codec wire buffer (write side; `scratch` above is
+        // the read side).
+        let mut wire_scratch: Vec<u8> = Vec::new();
         let mut fwd_in: u64 = 0;
         let mut report = 0u32;
         loop {
@@ -1345,7 +1357,14 @@ async fn run_sudp_message_bridge(
                 }
             }
             let write = if provider_v2 {
-                write_msg_v2_with_udp_codec(&mut w_w, &msg, provider_codec_opt, false).await
+                write_msg_v2_with_udp_codec(
+                    &mut w_w,
+                    &msg,
+                    provider_codec_opt,
+                    false,
+                    &mut wire_scratch,
+                )
+                .await
             } else {
                 write_msg_v1(&mut w_w, &msg).await
             };
@@ -1376,6 +1395,9 @@ async fn run_sudp_message_bridge(
         // Reusable payload buffer for the V2 UDP read path (own buffer; the
         // two directions run concurrently via tokio::join!).
         let mut scratch: Vec<u8> = Vec::new();
+        // Reusable binary-codec wire buffer (write side; `scratch` above is
+        // the read side).
+        let mut wire_scratch: Vec<u8> = Vec::new();
         let mut fwd_out: u64 = 0;
         let mut report = 0u32;
         loop {
@@ -1421,7 +1443,14 @@ async fn run_sudp_message_bridge(
                 }
             }
             let write = if visitor_v2 {
-                write_msg_v2_with_udp_codec(&mut v_w, &msg, visitor_codec_opt, false).await
+                write_msg_v2_with_udp_codec(
+                    &mut v_w,
+                    &msg,
+                    visitor_codec_opt,
+                    false,
+                    &mut wire_scratch,
+                )
+                .await
             } else {
                 write_msg_v1(&mut v_w, &msg).await
             };

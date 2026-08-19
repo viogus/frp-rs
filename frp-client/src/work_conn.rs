@@ -890,6 +890,8 @@ async fn run_udp_work_conn(
         let mut local_udp_addr: Option<msg::UdpAddr> = msg::UdpAddr::from_string(&local_addr_str);
         // Ping-pong scratch for the per-packet compress chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
+        // Reused binary-codec wire buffer: type ID + encoded packet.
+        let mut wire_scratch: Vec<u8> = Vec::new();
         let mut keepalive = tokio::time::interval(Duration::from_secs(if udp_keepalive_secs > 0 {
             udp_keepalive_secs
         } else {
@@ -940,7 +942,14 @@ async fn run_udp_work_conn(
                         } else {
                             Some(udp_packet_codec.as_str())
                         };
-                        write_msg_v2_with_udp_codec(&mut w_w, &pkt, codec_opt, false).await
+                        write_msg_v2_with_udp_codec(
+                            &mut w_w,
+                            &pkt,
+                            codec_opt,
+                            false,
+                            &mut wire_scratch,
+                        )
+                        .await
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
