@@ -280,10 +280,22 @@ impl<R: AsyncRead + Unpin> AsyncRead for CipherReader<R> {
 /// Partial-write safety: if the underlying stream cannot accept all bytes at
 /// once (common with KCP), the first-write buffer is saved and retried on
 /// subsequent poll_write calls without re-encrypting.
-pub struct CipherWriter<W: AsyncWrite + Unpin> {
-    inner: W,
+/// Shared AES-128-CFB **write** state machine, used by both `CipherWriter`
+/// (a pure writer) and `CipherStream` (a combined reader+writer). It owns every
+/// write-side field — key, CFB state, the random IV, the partial-write retry
+/// buffers and the reusable encrypt scratch — and exposes the
+/// `poll_write`/`poll_flush`/`poll_shutdown` methods over a borrowed underlying
+/// `AsyncWrite`. This keeps the ~280-line partial-write/IV logic defined ONCE
+/// (audit #11): previously it was near-verbatim duplicated in `CipherStream`,
+/// and a bug fixed on one path could silently stay on the other.
+///
+/// The IV is generated up front (in `new`) and emitted with the first
+/// write (or first `flush`) — identical wire behavior to generating it lazily,
+/// since the random IV always precedes the first ciphertext byte.
+struct CipherWriterState {
     key: [u8; 16],
     cfb: Option<CfbState>,
+    write_iv: [u8; 16],
     iv_sent: bool,
     /// Buffered first write (IV + encrypted payload). Saved across partial writes.
     first_write_buf: Option<Vec<u8>>,
@@ -303,12 +315,14 @@ pub struct CipherWriter<W: AsyncWrite + Unpin> {
     scratch: Vec<u8>,
 }
 
-impl<W: AsyncWrite + Unpin> CipherWriter<W> {
-    pub fn new(inner: W, key: [u8; 16]) -> Self {
+impl CipherWriterState {
+    fn new(key: [u8; 16]) -> Self {
+        let mut write_iv = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut write_iv);
         Self {
-            inner,
             key,
             cfb: None,
+            write_iv,
             iv_sent: false,
             first_write_buf: None,
             first_write_pos: 0,
@@ -319,50 +333,44 @@ impl<W: AsyncWrite + Unpin> CipherWriter<W> {
         }
     }
 
-    /// Send the random IV to the peer. Must be called once before write_encrypted.
-    /// Idempotent — subsequent calls are no-ops.
-    async fn send_iv(&mut self) -> io::Result<()> {
+    /// Send the random IV to the peer. Must be called once before
+    /// write_encrypted. Idempotent — subsequent calls are no-ops.
+    async fn send_iv<W: AsyncWrite + Unpin>(&mut self, inner: &mut W) -> io::Result<()> {
         if self.iv_sent {
             return Ok(());
         }
         self.iv_sent = true;
-        let mut iv = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut iv);
-        self.cfb = Some(CfbState::new(&self.key, &iv));
-        self.inner.write_all(&iv).await
+        self.cfb = Some(CfbState::new(&self.key, &self.write_iv));
+        inner.write_all(&self.write_iv).await
     }
 
     /// Encrypt `data` in-place (CFB) and write to the underlying transport.
     /// `data` is overwritten with ciphertext — caller must not read it after.
     /// IV must already be sent (via poll_write first write, poll_flush, or send_iv).
-    pub async fn write_encrypted(&mut self, data: &mut [u8]) -> io::Result<usize> {
-        self.send_iv().await?;
+    async fn write_encrypted<W: AsyncWrite + Unpin>(
+        &mut self,
+        inner: &mut W,
+        data: &mut [u8],
+    ) -> io::Result<usize> {
+        self.send_iv(inner).await?;
         let cfb = self.cfb.as_mut().expect("IV must be set after send_iv");
         cfb.encrypt(data);
-        self.inner.write_all(data).await?;
+        inner.write_all(data).await?;
         Ok(data.len())
     }
-}
 
-impl<W: AsyncWrite + Unpin> Drop for CipherWriter<W> {
-    fn drop(&mut self) {
-        // Wipe the AES-128 key copy this writer retains.
-        zeroize_bytes(&mut self.key);
-    }
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
+    fn poll_write<W: AsyncWrite + Unpin>(
+        &mut self,
         cx: &mut Context<'_>,
+        inner: &mut W,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = &mut *self;
+        let this = self;
 
         // Flush pending first-write buffer (partial write retry).
         if let Some(ref pending) = this.first_write_buf {
             let remaining = &pending[this.first_write_pos..];
-            match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+            match Pin::new(&mut *inner).poll_write(cx, remaining) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -394,13 +402,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
             }
         }
 
-        // On first write, generate random IV and prepend it.
-        // Matches Go frp v0.69.1 `crypto.NewWriter` behavior.
+        // On first write, emit the random IV generated in new().
         if !this.iv_sent {
             this.iv_sent = true;
-            let mut iv = [0u8; 16];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut iv);
-            this.cfb = Some(CfbState::new(&this.key, &iv));
+            this.cfb = Some(CfbState::new(&this.key, &this.write_iv));
             // Encrypt into reusable scratch buffer — avoids buf.to_vec() allocation.
             this.scratch.clear();
             this.scratch.extend_from_slice(buf);
@@ -409,9 +414,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
                 .expect("cfb set to Some on first write above")
                 .encrypt(&mut this.scratch);
             let mut output = Vec::with_capacity(16 + this.scratch.len());
-            output.extend_from_slice(&iv);
+            output.extend_from_slice(&this.write_iv);
             output.extend_from_slice(&this.scratch);
-            match Pin::new(&mut this.inner).poll_write(cx, &output) {
+            match Pin::new(&mut *inner).poll_write(cx, &output) {
                 Poll::Ready(Ok(n)) if n >= output.len() => {
                     return Poll::Ready(Ok(buf.len()));
                 }
@@ -441,7 +446,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         // Drain pending encrypted_buf (partial write retry of a normal write).
         if let Some(ref pending) = this.encrypted_buf {
             let remaining = &pending[this.encrypted_write_pos..];
-            match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+            match Pin::new(&mut *inner).poll_write(cx, remaining) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -477,7 +482,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         this.scratch.clear();
         this.scratch.extend_from_slice(buf);
         cfb.encrypt(&mut this.scratch);
-        match Pin::new(&mut this.inner).poll_write(cx, &this.scratch) {
+        match Pin::new(&mut *inner).poll_write(cx, &this.scratch) {
             Poll::Ready(Ok(n)) if n >= this.scratch.len() => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Ok(0)) => {
                 Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
@@ -499,13 +504,17 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = &mut *self;
+    fn poll_flush<W: AsyncWrite + Unpin>(
+        &mut self,
+        cx: &mut Context<'_>,
+        inner: &mut W,
+    ) -> Poll<io::Result<()>> {
+        let this = self;
 
         // Drain pending first-write buffer (partial write retry).
         if let Some(ref pending) = this.first_write_buf {
             let remaining = &pending[this.first_write_pos..];
-            match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+            match Pin::new(&mut *inner).poll_write(cx, remaining) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -531,7 +540,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         // Drain pending encrypted_buf (partial write retry of normal write).
         if let Some(ref pending) = this.encrypted_buf {
             let remaining = &pending[this.encrypted_write_pos..];
-            match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+            match Pin::new(&mut *inner).poll_write(cx, remaining) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -559,15 +568,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         }
 
         // Eagerly send IV if not yet sent — unblocks the peer's CipherReader.
-        // Without this, when both sides use CipherWriter/CipherReader pairs,
-        // the first write is gated on user data arriving, but the peer's
-        // CipherReader blocks on the IV before it can make progress.
         if !this.iv_sent {
             this.iv_sent = true;
-            let mut iv = [0u8; 16];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut iv);
-            this.cfb = Some(CfbState::new(&this.key, &iv));
-            match Pin::new(&mut this.inner).poll_write(cx, &iv) {
+            this.cfb = Some(CfbState::new(&this.key, &this.write_iv));
+            match Pin::new(&mut *inner).poll_write(cx, &this.write_iv) {
                 Poll::Ready(Ok(n)) if n >= 16 => {}
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -577,7 +581,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
                 }
                 Poll::Ready(Ok(n)) => {
                     this.first_write_data_len = 0; // IV-only, no payload data
-                    this.first_write_buf = Some(iv.to_vec());
+                    this.first_write_buf = Some(this.write_iv.to_vec());
                     this.first_write_pos = n;
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
@@ -585,23 +589,27 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {
                     this.first_write_data_len = 0; // IV-only, no payload data
-                    this.first_write_buf = Some(iv.to_vec());
+                    this.first_write_buf = Some(this.write_iv.to_vec());
                     this.first_write_pos = 0;
                     return Poll::Pending;
                 }
             }
         }
 
-        Pin::new(&mut this.inner).poll_flush(cx)
+        Pin::new(&mut *inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = &mut *self;
+    fn poll_shutdown<W: AsyncWrite + Unpin>(
+        &mut self,
+        cx: &mut Context<'_>,
+        inner: &mut W,
+    ) -> Poll<io::Result<()>> {
+        let this = self;
 
         // Best-effort drain of pending first-write buffer before shutdown.
         if let Some(ref pending) = this.first_write_buf {
             let remaining = &pending[this.first_write_pos..];
-            if let Poll::Ready(Ok(n)) = Pin::new(&mut this.inner).poll_write(cx, remaining) {
+            if let Poll::Ready(Ok(n)) = Pin::new(&mut *inner).poll_write(cx, remaining) {
                 this.first_write_pos += n;
             }
             if this.first_write_pos < pending.len() {
@@ -619,7 +627,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         // Best-effort drain of pending encrypt buffer before shutdown.
         if let Some(ref pending) = this.encrypted_buf {
             let remaining = &pending[this.encrypted_write_pos..];
-            if let Poll::Ready(Ok(n)) = Pin::new(&mut this.inner).poll_write(cx, remaining) {
+            if let Poll::Ready(Ok(n)) = Pin::new(&mut *inner).poll_write(cx, remaining) {
                 this.encrypted_write_pos += n;
             }
             if this.encrypted_write_pos < pending.len() {
@@ -633,7 +641,61 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
             this.encrypted_write_pos = 0;
         }
 
-        Pin::new(&mut this.inner).poll_shutdown(cx)
+        Pin::new(&mut *inner).poll_shutdown(cx)
+    }
+}
+
+/// Writer of an AES-128-CFB encrypted stream.
+///
+/// Outputs the random IV as a 16-byte prefix, then a continuous CFB
+/// ciphertext stream (no per-frame length prefix) — matching Go frp v0.69.1
+/// `crypto.NewWriter`.
+pub struct CipherWriter<W: AsyncWrite + Unpin> {
+    inner: W,
+    state: CipherWriterState,
+}
+
+impl<W: AsyncWrite + Unpin> CipherWriter<W> {
+    pub fn new(inner: W, key: [u8; 16]) -> Self {
+        Self {
+            inner,
+            state: CipherWriterState::new(key),
+        }
+    }
+
+    /// Encrypt `data` in-place (CFB) and write to the underlying transport.
+    /// `data` is overwritten with ciphertext — caller must not read it after.
+    /// IV must already be sent (via poll_write first write, poll_flush, or send_iv).
+    pub async fn write_encrypted(&mut self, data: &mut [u8]) -> io::Result<usize> {
+        self.state.write_encrypted(&mut self.inner, data).await
+    }
+}
+
+impl<W: AsyncWrite + Unpin> Drop for CipherWriter<W> {
+    fn drop(&mut self) {
+        // Wipe the AES-128 key copy this writer retains.
+        zeroize_bytes(&mut self.state.key);
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        this.state.poll_write(cx, &mut this.inner, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        this.state.poll_flush(cx, &mut this.inner)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        this.state.poll_shutdown(cx, &mut this.inner)
     }
 }
 
@@ -645,50 +707,23 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
 pub struct CipherStream<S: AsyncRead + AsyncWrite + Unpin> {
     inner: S,
     read_key: [u8; 16],
-    write_key: [u8; 16],
     read_cfb: Option<CfbState>,
-    write_cfb: Option<CfbState>,
     iv_read: usize,
     iv_buf: [u8; 16],
-    iv_sent: bool,
-    write_iv: [u8; 16],
-    /// Buffered first write for partial-write retry safety.
-    first_write_buf: Option<Vec<u8>>,
-    first_write_pos: usize,
-    /// Original data length when buffer was set by poll_write (excl. 16-byte IV).
-    /// Zero when buffer was set by poll_flush (IV-only eager send).
-    first_write_data_len: usize,
-    /// Buffered second+ write (encrypted payload only, no IV).
-    /// Saved across partial writes so retries don't re-encrypt and corrupt CFB.
-    encrypted_buf: Option<Vec<u8>>,
-    /// Bytes already written from encrypted_buf.
-    encrypted_write_pos: usize,
-    /// Reused encrypt scratch — avoids a per-write `Vec` allocation on the
-    /// hot write path. Moved out (via `mem::take`) only on rare partial-write
-    /// branch, then regrown on the next call.
-    scratch: Vec<u8>,
+    /// Write-side state (IV, CFB, partial-write retry buffers) — delegated to
+    /// the shared `CipherWriterState` so the write path is defined once (#11).
+    write_state: CipherWriterState,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> CipherStream<S> {
     pub fn new(inner: S, key: [u8; 16]) -> Self {
-        let mut write_iv = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut write_iv);
         Self {
             inner,
             read_key: key,
-            write_key: key,
             read_cfb: None,
-            write_cfb: None,
             iv_read: 0,
             iv_buf: [0u8; 16],
-            iv_sent: false,
-            write_iv,
-            first_write_buf: None,
-            first_write_pos: 0,
-            first_write_data_len: 0,
-            encrypted_buf: None,
-            encrypted_write_pos: 0,
-            scratch: Vec::new(),
+            write_state: CipherWriterState::new(key),
         }
     }
 }
@@ -697,7 +732,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Drop for CipherStream<S> {
     fn drop(&mut self) {
         // Wipe both directional AES-128 key copies this stream retains.
         zeroize_bytes(&mut self.read_key);
-        zeroize_bytes(&mut self.write_key);
+        zeroize_bytes(&mut self.write_state.key);
     }
 }
 
@@ -798,273 +833,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
-
-        // Flush pending first-write buffer (partial write retry).
-        if let Some(ref pending) = this.first_write_buf {
-            let remaining = &pending[this.first_write_pos..];
-            match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    this.first_write_pos += n;
-                    if this.first_write_pos >= pending.len() {
-                        let data_len = this.first_write_data_len;
-                        this.first_write_buf = None;
-                        this.first_write_pos = 0;
-                        this.first_write_data_len = 0;
-                        // Buffer came from poll_write (has data after IV).
-                        // Data was already encrypted and stored in buffer —
-                        // don't fall through to re-encrypt buf.
-                        if data_len > 0 {
-                            return Poll::Ready(Ok(data_len));
-                        }
-                        // Buffer was IV-only (set by poll_flush). Fall through
-                        // to normal path — buf still needs encrypting.
-                    } else {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        // On first write, prepend the random IV generated in new().
-        if !this.iv_sent {
-            this.iv_sent = true;
-            this.write_cfb = Some(CfbState::new(&this.write_key, &this.write_iv));
-            tracing::debug!(iv_hex = %crate::hex_encode(&this.write_iv), data_len = buf.len(), "CipherStream: first write, sending IV + encrypted data");
-            // Encrypt into reusable scratch buffer — avoids buf.to_vec() allocation.
-            this.scratch.clear();
-            this.scratch.extend_from_slice(buf);
-            this.write_cfb
-                .as_mut()
-                .expect("write_cfb set to Some on first write above")
-                .encrypt(&mut this.scratch);
-            let mut output = Vec::with_capacity(16 + this.scratch.len());
-            output.extend_from_slice(&this.write_iv);
-            output.extend_from_slice(&this.scratch);
-            match Pin::new(&mut this.inner).poll_write(cx, &output) {
-                Poll::Ready(Ok(n)) if n >= output.len() => {
-                    return Poll::Ready(Ok(buf.len()));
-                }
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    this.first_write_buf = Some(output);
-                    this.first_write_pos = n;
-                    this.first_write_data_len = buf.len();
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    this.first_write_buf = Some(output);
-                    this.first_write_pos = 0;
-                    this.first_write_data_len = buf.len();
-                    return Poll::Pending;
-                }
-            }
-        }
-
-        // Drain pending encrypted_buf (partial write retry of a normal write).
-        if let Some(ref pending) = this.encrypted_buf {
-            let remaining = &pending[this.encrypted_write_pos..];
-            match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    this.encrypted_write_pos += n;
-                    if this.encrypted_write_pos >= pending.len() {
-                        let written = pending.len(); // CFB does not expand; == original buf.len()
-                                                     // Return buffer to scratch to reuse allocation on next write.
-                        this.scratch = this
-                            .encrypted_buf
-                            .take()
-                            .expect("encrypted_buf is Some — checked above");
-                        this.scratch.clear();
-                        this.encrypted_write_pos = 0;
-                        return Poll::Ready(Ok(written));
-                    } else {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        let cfb = this
-            .write_cfb
-            .as_mut()
-            .expect("IV must be sent before encrypting");
-        this.scratch.clear();
-        this.scratch.extend_from_slice(buf);
-        cfb.encrypt(&mut this.scratch);
-        match Pin::new(&mut this.inner).poll_write(cx, &this.scratch) {
-            Poll::Ready(Ok(n)) if n >= this.scratch.len() => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Ok(0)) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
-            }
-            Poll::Ready(Ok(n)) => {
-                this.encrypted_buf = Some(std::mem::take(&mut this.scratch));
-                this.encrypted_write_pos = n;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => {
-                this.encrypted_buf = Some(std::mem::take(&mut this.scratch));
-                this.encrypted_write_pos = 0;
-                Poll::Pending
-            }
-        }
+        // Delegate to the shared write state machine (which owns the write IV,
+        // CFB state and partial-write retry buffers) — defined once, not
+        // duplicated from CipherWriter (audit #11).
+        this.write_state.poll_write(cx, &mut this.inner, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
-
-        // Drain pending first-write buffer (partial write retry).
-        if let Some(ref pending) = this.first_write_buf {
-            let remaining = &pending[this.first_write_pos..];
-            match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    this.first_write_pos += n;
-                    if this.first_write_pos >= pending.len() {
-                        this.first_write_buf = None;
-                        this.first_write_pos = 0;
-                        this.first_write_data_len = 0;
-                    } else {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        // Drain pending encrypted_buf (partial write retry of normal write).
-        if let Some(ref pending) = this.encrypted_buf {
-            let remaining = &pending[this.encrypted_write_pos..];
-            match Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    this.encrypted_write_pos += n;
-                    if this.encrypted_write_pos >= pending.len() {
-                        // Return buffer to scratch to reuse allocation.
-                        this.scratch = this
-                            .encrypted_buf
-                            .take()
-                            .expect("encrypted_buf is Some — checked above");
-                        this.scratch.clear();
-                        this.encrypted_write_pos = 0;
-                    } else {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        // Eagerly send pre-generated IV if not yet sent.
-        if !this.iv_sent {
-            this.iv_sent = true;
-            this.write_cfb = Some(CfbState::new(&this.write_key, &this.write_iv));
-            match Pin::new(&mut this.inner).poll_write(cx, &this.write_iv) {
-                Poll::Ready(Ok(n)) if n >= 16 => {}
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    this.first_write_data_len = 0; // IV-only, no payload data
-                    this.first_write_buf = Some(this.write_iv.to_vec());
-                    this.first_write_pos = n;
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    this.first_write_data_len = 0; // IV-only, no payload data
-                    this.first_write_buf = Some(this.write_iv.to_vec());
-                    this.first_write_pos = 0;
-                    return Poll::Pending;
-                }
-            }
-        }
-
-        Pin::new(&mut this.inner).poll_flush(cx)
+        this.write_state.poll_flush(cx, &mut this.inner)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
-
-        // Best-effort drain of pending first-write buffer before shutdown.
-        if let Some(ref pending) = this.first_write_buf {
-            let remaining = &pending[this.first_write_pos..];
-            if let Poll::Ready(Ok(n)) = Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                this.first_write_pos += n;
-            }
-            if this.first_write_pos < pending.len() {
-                tracing::warn!(
-                    dropped = pending.len() - this.first_write_pos,
-                    "CipherStream::poll_shutdown: discarding {} bytes from first-write buffer",
-                    pending.len() - this.first_write_pos,
-                );
-            }
-            this.first_write_buf = None;
-            this.first_write_pos = 0;
-            this.first_write_data_len = 0;
-        }
-
-        // Best-effort drain of pending encrypt buffer before shutdown.
-        if let Some(ref pending) = this.encrypted_buf {
-            let remaining = &pending[this.encrypted_write_pos..];
-            if let Poll::Ready(Ok(n)) = Pin::new(&mut this.inner).poll_write(cx, remaining) {
-                this.encrypted_write_pos += n;
-            }
-            if this.encrypted_write_pos < pending.len() {
-                tracing::warn!(
-                    dropped = pending.len() - this.encrypted_write_pos,
-                    "CipherStream::poll_shutdown: discarding {} bytes from encrypt buffer",
-                    pending.len() - this.encrypted_write_pos,
-                );
-            }
-            this.encrypted_buf = None;
-            this.encrypted_write_pos = 0;
-        }
-
-        Pin::new(&mut this.inner).poll_shutdown(cx)
+        this.write_state.poll_shutdown(cx, &mut this.inner)
     }
 }
 

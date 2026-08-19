@@ -123,7 +123,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo test --workspace --all-features` | 797 passed, 0 failed |
 | `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); CI dev builds override LTO/opt (`lto=false opt-level=2`, written by ci.yml on runners) for build speed and come out ~70% larger (measured 2026-08-09: 9.1MB vs 5.3MB), so CI artifact sizes do not reflect release; local builds use the declared profile; hyper-based HTTP client + otel/prometheus default-features pruning) |
 | `compat-test.sh` (Go frp v0.71.0) | 76 run_test scenarios + 17 XTCP pairwise, all green in CI |
-| `unsafe` blocks | 13 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
+| `unsafe` blocks | 17 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
 | `data-encoding` crate | removed — inline `frp_core::base64` (encode/decode, standard alphabet) + existing `hex_encode` for the one HEXLOWER log site |

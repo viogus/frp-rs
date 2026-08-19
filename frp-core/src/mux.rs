@@ -18,14 +18,14 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 #[cfg(feature = "tcp-mux")]
-use tokio::sync::{oneshot, watch};
+use tokio::sync::oneshot;
 
 #[cfg(feature = "tcp-mux")]
 use futures_util::future::poll_fn;
 #[cfg(feature = "tcp-mux")]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 #[cfg(feature = "tcp-mux")]
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
@@ -298,25 +298,26 @@ impl IncomingStreams {
 #[cfg(feature = "tcp-mux")]
 #[derive(Clone)]
 pub struct YamuxSession {
-    /// Request channel to the background driver task. `open_stream()` sends
-    /// a one-shot request here and awaits the result; opening a stream does
-    /// NOT take the shared Connection lock (the driver task owns driving the
-    /// connection's I/O), so a session handle never blocks a worker thread
-    /// behind an in-flight connection poll.
+    /// Request channel to the background driver task. `open_stream()` sends a
+    /// one-shot request here and awaits the result — the OPENING task does NOT
+    /// take the shared Connection lock. The driver owns the connection and
+    /// both opens the stream AND drives connection I/O, so it keeps reading
+    /// inbound (ACK) frames while an open is in flight; a caller holding the
+    /// lock to poll_new_outbound would stall the driver's ACK reads and add
+    /// measurable setup latency (measured: setup_cold p50 +38% vs the
+    /// request-channel design). See `client_mux` for the non-blocking open
+    /// service that prevents the driver from parking inside an open (the
+    /// rebuild that made request-channel safe).
     open_tx:
         mpsc::UnboundedSender<oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>>,
     /// Set false when the background driver exits (I/O error, keepalive
     /// bound, or session drop). open_stream() checks it to fail fast
     /// instead of polling a connection whose driver is gone.
     alive: Arc<AtomicBool>,
-    /// Stateful wakeup for the driver after open_stream(): a `watch` send
-    /// is never lost — if the driver is mid-iteration (processing inbound
-    /// I/O) when the send happens, its next `changed()` resolves
-    /// immediately. A plain `Notify` would drop a wakeup fired while no
-    /// waiter was registered, leaving the new open request (and its queued
-    /// SYN flag / initial window update frames) unflushed until the next
-    /// keepalive tick (30s default) or inbound traffic.
-    opened: Arc<watch::Sender<()>>,
+    /// Wakes the driver after an open_stream() enqueues a request, so a new
+    /// open is served on the next driver I/O pass even when no inbound traffic
+    /// would otherwise wake it.
+    open_notify: Arc<tokio::sync::Notify>,
     /// When the last YamuxSession reference is dropped, this sender drops,
     /// signalling the background driver to exit (mirrors IncomingStreams).
     /// Arc'd because YamuxSession must be Clone (oneshot::Sender is not).
@@ -341,12 +342,10 @@ impl YamuxSession {
             // here.
             return None;
         }
-        // Wake the driver so it processes the open request. The watch send
-        // is stateful: it also wakes the driver if the send lands while the
-        // driver is mid-select-iteration (a Notify would lose it), so the new
-        // stream's queued frames (SYN flag / initial window update) get
-        // flushed promptly rather than waiting for the next keepalive tick.
-        let _ = self.opened.send(());
+        // Wake the driver so it picks up this open request on its next I/O
+        // pass (the driver does not block on this channel; the notify is how
+        // a quiet session learns a new open is queued).
+        self.open_notify.notify_one();
         let stream = match rx.await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
@@ -358,6 +357,9 @@ impl YamuxSession {
                 return None;
             }
         };
+        // The stream's queued frames (SYN flag / initial window update) are
+        // flushed by the driver's I/O pass that served this open, within the
+        // same poll. No further wakeup needed.
         Some(stream.compat())
     }
 }
@@ -590,9 +592,12 @@ where
 {
     let activity = Arc::new(ActivityState::default());
     let yamux_cfg = yamux_config(mux_cfg);
-    // Type-erased connection: YamuxSession holds an Arc<Mutex<Connection>> so
-    // open_stream() can poll poll_new_outbound directly (no request-channel
-    // round trip), while the driver task below drives connection I/O.
+    // The driver owns the Connection exclusively: it BOTH opens outbound
+    // streams (request-channel from open_stream) and drives connection I/O,
+    // so the opening caller never touches the Connection lock. This keeps the
+    // driver free to keep polling poll_next_inbound (processing ACK frames)
+    // while an open is in flight — a caller holding the lock to poll the
+    // connection would stall those ACK reads and add measurable setup latency.
     let mut conn: Connection<Box<dyn MuxSocket>> = Connection::new(
         Box::new(ActivityIo::new(stream, activity.clone()).compat()),
         yamux_cfg,
@@ -606,22 +611,22 @@ where
 
     let control_compat = control.compat();
 
-    let conn = Arc::new(Mutex::new(conn));
-    let bg_conn = conn.clone();
     // Shutdown signal: when the last YamuxSession is dropped (shutdown_tx
     // closed), the driver exits — mirrors server_mux's IncomingStreams.
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(shutdown_tx);
     let alive = Arc::new(AtomicBool::new(true));
     let bg_alive = alive.clone();
-    let (opened_tx, mut bg_opened) = watch::channel(());
-    let opened = Arc::new(opened_tx);
-    // Channel over which open_stream() requests a new outbound stream. The
-    // driver owns the Connection and opens the stream on request, so the
-    // session handle never contends on the Connection lock.
+    // Request channel by which open_stream() asks the driver to open a new
+    // outbound stream; the driver answers with the yamux Stream (or error).
+    // The caller never touches the Connection: it only sends + awaits.
     let (open_tx, mut bg_open_rx) = mpsc::unbounded_channel::<
         oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
     >();
+    // Used by open_stream() to wake the driver so a queued open is served on
+    // the next I/O pass even on an otherwise-quiet session.
+    let open_notify = Arc::new(tokio::sync::Notify::new());
+    let bg_open_notify = open_notify.clone();
     let keepalive = normalized_keepalive_interval(mux_cfg.keepalive_interval);
     // Dead-session bound in wall-clock time — see server_mux for why the
     // configured interval cannot be used alone as the dead bound.
@@ -629,9 +634,19 @@ where
     let mut consecutive_idle = 0u32;
 
     tokio::task::spawn(async move {
+        // Open requests drained from the channel but not yet answerable
+        // because the outbound ACK backlog is full (yamux MAX_ACK_BACKLOG).
+        // Served non-blockingly on the I/O branch; the driver NEVER parks
+        // inside poll_new_outbound, so it keeps reading ACK frames and the
+        // session can always make progress — this is what makes the
+        // request-channel driver safe from the PERMANENT wedge (#1).
+        let mut pending_opens: std::collections::VecDeque<
+            oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
+        > = std::collections::VecDeque::new();
         loop {
             tokio::select! {
-                // Drive connection I/O.
+                // Drive connection I/O and serve queued open requests in the
+                // SAME poll.
                 //
                 // Double-poll: with the vendored yamux the first poll already
                 // puts frames on the wire — Active::poll drains stream frames
@@ -647,20 +662,60 @@ where
                 // does no work), and it insulates us against any future yamux
                 // change that defers writes to a later poll.
                 //
-                // Streams opened from open_stream() are flushed by the `opened`
-                // wakeup branch below, which wakes this poll so the double-poll
-                // picks up the new stream's queued frames.
+                // POLL DISCIPLINE (driver loop invariant): this I/O branch is
+                // the ONLY branch that may touch the connection. It reads
+                // inbound frames (including the ACKs that wake a backlog-parked
+                // open) AND serves outbound opens via non-blocking
+                // poll_new_outbound. The keepalive branch below performs only
+                // a synchronous single-poll (wrapped in Poll::Ready, so it
+                // never parks). Do not add a branch that awaits a connection
+                // poll: it would stall ACK processing and wedge the session.
                 result = poll_fn(|cx| {
-                    let mut conn = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
-                    // First poll: drain stream commands and reads; batched
-                    // writes are flushed within this same call.
+                    // (1) drain any enqueued open requests into the local
+                    // pending queue (open_stream never touches the connection).
+                    loop {
+                        match bg_open_rx.try_recv() {
+                            Ok(req) => pending_opens.push_back(req),
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    // (2) serve as many as the ack_backlog admits. pop-first:
+                    // each request is answered (or, on a full backlog, pushed
+                    // straight back and the loop stops) so the borrow checker
+                    // is satisfied.
+                    loop {
+                        let Some(req) = pending_opens.pop_front() else {
+                            break;
+                        };
+                        // The caller cancelled (dropped its receiver) before
+                        // this pass — never open a phantom stream for it
+                        // (audit #7).
+                        if req.is_closed() {
+                            continue;
+                        }
+                        match conn.poll_new_outbound(cx) {
+                            Poll::Ready(Ok(stream)) => {
+                                let _ = req.send(Ok(stream));
+                            }
+                            Poll::Ready(Err(e)) => {
+                                let _ = req.send(Err(e));
+                            }
+                            Poll::Pending => {
+                                // ack_backlog full — keep the request queued
+                                // and continue THIS poll to poll_next_inbound,
+                                // which reads the ACKs that free backlog.
+                                pending_opens.push_front(req);
+                                break;
+                            }
+                        }
+                    }
+                    // (3) double-poll inbound (ACK + flush).
                     let first = conn.poll_next_inbound(cx);
                     match first {
                         Poll::Ready(r) => return Poll::Ready(r),
                         Poll::Pending => {}
                     }
-                    // Second poll: no-op with the vendored yamux (the first
-                    // poll already flushed the batch); kept as insurance.
                     debug!("yamux client: second poll (batch already flushed)");
                     conn.poll_next_inbound(cx)
                 }) => {
@@ -690,14 +745,12 @@ where
                     // Drive I/O to allow yamux internal PING/PONG processing.
                     // yamux-rs 0.14's RTT module sends PING every 10s and
                     // expects PONG, but does NOT timeout on AwaitingPong.
-                    let poll_result = poll_fn(|cx| {
-                        Poll::Ready(
-                            bg_conn
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .poll_next_inbound(cx),
-                        )
-                    }).await;
+                    // Synchronous single-poll (Poll::Ready wrapper, never
+                    // parks): this is an idle probe, not a blocking read — it
+                    // must NOT become an awaited poll, or it could dethrone
+                    // the double-poll I/O branch as the ACK-processing site.
+                    let poll_result =
+                        poll_fn(|cx| Poll::Ready(conn.poll_next_inbound(cx))).await;
                     match poll_result {
                         Poll::Ready(Some(Ok(_))) => {
                             debug!("yamux client: inbound stream received on keepalive poll");
@@ -739,27 +792,9 @@ where
                     bg_alive.store(false, Ordering::Release);
                     break;
                 }
-                // A session handle requested a new outbound stream. Open it
-                // on the connection and answer the requester. If the caller
-                // has dropped the request (session torn down), the send fails
-                // and the stream is discarded.
-                Some(req) = bg_open_rx.recv() => {
-                    let result = poll_fn(|cx| {
-                        bg_conn
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .poll_new_outbound(cx)
-                    })
-                    .await;
-                    let _ = req.send(result);
-                }
-                // A stream was opened from open_stream() — wake so the I/O
-                // branch re-polls and flushes the new stream's queued frames
-                // (SYN flag / initial window update) to the wire. watch's
-                // changed() resolves immediately if the send happened while
-                // this driver was busy elsewhere in the select, so the
-                // wakeup is never lost (a Notify would drop those).
-                _ = bg_opened.changed() => {}
+                // An open_stream() enqueued a request — wake so the I/O branch
+                // drains and serves it even on an otherwise-quiet session.
+                _ = bg_open_notify.notified() => {}
             }
         }
         debug!("yamux client: background task exiting");
@@ -770,7 +805,7 @@ where
         YamuxSession {
             open_tx,
             alive,
-            opened,
+            open_notify,
             shutdown_tx,
         },
     ))

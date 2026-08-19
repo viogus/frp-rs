@@ -596,7 +596,19 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
     // holds `scratch` outside its message loop and reuses it across frames,
     // avoiding a heap allocation per UDP packet.
     scratch.clear();
-    scratch.resize(payload_len, 0);
+    scratch.reserve(payload_len);
+    // Set the length without the `resize`-style zero-fill: `read_exact`
+    // below immediately overwrites the entire buffer, so the memset would be
+    // pure waste on the per-UDP-packet hot path (audit #14d).
+    // SAFETY: the region is written in full by `read_exact` on the next line
+    // *before* any element is read; tokio::io::AsyncReadExt then reads into
+    // the exact length we just set. `#[allow(clippy::uninit_vec)]` silences
+    // clippy's uninit_vec lint (flags the reserve→set_len shape), which is
+    // precisely the intentional use here.
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        scratch.set_len(payload_len);
+    }
     reader
         .read_exact(scratch.as_mut_slice())
         .await

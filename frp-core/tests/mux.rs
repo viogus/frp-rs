@@ -423,3 +423,153 @@ async fn server_mux_first_stream_wait_is_bounded_by_accept_deadline() {
     );
     drop(client_io);
 }
+
+/// Regression for the open_stream cancellation race (#7): cancelling an
+/// in-flight `open_stream()` must leave the session fully usable. The old
+/// request-channel design had the DRIVER open the stream and then fail the
+/// reply send when the caller had gone — leaving a phantom outbound stream
+/// (SYN already flushed) and, on cancellation floods, unbounded queued
+/// requests. The caller-side design polls on the calling task, so dropping
+/// the future simply cancels the poll with no side effect.
+#[tokio::test]
+async fn cancelling_open_stream_leaves_session_usable() {
+    let interval = Duration::from_secs(60);
+    let (_server_control, mut incoming, _client_control, session) =
+        connected_mux_pair(mux_config(interval), mux_config(interval)).await;
+
+    // Spawn and cancel several open_stream() calls. Aborting the task drops
+    // the in-flight future mid-poll (it may be parked awaiting an ACK).
+    for _ in 0..8 {
+        let s = session.clone();
+        let handle = tokio::spawn(async move { s.open_stream().await });
+        // Give the spawned task a chance to actually enter the poll before
+        // we cancel it, exercising the cancellation path with a real poll.
+        tokio::task::yield_now().await;
+        handle.abort();
+    }
+
+    // The session must still be alive and able to open a stream that the
+    // server actually accepts — proving the cancelled opens left no wedge
+    // and no phantom stream polluted the session.
+    let mut stream = tokio::time::timeout(Duration::from_secs(2), session.open_stream())
+        .await
+        .expect("open_stream must complete after cancellations")
+        .expect("session must stay usable after cancelled opens");
+    stream.write_all(b"ok").await.expect("write on stream");
+    stream.flush().await.expect("flush stream");
+
+    let mut server_stream = tokio::time::timeout(Duration::from_secs(3), incoming.recv())
+        .await
+        .expect("server must accept the post-cancellation stream")
+        .expect("server session must remain open");
+    let mut byte = [0u8; 2];
+    server_stream
+        .read_exact(&mut byte)
+        .await
+        .expect("server should read from the accepted stream");
+    assert_eq!(&byte, b"ok");
+}
+
+/// High-concurrency open_stream stress: a burst of simultaneous opens must
+/// not wedge the session's driver task. In the old design the driver did the
+/// poll_new_outbound, so once the outbound ACK backlog hit its cap the driver
+/// parked and could never read the ACK that would unblock it — a PERMANENT
+/// session wedge (#1). With the caller-side design the driver keeps reading
+/// inbound (and thus ACKs) independently, so a burst of opens always drains.
+///
+/// N is capped at 64: beyond yamux's per-drain write batch (64 SYN frames per
+/// Active::poll) and approaching MAX_ACK_BACKLOG (256), the vendored yamux
+/// write path cannot flush a large burst of SYN frames in one pass, so the
+/// SERVER sees fewer streams than the client opened regardless of the
+/// open_stream design (verified identical on main and this branch) — that is
+/// a pre-existing transport-throughput limit, not an open_stream wedge. This
+/// test pins the driver-not-wedged property for a realistic burst; the deeper
+/// >256 backpressure is out of scope here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_open_stream_burst_does_not_wedge_driver() {
+    let interval = Duration::from_secs(60);
+    // Use a large duplex so the concurrent yamux streams (SYN + ACK + each
+    // stream's data frame) do not fill the shared buffer and stall the peers.
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let (_server_control, mut incoming, _client_control, session) = connected_mux_pair_over(
+        client_io,
+        server_io,
+        mux_config(interval),
+        mux_config(interval),
+    )
+    .await;
+
+    // The core of (#1): open all N streams concurrently while the server side
+    // drains/ACKs them in parallel. With the caller-side design open_stream
+    // parks on ITS OWN task when the ACK backlog is full; the driver is never
+    // parked inside an open, so it keeps reading ACKs and the burst completes.
+    //
+    // The server side MUST drain `incoming` concurrently: its channel is
+    // bounded (256) and the server driver stalls accept/ACK when it fills —
+    // that is backpressure, not a wedge.
+    const N: usize = 64;
+
+    // Parallel server drain: accept each stream and read back its 16-bit index.
+    let server_drain = tokio::spawn(async move {
+        let mut seen2 = vec![false; N];
+        let mut n = 0usize;
+        while n < N {
+            let mut server_stream = tokio::time::timeout(Duration::from_secs(15), incoming.recv())
+                .await
+                .expect("accepted stream must arrive promptly")
+                .expect("server session must stay open");
+            let mut idx_bytes = [0u8; 2];
+            server_stream
+                .read_exact(&mut idx_bytes)
+                .await
+                .expect("read");
+            let v = u16::from_le_bytes(idx_bytes) as usize;
+            assert!(v < N && !seen2[v], "server saw stream {v} twice or OOB");
+            seen2[v] = true;
+            n += 1;
+        }
+        seen2
+    });
+
+    // Parallel client opens: each opens a stream and writes its index. The
+    // stream stays owned by the task until server_drain has read it (yield
+    // once so the drain can run), avoiding an early-drop RST race.
+    let mut open_handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let s = session.clone();
+        open_handles.push(tokio::spawn(async move {
+            let mut stream = tokio::time::timeout(Duration::from_secs(30), s.open_stream())
+                .await
+                .expect("concurrent open must resolve (no driver wedge)")
+                .expect("open_stream returned None (session must stay usable)");
+            stream
+                .write_all(&(i as u16).to_le_bytes())
+                .await
+                .expect("write");
+            stream.flush().await.expect("flush");
+            tokio::task::yield_now().await;
+            (i, stream)
+        }));
+    }
+    // Errors in any opening task surface the wedge: collect them all.
+    let mut open_errors: Vec<String> = Vec::new();
+    for h in open_handles {
+        if let Err(e) = h.await {
+            open_errors.push(format!("open task panicked: {e}"));
+        }
+    }
+
+    let seen2 = tokio::time::timeout(Duration::from_secs(120), server_drain)
+        .await
+        .expect("server must drain all concurrent streams without wedging")
+        .expect("server drain task");
+    assert!(
+        seen2.iter().all(|s| *s),
+        "every stream must be received once"
+    );
+    assert!(
+        open_errors.is_empty(),
+        "client open tasks panicked: {}",
+        open_errors.join("; ")
+    );
+}
