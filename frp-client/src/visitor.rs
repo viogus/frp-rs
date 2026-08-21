@@ -1526,6 +1526,9 @@ async fn run_sudp_worker(
     };
     // Buffer frame reads: read_msg_v1 issues two read_exact calls per message.
     let mut srv_r = tokio::io::BufReader::with_capacity(16 * 1024, srv_r);
+    // Reused binary-codec wire buffer (write side; the `scratch` inside the
+    // loop is the read side).
+    let mut wire_scratch: Vec<u8> = Vec::new();
     // The first packet (which triggered the connect) is written immediately.
     let first_write = if v2 {
         write_msg_v2_with_udp_codec(
@@ -1533,6 +1536,7 @@ async fn run_sudp_worker(
             &FrpMessage::UDPPacket(first_pkt),
             udp_codec_opt,
             false,
+            &mut wire_scratch,
         )
         .await
     } else {
@@ -1580,6 +1584,7 @@ async fn run_sudp_worker(
                                 &FrpMessage::UDPPacket(p),
                                 udp_codec_opt,
                                 false,
+                                &mut wire_scratch,
                             )
                             .await
                         } else {

@@ -39,6 +39,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# LOCAL PATCH (perf measurement only, not part of the code diff): fixed
+# /tmp/ab-* paths collide across users on shared machines (sticky-bit /tmp,
+# files owned by another user are undeletable and unwritable). Use a private
+# mktemp dir instead.
+ABTMP="$(mktemp -d /tmp/abmatrix-XXXXXX)"
+
 REPS="${1:-3}"
 RDUR="${2:-10}"
 GATE_PCT="${GATE_PCT:-5}"
@@ -106,18 +112,19 @@ FRPS_B="$AFTER_DIR/target/release/frps"   FRPC_B="$AFTER_DIR/target/release/frpc
 
 # --- ports / token / TLS certs ----------------------------------------------
 PORT=18040; RPORT=18041; ECHO=18042; TOKEN="ab-matrix-token"
-CA=/tmp/abmatrix-ca.crt; CAKEY=/tmp/abmatrix-ca.key
-CERT=/tmp/abmatrix-srv.crt; KEY=/tmp/abmatrix-srv.key
+CA="$ABTMP/ca.crt"; CAKEY="$ABTMP/ca.key"
+CERT="$ABTMP/srv.crt"; KEY="$ABTMP/srv.key"
 if [[ ! -f "$CERT" ]]; then
   openssl req -x509 -newkey rsa:2048 -keyout "$CAKEY" -out "$CA" -days 1 -nodes -subj "/CN=abmatrix-ca" 2>/dev/null
-  openssl req -newkey rsa:2048 -keyout "$KEY" -out /tmp/abmatrix-srv.csr -nodes -subj "/CN=localhost" 2>/dev/null
-  openssl x509 -req -in /tmp/abmatrix-srv.csr -CA "$CA" -CAkey "$CAKEY" -CAcreateserial -out "$CERT" -days 1 \
+  openssl req -newkey rsa:2048 -keyout "$KEY" -out "$ABTMP/srv.csr" -nodes -subj "/CN=localhost" 2>/dev/null
+  openssl x509 -req -in "$ABTMP/srv.csr" -CA "$CA" -CAkey "$CAKEY" -CAcreateserial -out "$CERT" -days 1 \
     -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE") 2>/dev/null
 fi
 
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+  rm -rf "$ABTMP"
   # Remove REF-mode worktrees this run created, so repeated invocations (e.g.
   # CI cache warm-up) do not leak detached WORKTREEs.
   for w in "${_WT_PATHS[@]}"; do git -C "$PROJECT_DIR" worktree remove --force "$w" 2>/dev/null || true; done
@@ -132,7 +139,7 @@ run_side() {
     echo "bind_addr = \"127.0.0.1\""; echo "bind_port = $PORT"; echo "tcp_mux = $mux"
     if [[ "$tls" == "true" ]]; then echo "tls_enable = true"; echo "tls_cert_file = \"$CERT\""; echo "tls_key_file = \"$KEY\""; fi
     echo "[auth]"; echo "method = \"token\""; echo "token = \"$TOKEN\""; echo "[log]"; echo "level = \"warn\""
-  } > /tmp/ab-frps.toml
+  } > "$ABTMP/frps.toml"
   {
     echo "server_addr = \"127.0.0.1\""; echo "server_port = $PORT"; echo "token = \"$TOKEN\""
     echo "login_fail_exit = true"; echo "pool_count = 1"; echo "tcp_mux = $mux"
@@ -141,13 +148,13 @@ run_side() {
     echo "local_ip = \"127.0.0.1\""; echo "local_port = $ECHO"; echo "remote_port = $RPORT"
     [[ "$enc"  == "true" ]] && echo "use_encryption = true"
     [[ "$comp" == "true" ]] && echo "use_compression = true"
-  } > /tmp/ab-frpc.toml
+  } > "$ABTMP/frpc.toml"
   PIDS=()
   "$stress" --scenario echo --port "$ECHO" >/dev/null 2>&1 & PIDS+=($!)
   sleep 1
-  "$frps" -c /tmp/ab-frps.toml >/dev/null 2>&1 & PIDS+=($!)
+  "$frps" -c "$ABTMP/frps.toml" >/dev/null 2>&1 & PIDS+=($!)
   sleep 1
-  "$frpc" -c /tmp/ab-frpc.toml >/dev/null 2>&1 & PIDS+=($!)
+  "$frpc" -c "$ABTMP/frpc.toml" >/dev/null 2>&1 & PIDS+=($!)
   local ok=""
   for i in $(seq 1 10); do
     if python3 -c "

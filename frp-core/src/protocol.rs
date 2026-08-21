@@ -358,17 +358,48 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
         payload.len()
     );
 
-    // Two writes instead of one merged Vec: avoids a heap allocation and a
-    // full payload memcpy per frame. The reader side is buffered on every
-    // transport we use, so this does not add a syscall.
-    writer
-        .write_all(&header)
-        .await
-        .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
-    writer
-        .write_all(payload)
-        .await
-        .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
+    // Header + payload go out as ONE writev(2) call. The old two write_all's
+    // were two send() syscalls per frame on a raw TcpStream — and with
+    // TCP_NODELAY (set on every data-path socket) the 8-byte header went out
+    // as its own tiny segment: two packets and ~40 extra bytes of IP/TCP
+    // header per frame on the UDP data plane. write_vectored maps to writev
+    // on TcpStream: one syscall, no allocation, no payload memcpy, and the
+    // kernel packs header + payload into one segment. Transports whose
+    // is_write_vectored is false (KCP, yamux, WebSocket, CipherWriter) fall
+    // back to per-buffer poll_write in tokio's default impl — semantically
+    // identical to the old two write_all's, so buffered transports are
+    // unaffected. writev may consume a partial iovec, so retries continue
+    // from the exact unwritten byte.
+    let mut hdr_off = 0usize;
+    let mut payload_off = 0usize;
+    loop {
+        if hdr_off >= header.len() && payload_off >= payload.len() {
+            break;
+        }
+        let bufs = [
+            std::io::IoSlice::new(&header[hdr_off..]),
+            std::io::IoSlice::new(&payload[payload_off..]),
+        ];
+        let n = writer
+            .write_vectored(&bufs)
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
+        if n == 0 {
+            return Err(crate::Error::Protocol(
+                "write V2 frame: zero-length write".into(),
+            ));
+        }
+        let mut rem = n;
+        if hdr_off < header.len() {
+            let take = rem.min(header.len() - hdr_off);
+            hdr_off += take;
+            rem -= take;
+        }
+        let take = rem.min(payload.len() - payload_off);
+        payload_off += take;
+        rem -= take;
+        debug_assert_eq!(rem, 0);
+    }
     Ok(())
 }
 
@@ -647,22 +678,27 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
 ///
 /// `no_flush` mirrors `write_msg_v2_nof`: skip the trailing flush syscall for
 /// raw TcpStream data planes where TCP_NODELAY already flushes per write.
+/// `scratch` is the reusable buffer for the binary codec path (cleared per
+/// call) — pass a buffer owned by the caller's task to avoid per-packet
+/// allocations.
 pub async fn write_msg_v2_with_udp_codec<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
     udp_packet_codec: Option<&str>,
     no_flush: bool,
+    scratch: &mut Vec<u8>,
 ) -> Result<(), crate::Error> {
     let binary = udp_packet_codec == Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY);
     if binary {
         if let FrpMessage::UDPPacket(packet) = msg {
-            let body = crate::udp_binary::encode_udp_packet_binary(packet).map_err(|e| {
+            // Reuse the caller's scratch: type ID + binary body, zero
+            // allocation per packet (was: body Vec + payload Vec = 2 allocs).
+            scratch.clear();
+            scratch.extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
+            crate::udp_binary::encode_udp_packet_binary_into(packet, scratch).map_err(|e| {
                 crate::Error::Protocol(format!("encode binary UDP packet: {e}").into())
             })?;
-            let mut payload = Vec::with_capacity(2 + body.len());
-            payload.extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
-            payload.extend_from_slice(&body);
-            write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await?;
+            write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, scratch).await?;
             // Flush unless the caller manages it (raw TcpStream + TCP_NODELAY,
             // or a CipherWriter that must flush to emit its IV). Without this,
             // buffered transports (TLS, yamux, WebSocket) and encrypted
@@ -1703,6 +1739,7 @@ mod tests {
                 &pkt,
                 Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
                 false,
+                &mut Vec::new(),
             )
             .await
             .unwrap();
@@ -1739,6 +1776,7 @@ mod tests {
                 pkt,
                 Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
                 false,
+                &mut Vec::new(),
             )
             .await
             .unwrap();
@@ -1754,7 +1792,7 @@ mod tests {
             let mut w = client;
             let mut r = server;
             let pkt = FrpMessage::UDPPacket(sample_udp_packet());
-            write_msg_v2_with_udp_codec(&mut w, &pkt, None, false)
+            write_msg_v2_with_udp_codec(&mut w, &pkt, None, false, &mut Vec::new())
                 .await
                 .unwrap();
             let got = read_msg_v2(&mut r).await.unwrap();
@@ -1765,7 +1803,7 @@ mod tests {
             let (client, server) = duplex(8192);
             let mut w = client;
             let mut r = server;
-            write_msg_v2_with_udp_codec(&mut w, &pkt, None, false)
+            write_msg_v2_with_udp_codec(&mut w, &pkt, None, false, &mut Vec::new())
                 .await
                 .unwrap();
             let err = read_msg_v2_with_udp_codec(
@@ -1792,6 +1830,7 @@ mod tests {
                 &pkt,
                 Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
                 true,
+                &mut Vec::new(),
             )
             .await
             .unwrap();

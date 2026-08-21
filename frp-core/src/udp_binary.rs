@@ -142,11 +142,20 @@ fn read_addr(body: &[u8], offset: usize) -> Result<(UdpAddr, usize), String> {
     ))
 }
 
+/// Convenience wrapper: encode into a fresh Vec.
+pub fn encode_udp_packet_binary(packet: &UDPPacket) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    encode_udp_packet_binary_into(packet, &mut body)?;
+    Ok(body)
+}
+
 /// Encode a UDPPacket into the binary codec body (the payload following the
-/// 2-byte type ID inside a V2 message frame).
+/// 2-byte type ID inside a V2 message frame), appending after any existing
+/// content of `out`. Callers that encode packet after packet reuse one buffer
+/// and pay the allocation once per bridge, not once per packet.
 ///
 /// RemoteAddr is required (Go: EncodeUDPPacketBinary errors without it).
-pub fn encode_udp_packet_binary(packet: &UDPPacket) -> Result<Vec<u8>, String> {
+pub fn encode_udp_packet_binary_into(packet: &UDPPacket, out: &mut Vec<u8>) -> Result<(), String> {
     let remote = packet
         .remote_addr
         .as_ref()
@@ -180,16 +189,17 @@ pub fn encode_udp_packet_binary(packet: &UDPPacket) -> Result<Vec<u8>, String> {
         ));
     }
 
-    let mut body = Vec::with_capacity(body_len);
-    body.push(flags);
+    let start = out.len();
+    out.reserve(body_len);
+    out.push(flags);
     if let Some(l) = local {
-        put_addr(&mut body, &l);
+        put_addr(out, &l);
     }
-    put_addr(&mut body, &remote_b);
-    body.extend_from_slice(&(packet.content.len() as u16).to_be_bytes());
-    body.extend_from_slice(&packet.content);
-    debug_assert_eq!(body.len(), body_len);
-    Ok(body)
+    put_addr(out, &remote_b);
+    out.extend_from_slice(&(packet.content.len() as u16).to_be_bytes());
+    out.extend_from_slice(&packet.content);
+    debug_assert_eq!(out.len() - start, body_len);
+    Ok(())
 }
 
 /// Decode a UDPPacket from a binary codec body.
