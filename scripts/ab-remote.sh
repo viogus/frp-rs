@@ -69,8 +69,17 @@ if [[ -z "$SSH_KEY_FILE" ]]; then
 fi
 chmod 600 "$SSH_KEY_FILE"
 
+# -o ServerAliveInterval: the VPS measurement emits nothing on stdout while it
+# runs (ab-remote.sh buffers the whole `ab-matrix.sh` output in $OUT and only
+# prints it at the end), so the SSH connection carries zero data for minutes.
+# On a network path with an idle-session timeout this was observed as an
+# occasional `client_loop: send disconnect: Broken pipe` mid-measurement (the
+# 2026-08-22 schedule run died ~5min in, far short of the normal 13-17min).
+# Keepalives cost negligible bandwidth and prevent the session from being
+# reaped as idle; 3 missed replies = ~3*interval = a hard failure we do want.
 SSH_COMMON=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-            -o BatchMode=yes -i "$SSH_KEY_FILE")
+            -o BatchMode=yes -i "$SSH_KEY_FILE"
+            -o ServerAliveInterval=60 -o ServerAliveCountMax=3)
 
 # Sanity-check the local binary roots before shipping.
 check_root() {  # check_root <label> <root>
