@@ -112,11 +112,24 @@ impl PoolGuard {
     #[inline]
     pub fn acquire() -> Self {
         let mut buf = BUFFER_POOL.acquire();
-        // Only zero-fill on a freshly allocated (len 0) buffer. Recycled buffers
-        // already have length BUFFER_SIZE, so skip the 64KB memset. read() fills
-        // the slice and callers use only the [..n] prefix, so stale bytes are safe.
+        // Only stretch a freshly allocated (len 0) buffer up to BUFFER_SIZE.
+        // Recycled buffers already have length BUFFER_SIZE. We use an
+        // uninitialized `set_len` instead of `resize(.., 0)` so the pool-miss
+        // path skips a 32 KiB memset: `read()` immediately overwrites the
+        // whole slice and callers only observe the `[..n]` prefix, so stale
+        // bytes are never read (same argument as the V2 UDP read path's
+        // `set_len` in `protocol.rs::read_msg_v2_with_udp_codec`). The
+        // `PoolGuard` docs above already declare the `[..n]`-prefix contract.
         if buf.len() < *BUFFER_SIZE {
-            buf.resize(*BUFFER_SIZE, 0);
+            // SAFETY: on a pool miss `acquire()` allocates
+            // `Vec::with_capacity(BUFFER_SIZE)`, so `capacity >= BUFFER_SIZE`
+            // always holds; the region is fully overwritten by the caller's
+            // next `read()` before any element is observed, so uninitialized
+            // bytes are never read.
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                buf.set_len(*BUFFER_SIZE);
+            }
         }
         Self { buf }
     }
