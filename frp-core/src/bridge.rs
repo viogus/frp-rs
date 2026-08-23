@@ -216,6 +216,14 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
         Vec::new()
     };
     let mut compressor = make_compressor(use_compression);
+    // Compressed path batching: accumulate written (compressed) bytes and only
+    // flush when the accumulated batch reaches MAX_WORK_TO_USER_BATCH (256 KiB)
+    // or a short read indicates interactive traffic. This mirrors the
+    // work->user batching (bridge_work_to_user): raw TCP under TCP_NODELAY sees
+    // no change (flush is a no-op there), but buffered transports (TLS/WS/yamux)
+    // save one flush syscall + waker round-trip per ~256 KiB instead of per
+    // 32 KiB chunk. The plaintext path is unchanged (flush on short read).
+    let mut pending = 0usize;
     loop {
         let n = match user_r.read(buf.as_mut_slice()).await {
             Ok(0) => break,
@@ -248,6 +256,16 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
             }
             // comp_buf is cleared and refilled on each compress call, so its
             // capacity is retained across chunks.
+            // Batch the flush: accumulate compressed bytes; flush when the
+            // batch cap is hit OR the read was short (interactive latency).
+            pending += comp_buf.len();
+            if n < cap || pending >= MAX_WORK_TO_USER_BATCH {
+                if let Err(e) = writer.flush_bridge().await {
+                    tracing::debug!(error = %e, "bridge user_to_work: flush error");
+                    break;
+                }
+                pending = 0;
+            }
         } else {
             let slice = &mut buf.as_mut_slice()[..n];
             if let Some(ref mut lim) = write_limiter {
@@ -257,13 +275,13 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
                 tracing::debug!(error = %e, "bridge user_to_work: write error");
                 break;
             }
-        }
-
-        // Conditional flush: batch on full reads unless compressing
-        if use_compression || n < cap {
-            if let Err(e) = writer.flush_bridge().await {
-                tracing::debug!(error = %e, "bridge user_to_work: flush error");
-                break;
+            // Conditional flush: batch on full reads (plaintext path — flush
+            // on short reads for interactive latency).
+            if n < cap {
+                if let Err(e) = writer.flush_bridge().await {
+                    tracing::debug!(error = %e, "bridge user_to_work: flush error");
+                    break;
+                }
             }
         }
     }
@@ -897,6 +915,158 @@ mod tests {
             flushes.load(Ordering::SeqCst),
             1,
             "expected batched flush, got per-chunk"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "compression")]
+    async fn bridge_user_to_work_batches_compressed_flushes_on_full_reads() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        struct CountingWriter(Arc<AtomicUsize>);
+        impl AsyncWrite for CountingWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                b: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(b.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Reader that yields N full-capacity chunks (each = BUFFER_SIZE) then EOF.
+        struct NFulllChunks(usize);
+        impl AsyncRead for NFulllChunks {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.0 == 0 {
+                    return Poll::Ready(Ok(()));
+                } // EOF
+                self.0 -= 1;
+                let n = buf.remaining();
+                // Repeated bytes — snappy-compressible, so the compressed output
+                // per chunk is tiny and `pending` stays far below the 256 KiB
+                // batch cap: with full reads the batch must NOT flush per chunk.
+                buf.put_slice(&vec![0x41u8; n]);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let reads = 32usize;
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let user_r = NFulllChunks(reads);
+        let work_w = CountingWriter(flushes.clone());
+
+        bridge_user_to_work(
+            user_r,
+            WorkWriter::Plain(work_w),
+            true, // compression on — the batched path
+            Vec::new(),
+            None,
+            None,
+        )
+        .await;
+
+        // All reads are full capacity; none is short, so the compressed path
+        // must NOT flush per chunk. It flushes only when the accumulated batch
+        // reaches MAX_WORK_TO_USER_BATCH (unreached here given high
+        // compressibility) or the final shutdown flush. Assert it flushed far
+        // fewer times than it read chunks (batching effective) and at least
+        // once total (final flush happened).
+        let f = flushes.load(Ordering::SeqCst);
+        assert!(
+            f < reads,
+            "expected batched (non-per-chunk) flush on compressed full reads, got {f} flushes for {reads} reads"
+        );
+        assert!(f >= 1, "expected at least the final flush, got {f}");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "compression")]
+    async fn bridge_user_to_work_compressed_flushes_on_short_reads() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        struct CountingWriter(Arc<AtomicUsize>);
+        impl AsyncWrite for CountingWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                b: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(b.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Reader that yields N short chunks (each < BUFFER_SIZE) then EOF.
+        struct NShortChunks(usize);
+        impl AsyncRead for NShortChunks {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.0 == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                self.0 -= 1;
+                let n = buf.remaining().min(16);
+                buf.put_slice(&vec![0x42u8; n]);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let reads = 64usize;
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let user_r = NShortChunks(reads);
+        let work_w = CountingWriter(flushes.clone());
+
+        bridge_user_to_work(
+            user_r,
+            WorkWriter::Plain(work_w),
+            true,
+            Vec::new(),
+            None,
+            None,
+        )
+        .await;
+
+        // Every read is short (n < cap), so the compressed path MUST flush on
+        // each one: interactive latency is preserved even under compression.
+        let f = flushes.load(Ordering::SeqCst);
+        assert!(
+            f >= reads,
+            "expected per-read flush on short reads (interactive), got {f} for {reads} reads"
         );
     }
 
