@@ -194,6 +194,27 @@ enum LoopExit {
     Reconnect,
 }
 
+/// The session-agnostic inputs to the message loop, created once in run()
+/// and outliving sessions. Held by `&mut` borrow (not owned) because run()
+/// needs `stop_rx` and `health_cancels` again after the loop returns — the
+/// reconnect-backoff race and teardown both use them.
+struct SessionChannels<'a> {
+    /// Health-check results from the spawned health check tasks.
+    health_rx: &'a mut mpsc::Receiver<HealthEvent>,
+    /// Reload requests from the admin API (config hot-reload).
+    reload_rx: &'a mut mpsc::Receiver<ReloadRequest>,
+    /// XTCP STUN results from the off-loop STUN discovery tasks.
+    xtcp_rx: &'a mut mpsc::Receiver<XtcpNotification>,
+    /// New-visitor requests from spawned visitor listeners (STCP/XTCP).
+    visitor_rx: &'a mut mpsc::Receiver<VisitorRequest>,
+    /// Stop request from the admin API / signal handler.
+    stop_rx: &'a mut mpsc::Receiver<()>,
+    /// Cancellation flags for health check tasks, shared with teardown.
+    health_cancels: &'a Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// STUN server address used for XTCP hole punching.
+    nat_hole_stun_server: &'a str,
+}
+
 /// Per-session state shared across the login → registration → message-loop
 /// phases of one connection attempt. Created on successful login, dropped on
 /// teardown. Holds exactly the locals that used to live inline in run().
@@ -1091,8 +1112,11 @@ impl Service {
             // unresponsive, so the session goes straight to teardown +
             // reconnect below — the same path a message-loop heartbeat
             // timeout takes. An aborted session has no spawned visitors or
-            // writer task to clean up; the teardown below handles both.
-            if !aborted {
+            // writer task to clean up; the shared teardown below handles
+            // both. The loop exit is captured as `Option` so the aborted
+            // path (no loop ran) feeds into the same teardown + decision
+            // tail as a `LoopExit::Reconnect` exit.
+            let exit = if !aborted {
                 // Phase 5: split the stream, spawn the writer task and vnet
                 // controllers, cancel the previous session's visitor
                 // listeners, and spawn the current session's visitors.
@@ -1113,64 +1137,53 @@ impl Service {
                 drop(cfg_local);
 
                 // Phase 6: the message loop, until the session ends.
-                match self
-                    .run_message_loop(
+                Some(
+                    self.run_message_loop(
                         &mut ctx,
-                        &mut health_rx,
-                        &mut reload_rx,
-                        &mut xtcp_rx,
-                        &mut visitor_rx,
-                        &mut stop_rx,
-                        &health_cancels,
-                        &nat_hole_stun_server,
+                        &mut SessionChannels {
+                            health_rx: &mut health_rx,
+                            reload_rx: &mut reload_rx,
+                            xtcp_rx: &mut xtcp_rx,
+                            visitor_rx: &mut visitor_rx,
+                            stop_rx: &mut stop_rx,
+                            health_cancels: &health_cancels,
+                            nat_hole_stun_server: &nat_hole_stun_server,
+                        },
                     )
-                    .await
-                {
-                    // A stop was requested (admin API / signal): tear down
-                    // and exit — the session must not reconnect.
-                    LoopExit::Shutdown => {
-                        self.teardown_session(
-                            &mut ctx,
-                            #[cfg(feature = "tcp-mux")]
-                            &mut prev_yamux,
-                            &health_cancels,
-                            &mut admin_handle,
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                    // The session died: tear down, then reconnect with backoff.
-                    LoopExit::Reconnect => {
-                        if self
-                            .teardown_session(
-                                &mut ctx,
-                                #[cfg(feature = "tcp-mux")]
-                                &mut prev_yamux,
-                                &health_cancels,
-                                &mut admin_handle,
-                            )
-                            .await
-                        {
-                            return Ok(());
-                        }
-                    }
-                }
+                    .await,
+                )
             } else {
                 // Registration aborted (read error or heartbeat watchdog):
-                // no writer task or visitors were spawned; tear down and
-                // reconnect. teardown_session returns true only when a stop
-                // was requested (shutdown_flag set).
-                if self
-                    .teardown_session(
-                        &mut ctx,
-                        #[cfg(feature = "tcp-mux")]
-                        &mut prev_yamux,
-                        &health_cancels,
-                        &mut admin_handle,
-                    )
-                    .await
-                {
-                    return Ok(());
+                // no writer task or visitors were spawned; `None` means there
+                // is no message-loop exit, and the session reconnects exactly
+                // as a `Reconnect` exit does.
+                None
+            };
+
+            // Phase 7: tear down the session exactly once, whether the
+            // message loop exited or registration aborted. Returns true only
+            // when a stop was requested during the session (shutdown_flag
+            // set).
+            let stop_requested = self
+                .teardown_session(
+                    &mut ctx,
+                    #[cfg(feature = "tcp-mux")]
+                    &mut prev_yamux,
+                    &health_cancels,
+                    &mut admin_handle,
+                )
+                .await;
+
+            // Single exit-vs-reconnect decision point. A stop (admin API /
+            // signal) always exits — the session must not reconnect. A dead
+            // session or aborted registration reconnects with backoff unless
+            // the teardown itself found a stop request.
+            match exit {
+                Some(LoopExit::Shutdown) => return Ok(()),
+                Some(LoopExit::Reconnect) | None => {
+                    if stop_requested {
+                        return Ok(());
+                    }
                 }
             }
 
@@ -2257,19 +2270,12 @@ impl Service {
     /// requested (run() must not reconnect), `Reconnect` when the session
     /// died (run() tears down and reconnects).
     ///
-    /// The session-agnostic receivers and handles are parameters: they are
-    /// created once in run() and outlive sessions.
-    #[allow(clippy::too_many_arguments)]
+    /// The session-agnostic receivers and handles are bundled in `channels`:
+    /// they are created once in run() and outlive sessions.
     async fn run_message_loop(
         &self,
         ctx: &mut SessionCtx,
-        health_rx: &mut mpsc::Receiver<HealthEvent>,
-        reload_rx: &mut mpsc::Receiver<ReloadRequest>,
-        xtcp_rx: &mut mpsc::Receiver<XtcpNotification>,
-        visitor_rx: &mut mpsc::Receiver<VisitorRequest>,
-        stop_rx: &mut mpsc::Receiver<()>,
-        health_cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-        nat_hole_stun_server: &str,
+        channels: &mut SessionChannels<'_>,
     ) -> LoopExit {
         // The message loop owns the split reader half.
         let mut reader = ctx
@@ -2367,7 +2373,7 @@ impl Service {
                         Ok(FrpMessage::CloseProxy(cp)) => {
                             info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
                             // Cancel health check task and remove map entry.
-                            let mut cancels = health_cancels.lock().await;
+                            let mut cancels = channels.health_cancels.lock().await;
                             if let Some(cancel) = cancels.get(&cp.proxy_name) {
                                 cancel.store(true, Ordering::Relaxed);
                             }
@@ -2776,7 +2782,7 @@ impl Service {
                     }
                 }
 
-                Some(event) = health_rx.recv() => {
+                Some(event) = channels.health_rx.recv() => {
                     match event {
                         HealthEvent::Close(proxy_name) => {
                             info!(proxy_name = %proxy_name, "Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
@@ -2830,7 +2836,7 @@ impl Service {
                     }
                 }
 
-                Some(req) = reload_rx.recv() => {
+                Some(req) = channels.reload_rx.recv() => {
                     let result = match &self.config_file {
                         Some(path) => self.try_reload(path, req.strict, &writer).await,
                         None => Err("no config file path stored".into()),
@@ -2846,7 +2852,7 @@ impl Service {
                     let _ = req.reply.send(result);
                 }
 
-                Some(xtcp_notif) = xtcp_rx.recv() => {
+                Some(xtcp_notif) = channels.xtcp_rx.recv() => {
                     let XtcpNotification { sid, proxy_name } = xtcp_notif;
                     info!(proxy_name = %proxy_name, "XTCP provider: received NatHoleSid for '{}'", proxy_name);
                     // STUN discovery runs off the control loop: two STUN
@@ -2856,7 +2862,7 @@ impl Service {
                     // hands the finished NatHoleClient back for the loop to
                     // write + bookkeep, preserving the write-before-NatHoleResp
                     // ordering.
-                    let stun_server = nat_hole_stun_server.to_string();
+                    let stun_server = channels.nat_hole_stun_server.to_string();
                     let stun_sockets = Arc::clone(&ctx.xtcp_sockets);
                     let stun_tx = ctx
                         .stun_result_tx
@@ -3007,7 +3013,7 @@ impl Service {
                 // Visitor requests: send NatHoleVisitor on control connection.
                 // Go frps v0.69.1 only handles NatHoleVisitor on the control
                 // connection path, not on fresh TCP connections.
-                Some(vreq) = visitor_rx.recv() => {
+                Some(vreq) = channels.visitor_rx.recv() => {
                     let txn_id = vreq.nhv.transaction_id.clone();
                     let nhv = FrpMessage::NatHoleVisitor(vreq.nhv);
                     match writer.send(nhv, ctx.v2) {
@@ -3043,7 +3049,7 @@ impl Service {
                     }
                 }
 
-                Some(()) = stop_rx.recv() => {
+                Some(()) = channels.stop_rx.recv() => {
                     info!("Stop requested, shutting down");
                     ctx.shutdown_flag.store(true, Ordering::SeqCst);
                     return LoopExit::Shutdown;
@@ -4736,6 +4742,135 @@ mod tests {
         assert!(
             !msg.contains("frp-token-startup.txt"),
             "error leaked the token-file path: {msg}"
+        );
+    }
+
+    /// Regression (PR #242 review): when a NewProxy write on the control
+    /// stream fails, `register_proxies` must set `ctx.write_failed` and abort
+    /// the registration response phase immediately — the server never received
+    /// the request, so no NewProxyResp will ever arrive, and waiting for one
+    /// would hang the registration for a full `REGISTRATION_RESPONSE_TIMEOUT`
+    /// (30s at default) or until the heartbeat watchdog. The abort returns
+    /// false, which makes run() skip the session continuation (writer task,
+    /// visitor listeners, message loop) and go straight to teardown +
+    /// reconnect.
+    #[tokio::test]
+    async fn register_proxies_aborts_on_control_write_failure() {
+        let proxy = frp_core::config::ProxyConfig {
+            name: "abort-tcp".to_string(),
+            proxy_type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 1,
+            remote_port: 12345,
+            enabled: true,
+            ..Default::default()
+        };
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            proxies: vec![proxy.clone()],
+            ..Default::default()
+        };
+        let service = Service::with_unsafe_features(cfg.clone(), None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed");
+
+        // Control stream with a dead write direction: connect a real TCP pair,
+        // then SHUT_WR the client half — every subsequent write fails with
+        // BrokenPipe (EPIPE) immediately, no peer RTT involved.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _server = listener.accept().await.unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut client)
+            .await
+            .unwrap();
+
+        let mut ctx = SessionCtx {
+            control_stream: Some(IoStream::Tcp(client)),
+            run_id: "test-run-id".to_string(),
+            yamux: None,
+            v2: false,
+            #[cfg(feature = "quic")]
+            quic_conn: None,
+            ping_interval: None,
+            last_pong: Instant::now(),
+            hb_timeout: 30,
+            hb_timeout_dur: Duration::from_secs(30),
+            hb_watchdog_active: false,
+            session_alive: Arc::new(AtomicBool::new(true)),
+            wc_server_addr: "127.0.0.1".to_string(),
+            wc_server_port: 7000,
+            wc_tls_enable: false,
+            wc_tls_server_name: String::new(),
+            wc_tls_ca_file: None,
+            wc_tls_cert_file: None,
+            wc_tls_key_file: None,
+            wc_dns_server: None,
+            wc_udp_packet_size: 1500,
+            wc_udp_packet_codec: String::new(),
+            wc_disable_custom_tls_first_byte: false,
+            wc_keepalive_secs: 7200,
+            wc_bind_addr: None,
+            wc_proxy_url: String::new(),
+            wc_dial_timeout_secs: 10,
+            protocol: TransportProtocol::Tcp,
+            client_scopes: Vec::new(),
+            server_scopes: Vec::new(),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            session_started_at: Instant::now(),
+            pending_proxies: Vec::new(),
+            pending_visitors: Vec::new(),
+            write_failed: false,
+            seen_registration_response: false,
+            req_work_conns_seen: 0,
+            writer: None,
+            control_rx: None,
+            control_failed: None,
+            control_notify: None,
+            reader: None,
+            visitor_shutdown: None,
+            visitor_handles: Vec::new(),
+            pending_xtcp: HashMap::new(),
+            xtcp_sockets: Default::default(),
+            visitor_pending: HashMap::new(),
+            stun_result_tx: None,
+            stun_result_rx: None,
+            xtcp_cleanup_rx: None,
+            proxy_retry_interval: None,
+            waitstart_seen: HashMap::new(),
+            cfg_user: String::new(),
+        };
+
+        // The failed write must not leave the response-read loop spinning:
+        // registration must return false promptly (without it, the loop would
+        // wait out REGISTRATION_RESPONSE_TIMEOUT for a response to a request
+        // the server never received — the 5s test timeout catches that).
+        let completed = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.register_proxies(&mut ctx, &cfg, std::slice::from_ref(&proxy), 1),
+        )
+        .await
+        .expect("register_proxies must exit promptly on a control write failure");
+
+        assert!(
+            !completed,
+            "a failed control write must abort registration, not complete it"
+        );
+        assert!(ctx.write_failed, "write_failed must be recorded on the ctx");
+        assert!(
+            ctx.pending_proxies.is_empty(),
+            "the failed request must not be left pending"
+        );
+        let map = service.proxy_info_map.read().await;
+        let info = map
+            .get(&wire_proxy_name(&cfg.user, &proxy.name))
+            .expect("proxy must have a runtime info entry");
+        assert!(
+            matches!(&info.phase, ProxyPhase::StartErr(e) if !e.is_empty()),
+            "proxy must be marked StartErr after a failed write, got {:?}",
+            info.phase
         );
     }
 }
