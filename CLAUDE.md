@@ -113,16 +113,16 @@ Every feature, fix, and test change follows three rules:
    bash scripts/download-go-frp.sh
    ```
 
-## Current Health (2026-08)
+## Current Health (2026-08-23)
 
 | Metric | Value |
 |--------|-------|
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 797 passed, 0 failed |
+| `cargo test --workspace --all-features` | 998 passed, 0 failed |
 | `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); CI dev builds override LTO/opt (`lto=false opt-level=2`, written by ci.yml on runners) for build speed and come out ~70% larger (measured 2026-08-09: 9.1MB vs 5.3MB), so CI artifact sizes do not reflect release; local builds use the declared profile; hyper-based HTTP client + otel/prometheus default-features pruning) |
-| `compat-test.sh` (Go frp v0.71.0) | 76 run_test scenarios + 17 XTCP pairwise, all green in CI |
+| `compat-test.sh` (Go frp v0.71.0) | 76 run_test scenarios + 17 XTCP pairwise; XTCP 17/17 re-verified locally vs Go 0.71.0 (2026-08-23) |
 | `unsafe` blocks | 17 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
@@ -131,6 +131,8 @@ Every feature, fix, and test change follows three rules:
 | `exec://` token source | always blocked by `UnsafeFeatures::default()` |
 | Security audit | `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` + `cargo deny check` before release |
 | Go frp parity (2026-08-02) | 20-task pass merged (PR #221): OIDC/QUIC/KCP+TLS/WS/UDP/PROXY/plugin/client-management parity, `{single=N}` allowPorts + 24h reservations, HTTPS vhost SNI passthrough, fail-closed HTTP server plugins, **SSH gateway `ssh -R`** (tcpip-forward/forwarded-tcpip), dashboard offline clients/root auth/store 0600, XTCP **MakeHole** state machine, IPv6 vnet routing |
+| Go frp v0.71.0 parity (2026-08-16) | PR #246: UDP packet binary codec (`binary-v1`, V2 frame type 19), version alignment 0.71.0, V2 extension types renumbered 21/22, negative pool_count rejected at login, case-insensitive customDomains check |
+| Post-0.71.0 hardening (2026-08-17..22) | PRs #254-#263: vendor yamux 0.14 + stream cap 1024, zero-copy snappy hot paths, 3 LOW data-path fixes, WS-over-TLS stall recovery, ci fmt/clippy/audit fixes, 15-item review (wedge/cipher/splice/metrics/dedup), cargo update, single-writev V2 frames + zero-alloc binary UDP encode |
 
 Key perf optimizations (3 audit cycles):
 - Bridge: `compress_chunk`/`decompress_chunk` reuse buffers (zero alloc per iteration)
@@ -251,7 +253,7 @@ Two paths for visitor connections:
 
 Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkConn → StartWorkConn+NatHoleSid on work conn) → Provider does STUN → Provider→Server(NatHoleClient on control) → Server NAT analysis (classify + 5-mode behavior recommend) → Server→Visitor(NatHoleResp) + Server→Provider(NatHoleResp, sender side delayed 1s) → both sides run MakeHole UDP probing per DetectBehavior → winner socket carries the KCP+yamux P2P data plane → bridge to local → Provider→Server(NatHoleReport) → session complete.
 
-**Status:** Fully implemented (cross-compat verified: 17/17 XTCP pairwise scenarios with Go frp v0.70.1). The server is a control-plane coordinator — it classifies NAT features, recommends a 5-mode `DetectBehavior`, and manages sessions — but never relays XTCP data nor sends probe packets (provider and visitor each do their own STUN). Hole punching is UDP-based: both sides run Go-style `MakeHole` probing (`punch_udp_hole_makehole_owned` in `frp-core/src/xtcp_p2p.rs`) and the KCP+yamux data plane runs on the socket that received the peer's detect reply (Go `result.lConn` semantics). Provider-side (`frp-client/src/service.rs`) reads StartWorkConn+NatHoleSid from work conn, does STUN, sends NatHoleClient on control, reads NatHoleResp, then `xtcp_p2p_connect_yamux` → bridge to local. Visitor-side (`frp-client/src/visitor.rs`) handles `NatHoleVisitor` → PreCheck + STUN + full NatHoleVisitor → `xtcp_p2p_connect_yamux` → bridge to user. STCP fallback if hole punch fails (uses `fallback_to` config field to point at separate STCP proxy, matching Go frp architecture). e2e test in `frp-server/tests/xtcp_hole_punch.rs`, loopback MakeHole tests in `frp-core/tests/xtcp_p2p.rs`.
+**Status:** Fully implemented (cross-compat verified: 17/17 XTCP pairwise scenarios with Go frp v0.71.0 (re-verified locally 2026-08-23; daily `xtcp-compat.yml` VPS matrix)). The server is a control-plane coordinator — it classifies NAT features, recommends a 5-mode `DetectBehavior`, and manages sessions — but never relays XTCP data nor sends probe packets (provider and visitor each do their own STUN). Hole punching is UDP-based: both sides run Go-style `MakeHole` probing (`punch_udp_hole_makehole_owned` in `frp-core/src/xtcp_p2p.rs`) and the KCP+yamux data plane runs on the socket that received the peer's detect reply (Go `result.lConn` semantics). Provider-side (`frp-client/src/service.rs`) reads StartWorkConn+NatHoleSid from work conn, does STUN, sends NatHoleClient on control, reads NatHoleResp, then `xtcp_p2p_connect_yamux` → bridge to local. Visitor-side (`frp-client/src/visitor.rs`) handles `NatHoleVisitor` → PreCheck + STUN + full NatHoleVisitor → `xtcp_p2p_connect_yamux` → bridge to user. STCP fallback if hole punch fails (uses `fallback_to` config field to point at separate STCP proxy, matching Go frp architecture). e2e test in `frp-server/tests/xtcp_hole_punch.rs`, loopback MakeHole tests in `frp-core/tests/xtcp_p2p.rs`.
 
 **XTCP P2P bridging:** After successful hole punch, the P2P KCP-over-UDP stream (`XtcpP2pStream`, wrapped in yamux) is bridged to the local service with conditional `bridge_encrypted` (when `use_encryption=true` + `sk` non-empty) or `bridge_plain` (otherwise). Encryption key derived from proxy's `sk` (SecretKey) via `derive_key()` — same derivation as control connection but uses SecretKey instead of auth token. Probe packets (NatHoleSid) are AES-128-CFB encrypted with the same key; without a secret key Rust↔Rust probes fall back to the `"frp"` magic. `ProxyRuntimeInfo.sk` stores the SecretKey for access in NAT hole punch handler paths (`NatHoleClient` and `NatHoleResp` handlers in service.rs, visitor P2P path in visitor.rs). Both sides derive the same key from the shared SecretKey, matching Go frp.
 
@@ -286,7 +288,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **Protocol connectivity matrix**: `scripts/protocol-matrix.sh` — end-to-end throughput through frps+frpc for 11 transport rows (tcp/ws/wss/kcp/quic × tls × tcp_mux). Each row asserts data actually moves (mbps > 0), catching "connects but bridges zero bytes" regressions like the WS-over-TLS lost-wakeup stall. Runs in `compat.yml` after the compat tests; also run locally after any transport change: `bash scripts/protocol-matrix.sh`.
 - **Security audit**: Run `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` and `cargo deny check` before each release. The three ignores are pre-existing issues with **no upstream fix** (cargo-audit ≥0.21 dropped `audit.toml` config file support — flags are the only mechanism; keep reasons in sync with the CI job in `ci.yml`):
   - `RUSTSEC-2026-0194/0195` (quick-xml 0.26, high): dev-only `profiling` feature chain pprof 0.15 → inferno 0.11.21 → quick-xml 0.26. pprof 0.15.0 is the latest release; nothing newer resolves. Never compiled into release binaries.
-  - `RUSTSEC-2023-0071` (rsa 0.10.0-rc.18, Marvin attack, medium): pinned by russh 0.62.5 (latest) via ssh-key 0.7.0-rc.11. Advisory has no fixed upgrade. Affects frps SSH gateway (RSA host keys/auth) only. Re-check on every russh bump.
+  - `RUSTSEC-2023-0071` (rsa 0.10.0-rc.18, Marvin attack, medium): pinned by russh 0.62.7 (latest) via ssh-key 0.7.0-rc.11. Advisory has no fixed upgrade. Affects frps SSH gateway (RSA host keys/auth) only. Re-check on every russh bump.
 
 ### Test Coverage Gaps
 
@@ -295,7 +297,7 @@ Known areas lacking e2e cross-compat test coverage:
 - ~~UDP proxy: no Go frp cross-compat~~ — covered (test_g2r_udp + test_r2g_udp, both in Phase 4)
 - HTTP/HTTPS proxy: basic VHost + basic auth + host_header_rewrite + subdomain tested (7 compat tests); response_headers, route_by_http_user, locations all now cross-compat tested
 - Reload configuration: automated test added (reload_integration.rs, SIGUSR1 client-side reload path)
-- **XTCP NAT traversal**: tested pairwise on localhost, not across real NAT devices
+- **XTCP NAT traversal**: daily CI pairwise matrix (`xtcp-compat.yml`) runs frps on a VPS (public IP) with both frpc ends on the NATed GitHub runner — real STUN/NAT classify, but not two independent NATed networks
 
 ### Dependency Policy (mandatory)
 
@@ -316,7 +318,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Crypto (general) | `ring` | 0.17 — SHA256, AES-256-GCM, HKDF, HMAC |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` | ring only has ChaCha20 (96-bit nonce), V2 needs XChaCha20 (192-bit) |
-| TLS | `rustls` + `tokio-rustls` + `rustls-platform-verifier` | ring backend, tls12, native cert verifier. **Vendored** at `vendor/rustls` 0.23.41 with a one-line SNI patch (`ServerNamePayload::Invalid` → treat as no-SNI) for Go XTCP QUIC visitor compat; delete the vendored copy when upgrading to rustls ≥0.24 (native `invalid_sni_policy`) and keep tracking 0.23.x security updates manually |
+| TLS | `rustls` + `tokio-rustls` + `rustls-platform-verifier` | ring backend, tls12, native cert verifier. **Vendored** at `vendor/rustls` 0.23.43 with a one-line SNI patch (`ServerNamePayload::Invalid` → treat as no-SNI) for Go XTCP QUIC visitor compat; delete the vendored copy when upgrading to rustls ≥0.24 (native `invalid_sni_policy`) and keep tracking 0.23.x security updates manually |
 | SSH | `russh` | ring backend (NOT aws-lc-rs), features: ring+rsa only |
 | HTTP client | inline `frp_core::http_client` | hyper + hyper-rustls direct (not reqwest — size-pruned); OIDC + http-proxy + dashboard health use it |
 | HTTP server | `axum` | dashboard, admin auth |
@@ -343,7 +345,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 - `lazy_static` — replaced by `std::sync::LazyLock` (stable since Rust 1.80)
 - `libc` — active direct dependency (frp-core Linux splice(2), frp-vnet TUN ioctl)
 
-> Note: "banned" means no **direct** dependency. Several still exist **transitively** in the default frps dependency tree via the SSH feature chain (russh 0.62.5 → ssh-key 0.7.0-rc): `data-encoding`, `aes-gcm`, `sha2`, `hkdf`, `hmac` (and `base64`/`lazy_static` via dev-only pprof/tracing paths). They cannot be removed without replacing russh; only direct use is forbidden.
+> Note: "banned" means no **direct** dependency. Several still exist **transitively** in the default frps dependency tree via the SSH feature chain (russh 0.62.7 → ssh-key 0.7.0-rc): `data-encoding`, `aes-gcm`, `sha2`, `hkdf`, `hmac` (and `base64`/`lazy_static` via dev-only pprof/tracing paths). They cannot be removed without replacing russh; only direct use is forbidden.
 
 ### Workspace Dependencies
 
