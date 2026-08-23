@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
@@ -200,6 +201,25 @@ fn plan_visitor_dial(
     }
 }
 
+/// XTCP retry decision after a failed NatHoleVisitor attempt.
+///
+/// Returns `None` when the per-connection cancellation token is cancelled —
+/// the visitor listener is shutting down and the task must drop the user
+/// connection and return without bridging (Go frpc cancels a per-visitor
+/// context on teardown). `Some(true)` retries with the next attempt;
+/// `Some(false)` gives up (attempt budget exhausted, or one-shot mode).
+fn xtcp_retry_decision(
+    cancelled: bool,
+    keep_tunnel_open: bool,
+    attempt: usize,
+    max_retries: usize,
+) -> Option<bool> {
+    if cancelled {
+        return None;
+    }
+    Some(keep_tunnel_open && attempt < max_retries)
+}
+
 /// Run the packet loop over an established `virtual_net` visitor tunnel.
 ///
 /// After the NewVisitorConn handshake, tunnel bytes are wrapped in the same
@@ -348,11 +368,23 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
     };
     info!(name = %name, bind_addr = %bind_addr, "Visitor '{}' listening on {}", name, bind_addr);
 
+    // Parent cancellation token: every accepted connection gets a child token,
+    // cancelled when the listener exits (shutdown, accept error, or the
+    // listener task being aborted). In-flight connection tasks otherwise run
+    // to completion after shutdown — an XTCP visitor with keep_tunnel_open
+    // retries for up to an hour per connection. Go frpc cancels a per-visitor
+    // context on teardown; the token is the Rust equivalent. The drop guard
+    // covers the abort path (service.rs aborts a listener stuck in accept()
+    // after 500ms): dropping the guard cancels the parent and every child.
+    let listener_cancel = CancellationToken::new();
+    let _cancel_guard = listener_cancel.clone().drop_guard();
+
     loop {
         // Check graceful shutdown signal before each accept (Go frp compat:
         // visitor listeners exit cleanly instead of being aborted).
         if shutdown.load(Ordering::Relaxed) {
             info!(name = %name, "Visitor '{}' shutting down gracefully", name);
+            listener_cancel.cancel();
             return;
         }
 
@@ -391,6 +423,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                     tls_key_file: tls_key_file.clone(),
                     v2,
                 };
+
+                // Per-connection shutdown token: a child of the listener
+                // token, cancelled on listener exit so this task aborts its
+                // XTCP retry loop / pending bridge instead of running out its
+                // retry budget after shutdown has been requested. The child
+                // dies with the task — no pruning needed.
+                let conn_cancel = listener_cancel.child_token();
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
@@ -486,6 +525,14 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         }
 
                         for attempt in 0..=max_retries {
+                            // Shutdown boundary: abandon the connection
+                            // between attempts. Never checked mid-hole-punch —
+                            // an in-flight STUN/MakeHole attempt runs to its
+                            // own timeout before this boundary is reached.
+                            if conn_cancel.is_cancelled() {
+                                info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
+                                return; // drops the user connection unbridged
+                            }
                             if attempt > 0 {
                                 debug!(
                                     visitor_name = %visitor_name, attempt = %attempt, max_retries = %max_retries, retry_delay = ?retry_delay,
@@ -612,24 +659,51 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 Ok(Ok(Ok(resp))) => resp,
                                 Ok(Ok(Err(e))) => {
                                     warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': NatHoleResp error from server: {}", visitor_name, e);
-                                    if keep_tunnel_open && attempt < max_retries {
-                                        continue;
+                                    match xtcp_retry_decision(
+                                        conn_cancel.is_cancelled(),
+                                        keep_tunnel_open,
+                                        attempt,
+                                        max_retries,
+                                    ) {
+                                        Some(true) => continue,
+                                        Some(false) => return,
+                                        None => {
+                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
+                                            return; // drops the user connection unbridged
+                                        }
                                     }
-                                    return;
                                 }
                                 Ok(Err(_)) => {
                                     warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp channel closed (control loop dropped)", visitor_name);
-                                    if keep_tunnel_open && attempt < max_retries {
-                                        continue;
+                                    match xtcp_retry_decision(
+                                        conn_cancel.is_cancelled(),
+                                        keep_tunnel_open,
+                                        attempt,
+                                        max_retries,
+                                    ) {
+                                        Some(true) => continue,
+                                        Some(false) => return,
+                                        None => {
+                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
+                                            return; // drops the user connection unbridged
+                                        }
                                     }
-                                    return;
                                 }
                                 Err(_elapsed) => {
                                     warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp timed out after 15s", visitor_name);
-                                    if keep_tunnel_open && attempt < max_retries {
-                                        continue;
+                                    match xtcp_retry_decision(
+                                        conn_cancel.is_cancelled(),
+                                        keep_tunnel_open,
+                                        attempt,
+                                        max_retries,
+                                    ) {
+                                        Some(true) => continue,
+                                        Some(false) => return,
+                                        None => {
+                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
+                                            return; // drops the user connection unbridged
+                                        }
                                     }
-                                    return;
                                 }
                             };
                             debug!(visitor_name = %visitor_name, "Visitor '{}': received NatHoleResp from server", visitor_name);
@@ -727,6 +801,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 };
                                 match p2p_stream {
                                     Ok(mut p2p_stream) => {
+                                        // Shutdown boundary: don't start the
+                                        // P2P bridge — drop the user
+                                        // connection and return.
+                                        if conn_cancel.is_cancelled() {
+                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP P2P connection", visitor_name);
+                                            return; // drops the user connection unbridged
+                                        }
                                         info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected", visitor_name);
                                         let use_enc = use_encryption && !sk.is_empty();
                                         let (user_r, user_w) = user_conn
@@ -878,6 +959,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             }
                         }
 
+                        // Shutdown boundary: don't start the fallback relay —
+                        // drop the user connection and return.
+                        if conn_cancel.is_cancelled() {
+                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning STCP fallback connection", visitor_name);
+                            return; // drops the user connection unbridged
+                        }
+
                         let user = user_conn;
                         let (user_r, user_w) = user.into_split();
                         let (srv_r, srv_w) = match split_work_conn_halves(server_conn) {
@@ -994,6 +1082,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             }
                         }
 
+                        // Shutdown boundary: don't start the relay bridge —
+                        // drop the user connection and return.
+                        if conn_cancel.is_cancelled() {
+                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning STCP connection", visitor_name);
+                            return; // drops the user connection unbridged
+                        }
+
                         let user = user_conn;
                         let (user_r, user_w) = user.into_split();
                         let (srv_r, srv_w) = match split_work_conn_halves(server_conn) {
@@ -1041,6 +1136,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
             }
             Err(e) => {
                 warn!(name = %name, error = %e, "Visitor '{}': accept error: {}", name, e);
+                listener_cancel.cancel();
                 break;
             }
         }
@@ -2315,5 +2411,36 @@ mod transport_tests {
         assert_eq!(plan.opts.tls_cert_file.as_deref(), Some("/c.pem"));
         assert_eq!(plan.opts.tls_key_file.as_deref(), Some("/k.pem"));
         assert!(!plan.opts.v2);
+    }
+}
+
+#[cfg(test)]
+mod retry_decision_tests {
+    use super::xtcp_retry_decision;
+
+    #[test]
+    fn cancellation_aborts_retries_regardless_of_budget() {
+        // Cancelled token → abandon the connection (drop the user conn, no
+        // bridging), even with keep_tunnel_open and attempts left.
+        assert_eq!(xtcp_retry_decision(true, true, 0, 5), None);
+        assert_eq!(xtcp_retry_decision(true, true, 4, 5), None);
+        assert_eq!(xtcp_retry_decision(true, true, 5, 5), None);
+        // One-shot mode (keep_tunnel_open=false) too.
+        assert_eq!(xtcp_retry_decision(true, false, 0, 1), None);
+    }
+
+    #[test]
+    fn keep_tunnel_open_retries_while_budget_remains() {
+        assert_eq!(xtcp_retry_decision(false, true, 0, 5), Some(true));
+        assert_eq!(xtcp_retry_decision(false, true, 4, 5), Some(true));
+        // Attempt budget exhausted → give up.
+        assert_eq!(xtcp_retry_decision(false, true, 5, 5), Some(false));
+    }
+
+    #[test]
+    fn one_shot_mode_gives_up_after_first_failure() {
+        // keep_tunnel_open=false → 2 total attempts, no retry after the first.
+        assert_eq!(xtcp_retry_decision(false, false, 0, 1), Some(false));
+        assert_eq!(xtcp_retry_decision(false, false, 1, 1), Some(false));
     }
 }
