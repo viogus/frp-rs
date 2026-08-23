@@ -4,6 +4,7 @@ use std::sync::{Arc, LazyLock};
 #[cfg(all(feature = "vnet", test))]
 use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 /// Internal request from a visitor task to the control loop.
 /// Visitor sends NatHoleVisitor on the control connection (Go frps compat:
@@ -413,6 +414,13 @@ pub struct Service {
     /// the CloseProxy handler looks up. Set to true on CloseProxy/CloseProxyResp;
     /// entry removed in try_reload.
     health_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Per-proxy cancellation tokens for provider-side XTCP P2P bridge tasks.
+    /// Keyed by the WIRE proxy name ({user}.{name}) like health_cancels.
+    /// Lazily created at the nat_hole call sites; cancelled on CloseProxy and
+    /// reload removal so a deleted proxy aborts in-flight hole punches and
+    /// closes active P2P bridges (else the bridge task + UDP fd + KCP + yamux
+    /// leak until the peer closes).
+    p2p_bridge_tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Proxy configs for health-checked proxies, used to re-register on health
     /// recovery. Keyed by the WIRE proxy name ({user}.{name}) — the same key
     /// Service::new populates with and the Recover handler looks up.
@@ -829,6 +837,7 @@ impl Service {
             visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
             visitor_reload_needed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             health_cancels: Arc::new(Mutex::new(HashMap::new())),
+            p2p_bridge_tokens: Arc::new(Mutex::new(HashMap::new())),
             health_proxy_configs,
             health_tx,
             health_rx: std::sync::Mutex::new(Some(health_rx)),
@@ -2387,6 +2396,13 @@ impl Service {
                                 cancel.store(true, Ordering::Relaxed);
                             }
                             cancels.remove(&cp.proxy_name);
+                            // Cancel any XTCP P2P bridge tasks for this proxy
+                            // and drop the token (a re-registered proxy gets a
+                            // fresh token via lazy get_or_insert_with).
+                            let mut tokens = self.p2p_bridge_tokens.lock().await;
+                            if let Some(token) = tokens.remove(&cp.proxy_name) {
+                                token.cancel();
+                            }
                         }
                         Ok(FrpMessage::CloseProxyResp(cpr)) => {
                             info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);
@@ -2398,10 +2414,38 @@ impl Service {
                             warn!(error = %err.error, "Server error: {}", err.error);
                         }
                         Ok(FrpMessage::NatHoleClient(nhc)) => {
-                            self.handle_nat_hole_client(*nhc, &writer, ctx.v2, ctx.session_alive.clone()).await;
+                            let proxy_token = self
+                                .p2p_bridge_tokens
+                                .lock()
+                                .await
+                                .entry(nhc.proxy_name.clone())
+                                .or_insert_with(CancellationToken::new)
+                                .clone();
+                            self.handle_nat_hole_client(*nhc, &writer, ctx.v2, ctx.session_alive.clone(), proxy_token).await;
                         }
                         Ok(FrpMessage::NatHoleResp(resp)) => {
-                            self.handle_nat_hole_resp(*resp, &mut ctx.pending_xtcp, &mut ctx.visitor_pending, &ctx.xtcp_sockets, &writer, ctx.session_alive.clone()).await;
+                            // Lazily resolve the provider's cancel token from the
+                            // sid → proxy_name map. A visitor-routed resp (or an
+                            // unknown sid) has no pending provider proxy; the
+                            // fresh inert token it gets is never inserted into
+                            // the map and simply stays uncancelled.
+                            let sid = resp.sid.clone().unwrap_or_default();
+                            let proxy_name = if sid.is_empty() {
+                                None
+                            } else {
+                                ctx.pending_xtcp.get(&sid).cloned()
+                            };
+                            let proxy_token = match proxy_name {
+                                Some(name) if !name.is_empty() => self
+                                    .p2p_bridge_tokens
+                                    .lock()
+                                    .await
+                                    .entry(name)
+                                    .or_insert_with(CancellationToken::new)
+                                    .clone(),
+                                _ => CancellationToken::new(),
+                            };
+                            self.handle_nat_hole_resp(*resp, &mut ctx.pending_xtcp, &mut ctx.visitor_pending, &ctx.xtcp_sockets, &writer, ctx.session_alive.clone(), proxy_token).await;
                         }
                         Ok(FrpMessage::NewProxyResp(resp)) => {
                             if let Some(err) = resp.error.as_ref().filter(|e| !e.is_empty()) {
@@ -2795,6 +2839,14 @@ impl Service {
                     match event {
                         HealthEvent::Close(proxy_name) => {
                             info!(proxy_name = %proxy_name, "Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
+                            // Cancel + drop the XTCP P2P bridge token for this
+                            // proxy, mirroring the CloseProxy handler: a
+                            // health-closed XTCP provider must not leave its
+                            // in-flight P2P bridge + UDP socket running.
+                            let mut tokens = self.p2p_bridge_tokens.lock().await;
+                            if let Some(token) = tokens.remove(&proxy_name) {
+                                token.cancel();
+                            }
                             // Set phase to CheckFailed before sending CloseProxy
                             // (Go frp compat: PhaseCheckFailed is an explicit state in proxy lifecycle).
                             {
@@ -3789,6 +3841,19 @@ impl Service {
                     cancel.store(true, Ordering::Relaxed);
                 }
                 cancels.remove(wn);
+            }
+        }
+        {
+            // Same removal path for XTCP P2P bridge tokens: reload-removed or
+            // changed proxies must not leak active P2P bridges/UDP sockets.
+            let mut tokens = self.p2p_bridge_tokens.lock().await;
+            for name in delta.removed.iter().chain(delta.changed.iter()) {
+                let Some(wn) = wire_keys.get(name) else {
+                    continue;
+                };
+                if let Some(token) = tokens.remove(wn) {
+                    token.cancel();
+                }
             }
         }
         {
