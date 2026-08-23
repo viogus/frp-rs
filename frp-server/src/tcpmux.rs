@@ -67,9 +67,16 @@ impl TcpMuxManager {
         let mut routes = self.routes.write().await;
         let mut by_proxy = self.by_proxy.write().await;
 
+        // Go frp compat (pkg/util/vhost/router.go): domains are stored
+        // lowercased (`Routers.Add` → strings.ToLower), so CONNECT Host
+        // lookups are case-insensitive. Lowercase each domain ONCE, before
+        // the conflict check, the insert, and the by_proxy bookkeeping,
+        // keeping register/unregister symmetric.
+        let domains: Vec<String> = domains.iter().map(|d| d.to_lowercase()).collect();
+
         // Validate every domain before inserting anything (no partial state).
         // Re-registration by the same proxy name is allowed (idempotent).
-        for domain in domains {
+        for domain in &domains {
             if let Some(existing) = routes.get(domain) {
                 if existing.proxy_name != proxy_name {
                     return Err(format!(
@@ -81,7 +88,7 @@ impl TcpMuxManager {
         }
 
         let mut domains_for_proxy = Vec::new();
-        for domain in domains {
+        for domain in &domains {
             routes.insert(domain.clone(), route.clone());
             domains_for_proxy.push(domain.clone());
         }
@@ -113,7 +120,7 @@ impl TcpMuxManager {
         }
     }
 
-    /// Look up by hostname (exact match, port-stripped).
+    /// Look up by hostname (exact match, port-stripped, case-insensitive).
     pub async fn lookup(&self, host: &str) -> Option<TcpMuxRoute> {
         // Strip port if present: example.com:443 → example.com
         // Handle bracketed IPv6: [::1]:443 → ::1
@@ -126,7 +133,20 @@ impl TcpMuxManager {
         } else {
             host.rsplitn(2, ':').last().unwrap_or(host)
         };
-        self.routes.read().await.get(hostname).cloned()
+        // Go frp compat (pkg/util/vhost/router.go): `Get` lowercases the
+        // host — domains are stored lowercased at register. Alloc-free ASCII
+        // fast path (Go's strings.ToLower skips allocation for all-lowercase
+        // input); Unicode case mapping can expand length (İ → "i̇") vs Go's
+        // single-rune map, but real hostnames are IDNA/punycode ASCII —
+        // divergence accepted.
+        let lowered;
+        let host_key: &str = if hostname.bytes().all(|b| !b.is_ascii_uppercase()) {
+            hostname
+        } else {
+            lowered = hostname.to_lowercase();
+            &lowered
+        };
+        self.routes.read().await.get(host_key).cloned()
     }
 }
 
@@ -479,6 +499,64 @@ mod tests {
         // Unregister
         mgr.unregister("p1").await;
         assert!(mgr.lookup("a.example.com").await.is_none());
+    }
+
+    /// Go frp compat (pkg/util/vhost/router.go): tcpmux domains are stored
+    /// lowercased at register and lookups lowercase the host, so a
+    /// mixed-case customDomain must resolve for any casing. Conflict
+    /// detection and unregister must also be case-insensitive.
+    #[tokio::test]
+    async fn test_tcpmux_register_lookup_case_insensitive() {
+        let mgr = TcpMuxManager::new();
+
+        mgr.register(
+            "p1",
+            &["MixedCase.Example.com".into()],
+            "run-1",
+            "",
+            "",
+            &[],
+        )
+        .await
+        .expect("registration must succeed");
+
+        // Lookup must resolve for lowercase, uppercase, and the original
+        // mixed case (Host header arrives verbatim from extract_host_header).
+        for host in [
+            "mixedcase.example.com",
+            "MIXEDCASE.EXAMPLE.COM",
+            "MixedCase.Example.com",
+            "MixedCase.Example.com:443",
+        ] {
+            let r = mgr
+                .lookup(host)
+                .await
+                .unwrap_or_else(|| panic!("lookup for '{host}' must resolve"));
+            assert_eq!(r.proxy_name, "p1");
+        }
+
+        // A second proxy claiming the same domain in a different case must
+        // be rejected as a conflict (Add checks the lowered key).
+        let err = mgr
+            .register(
+                "p2",
+                &["MIXEDCASE.EXAMPLE.COM".into()],
+                "run-2",
+                "",
+                "",
+                &[],
+            )
+            .await
+            .expect_err("case-variant conflict must be rejected");
+        assert!(
+            err.contains("example.com"),
+            "conflict must name the lowered domain: {err}"
+        );
+
+        // Unregister removes the route regardless of the original casing
+        // (by_proxy bookkeeping holds the same lowered keys).
+        mgr.unregister("p1").await;
+        assert!(mgr.lookup("mixedcase.example.com").await.is_none());
     }
 
     #[tokio::test]

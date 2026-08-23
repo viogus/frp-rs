@@ -2203,6 +2203,99 @@ TOML
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, HTTP proxy (VHost) with mixed-case customDomain
+# Go frp pkg/util/vhost/router.go lowercases domains on Add and Get, so a
+# mixed-case customDomain must route case-insensitively: the request's
+# lowercase Host must resolve to the mixed-case registration.
+# =============================================================================
+test_g2r_http_case_insensitive() {
+    local name="go-to-rust-http-case-insensitive"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-http-case"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start simple HTTP echo server (returns request body)
+    start_http_echo_server "$echo_port" "http-ok:"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "HTTP echo server did not start"
+        return
+    }
+
+    # Start Rust frps with VHost HTTP port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+vhost_http_port = $vhost_port
+subdomain_host = "test.local"
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$vhost_port" 5 || {
+        fail_test "$name" "VHost HTTP port $vhost_port not reachable"
+        return
+    }
+
+    # Start Go frpc with HTTP proxy using a mixed-case customDomain
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "http-web"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo_port
+customDomains = ["MixedCase.Example.com"]
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    # sleep 3: wait for HTTP proxy registration + VHost routing propagation
+    sleep 3
+
+    # Send HTTP request through VHost with a lowercase Host header — must
+    # route to the mixed-case customDomain (Go router.go lowercases both).
+    local result
+    result=$(send_http_test "$vhost_port" "mixedcase.example.com" "http-ok:" 5)
+    if [[ "$result" != "OK" ]]; then
+        fail_test "$name" "$result"
+        return
+    fi
+
+    # Uppercase Host header must also route.
+    result=$(send_http_test "$vhost_port" "MIXEDCASE.EXAMPLE.COM" "http-ok:" 5)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Go frpc HTTP group (loadBalancer.group) -> Rust frps
 # Two Go http proxies share one vhost route; the server dispatches requests
 # round-robin across the group members (Go frp v0.71.0 HTTPGroupController).
@@ -5351,6 +5444,7 @@ run_test test_r2g_udp_encrypted
 run_test test_g2r_sudp
 run_test test_g2r_sudp_encrypted
 run_test test_g2r_http
+run_test test_g2r_http_case_insensitive
 run_test test_g2r_http_group
 run_test test_r2g_http
 run_test test_g2r_https
