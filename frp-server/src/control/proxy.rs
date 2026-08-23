@@ -373,6 +373,13 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
     // task's Arc is released when it observes the cancellation and exits.
     ctl.udp_cancel.cancel();
     ctl.udp_sockets.clear();
+    // Cancel TCP/WS/KCP work-conn bridge tasks (HIGH finding): each bridge
+    // holds the user conn + work conn and copies until one side dies. The
+    // work conn is owned by this control, so on disconnect/supersession it
+    // stays half-open forever and every reconnect with active tunnels leaked
+    // 1 task + 2 fds. The bridges select on this token alongside the
+    // server-global shutdown token (which still covers graceful shutdown).
+    ctl.bridge_cancel.cancel();
     // Per-proxy UDP bridge tokens are children of udp_cancel — already
     // cancelled by the line above; drop the map.
     ctl.udp_cancels.clear();
@@ -507,6 +514,7 @@ mod tests {
             shutdown_done: None,
             udp_cancel: tokio_util::sync::CancellationToken::new(),
             udp_cancels: HashMap::new(),
+            bridge_cancel: tokio_util::sync::CancellationToken::new(),
             work_pool: std::collections::VecDeque::new(),
             pending_requests: std::collections::VecDeque::new(),
             pending_udp: std::collections::VecDeque::new(),
@@ -538,6 +546,62 @@ mod tests {
         assert!(
             ctl.udp_cancels.is_empty(),
             "cancelled token must be removed from the map"
+        );
+    }
+
+    /// HIGH finding: cleanup (control disconnect / supersession) must cancel
+    /// the work-conn bridge token so TCP/WS/KCP bridges spawned by
+    /// `assign_work_to_proxy` exit instead of copying forever over a
+    /// half-open work conn (1 task + 2 fds leaked per reconnect with active
+    /// tunnels). The bridge-task side is covered e2e by bridge.rs
+    /// `bridge_cancel_terminates_half_open_tcp_bridge`; this pins the
+    /// cleanup wiring: teardown cancels the token.
+    #[tokio::test]
+    async fn cleanup_cancels_work_conn_bridge_token() {
+        let state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        let (_, run_mu_guard) = state.get_run_mu("run-1");
+        let (internal_tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut ctx = ControlContext {
+            state: Arc::clone(&state),
+            pool_stats: Arc::new(crate::state::PoolStats::default()),
+            reloadable: state
+                .reloadable
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            v2: false,
+            run_id: "run-1".to_string(),
+            control_id: 1,
+            pool_cap: 10,
+            internal_tx,
+            peer: None,
+            authenticated_user: String::new(),
+            udp_packet_codec: String::new(),
+            _run_mu_guard: run_mu_guard,
+        };
+        let mut ctl = ControlState {
+            shutting_down: false,
+            shutdown_done: None,
+            udp_cancel: tokio_util::sync::CancellationToken::new(),
+            udp_cancels: HashMap::new(),
+            bridge_cancel: tokio_util::sync::CancellationToken::new(),
+            work_pool: std::collections::VecDeque::new(),
+            pending_requests: std::collections::VecDeque::new(),
+            pending_udp: std::collections::VecDeque::new(),
+            pending_nat_hole_sids: std::collections::VecDeque::new(),
+            listener_handles: HashMap::new(),
+            udp_sockets: HashMap::new(),
+            last_ping: tokio::time::Instant::now(),
+        };
+        let bridge_token = ctl.bridge_cancel.clone();
+        assert!(!bridge_token.is_cancelled(), "token starts live");
+
+        let mut writer = Vec::new();
+        cleanup(&mut ctx, &mut ctl, &mut writer).await;
+
+        assert!(
+            bridge_token.is_cancelled(),
+            "cleanup must cancel the work-conn bridge token"
         );
     }
 }

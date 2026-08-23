@@ -92,6 +92,24 @@ impl KcpListener {
 
 /// Create an outbound KCP connection (dial).
 pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
+    let (stream, driver) = dial_kcp_with_driver(addr, config).await?;
+    // Detach the driver: it self-exits once the stream is dropped (see
+    // KcpSocket::run). The JoinHandle is deliberately dropped — aborting
+    // it here would kill the connection before its first probe is sent
+    // (audit round 5 tried this and it broke dial→accept).
+    drop(driver);
+    Ok(stream)
+}
+
+/// Like [`dial_kcp`], but returns the socket driver's `JoinHandle` so the
+/// caller can observe driver self-exit (after the last stream is dropped
+/// the driver terminates itself — see `KcpSocket::run`). Production uses
+/// [`dial_kcp`], which detaches the handle; tests use this to prove the
+/// driver does not leak.
+pub async fn dial_kcp_with_driver(
+    addr: &str,
+    config: KcpConfig,
+) -> io::Result<(KcpStream, tokio::task::JoinHandle<()>)> {
     let remote: SocketAddr = addr.parse().map_err(io::Error::other)?;
     let conv: u32 = loop {
         let c = rand::random();
@@ -137,23 +155,30 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
         .try_send((conv, remote, session))
         .map_err(|e| io::Error::other(format!("KCP register failed: {e}")))?;
 
-    // Spawn the socket driver. NOTE: the JoinHandle is deliberately not
-    // stored/aborted on the dial path — dial_kcp returns before the KCP
-    // handshake completes, so aborting the driver on stream drop would kill
-    // the connection before its first probe is sent (audit round 5 tried
-    // this and it broke dial→accept). The driver self-cleans when its UDP
-    // socket errors/closes (cold path, per audit round 5 LOW 2.3).
-    tokio::spawn(async move { kcp_socket.run().await });
+    // Spawn the socket driver. The JoinHandle is returned to the caller but
+    // NOT used to abort: dial returns before the KCP handshake completes,
+    // so aborting the driver on stream drop would kill the connection
+    // before its first probe is sent (audit round 5 tried this and it broke
+    // dial→accept). Instead the driver self-exits once the last stream is
+    // dropped (KcpSocket::run exit check, keyed on the alive_streams
+    // counter + register channel closure) — closing the UDP socket and
+    // freeing the task instead of leaking one per dial for the process
+    // lifetime (HIGH leak under reconnect churn).
+    let driver = tokio::spawn(async move { kcp_socket.run().await });
 
-    Ok(KcpStream::new(
-        conv,
-        remote,
-        handle.write_tx,
-        read_rx,
-        handle.write_backlog.clone(),
-        handle.write_notify.clone(),
-        snd_backlog,
-        snd_notify,
-        alive_handle,
+    Ok((
+        KcpStream::new(
+            conv,
+            remote,
+            handle.write_tx,
+            read_rx,
+            handle.write_backlog.clone(),
+            handle.write_notify.clone(),
+            snd_backlog,
+            snd_notify,
+            alive_handle,
+            handle.alive_streams,
+        ),
+        driver,
     ))
 }

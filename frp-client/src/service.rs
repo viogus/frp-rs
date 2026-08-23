@@ -323,6 +323,14 @@ struct SessionCtx {
     /// Join handles of the current session's visitor listener tasks,
     /// cancelled at teardown.
     visitor_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Join handles of the current session's work-conn tasks, aborted at
+    /// teardown. Standalone work conns (tcp/ws/kcp/quic-direct dial) own
+    /// their own connection to the server and would otherwise keep bridging
+    /// until a socket error, outliving the session (HIGH leak on reconnect
+    /// churn). Mux-bound tasks would die with the yamux session, but
+    /// aborting them is an ordinary stream close and releases their session
+    /// Arc clones — one mechanism for both.
+    work_conn_handles: Vec<tokio::task::JoinHandle<()>>,
     // --- Message loop (phase 6) ---
     /// Map sid -> proxy_name for XTCP NatHoleResp routing (provider side).
     pending_xtcp: std::collections::HashMap<String, String>,
@@ -1437,6 +1445,7 @@ impl Service {
             reader: None,
             visitor_shutdown: None,
             visitor_handles: Vec::new(),
+            work_conn_handles: Vec::new(),
             pending_xtcp: std::collections::HashMap::new(),
             xtcp_sockets: Default::default(),
             visitor_pending: std::collections::HashMap::new(),
@@ -3159,14 +3168,57 @@ impl Service {
         // Step 1: Signal work connection pool to stop replenishment cascade.
         ctx.session_alive.store(false, Ordering::Release);
 
-        // Step 2: Signal visitor listeners to stop accepting new connections
+        // Step 2: Abort this session's work-conn tasks. Standalone work
+        // conns (tcp/ws/kcp/quic-direct dial, tcp_mux off) own their own
+        // connection to the server and would otherwise keep bridging until
+        // a socket error — the orphaned-connection leak Go frp avoids by
+        // closing work conns on control close (workConnManager.Close); on
+        // reconnect each one lived until the peer timed it out. Under
+        // tcp-mux the tasks are yamux streams on the session dropped in
+        // step 4, but aborting them is also correct: it is an ordinary
+        // stream close, and it releases the YamuxSession Arc clones that
+        // would otherwise keep the yamux driver alive past teardown. Abort
+        // is immediate; await so the sockets are closed before the next
+        // session's dials.
+        let mut work_conn_handles = std::mem::take(&mut ctx.work_conn_handles);
+        if !work_conn_handles.is_empty() {
+            debug!(
+                count = work_conn_handles.len(),
+                "Aborting work-conn tasks at session teardown"
+            );
+            for h in &work_conn_handles {
+                h.abort();
+            }
+            // Abort only lands at the task's next await point; bound the
+            // join so teardown can never hang on a stuck task (same
+            // pattern as shutdown_visitor_tasks). On timeout, report the
+            // stragglers and continue — the aborted tasks finish on their
+            // own.
+            let joined = tokio::time::timeout(
+                Duration::from_secs(5),
+                futures_util::future::join_all(work_conn_handles.iter_mut()),
+            )
+            .await;
+            if joined.is_err() {
+                let unfinished = work_conn_handles
+                    .iter()
+                    .filter(|h| !h.is_finished())
+                    .count();
+                warn!(
+                    count = unfinished,
+                    "Work-conn teardown timed out after 5s; continuing without waiting for unfinished task(s)"
+                );
+            }
+        }
+
+        // Step 3: Signal visitor listeners to stop accepting new connections
         // (Go frp compat: vm.Close() closes all visitors before session is torn down).
         ctx.visitor_shutdown
             .as_ref()
             .expect("visitor_shutdown available before teardown")
             .store(true, Ordering::Release);
 
-        // Step 3: Drop the control connection (Go frp compat: closeSession()).
+        // Step 4: Drop the control connection (Go frp compat: closeSession()).
         // Dropping prev_yamux closes the underlying TCP socket so the background
         // yamux task exits before we attempt to reconnect. This prevents
         // dual-yamux-session leaks through a half-open TCP mux connection.
@@ -3201,7 +3253,7 @@ impl Service {
     /// response to ReqWorkConn messages; pool_count is sent to the server via
     /// Login so it knows how many ReqWorkConn messages to issue, and the
     /// client never eagerly spawns pool connections.
-    fn handle_req_work_conn(&self, ctx: &SessionCtx) {
+    fn handle_req_work_conn(&self, ctx: &mut SessionCtx) {
         // Go frp v0.70.1 spawns each ReqWorkConn handler asynchronously
         // with no client-side in-flight cap (client/control.go:
         // handleReqWorkConn). Spawn directly so a burst of requests
@@ -3213,7 +3265,7 @@ impl Service {
         let quic_arg = ctx.quic_conn.clone();
         #[cfg(not(feature = "quic"))]
         let quic_arg = ();
-        crate::work_conn::spawn_work_conn(crate::work_conn::WorkConnConfig {
+        let handle = crate::work_conn::spawn_work_conn(crate::work_conn::WorkConnConfig {
             server_addr: ctx.wc_server_addr.clone(),
             server_port: ctx.wc_server_port,
             protocol: ctx.protocol.clone(),
@@ -3252,6 +3304,18 @@ impl Service {
             #[cfg(feature = "vnet")]
             vnet_tun_tx: self.vnet_tun_tx.clone(),
         });
+        // Track the task so teardown can abort it: a standalone work conn
+        // owns its own connection to the server and must not outlive the
+        // session (Go frp closes work conns on control close via
+        // workConnManager).
+        //
+        // Reap finished handles here too, or a long-lived session
+        // accumulates one entry per ReqWorkConn (idle pool churn: ~1
+        // handle per pool slot per 10s; they would otherwise only free at
+        // teardown). The sweep runs before the push, so the just-spawned
+        // handle is never removed.
+        ctx.work_conn_handles.retain(|h| !h.is_finished());
+        ctx.work_conn_handles.push(handle);
     }
 
     /// Spawn per-proxy health check tasks (once, outside reconnect loop).
@@ -4832,6 +4896,7 @@ mod tests {
             reader: None,
             visitor_shutdown: None,
             visitor_handles: Vec::new(),
+            work_conn_handles: Vec::new(),
             pending_xtcp: HashMap::new(),
             xtcp_sockets: Default::default(),
             visitor_pending: HashMap::new(),
@@ -4872,5 +4937,131 @@ mod tests {
             "proxy must be marked StartErr after a failed write, got {:?}",
             info.phase
         );
+    }
+
+    /// Sets its flag on drop — used to observe task cancellation (aborting
+    /// a task drops its future, running destructors).
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// Regression (HIGH leak): standalone work-conn tasks (tcp_mux off)
+    /// were spawned without tracking and never closed at teardown — on
+    /// reconnect each orphaned work-conn task + TCP conn lived until a
+    /// socket error (Go frp avoids this by closing work conns on control
+    /// close via workConnManager). `teardown_session` must abort them.
+    #[cfg(feature = "tcp-mux")]
+    #[tokio::test]
+    async fn teardown_session_aborts_work_conn_tasks() {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            ..Default::default()
+        };
+        let service = Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed");
+
+        // A work-conn-shaped task that would otherwise bridge forever (an
+        // idle connection with no traffic): block on a never-completing
+        // future. A drop-guard flags when the task is cancelled, so the
+        // test can observe the abort without owning the JoinHandle (which
+        // is moved into the session and taken by teardown).
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let stuck = tokio::spawn(async move {
+            let _guard = DropFlag(flag);
+            std::future::pending::<()>().await
+        });
+        // Let the task run once so its drop-guard exists before teardown
+        // aborts it: a task aborted before its first poll never executes its
+        // body, and the guard is created inside the body.
+        tokio::task::yield_now().await;
+
+        let mut ctx = SessionCtx {
+            control_stream: None,
+            run_id: "teardown-test-run-id".to_string(),
+            yamux: None,
+            v2: false,
+            #[cfg(feature = "quic")]
+            quic_conn: None,
+            ping_interval: None,
+            last_pong: Instant::now(),
+            hb_timeout: 30,
+            hb_timeout_dur: Duration::from_secs(30),
+            hb_watchdog_active: false,
+            session_alive: Arc::new(AtomicBool::new(true)),
+            wc_server_addr: "127.0.0.1".to_string(),
+            wc_server_port: 7000,
+            wc_tls_enable: false,
+            wc_tls_server_name: String::new(),
+            wc_tls_ca_file: None,
+            wc_tls_cert_file: None,
+            wc_tls_key_file: None,
+            wc_dns_server: None,
+            wc_udp_packet_size: 1500,
+            wc_udp_packet_codec: String::new(),
+            wc_disable_custom_tls_first_byte: false,
+            wc_keepalive_secs: 7200,
+            wc_bind_addr: None,
+            wc_proxy_url: String::new(),
+            wc_dial_timeout_secs: 10,
+            protocol: TransportProtocol::Tcp,
+            client_scopes: Vec::new(),
+            server_scopes: Vec::new(),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            session_started_at: Instant::now(),
+            pending_proxies: Vec::new(),
+            pending_visitors: Vec::new(),
+            write_failed: false,
+            seen_registration_response: false,
+            req_work_conns_seen: 0,
+            // The vnet teardown path sends VnetRouteRemove via the writer;
+            // a drained channel satisfies the `.expect()` and the send
+            // failures are logged, not fatal.
+            #[cfg(feature = "vnet")]
+            writer: Some(test_control_writer()),
+            #[cfg(not(feature = "vnet"))]
+            writer: None,
+            control_rx: None,
+            control_failed: None,
+            control_notify: None,
+            reader: None,
+            visitor_shutdown: Some(Arc::new(AtomicBool::new(false))),
+            visitor_handles: Vec::new(),
+            work_conn_handles: vec![stuck],
+            pending_xtcp: HashMap::new(),
+            xtcp_sockets: Default::default(),
+            visitor_pending: HashMap::new(),
+            stun_result_tx: None,
+            stun_result_rx: None,
+            xtcp_cleanup_rx: None,
+            proxy_retry_interval: None,
+            waitstart_seen: HashMap::new(),
+            cfg_user: String::new(),
+        };
+
+        let health_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mut admin_handle = None;
+        service
+            .teardown_session(&mut ctx, &mut None, &health_cancels, &mut admin_handle)
+            .await;
+
+        // The work-conn task must be cancelled: teardown aborts it. Without
+        // the fix the task keeps running forever and the flag never fires —
+        // this await times out (the test's failure mode).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cancelled.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("teardown_session must abort the session's work-conn tasks");
     }
 }

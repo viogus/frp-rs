@@ -874,6 +874,7 @@ pub(crate) async fn authenticate(
             shutdown_done: None,
             udp_cancel: tokio_util::sync::CancellationToken::new(),
             udp_cancels,
+            bridge_cancel: tokio_util::sync::CancellationToken::new(),
             work_pool,
             pending_requests,
             pending_udp,

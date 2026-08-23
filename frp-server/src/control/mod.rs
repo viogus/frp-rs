@@ -77,6 +77,14 @@ pub(crate) struct ControlState {
     /// `udp_cancel.cancel()` covers them too (idempotent, no double-cancel
     /// hazard). Map key: proxy_name.
     pub udp_cancels: std::collections::HashMap<String, tokio_util::sync::CancellationToken>,
+    /// Cancelled by cleanup (supersession / control disconnect) so TCP/WS/KCP
+    /// work-conn bridge tasks spawned by `assign_work_to_proxy` terminate
+    /// instead of copying forever over a half-open work conn whose control
+    /// connection is gone (HIGH finding: 1 task + 2 fds leak per reconnect
+    /// with active tunnels). The server-global `AppState::shutdown_token`
+    /// still interrupts bridges on graceful shutdown; this is the
+    /// per-control teardown signal, mirroring `udp_cancel` for the TCP path.
+    pub bridge_cancel: tokio_util::sync::CancellationToken,
     pub work_pool: VecDeque<pool::PoolEntry>,
     pub pending_requests: VecDeque<pool::PendingRequest>,
     pub pending_udp: VecDeque<(String, Instant)>,

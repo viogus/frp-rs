@@ -1491,6 +1491,7 @@ pub(crate) async fn assign_work_to_proxy(
     encryption_key: [u8; 16],
     state: Arc<AppState>,
     v2: bool,
+    bridge_cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), PendingRequest> {
     // Extract peer address from user connection for PROXY protocol support
     let (src_addr, src_port) = req
@@ -1598,17 +1599,22 @@ pub(crate) async fn assign_work_to_proxy(
 
     // Spawn the bridge; select against the server shutdown token so a
     // graceful shutdown can interrupt half-open idle bridges instead of
-    // waiting on TCP keepalive (2h) or yamux keepalive (90s) — audit D2-4.
-    // ONE task per bridged connection instead of the old nested spawn whose
-    // JoinHandle was awaited only to extract the panic payload (audit round
-    // 5, MEDIUM): the select is polled in-place and panics are surfaced via
-    // catch_unwind, halving the task allocations and wakeup registrations.
-    // The task is fire-and-forget (bridges are connection-bounded and
-    // self-terminate; shutdown just accelerates teardown). Note: in the
-    // release panic=abort profile the panic aborts before catch_unwind
-    // fires — exactly as the old JoinHandle-await also never fired there;
-    // in unwinding builds (tests) the payload still reaches log_bridge_panic
-    // and the RAII ConnGuard still releases the slot during unwind.
+    // waiting on TCP keepalive (2h) or yamux keepalive (90s) — audit D2-4 —
+    // AND against the per-control `bridge_cancel` token so control teardown
+    // (disconnect / supersession) stops the bridge: the work conn is owned
+    // by this control, and a half-open client-side conn would otherwise
+    // copy forever, leaking 1 task + 2 fds per reconnect with active
+    // tunnels (HIGH finding). ONE task per bridged connection instead of
+    // the old nested spawn whose JoinHandle was awaited only to extract the
+    // panic payload (audit round 5, MEDIUM): the select is polled in-place
+    // and panics are surfaced via catch_unwind, halving the task
+    // allocations and wakeup registrations. The task is fire-and-forget
+    // (bridges are connection-bounded and self-terminate; shutdown just
+    // accelerates teardown). Note: in the release panic=abort profile the
+    // panic aborts before catch_unwind fires — exactly as the old
+    // JoinHandle-await also never fired there; in unwinding builds (tests)
+    // the payload still reaches log_bridge_panic and the RAII ConnGuard
+    // still releases the slot during unwind.
     let shutdown = state.shutdown_token.clone();
     let state_for_bridge = state.clone();
     let log_proxy_name = req.proxy_name.clone();
@@ -1626,6 +1632,7 @@ pub(crate) async fn assign_work_to_proxy(
                     v2,
                 ) => {}
                 _ = shutdown.cancelled() => {}
+                _ = bridge_cancel.cancelled() => {}
             }
         };
         if let Err(p) = AssertUnwindSafe(fut).catch_unwind().await {
@@ -1638,6 +1645,7 @@ pub(crate) async fn assign_work_to_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     /// Work stream whose reads block forever and whose writes fail
     /// deterministically, independent of platform TCP shutdown/RST timing.
@@ -1855,6 +1863,85 @@ mod tests {
             .await
             .expect("cancel must terminate the half-open UDP bridge task")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_cancel_terminates_half_open_tcp_bridge() {
+        // Half-open TCP bridge: work conn + user conn both open, neither
+        // side sending, so the copy blocks forever. Before the fix the
+        // bridge task selected only on the server-global shutdown token, so
+        // control teardown (disconnect / supersession) left it copying — the
+        // half-open work conn (client side gone) + user conn + task leaked
+        // per reconnect with active tunnels (HIGH finding). The bridge must
+        // exit when the per-control token is cancelled, which is exactly
+        // what control cleanup does with `bridge_cancel`.
+        let state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        let (work, mut work_peer) = tcp_pair().await;
+        let (user, _user_peer) = tcp_pair().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let req = PendingRequest {
+            proxy_name: "t1".to_string(),
+            user_conn: IoStream::Tcp(user),
+            pre_read: Vec::new(),
+            use_encryption: false,
+            use_compression: false,
+            visitor_use_encryption: false,
+            visitor_use_compression: false,
+            visitor_v2: false,
+            visitor_udp_packet_codec: String::new(),
+            created_at: tokio::time::Instant::now(),
+            user_conn_permit: None,
+            proxy_info: Some(Arc::new(
+                crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+                    "t1",
+                    "tcp",
+                    "run-1",
+                    Some(24000),
+                    1,
+                ),
+            )),
+        };
+        let spawn_res = assign_work_to_proxy(
+            IoStream::Tcp(work),
+            req,
+            [0u8; 16],
+            state,
+            false,
+            cancel.clone(),
+        )
+        .await;
+        assert!(spawn_res.is_ok(), "bridge spawn must succeed");
+
+        // Let the bridge reach its blocking copy point on the half-open pair.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Control teardown: cancel the per-control bridge token.
+        cancel.cancel();
+
+        // The bridge task must exit, dropping the work conn (and user conn).
+        // The work-conn peer observes EOF — but first drains the
+        // StartWorkConn frame written on spawn. Without the fix the final
+        // read hangs forever and the timeout fires.
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 64];
+        loop {
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                work_peer.read(&mut chunk),
+            )
+            .await
+            .expect("cancel must terminate the half-open TCP bridge (work conn peer must see EOF)")
+            .expect("read from work conn peer must succeed");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        assert!(
+            !out.is_empty(),
+            "StartWorkConn frame must have been delivered before EOF"
+        );
     }
 
     // ---------------------------------------------------------------------
