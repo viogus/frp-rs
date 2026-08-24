@@ -408,6 +408,17 @@ mod oidc_impl {
     /// soonest-expiring entry is evicted to make room for the new jti.
     const MAX_SEEN_JTIS: usize = 100_000;
 
+    /// Minimum interval between attacker-triggered JWKS refreshes on the
+    /// `refresh_warranted` retry path. A forged JWT (valid kid, garbage
+    /// signature) fails with a key-related error and would otherwise trigger
+    /// one outbound JWKS GET (TLS handshake + HTTPS request to the IdP) per
+    /// attempt with no cooldown. The per-IP login throttle bounds the attempt
+    /// rate; this gate bounds the outbound fetch rate globally (F1). The
+    /// 3600s stale-cache refresh (`CachedJwks::refresh_after`) is a separate,
+    /// naturally rate-limited path and is untouched.
+    const JWKS_FORCED_REFRESH_MIN_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(60);
+
     /// Server-side OIDC verifier. Discovers JWKS from issuer, verifies JWT tokens,
     /// and enforces subject binding for ping/NewWorkConn.
     pub struct OidcVerifier {
@@ -428,6 +439,13 @@ mod oidc_impl {
         /// Background JWKS refresh task (started via `start_background_refresh`),
         /// aborted via `stop_background_refresh` (audit round 5, LOW 2.4).
         refresh_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+        /// Timestamp of the last attacker-triggered JWKS refresh (the
+        /// `refresh_warranted` retry path). Gates that path so forged-token
+        /// floods cannot force more than one outbound IdP fetch per
+        /// `JWKS_FORCED_REFRESH_MIN_INTERVAL`. The 3600s stale-cache refresh
+        /// (`CachedJwks::refresh_after`) is a separate, naturally rate-limited
+        /// path and is untouched.
+        last_forced_refresh: std::sync::Mutex<Option<std::time::Instant>>,
     }
 
     /// Decide the audience-validation mode for a verifier.
@@ -538,6 +556,7 @@ mod oidc_impl {
                 http,
                 seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
                 refresh_task: std::sync::Mutex::new(None),
+                last_forced_refresh: std::sync::Mutex::new(None),
             };
 
             if verifier.skip_expiry {
@@ -755,6 +774,34 @@ mod oidc_impl {
                     // errors (expired token, wrong issuer/audience, missing
                     // claims) must not trigger outbound JWKS refreshes.
                     if !first_err.refresh_warranted {
+                        return Err(first_err.message);
+                    }
+                    // Cooldown (F1): this retry path is reachable by an
+                    // unauthenticated attacker — a forged JWT (valid kid,
+                    // garbage signature) verifies against the cached key,
+                    // fails, and classifies as key-related. Gate the outbound
+                    // JWKS GET so the IdP sees at most one attacker-triggered
+                    // fetch per `JWKS_FORCED_REFRESH_MIN_INTERVAL`; within the
+                    // window the login fails with the cached keys and no
+                    // outbound fetch happens. The marker is set BEFORE the
+                    // fetch so a failed fetch still counts against the window.
+                    let refresh_due = {
+                        let mut last = self
+                            .last_forced_refresh
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        match *last {
+                            Some(at) if at.elapsed() < JWKS_FORCED_REFRESH_MIN_INTERVAL => false,
+                            _ => {
+                                *last = Some(std::time::Instant::now());
+                                true
+                            }
+                        }
+                    };
+                    if !refresh_due {
+                        tracing::debug!(
+                            "OIDC: JWKS refresh cooldown active; skipping outbound refresh (login fails with cached keys)"
+                        );
                         return Err(first_err.message);
                     }
                     self.refresh_jwks().await?;
@@ -1236,6 +1283,7 @@ mod oidc_impl {
                     .expect("test HTTP client"),
                 seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
                 refresh_task: std::sync::Mutex::new(None),
+                last_forced_refresh: std::sync::Mutex::new(None),
             }
         }
 
@@ -1323,6 +1371,80 @@ mod oidc_impl {
             assert!(
                 deadline.is_some_and(|d| d > now),
                 "expired-exp jti must be tracked with a deadline in the future"
+            );
+        }
+
+        #[tokio::test]
+        async fn refresh_warranted_retry_skips_outbound_fetch_within_cooldown() {
+            // A forged token (valid kid, signature that fails against the
+            // cached key) classifies as key-related and would trigger one
+            // outbound JWKS GET per attempt. The cooldown gate (F1) must
+            // suppress the fetch inside the window and return the original
+            // verification error instead.
+            use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation};
+
+            let v = test_verifier();
+            // Seed the JWKS cache with an oct key whose secret differs from
+            // the signing secret → InvalidSignature (refresh_warranted=true).
+            *v.jwks.write().await = Some(CachedJwks {
+                keys: serde_json::json!({
+                    "keys": [{
+                        "kty": "oct",
+                        "kid": "k1",
+                        "k": crate::base64::encode(b"mock-jwks-secret"),
+                    }]
+                }),
+                fetched_at: std::time::Instant::now(),
+                refresh_after: std::time::Duration::from_secs(3600),
+            });
+            let forged = jsonwebtoken::encode(
+                &Header {
+                    alg: Algorithm::HS256,
+                    kid: Some("k1".into()),
+                    ..Header::default()
+                },
+                &serde_json::json!({"sub": "attacker", "exp": 4_102_444_800_u64}),
+                &EncodingKey::from_secret(b"attacker-secret"),
+            )
+            .expect("encode forged token");
+            // Sanity: the forged signature really is a key-related failure.
+            let e = v
+                .try_verify_token(&forged, &Validation::new(Algorithm::HS256), Some("k1"))
+                .await
+                .expect_err("forged signature must fail");
+            assert!(e.refresh_warranted, "forged signature must be key-related");
+
+            // Cooldown active: the retry must skip the outbound fetch and
+            // return the ORIGINAL verification error — not a fetch error.
+            *v.last_forced_refresh.lock().unwrap() = Some(std::time::Instant::now());
+            let err = v
+                .verify_login(&forged)
+                .await
+                .expect_err("forged token must fail");
+            assert!(
+                err.contains("JWT verification failed"),
+                "cooldown-active failure must be the original verify error, got: {err}"
+            );
+            assert!(
+                !err.contains("fetch JWKS"),
+                "no outbound fetch may happen inside the cooldown window: {err}"
+            );
+
+            // Cooldown elapsed: the retry performs the outbound fetch — which
+            // fails against the test verifier's empty jwks_uri — proving the
+            // gate (not something else) suppressed it.
+            *v.last_forced_refresh.lock().unwrap() = Some(
+                std::time::Instant::now()
+                    - JWKS_FORCED_REFRESH_MIN_INTERVAL
+                    - std::time::Duration::from_secs(1),
+            );
+            let err = v
+                .verify_login(&forged)
+                .await
+                .expect_err("forged token must fail");
+            assert!(
+                err.contains("failed to fetch JWKS"),
+                "cooldown-elapsed retry must attempt the outbound fetch, got: {err}"
             );
         }
     }
