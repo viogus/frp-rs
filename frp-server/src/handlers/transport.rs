@@ -286,12 +286,13 @@ pub(crate) async fn handle_tls_connection(
             Ok(mut ws) => {
                 info!(addr = %addr, "WebSocket upgrade over TLS for {}", addr);
                 let mut magic = [0u8; 7];
-                // Bounded by the same accept deadline as the TLS/WS accept
-                // above: a client that completes the WS upgrade then goes
-                // silent must not park the task/fd/permit forever (Go frp
-                // connReadTimeout=10s covers this post-upgrade read too).
+                // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s), like the
+                // TLS/WS accept reads: a client that completes the WS
+                // upgrade then goes silent must not park the task/fd/permit
+                // forever (the 10s connReadTimeout covers only the accept
+                // phase, not a slow pre-Login OIDC token fetch).
                 let is_v2 = match tokio::time::timeout_at(
-                    accept_deadline,
+                    accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT),
                     ws.read_exact(&mut magic),
                 )
                 .await
@@ -380,11 +381,25 @@ pub(crate) async fn handle_tls_connection(
                             let mut io = IoStream::Yamux(control_stream);
                             info!(addr = %addr, "Yamux over WS+TLS session established for {}", addr);
 
-                            // Try V2 detection on yamux stream
+                            // Try V2 detection on yamux stream. Bounded by
+                            // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                            // completes the yamux handshake then sends nothing
+                            // must not park the task and conn_semaphore permit
+                            // indefinitely (slowloris).
                             let mut v2_magic = [0u8; 7];
-                            let is_v2 = match io.read_exact(&mut v2_magic).await {
-                                Ok(_) => is_v2_magic(&v2_magic),
-                                Err(_) => false,
+                            let is_v2 = match tokio::time::timeout_at(
+                                accept_deadline
+                                    .max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT),
+                                io.read_exact(&mut v2_magic),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => is_v2_magic(&v2_magic),
+                                Ok(Err(_)) => false,
+                                Err(_elapsed) => {
+                                    warn!(addr = %addr, "WS+TLS+yamux: timed out reading first 7 bytes from {}", addr);
+                                    return;
+                                }
                             };
                             if is_v2 {
                                 let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
@@ -484,11 +499,24 @@ pub(crate) async fn handle_tls_connection(
                 let mut io = IoStream::Yamux(control_stream);
                 info!(addr = ?addr, "Yamux over TLS session established for {:?}", addr);
 
-                // Try V2 detection on yamux stream (Go frp: magic on stream)
+                // Try V2 detection on yamux stream (Go frp: magic on stream).
+                // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                // completes the yamux handshake then sends nothing must not
+                // park the task and conn_semaphore permit indefinitely
+                // (slowloris).
                 let mut magic = [0u8; 7];
-                let is_v2 = match io.read_exact(&mut magic).await {
-                    Ok(_) => is_v2_magic(&magic),
-                    Err(_) => false,
+                let is_v2 = match tokio::time::timeout_at(
+                    accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT),
+                    io.read_exact(&mut magic),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => is_v2_magic(&magic),
+                    Ok(Err(_)) => false,
+                    Err(_elapsed) => {
+                        warn!(addr = %addr, "TLS+yamux: timed out reading first 7 bytes from {}", addr);
+                        return;
+                    }
                 };
                 if is_v2 {
                     // V2 detected on TLS+yamux stream
@@ -571,12 +599,17 @@ pub(crate) async fn handle_tls_connection(
     } else {
         // io already includes peeked bytes via BufferedRead.
         // Proceed with V2/V1 detection on the TLS stream.
-        // Try V2 magic detection. Bounded by the accept deadline: a client
-        // that finishes the TLS handshake then sends nothing must be
-        // dropped instead of parking the task/fd/permit forever (Go frp
-        // connReadTimeout=10s covers this read).
+        // Try V2 magic detection. Bounded by POST_HANDSHAKE_READ_TIMEOUT
+        // (30s): a client that finishes the TLS handshake then sends
+        // nothing must be dropped instead of parking the task/fd/permit
+        // forever (the 10s connReadTimeout covers only the accept phase,
+        // not a slow pre-Login OIDC token fetch).
         let mut magic = [0u8; 7];
-        let is_v2 = match tokio::time::timeout_at(accept_deadline, io.read_exact(&mut magic)).await
+        let is_v2 = match tokio::time::timeout_at(
+            accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT),
+            io.read_exact(&mut magic),
+        )
+        .await
         {
             Ok(Ok(_)) => is_v2_magic(&magic),
             Ok(Err(_)) => false,
@@ -716,13 +749,17 @@ pub(crate) async fn handle_websocket_connection(
         Ok(mut ws) => {
             info!(addr = %addr, "WebSocket upgrade on main port for {}", addr);
 
-            // Try V2 magic detection. Bounded by the accept deadline: a
-            // client that completes the WS upgrade then goes silent must
-            // not park the task/fd/permit forever (Go frp connReadTimeout
-            // =10s covers this post-upgrade read).
+            // Try V2 magic detection. Bounded by POST_HANDSHAKE_READ_TIMEOUT
+            // (30s): a client that completes the WS upgrade then goes silent
+            // must not park the task/fd/permit forever (the 10s
+            // connReadTimeout covers only the accept phase, not a slow
+            // pre-Login OIDC token fetch).
             let mut magic = [0u8; 7];
-            let is_v2 = match tokio::time::timeout_at(accept_deadline, ws.read_exact(&mut magic))
-                .await
+            let is_v2 = match tokio::time::timeout_at(
+                accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT),
+                ws.read_exact(&mut magic),
+            )
+            .await
             {
                 Ok(Ok(_)) => {
                     let matches = is_v2_magic(&magic);
@@ -802,11 +839,26 @@ pub(crate) async fn handle_websocket_connection(
                                 let mut io = IoStream::Yamux(control_stream);
                                 info!(addr = ?addr, "Yamux over WS+TLS session established for {:?}", addr);
 
-                                // V2 detection on yamux stream
+                                // V2 detection on yamux stream. Bounded by
+                                // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                                // completes the yamux handshake then sends nothing
+                                // must not park the task and conn_semaphore permit
+                                // indefinitely (slowloris).
                                 let mut magic = [0u8; 7];
-                                let is_v2 = match io.read_exact(&mut magic).await {
-                                    Ok(_) => is_v2_magic(&magic),
-                                    Err(_) => false,
+                                let is_v2 = match tokio::time::timeout_at(
+                                    accept_deadline.max(
+                                        tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT,
+                                    ),
+                                    io.read_exact(&mut magic),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => is_v2_magic(&magic),
+                                    Ok(Err(_)) => false,
+                                    Err(_elapsed) => {
+                                        warn!(addr = ?addr, "WS+TLS+yamux: timed out reading first 7 bytes from {:?}", addr);
+                                        return;
+                                    }
                                 };
                                 if is_v2 {
                                     let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
@@ -877,12 +929,13 @@ pub(crate) async fn handle_websocket_connection(
                         let mut io = IoStream::Tls(Box::new(tls_stream), addr);
 
                         // V2 chicken check on the decrypted TLS stream.
-                        // Bounded by the accept deadline: a client that
+                        // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s): a client that
                         // stops after the WS+TLS handshakes must not park
                         // the task/fd/permit forever.
                         let mut chicken = [0u8; 7];
                         let is_tls_v2 = match tokio::time::timeout_at(
-                            accept_deadline,
+                            accept_deadline
+                                .max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT),
                             io.read_exact(&mut chicken),
                         )
                         .await
@@ -982,11 +1035,25 @@ pub(crate) async fn handle_websocket_connection(
                         let mut io = IoStream::Yamux(control_stream);
                         info!(addr = ?addr, "Yamux over WebSocket session established for {:?}", addr);
 
-                        // V2 detection on yamux stream
+                        // V2 detection on yamux stream. Bounded by
+                        // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                        // completes the yamux handshake then sends nothing
+                        // must not park the task and conn_semaphore permit
+                        // indefinitely (slowloris).
                         let mut mux_magic = [0u8; 7];
-                        let is_v2 = match io.read_exact(&mut mux_magic).await {
-                            Ok(_) => is_v2_magic(&mux_magic),
-                            Err(_) => false,
+                        let is_v2 = match tokio::time::timeout_at(
+                            accept_deadline
+                                .max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT),
+                            io.read_exact(&mut mux_magic),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => is_v2_magic(&mux_magic),
+                            Ok(Err(_)) => false,
+                            Err(_elapsed) => {
+                                warn!(addr = ?addr, "WS+yamux: timed out reading first 7 bytes from {:?}", addr);
+                                return;
+                            }
                         };
                         if is_v2 {
                             let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
@@ -1346,10 +1413,23 @@ pub(crate) async fn handle_v1_connection(
 
                 // Try V2 detection: read 7 magic bytes from yamux stream.
                 // Go frp sends V2 magic on yamux stream (not raw TCP) when tcpMux.
+                // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that completes the
+                // yamux handshake then sends nothing must not park the task
+                // and conn_semaphore permit until yamux keepalive dead-time
+                // (slowloris).
                 let mut magic = [0u8; 7];
-                let is_v2 = match io.read_exact(&mut magic).await {
-                    Ok(_) => is_v2_magic(&magic),
-                    Err(_) => false,
+                let is_v2 = match tokio::time::timeout_at(
+                    accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT),
+                    io.read_exact(&mut magic),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => is_v2_magic(&magic),
+                    Ok(Err(_)) => false,
+                    Err(_elapsed) => {
+                        warn!(addr = ?addr, "TCP+yamux: timed out reading first 7 bytes from {:?}", addr);
+                        return;
+                    }
                 };
                 if is_v2 {
                     // V2 detected on yamux stream! Do V2 handshake + dispatch
@@ -1467,6 +1547,16 @@ pub(crate) fn is_v2_magic(buf: &[u8]) -> bool {
 pub(crate) fn is_v1_type_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
 }
+
+/// Generous fixed bound for post-handshake FRP first-byte reads (after
+/// TLS/WS/yamux setup, before Login). Never tighter than the yamux
+/// driver's own idle-kill floor (MIN_IDLE_DEAD_TIME = 30s, mux.rs): a
+/// legit client (Go frpc with OIDC) fetches its JWT via auth.oidc.proxyURL
+/// after the handshake and before Login, which can take >10s — the 10s
+/// accept deadline is reserved for pre-handshake reads (ClientHello, WS
+/// upgrade), which legit clients satisfy immediately.
+pub(crate) const POST_HANDSHAKE_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 #[cfg(feature = "quic")]
 pub(crate) const QUIC_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);

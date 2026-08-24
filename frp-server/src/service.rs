@@ -465,11 +465,19 @@ impl Service {
                                                                 let mut io = IoStream::Yamux(control_stream);
                                                                 tracing::info!(addr = ?addr, "Yamux over WS+TLS session established for {:?}", addr);
 
-                                                                // V2 detection on yamux stream
+                                                                // V2 detection on yamux stream. Bounded by
+                                                                // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                                                                // completes the yamux handshake then sends nothing
+                                                                // must not park the task and conn_semaphore permit
+                                                                // indefinitely (slowloris).
                                                                 let mut magic = [0u8; 7];
-                                                                let is_v2 = match io.read_exact(&mut magic).await {
-                                                                    Ok(_) => crate::handlers::is_v2_magic(&magic),
-                                                                    Err(_) => false,
+                                                                let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut magic)).await {
+                                                                    Ok(Ok(_)) => crate::handlers::is_v2_magic(&magic),
+                                                                    Ok(Err(_)) => false,
+                                                                    Err(_elapsed) => {
+                                                                        tracing::warn!(addr = ?addr, "WS+TLS+yamux: timed out reading first 7 bytes from {:?}", addr);
+                                                                        return;
+                                                                    }
                                                                 };
                                                                 if is_v2 {
                                                                     let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(addr), accept_deadline, "WS+TLS+yamux V2").await {
@@ -493,9 +501,17 @@ impl Service {
                                                         let mut io = IoStream::Tls(Box::new(tls_stream), addr);
 
                                                         let mut chicken = [0u8; 7];
-                                                        let is_tls_v2 = match io.read_exact(&mut chicken).await {
-                                                            Ok(_) => crate::handlers::is_v2_magic(&chicken),
-                                                            Err(_) => false,
+                                                        // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s): a peer
+                                                        // that completes WS+TLS then sends nothing must not
+                                                        // park the task and conn_semaphore permit indefinitely
+                                                        // (slowloris).
+                                                        let is_tls_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut chicken)).await {
+                                                            Ok(Ok(_)) => crate::handlers::is_v2_magic(&chicken),
+                                                            Ok(Err(_)) => false,
+                                                            Err(_elapsed) => {
+                                                                tracing::warn!(addr = ?addr, "WS+TLS: timed out reading first 7 bytes from {:?}", addr);
+                                                                return;
+                                                            }
                                                         };
                                                         if is_tls_v2 {
                                                             let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(addr), accept_deadline, "WS+TLS+V2").await {
@@ -532,11 +548,19 @@ impl Service {
                                                         let mut io = IoStream::Yamux(control_stream);
                                                         tracing::info!(addr = ?addr, "Yamux over WebSocket session established for {:?}", addr);
 
-                                                        // V2 detection on yamux stream
+                                                        // V2 detection on yamux stream. Bounded by
+                                                        // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                                                        // completes the yamux handshake then sends nothing
+                                                        // must not park the task and conn_semaphore permit
+                                                        // indefinitely (slowloris).
                                                         let mut mux_magic = [0u8; 7];
-                                                        let is_v2 = match io.read_exact(&mut mux_magic).await {
-                                                            Ok(_) => crate::handlers::is_v2_magic(&mux_magic),
-                                                            Err(_) => false,
+                                                        let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut mux_magic)).await {
+                                                            Ok(Ok(_)) => crate::handlers::is_v2_magic(&mux_magic),
+                                                            Ok(Err(_)) => false,
+                                                            Err(_elapsed) => {
+                                                                tracing::warn!(addr = ?addr, "WS+yamux: timed out reading first 7 bytes from {:?}", addr);
+                                                                return;
+                                                            }
                                                         };
                                                         if is_v2 {
                                                             let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(addr), accept_deadline, "WS+yamux V2").await {
@@ -875,10 +899,19 @@ impl Service {
                                                             let mut io = frp_core::transport::IoStream::Yamux(control_stream);
                                                             tracing::info!(peer = %peer, "KCP TLS+yamux session established for {}", peer);
 
+                                                            // V2 magic read on the yamux stream. Bounded by
+                                                            // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                                                            // completes the yamux handshake then sends nothing
+                                                            // must not park the task and conn_semaphore permit
+                                                            // indefinitely (slowloris).
                                                             let mut yamux_magic = [0u8; 7];
-                                                            let is_v2 = match io.read_exact(&mut yamux_magic).await {
-                                                                Ok(_) => crate::handlers::is_v2_magic(&yamux_magic),
-                                                                Err(_) => false,
+                                                            let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut yamux_magic)).await {
+                                                                Ok(Ok(_)) => crate::handlers::is_v2_magic(&yamux_magic),
+                                                                Ok(Err(_)) => false,
+                                                                Err(_elapsed) => {
+                                                                    tracing::warn!(peer = %peer, "KCP TLS+yamux: timed out reading first 7 bytes from {}", peer);
+                                                                    return;
+                                                                }
                                                             };
                                                             if is_v2 {
                                                                 let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
@@ -940,11 +973,19 @@ impl Service {
                                                 // tcpMux disabled: V2/V1 directly on TLS-decrypted stream
                                                 let mut ctl = tls_io;
 
-                                                // After TLS: detect V2 then V1 on the decrypted stream
+                                                // After TLS: detect V2 then V1 on the decrypted stream.
+                                                // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s): a peer
+                                                // that completes the KCP TLS handshake then sends nothing
+                                                // must not park the task and conn_semaphore permit
+                                                // indefinitely (slowloris).
                                                 let mut tls_magic = [0u8; 7];
-                                                let is_v2 = match ctl.read_exact(&mut tls_magic).await {
-                                                    Ok(_) => crate::handlers::is_v2_magic(&tls_magic),
-                                                    Err(_) => false,
+                                                let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), ctl.read_exact(&mut tls_magic)).await {
+                                                    Ok(Ok(_)) => crate::handlers::is_v2_magic(&tls_magic),
+                                                    Ok(Err(_)) => false,
+                                                    Err(_elapsed) => {
+                                                        tracing::warn!(peer = %peer, "KCP TLS: timed out reading first 7 bytes from {}", peer);
+                                                        return;
+                                                    }
                                                 };
                                                 if is_v2 {
                                                     let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
@@ -1000,14 +1041,24 @@ impl Service {
                                                             break None;
                                                         }
                                                         let mut buf = vec![0u8; 1024];
-                                                        match ctl.read(&mut buf).await {
-                                                            Ok(n) if n > 0 => {
+                                                        // Each read is bounded by POST_HANDSHAKE_READ_TIMEOUT
+                                                        // (30s): the 2 KiB cap bounds iterations only while data
+                                                        // flows, so a peer that stalls mid-scan must not park
+                                                        // the task and conn_semaphore permit indefinitely
+                                                        // (slowloris).
+                                                        let scan_deadline = accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT);
+                                                        match tokio::time::timeout_at(scan_deadline, ctl.read(&mut buf)).await {
+                                                            Ok(Ok(n)) if n > 0 => {
                                                                 scan_data.extend_from_slice(&buf[..n]);
                                                             }
-                                                            Ok(_) => break None, // EOF
-                                                            Err(e) => {
+                                                            Ok(Ok(_)) => break None, // EOF
+                                                            Ok(Err(e)) => {
                                                                 tracing::debug!(peer = %peer, error = %e, "KCP TLS: read error during scan");
                                                                 break None;
+                                                            }
+                                                            Err(_elapsed) => {
+                                                                tracing::warn!(peer = %peer, "KCP TLS: timed out reading during V1 scan from {}", peer);
+                                                                return;
                                                             }
                                                         }
                                                     };
@@ -1081,11 +1132,19 @@ impl Service {
                                                     let mut io = frp_core::transport::IoStream::Yamux(control_stream);
                                                     tracing::info!(peer = %peer, "KCP yamux session established for {}", peer);
 
-                                                    // V2 magic detection on yamux stream
+                                                    // V2 magic detection on yamux stream. Bounded by
+                                                    // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                                                    // completes the yamux handshake then sends nothing
+                                                    // must not park the task and conn_semaphore permit
+                                                    // indefinitely (slowloris).
                                                     let mut yamux_magic = [0u8; 7];
-                                                    let is_v2 = match io.read_exact(&mut yamux_magic).await {
-                                                        Ok(_) => crate::handlers::is_v2_magic(&yamux_magic),
-                                                        Err(_) => false,
+                                                    let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut yamux_magic)).await {
+                                                        Ok(Ok(_)) => crate::handlers::is_v2_magic(&yamux_magic),
+                                                        Ok(Err(_)) => false,
+                                                        Err(_elapsed) => {
+                                                            tracing::warn!(peer = %peer, "KCP yamux: timed out reading first 7 bytes from {}", peer);
+                                                            return;
+                                                        }
                                                     };
                                                     if is_v2 {
                                                         let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
