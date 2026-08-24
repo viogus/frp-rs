@@ -1176,7 +1176,11 @@ async fn run_virtual_net_plugin_work_conn(
 /// 5. Bridges data bidirectionally
 ///
 /// `pool_id` is for logging only (< 0 means on-demand).
-pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
+///
+/// Returns the task's `JoinHandle`. The session (`handle_req_work_conn`)
+/// tracks it and aborts it at teardown: a standalone work conn owns its
+/// own connection to the server and must not outlive its session.
+pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Some(counter) = &cfg.spawned_counter {
             counter.fetch_add(1, Ordering::SeqCst);
@@ -1712,7 +1716,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         // v0.70. The client does NOT auto-spawn replacements — if it did,
         // concurrent completions could push the pool past server pool_cap
         // before the server can refuse, wasting TCP/TLS/yamux setup.
-    });
+    })
 }
 
 #[cfg(test)]
@@ -1820,7 +1824,9 @@ mod tests {
                 session_alive.clone(),
                 Some(started.clone()),
             );
-            spawn_work_conn(cfg);
+            // JoinHandle is must_use; the task's completion is irrelevant
+            // to this test (it dials 127.0.0.1:1 and fails fast).
+            std::mem::drop(spawn_work_conn(cfg));
         }
 
         tokio::time::timeout(Duration::from_secs(2), async {

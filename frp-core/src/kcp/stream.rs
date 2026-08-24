@@ -54,6 +54,10 @@ pub struct KcpStream {
     /// Shared with KcpSession. Set to false when the session is removed from
     /// the driver, so poll_write/poll_read can fail fast.
     session_alive: Arc<AtomicBool>,
+    /// Live-stream counter shared with the KcpSocket driver. Incremented at
+    /// construction, decremented on drop: the dial driver self-exits once
+    /// the last stream is gone and no registrations can arrive.
+    alive_streams: Arc<AtomicUsize>,
 }
 
 impl KcpStream {
@@ -68,7 +72,13 @@ impl KcpStream {
         snd_backlog: Arc<AtomicUsize>,
         snd_notify: Arc<Notify>,
         session_alive: Arc<AtomicBool>,
+        alive_streams: Arc<AtomicUsize>,
     ) -> Self {
+        // Register this stream with the socket driver's liveness counter.
+        // The dial driver self-exits when the counter reaches zero (see
+        // KcpSocket::run); the increment must happen-before the stream is
+        // handed to the caller, and the counter decrements in Drop below.
+        alive_streams.fetch_add(1, Ordering::AcqRel);
         Self {
             conv,
             peer_addr,
@@ -86,6 +96,7 @@ impl KcpStream {
             snd_backlog,
             snd_notify,
             session_alive,
+            alive_streams,
         }
     }
 
@@ -97,6 +108,16 @@ impl KcpStream {
     }
     pub fn global_write_bytes() -> u64 {
         KCP_WRITE_BYTES.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for KcpStream {
+    fn drop(&mut self) {
+        // Release the socket driver's liveness signal: the dial driver
+        // self-exits once the last stream is dropped and no registrations
+        // remain (see KcpSocket::run). AcqRel pairs with the driver's
+        // Acquire load so an observed zero implies this stream is gone.
+        self.alive_streams.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

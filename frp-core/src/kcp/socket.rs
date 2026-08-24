@@ -95,6 +95,12 @@ pub(crate) struct KcpSocketHandle {
     pub write_backlog: Arc<AtomicUsize>,
     /// Wakes KcpStream poll_write tasks blocked on write backpressure.
     pub write_notify: Arc<Notify>,
+    /// Count of live KcpStreams bound to this socket — incremented on
+    /// stream creation, decremented on stream drop. The dial driver
+    /// self-exits when this reaches zero AND the register channel is
+    /// closed (no listener to keep it alive); the listen path keeps
+    /// register_tx open, so the driver never exits there.
+    pub alive_streams: Arc<AtomicUsize>,
 }
 
 pub(crate) struct KcpSocket {
@@ -128,6 +134,9 @@ pub(crate) struct KcpSocket {
     accept_notify_rx: mpsc::Receiver<(u32, SocketAddr)>,
     write_backlog: Arc<AtomicUsize>,
     write_notify: Arc<Notify>,
+    /// Live KcpStream count — shared with KcpSocketHandle, drives the
+    /// dial-path driver self-exit check in run().
+    alive_streams: Arc<AtomicUsize>,
     start: Instant,
     /// UDP packets that could not be sent immediately because the socket
     /// send buffer was full (try_send_to). Drained on the next tick — keeps
@@ -176,6 +185,7 @@ impl KcpSocket {
         let (accept_notify_tx, accept_notify_rx) = mpsc::channel(CAP_ACCEPT_NOTIFY);
         let write_backlog = Arc::new(AtomicUsize::new(0));
         let write_notify = Arc::new(Notify::new());
+        let alive_streams = Arc::new(AtomicUsize::new(0));
         let this = Self {
             socket,
             config,
@@ -192,6 +202,7 @@ impl KcpSocket {
             accept_notify_rx,
             write_backlog: write_backlog.clone(),
             write_notify: write_notify.clone(),
+            alive_streams: alive_streams.clone(),
             start: Instant::now(),
             pending_udp: VecDeque::new(),
             to_remove: Vec::with_capacity(16),
@@ -205,6 +216,7 @@ impl KcpSocket {
             accept_notify_tx,
             write_backlog,
             write_notify,
+            alive_streams,
         };
         (this, handle, accept_rx)
     }
@@ -315,6 +327,32 @@ impl KcpSocket {
                         }
                         !log.is_empty()
                     });
+                    // Dial-path self-exit (HIGH leak fix): once the last
+                    // stream is dropped and no more registrations can
+                    // arrive, the driver has no work left — looping on
+                    // tick/recv with an empty session table would hold the
+                    // UDP socket + task for the process lifetime (every KCP
+                    // dial leaked one; reconnect churn grew unbounded).
+                    // `register_rx.is_closed()` separates the dial path
+                    // (register_tx is dropped when dial_kcp returns) from
+                    // the listen path (KcpListener keeps the handle, and
+                    // must keep accepting new wire sessions forever). The
+                    // stream counter is the authoritative liveness signal:
+                    // the sessions map can lag a dropped stream (an idle
+                    // session's closed read channel is only noticed when
+                    // data arrives) and must not gate exit. No grace period
+                    // is needed — register_tx cannot close before the dial
+                    // stream exists (KcpStream::new increments before
+                    // dial_kcp returns), so this condition is never
+                    // observed while a stream is alive.
+                    if self.alive_streams.load(Ordering::Acquire) == 0
+                        && self.register_rx.is_closed()
+                    {
+                        tracing::debug!(
+                            "KCP SOCKET: dial driver exiting (no live streams, register channel closed)"
+                        );
+                        break;
+                    }
                 }
 
                 Some((conv, req)) = self.write_rx.recv() => {
@@ -521,6 +559,7 @@ impl KcpSocket {
                                         snd_backlog,
                                         snd_notify,
                                         session.alive_handle(),
+                                        self.alive_streams.clone(),
                                     );
                                     if let Err(mpsc::error::TrySendError::Full(_)) =
                                         self.accept_tx.try_send(stream)

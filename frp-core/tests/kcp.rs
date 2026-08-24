@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use frp_core::kcp::{default_kcp_config, dial_kcp, KcpConfig, KcpListener};
+use frp_core::kcp::{default_kcp_config, dial_kcp, dial_kcp_with_driver, KcpConfig, KcpListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 
@@ -55,6 +55,36 @@ async fn test_kcp_dial_send_recv() {
 
     assert_eq!(&buf[..n], b"hello from dialer");
     dial_handle.await.expect("dial task");
+}
+
+/// Regression (HIGH leak): the dial-path KcpSocket driver used to loop
+/// forever after the last stream was dropped — sessions empty, but run()
+/// still spinning on tick/recv with the UDP socket open, leaking one task +
+/// socket per KCP dial (control conn, each work conn) for the process
+/// lifetime; reconnect churn grew it unbounded. The driver must self-exit
+/// once its only stream is dropped. Fails (timeout) without the fix.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_kcp_dial_driver_self_exits_after_stream_drop() {
+    let config = no_fec_config();
+
+    // Real dial (binds a UDP socket and spawns the driver), then drop the
+    // stream immediately — no peer needed, the driver's liveness signal is
+    // the stream itself.
+    let (stream, driver) = timeout(
+        Duration::from_secs(10),
+        dial_kcp_with_driver("127.0.0.1:1", config),
+    )
+    .await
+    .expect("dial timeout")
+    .expect("dial_kcp_with_driver");
+    drop(stream);
+
+    // The driver must terminate promptly once its only stream is gone.
+    // (The outer Result is the timeout — the failure this test exists to
+    // catch; the driver's own exit status is irrelevant once it resolves.)
+    let _: Result<(), _> = timeout(Duration::from_secs(5), driver)
+        .await
+        .expect("KCP dial driver must self-exit after the last stream is dropped");
 }
 
 /// KCP+TLS round-trip: the client wraps the KCP stream in TLS with the

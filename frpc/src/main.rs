@@ -312,6 +312,57 @@ async fn run_normal(mut args: FrpcRunArgs) {
     if let Some(ref dir) = args.config_dir {
         init_logging(&args, None);
 
+        // SIGINT/SIGTERM → graceful shutdown of every directory service.
+        // One process-wide handler sets SHUTDOWN_REQUESTED and iterates the
+        // registered services on each signal; request_stop() is idempotent,
+        // so repeat signals are harmless. Services register their Arc as
+        // they come up. A signal delivered before a service finishes
+        // initializing would otherwise be lost — docker stop sends exactly
+        // one signal, so the handler cannot rely on re-firing — and the flag
+        // is re-checked at registration time to stop a just-registered
+        // service immediately.
+        #[cfg(unix)]
+        static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        #[cfg(unix)]
+        let stop_services: Arc<std::sync::Mutex<Vec<Arc<Service>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        #[cfg(unix)]
+        {
+            let stop_services = stop_services.clone();
+            tokio::spawn(async move {
+                let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate())
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SIGTERM handler init failed: {}", e);
+                        return;
+                    }
+                };
+                let mut sigint = match signal::unix::signal(signal::unix::SignalKind::interrupt()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SIGINT handler init failed: {}", e);
+                        return;
+                    }
+                };
+                loop {
+                    tokio::select! {
+                        _ = sigterm.recv() => {
+                            tracing::info!(pid = %std::process::id(), "SIGTERM received, initiating graceful shutdown");
+                        }
+                        _ = sigint.recv() => {
+                            tracing::info!(pid = %std::process::id(), "SIGINT received, initiating graceful shutdown");
+                        }
+                    }
+                    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    for svc in stop_services.lock().unwrap().iter() {
+                        svc.request_stop();
+                    }
+                }
+            });
+        }
+
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
             Err(e) => {
@@ -336,6 +387,8 @@ async fn run_normal(mut args: FrpcRunArgs) {
             match load_client_config(&path_str, args.strict_config) {
                 Ok(cfg) => {
                     let uf = unsafe_features.clone();
+                    #[cfg(unix)]
+                    let stop_services = stop_services.clone();
                     handles.push(tokio::spawn(async move {
                         let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
                             Ok(svc) => svc,
@@ -344,6 +397,13 @@ async fn run_normal(mut args: FrpcRunArgs) {
                                 return;
                             }
                         };
+                        let service = Arc::new(service);
+                        #[cfg(unix)]
+                        stop_services.lock().unwrap().push(service.clone());
+                        #[cfg(unix)]
+                        if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                            service.request_stop();
+                        }
                         if let Err(e) = service.run().await {
                             tracing::error!(config_file = %path_str, error = %e, "frpc service error for config file [{}]: {}", path_str, e);
                         }
@@ -465,22 +525,37 @@ async fn run_normal(mut args: FrpcRunArgs) {
         })
     };
 
-    // SIGTERM → graceful shutdown (docker stop / systemctl stop send SIGTERM).
-    // request_stop() wakes run()'s stop channel; the session loop exits cleanly.
+    // SIGINT/SIGTERM → graceful shutdown (Ctrl+C; docker stop / systemctl stop
+    // send SIGTERM). request_stop() wakes run()'s stop channel; the session
+    // loop exits cleanly. Both signals take the same path and request_stop()
+    // is idempotent, so repeat signals are harmless.
     #[cfg(unix)]
     {
         let stop_svc = service.clone();
         tokio::spawn(async move {
-            let mut sig = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(error = %e, "SIGTERM handler init failed: {}", e);
                     return;
                 }
             };
+            let mut sigint = match signal::unix::signal(signal::unix::SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "SIGINT handler init failed: {}", e);
+                    return;
+                }
+            };
             loop {
-                sig.recv().await;
-                tracing::info!(pid = %std::process::id(), "SIGTERM received, initiating graceful shutdown");
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        tracing::info!(pid = %std::process::id(), "SIGTERM received, initiating graceful shutdown");
+                    }
+                    _ = sigint.recv() => {
+                        tracing::info!(pid = %std::process::id(), "SIGINT received, initiating graceful shutdown");
+                    }
+                }
                 stop_svc.request_stop();
             }
         });

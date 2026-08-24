@@ -435,10 +435,15 @@ impl<Output> Kcp<Output> {
     /// Send bytes into the buffer. In stream mode a trailing partial segment
     /// is extended when possible; in message mode the data is split into
     /// `MSS`-sized segments chained by the `frg` field.
-    /// Takes ownership of `buf` so segmentation can split by moving
-    /// (`Vec::split_off`, O(1)) instead of copying each segment.
-    pub fn send(&mut self, mut buf: Vec<u8>) -> Result<usize> {
+    ///
+    /// The buffer is consumed through a single advancing offset: every byte
+    /// is copied exactly once, into the segment that owns it. No
+    /// `Vec::split_off` tail moves, so the shrinking-remainder chain that
+    /// would re-allocate and re-copy the unconsumed tail on every segment is
+    /// avoided entirely.
+    pub fn send(&mut self, buf: Vec<u8>) -> Result<usize> {
         let mut sent_size = 0;
+        let mut offset = 0;
 
         assert!(self.mss > 0, "mss must be positive");
 
@@ -448,25 +453,25 @@ impl<Output> Kcp<Output> {
                 let l = old.data.len();
                 if l < self.mss {
                     let capacity = self.mss - l;
-                    let extend = cmp::min(buf.len(), capacity);
-                    let tail = buf.split_off(extend); // buf = [..extend], tail = [extend..]
-                    old.data.extend_from_slice(&buf);
-                    buf = tail;
+                    let extend = cmp::min(buf.len() - offset, capacity);
+                    old.data.extend_from_slice(&buf[offset..offset + extend]);
+                    offset += extend;
 
                     old.frg = 0;
                     sent_size += extend;
                 }
             }
 
-            if buf.is_empty() {
+            if offset == buf.len() {
                 return Ok(sent_size);
             }
         }
 
-        let count = if buf.len() <= self.mss {
+        let remaining = buf.len() - offset;
+        let count = if remaining <= self.mss {
             1
         } else {
-            buf.len().div_ceil(self.mss)
+            remaining.div_ceil(self.mss)
         };
 
         if count >= KCP_WND_RCV as usize {
@@ -476,13 +481,13 @@ impl<Output> Kcp<Output> {
         let count = cmp::max(1, count);
 
         for i in 0..count {
-            let size = cmp::min(self.mss, buf.len());
-            // Move the tail out (O(1) pointer move) instead of split_at +
-            // to_vec (a full copy per segment): the send path now copies the
-            // caller's buffer exactly once, into the first segment.
-            let tail = buf.split_off(size); // buf = [..size], tail = [size..]
-            let mut new_segment = KcpSegment::new_with_data(buf);
-            buf = tail;
+            let size = cmp::min(self.mss, buf.len() - offset);
+            // One exact-size copy per segment, straight out of the original
+            // buffer (no split_off tail moves): each byte is copied exactly
+            // once, into the single segment that owns it.
+            let data = buf[offset..offset + size].to_vec();
+            let mut new_segment = KcpSegment::new_with_data(data);
+            offset += size;
 
             new_segment.frg = if self.stream {
                 0
@@ -1583,6 +1588,33 @@ mod tests {
         // mss=1376; KCP_WND_RCV=128 => max message ~ 128 * 1376.
         let too_big = vec![0u8; 128 * 1376];
         assert!(matches!(a.send(too_big.clone()), Err(Error::UserBufTooBig)));
+    }
+
+    /// Message-mode segmentation walks the original buffer with one offset:
+    /// every byte lands in exactly one segment and the `frg` chain counts
+    /// down from (segments-1) to 0 in send order.
+    #[test]
+    fn message_mode_segments_frg_chain_and_data() {
+        let mut a = Kcp::new(1, PacketWriter::default());
+        a.set_mtu(50).unwrap(); // mss = 50 - KCP_OVERHEAD = 26
+        let mss = 50usize - KCP_OVERHEAD;
+        let buf: Vec<u8> = (0..(3 * mss + 7) as u32).map(|i| (i % 251) as u8).collect();
+
+        let sent = a.send(buf.clone()).unwrap();
+        assert_eq!(sent, buf.len());
+        assert_eq!(a.snd_queue.len(), 4);
+
+        let frgs: Vec<u8> = a.snd_queue.iter().map(|s| s.frg).collect();
+        assert_eq!(frgs, vec![3, 2, 1, 0], "frg counts down to 0 in send order");
+
+        let sizes: Vec<usize> = a.snd_queue.iter().map(|s| s.data.len()).collect();
+        assert_eq!(sizes, vec![mss, mss, mss, 7]);
+
+        let mut concat = Vec::new();
+        for s in &a.snd_queue {
+            concat.extend_from_slice(&s.data);
+        }
+        assert_eq!(concat, buf, "segment data reassembles the input exactly");
     }
 
     // ── 5. kcp-go v5.6.13 compat patches ─────────────────────────────────

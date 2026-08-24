@@ -1373,6 +1373,7 @@ mod vnet_route_tests {
             shutdown_done: None,
             udp_cancel: tokio_util::sync::CancellationToken::new(),
             udp_cancels: HashMap::new(),
+            bridge_cancel: tokio_util::sync::CancellationToken::new(),
             work_pool: VecDeque::new(),
             pending_requests: VecDeque::new(),
             pending_udp: VecDeque::new(),

@@ -140,6 +140,7 @@ pub(crate) async fn assign_or_queue<W>(
     ctx: &ControlContext,
     writer: &mut W,
     req: PendingRequest,
+    bridge_cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), ()>
 where
     W: AsyncWriteExt + Unpin,
@@ -168,6 +169,7 @@ where
             ctx.reloadable.encryption_key,
             ctx.state.clone(),
             ctx.v2,
+            bridge_cancel,
         )
         .await
         {
@@ -401,8 +403,15 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                     .pool_size
                     .store(ctl.work_pool.len() as i64, Ordering::Relaxed);
                 let enc_key = ctx.reloadable.encryption_key;
-                match bridge::assign_work_to_proxy(stream, req, enc_key, ctx.state.clone(), ctx.v2)
-                    .await
+                match bridge::assign_work_to_proxy(
+                    stream,
+                    req,
+                    enc_key,
+                    ctx.state.clone(),
+                    ctx.v2,
+                    ctl.bridge_cancel.clone(),
+                )
+                .await
                 {
                     Ok(()) => {}
                     // A freshly delivered work conn died at StartWorkConn —
@@ -492,6 +501,7 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
             user_conn_permit: None,
             proxy_info,
         },
+        ctl.bridge_cancel.clone(),
     )
     .await
 }
@@ -742,6 +752,7 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             user_conn_permit,
             proxy_info,
         },
+        ctl.bridge_cancel.clone(),
     )
     .await
 }
@@ -888,6 +899,7 @@ mod tests {
             shutdown_done: None,
             udp_cancel: tokio_util::sync::CancellationToken::new(),
             udp_cancels: HashMap::new(),
+            bridge_cancel: tokio_util::sync::CancellationToken::new(),
             work_pool: VecDeque::new(),
             pending_requests: VecDeque::new(),
             pending_udp: VecDeque::new(),
@@ -932,6 +944,7 @@ mod tests {
             &ctx,
             &mut writer,
             test_req("p1"),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(res.is_ok(), "assign_or_queue must not fail the control");

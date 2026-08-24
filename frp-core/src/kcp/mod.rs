@@ -12,7 +12,7 @@ mod socket;
 mod stream;
 
 pub use config::{KcpConfig, KcpNoDelayConfig};
-pub use listener::{dial_kcp, KcpListener};
+pub use listener::{dial_kcp, dial_kcp_with_driver, KcpListener};
 pub use session::KcpSession;
 pub use stream::KcpStream;
 

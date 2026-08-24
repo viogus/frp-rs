@@ -1,10 +1,12 @@
 #[cfg(feature = "vnet")]
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
@@ -200,6 +202,25 @@ fn plan_visitor_dial(
     }
 }
 
+/// XTCP retry decision after a failed NatHoleVisitor attempt.
+///
+/// Returns `None` when the per-connection cancellation token is cancelled —
+/// the visitor listener is shutting down and the task must drop the user
+/// connection and return without bridging (Go frpc cancels a per-visitor
+/// context on teardown). `Some(true)` retries with the next attempt;
+/// `Some(false)` gives up (attempt budget exhausted, or one-shot mode).
+fn xtcp_retry_decision(
+    cancelled: bool,
+    keep_tunnel_open: bool,
+    attempt: usize,
+    max_retries: usize,
+) -> Option<bool> {
+    if cancelled {
+        return None;
+    }
+    Some(keep_tunnel_open && attempt < max_retries)
+}
+
 /// Run the packet loop over an established `virtual_net` visitor tunnel.
 ///
 /// After the NewVisitorConn handshake, tunnel bytes are wrapped in the same
@@ -287,6 +308,31 @@ async fn run_virtual_net_tunnel_io(
     }
 }
 
+/// Runs a bridge future to completion, aborting early when the
+/// per-connection cancellation token is cancelled (listener teardown /
+/// proxy removal). Without the select, the bridge task holds the UDP fd +
+/// KCP session + yamux and a 10ms driver task forever while the peer is
+/// alive. Returns true when the bridge completed normally; false when the
+/// token was cancelled (callers return and drop the bridge halves).
+async fn bridge_until_cancelled(
+    visitor_name: &str,
+    closed_debug: &str,
+    abort_info: &str,
+    conn_cancel: &CancellationToken,
+    bridge_fut: impl Future,
+) -> bool {
+    tokio::select! {
+        _ = bridge_fut => {
+            debug!(visitor_name = %visitor_name, "Visitor '{}' {} closed", visitor_name, closed_debug);
+            true
+        }
+        _ = conn_cancel.cancelled() => {
+            info!(visitor_name = %visitor_name, "Visitor '{}': {}", visitor_name, abort_info);
+            false
+        }
+    }
+}
+
 /// Run an STCP/XTCP visitor listener.
 /// Binds a local port, accepts connections, and tunnels them
 /// through the frps server to the remote STCP proxy.
@@ -348,11 +394,23 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
     };
     info!(name = %name, bind_addr = %bind_addr, "Visitor '{}' listening on {}", name, bind_addr);
 
+    // Parent cancellation token: every accepted connection gets a child token,
+    // cancelled when the listener exits (shutdown, accept error, or the
+    // listener task being aborted). In-flight connection tasks otherwise run
+    // to completion after shutdown — an XTCP visitor with keep_tunnel_open
+    // retries for up to an hour per connection. Go frpc cancels a per-visitor
+    // context on teardown; the token is the Rust equivalent. The drop guard
+    // covers the abort path (service.rs aborts a listener stuck in accept()
+    // after 500ms): dropping the guard cancels the parent and every child.
+    let listener_cancel = CancellationToken::new();
+    let _cancel_guard = listener_cancel.clone().drop_guard();
+
     loop {
         // Check graceful shutdown signal before each accept (Go frp compat:
         // visitor listeners exit cleanly instead of being aborted).
         if shutdown.load(Ordering::Relaxed) {
             info!(name = %name, "Visitor '{}' shutting down gracefully", name);
+            listener_cancel.cancel();
             return;
         }
 
@@ -391,6 +449,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                     tls_key_file: tls_key_file.clone(),
                     v2,
                 };
+
+                // Per-connection shutdown token: a child of the listener
+                // token, cancelled on listener exit so this task aborts its
+                // XTCP retry loop / pending bridge instead of running out its
+                // retry budget after shutdown has been requested. The child
+                // dies with the task — no pruning needed.
+                let conn_cancel = listener_cancel.child_token();
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
@@ -486,6 +551,14 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         }
 
                         for attempt in 0..=max_retries {
+                            // Shutdown boundary: abandon the connection
+                            // between attempts. Never checked mid-hole-punch —
+                            // an in-flight STUN/MakeHole attempt runs to its
+                            // own timeout before this boundary is reached.
+                            if conn_cancel.is_cancelled() {
+                                info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
+                                return; // drops the user connection unbridged
+                            }
                             if attempt > 0 {
                                 debug!(
                                     visitor_name = %visitor_name, attempt = %attempt, max_retries = %max_retries, retry_delay = ?retry_delay,
@@ -612,24 +685,51 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 Ok(Ok(Ok(resp))) => resp,
                                 Ok(Ok(Err(e))) => {
                                     warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': NatHoleResp error from server: {}", visitor_name, e);
-                                    if keep_tunnel_open && attempt < max_retries {
-                                        continue;
+                                    match xtcp_retry_decision(
+                                        conn_cancel.is_cancelled(),
+                                        keep_tunnel_open,
+                                        attempt,
+                                        max_retries,
+                                    ) {
+                                        Some(true) => continue,
+                                        Some(false) => return,
+                                        None => {
+                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
+                                            return; // drops the user connection unbridged
+                                        }
                                     }
-                                    return;
                                 }
                                 Ok(Err(_)) => {
                                     warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp channel closed (control loop dropped)", visitor_name);
-                                    if keep_tunnel_open && attempt < max_retries {
-                                        continue;
+                                    match xtcp_retry_decision(
+                                        conn_cancel.is_cancelled(),
+                                        keep_tunnel_open,
+                                        attempt,
+                                        max_retries,
+                                    ) {
+                                        Some(true) => continue,
+                                        Some(false) => return,
+                                        None => {
+                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
+                                            return; // drops the user connection unbridged
+                                        }
                                     }
-                                    return;
                                 }
                                 Err(_elapsed) => {
                                     warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp timed out after 15s", visitor_name);
-                                    if keep_tunnel_open && attempt < max_retries {
-                                        continue;
+                                    match xtcp_retry_decision(
+                                        conn_cancel.is_cancelled(),
+                                        keep_tunnel_open,
+                                        attempt,
+                                        max_retries,
+                                    ) {
+                                        Some(true) => continue,
+                                        Some(false) => return,
+                                        None => {
+                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
+                                            return; // drops the user connection unbridged
+                                        }
                                     }
-                                    return;
                                 }
                             };
                             debug!(visitor_name = %visitor_name, "Visitor '{}': received NatHoleResp from server", visitor_name);
@@ -727,6 +827,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 };
                                 match p2p_stream {
                                     Ok(mut p2p_stream) => {
+                                        // Shutdown boundary: don't start the
+                                        // P2P bridge — drop the user
+                                        // connection and return.
+                                        if conn_cancel.is_cancelled() {
+                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP P2P connection", visitor_name);
+                                            return; // drops the user connection unbridged
+                                        }
                                         info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected", visitor_name);
                                         let use_enc = use_encryption && !sk.is_empty();
                                         let (user_r, user_w) = user_conn
@@ -736,35 +843,51 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                         let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
                                         if use_enc {
                                             let key = frp_core::encryption::derive_key(&sk);
-                                            frp_core::bridge::bridge_encrypted(
-                                                user_r,
-                                                user_w,
-                                                p2p_r,
-                                                p2p_w,
-                                                &key,
-                                                use_compression,
-                                                vec![],
-                                                None,
-                                                None,
-                                                None,
-                                                None,
-                                                false,
+                                            if !bridge_until_cancelled(
+                                                &visitor_name,
+                                                "XTCP encrypted P2P",
+                                                "shutting down, aborting XTCP encrypted P2P bridge",
+                                                &conn_cancel,
+                                                frp_core::bridge::bridge_encrypted(
+                                                    user_r,
+                                                    user_w,
+                                                    p2p_r,
+                                                    p2p_w,
+                                                    &key,
+                                                    use_compression,
+                                                    vec![],
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    false,
+                                                ),
                                             )
-                                            .await;
-                                            debug!(visitor_name = %visitor_name, "Visitor '{}' XTCP encrypted P2P closed", visitor_name);
+                                            .await
+                                            {
+                                                return; // drops both bridge halves
+                                            }
                                         } else {
-                                            frp_core::bridge::bridge_plain(
-                                                user_r,
-                                                user_w,
-                                                p2p_r,
-                                                p2p_w,
-                                                use_compression,
-                                                vec![],
-                                                None,
-                                                None,
+                                            if !bridge_until_cancelled(
+                                                &visitor_name,
+                                                "XTCP",
+                                                "shutting down, aborting XTCP P2P bridge",
+                                                &conn_cancel,
+                                                frp_core::bridge::bridge_plain(
+                                                    user_r,
+                                                    user_w,
+                                                    p2p_r,
+                                                    p2p_w,
+                                                    use_compression,
+                                                    vec![],
+                                                    None,
+                                                    None,
+                                                ),
                                             )
-                                            .await;
-                                            debug!(visitor_name = %visitor_name, "Visitor '{}' XTCP closed", visitor_name);
+                                            .await
+                                            {
+                                                return; // drops both bridge halves
+                                            }
                                         }
                                         hole_punch_ok = true;
                                     }
@@ -878,6 +1001,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             }
                         }
 
+                        // Shutdown boundary: don't start the fallback relay —
+                        // drop the user connection and return.
+                        if conn_cancel.is_cancelled() {
+                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning STCP fallback connection", visitor_name);
+                            return; // drops the user connection unbridged
+                        }
+
                         let user = user_conn;
                         let (user_r, user_w) = user.into_split();
                         let (srv_r, srv_w) = match split_work_conn_halves(server_conn) {
@@ -890,35 +1020,47 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         let use_enc_relay = use_encryption && !sk.is_empty();
                         if use_enc_relay {
                             let key = frp_core::encryption::derive_key(&sk);
-                            frp_core::bridge::bridge_encrypted(
-                                user_r,
-                                user_w,
-                                srv_r,
-                                srv_w,
-                                &key,
-                                use_compression,
-                                vec![],
-                                None,
-                                None,
-                                None,
-                                None,
-                                false,
+                            if !bridge_until_cancelled(
+                                &visitor_name,
+                                "STCP fallback encrypted relay",
+                                "shutting down, aborting STCP fallback encrypted relay",
+                                &conn_cancel,
+                                frp_core::bridge::bridge_encrypted(
+                                    user_r,
+                                    user_w,
+                                    srv_r,
+                                    srv_w,
+                                    &key,
+                                    use_compression,
+                                    vec![],
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    false,
+                                ),
                             )
-                            .await;
-                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP fallback encrypted relay closed", visitor_name);
+                            .await
+                            {}
                         } else {
-                            frp_core::bridge::bridge_plain(
-                                user_r,
-                                user_w,
-                                srv_r,
-                                srv_w,
-                                use_compression,
-                                vec![],
-                                None,
-                                None,
+                            if !bridge_until_cancelled(
+                                &visitor_name,
+                                "STCP fallback relay",
+                                "shutting down, aborting STCP fallback relay",
+                                &conn_cancel,
+                                frp_core::bridge::bridge_plain(
+                                    user_r,
+                                    user_w,
+                                    srv_r,
+                                    srv_w,
+                                    use_compression,
+                                    vec![],
+                                    None,
+                                    None,
+                                ),
                             )
-                            .await;
-                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP fallback relay closed", visitor_name);
+                            .await
+                            {}
                         }
                     } else {
                         // --- STCP relay path (TCP-based visitors) ---
@@ -994,6 +1136,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             }
                         }
 
+                        // Shutdown boundary: don't start the relay bridge —
+                        // drop the user connection and return.
+                        if conn_cancel.is_cancelled() {
+                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning STCP connection", visitor_name);
+                            return; // drops the user connection unbridged
+                        }
+
                         let user = user_conn;
                         let (user_r, user_w) = user.into_split();
                         let (srv_r, srv_w) = match split_work_conn_halves(server_conn) {
@@ -1006,41 +1155,54 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         let use_enc_relay = use_encryption && !sk.is_empty();
                         if use_enc_relay {
                             let key = frp_core::encryption::derive_key(&sk);
-                            frp_core::bridge::bridge_encrypted(
-                                user_r,
-                                user_w,
-                                srv_r,
-                                srv_w,
-                                &key,
-                                use_compression,
-                                vec![],
-                                None,
-                                None,
-                                None,
-                                None,
-                                false,
+                            if !bridge_until_cancelled(
+                                &visitor_name,
+                                "STCP encrypted relay",
+                                "shutting down, aborting STCP encrypted relay",
+                                &conn_cancel,
+                                frp_core::bridge::bridge_encrypted(
+                                    user_r,
+                                    user_w,
+                                    srv_r,
+                                    srv_w,
+                                    &key,
+                                    use_compression,
+                                    vec![],
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    false,
+                                ),
                             )
-                            .await;
-                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP encrypted relay closed", visitor_name);
+                            .await
+                            {}
                         } else {
-                            frp_core::bridge::bridge_plain(
-                                user_r,
-                                user_w,
-                                srv_r,
-                                srv_w,
-                                use_compression,
-                                vec![],
-                                None,
-                                None,
+                            if !bridge_until_cancelled(
+                                &visitor_name,
+                                "STCP relay",
+                                "shutting down, aborting STCP relay",
+                                &conn_cancel,
+                                frp_core::bridge::bridge_plain(
+                                    user_r,
+                                    user_w,
+                                    srv_r,
+                                    srv_w,
+                                    use_compression,
+                                    vec![],
+                                    None,
+                                    None,
+                                ),
                             )
-                            .await;
-                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP relay closed", visitor_name);
+                            .await
+                            {}
                         }
                     }
                 });
             }
             Err(e) => {
                 warn!(name = %name, error = %e, "Visitor '{}': accept error: {}", name, e);
+                listener_cancel.cancel();
                 break;
             }
         }
@@ -2315,5 +2477,87 @@ mod transport_tests {
         assert_eq!(plan.opts.tls_cert_file.as_deref(), Some("/c.pem"));
         assert_eq!(plan.opts.tls_key_file.as_deref(), Some("/k.pem"));
         assert!(!plan.opts.v2);
+    }
+}
+
+#[cfg(test)]
+mod retry_decision_tests {
+    use super::xtcp_retry_decision;
+
+    #[test]
+    fn cancellation_aborts_retries_regardless_of_budget() {
+        // Cancelled token → abandon the connection (drop the user conn, no
+        // bridging), even with keep_tunnel_open and attempts left.
+        assert_eq!(xtcp_retry_decision(true, true, 0, 5), None);
+        assert_eq!(xtcp_retry_decision(true, true, 4, 5), None);
+        assert_eq!(xtcp_retry_decision(true, true, 5, 5), None);
+        // One-shot mode (keep_tunnel_open=false) too.
+        assert_eq!(xtcp_retry_decision(true, false, 0, 1), None);
+    }
+
+    #[test]
+    fn keep_tunnel_open_retries_while_budget_remains() {
+        assert_eq!(xtcp_retry_decision(false, true, 0, 5), Some(true));
+        assert_eq!(xtcp_retry_decision(false, true, 4, 5), Some(true));
+        // Attempt budget exhausted → give up.
+        assert_eq!(xtcp_retry_decision(false, true, 5, 5), Some(false));
+    }
+
+    #[test]
+    fn one_shot_mode_gives_up_after_first_failure() {
+        // keep_tunnel_open=false → 2 total attempts, no retry after the first.
+        assert_eq!(xtcp_retry_decision(false, false, 0, 1), Some(false));
+        assert_eq!(xtcp_retry_decision(false, false, 1, 1), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod bridge_cancel_tests {
+    use super::*;
+
+    /// The shared bridge-until-cancelled helper (used by the XTCP P2P and
+    /// STCP relay sites) must abort when the per-connection cancellation
+    /// token is cancelled (listener teardown / proxy removal). Without the
+    /// select, the bridge task holds the UDP fd + KCP session + yamux and a
+    /// 10ms driver task forever while the peer is alive. Two duplex pairs
+    /// stand in for the user connection and the peer stream; bridge_plain
+    /// would block on reads indefinitely, so only the cancellation arm can
+    /// resolve the select.
+    #[tokio::test]
+    async fn p2p_bridge_cancels_on_token_cancel() {
+        let (user_a, _user_b) = tokio::io::duplex(8192);
+        let (p2p_a, _p2p_b) = tokio::io::duplex(8192);
+        let (user_r, user_w) = tokio::io::split(user_a);
+        let (p2p_r, p2p_w) = tokio::io::split(p2p_a);
+        let conn_cancel = CancellationToken::new();
+        let bridge_cancel = conn_cancel.clone();
+
+        let bridge_task = tokio::spawn(async move {
+            // Production bridge site: exercises the same select path the
+            // XTCP P2P / STCP relay sites use.
+            bridge_until_cancelled(
+                "test",
+                "XTCP",
+                "shutting down, aborting XTCP P2P bridge",
+                &bridge_cancel,
+                frp_core::bridge::bridge_plain(
+                    user_r,
+                    user_w,
+                    p2p_r,
+                    p2p_w,
+                    false,
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .await;
+        });
+
+        conn_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), bridge_task)
+            .await
+            .expect("bridge must abort when the connection token is cancelled")
+            .expect("bridge task must not panic");
     }
 }

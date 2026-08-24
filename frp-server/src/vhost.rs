@@ -126,7 +126,21 @@ fn get_locked(
     path: &str,
     http_user: &str,
 ) -> Option<VhostRouteMatch> {
-    let user_map = routes.get(host)?;
+    // Go frp compat (pkg/util/vhost/router.go): `Get` does
+    // `strings.ToLower(host)` before lookup — domains are stored lowercased
+    // at register, so a mixed-case Host/SNI must resolve case-insensitively.
+    // Alloc-free ASCII fast path (Go's strings.ToLower avoids allocating for
+    // all-lowercase input); Unicode case mapping can expand length (İ → "i̇")
+    // vs Go's single-rune map, but real hostnames are IDNA/punycode ASCII —
+    // divergence accepted.
+    let lowered;
+    let host_key: &str = if host.bytes().all(|b| !b.is_ascii_uppercase()) {
+        host
+    } else {
+        lowered = host.to_lowercase();
+        &lowered
+    };
+    let user_map = routes.get(host_key)?;
     // Try httpUser-specific first
     if let Some(vrs) = user_map.get(http_user) {
         if let Some(route) = find_matching_route(vrs, path) {
@@ -227,9 +241,17 @@ impl VhostManager {
 
         let mut tables = self.inner.write().await;
 
+        // Go frp compat (pkg/util/vhost/router.go): `Routers.Add` does
+        // `strings.ToLower(domain)` — domains are stored lowercased, so
+        // lookups are case-insensitive. Lowercase each domain ONCE, before
+        // the conflict check, the routes insert, and the by_proxy
+        // bookkeeping, keeping register/unregister symmetric (unregister
+        // looks up by the same lowered key).
+        let domains: Vec<String> = domains.iter().map(|d| d.to_lowercase()).collect();
+
         // Check for conflicts: each (domain, route_by_http_user, location) triple
         // must be unique. Matching Go's exist() which checks exact location match.
-        for domain in domains {
+        for domain in &domains {
             if let Some(user_map) = tables.routes.get(domain) {
                 if let Some(vrs) = user_map.get(route_by_http_user) {
                     for loc in locations {
@@ -251,7 +273,7 @@ impl VhostManager {
 
         // Register domain routes: append to Vec; sort once after all inserts.
         let mut domain_entries = Vec::new();
-        for domain in domains {
+        for domain in &domains {
             let vrs = tables
                 .routes
                 .entry(domain.clone())
@@ -262,7 +284,7 @@ impl VhostManager {
             domain_entries.push((domain.clone(), route_by_http_user.to_string()));
         }
         // Sort once after all domain insertions (was O(N) per registration).
-        for domain in domains {
+        for domain in &domains {
             if let Some(user_map) = tables.routes.get_mut(domain) {
                 if let Some(vrs) = user_map.get_mut(route_by_http_user) {
                     sort_by_longest_location(vrs);
@@ -1017,6 +1039,11 @@ pub async fn run_vhost_https_listener(
                     debug!(sni = %sni, peer = %peer, "HTTPS VHost SNI '{}' from {}", sni, peer);
 
                     // Route by SNI (host), path "/" (Go https.go getByRoute).
+                    // Go frp lowercases the host before lookup (router.go
+                    // `Get` → strings.ToLower), so a mixed-case SNI must
+                    // resolve case-insensitively. get_locked is the sole
+                    // routing lowercaser, so pass the raw SNI here — the
+                    // debug/warn lines below log it case-preserved.
                     if let Some(route) = state
                         .vhost_manager
                         .lookup_combined(&sni, "/", "")
@@ -1615,5 +1642,74 @@ mod tests {
         assert!(resp.contains("HTTP/1.1 404 Not Found"));
         assert!(resp.contains("Content-Type: text/html"));
         assert!(resp.contains("<h1>Not Found</h1>"));
+    }
+
+    /// Go frp compat (pkg/util/vhost/router.go): domains are stored
+    /// lowercased at register (`Routers.Add` → strings.ToLower) and lookups
+    /// lowercase the host (`Get` → strings.ToLower), so a mixed-case
+    /// customDomain must resolve for any casing. Conflict detection and
+    /// unregister must also be case-insensitive (same lowered keys).
+    #[tokio::test]
+    async fn test_vhost_register_lookup_case_insensitive() {
+        let mgr = VhostManager::new();
+
+        // Same shared location on both registrations so the (domain, rubu,
+        // location) triple conflict check fires — like Go's exist() with
+        // `location == "/"`.
+        mgr.register(
+            "p1",
+            &["MixedCase.Example.com".into()],
+            &["/".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("registration must succeed");
+
+        // Lookup must resolve for lowercase, uppercase, and the original
+        // mixed case (Host header arrives verbatim from extract_host_header).
+        for host in [
+            "mixedcase.example.com",
+            "MIXEDCASE.EXAMPLE.COM",
+            "MixedCase.Example.com",
+        ] {
+            let route = mgr
+                .lookup(host, "/", "")
+                .await
+                .unwrap_or_else(|| panic!("lookup for '{host}' must resolve"));
+            assert_eq!(route.proxy_name.as_ref(), "p1");
+        }
+
+        // A second proxy claiming the same domain in a different case must
+        // be rejected as a conflict (Go frp: Add lowercases then exist()).
+        let err = mgr
+            .register(
+                "p2",
+                &["MIXEDCASE.EXAMPLE.COM".into()],
+                &["/".into()],
+                "run-2",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect_err("case-variant conflict must be rejected");
+        assert!(
+            err.to_string().contains("example.com"),
+            "conflict must name the lowered domain: {err}"
+        );
+
+        // Unregister removes the route regardless of the original casing
+        // (by_proxy bookkeeping holds the same lowered keys).
+        mgr.unregister("p1").await;
+        assert!(mgr.lookup("mixedcase.example.com", "/", "").await.is_none());
     }
 }

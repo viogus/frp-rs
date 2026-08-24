@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::service::ControlWriter;
@@ -33,6 +34,7 @@ impl Service {
         writer: &Arc<ControlWriter>,
         v2: bool,
         session_alive: Arc<AtomicBool>,
+        proxy_token: CancellationToken,
     ) {
         debug!(proxy_name = %nhc.proxy_name, "Received NatHoleClient for proxy '{}'", nhc.proxy_name);
         let visitor_addr = nhc.visitor_addr.unwrap_or_default();
@@ -93,7 +95,9 @@ impl Service {
         // so it doesn't starve the control loop's ping/health/reload handling.
         // The task is session-bound: `session_alive` is cleared at session
         // teardown, which aborts both the hole punch and the P2P bridge
-        // instead of leaving them probing a dead control channel.
+        // instead of leaving them probing a dead control channel. It is also
+        // proxy-bound: `proxy_token` is cancelled on CloseProxy/reload removal
+        // so a deleted proxy cannot leak the bridge task + UDP fd + KCP + yamux.
         let w = writer.clone();
         tokio::spawn(async move {
             let alive = session_alive;
@@ -141,6 +145,12 @@ impl Service {
                         debug!(proxy_name = %proxy_name, "XTCP provider '{}': session ended during hole punch, aborting", proxy_name);
                         return;
                     }
+                    _ = proxy_token.cancelled() => {
+                        // Proxy deleted (CloseProxy/reload): drop the punch
+                        // future, releasing its UDP socket.
+                        debug!(proxy_name = %proxy_name, "XTCP provider '{}': proxy deleted during hole punch, aborting", proxy_name);
+                        return;
+                    }
                 }
             };
             match punch_result {
@@ -162,6 +172,10 @@ impl Service {
                                 debug!(proxy_name = %proxy_name, "XTCP provider '{}': session ended during local connect, aborting", proxy_name);
                                 return;
                             }
+                            _ = proxy_token.cancelled() => {
+                                debug!(proxy_name = %proxy_name, "XTCP provider '{}': proxy deleted during local connect, aborting", proxy_name);
+                                return;
+                            }
                         };
                         match local_result {
                             Ok(local_stream) => {
@@ -171,6 +185,7 @@ impl Service {
                                 let sk = xtcp_sk.clone();
                                 let pn = proxy_name.clone();
                                 let alive_inner = alive.clone();
+                                let p2p_token = proxy_token.clone();
                                 tokio::spawn(async move {
                                     let (local_r, local_w) = local_stream.into_split();
                                     let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
@@ -214,6 +229,12 @@ impl Service {
                                             // futures, closing the P2P stream and
                                             // the local connection.
                                             debug!(proxy_name = %pn, "XTCP provider '{}': session ended, closing P2P bridge", pn);
+                                        }
+                                        _ = p2p_token.cancelled() => {
+                                            // Proxy deleted: drop the bridge
+                                            // futures, closing the P2P stream and
+                                            // the local connection.
+                                            debug!(proxy_name = %pn, "XTCP provider '{}': proxy deleted, closing P2P bridge", pn);
                                         }
                                     }
                                 });
@@ -266,6 +287,7 @@ impl Service {
     /// Routes to waiting visitor (by transaction_id) or spawns provider hole
     /// punch task (by sid). Provider side iterates candidate addresses from
     /// the server's NAT analysis.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_nat_hole_resp(
         &self,
         resp: msg::NatHoleResp,
@@ -278,6 +300,7 @@ impl Service {
         >,
         writer: &Arc<ControlWriter>,
         session_alive: Arc<AtomicBool>,
+        proxy_token: CancellationToken,
     ) {
         // Route to waiting visitor first (Go frps compat path).
         let txn_id = resp.transaction_id.clone();
@@ -351,7 +374,10 @@ impl Service {
         tokio::spawn(async move {
             // Session-bound task: `session_alive` is cleared at session
             // teardown, which aborts both the hole punch and the P2P bridge
-            // instead of leaving them probing a dead control channel.
+            // instead of leaving them probing a dead control channel. Also
+            // proxy-bound: `proxy_token` is cancelled on CloseProxy/reload
+            // removal so a deleted proxy cannot leak the bridge task + UDP
+            // fd + KCP + yamux.
             let alive = session_alive;
             // Retrieve the STUN socket persisted by the control loop.
             let stun_socket = {
@@ -493,6 +519,12 @@ impl Service {
                         debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': session ended during hole punch, aborting", proxy_name_clone);
                         return;
                     }
+                    _ = proxy_token.cancelled() => {
+                        // Proxy deleted (CloseProxy/reload): drop the punch
+                        // future, releasing its UDP socket.
+                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': proxy deleted during hole punch, aborting", proxy_name_clone);
+                        return;
+                    }
                 }
             };
             match p2p_stream {
@@ -516,6 +548,10 @@ impl Service {
                             r = &mut connect_fut => r,
                             _ = wait_session_dead(&alive) => {
                                 debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': session ended during local connect, aborting", proxy_name_clone);
+                                return;
+                            }
+                            _ = proxy_token.cancelled() => {
+                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': proxy deleted during local connect, aborting", proxy_name_clone);
                                 return;
                             }
                         };
@@ -565,6 +601,12 @@ impl Service {
                                         // futures, closing the P2P stream and
                                         // the local connection.
                                         debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': session ended, closing P2P bridge", proxy_name_clone);
+                                    }
+                                    _ = proxy_token.cancelled() => {
+                                        // Proxy deleted: drop the bridge
+                                        // futures, closing the P2P stream and
+                                        // the local connection.
+                                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': proxy deleted, closing P2P bridge", proxy_name_clone);
                                     }
                                 }
                                 debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
@@ -850,5 +892,37 @@ mod tests {
                 "channel stand-in still held after abort"
             ),
         }
+    }
+
+    /// Regression: a hole-punch future selected against the proxy's cancel
+    /// token — the per-proxy deletion bound added alongside `wait_session_dead`
+    /// in `handle_nat_hole_client`/`handle_nat_hole_resp` — must abort when the
+    /// proxy is deleted (CloseProxy / reload removal), dropping the punch
+    /// instead of probing until the peer closes. Covers the case
+    /// `wait_session_dead` cannot: single-proxy deletion without session
+    /// teardown.
+    #[tokio::test]
+    async fn p2p_punch_aborts_on_proxy_token_cancel() {
+        let token = CancellationToken::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let token2 = token.clone();
+        let task = tokio::spawn(async move {
+            let _ = entered_tx.send(());
+            // Stand-in for the real hole-punch future
+            // (`xtcp_p2p_connect_yamux`): pending forever, like a punch against
+            // a peer that never answers.
+            let punch = std::future::pending::<Result<(), String>>();
+            tokio::pin!(punch);
+            tokio::select! {
+                _ = &mut punch => {}
+                _ = token2.cancelled() => {}
+            }
+        });
+        entered_rx.await.expect("punch task never started");
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("proxy-token-bound hole punch did not abort after proxy deletion")
+            .expect("hole punch task panicked");
     }
 }

@@ -120,7 +120,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 1135 passed, 0 failed (full suite incl. dashboard — requires an all-features frps binary, see Testing & Tooling) |
+| `cargo test --workspace --all-features` | 1149 passed, 0 failed (full suite incl. dashboard — requires an all-features frps binary, see Testing & Tooling) |
 | `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); CI dev builds override LTO/opt (`lto=false opt-level=2`, written by ci.yml on runners) for build speed and come out ~70% larger (measured 2026-08-09: 9.1MB vs 5.3MB), so CI artifact sizes do not reflect release; local builds use the declared profile; hyper-based HTTP client + otel/prometheus default-features pruning) |
 | `compat-test.sh` (Go frp v0.71.0) | 76 run_test scenarios + 17 XTCP pairwise; XTCP 17/17 re-verified locally vs Go 0.71.0 (2026-08-23) |
 | `unsafe` blocks | 17 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
@@ -133,6 +133,7 @@ Every feature, fix, and test change follows three rules:
 | Go frp parity (2026-08-02) | 20-task pass merged (PR #221): OIDC/QUIC/KCP+TLS/WS/UDP/PROXY/plugin/client-management parity, `{single=N}` allowPorts + 24h reservations, HTTPS vhost SNI passthrough, fail-closed HTTP server plugins, **SSH gateway `ssh -R`** (tcpip-forward/forwarded-tcpip), dashboard offline clients/root auth/store 0600, XTCP **MakeHole** state machine, IPv6 vnet routing |
 | Go frp v0.71.0 parity (2026-08-16) | PR #246: UDP packet binary codec (`binary-v1`, V2 frame type 19), version alignment 0.71.0, V2 extension types renumbered 21/22, negative pool_count rejected at login, case-insensitive customDomains check |
 | Post-0.71.0 hardening (2026-08-17..22) | PRs #254-#263: vendor yamux 0.14 + stream cap 1024, zero-copy snappy hot paths, 3 LOW data-path fixes, WS-over-TLS stall recovery, ci fmt/clippy/audit fixes, 15-item review (wedge/cipher/splice/metrics/dedup), cargo update, single-writev V2 frames + zero-alloc binary UDP encode |
+| Post-0.71.0 hardening (2026-08-24) | PR #267: 3 HIGH leak fixes (server bridge cancel via per-control CancellationToken, KCP dial-driver self-exit via alive_streams counter, client work-conn abort + bounded join), XTCP/STCP bridge cancellation on teardown + proxy deletion (visitor `bridge_until_cancelled` helper; provider per-proxy `p2p_bridge_tokens` cancelled by CloseProxy/HealthEvent::Close/reload), case-insensitive vhost/tcpmux/SNI routing (Go parity), frpc SIGINT/SIGTERM incl. config-dir mode, single-copy KCP send segmentation (drops the `split_off` tail-chain, every byte copied exactly once) |
 
 Key perf optimizations (3 audit cycles):
 - Bridge: `compress_chunk`/`decompress_chunk` reuse buffers (zero alloc per iteration)
@@ -140,7 +141,7 @@ Key perf optimizations (3 audit cycles):
 - Linux TCP bridge: `splice(2)` zero-copy relay
 - CipherWriter: shared `scratch` buffer reuse
 - AEAD read: pre-allocated `scratch` retained across frames
-- KCP: packet pool, FEC fast-path (skip 6 allocs when no loss), lazy `recv_buf`, O(1) write-path `conv_index`, write backpressure
+- KCP: packet pool, FEC fast-path (skip 6 allocs when no loss), lazy `recv_buf`, O(1) write-path `conv_index`, write backpressure; send path single-copy offset segmentation (no `split_off` tail re-copy per segment)
 - BandwidthLimiter: `f64` token bucket, zero alloc per check
 
 Deep-dive architecture docs live in Claude memory files: `frp-core-deep-dive`, `frp-server-deep-dive`, `frp-client-deep-dive`, `frp-test-coverage`, `frp-vnet-architecture`.
