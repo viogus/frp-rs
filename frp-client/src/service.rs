@@ -332,6 +332,15 @@ struct SessionCtx {
     /// aborting them is an ordinary stream close and releases their session
     /// Arc clones — one mechanism for both.
     work_conn_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Join handle of the dedicated control writer task (phase 5). Aborted
+    /// at teardown AFTER the vnet route-removal sends (which ride the writer
+    /// channel) and the yamux/socket drop. On tcp_mux=false the raw write
+    /// half lives only inside this task: against a wedged-but-alive peer
+    /// (zero-window TCP that ACKs keepalive/window probes, or no-mux KCP
+    /// with no dead-conn detection) `write_msg` blocks forever, and without
+    /// the abort teardown cannot close the socket — one task+fd leaked per
+    /// reconnect cycle.
+    control_writer_handle: Option<tokio::task::JoinHandle<()>>,
     // --- Message loop (phase 6) ---
     /// Map sid -> proxy_name for XTCP NatHoleResp routing (provider side).
     pending_xtcp: std::collections::HashMap<String, String>,
@@ -1455,6 +1464,7 @@ impl Service {
             visitor_shutdown: None,
             visitor_handles: Vec::new(),
             work_conn_handles: Vec::new(),
+            control_writer_handle: None,
             pending_xtcp: std::collections::HashMap::new(),
             xtcp_sockets: Default::default(),
             visitor_pending: std::collections::HashMap::new(),
@@ -2033,7 +2043,11 @@ impl Service {
                 .control_rx
                 .take()
                 .expect("control_rx available before split");
-            tokio::spawn(async move {
+            // Keep the JoinHandle on SessionCtx so teardown can abort the
+            // writer (F7): the raw write half lives only inside this task,
+            // and against a wedged-but-alive peer a blocked write_msg would
+            // otherwise keep the task + socket fd alive past session end.
+            let writer_handle = tokio::spawn(async move {
                 let mut rx = control_rx;
                 let mut w = raw_writer;
                 while let Some((msg, v2)) = rx.recv().await {
@@ -2045,6 +2059,7 @@ impl Service {
                     }
                 }
             });
+            ctx.control_writer_handle = Some(writer_handle);
         }
 
         // Spawn VnetControllers for all vnet proxies now that the
@@ -2281,6 +2296,27 @@ impl Service {
         Ok(())
     }
 
+    /// F2 liveness guard for the XTCP punch paths. Reload removal and the
+    /// health Close event cancel the per-proxy P2P bridge token (and remove
+    /// the proxy from `proxy_info_map` / mark it CheckFailed) at one loop
+    /// iteration, but the server's nathole session outlives proxy
+    /// unregistration (NAT_HOLE_TIMEOUT = 10s): a NatHoleClient/NatHoleResp
+    /// the server already put on the wire arrives at a LATER iteration and
+    /// would re-insert a FRESH uncancelled token via
+    /// `entry(name).or_insert_with(CancellationToken::new)` — the
+    /// cancel-before-reinsert race. The punch/bridge it spawns would then
+    /// never observe the earlier cancellation (the removed proxy gets no
+    /// further CloseProxy/HealthEvent to cancel it) and would run until the
+    /// peer closes. A proxy is dead for punching when it is absent from
+    /// `proxy_info_map` (reload removal) or in CheckFailed (health Close).
+    pub(crate) async fn punch_proxy_still_live(&self, proxy_name: &str) -> bool {
+        let map = self.proxy_info_map.read().await;
+        match map.get(proxy_name) {
+            None => false,
+            Some(info) => !matches!(info.phase, ProxyPhase::CheckFailed),
+        }
+    }
+
     /// Phase 6 of one connection attempt: the message loop. Reads control
     /// frames, ticks the heartbeat ping, retries StartErr proxies every 30s,
     /// and handles health / reload / XTCP / visitor / stop events until the
@@ -2414,6 +2450,18 @@ impl Service {
                             warn!(error = %err.error, "Server error: {}", err.error);
                         }
                         Ok(FrpMessage::NatHoleClient(nhc)) => {
+                            // F2 cancel-before-reinsert guard: a reload removal
+                            // or health Close at an earlier iteration cancelled
+                            // this proxy's P2P token; a NatHoleClient the server
+                            // already queued must not re-arm a fresh uncancelled
+                            // token here (the punch/bridge would then run until
+                            // the peer closes). Bail before the insert — the same
+                            // guard therefore covers the spawn in
+                            // handle_nat_hole_client (no token, no punch).
+                            if !self.punch_proxy_still_live(&nhc.proxy_name).await {
+                                debug!(proxy_name = %nhc.proxy_name, "Ignoring NatHoleClient for dead proxy '{}'", nhc.proxy_name);
+                                continue;
+                            }
                             let proxy_token = self
                                 .p2p_bridge_tokens
                                 .lock()
@@ -2435,14 +2483,29 @@ impl Service {
                             } else {
                                 ctx.pending_xtcp.get(&sid).cloned()
                             };
+                            // F2 cancel-before-reinsert guard, same race as the
+                            // NatHoleClient arm: a reload removal or health Close
+                            // cancelled this proxy's P2P token at an earlier
+                            // iteration; a NatHoleResp the server already queued
+                            // must not re-arm a fresh uncancelled token. Reclaim
+                            // the sid's socket + pending_xtcp entries so the
+                            // bailed resp cannot leak the STUN UDP socket.
                             let proxy_token = match proxy_name {
-                                Some(name) if !name.is_empty() => self
-                                    .p2p_bridge_tokens
-                                    .lock()
-                                    .await
-                                    .entry(name)
-                                    .or_insert_with(CancellationToken::new)
-                                    .clone(),
+                                Some(name) if !name.is_empty() => {
+                                    if !self.punch_proxy_still_live(&name).await {
+                                        debug!(proxy_name = %name, "Ignoring NatHoleResp for dead proxy '{}'", name);
+                                        ctx.pending_xtcp.remove(&sid);
+                                        ctx.xtcp_sockets.lock().await.remove(&sid);
+                                        continue;
+                                    }
+                                    self
+                                        .p2p_bridge_tokens
+                                        .lock()
+                                        .await
+                                        .entry(name)
+                                        .or_insert_with(CancellationToken::new)
+                                        .clone()
+                                }
                                 _ => CancellationToken::new(),
                             };
                             self.handle_nat_hole_resp(*resp, &mut ctx.pending_xtcp, &mut ctx.visitor_pending, &ctx.xtcp_sockets, &writer, ctx.session_alive.clone(), proxy_token).await;
@@ -3276,6 +3339,32 @@ impl Service {
         // dual-yamux-session leaks through a half-open TCP mux connection.
         #[cfg(feature = "tcp-mux")]
         drop(prev_yamux.take());
+
+        // Step 5: Abort the control writer task. This must come after the
+        // vnet route-removal sends above (they ride the writer channel, so
+        // the writer must still be alive to drain them) and after dropping
+        // the yamux session. On the tcp-mux path dropping prev_yamux already
+        // closed the socket, so the writer exits on its own and this abort is
+        // a no-op or immediate. On tcp_mux=false the raw write half lives
+        // only inside the writer task: against a wedged-but-alive peer
+        // (zero-window TCP that ACKs keepalive/window probes, or no-mux KCP
+        // with no dead-conn detection) write_msg would block forever and
+        // nothing else can close the socket — aborting the task drops the
+        // write half (and the fd) instead of leaking one task+fd per
+        // reconnect cycle.
+        let control_writer_handle = std::mem::take(&mut ctx.control_writer_handle);
+        if let Some(handle) = control_writer_handle {
+            handle.abort();
+            // Abort only lands at the task's next await point; bound the
+            // join so teardown can never hang on a stuck writer (same
+            // pattern as the work-conn abort above). On timeout the aborted
+            // task finishes on its own — the write half it owns is dropped
+            // the moment the abort takes effect.
+            let joined = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            if joined.is_err() {
+                warn!("Control writer teardown timed out after 5s; continuing without waiting for the writer task");
+            }
+        }
 
         // Wait briefly for visitor tasks to notice the shutdown signal and
         // exit gracefully (timeout so we never block reconnection).
@@ -4123,8 +4212,9 @@ mod tests {
     }
 
     /// Like [`test_control_writer`], but keeps the receiver so the test can
-    /// assert on the messages enqueued by the code under test.
-    #[cfg(feature = "vnet")]
+    /// assert on the messages enqueued by the code under test. Not gated on
+    /// vnet: the XTCP punch-path tests use it to assert that a dead proxy
+    /// enqueues nothing on the control channel.
     fn test_control_writer_rx() -> (
         Arc<ControlWriter>,
         tokio::sync::mpsc::Receiver<(FrpMessage, bool)>,
@@ -4962,6 +5052,7 @@ mod tests {
             visitor_shutdown: None,
             visitor_handles: Vec::new(),
             work_conn_handles: Vec::new(),
+            control_writer_handle: None,
             pending_xtcp: HashMap::new(),
             xtcp_sockets: Default::default(),
             visitor_pending: HashMap::new(),
@@ -5100,6 +5191,7 @@ mod tests {
             visitor_shutdown: Some(Arc::new(AtomicBool::new(false))),
             visitor_handles: Vec::new(),
             work_conn_handles: vec![stuck],
+            control_writer_handle: None,
             pending_xtcp: HashMap::new(),
             xtcp_sockets: Default::default(),
             visitor_pending: HashMap::new(),
@@ -5128,5 +5220,331 @@ mod tests {
         })
         .await
         .expect("teardown_session must abort the session's work-conn tasks");
+    }
+
+    /// Regression (MEDIUM): the control writer task was spawned untracked
+    /// and never aborted at teardown. On tcp_mux=false the raw write half
+    /// lives only inside that task, so against a wedged-but-alive peer
+    /// (zero-window TCP that ACKs keepalive/window probes, or no-mux KCP
+    /// with no dead-conn detection) the task blocks forever in write_msg and
+    /// teardown cannot close the socket any other way — one task+fd leaked
+    /// per reconnect cycle. `teardown_session` must abort the writer (after
+    /// the vnet route-removal sends that ride its channel). The abort step
+    /// itself is feature-independent; the call-site signature differs under
+    /// tcp-mux, hence the two cfg-branched calls.
+    #[tokio::test]
+    async fn teardown_session_aborts_control_writer() {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            ..Default::default()
+        };
+        let service = Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed");
+
+        // A writer-shaped task that would otherwise block forever (the
+        // wedged-peer write_msg): block on a never-completing future. A
+        // drop-guard flags when the task is cancelled, so the test can
+        // observe the abort without owning the JoinHandle (which is moved
+        // into the session and taken by teardown).
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let stuck = tokio::spawn(async move {
+            let _guard = DropFlag(flag);
+            std::future::pending::<()>().await
+        });
+        // Let the task run once so its drop-guard exists before teardown
+        // aborts it: a task aborted before its first poll never executes its
+        // body, and the guard is created inside the body.
+        tokio::task::yield_now().await;
+
+        let mut ctx = SessionCtx {
+            control_stream: None,
+            run_id: "writer-teardown-test-run-id".to_string(),
+            yamux: None,
+            v2: false,
+            #[cfg(feature = "quic")]
+            quic_conn: None,
+            ping_interval: None,
+            last_pong: Instant::now(),
+            hb_timeout: 30,
+            hb_timeout_dur: Duration::from_secs(30),
+            hb_watchdog_active: false,
+            session_alive: Arc::new(AtomicBool::new(true)),
+            wc_server_addr: "127.0.0.1".to_string(),
+            wc_server_port: 7000,
+            wc_tls_enable: false,
+            wc_tls_server_name: String::new(),
+            wc_tls_ca_file: None,
+            wc_tls_cert_file: None,
+            wc_tls_key_file: None,
+            wc_dns_server: None,
+            wc_udp_packet_size: 1500,
+            wc_udp_packet_codec: String::new(),
+            wc_disable_custom_tls_first_byte: false,
+            wc_keepalive_secs: 7200,
+            wc_bind_addr: None,
+            wc_proxy_url: String::new(),
+            wc_dial_timeout_secs: 10,
+            protocol: TransportProtocol::Tcp,
+            client_scopes: Vec::new(),
+            server_scopes: Vec::new(),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            session_started_at: Instant::now(),
+            pending_proxies: Vec::new(),
+            pending_visitors: Vec::new(),
+            write_failed: false,
+            seen_registration_response: false,
+            req_work_conns_seen: 0,
+            // The vnet teardown path sends VnetRouteRemove via the writer;
+            // a drained channel satisfies the `.expect()` and the send
+            // failures are logged, not fatal.
+            #[cfg(feature = "vnet")]
+            writer: Some(test_control_writer()),
+            #[cfg(not(feature = "vnet"))]
+            writer: None,
+            control_rx: None,
+            control_failed: None,
+            control_notify: None,
+            reader: None,
+            visitor_shutdown: Some(Arc::new(AtomicBool::new(false))),
+            visitor_handles: Vec::new(),
+            work_conn_handles: Vec::new(),
+            control_writer_handle: Some(stuck),
+            pending_xtcp: HashMap::new(),
+            xtcp_sockets: Default::default(),
+            visitor_pending: HashMap::new(),
+            stun_result_tx: None,
+            stun_result_rx: None,
+            xtcp_cleanup_rx: None,
+            proxy_retry_interval: None,
+            waitstart_seen: HashMap::new(),
+            cfg_user: String::new(),
+        };
+
+        let health_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mut admin_handle = None;
+        #[cfg(feature = "tcp-mux")]
+        service
+            .teardown_session(&mut ctx, &mut None, &health_cancels, &mut admin_handle)
+            .await;
+        #[cfg(not(feature = "tcp-mux"))]
+        service
+            .teardown_session(&mut ctx, &health_cancels, &mut admin_handle)
+            .await;
+
+        // The writer task must be cancelled: teardown aborts it. Without the
+        // fix the task keeps running forever and the flag never fires — this
+        // await times out (the test's failure mode).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cancelled.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("teardown_session must abort the control writer task");
+    }
+
+    /// F2 guard semantics: the XTCP punch paths must refuse proxies that a
+    /// reload removed (absent from proxy_info_map) or a health Close marked
+    /// CheckFailed — punching for either would re-arm a fresh uncancelled
+    /// P2P token after the removal already cancelled one (the
+    /// cancel-before-reinsert race). A live (Running) or re-registering
+    /// (WaitStart) proxy must still pass.
+    #[tokio::test]
+    async fn punch_proxy_still_live_tracks_proxy_liveness() {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            ..Default::default()
+        };
+        let service = Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed");
+
+        // Unknown proxy (reload removed it): dead.
+        assert!(
+            !service.punch_proxy_still_live("user.xtcp-a").await,
+            "a proxy absent from proxy_info_map must not punch"
+        );
+
+        let proxy_info_map = &service.proxy_info_map;
+        let insert = |phase: ProxyPhase| async move {
+            let mut map = proxy_info_map.write().await;
+            map.insert(
+                "user.xtcp-a".to_string(),
+                ProxyRuntimeInfo {
+                    local_addr: "127.0.0.1:8080".to_string(),
+                    proxy_type: "xtcp".to_string(),
+                    use_encryption: false,
+                    use_compression: false,
+                    sk: String::new(),
+                    bandwidth_limit: 0,
+                    bandwidth_limit_mode: String::new(),
+                    proxy_protocol_version: String::new(),
+                    plugin: String::new(),
+                    remote_addr: String::new(),
+                    err: String::new(),
+                    config_snapshot: String::new(),
+                    phase,
+                },
+            );
+        };
+
+        insert(ProxyPhase::Running).await;
+        assert!(
+            service.punch_proxy_still_live("user.xtcp-a").await,
+            "a Running proxy must still punch"
+        );
+
+        // Health Close marks the proxy CheckFailed (it stays in the map for
+        // recovery monitoring): dead for punching.
+        insert(ProxyPhase::CheckFailed).await;
+        assert!(
+            !service.punch_proxy_still_live("user.xtcp-a").await,
+            "a health-closed (CheckFailed) proxy must not punch"
+        );
+
+        // Recovery re-registration (WaitStart) may punch again.
+        insert(ProxyPhase::WaitStart).await;
+        assert!(
+            service.punch_proxy_still_live("user.xtcp-a").await,
+            "a re-registering (WaitStart) proxy must punch"
+        );
+    }
+
+    /// F2: a NatHoleClient for a dead proxy must not punch — the handler
+    /// bails before binding a UDP socket or sending anything on the control
+    /// channel. Without the guard the handler reaches the visitor_addr
+    /// check and immediately enqueues a NatHoleReport failure; the test
+    /// asserts the control channel stays silent instead.
+    #[tokio::test]
+    async fn nat_hole_client_bails_for_dead_proxy_without_sending() {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            ..Default::default()
+        };
+        let service = Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed");
+        let (writer, mut control_rx) = test_control_writer_rx();
+
+        // proxy_info_map is empty: the proxy is dead (reload removed it).
+        let nhc = msg::NatHoleClient {
+            transaction_id: "txn-dead".to_string(),
+            proxy_name: "user.xtcp-dead".to_string(),
+            sid: Some("sid-dead".to_string()),
+            protocol: Some("kcp".to_string()),
+            mapped_addrs: None,
+            assisted_addrs: None,
+            visitor_addr: None,
+        };
+        service
+            .handle_nat_hole_client(
+                nhc,
+                &writer,
+                false,
+                Arc::new(AtomicBool::new(true)),
+                CancellationToken::new(),
+            )
+            .await;
+
+        // Nothing may be enqueued: the guard returns before the handler can
+        // send NatHoleSid / a NatHoleReport failure. Without the guard the
+        // empty visitor_addr would produce an immediate NatHoleReport, and
+        // this recv would resolve with Some instead of timing out.
+        let silent = tokio::time::timeout(Duration::from_millis(300), control_rx.recv())
+            .await
+            .is_err();
+        assert!(
+            silent,
+            "dead-proxy NatHoleClient must not punch; a control message was enqueued"
+        );
+    }
+
+    /// F2: a NatHoleResp routed to a dead provider proxy must not spawn a
+    /// punch — the handler reclaims the sid's STUN socket and returns. The
+    /// socket refcount is the revert-proof observable: without the guard the
+    /// spawned punch task holds an Arc clone (and punches for up to 5s), so
+    /// `Arc::try_unwrap` would fail; with the guard the map was the only
+    /// other holder and the reclaim drops it.
+    #[tokio::test]
+    async fn nat_hole_resp_bails_for_dead_proxy_and_reclaims_socket() {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            ..Default::default()
+        };
+        let service = Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed");
+        let (writer, _control_rx) = test_control_writer_rx();
+
+        let socket = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                eprintln!(
+                    "UDP bind denied ({e}); asserting map reclaim without the socket-refcount check"
+                );
+                None
+            }
+        };
+
+        let sid = "sid-dead".to_string();
+        let mut pending_xtcp = HashMap::new();
+        pending_xtcp.insert(sid.clone(), "user.xtcp-dead".to_string());
+        let xtcp_sockets: Arc<Mutex<HashMap<String, Arc<tokio::net::UdpSocket>>>> =
+            Default::default();
+        if let Some(ref s) = socket {
+            xtcp_sockets.lock().await.insert(sid.clone(), s.clone());
+        }
+        let mut visitor_pending = HashMap::new();
+
+        let resp = msg::NatHoleResp {
+            transaction_id: String::new(),
+            error: None,
+            sid: Some(sid.clone()),
+            protocol: None,
+            candidate_addrs: Some(vec!["127.0.0.1:12345".to_string()]),
+            assisted_addrs: Some(Vec::new()),
+            detect_behavior: None,
+        };
+        service
+            .handle_nat_hole_resp(
+                resp,
+                &mut pending_xtcp,
+                &mut visitor_pending,
+                &xtcp_sockets,
+                &writer,
+                Arc::new(AtomicBool::new(true)),
+                CancellationToken::new(),
+            )
+            .await;
+
+        // The guard reclaimed both sid entries synchronously.
+        assert!(
+            !pending_xtcp.contains_key(&sid),
+            "dead-proxy NatHoleResp must reclaim the pending_xtcp entry"
+        );
+        assert!(
+            !xtcp_sockets.lock().await.contains_key(&sid),
+            "dead-proxy NatHoleResp must reclaim the STUN socket entry"
+        );
+        // The punch task must not exist: with the guard the map was the only
+        // other Arc holder, so the reclaim leaves our clone alone; without
+        // the guard the spawned task holds a clone for the punch duration.
+        if let Some(socket) = socket {
+            assert!(
+                Arc::try_unwrap(socket).is_ok(),
+                "dead-proxy NatHoleResp must not spawn a punch task holding the STUN socket"
+            );
+        }
     }
 }

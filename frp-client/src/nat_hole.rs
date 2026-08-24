@@ -40,6 +40,17 @@ impl Service {
         let visitor_addr = nhc.visitor_addr.unwrap_or_default();
         let proxy_name = nhc.proxy_name.clone();
         let sid = nhc.transaction_id.clone();
+        // F2 cancel-before-reinsert guard (defense in depth; the message-loop
+        // arm guards before arming the token): a reload-removed or
+        // health-closed proxy must not punch — its P2P token was cancelled at
+        // the removal/close, so spawning here would arm an uncancelled bridge
+        // that runs until the peer closes. Mirrors the visitor.rs
+        // conn_cancel.is_cancelled() early-bail pattern. Bails before the UDP
+        // bind so a dead proxy cannot even hold a socket briefly.
+        if !self.punch_proxy_still_live(&proxy_name).await {
+            debug!(proxy_name = %proxy_name, "XTCP provider '{}': proxy no longer live (reload/health close), aborting NatHoleClient", proxy_name);
+            return;
+        }
         let proxy_info = self.proxy_info_map.read().await.get(&proxy_name).map(|p| {
             (
                 p.local_addr.clone(),
@@ -331,6 +342,19 @@ impl Service {
             // NatHoleClient write failed before `pending_xtcp` was populated,
             // leaving an orphaned socket). Drop it here so an unknown sid
             // cannot leak a UDP socket + map entry.
+            xtcp_sockets.lock().await.remove(&sid);
+            return;
+        }
+        // F2 cancel-before-reinsert guard (defense in depth; the message-loop
+        // arm guards before arming the token): a reload-removed or
+        // health-closed proxy must not punch — its P2P token was cancelled at
+        // the removal/close, so spawning here would arm an uncancelled bridge
+        // that runs until the peer closes. Mirrors the visitor.rs
+        // conn_cancel.is_cancelled() early-bail pattern. `pending_xtcp` was
+        // already reclaimed above; drop the cached STUN socket so the bailed
+        // resp cannot leak it either.
+        if !self.punch_proxy_still_live(&proxy_name).await {
+            debug!(proxy_name = %proxy_name, "XTCP provider '{}': proxy no longer live (reload/health close), aborting NatHoleResp", proxy_name);
             xtcp_sockets.lock().await.remove(&sid);
             return;
         }
