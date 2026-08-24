@@ -1360,9 +1360,14 @@ fn extract_host_header(request: &str) -> Option<&str> {
             continue;
         }
         let value = line[5..].trim();
-        // Handle IPv6: [::1]:8080 → ::1, example.com:8080 → example.com
+        // Handle IPv6: [::1]:8080 → ::1 (then trailing-dot trim, as Go
+        // applies TrimSuffix after the port split in every case),
+        // example.com:8080 → example.com
         if value.starts_with('[') {
-            return value.find(']').map(|end| &value[1..end]);
+            return value.find(']').map(|end| {
+                let hostname = &value[1..end];
+                hostname.strip_suffix('.').unwrap_or(hostname)
+            });
         }
         let host = value.split(':').next().unwrap_or(value);
         // Strip exactly one trailing dot from FQDNs (Go TrimSuffix — one

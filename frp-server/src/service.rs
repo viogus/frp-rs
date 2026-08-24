@@ -393,6 +393,14 @@ impl Service {
                                     // semantics. The upgrade itself is bounded by accept_websocket's
                                     // internal HANDSHAKE_TIMEOUT.
                                     let accept_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                                    // Post-upgrade reads (V2 magic, handshake, first frame,
+                                    // V1 Login) get their own deadline: the 10s accept
+                                    // deadline covers only the WS upgrade; a client that
+                                    // upgrades then goes silent must not park the
+                                    // task/fd/permit beyond 30s (slowloris), and a slow
+                                    // pre-Login OIDC JWT fetch must not be cut off at 10s.
+                                    let post_deadline = accept_deadline
+                                        .max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT);
                                     match frp_core::transport::accept_websocket(IoStream::Tcp(stream)).await {
                                         Ok(mut ws) => {
                                             info!(addr = %addr, "WebSocket upgrade completed for {}", addr);
@@ -406,13 +414,14 @@ impl Service {
                                                 return;
                                             }
 
-                                            // Try V2 magic detection. Bounded by the same
-                                            // accept deadline as the handshakes above: a client
-                                            // that completes the WS upgrade then goes silent must
-                                            // not park the task/fd/permit forever (Go frp
-                                            // connReadTimeout=10s covers this post-upgrade read).
+                                            // Try V2 magic detection. Bounded by the 30s
+                                            // post-handshake deadline: a client that completes
+                                            // the WS upgrade then goes silent must not park the
+                                            // task/fd/permit forever (Go frp connReadTimeout=10s
+                                            // covers only the accept phase, not a slow pre-Login
+                                            // OIDC token fetch).
                                             let mut magic = [0u8; 7];
-                                            let is_v2 = match tokio::time::timeout_at(accept_deadline, ws.read_exact(&mut magic)).await {
+                                            let is_v2 = match tokio::time::timeout_at(post_deadline, ws.read_exact(&mut magic)).await {
                                                 Ok(Ok(_)) => crate::handlers::is_v2_magic(&magic),
                                                 Ok(Err(_)) => false,
                                                 Err(_elapsed) => {
@@ -471,7 +480,7 @@ impl Service {
                                                                 // must not park the task and conn_semaphore permit
                                                                 // indefinitely (slowloris).
                                                                 let mut magic = [0u8; 7];
-                                                                let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut magic)).await {
+                                                                let is_v2 = match tokio::time::timeout_at(post_deadline, io.read_exact(&mut magic)).await {
                                                                     Ok(Ok(_)) => crate::handlers::is_v2_magic(&magic),
                                                                     Ok(Err(_)) => false,
                                                                     Err(_elapsed) => {
@@ -480,7 +489,7 @@ impl Service {
                                                                     }
                                                                 };
                                                                 if is_v2 {
-                                                                    let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(addr), accept_deadline, "WS+TLS+yamux V2").await {
+                                                                    let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(addr), post_deadline, "WS+TLS+yamux V2").await {
                                                                         Some(v) => v,
                                                                         None => return,
                                                                     };
@@ -490,7 +499,7 @@ impl Service {
                                                                     let io = frp_core::transport::IoStream::BufferedRead(
                                                                         magic.to_vec(), 0, Box::new(io),
                                                                     );
-                                                                    crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None, accept_deadline).await;
+                                                                    crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None, post_deadline).await;
                                                                 }
                                                             }
                                                             Err(e) => {
@@ -505,7 +514,7 @@ impl Service {
                                                         // that completes WS+TLS then sends nothing must not
                                                         // park the task and conn_semaphore permit indefinitely
                                                         // (slowloris).
-                                                        let is_tls_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut chicken)).await {
+                                                        let is_tls_v2 = match tokio::time::timeout_at(post_deadline, io.read_exact(&mut chicken)).await {
                                                             Ok(Ok(_)) => crate::handlers::is_v2_magic(&chicken),
                                                             Ok(Err(_)) => false,
                                                             Err(_elapsed) => {
@@ -514,7 +523,7 @@ impl Service {
                                                             }
                                                         };
                                                         if is_tls_v2 {
-                                                            let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(addr), accept_deadline, "WS+TLS+V2").await {
+                                                            let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(addr), post_deadline, "WS+TLS+V2").await {
                                                                 Some(v) => v,
                                                                 None => return,
                                                             };
@@ -523,7 +532,7 @@ impl Service {
                                                             let io = frp_core::transport::IoStream::BufferedRead(
                                                                 chicken.to_vec(), 0, Box::new(io),
                                                             );
-                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None, accept_deadline).await;
+                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None, post_deadline).await;
                                                         }
                                                     }
                                                 }
@@ -554,7 +563,7 @@ impl Service {
                                                         // must not park the task and conn_semaphore permit
                                                         // indefinitely (slowloris).
                                                         let mut mux_magic = [0u8; 7];
-                                                        let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut mux_magic)).await {
+                                                        let is_v2 = match tokio::time::timeout_at(post_deadline, io.read_exact(&mut mux_magic)).await {
                                                             Ok(Ok(_)) => crate::handlers::is_v2_magic(&mux_magic),
                                                             Ok(Err(_)) => false,
                                                             Err(_elapsed) => {
@@ -563,7 +572,7 @@ impl Service {
                                                             }
                                                         };
                                                         if is_v2 {
-                                                            let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(addr), accept_deadline, "WS+yamux V2").await {
+                                                            let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(addr), post_deadline, "WS+yamux V2").await {
                                                                 Some(v) => v,
                                                                 None => return,
                                                             };
@@ -573,7 +582,7 @@ impl Service {
                                                             let io = IoStream::BufferedRead(
                                                                 mux_magic.to_vec(), 0, Box::new(io),
                                                             );
-                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None, accept_deadline).await;
+                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None, post_deadline).await;
                                                         }
                                                     }
                                                     Err(e) => {
@@ -582,7 +591,7 @@ impl Service {
                                                 }
                                             } else if is_v2 {
                                                 // V2 path: ClientHello/ServerHello handshake
-                                                let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut ws, Some(addr), accept_deadline, "WS V2").await {
+                                                let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut ws, Some(addr), post_deadline, "WS V2").await {
                                                     Some(v) => v,
                                                     None => return,
                                                 };
@@ -590,7 +599,7 @@ impl Service {
                                             } else {
                                                 // V1 fallback: replay consumed 7 bytes
                                                 let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
-                                                crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None, accept_deadline).await;
+                                                crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None, post_deadline).await;
                                             }
                                         }
                                         Err(e) => {
@@ -778,6 +787,13 @@ impl Service {
                                             // would otherwise park the task and conn_semaphore
                                             // permit indefinitely (slowloris).
                                             let accept_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                                            // Post-handshake reads (V2 handshake, first frame,
+                                            // V1 Login) get their own deadline: the 10s accept
+                                            // deadline covers only magic detection + yamux/TLS
+                                            // handshakes; a slow pre-Login OIDC JWT fetch must
+                                            // not be cut off at 10s, nor left unbounded.
+                                            let post_deadline = accept_deadline
+                                                .max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT);
                                             let peer = stream.peer_addr;
                                     let conv = stream.conv();
                                     tracing::debug!(peer = %peer, conv = conv, "KCP HANDLER: spawned");
@@ -905,7 +921,7 @@ impl Service {
                                                             // must not park the task and conn_semaphore permit
                                                             // indefinitely (slowloris).
                                                             let mut yamux_magic = [0u8; 7];
-                                                            let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut yamux_magic)).await {
+                                                            let is_v2 = match tokio::time::timeout_at(post_deadline, io.read_exact(&mut yamux_magic)).await {
                                                                 Ok(Ok(_)) => crate::handlers::is_v2_magic(&yamux_magic),
                                                                 Ok(Err(_)) => false,
                                                                 Err(_elapsed) => {
@@ -937,27 +953,32 @@ impl Service {
                                                                 crate::handlers::dispatch_v2_message(io, msg_payload, state, peer, Some(incoming), None, crypto_ctx).await;
                                                             } else {
                                                                 let mut io = frp_core::transport::IoStream::BufferedRead(yamux_magic.to_vec(), 0, Box::new(io));
-                                                                match frp_core::protocol::read_msg_v1(&mut io).await {
-                                                                    Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                                                match tokio::time::timeout_at(post_deadline, frp_core::protocol::read_msg_v1(&mut io)).await {
+                                                                    Ok(Ok(frp_core::msg::FrpMessage::Login(login))) => {
                                                                         tracing::info!(peer = %peer, "KCP TLS+yamux Login from {}", peer);
                                                                         control::handle_control(io, *login, state, Some(peer), Some(incoming), false, None, false).await;
                                                                     }
-                                                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                                    Ok(Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc))) => {
                                                                         tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS+yamux NewWorkConn from {}", peer);
                                                                         crate::handlers::handle_work_conn_inner(io, nwc, state, false).await;
                                                                     }
-                                                                    Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                                    Ok(Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc))) => {
                                                                         tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS+yamux NewVisitorConn from {}", peer);
                                                                         crate::handlers::handle_visitor_conn_inner(io, nvc, state, false, Some(peer)).await;
                                                                     }
-                                                                    Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                    Ok(Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv))) => {
                                                                         tracing::info!(peer = %peer, "KCP TLS+yamux NatHoleVisitor from {}", peer);
                                                                         crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
                                                                     }
-                                                                    Ok(other) => {
+                                                                    Ok(Ok(other)) => {
                                                                         tracing::warn!(peer = %peer, other = ?other.v1_type_byte(), "Unexpected KCP TLS+yamux message: {:?}", other.v1_type_byte());
                                                                     }
-                                                                    Err(e) => {
+                                                                    Err(_elapsed) => {
+                                                                        // No `return`: the io drops at block end (closing the slow peer's
+                                                                        // connection); the accept loop must keep accepting other peers.
+                                                                        tracing::warn!(peer = %peer, "KCP: timed out waiting for first V1 message (post-handshake deadline 30s) from {}", peer);
+                                                                        }
+                                                                    Ok(Err(e)) => {
                                                                         tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux read error: {}", e);
                                                                     }
                                                                 }
@@ -979,7 +1000,7 @@ impl Service {
                                                 // must not park the task and conn_semaphore permit
                                                 // indefinitely (slowloris).
                                                 let mut tls_magic = [0u8; 7];
-                                                let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), ctl.read_exact(&mut tls_magic)).await {
+                                                let is_v2 = match tokio::time::timeout_at(post_deadline, ctl.read_exact(&mut tls_magic)).await {
                                                     Ok(Ok(_)) => crate::handlers::is_v2_magic(&tls_magic),
                                                     Ok(Err(_)) => false,
                                                     Err(_elapsed) => {
@@ -1070,27 +1091,32 @@ impl Service {
                                                             let mut ctl = frp_core::transport::IoStream::BufferedRead(
                                                                 scan_data[off..].to_vec(), 0, Box::new(ctl),
                                                             );
-                                                            match frp_core::protocol::read_msg_v1(&mut ctl).await {
-                                                                Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                                            match tokio::time::timeout_at(post_deadline, frp_core::protocol::read_msg_v1(&mut ctl)).await {
+                                                                Ok(Ok(frp_core::msg::FrpMessage::Login(login))) => {
                                                                     tracing::info!(peer = %peer, "KCP TLS Login from {}", peer);
                                                                     control::handle_control(ctl, *login, state, Some(peer), None, false, None, false).await;
                                                                 }
-                                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                                Ok(Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc))) => {
                                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS NewWorkConn from {}", peer);
                                                                     crate::handlers::handle_work_conn_inner(ctl, nwc, state, false).await;
                                                                 }
-                                                                Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                                Ok(Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc))) => {
                                                                     tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS NewVisitorConn from {}", peer);
                                                                     crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false, Some(peer)).await;
                                                                 }
-                                                                Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                Ok(Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv))) => {
                                                                     tracing::info!(peer = %peer, "KCP TLS NatHoleVisitor from {}", peer);
                                                                     crate::handlers::handle_nat_hole_visitor(ctl, nhv, state, None, false).await;
                                                                 }
-                                                                Ok(other) => {
+                                                                Ok(Ok(other)) => {
                                                                     tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP TLS message: {:?}", other.v1_type_byte());
                                                                 }
-                                                                Err(e) => {
+                                                                Err(_elapsed) => {
+                                                                    // No `return`: the io drops at block end (closing the slow peer's
+                                                                    // connection); the accept loop must keep accepting other peers.
+                                                                    tracing::warn!(peer = %peer, "KCP: timed out waiting for first V1 message (post-handshake deadline 30s) from {}", peer);
+                                                                    }
+                                                                Ok(Err(e)) => {
                                                                     tracing::warn!(error = %e, "KCP TLS read error: {}", e);
                                                                 }
                                                             }
@@ -1138,7 +1164,7 @@ impl Service {
                                                     // must not park the task and conn_semaphore permit
                                                     // indefinitely (slowloris).
                                                     let mut yamux_magic = [0u8; 7];
-                                                    let is_v2 = match tokio::time::timeout_at(accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT), io.read_exact(&mut yamux_magic)).await {
+                                                    let is_v2 = match tokio::time::timeout_at(post_deadline, io.read_exact(&mut yamux_magic)).await {
                                                         Ok(Ok(_)) => crate::handlers::is_v2_magic(&yamux_magic),
                                                         Ok(Err(_)) => false,
                                                         Err(_elapsed) => {
@@ -1171,27 +1197,32 @@ impl Service {
                                                     } else {
                                                         // V1 on yamux: replay consumed bytes, read Login/NewWorkConn
                                                         let mut io = frp_core::transport::IoStream::BufferedRead(yamux_magic.to_vec(), 0, Box::new(io));
-                                                        match frp_core::protocol::read_msg_v1(&mut io).await {
-                                                            Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                                        match tokio::time::timeout_at(post_deadline, frp_core::protocol::read_msg_v1(&mut io)).await {
+                                                            Ok(Ok(frp_core::msg::FrpMessage::Login(login))) => {
                                                                 tracing::info!(peer = %peer, "KCP yamux Login from {}", peer);
                                                                 control::handle_control(io, *login, state, Some(peer), Some(incoming), false, None, false).await;
                                                             }
-                                                            Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                            Ok(Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc))) => {
                                                                 tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP yamux NewWorkConn from {}", peer);
                                                                 crate::handlers::handle_work_conn_inner(io, nwc, state, false).await;
                                                             }
-                                                            Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                            Ok(Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc))) => {
                                                                 tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP yamux NewVisitorConn from {}", peer);
                                                                 crate::handlers::handle_visitor_conn_inner(io, nvc, state, false, Some(peer)).await;
                                                             }
-                                                            Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                            Ok(Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv))) => {
                                                                 tracing::info!(peer = %peer, "KCP yamux NatHoleVisitor from {}", peer);
                                                                 crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
                                                             }
-                                                            Ok(other) => {
+                                                            Ok(Ok(other)) => {
                                                                 tracing::warn!(peer = %peer, other = ?other.v1_type_byte(), "Unexpected KCP yamux message: {:?}", other.v1_type_byte());
                                                             }
-                                                            Err(e) => {
+                                                            Err(_elapsed) => {
+                                                                // No `return`: the io drops at block end (closing the slow peer's
+                                                                // connection); the accept loop must keep accepting other peers.
+                                                                tracing::warn!(peer = %peer, "KCP: timed out waiting for first V1 message (post-handshake deadline 30s) from {}", peer);
+                                                                }
+                                                            Ok(Err(e)) => {
                                                                 tracing::warn!(peer = %peer, error = %e, "KCP yamux read error: {}", e);
                                                             }
                                                         }
@@ -1204,27 +1235,32 @@ impl Service {
                                         } else {
                                             // No tcp_mux: replay consumed 7 bytes, read V1 frame directly
                                             let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
-                                            match frp_core::protocol::read_msg_v1(&mut ctl).await {
-                                                Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                            match tokio::time::timeout_at(post_deadline, frp_core::protocol::read_msg_v1(&mut ctl)).await {
+                                                Ok(Ok(frp_core::msg::FrpMessage::Login(login))) => {
                                                                     tracing::info!(peer = %peer, "KCP Login from {}", peer);
                                                                     control::handle_control(ctl, *login, state, Some(peer), None, false, None, false).await;
                                                 }
-                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                Ok(Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc))) => {
                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP NewWorkConn from {}", peer);
                                                     crate::handlers::handle_work_conn_inner(ctl, nwc, state, false).await;
                                                 }
-                                                Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                Ok(Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc))) => {
                                                     tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP NewVisitorConn from {}", peer);
                                                     crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false, Some(peer)).await;
                                                 }
-                                                Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                Ok(Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv))) => {
                                                     tracing::info!(peer = %peer, "KCP NatHoleVisitor from {}", peer);
                                                     crate::handlers::handle_nat_hole_visitor(ctl, nhv, state, None, false).await;
                                                 }
-                                                Ok(other) => {
+                                                Ok(Ok(other)) => {
                                                     tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP message: {:?}", other.v1_type_byte());
                                                 }
-                                                Err(e) => {
+                                                Err(_elapsed) => {
+                                                    // No `return`: the io drops at block end (closing the slow peer's
+                                                    // connection); the accept loop must keep accepting other peers.
+                                                    tracing::warn!(peer = %peer, "KCP: timed out waiting for first V1 message (post-handshake deadline 30s) from {}", peer);
+                                                    }
+                                                Ok(Err(e)) => {
                                                     tracing::warn!(error = %e, "KCP read error: {}", e);
                                                 }
                                             }

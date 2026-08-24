@@ -75,8 +75,8 @@ async fn start_server(cfg: ServerConfig) {
 /// the tests set tcp_mux_keepalive_interval = 1s so the client-visible
 /// close follows the deadline within ~1s. The 45s per-read window covers
 /// both bounds; without the deadline fix the close never comes (keepalive
-/// dead-time is ~90s, or never for a peer that keeps the yamux link
-/// alive).
+/// dead-time is ~90s, or never for a peer that keeps the yamux link alive
+/// — the ponging test below pins that case).
 async fn expect_silent_disconnect<R>(sock: &mut R, what: &str)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -178,6 +178,101 @@ async fn yamux_client_silent_after_stream_open_dropped_at_post_handshake_deadlin
         .expect("write yamux stream-open frame");
 
     expect_silent_disconnect(&mut sock, "post-yamux client").await;
+}
+
+/// The yamux handshake completes, and the client then answers every
+/// keepalive ping with a pong — keeping the yamux driver (and its dead-time
+/// kill) alive. Only the post-yamux V2-magic read deadline can release the
+/// handler. Before the fix, a ponging peer held the task and its
+/// conn_semaphore permit indefinitely: the keepalive dead-time only fires
+/// for a link that goes quiet, and a peer that keeps ponging never does.
+/// (The silent test above cannot prove the deadline fires — with
+/// keepalive=1s the driver dead-time is also ~30s, indistinguishable from
+/// POST_HANDSHAKE_READ_TIMEOUT.)
+#[tokio::test]
+async fn yamux_ponging_client_still_dropped_at_post_handshake_deadline() {
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        // 1s driver keepalive: shortens the dead-time that this test must
+        // NOT rely on — the pongs keep the link alive regardless.
+        transport: frp_core::config::ServerTransportConfig {
+            tcp_mux_keepalive_interval: 1,
+            ..Default::default()
+        },
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    start_server(cfg).await;
+
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", bind_port))
+        .await
+        .expect("dial server");
+    use tokio::io::AsyncWriteExt;
+    sock.write_all(&YAMUX_STREAM_OPEN_FRAME)
+        .await
+        .expect("write yamux stream-open frame");
+
+    // Read frames and pong every ping (tag 4, no ACK, stream 0) until the
+    // server closes. A pong is the same frame with the ACK flag (0x2) set
+    // and the payload (ping id) echoed. Frame header:
+    // [version 1][tag 1][flags 2][stream_id 4][length 4] = 12 bytes.
+    let start = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut buf = [0u8; 512];
+    let mut pongs = 0usize;
+    loop {
+        match tokio::time::timeout_at(deadline, sock.read(&mut buf)).await {
+            Err(_) => panic!("server did not close the ponging client within 45s"),
+            Ok(Ok(0)) | Ok(Err(_)) => break, // EOF / abrupt close — dropped
+            Ok(Ok(n)) => {
+                let mut off = 0;
+                while off + 12 <= n {
+                    let tag = buf[off + 1];
+                    let flags = u16::from_be_bytes([buf[off + 2], buf[off + 3]]);
+                    let stream = u32::from_be_bytes([
+                        buf[off + 4],
+                        buf[off + 5],
+                        buf[off + 6],
+                        buf[off + 7],
+                    ]);
+                    let len = u32::from_be_bytes([
+                        buf[off + 8],
+                        buf[off + 9],
+                        buf[off + 10],
+                        buf[off + 11],
+                    ]) as usize;
+                    let total = 12 + len;
+                    if total > n - off {
+                        break; // truncated frame — wait for more
+                    }
+                    if buf[off] == 0 && tag == 4 && flags & 0x2 == 0 && stream == 0 {
+                        // Ping → pong (ACK echo).
+                        let mut pong = [0u8; 16];
+                        pong[1] = 4;
+                        pong[3] = 0x2; // ACK flag
+                        pong[8..12].copy_from_slice(&buf[off + 8..off + 12]); // same length
+                        pong[12..total].copy_from_slice(&buf[off + 12..off + total]); // echo id
+                        sock.write_all(&pong[..total]).await.expect("write pong");
+                        pongs += 1;
+                    }
+                    off += total;
+                }
+            }
+        }
+    }
+    // Sanity: the driver must have pinged (hardcoded ~10s RTT interval, so
+    // several within the 45s window) — otherwise the test proves nothing.
+    assert!(pongs >= 1, "server never pinged; the test is vacuous");
+    let elapsed = start.elapsed();
+    // Dropped at the ~30s deadline (plus the ~1s keepalive tick before the
+    // driver closes the socket), never before.
+    assert!(
+        elapsed >= Duration::from_secs(20),
+        "ponging client dropped too early after {elapsed:?}; must wait the post-handshake deadline"
+    );
+    eprintln!("server dropped ponging client after {elapsed:?} ({pongs} pongs answered)");
 }
 
 /// TLS handshake completes and the yamux stream opens (tcp_mux on),

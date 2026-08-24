@@ -616,56 +616,29 @@ fn validate_new_proxy(np: &msg::NewProxy, sub_domain_host: &str) -> Result<(), S
     }
     if let Some(ref domains) = np.custom_domains {
         for domain in domains {
-            if domain.len() > 253 {
+            // Go frp validateDomainConfigForServer performs NO character or
+            // structure validation on customDomains (any string registers as
+            // a vhost key; only routing decides reachability). frp-rs keeps
+            // exactly the rejections that are unsafe in the vhost key space:
+            // control characters (CR/LF header injection — Go's http router
+            // rejects these at request time, frp-rs rejects at register time)
+            // and empty entries.
+            if domain.is_empty() || domain.chars().any(|c| c.is_control() || c.is_whitespace()) {
                 return Err(format!(
-                    "custom_domain '{}' exceeds 253 characters (RFC 1035 FQDN limit)",
-                    domain
-                ));
-            }
-            // Character whitelist + structure: only DNS-ish names are
-            // routable vhost keys. Go frp permits a wildcard as the leading
-            // label ("*.example.com") or the bare catch-all ("*") in
-            // customDomains — routing (getByRoute) replaces the leftmost
-            // label with "*" and walks, so those are routable. A "*" in any
-            // other position can never match a route in Go, so it stays
-            // rejected (dead config must not register). Whitespace, CR/LF,
-            // and empty labels are rejected as before.
-            let wildcard_ok = domain == "*"
-                || domain
-                    .strip_prefix("*.")
-                    .is_some_and(|rest| !rest.contains('*'));
-            if domain.is_empty()
-                || !domain.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == '*'
-                })
-                || domain.starts_with('.')
-                || domain.ends_with('.')
-                || domain.contains("..")
-                || (domain.contains('*') && !wildcard_ok)
-                || domain.chars().any(|c| c.is_control() || c.is_whitespace())
-            {
-                return Err(format!(
-                    "custom_domain '{}' contains invalid characters or structure (letters, digits, '.', '-', '_' only; '*' allowed only as the leading label, e.g. '*.example.com')",
+                    "custom_domain '{}' is empty or contains control/whitespace characters",
                     domain
                 ));
             }
         }
     }
     if let Some(ref subdomain) = np.subdomain {
-        // Single DNS label: letters/digits/'-', no '.', not starting/ending
-        // with '-'. Without this, a subdomain containing '.' could register
-        // arbitrary-depth names under the vhost root (Go frp applies the same
-        // RFC 1123 label rules).
-        let valid = !subdomain.is_empty()
-            && subdomain.len() <= 63
-            && subdomain
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
-            && !subdomain.starts_with('-')
-            && !subdomain.ends_with('-');
-        if !valid {
+        // Go frp validateDomainConfigForServer rejects a subdomain only when
+        // it contains '.' (label separator — a subdomain must be a single
+        // label under the vhost root) or '*' (wildcard). Underscores, length,
+        // and leading/trailing '-' are accepted (Go parity, not RFC 1123).
+        if subdomain.contains('.') || subdomain.contains('*') {
             return Err(format!(
-                "subdomain '{}' is not a valid RFC 1123 DNS label (letters, digits, '-'; no leading/trailing '-' or '.')",
+                "invalid subdomain '{}' (Go frp parity: '.' and '*' are the only rejected characters)",
                 subdomain
             ));
         }
@@ -715,12 +688,27 @@ async fn register_http_vhost(
     if let Some(ref subdomain) = np.subdomain {
         if !subdomain.is_empty() {
             let sub_host = &state.sub_domain_host;
-            if !sub_host.is_empty() {
-                let full_domain = format!("{}.{}", subdomain, sub_host);
-                info!(full_domain = %full_domain, proxy_name = %np.proxy_name, "Subdomain route: {} → {}", full_domain, np.proxy_name);
-                if !domains.contains(&full_domain) {
-                    domains.push(full_domain);
-                }
+            if sub_host.is_empty() {
+                // Go frp validateDomainConfigForServer rejects a subdomain
+                // when SubDomainHost is unset (HTTP/HTTPS/tcpmux all route
+                // through it) — mirror the tcpmux accept/reject decision
+                // instead of silently dropping the route.
+                rollback_vhost_conflict(state, run_id, port, false).await;
+                reject_new_proxy(
+                    writer,
+                    &np.proxy_name,
+                    "subdomain is not supported because this feature is not enabled in server"
+                        .into(),
+                    v2,
+                )
+                .await;
+                state.proxy_manager.remove(&np.proxy_name).await;
+                return false;
+            }
+            let full_domain = format!("{}.{}", subdomain, sub_host);
+            info!(full_domain = %full_domain, proxy_name = %np.proxy_name, "Subdomain route: {} → {}", full_domain, np.proxy_name);
+            if !domains.contains(&full_domain) {
+                domains.push(full_domain);
             }
         }
     }
@@ -902,15 +890,29 @@ async fn register_https_vhost(
 ) -> bool {
     let mut domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
 
-    // Subdomain routing
+    // Subdomain routing: {subdomain}.{sub_domain_host}
     if let Some(ref subdomain) = np.subdomain {
         if !subdomain.is_empty() {
             let sub_host = &state.sub_domain_host;
-            if !sub_host.is_empty() {
-                let full_domain = format!("{}.{}", subdomain, sub_host);
-                if !domains.contains(&full_domain) {
-                    domains.push(full_domain);
-                }
+            if sub_host.is_empty() {
+                // Go frp validateDomainConfigForServer rejects a subdomain
+                // when SubDomainHost is unset — mirror the HTTP/tcpmux
+                // accept/reject decision instead of silently dropping it.
+                rollback_vhost_conflict(state, run_id, port, false).await;
+                reject_new_proxy(
+                    writer,
+                    &np.proxy_name,
+                    "subdomain is not supported because this feature is not enabled in server"
+                        .into(),
+                    v2,
+                )
+                .await;
+                state.proxy_manager.remove(&np.proxy_name).await;
+                return false;
+            }
+            let full_domain = format!("{}.{}", subdomain, sub_host);
+            if !domains.contains(&full_domain) {
+                domains.push(full_domain);
             }
         }
     }
@@ -4543,9 +4545,18 @@ mod subdomain_conflict_tests {
 
     #[test]
     fn subdomain_field_still_validated() {
+        // Go frp parity (validateDomainConfigForServer): a subdomain is
+        // rejected only for '.' (label separator) or '*' (wildcard).
         let np = np_with_domains(vec![], Some("bad.subdomain"));
         let err = validate_new_proxy(&np, "example.com").unwrap_err();
-        assert!(err.contains("not a valid RFC 1123"), "got: {err}");
+        assert!(err.contains("invalid subdomain"), "got: {err}");
+        // Underscores, length, leading/trailing '-' are accepted (not
+        // RFC 1123 — Go parity).
+        let np = np_with_domains(vec![], Some("good_sub-domain-"));
+        assert!(
+            validate_new_proxy(&np, "example.com").is_ok(),
+            "underscore/length-tolerant subdomain must register (Go parity)"
+        );
     }
 
     // Go frp v0.71.0: customDomains may carry a wildcard as the leading
@@ -4566,11 +4577,17 @@ mod subdomain_conflict_tests {
     }
 
     #[test]
-    fn wildcard_in_nonleading_position_rejected() {
+    fn wildcard_in_nonleading_position_accepted() {
+        // Go frp v0.71.0 performs NO character or structure validation on
+        // customDomains — any string registers as a vhost key (routing
+        // decides reachability). A "*" in a non-leading position can never
+        // match a route in Go, but is accepted at register time (Go parity).
         for domain in ["a.*.com", "*.*.com", "exa*mple.com"] {
             let np = np_with_domains(vec![domain], None);
-            let err = validate_new_proxy(&np, "").unwrap_err();
-            assert!(err.contains("invalid"), "domain '{domain}' got: {err}");
+            assert!(
+                validate_new_proxy(&np, "").is_ok(),
+                "domain '{domain}' must be accepted at register time (Go parity)"
+            );
         }
     }
 

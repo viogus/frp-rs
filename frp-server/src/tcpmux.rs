@@ -24,6 +24,11 @@ pub struct TcpMuxManager {
     routes: RwLock<HashMap<String, TcpMuxRoute>>,
     /// proxy_name → domains (for unregister)
     by_proxy: RwLock<HashMap<String, Vec<String>>>,
+    /// Live count of registered `*.` wildcard routes. Lets `lookup` skip the
+    /// label-walk (each iteration allocates a joined host) entirely when no
+    /// wildcard route exists — the common case, where `example.com` lookups
+    /// never matched anything but the exact map hit anyway.
+    wildcard_count: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for TcpMuxManager {
@@ -37,6 +42,7 @@ impl TcpMuxManager {
         Self {
             routes: RwLock::new(HashMap::new()),
             by_proxy: RwLock::new(HashMap::new()),
+            wildcard_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -89,7 +95,12 @@ impl TcpMuxManager {
 
         let mut domains_for_proxy = Vec::new();
         for domain in &domains {
-            routes.insert(domain.clone(), route.clone());
+            // insert returns the overwritten route: a re-registration of the
+            // same domain by the same proxy must not double-count the wildcard.
+            if routes.insert(domain.clone(), route.clone()).is_none() && domain.starts_with("*.") {
+                self.wildcard_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             domains_for_proxy.push(domain.clone());
         }
         if !domains_for_proxy.is_empty() {
@@ -114,6 +125,13 @@ impl TcpMuxManager {
                     .get(domain)
                     .is_some_and(|r| r.proxy_name == proxy_name)
                 {
+                    // Same guard as the removal: only count down routes this
+                    // proxy actually owned (a sibling's `*.` route pointing at
+                    // the same domain must keep its count).
+                    if domain.starts_with("*.") {
+                        self.wildcard_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     routes.remove(domain);
                 }
             }
@@ -150,15 +168,23 @@ impl TcpMuxManager {
         }
         // 2. Replace the leftmost label with "*" progressively. Only for
         //    hosts with >=3 labels (Go's `for len(hostSplit) >= 3` —
-        //    prevents `*.com` from matching `example.com`).
-        let mut parts: Vec<&str> = host_key.split('.').collect();
-        while parts.len() > 2 {
-            parts[0] = "*";
-            let wildcard_host = parts.join(".");
-            if let Some(route) = routes.get(&wildcard_host) {
-                return Some(route.clone());
+        //    prevents `*.com` from matching `example.com`). Each iteration
+        //    allocates a joined host string, so skip the walk entirely when
+        //    no `*.` route is registered (the common case).
+        if self
+            .wildcard_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            let mut parts: Vec<&str> = host_key.split('.').collect();
+            while parts.len() > 2 {
+                parts[0] = "*";
+                let wildcard_host = parts.join(".");
+                if let Some(route) = routes.get(&wildcard_host) {
+                    return Some(route.clone());
+                }
+                parts.remove(0);
             }
-            parts.remove(0);
         }
         // 3. Catch-all "*"
         routes.get("*").cloned()
@@ -259,10 +285,10 @@ pub async fn run_tcpmux_listener(
                 return;
             }
 
-            // Extract Host header; when absent, fall back to the
-            // request-line authority (CONNECT target) — Go net/http fills
-            // req.Host from req.URL.Host, so Go routes Host-less CONNECTs
-            // (see `extract_route_host`). 400 only when both are absent.
+            // Route on the request-line authority (CONNECT target) — Go
+            // net/http fills req.Host from req.URL.Host and ignores the
+            // Host header for CONNECT (RFC 7230 §5.3; see
+            // `extract_route_host`). 400 only when both are absent.
             let host = match extract_route_host(&request_text) {
                 Some(h) => h.to_string(),
                 None => {
@@ -471,31 +497,26 @@ fn extract_host_header(request: &str) -> Option<&str> {
     None
 }
 
-/// Extract the routing host from a CONNECT request: the Host header, or —
-/// when absent — the request-line authority (CONNECT target). RFC 7230
-/// §5.4 requires Host in HTTP/1.1, but Go tolerates the absence: net/http
-/// ReadRequest fills `req.Host` from `req.URL.Host`, and Go's tcpmux
-/// routes on `CanonicalHost(req.Host)`. The target goes through the same
-/// canonicalization (port-strip, bracketed IPv6, trailing-dot trim).
-/// Returns None only when neither is present (caller replies 400).
-///
-/// Go net/http ReadRequest sets `req.Host` from the Host header and falls
-/// back to `req.URL.Host` (request-line authority) only when the header is
-/// absent — Host-header-first, exactly what this function does.
+/// Extract the routing host from a CONNECT request: the request-line
+/// authority (CONNECT target) when present, else the Host header. Go
+/// net/http ReadRequest sets `req.Host = req.URL.Host` and falls back to
+/// the Host header only when the URL carries no host (RFC 7230 §5.3 —
+/// "in the second case, any Host header is ignored"); for CONNECT the
+/// authority is always present, so the header is effectively ignored.
+/// The target goes through the same canonicalization (port-strip,
+/// bracketed IPv6, trailing-dot trim). Returns None only when neither is
+/// present (caller replies 400).
 fn extract_route_host(request: &str) -> Option<&str> {
-    if let Some(host) = extract_host_header(request) {
-        return Some(host);
-    }
     let first_line = request.lines().next()?;
     let target = first_line.split_whitespace().nth(1).unwrap_or("");
-    // The only other second token a request line can carry is the HTTP
-    // version — "CONNECT HTTP/1.1" has no authority and must not route on
-    // the version string (Go's ReadRequest rejects the line outright).
-    if target.is_empty() || target.starts_with("HTTP/") {
-        None
-    } else {
-        Some(canonicalize_host(target))
+    // Path-form targets ("GET /path") carry no URL host in Go — fall back
+    // to the header (the caller rejects non-CONNECT upstream anyway). A
+    // bare-version line ("CONNECT HTTP/1.1") has no authority either and
+    // must not route on the version string.
+    if !target.is_empty() && !target.starts_with("HTTP/") && !target.starts_with('/') {
+        return Some(canonicalize_host(target));
     }
+    extract_host_header(request)
 }
 
 /// Extract Proxy-Authorization Basic credentials.
@@ -551,15 +572,17 @@ mod tests {
         // No Host header: extraction itself returns None...
         let req = "CONNECT example.com:443 HTTP/1.1\r\n\r\n";
         assert_eq!(extract_host_header(req), None);
-        // ...but the routing host falls back to the request-line authority
+        // ...but the routing host comes from the request-line authority
         // (Go net/http ReadRequest fills req.Host from req.URL.Host, so Go
         // routes Host-less CONNECTs), through the same canonicalization.
         assert_eq!(extract_route_host(req), Some("example.com"));
     }
 
     #[test]
-    fn test_extract_route_host_falls_back_to_target() {
-        // Authority fallback: port-strip, bracketed IPv6, trailing-dot trim.
+    fn test_extract_route_host_authority_wins() {
+        // CONNECT authority precedence (Go net/http ReadRequest fills
+        // req.Host from req.URL.Host — RFC 7230 §5.3 "any Host header is
+        // ignored"): port-strip, bracketed IPv6, trailing-dot trim.
         assert_eq!(
             extract_route_host("CONNECT example.com.:443 HTTP/1.1\r\n\r\n"),
             Some("example.com")
@@ -568,19 +591,20 @@ mod tests {
             extract_route_host("CONNECT [::1]:443 HTTP/1.1\r\n\r\n"),
             Some("::1")
         );
-        // Host header still wins when both are present (deliberate
-        // header-first contract — Go gives the authority precedence, but
-        // clients send matching values, and the compat suite pins this).
+        // A conflicting Host header is ignored — the authority routes.
         let req = "CONNECT example.com:443 HTTP/1.1\r\nHost: other.net\r\n\r\n";
-        assert_eq!(extract_route_host(req), Some("other.net"));
+        assert_eq!(extract_route_host(req), Some("example.com"));
+        // Path-form requests (rejected 405 upstream) carry no URL host in
+        // Go — the header fallback applies.
+        let req = "GET /path HTTP/1.1\r\nHost: foo.bar\r\n\r\n";
+        assert_eq!(extract_route_host(req), Some("foo.bar"));
     }
 
     #[test]
     fn test_extract_route_host_missing_both() {
         // Neither a Host header nor a request-line target: 400 stays. The
         // "CONNECT HTTP/1.1" line has no authority either — the second
-        // token is the HTTP version, which must not be routed on (Go's
-        // ReadRequest rejects the line outright).
+        // token is the HTTP version, which must not be routed on.
         let req = "CONNECT HTTP/1.1\r\n\r\n";
         assert_eq!(extract_route_host(req), None);
         assert_eq!(extract_route_host(""), None);

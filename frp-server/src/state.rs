@@ -701,6 +701,20 @@ impl ReplayTable {
     ///   run_id is evicted to admit the new one (F3) — the evicted entry
     ///   loses dedup coverage only.
     pub fn record(&mut self, ts: i64, run_id: &str) -> ReplayCheck {
+        // Duplicate check FIRST: a duplicate login must never evict other
+        // entries to make room for itself — that would discard innocent
+        // run_ids' dedup coverage, and under the global cap would let an
+        // attacker replaying one (ts, run_id) pair repeatedly evict fresh
+        // keys, shrinking the replay window.
+        if let Some(entry) = self.map.get(&ts) {
+            if entry.iter().any(|r| r == run_id) {
+                return if ts < MS_EPOCH {
+                    ReplayCheck::DuplicateSecondsPrecision
+                } else {
+                    ReplayCheck::Replay
+                };
+            }
+        }
         // Global cap: evict whole oldest keys until there is room. The
         // caller prunes first, so the oldest remaining keys are the
         // freshest possible eviction targets.
@@ -711,16 +725,6 @@ impl ReplayTable {
             self.total -= self.map.remove(&oldest_ts).map_or(0, |v| v.len());
         }
         let entry = self.map.entry(ts).or_default();
-        // Duplicate check BEFORE the per-timestamp cap: evicting to make
-        // room for a duplicate would discard an innocent run_id's dedup
-        // coverage for no benefit.
-        if entry.iter().any(|r| r == run_id) {
-            return if ts < MS_EPOCH {
-                ReplayCheck::DuplicateSecondsPrecision
-            } else {
-                ReplayCheck::Replay
-            };
-        }
         // Per-timestamp cap: evict the oldest run_id (insertion-ordered
         // Vec → index 0) and admit the new one.
         if entry.len() >= MAX_ENTRIES_PER_TIMESTAMP {

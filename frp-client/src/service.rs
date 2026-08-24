@@ -2313,7 +2313,7 @@ impl Service {
         let map = self.proxy_info_map.read().await;
         match map.get(proxy_name) {
             None => false,
-            Some(info) => !matches!(info.phase, ProxyPhase::CheckFailed),
+            Some(info) => !matches!(info.phase, ProxyPhase::CheckFailed | ProxyPhase::Closed),
         }
     }
 
@@ -2438,6 +2438,16 @@ impl Service {
                             let mut tokens = self.p2p_bridge_tokens.lock().await;
                             if let Some(token) = tokens.remove(&cp.proxy_name) {
                                 token.cancel();
+                            }
+                            // Mark the proxy Closed: the server's nathole session
+                            // outlives the close (NAT_HOLE_TIMEOUT = 10s), so a
+                            // late NatHoleClient/NatHoleResp would otherwise
+                            // punch/bridge for a proxy the server just deleted —
+                            // punch_proxy_still_live must reject it (matches the
+                            // health-Close CheckFailed marking in HealthEvent).
+                            let mut map = self.proxy_info_map.write().await;
+                            if let Some(info) = map.get_mut(&cp.proxy_name) {
+                                info.phase = ProxyPhase::Closed;
                             }
                         }
                         Ok(FrpMessage::CloseProxyResp(cpr)) => {
@@ -5407,6 +5417,15 @@ mod tests {
         assert!(
             !service.punch_proxy_still_live("user.xtcp-a").await,
             "a health-closed (CheckFailed) proxy must not punch"
+        );
+
+        // Server CloseProxy marks the proxy Closed: the server's nathole
+        // session outlives the close (NAT_HOLE_TIMEOUT = 10s), so a late
+        // NatHoleClient/NatHoleResp must not re-arm a fresh token.
+        insert(ProxyPhase::Closed).await;
+        assert!(
+            !service.punch_proxy_still_live("user.xtcp-a").await,
+            "a server-closed (Closed) proxy must not punch"
         );
 
         // Recovery re-registration (WaitStart) may punch again.

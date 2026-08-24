@@ -105,7 +105,8 @@ async fn send_login_error(
 /// window quota (`None` → the attempt proceeds to the normal error
 /// response).
 ///
-/// Go frp LoginThrottle parity: only failures consume a slot — this
+/// Deliberate frp-rs hardening (NOT Go frp parity — Go frp v0.71.0 has
+/// no login throttle in its source): only failures consume a slot — this
 /// helper is invoked on failure paths only, so successful logins are
 /// never counted and legitimate reconnects are never throttled. An IP is
 /// rejected for the 60s window after the 5th failure (per-IP sliding
@@ -381,8 +382,13 @@ async fn verify_login_auth(
                 // login: the per-timestamp cap evicts the oldest run_id, the
                 // global cap evicts whole oldest keys (F3/F4) — only an
                 // identical ms-precision (run_id, ts) replay is rejected.
-                match used.record(ts, &run_id_for_check) {
-                    ReplayCheck::Admitted => {}
+                // The decision is produced under the lock, but the rejection
+                // write happens AFTER dropping it: send_login_error awaits a
+                // network write, which must not hold the shared
+                // used_timestamps lock (a slow/blocked peer would stall every
+                // concurrent login).
+                let reject_replay = match used.record(ts, &run_id_for_check) {
+                    ReplayCheck::Admitted => None,
                     ReplayCheck::DuplicateSecondsPrecision => {
                         // Duplicate (run_id, ts). Go frpc reuses its run_id
                         // and sends SECONDS keys: a reconnect landing in the
@@ -393,6 +399,7 @@ async fn verify_login_auth(
                             peer = ?peer, run_id = %run_id_for_check, ts = %ts,
                             "Login: duplicate seconds-precision (run_id, ts) — treating as same-second Go frpc reconnect"
                         );
+                        None
                     }
                     ReplayCheck::Replay => {
                         // Rust frpc sends MILLISECONDS keys — a genuine
@@ -402,14 +409,13 @@ async fn verify_login_auth(
                             "Replay attack detected: duplicate (run_id, timestamp) pair for run_id={} ts={}",
                             run_id_for_check, ts,
                         );
-                        send_login_error(
-                            stream,
-                            "replay attack detected: duplicate timestamp".into(),
-                            v2,
-                        )
-                        .await;
-                        return Err(());
+                        Some("replay attack detected: duplicate timestamp".to_string())
                     }
+                };
+                drop(used);
+                if let Some(error) = reject_replay {
+                    send_login_error(stream, error, v2).await;
+                    return Err(());
                 }
             }
         }
