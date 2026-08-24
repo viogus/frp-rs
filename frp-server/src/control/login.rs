@@ -109,8 +109,9 @@ async fn send_login_error(
 /// no login throttle in its source): only failures consume a slot — this
 /// helper is invoked on failure paths only, so successful logins are
 /// never counted and legitimate reconnects are never throttled. An IP is
-/// rejected for the 60s window after the 5th failure (per-IP sliding
-/// window, capped table with a coarse overflow bucket).
+/// rejected for the 60s window after the 5th failure (per-IP fixed 60s
+/// window anchored at the first counted failure, capped table with a
+/// coarse overflow bucket).
 async fn throttled_login_error(state: &AppState, peer: Option<SocketAddr>) -> Option<String> {
     let throttled = match peer {
         Some(addr) => !state.check_login_throttle(addr).await,
@@ -267,8 +268,9 @@ async fn verify_login_auth(
         });
         if let Err(e) = login_auth {
             warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
-            // Rate-limit failed logins per IP (Go frp LoginThrottle parity).
-            // Only failures consume a slot — successful logins are not counted.
+            // Rate-limit failed logins per IP (deliberate frp-rs hardening
+            // — Go frp v0.71.0 has no login throttle). Only failures
+            // consume a slot — successful logins are not counted.
             if let Some(msg) = throttled_login_error(state, peer).await {
                 send_login_error(stream, msg, v2).await;
                 return Err(());
@@ -414,7 +416,13 @@ async fn verify_login_auth(
                 };
                 drop(used);
                 if let Some(error) = reject_replay {
-                    send_login_error(stream, error, v2).await;
+                    // Replay rejections consume a throttle slot like any
+                    // other failure: a captured (ts, md5, run_id) triple
+                    // can otherwise be replayed repeatedly, each attempt
+                    // costing an accept + MD5 + table lookup with no rate
+                    // limit until the ts ages out of the freshness window.
+                    let throttled = throttled_login_error(state, peer).await;
+                    send_login_error(stream, throttled.unwrap_or(error), v2).await;
                     return Err(());
                 }
             }
@@ -455,13 +463,15 @@ pub(crate) async fn authenticate(
     ),
     (),
 > {
-    // Login throttle: FAIL-ONLY rate limiting (Go frp LoginThrottle parity).
+    // Login throttle: FAIL-ONLY rate limiting (deliberate frp-rs hardening
+    // — Go frp v0.71.0 has no login throttle).
     // `check_login_throttle` is invoked on authentication failure below and
     // counts only failed attempts — successful logins never consume a slot,
     // so legitimate reconnects are never throttled. A throttled IP is
-    // rejected for the 60s window after the 5th failure (per-IP sliding
-    // window, capped table with a coarse overflow bucket). Rejection here
-    // returns Err(()) and the login error response is sent by the caller.
+    // rejected for the 60s window after the 5th failure (per-IP fixed 60s
+    // window anchored at the first counted failure, capped table with a
+    // coarse overflow bucket). Rejection here returns Err(()) and the
+    // login error response is sent by the caller.
 
     // --- Authenticate ---
     // Split into its own state machine (OIDC/token verification + timestamp

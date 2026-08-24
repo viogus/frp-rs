@@ -80,6 +80,26 @@ impl TcpMuxManager {
         // keeping register/unregister symmetric.
         let domains: Vec<String> = domains.iter().map(|d| d.to_lowercase()).collect();
 
+        // Re-registration with a changed domain list (server reload): drop
+        // routes that left the list — otherwise a shrunken reload orphans
+        // the dropped `*.` route (and its wildcard count) forever. Same
+        // ownership guard as unregister: a sibling's live route survives.
+        if let Some(old) = by_proxy.get(proxy_name) {
+            for domain in old {
+                if !domains.contains(domain)
+                    && routes
+                        .get(domain)
+                        .is_some_and(|r| r.proxy_name == proxy_name)
+                {
+                    if domain.starts_with("*.") {
+                        self.wildcard_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    routes.remove(domain);
+                }
+            }
+        }
+
         // Validate every domain before inserting anything (no partial state).
         // Re-registration by the same proxy name is allowed (idempotent).
         for domain in &domains {
@@ -146,7 +166,7 @@ impl TcpMuxManager {
         // Strip port if present: example.com:443 → example.com; bracketed
         // IPv6: [::1]:443 → ::1; then exactly one trailing dot (Go frp
         // CanonicalHost, pkg/util/http/http.go).
-        let hostname = canonicalize_host(host);
+        let hostname = canonicalize_host(host)?;
         // Go frp compat (pkg/util/vhost/router.go): `Get` lowercases the
         // host — domains are stored lowercased at register. Alloc-free ASCII
         // fast path (Go's strings.ToLower skips allocation for all-lowercase
@@ -270,7 +290,11 @@ pub async fn run_tcpmux_listener(
             let method = parts.next().unwrap_or("");
             let target = parts.next().unwrap_or("");
 
-            if !method.eq_ignore_ascii_case("CONNECT") {
+            // Case-sensitive like Go: httpconnect.go's `req.Method !=
+            // "CONNECT"` (and justAuthority, which only treats an exact
+            // "CONNECT" as authority-form — a lowercase "connect" has no
+            // URL host and errors).
+            if method != "CONNECT" {
                 warn!(
                     method = %method, peer = %peer,
                     "TCPMux: expected CONNECT, got {} from {}",
@@ -446,26 +470,46 @@ async fn read_http_headers(
     }
 }
 
-/// Canonicalize a CONNECT authority for routing (Go frp `CanonicalHost`,
-/// pkg/util/http/http.go): strip the port (bracketed IPv6 aware), then
-/// trim exactly one trailing dot. Lowercasing happens in `lookup`.
-/// Registration is NOT canonicalized — a registered "example.com." is
-/// unroutable in Go too (CanonicalHost applies at lookup only).
-fn canonicalize_host(host: &str) -> &str {
-    // Strip port if present: example.com:443 → example.com
-    // Handle bracketed IPv6: [::1]:443 → ::1
-    let hostname = if host.starts_with('[') {
-        if let Some(end) = host.find(']') {
-            &host[1..end]
-        } else {
-            host
+/// Canonicalize a routing host (Go frp `CanonicalHost`,
+/// pkg/util/http/http.go). Lowercasing happens in `lookup`; registration
+/// is NOT canonicalized — a registered "example.com." is unroutable in Go
+/// too (CanonicalHost applies at lookup only).
+///
+/// Port handling follows Go's `hasPort` gate: the port is split only when
+/// the value has exactly one colon (host:port / IPv4:port) or is a
+/// bracket-start with `]:` (bracketed IPv6). A split port must be numeric
+/// — `net.SplitHostPort` rejects anything else and Go frp discards the
+/// error, so "example.com:abc" is unroutable (caller replies 400).
+/// Portless values are used as-is: "example.com", "[::1]" (stays
+/// bracketed — nothing registers brackets, so it is unroutable), or
+/// unbracketed multi-colon "::1:443". Then trim exactly one trailing dot
+/// (Go TrimSuffix — one dot only, so "example.com.." stays unroutable).
+fn canonicalize_host(host: &str) -> Option<&str> {
+    let colons = host.bytes().filter(|b| *b == b':').count();
+    let hostname = if colons == 1 {
+        // host:port — the port must be numeric (SplitHostPort rejects
+        // "example.com:abc" and "example.com:").
+        let (h, port) = host.rsplit_once(':')?;
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
         }
+        h
+    } else if colons >= 2 && host.starts_with('[') && host.contains("]:") {
+        // Bracketed IPv6 with port: [::1]:443 → ::1. "[::1]" without a
+        // "]:port" is portless in Go too (hasPort false) and stays
+        // bracketed — unroutable.
+        let end = host.find(']')?;
+        let port = &host[end + 2..];
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        &host[1..end]
     } else {
-        host.rsplitn(2, ':').last().unwrap_or(host)
+        // No port: portless hostname, bracketed IPv6 without "]:", or
+        // unbracketed multi-colon — Go leaves the value untouched.
+        host
     };
-    // Strip exactly one trailing dot from FQDNs (Go TrimSuffix — one dot
-    // only, so "example.com.." stays unroutable).
-    trim_trailing_dot(hostname)
+    Some(trim_trailing_dot(hostname))
 }
 
 /// Strip exactly one trailing dot from a hostname (Go CanonicalHost's
@@ -485,14 +529,7 @@ fn extract_host_header(request: &str) -> Option<&str> {
             continue;
         }
         let value = line[5..].trim();
-        // Handle IPv6: [::1]:8080 → ::1 (then trailing-dot trim, as Go
-        // applies TrimSuffix after the port split in every case)
-        if value.starts_with('[') {
-            return value.find(']').map(|end| trim_trailing_dot(&value[1..end]));
-        }
-        // Strip port: example.com:8080 → example.com, then the trailing dot.
-        let host = value.rsplitn(2, ':').last().unwrap_or(value);
-        return Some(trim_trailing_dot(host));
+        return canonicalize_host(value);
     }
     None
 }
@@ -504,19 +541,32 @@ fn extract_host_header(request: &str) -> Option<&str> {
 /// "in the second case, any Host header is ignored"); for CONNECT the
 /// authority is always present, so the header is effectively ignored.
 /// The target goes through the same canonicalization (port-strip,
-/// bracketed IPv6, trailing-dot trim). Returns None only when neither is
-/// present (caller replies 400).
+/// bracketed IPv6, trailing-dot trim). Returns None when the request
+/// line is malformed or neither source is present (caller replies 400).
 fn extract_route_host(request: &str) -> Option<&str> {
     let first_line = request.lines().next()?;
-    let target = first_line.split_whitespace().nth(1).unwrap_or("");
-    // Path-form targets ("GET /path") carry no URL host in Go — fall back
-    // to the header (the caller rejects non-CONNECT upstream anyway). A
-    // bare-version line ("CONNECT HTTP/1.1") has no authority either and
-    // must not route on the version string.
-    if !target.is_empty() && !target.starts_with("HTTP/") && !target.starts_with('/') {
-        return Some(canonicalize_host(target));
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    // Go net/http parseRequestLine requires "METHOD TARGET VERSION": a
+    // 2-part line ("CONNECT HTTP/1.1", versionless "CONNECT
+    // example.com:443") errors the whole ReadRequest regardless of any
+    // Host header, so the connection is closed with 400. A bare-version
+    // line must not route on the version string.
+    if target.is_empty() || parts.next().is_none() || target.starts_with("HTTP/") {
+        return None;
     }
-    extract_host_header(request)
+    // Path-form targets ("GET /path") carry no URL host in Go — fall back
+    // to the header (the caller rejects non-CONNECT upstream anyway). Same
+    // for any non-"CONNECT" method: Go's justAuthority check is
+    // case-sensitive, so a lowercase "connect" has no URL host and must
+    // not route on the target.
+    if method != "CONNECT" || target.starts_with('/') {
+        return extract_host_header(request);
+    }
+    // Authority-form: req.Host = req.URL.Host (RFC 7230 §5.3 — any Host
+    // header is ignored).
+    canonicalize_host(target)
 }
 
 /// Extract Proxy-Authorization Basic credentials.
@@ -608,6 +658,46 @@ mod tests {
         let req = "CONNECT HTTP/1.1\r\n\r\n";
         assert_eq!(extract_route_host(req), None);
         assert_eq!(extract_route_host(""), None);
+    }
+
+    #[test]
+    fn test_extract_route_host_go_parity_edge_cases() {
+        // Portless CONNECT authority routes fine (Go hasPort false → no
+        // SplitHostPort).
+        assert_eq!(
+            extract_route_host("CONNECT example.com HTTP/1.1\r\n\r\n"),
+            Some("example.com")
+        );
+        // Non-numeric port: net.SplitHostPort errors, Go frp discards the
+        // CanonicalHost error → host "" → unroutable → 400.
+        assert_eq!(
+            extract_route_host("CONNECT example.com:abc HTTP/1.1\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            extract_route_host("CONNECT example.com: HTTP/1.1\r\n\r\n"),
+            None
+        );
+        // Versionless request line: Go parseRequestLine needs 3 parts and
+        // errors → 400, no routing on the Host header either.
+        let req = "CONNECT example.com:443\r\nHost: other.net\r\n\r\n";
+        assert_eq!(extract_route_host(req), None);
+        // Lowercase method: Go justAuthority is case-sensitive → no URL
+        // host → Host header fallback (the caller 405s non-"CONNECT").
+        let req = "connect example.com:443 HTTP/1.1\r\nHost: header.net\r\n\r\n";
+        assert_eq!(extract_route_host(req), Some("header.net"));
+        // Non-numeric port in the Host header fallback is unroutable too.
+        let req = "CONNECT /path HTTP/1.1\r\nHost: example.com:abc\r\n\r\n";
+        assert_eq!(extract_route_host(req), None);
+        // Bracketed IPv6 without a port stays bracketed (hasPort false) —
+        // unroutable, but not an error.
+        let req = "CONNECT [::1] HTTP/1.1\r\n\r\n";
+        assert_eq!(extract_route_host(req), Some("[::1]"));
+        // Bracketed IPv6 with a non-numeric port is unroutable.
+        assert_eq!(
+            extract_route_host("CONNECT [::1]:abc HTTP/1.1\r\n\r\n"),
+            None
+        );
     }
 
     #[test]
@@ -905,5 +995,83 @@ mod tests {
 
         mgr.unregister("p2").await;
         assert!(mgr.lookup("a.example.com").await.is_none());
+    }
+
+    /// The wildcard fast-exit count stays symmetric across register,
+    /// idempotent re-registration, a shrunken domain list (server reload),
+    /// unregister, and a foreign-owned wildcard route.
+    #[tokio::test]
+    async fn test_tcpmux_wildcard_count_symmetry() {
+        use std::sync::atomic::Ordering;
+        let mgr = TcpMuxManager::new();
+
+        // Register exact + wildcard: count 1.
+        mgr.register(
+            "p1",
+            &["a.example.com".into(), "*.wild.example.com".into()],
+            "run-1",
+            "",
+            "",
+            &[],
+        )
+        .await
+        .expect("registration must succeed");
+        assert_eq!(mgr.wildcard_count.load(Ordering::Relaxed), 1);
+
+        // Same-name re-registration must not double-count.
+        mgr.register(
+            "p1",
+            &["a.example.com".into(), "*.wild.example.com".into()],
+            "run-1",
+            "",
+            "",
+            &[],
+        )
+        .await
+        .expect("idempotent re-registration must succeed");
+        assert_eq!(mgr.wildcard_count.load(Ordering::Relaxed), 1);
+
+        // A wildcard lookup hits the registered route.
+        assert!(mgr
+            .lookup("x.wild.example.com")
+            .await
+            .is_some_and(|r| r.proxy_name == "p1"));
+
+        // Shrunken re-registration (server reload drops the wildcard):
+        // the route and its count must leave the map.
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+            .await
+            .expect("shrunken re-registration must succeed");
+        assert_eq!(mgr.wildcard_count.load(Ordering::Relaxed), 0);
+        assert!(mgr.lookup("x.wild.example.com").await.is_none());
+
+        // unregister decrements on the route the proxy still owns.
+        mgr.unregister("p1").await;
+        assert!(mgr.lookup("a.example.com").await.is_none());
+
+        // A wildcard route owned by a DIFFERENT proxy (legacy by_proxy
+        // state) keeps both the route and the count through p1's
+        // unregister.
+        mgr.register("p1", &["*.shared.example.com".into()], "run-1", "", "", &[])
+            .await
+            .expect("registration must succeed");
+        {
+            let mut routes = mgr.routes.write().await;
+            routes.insert(
+                "*.shared.example.com".to_string(),
+                TcpMuxRoute {
+                    proxy_name: "p2".to_string(),
+                    run_id: "run-2".to_string(),
+                    http_user: String::new(),
+                    http_pwd: String::new(),
+                },
+            );
+        }
+        mgr.unregister("p1").await;
+        assert_eq!(mgr.wildcard_count.load(Ordering::Relaxed), 1);
+        assert!(mgr
+            .lookup("x.shared.example.com")
+            .await
+            .is_some_and(|r| r.proxy_name == "p2"));
     }
 }

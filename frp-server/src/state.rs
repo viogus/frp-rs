@@ -1517,6 +1517,44 @@ mod tests {
     }
 
     #[test]
+    fn replay_table_duplicate_at_global_cap_does_not_evict() {
+        // S5: the duplicate check runs BEFORE the global-cap eviction — a
+        // replayed (ts, run_id) at (or over) the cap must return Replay
+        // without evicting anything. Otherwise an attacker replaying one
+        // captured pair could repeatedly evict fresh keys, shrinking the
+        // replay window.
+        let mut t = ReplayTable::new();
+        let n_ts = MAX_TOTAL_REPLAY_ENTRIES / MAX_ENTRIES_PER_TIMESTAMP;
+        for ts_i in 0..n_ts {
+            let ts = MS_NOW + ts_i as i64;
+            for i in 0..MAX_ENTRIES_PER_TIMESTAMP {
+                assert_eq!(
+                    t.record(ts, &format!("run-{ts_i}-{i}")),
+                    ReplayCheck::Admitted
+                );
+            }
+        }
+        assert_eq!(t.total(), MAX_TOTAL_REPLAY_ENTRIES);
+        let before = t.total();
+        let oldest_ts = MS_NOW; // still present at the cap
+        assert!(t.map.contains_key(&oldest_ts));
+
+        // A duplicate of the OLDEST still-present key: rejected, and
+        // neither the table nor any key is touched.
+        assert_eq!(t.record(oldest_ts, "run-0-0"), ReplayCheck::Replay);
+        assert_eq!(t.total(), before, "replay must not evict at the cap");
+        assert!(t.map.contains_key(&oldest_ts));
+        assert_eq!(t.map[&oldest_ts].len(), MAX_ENTRIES_PER_TIMESTAMP);
+        // The victim's coverage is intact: a fresh run_id at that key is
+        // still admitted (and evicts the oldest run_id there, as usual).
+        assert_eq!(
+            t.record(oldest_ts, "run-new"),
+            ReplayCheck::Admitted,
+            "non-duplicate logins still admitted at the cap"
+        );
+    }
+
+    #[test]
     fn replay_table_per_timestamp_cap_evicts_oldest_and_admits() {
         // 101 distinct run_ids at the same timestamp: ALL admitted (F3 —
         // the old behavior rejected every login at a full key, locking

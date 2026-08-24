@@ -1656,11 +1656,10 @@ pub(crate) async fn handle_new_proxy(
                 // frp v0.71.0 TCPMuxProxy::httpConnectRun routes
                 // buildDomains(CustomDomains, SubDomain), so a
                 // subdomain-only tcpmux proxy is valid (frpc sends
-                // subdomain for tcpmux). Unlike the HTTP path (which
-                // silently skips an unconfigured sub_domain_host), Go's
+                // subdomain for tcpmux). Go's
                 // validateDomainConfigForServer REJECTS a subdomain when
-                // SubDomainHost is unset — mirror that accept/reject
-                // decision.
+                // SubDomainHost is unset — the HTTP/HTTPS paths mirror
+                // this accept/reject decision (C1).
                 if let Some(ref subdomain) = np.subdomain {
                     if !subdomain.is_empty() {
                         let sub_host = &state.sub_domain_host;
@@ -4563,7 +4562,8 @@ mod subdomain_conflict_tests {
     // label ("*.example.com") or the bare catch-all ("*") for
     // http/https/tcpmux — routing (getByRoute) replaces the leftmost label
     // with "*" and walks, so those are routable. A "*" in any other
-    // position can never match a route in Go, so it stays rejected.
+    // position can never match a route in Go either — validation accepts
+    // it (Go has no structure check), but it stays unroutable.
     #[test]
     fn leading_label_wildcard_allowed() {
         let np = np_with_domains(vec!["*.example.com"], None);

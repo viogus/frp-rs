@@ -1348,9 +1348,15 @@ fn count_host_headers(request: &str) -> usize {
         .count()
 }
 
-/// Extract the Host header value from an HTTP request (hostname only, no
-/// port, exactly one trailing dot trimmed — Go frp `CanonicalHost`:
-/// lowercase, strip port, `TrimSuffix(host, ".")`).
+/// Extract the Host header value from an HTTP request (hostname only,
+/// exactly one trailing dot trimmed — Go frp `CanonicalHost`,
+/// pkg/util/http/http.go). Port handling follows Go's `hasPort` gate: the
+/// port is split only when the value has exactly one colon (host:port /
+/// IPv4:port) or is a bracket-start with `]:` (bracketed IPv6), and a
+/// split port must be numeric (`net.SplitHostPort` rejects anything else;
+/// Go frp discards the error, so "example.com:abc" is unroutable).
+/// Portless values are used as-is — "example.com", or "[::1]" which stays
+/// bracketed (unroutable, nothing registers brackets).
 fn extract_host_header(request: &str) -> Option<&str> {
     for line in request.lines() {
         if line.len() < 6 {
@@ -1360,21 +1366,29 @@ fn extract_host_header(request: &str) -> Option<&str> {
             continue;
         }
         let value = line[5..].trim();
-        // Handle IPv6: [::1]:8080 → ::1 (then trailing-dot trim, as Go
-        // applies TrimSuffix after the port split in every case),
-        // example.com:8080 → example.com
-        if value.starts_with('[') {
-            return value.find(']').map(|end| {
-                let hostname = &value[1..end];
-                hostname.strip_suffix('.').unwrap_or(hostname)
-            });
-        }
-        let host = value.split(':').next().unwrap_or(value);
+        let colons = value.bytes().filter(|b| *b == b':').count();
+        let hostname = if colons == 1 {
+            let (h, port) = value.rsplit_once(':')?;
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            h
+        } else if colons >= 2 && value.starts_with('[') && value.contains("]:") {
+            // Bracketed IPv6 with port: [::1]:8080 → ::1.
+            let end = value.find(']')?;
+            let port = &value[end + 2..];
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            &value[1..end]
+        } else {
+            value
+        };
         // Strip exactly one trailing dot from FQDNs (Go TrimSuffix — one
         // dot only, so "example.com.." stays unroutable; registration is
         // not canonicalized, so a user-registered "example.com." is
         // unroutable in Go too).
-        return Some(host.strip_suffix('.').unwrap_or(host));
+        return Some(hostname.strip_suffix('.').unwrap_or(hostname));
     }
     None
 }

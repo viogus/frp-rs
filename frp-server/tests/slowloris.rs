@@ -214,10 +214,17 @@ async fn yamux_ponging_client_still_dropped_at_post_handshake_deadline() {
         .await
         .expect("write yamux stream-open frame");
 
-    // Read frames and pong every ping (tag 4, no ACK, stream 0) until the
+    // Read frames and pong every ping (tag 2, no ACK, stream 0) until the
     // server closes. A pong is the same frame with the ACK flag (0x2) set
-    // and the payload (ping id) echoed. Frame header:
+    // and the ping id echoed in the length field. yamux-rs 0.14 encodes
+    // the tag as the fieldless-enum discriminant (`tag as u8`):
+    // Data = 0, WindowUpdate = 1, Ping = 2, GoAway = 3 — verified in the
+    // compiled crates.io yamux-0.14.0 source. Frame header:
     // [version 1][tag 1][flags 2][stream_id 4][length 4] = 12 bytes.
+    // Only Data frames carry a body; for WindowUpdate the length field is
+    // the credit, for Ping the ping id — non-Data frames are header-only,
+    // so `total = 12` (a `12 + len` arithmetic would "truncate" every
+    // non-Data frame and skip it, dropping subsequent pings).
     let start = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     let mut buf = [0u8; 512];
@@ -243,18 +250,18 @@ async fn yamux_ponging_client_still_dropped_at_post_handshake_deadline() {
                         buf[off + 10],
                         buf[off + 11],
                     ]) as usize;
-                    let total = 12 + len;
+                    let total = if tag == 0 { 12 + len } else { 12 };
                     if total > n - off {
                         break; // truncated frame — wait for more
                     }
-                    if buf[off] == 0 && tag == 4 && flags & 0x2 == 0 && stream == 0 {
-                        // Ping → pong (ACK echo).
-                        let mut pong = [0u8; 16];
-                        pong[1] = 4;
+                    if buf[off] == 0 && tag == 2 && flags & 0x2 == 0 && stream == 0 {
+                        // Ping → pong: ACK flag set, ping id echoed in the
+                        // length field, no body.
+                        let mut pong = [0u8; 12];
+                        pong[1] = 2;
                         pong[3] = 0x2; // ACK flag
-                        pong[8..12].copy_from_slice(&buf[off + 8..off + 12]); // same length
-                        pong[12..total].copy_from_slice(&buf[off + 12..off + total]); // echo id
-                        sock.write_all(&pong[..total]).await.expect("write pong");
+                        pong[8..12].copy_from_slice(&buf[off + 8..off + 12]); // echo id
+                        sock.write_all(&pong).await.expect("write pong");
                         pongs += 1;
                     }
                     off += total;

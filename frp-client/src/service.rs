@@ -2426,6 +2426,38 @@ impl Service {
                         }
                         Ok(FrpMessage::CloseProxy(cp)) => {
                             info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
+                            // Registration race: a server CloseProxy for an
+                            // OLD registration can land while a same-name
+                            // reload re-registration (phase New/WaitStart) is
+                            // in flight. Marking it Closed would kill the NEW
+                            // proxy — Closed is excluded from the retry loop
+                            // and the health-monitor kill below is not re-armed
+                            // — so skip the teardown when a registration is
+                            // pending; the authoritative phase comes from its
+                            // NewProxyResp. (Go deletes the entry by name —
+                            // same-keyed semantics — so this is client-side
+                            // robustness beyond parity.)
+                            let kill = {
+                                let mut map = self.proxy_info_map.write().await;
+                                match map.get_mut(&cp.proxy_name) {
+                                    Some(info)
+                                        if matches!(
+                                            info.phase,
+                                            ProxyPhase::New | ProxyPhase::WaitStart
+                                        ) =>
+                                    {
+                                        false
+                                    }
+                                    Some(info) => {
+                                        info.phase = ProxyPhase::Closed;
+                                        true
+                                    }
+                                    None => true, // absent: still reap stale handles
+                                }
+                            };
+                            if !kill {
+                                continue;
+                            }
                             // Cancel health check task and remove map entry.
                             let mut cancels = channels.health_cancels.lock().await;
                             if let Some(cancel) = cancels.get(&cp.proxy_name) {
@@ -2439,16 +2471,14 @@ impl Service {
                             if let Some(token) = tokens.remove(&cp.proxy_name) {
                                 token.cancel();
                             }
-                            // Mark the proxy Closed: the server's nathole session
-                            // outlives the close (NAT_HOLE_TIMEOUT = 10s), so a
-                            // late NatHoleClient/NatHoleResp would otherwise
-                            // punch/bridge for a proxy the server just deleted —
-                            // punch_proxy_still_live must reject it (matches the
-                            // health-Close CheckFailed marking in HealthEvent).
-                            let mut map = self.proxy_info_map.write().await;
-                            if let Some(info) = map.get_mut(&cp.proxy_name) {
-                                info.phase = ProxyPhase::Closed;
-                            }
+                            // The Closed phase (set above, outside the lock
+                            // order used by HealthEvent): the server's nathole
+                            // session outlives the close (NAT_HOLE_TIMEOUT =
+                            // 10s), so a late NatHoleClient/NatHoleResp would
+                            // otherwise punch/bridge for a proxy the server
+                            // just deleted — punch_proxy_still_live must reject
+                            // it (matches the health-Close CheckFailed marking
+                            // in HealthEvent).
                         }
                         Ok(FrpMessage::CloseProxyResp(cpr)) => {
                             info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);

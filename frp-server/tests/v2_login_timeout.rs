@@ -4,9 +4,11 @@
 //! covering magic read + V2 ClientHello/ServerHello exchange + first message.
 //! frp-rs mirrored the handshake timeout but left the read of the next frame
 //! (Login) after a ClientHello unbounded. These tests verify that a peer which
-//! completes ClientHello but never sends Login is disconnected within ~10s
-//! (`V2_HANDSHAKE_TIMEOUT`), so it cannot pin a server task / file descriptor
-//! forever.
+//! completes ClientHello but never sends Login is disconnected within ~30s
+//! (`V2_HANDSHAKE_TIMEOUT`, deliberately longer than Go's 10s — the pre-Login
+//! OIDC JWT fetch can exceed 10s, see the constant's doc comment in
+//! `frp-core/src/v2_handshake.rs`), so it cannot pin a server task / file
+//! descriptor forever.
 
 mod common;
 
@@ -58,20 +60,22 @@ async fn handshake_v2(
 }
 
 /// Wait for the server to close the connection after a handshake with no
-/// Login. Asserts the close happens after the V2 handshake timeout (~10s),
-/// not immediately (i.e. the post-handshake Login read is bounded).
+/// Login. Asserts the close happens at the V2 post-handshake deadline
+/// (~30s), not immediately (i.e. the post-handshake Login read is bounded).
+/// The 35s window covers the ~30s deadline; without the bound the close
+/// never comes.
 async fn expect_disconnect_after_timeout(io: &mut IoStream) {
     let start = Instant::now();
-    match tokio::time::timeout(Duration::from_secs(15), io.read_raw_v2_frame()).await {
+    match tokio::time::timeout(Duration::from_secs(35), io.read_raw_v2_frame()).await {
         Err(_) => panic!(
-            "server did not close the connection within 15s (elapsed {:?})",
+            "server did not close the connection within 35s (elapsed {:?})",
             start.elapsed()
         ),
         Ok(Err(e)) => {
             let elapsed = start.elapsed();
             assert!(
-                elapsed >= Duration::from_secs(8),
-                "connection closed too early after {elapsed:?}; server must wait the full V2 handshake timeout"
+                elapsed >= Duration::from_secs(20),
+                "connection closed too early after {elapsed:?}; server must wait the full V2 post-handshake deadline"
             );
             eprintln!("server closed idle V2 connection after {elapsed:?}: {e}");
         }
@@ -82,7 +86,7 @@ async fn expect_disconnect_after_timeout(io: &mut IoStream) {
 }
 
 /// V2 over yamux (default tcp_mux=true): ClientHello/ServerHello on the yamux
-/// control stream, then stay silent. Server must close within ~10s.
+/// control stream, then stay silent. Server must close within ~30s.
 #[tokio::test]
 async fn test_v2_post_handshake_login_read_timeout_yamux() {
     let bind_port = allocate_port();
@@ -111,7 +115,7 @@ async fn test_v2_post_handshake_login_read_timeout_yamux() {
 }
 
 /// V2 directly on raw TCP (tcp_mux=false): ClientHello/ServerHello, then stay
-/// silent. Server must close within ~10s.
+/// silent. Server must close within ~30s.
 #[tokio::test]
 async fn test_v2_post_handshake_login_read_timeout_raw_tcp() {
     let bind_port = allocate_port();

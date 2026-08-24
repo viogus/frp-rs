@@ -1054,7 +1054,7 @@ pub(crate) async fn dispatch_v1_message(
             warn!(error = %e, "V1 read error: {}", e);
         }
         Err(_elapsed) => {
-            warn!("V1 first message read timed out after 10s");
+            warn!("V1 first message read timed out at the post-handshake deadline");
         }
     }
 }
