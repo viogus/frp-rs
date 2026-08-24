@@ -1348,7 +1348,9 @@ fn count_host_headers(request: &str) -> usize {
         .count()
 }
 
-/// Extract the Host header value from an HTTP request (hostname only, no port).
+/// Extract the Host header value from an HTTP request (hostname only, no
+/// port, exactly one trailing dot trimmed — Go frp `CanonicalHost`:
+/// lowercase, strip port, `TrimSuffix(host, ".")`).
 fn extract_host_header(request: &str) -> Option<&str> {
     for line in request.lines() {
         if line.len() < 6 {
@@ -1362,7 +1364,12 @@ fn extract_host_header(request: &str) -> Option<&str> {
         if value.starts_with('[') {
             return value.find(']').map(|end| &value[1..end]);
         }
-        return Some(value.split(':').next().unwrap_or(value));
+        let host = value.split(':').next().unwrap_or(value);
+        // Strip exactly one trailing dot from FQDNs (Go TrimSuffix — one
+        // dot only, so "example.com.." stays unroutable; registration is
+        // not canonicalized, so a user-registered "example.com." is
+        // unroutable in Go too).
+        return Some(host.strip_suffix('.').unwrap_or(host));
     }
     None
 }
@@ -1584,6 +1591,32 @@ mod tests {
                 "GET / HTTP/1.1\r\nHost: new.example.com\r\n\r\nbody\r\nhost: evil.example.com"
             ),
             "only the head's Host may be rewritten: {text:?}"
+        );
+    }
+
+    /// Go frp CanonicalHost parity: port-strip, then TrimSuffix exactly one
+    /// trailing dot, before the vhost lookup ("example.com." and
+    /// "example.com" route identically; registration is not canonicalized,
+    /// so a user-registered "example.com." is unroutable in Go too).
+    #[test]
+    fn test_extract_host_header_trailing_dot() {
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nHost: example.com.:8080\r\n\r\n"),
+            Some("example.com")
+        );
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nHost: example.com.\r\n\r\n"),
+            Some("example.com")
+        );
+        // Two trailing dots: only one is trimmed (Go TrimSuffix trims one).
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nHost: example.com..\r\n\r\n"),
+            Some("example.com.")
+        );
+        // Bracketed IPv6 hosts are untouched.
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n"),
+            Some("::1")
         );
     }
 

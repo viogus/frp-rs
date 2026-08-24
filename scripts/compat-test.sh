@@ -893,12 +893,14 @@ write_frpc_config_udp() {
 write_frpc_config_tcpmux() {
     local impl="$1" server_port="$2" token="$3" echo_port="$4" \
           name="$5" domain="$6" out="$7" features="${8:-}"
-    local has_tls=false has_mux=false extra_line=""
+    local has_tls=false has_mux=false extra_line="" subdomain="" domains_value="$domain"
     for feat in $features; do
         case "$feat" in
             tls) has_tls=true ;;
             mux) has_mux=true ;;
             extra=*) extra_line="${feat#extra=}" ;;
+            subdomain=*) subdomain="${feat#subdomain=}" ;;
+            domain=*) domains_value="${feat#domain=}" ;;
         esac
     done
     local mux_val="false"; $has_mux && mux_val="true"
@@ -917,7 +919,12 @@ write_frpc_config_tcpmux() {
             printf 'transport.tcpMux = %s\n' "$mux_val"
             printf 'log.to = "%s/go-frpc-%s.log"\nlog.level = "debug"\n\n' "$TEST_DIR" "$name"
             printf '[[proxies]]\nname = "%s"\ntype = "tcpmux"\nmultiplexer = "httpconnect"\n' "$name"
-            printf 'localIP = "127.0.0.1"\nlocalPort = %s\ncustomDomains = ["%s"]\n' "$echo_port" "$domain"
+            if [[ -n "$subdomain" ]]; then
+                # subdomain only (no customDomains) — server expands via subdomain_host
+                printf 'localIP = "127.0.0.1"\nlocalPort = %s\nsubdomain = "%s"\n' "$echo_port" "$subdomain"
+            else
+                printf 'localIP = "127.0.0.1"\nlocalPort = %s\ncustomDomains = ["%s"]\n' "$echo_port" "$domains_value"
+            fi
             [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
         } > "$out"
     else
@@ -928,7 +935,12 @@ write_frpc_config_tcpmux() {
             printf 'tls_enable = false\n'
             printf 'login_fail_exit = true\npool_count = 1\n'
             printf '\n[[proxies]]\nname = "%s"\ntype = "tcpmux"\nmultiplexer = "httpconnect"\n' "$name"
-            printf 'local_ip = "127.0.0.1"\nlocal_port = %s\ncustom_domains = ["%s"]\n' "$echo_port" "$domain"
+            if [[ -n "$subdomain" ]]; then
+                # subdomain only (no customDomains) — server expands via subdomain_host
+                printf 'local_ip = "127.0.0.1"\nlocal_port = %s\nsubdomain = "%s"\n' "$echo_port" "$subdomain"
+            else
+                printf 'local_ip = "127.0.0.1"\nlocal_port = %s\ncustom_domains = ["%s"]\n' "$echo_port" "$domains_value"
+            fi
             [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
         } > "$out"
     fi
@@ -4701,6 +4713,137 @@ test_g2r_tcpmux() {
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, tcpmux with subdomain only (no customDomains)
+# Rust frps must accept the proxy and expand {subdomain}.{subdomain_host}
+# =============================================================================
+test_g2r_tcpmux_subdomain() {
+    local name="go-to-rust-tcpmux-subdomain"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local tcpmux_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-tcpmux-subdomain"
+    local connect_domain="mysub.test.local"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Rust frps with tcpmux HTTP CONNECT port + subdomain_host.
+    # NOTE: subdomain_host is a TOP-LEVEL key (ServerConfig field) — it must be
+    # emitted before the [auth]/[transport] sections, so this config is written
+    # inline rather than via write_frps_config extra= (which appends after
+    # [transport] and would land inside that section).
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+tcpmux_httpconnect_port = $tcpmux_port
+subdomain_host = "test.local"
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$tcpmux_port" 5 || {
+        fail_test "$name" "tcpmux port $tcpmux_port not reachable"
+        return
+    }
+
+    # Start Go frpc with tcpmux proxy — subdomain only, no customDomains
+    write_frpc_config_tcpmux go "$frps_port" "$token" "$echo_port" "tcpmux-sub" \
+        "$connect_domain" "$TEST_DIR/$name/frpc.toml" "subdomain=mysub"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    # tcpmux routing needs time to propagate
+    sleep 2
+
+    # HTTP CONNECT through tcpmux port, then echo test
+    local result
+    result=$(send_tcpmux_test "$tcpmux_port" "$connect_domain" "tcpmux-subdomain-echo" 15)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc -> Rust frps, tcpmux with wildcard customDomains ["*.domain"]
+# Rust frps must accept the wildcard and route CONNECT to a different leftmost
+# label (www.) to it
+# =============================================================================
+test_g2r_tcpmux_wildcard() {
+    local name="go-to-rust-tcpmux-wildcard"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local tcpmux_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-tcpmux-wildcard"
+    local connect_domain="www.tcpmux-w.local"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Rust frps with tcpmux HTTP CONNECT port
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tcpmux=$tcpmux_port"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$tcpmux_port" 5 || {
+        fail_test "$name" "tcpmux port $tcpmux_port not reachable"
+        return
+    }
+
+    # Start Go frpc with tcpmux proxy — wildcard customDomains
+    write_frpc_config_tcpmux go "$frps_port" "$token" "$echo_port" "tcpmux-wild" \
+        "$connect_domain" "$TEST_DIR/$name/frpc.toml" "domain=*.tcpmux-w.local"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    # tcpmux routing needs time to propagate
+    sleep 2
+
+    # HTTP CONNECT to a different leftmost label than the wildcard, then echo
+    local result
+    result=$(send_tcpmux_test "$tcpmux_port" "$connect_domain" "tcpmux-wildcard-echo" 15)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Rust frpc -> Go frps, tcpmux HTTP CONNECT
 # =============================================================================
 test_r2g_tcpmux() {
@@ -5460,6 +5603,8 @@ run_test test_g2r_route_by_http_user
 run_test test_r2g_route_by_http_user
 # Phase 4b: tcpmux HTTP CONNECT
 run_test test_g2r_tcpmux
+run_test test_g2r_tcpmux_subdomain
+run_test test_g2r_tcpmux_wildcard
 run_test test_r2g_tcpmux
 run_test test_g2r_stcp
 run_test test_r2g_stcp

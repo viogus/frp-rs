@@ -623,21 +623,29 @@ fn validate_new_proxy(np: &msg::NewProxy, sub_domain_host: &str) -> Result<(), S
                 ));
             }
             // Character whitelist + structure: only DNS-ish names are
-            // routable vhost keys. Reject wildcards (`*` catch-all would let
-            // a tenant hijack every host on a shared vhost deployment),
-            // whitespace, CR/LF, and empty labels.
+            // routable vhost keys. Go frp permits a wildcard as the leading
+            // label ("*.example.com") or the bare catch-all ("*") in
+            // customDomains — routing (getByRoute) replaces the leftmost
+            // label with "*" and walks, so those are routable. A "*" in any
+            // other position can never match a route in Go, so it stays
+            // rejected (dead config must not register). Whitespace, CR/LF,
+            // and empty labels are rejected as before.
+            let wildcard_ok = domain == "*"
+                || domain
+                    .strip_prefix("*.")
+                    .is_some_and(|rest| !rest.contains('*'));
             if domain.is_empty()
-                || !domain
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+                || !domain.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == '*'
+                })
                 || domain.starts_with('.')
                 || domain.ends_with('.')
                 || domain.contains("..")
-                || domain.contains('*')
+                || (domain.contains('*') && !wildcard_ok)
                 || domain.chars().any(|c| c.is_control() || c.is_whitespace())
             {
                 return Err(format!(
-                    "custom_domain '{}' contains invalid characters or structure (letters, digits, '.', '-', '_' only; no wildcards)",
+                    "custom_domain '{}' contains invalid characters or structure (letters, digits, '.', '-', '_' only; '*' allowed only as the leading label, e.g. '*.example.com')",
                     domain
                 ));
             }
@@ -1172,11 +1180,16 @@ async fn setup_proxy_listeners(
                                   // send().await: backpressure is correct — silently
                                   // dropping UdpNeedsWorkConn would permanently break
                                   // the UDP proxy (no work connection = no data flow).
-                let _ = itx_clone
+                                  // send() fails only when the internal channel is
+                                  // closed (control handler gone); log at debug.
+                if let Err(e) = itx_clone
                     .send(InternalMsg::UdpNeedsWorkConn {
-                        proxy_name: pn_clone,
+                        proxy_name: pn_clone.clone(),
                     })
-                    .await;
+                    .await
+                {
+                    debug!(proxy_name = %pn_clone, error = %e, "UdpNeedsWorkConn send failed: {}", e);
+                }
             });
         }
         if socket.is_none() {
@@ -1635,7 +1648,40 @@ pub(crate) async fn handle_new_proxy(
             // conflict rejects the proxy instead of silently overwriting the
             // live sibling's route (audit finding 5).
             if np.proxy_type == "tcpmux" {
-                let domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
+                let mut domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
+
+                // Subdomain routing: {subdomain}.{sub_domain_host} — Go
+                // frp v0.71.0 TCPMuxProxy::httpConnectRun routes
+                // buildDomains(CustomDomains, SubDomain), so a
+                // subdomain-only tcpmux proxy is valid (frpc sends
+                // subdomain for tcpmux). Unlike the HTTP path (which
+                // silently skips an unconfigured sub_domain_host), Go's
+                // validateDomainConfigForServer REJECTS a subdomain when
+                // SubDomainHost is unset — mirror that accept/reject
+                // decision.
+                if let Some(ref subdomain) = np.subdomain {
+                    if !subdomain.is_empty() {
+                        let sub_host = &state.sub_domain_host;
+                        if sub_host.is_empty() {
+                            rollback_vhost_conflict(state, run_id, port, false).await;
+                            reject_new_proxy(
+                                writer,
+                                &np.proxy_name,
+                                "subdomain is not supported because this feature is not enabled in server".into(),
+                                v2,
+                            )
+                            .await;
+                            state.proxy_manager.remove(&np.proxy_name).await;
+                            return false;
+                        }
+                        let full_domain = format!("{}.{}", subdomain, sub_host);
+                        info!(full_domain = %full_domain, proxy_name = %np.proxy_name, "Subdomain route: {} → {}", full_domain, np.proxy_name);
+                        if !domains.contains(&full_domain) {
+                            domains.push(full_domain);
+                        }
+                    }
+                }
+
                 if domains.is_empty() {
                     // TCPMux requires at least one domain for routing
                     rollback_vhost_conflict(state, run_id, port, false).await;
@@ -3297,6 +3343,187 @@ pub(crate) mod unregister_generation_tests {
         );
     }
 
+    /// Go frp v0.71.0 compat: TCPMuxProxy::httpConnectRun routes
+    /// buildDomains(CustomDomains, SubDomain), so a subdomain-only tcpmux
+    /// proxy must register with the expanded "{subdomain}.{sub_domain_host}"
+    /// route (frpc sends subdomain for tcpmux — previously hard-rejected
+    /// with "tcpmux proxy requires custom_domains").
+    #[tokio::test]
+    async fn tcpmux_subdomain_expands_to_route() {
+        let mut state = test_state();
+        // Fresh Arc from test_state: sole owner, safe to mutate in place.
+        Arc::get_mut(&mut state).unwrap().sub_domain_host = "example.com".to_string();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("mux-sub", "tcpmux");
+        np.subdomain = Some("app".to_string());
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "subdomain-only tcpmux proxy must register");
+        assert!(
+            state.proxy_manager.get("mux-sub").await.is_some(),
+            "subdomain-only tcpmux proxy must be registered"
+        );
+        assert!(
+            state
+                .tcpmux_manager
+                .lookup("app.example.com")
+                .await
+                .is_some_and(|r| r.proxy_name == "mux-sub"),
+            "expanded subdomain route must be registered"
+        );
+    }
+
+    /// Go validateDomainConfigForServer rejects a subdomain when
+    /// SubDomainHost is unset ("subdomain is not supported because this
+    /// feature is not enabled in server") — unlike the HTTP path (which
+    /// silently skips), the tcpmux path must mirror Go's rejection.
+    #[tokio::test]
+    async fn tcpmux_subdomain_without_subdomain_host_rejected() {
+        let state = test_state(); // sub_domain_host = ""
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("mux-sub", "tcpmux");
+        np.subdomain = Some("app".to_string());
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(!ok, "subdomain without sub_domain_host must be rejected");
+        assert!(
+            state.proxy_manager.get("mux-sub").await.is_none(),
+            "rejected tcpmux proxy must be rolled back"
+        );
+        assert!(
+            String::from_utf8_lossy(&writer)
+                .contains("not supported because this feature is not enabled in server"),
+            "rejection must carry Go's subdomain-disabled message"
+        );
+    }
+
+    /// The hard rejection stays for a tcpmux proxy whose MERGED domain list
+    /// is empty (no custom_domains, no subdomain) — Go registers a dead
+    /// proxy with zero routes; frp-rs rejects it instead.
+    #[tokio::test]
+    async fn tcpmux_no_domains_still_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let np = new_proxy("mux-none", "tcpmux");
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(!ok, "tcpmux with no domains must still be rejected");
+        assert!(state.proxy_manager.get("mux-none").await.is_none());
+        assert!(
+            String::from_utf8_lossy(&writer).contains("requires custom_domains"),
+            "rejection must name the missing custom_domains"
+        );
+    }
+
+    /// F10: the UdpNeedsWorkConn handoff task must tolerate a closed
+    /// internal channel — the send fails (logged at debug) without
+    /// panicking the spawned task or failing the registration. The
+    /// registration success path still drains the oneshot signals before
+    /// the send, so a healthy channel never sees a spurious failure.
+    #[tokio::test]
+    async fn udp_proxy_registers_when_control_channel_closed() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        // Closed internal channel: the spawned UdpNeedsWorkConn send must
+        // fail cleanly (debug log) — registration must still succeed.
+        let (itx, rx) = mpsc::channel(8);
+        drop(rx);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("udp-f10", "udp");
+        np.remote_port = Some(24026);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(
+            ok,
+            "UDP proxy must register even when the control channel is closed"
+        );
+        assert!(
+            state.proxy_manager.get("udp-f10").await.is_some(),
+            "closed control channel must not fail the registration"
+        );
+        assert!(
+            state.used_udp_ports.read().await.contains(&24026),
+            "UDP port must be marked"
+        );
+        // Yield so the spawned handoff task runs its send-failure path
+        // (a panic there would surface as a test failure).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     // ---------------------------------------------------------------
     // Audit fixes (2026-08-13): supersession port-mark leak, group-create
     // bind-race join, duplicate-login conflict sweep, sweep snapshot
@@ -4319,5 +4546,51 @@ mod subdomain_conflict_tests {
         let np = np_with_domains(vec![], Some("bad.subdomain"));
         let err = validate_new_proxy(&np, "example.com").unwrap_err();
         assert!(err.contains("not a valid RFC 1123"), "got: {err}");
+    }
+
+    // Go frp v0.71.0: customDomains may carry a wildcard as the leading
+    // label ("*.example.com") or the bare catch-all ("*") for
+    // http/https/tcpmux — routing (getByRoute) replaces the leftmost label
+    // with "*" and walks, so those are routable. A "*" in any other
+    // position can never match a route in Go, so it stays rejected.
+    #[test]
+    fn leading_label_wildcard_allowed() {
+        let np = np_with_domains(vec!["*.example.com"], None);
+        assert!(validate_new_proxy(&np, "").is_ok());
+    }
+
+    #[test]
+    fn bare_star_catch_all_allowed() {
+        let np = np_with_domains(vec!["*"], None);
+        assert!(validate_new_proxy(&np, "").is_ok());
+    }
+
+    #[test]
+    fn wildcard_in_nonleading_position_rejected() {
+        for domain in ["a.*.com", "*.*.com", "exa*mple.com"] {
+            let np = np_with_domains(vec![domain], None);
+            let err = validate_new_proxy(&np, "").unwrap_err();
+            assert!(err.contains("invalid"), "domain '{domain}' got: {err}");
+        }
+    }
+
+    #[test]
+    fn wildcard_under_subdomain_host_rejected() {
+        // Go validateDomainConfigForServer counts "*" as a label: a
+        // wildcard domain under the configured host is rejected exactly
+        // like any other sub-domain (contains check is ends_with, so the
+        // "*.example.com" prefix needs no special handling).
+        let np = np_with_domains(vec!["*.example.com"], None);
+        let err = validate_new_proxy(&np, "example.com").unwrap_err();
+        assert!(
+            err.contains("should not belong to subdomain host"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn wildcard_unrelated_host_allowed() {
+        let np = np_with_domains(vec!["*.other.net"], None);
+        assert!(validate_new_proxy(&np, "example.com").is_ok());
     }
 }
