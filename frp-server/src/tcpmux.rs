@@ -7,7 +7,8 @@ use tracing::{debug, info, warn};
 
 use crate::service::{AppState, InternalMsg};
 
-/// A route mapping: domain → proxy info for tcpmux CONNECT routing.
+/// A route mapping: (domain, route_by_http_user) → proxy info for tcpmux
+/// CONNECT routing.
 #[derive(Debug, Clone)]
 pub struct TcpMuxRoute {
     pub proxy_name: String,
@@ -15,16 +16,26 @@ pub struct TcpMuxRoute {
     /// HTTP Basic Auth credentials (empty = no auth).
     pub http_user: String,
     pub http_pwd: String,
+    /// Go frp `RouteConfig.RouteByHTTPUser` (round 6, A2): a second routing
+    /// dimension. CONNECT lookups try the request's Proxy-Authorization
+    /// username first, then fall back to the `""` bucket (Go
+    /// `getExactOrAllUsersLocked`).
+    pub route_by_http_user: String,
 }
 
-/// Manages TCPMux routing table (domain → proxy).
+/// Manages TCPMux routing table (domain + routeByHTTPUser → proxy).
 /// Maps Host header values from HTTP CONNECT requests to the correct proxy.
 pub struct TcpMuxManager {
-    /// domain → route
-    routes: RwLock<HashMap<String, TcpMuxRoute>>,
+    /// domain → route_by_http_user → route. Mirrors Go's
+    /// `indexByDomain[domain][httpUser]` (pkg/util/vhost/router.go): a
+    /// domain can carry several route_by_http_user buckets; lookup tries
+    /// the request's user bucket, then the `""` (all-users) bucket, then
+    /// moves on to wildcard levels.
+    routes: RwLock<HashMap<String, HashMap<String, TcpMuxRoute>>>,
     /// proxy_name → domains (for unregister)
     by_proxy: RwLock<HashMap<String, Vec<String>>>,
-    /// Live count of registered `*.` wildcard routes. Lets `lookup` skip the
+    /// Live count of registered `*.` wildcard routes (one per distinct
+    /// (domain, route_by_http_user) bucket). Lets `lookup` skip the
     /// label-walk (each iteration allocates a joined host) entirely when no
     /// wildcard route exists — the common case, where `example.com` lookups
     /// never matched anything but the exact map hit anyway.
@@ -48,12 +59,16 @@ impl TcpMuxManager {
 
     /// Register domains for a tcpmux proxy.
     ///
-    /// Returns `Err(conflict)` when any domain is already routed to a
-    /// different proxy. Every domain is validated BEFORE any insert, so a
-    /// rejected registration leaves no partial state — mirroring the VHost
-    /// manager. Previously the result was ignored and the last registration
+    /// Returns `Err(conflict)` when a (domain, route_by_http_user) pair is
+    /// already routed to a different proxy — same conflict rule as Go's
+    /// `Routers.Add` (`exist(domain, location, httpUser)`); a domain MAY
+    /// carry multiple route_by_http_user buckets from different proxies.
+    /// Every domain is validated BEFORE any insert, so a rejected
+    /// registration leaves no partial state — mirroring the VHost manager.
+    /// Previously the result was ignored and the last registration
     /// silently overwrote the first (audit finding 5), which meant closing
     /// the overwriting proxy deleted the live sibling's route.
+    #[allow(clippy::too_many_arguments)] // mirrors VhostManager::register (same route tuple)
     pub async fn register(
         &self,
         proxy_name: &str,
@@ -61,6 +76,7 @@ impl TcpMuxManager {
         run_id: &str,
         http_user: &str,
         http_pwd: &str,
+        route_by_http_user: &str,
         _headers: &[(String, String)],
     ) -> Result<(), String> {
         let route = TcpMuxRoute {
@@ -68,6 +84,7 @@ impl TcpMuxManager {
             run_id: run_id.to_string(),
             http_user: http_user.to_string(),
             http_pwd: http_pwd.to_string(),
+            route_by_http_user: route_by_http_user.to_string(),
         };
 
         let mut routes = self.routes.write().await;
@@ -82,13 +99,16 @@ impl TcpMuxManager {
 
         // Validate every domain before inserting anything (no partial state).
         // Re-registration by the same proxy name is allowed (idempotent).
+        // Conflict is per (domain, route_by_http_user) — Go `exist()`.
         for domain in &domains {
-            if let Some(existing) = routes.get(domain) {
-                if existing.proxy_name != proxy_name {
-                    return Err(format!(
-                        "tcpmux route conflict for domain '{}': proxy '{}' vs '{}'",
-                        domain, existing.proxy_name, proxy_name
-                    ));
+            if let Some(user_map) = routes.get(domain) {
+                if let Some(existing) = user_map.get(route_by_http_user) {
+                    if existing.proxy_name != proxy_name {
+                        return Err(format!(
+                            "tcpmux route conflict for domain '{}' (route_by_http_user '{}'): proxy '{}' vs '{}'",
+                            domain, route_by_http_user, existing.proxy_name, proxy_name
+                        ));
+                    }
                 }
             }
         }
@@ -102,25 +122,36 @@ impl TcpMuxManager {
         // sibling's live route survives.
         if let Some(old) = by_proxy.get(proxy_name) {
             for domain in old {
-                if !domains.contains(domain)
-                    && routes
-                        .get(domain)
-                        .is_some_and(|r| r.proxy_name == proxy_name)
-                {
-                    if domain.starts_with("*.") {
-                        self.wildcard_count
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if !domains.contains(domain) {
+                    if let Some(user_map) = routes.get_mut(domain) {
+                        if user_map
+                            .get(route_by_http_user)
+                            .is_some_and(|r| r.proxy_name == proxy_name)
+                        {
+                            user_map.remove(route_by_http_user);
+                            if user_map.is_empty() {
+                                routes.remove(domain);
+                                if domain.starts_with("*.") {
+                                    self.wildcard_count
+                                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
                     }
-                    routes.remove(domain);
                 }
             }
         }
 
         let mut domains_for_proxy = Vec::new();
         for domain in &domains {
+            let user_map = routes.entry(domain.clone()).or_default();
             // insert returns the overwritten route: a re-registration of the
-            // same domain by the same proxy must not double-count the wildcard.
-            if routes.insert(domain.clone(), route.clone()).is_none() && domain.starts_with("*.") {
+            // same (domain, route_by_http_user) by the same proxy must not
+            // double-count the wildcard.
+            let fresh = user_map
+                .insert(route_by_http_user.to_string(), route.clone())
+                .is_none();
+            if fresh && domain.starts_with("*.") {
                 self.wildcard_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -144,28 +175,34 @@ impl TcpMuxManager {
 
         if let Some(domains) = by_proxy.remove(proxy_name) {
             for domain in &domains {
-                if routes
-                    .get(domain)
-                    .is_some_and(|r| r.proxy_name == proxy_name)
-                {
-                    // Same guard as the removal: only count down routes this
-                    // proxy actually owned (a sibling's `*.` route pointing at
-                    // the same domain must keep its count).
-                    if domain.starts_with("*.") {
-                        self.wildcard_count
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(user_map) = routes.get_mut(domain) {
+                    // Remove every bucket this proxy owned (a proxy has one
+                    // route_by_http_user, but keep the loop general).
+                    let before = user_map.len();
+                    user_map.retain(|_, r| r.proxy_name != proxy_name);
+                    if user_map.is_empty() {
+                        routes.remove(domain);
+                        // Same guard as the removal: only count down routes
+                        // this proxy actually owned (a sibling's `*.` route
+                        // pointing at the same domain keeps its count).
+                        if domain.starts_with("*.") && before > 0 {
+                            self.wildcard_count
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
-                    routes.remove(domain);
                 }
             }
         }
     }
 
     /// Look up by hostname with wildcard fallback (Go frp vhost.Muxer →
-    /// getByRoute): exact match, then progressively replace the leftmost
-    /// label with "*" while >=3 labels remain, then the "*" catch-all.
-    /// Port-stripped, trailing-dot-trimmed, case-insensitive.
-    pub async fn lookup(&self, host: &str) -> Option<TcpMuxRoute> {
+    /// getByRoute → getExactOrAllUsersLocked): exact match, then
+    /// progressively replace the leftmost label with "*" while >=3 labels
+    /// remain, then the "*" catch-all. Each candidate domain tries the
+    /// request's Proxy-Authorization username bucket first, then the ""
+    /// (all-users) bucket. Port-stripped, trailing-dot-trimmed,
+    /// case-insensitive.
+    pub async fn lookup(&self, host: &str, http_user: &str) -> Option<TcpMuxRoute> {
         // Strip port if present: example.com:443 → example.com; bracketed
         // IPv6: [::1]:443 → ::1; then exactly one trailing dot (Go frp
         // CanonicalHost, pkg/util/http/http.go).
@@ -187,9 +224,21 @@ impl TcpMuxManager {
         };
 
         let routes = self.routes.read().await;
+        // Exact user bucket, then the "" (all-users) fallback — Go
+        // getExactOrAllUsersLocked. A route registered with a
+        // route_by_http_user only matches requests carrying that exact
+        // Proxy-Authorization username.
+        let try_buckets = |user_map: &HashMap<String, TcpMuxRoute>| -> Option<TcpMuxRoute> {
+            user_map
+                .get(http_user)
+                .or_else(|| user_map.get(""))
+                .cloned()
+        };
         // 1. Exact match
-        if let Some(route) = routes.get(host_key) {
-            return Some(route.clone());
+        if let Some(user_map) = routes.get(host_key) {
+            if let Some(route) = try_buckets(user_map) {
+                return Some(route);
+            }
         }
         // 2. Replace the leftmost label with "*" progressively. Only for
         //    hosts with >=3 labels (Go's `for len(hostSplit) >= 3` —
@@ -205,14 +254,16 @@ impl TcpMuxManager {
             while parts.len() > 2 {
                 parts[0] = "*";
                 let wildcard_host = parts.join(".");
-                if let Some(route) = routes.get(&wildcard_host) {
-                    return Some(route.clone());
+                if let Some(user_map) = routes.get(&wildcard_host) {
+                    if let Some(route) = try_buckets(user_map) {
+                        return Some(route);
+                    }
                 }
                 parts.remove(0);
             }
         }
         // 3. Catch-all "*"
-        routes.get("*").cloned()
+        routes.get("*").and_then(try_buckets)
     }
 }
 
@@ -329,20 +380,38 @@ pub async fn run_tcpmux_listener(
                 }
             };
 
+            // Go net/http readRequest: `len(req.Header["Host"]) > 1` →
+            // 400 "too many Host headers" (RFC 7230 §5.4). Applies even
+            // when the CONNECT authority ignores the header for routing —
+            // the duplicate check runs before any routing (round 6, LOW
+            // A9; counting semantics shared with the vhost path).
+            if crate::vhost::count_host_headers(&request_text) > 1 {
+                warn!(peer = %peer, "TCPMux: too many Host headers from {}", peer);
+                if let Err(e) = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await {
+                    tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
+                }
+                return;
+            }
+
             debug!(
                 target = %target, host = %host, peer = %peer,
                 "TCPMux CONNECT target='{}' host='{}' from {}",
                 target, host, peer
             );
 
-            // Look up route
-            let route = match state.tcpmux_manager.lookup(&host).await {
+            // Look up route (A2: the request's Proxy-Authorization username
+            // is the second routing dimension — Go `getExactOrAllUsersLocked`
+            // tries the exact user bucket, then the "" all-users bucket).
+            let http_user = extract_proxy_auth(&request_text)
+                .map(|(u, _)| u)
+                .unwrap_or_default();
+            let route = match state.tcpmux_manager.lookup(&host, &http_user).await {
                 Some(r) => r,
                 None => {
                     warn!(
-                        host = %host, peer = %peer,
-                        "TCPMux: no route for host '{}' from {}",
-                        host, peer
+                        host = %host, http_user = %http_user, peer = %peer,
+                        "TCPMux: no route for host '{}' (http_user '{}') from {}",
+                        host, http_user, peer
                     );
                     crate::vhost::write_http_error(
                         &mut stream,
@@ -508,6 +577,18 @@ fn canonicalize_host(host: &str, strict_port: bool) -> Option<&str> {
         // "]:port" is portless in Go too (hasPort false) and stays
         // bracketed — unroutable.
         let end = host.find(']')?;
+        // Round 6 (A5): Go SplitHostPort brackets the FIRST '[' to the
+        // LAST ']' — "[::1]x]:8080" → host "::1]x" (unroutable). The ']'
+        // must be immediately followed by ':'; when it is not, strict
+        // mode 400s (url.ParseRequestURI rejects a mis-bracketed
+        // authority on the CONNECT line) and lenient mode routes the raw
+        // value — same unroutable 404 as Go's "::1]x".
+        if !host[end + 1..].starts_with(':') {
+            if strict_port {
+                return None;
+            }
+            return Some(trim_trailing_dot(host));
+        }
         let port = &host[end + 2..];
         if strict_port && !port.is_empty() && !port.bytes().all(|b| b.is_ascii_digit()) {
             return None;
@@ -562,9 +643,10 @@ fn extract_route_host(request: &str) -> Option<&str> {
     // target slot) errors the whole ReadRequest regardless of any Host
     // header → 400. Tab-separated versions merge into the target token
     // and fail the authority parse below (Go's space-only split makes the
-    // whole line malformed). The version must be exactly "HTTP/1.x"
-    // (parseProtoVersion: major 1, numeric minor) — "HTTP/2", "garbage",
-    // and 4-token lines (version + trailing junk) all error in Go.
+    // whole line malformed). The version must be the exact 8-char shape
+    // "HTTP/X.Y" (ParseHTTPVersion; "HTTP/2.0" is accepted, "HTTP/1.10"
+    // rejected — see is_valid_version) — "HTTP/2", "garbage", and 4-token
+    // lines (version + trailing junk) all error in Go.
     let mut parts = first_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -591,18 +673,20 @@ fn extract_route_host(request: &str) -> Option<&str> {
     canonicalize_host(target, true)
 }
 
-/// Go net/http parseProtoVersion: exactly "HTTP/" + numeric major +
-/// "." + numeric minor, with major 1 ("HTTP/2.0" is unsupported by the
-/// server). Any other shape — trailing junk included — errors the
-/// ReadRequest.
+/// Go net/http ParseHTTPVersion (Go 1.25): exactly 8 chars "HTTP/X.Y"
+/// with single-digit major and minor. "HTTP/1.10" (9 chars), "HTTP/1.x",
+/// and "HTTP/11.0" all fail the shape → malformed → caller replies 400.
+/// NOTE: "HTTP/2.0" parses fine and is accepted — tcpmux uses
+/// http.ReadRequest (client-side parse), which has NO ProtoMajor gate
+/// (the 505 gate is http.Server-specific and does not apply here; the
+/// vhost path has its own, see vhost.rs A7). The round-5 comment claiming
+/// "major 1" was wrong, verified against Go 1.25.0 stdlib source.
 fn is_valid_version(version: &str) -> bool {
-    let Some(rest) = version.strip_prefix("HTTP/") else {
+    if version.len() != 8 || !version.starts_with("HTTP/") {
         return false;
-    };
-    let Some((maj, min)) = rest.split_once('.') else {
-        return false;
-    };
-    maj == "1" && !min.is_empty() && min.bytes().all(|b| b.is_ascii_digit())
+    }
+    let b = version.as_bytes();
+    b[5].is_ascii_digit() && b[6] == b'.' && b[7].is_ascii_digit()
 }
 
 /// Extract Proxy-Authorization Basic credentials.
@@ -776,28 +860,62 @@ mod tests {
         assert_eq!(extract_proxy_auth(req), None);
     }
 
+    #[test]
+    fn test_is_valid_version_go_parse_http_version_shape() {
+        // Go 1.25 ParseHTTPVersion: exactly 8 chars "HTTP/X.Y", digits.
+        assert!(is_valid_version("HTTP/1.1"));
+        assert!(is_valid_version("HTTP/1.0"));
+        assert!(is_valid_version("HTTP/0.9"));
+        assert!(is_valid_version("HTTP/2.0")); // parse accepts; no server gate on ReadRequest
+        assert!(!is_valid_version("HTTP/1.10")); // 9 chars — malformed
+        assert!(!is_valid_version("HTTP/1.")); // 7 chars
+        assert!(!is_valid_version("HTTP/1.x"));
+        assert!(!is_valid_version("HTTP/11.0"));
+        assert!(!is_valid_version("HTTP/1"));
+        assert!(!is_valid_version("garbage"));
+        assert!(!is_valid_version(""));
+    }
+
+    #[test]
+    fn test_canonicalize_host_bracket_requires_colon_after_close() {
+        // A5: "[::1]x]:8080" is NOT a bracket form — Go SplitHostPort
+        // yields host "::1]x" (unroutable), not "::1".
+        assert_eq!(canonicalize_host("[::1]:8080", false), Some("::1"));
+        assert_eq!(
+            canonicalize_host("[::1]x]:8080", false),
+            Some("[::1]x]:8080")
+        );
+        // strict mode (CONNECT line): mis-bracketed → 400 (None).
+        assert_eq!(canonicalize_host("[::1]x]:8080", true), None);
+        assert_eq!(canonicalize_host("[::1]:8080", true), Some("::1"));
+        // "[]:extra" — empty bracketed host + junk port: colons==1 splits
+        // to host "[]" (unroutable); strict rejects the non-numeric port.
+        assert_eq!(canonicalize_host("[]:extra", false), Some("[]"));
+        assert_eq!(canonicalize_host("[]:extra", true), None);
+    }
+
     #[tokio::test]
     async fn test_tcpmux_manager_register_lookup_unregister() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
             .await
             .expect("first registration must succeed");
 
         // Exact match
-        let r = mgr.lookup("a.example.com").await.unwrap();
+        let r = mgr.lookup("a.example.com", "").await.unwrap();
         assert_eq!(r.proxy_name, "p1");
 
         // With port
-        let r = mgr.lookup("a.example.com:443").await.unwrap();
+        let r = mgr.lookup("a.example.com:443", "").await.unwrap();
         assert_eq!(r.proxy_name, "p1");
 
         // No match
-        assert!(mgr.lookup("other.example.com").await.is_none());
+        assert!(mgr.lookup("other.example.com", "").await.is_none());
 
         // Unregister
         mgr.unregister("p1").await;
-        assert!(mgr.lookup("a.example.com").await.is_none());
+        assert!(mgr.lookup("a.example.com", "").await.is_none());
     }
 
     /// Go frp compat (pkg/util/vhost/router.go): tcpmux domains are stored
@@ -814,6 +932,7 @@ mod tests {
             "run-1",
             "",
             "",
+            "",
             &[],
         )
         .await
@@ -828,7 +947,7 @@ mod tests {
             "MixedCase.Example.com:443",
         ] {
             let r = mgr
-                .lookup(host)
+                .lookup(host, "")
                 .await
                 .unwrap_or_else(|| panic!("lookup for '{host}' must resolve"));
             assert_eq!(r.proxy_name, "p1");
@@ -843,6 +962,7 @@ mod tests {
                 "run-2",
                 "",
                 "",
+                "",
                 &[],
             )
             .await
@@ -855,7 +975,7 @@ mod tests {
         // Unregister removes the route regardless of the original casing
         // (by_proxy bookkeeping holds the same lowered keys).
         mgr.unregister("p1").await;
-        assert!(mgr.lookup("mixedcase.example.com").await.is_none());
+        assert!(mgr.lookup("mixedcase.example.com", "").await.is_none());
     }
 
     #[tokio::test]
@@ -868,18 +988,19 @@ mod tests {
             "run-1",
             "",
             "",
+            "",
             &[],
         )
         .await
         .expect("registration must succeed");
 
-        assert!(mgr.lookup("a.example.com").await.is_some());
-        assert!(mgr.lookup("b.example.com").await.is_some());
-        assert!(mgr.lookup("c.example.com").await.is_none());
+        assert!(mgr.lookup("a.example.com", "").await.is_some());
+        assert!(mgr.lookup("b.example.com", "").await.is_some());
+        assert!(mgr.lookup("c.example.com", "").await.is_none());
 
         mgr.unregister("p1").await;
-        assert!(mgr.lookup("a.example.com").await.is_none());
-        assert!(mgr.lookup("b.example.com").await.is_none());
+        assert!(mgr.lookup("a.example.com", "").await.is_none());
+        assert!(mgr.lookup("b.example.com", "").await.is_none());
     }
 
     /// Go frp v0.71.0 compat (vhost.Muxer → getByRoute): tcpmux lookup
@@ -888,30 +1009,87 @@ mod tests {
     async fn test_tcpmux_lookup_wildcard_leftmost_label() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["*.example.com".into()], "run-1", "", "", &[])
+        mgr.register("p1", &["*.example.com".into()], "run-1", "", "", "", &[])
             .await
             .expect("registration must succeed");
 
         // Any host under the wildcard matches.
         assert!(mgr
-            .lookup("a.example.com")
+            .lookup("a.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p1"));
         assert!(mgr
-            .lookup("a.b.example.com")
+            .lookup("a.b.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p1"));
         // Two-label hosts never match the wildcard (Go's >=3-label guard
         // keeps `*.com` from matching `example.com`).
-        assert!(mgr.lookup("example.com").await.is_none());
+        assert!(mgr.lookup("example.com", "").await.is_none());
         // Unrelated suffixes stay misses.
-        assert!(mgr.lookup("a.example.net").await.is_none());
+        assert!(mgr.lookup("a.example.net", "").await.is_none());
+    }
+
+    /// Go frp v0.71.0 compat (RouteConfig.RouteByHTTPUser +
+    /// getExactOrAllUsersLocked, round 6 A2): route_by_http_user is a
+    /// second routing dimension. A request only matches the bucket whose
+    /// route_by_http_user equals its Proxy-Authorization username; the ""
+    /// (all-users) bucket is the fallback. Same domain can host both.
+    #[tokio::test]
+    async fn test_tcpmux_lookup_route_by_http_user() {
+        let mgr = TcpMuxManager::new();
+
+        mgr.register(
+            "p1",
+            &["example.com".into()],
+            "run-1",
+            "u1",
+            "p1",
+            "team-a",
+            &[],
+        )
+        .await
+        .expect("p1 registration must succeed");
+        mgr.register("p2", &["example.com".into()], "run-2", "", "", "", &[])
+            .await
+            .expect("p2 registration must succeed (different rubu bucket)");
+
+        // Same-domain different-rubu buckets coexist (Go exist() is per
+        // (domain, httpUser)) — but a same-rubu claim conflicts.
+        let err = mgr
+            .register(
+                "p3",
+                &["example.com".into()],
+                "run-3",
+                "",
+                "",
+                "team-a",
+                &[],
+            )
+            .await
+            .expect_err("same (domain, rubu) claim must conflict");
+        assert!(err.contains("team-a"), "conflict names the rubu: {err}");
+
+        // Request user "alice" misses the "team-a" bucket, falls to "" (p2).
+        let r = mgr.lookup("example.com", "alice").await.unwrap();
+        assert_eq!(r.proxy_name, "p2");
+        // Request user "team-a" hits the exact bucket (p1).
+        let r = mgr.lookup("example.com", "team-a").await.unwrap();
+        assert_eq!(r.proxy_name, "p1");
+        // No auth at all → "" fallback.
+        let r = mgr.lookup("example.com", "").await.unwrap();
+        assert_eq!(r.proxy_name, "p2");
+
+        // Unregister p1 removes only its bucket; p2's "" bucket survives.
+        mgr.unregister("p1").await;
+        let r = mgr.lookup("example.com", "team-a").await.unwrap();
+        assert_eq!(r.proxy_name, "p2");
+        assert!(mgr.lookup("example.com", "alice").await.is_some());
     }
 
     #[tokio::test]
     async fn test_tcpmux_lookup_wildcard_catch_all() {
         let mgr = TcpMuxManager::new();
-        mgr.register("p1", &["*".into()], "run-1", "", "", &[])
+        mgr.register("p1", &["*".into()], "run-1", "", "", "", &[])
             .await
             .expect("catch-all registration must succeed");
 
@@ -922,7 +1100,9 @@ mod tests {
             "localhost:8080",
         ] {
             assert!(
-                mgr.lookup(host).await.is_some_and(|r| r.proxy_name == "p1"),
+                mgr.lookup(host, "")
+                    .await
+                    .is_some_and(|r| r.proxy_name == "p1"),
                 "catch-all must match '{host}'"
             );
         }
@@ -932,25 +1112,25 @@ mod tests {
     async fn test_tcpmux_lookup_exact_beats_wildcard() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
             .await
             .expect("exact registration must succeed");
-        mgr.register("p2", &["*.example.com".into()], "run-2", "", "", &[])
+        mgr.register("p2", &["*.example.com".into()], "run-2", "", "", "", &[])
             .await
             .expect("wildcard registration must succeed");
 
         // Exact match wins; the wildcard catches everything else under the
         // domain, including deeper hosts (leftmost-label walk).
         assert!(mgr
-            .lookup("a.example.com")
+            .lookup("a.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p1"));
         assert!(mgr
-            .lookup("b.example.com")
+            .lookup("b.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p2"));
         assert!(mgr
-            .lookup("x.y.example.com")
+            .lookup("x.y.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p2"));
     }
@@ -962,20 +1142,20 @@ mod tests {
     #[tokio::test]
     async fn test_tcpmux_lookup_trailing_dot() {
         let mgr = TcpMuxManager::new();
-        mgr.register("p1", &["example.com".into()], "run-1", "", "", &[])
+        mgr.register("p1", &["example.com".into()], "run-1", "", "", "", &[])
             .await
             .expect("registration must succeed");
 
         assert!(mgr
-            .lookup("example.com.")
+            .lookup("example.com.", "")
             .await
             .is_some_and(|r| r.proxy_name == "p1"));
         assert!(mgr
-            .lookup("example.com.:443")
+            .lookup("example.com.:443", "")
             .await
             .is_some_and(|r| r.proxy_name == "p1"));
         // Two trailing dots: only one is trimmed → no route.
-        assert!(mgr.lookup("example.com..").await.is_none());
+        assert!(mgr.lookup("example.com..", "").await.is_none());
     }
 
     /// Regression test for audit finding 5: a second proxy claiming an
@@ -986,12 +1166,12 @@ mod tests {
     async fn test_tcpmux_manager_conflict_rejects_second_proxy() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
             .await
             .expect("first registration must succeed");
 
         let err = mgr
-            .register("p2", &["a.example.com".into()], "run-2", "", "", &[])
+            .register("p2", &["a.example.com".into()], "run-2", "", "", "", &[])
             .await
             .expect_err("conflicting domain must be rejected");
         assert!(
@@ -1001,16 +1181,16 @@ mod tests {
 
         // The first proxy's route is intact; the second never registered.
         assert!(mgr
-            .lookup("a.example.com")
+            .lookup("a.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p1"));
 
         // Same-name re-registration is idempotent (allowed).
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
             .await
             .expect("same-proxy re-registration must succeed");
         assert!(mgr
-            .lookup("a.example.com")
+            .lookup("a.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p1"));
     }
@@ -1022,7 +1202,7 @@ mod tests {
     async fn test_tcpmux_unregister_keeps_foreign_route() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
             .await
             .expect("registration must succeed");
 
@@ -1030,15 +1210,19 @@ mod tests {
         // to p2, and p2's by_proxy entry also lists the domain.
         {
             let mut routes = mgr.routes.write().await;
-            routes.insert(
-                "a.example.com".to_string(),
-                TcpMuxRoute {
-                    proxy_name: "p2".to_string(),
-                    run_id: "run-2".to_string(),
-                    http_user: String::new(),
-                    http_pwd: String::new(),
-                },
-            );
+            routes
+                .entry("a.example.com".to_string())
+                .or_default()
+                .insert(
+                    String::new(),
+                    TcpMuxRoute {
+                        proxy_name: "p2".to_string(),
+                        run_id: "run-2".to_string(),
+                        http_user: String::new(),
+                        http_pwd: String::new(),
+                        route_by_http_user: String::new(),
+                    },
+                );
             mgr.by_proxy
                 .write()
                 .await
@@ -1047,14 +1231,14 @@ mod tests {
 
         mgr.unregister("p1").await;
         assert!(
-            mgr.lookup("a.example.com")
+            mgr.lookup("a.example.com", "")
                 .await
                 .is_some_and(|r| r.proxy_name == "p2"),
             "p1's unregister must not delete p2's live route"
         );
 
         mgr.unregister("p2").await;
-        assert!(mgr.lookup("a.example.com").await.is_none());
+        assert!(mgr.lookup("a.example.com", "").await.is_none());
     }
 
     /// The wildcard fast-exit count stays symmetric across register,
@@ -1072,6 +1256,7 @@ mod tests {
             "run-1",
             "",
             "",
+            "",
             &[],
         )
         .await
@@ -1085,6 +1270,7 @@ mod tests {
             "run-1",
             "",
             "",
+            "",
             &[],
         )
         .await
@@ -1093,44 +1279,56 @@ mod tests {
 
         // A wildcard lookup hits the registered route.
         assert!(mgr
-            .lookup("x.wild.example.com")
+            .lookup("x.wild.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p1"));
 
         // Shrunken re-registration (server reload drops the wildcard):
         // the route and its count must leave the map.
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
             .await
             .expect("shrunken re-registration must succeed");
         assert_eq!(mgr.wildcard_count.load(Ordering::Relaxed), 0);
-        assert!(mgr.lookup("x.wild.example.com").await.is_none());
+        assert!(mgr.lookup("x.wild.example.com", "").await.is_none());
 
         // unregister decrements on the route the proxy still owns.
         mgr.unregister("p1").await;
-        assert!(mgr.lookup("a.example.com").await.is_none());
+        assert!(mgr.lookup("a.example.com", "").await.is_none());
 
         // A wildcard route owned by a DIFFERENT proxy (legacy by_proxy
         // state) keeps both the route and the count through p1's
         // unregister.
-        mgr.register("p1", &["*.shared.example.com".into()], "run-1", "", "", &[])
-            .await
-            .expect("registration must succeed");
+        mgr.register(
+            "p1",
+            &["*.shared.example.com".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            &[],
+        )
+        .await
+        .expect("registration must succeed");
         {
             let mut routes = mgr.routes.write().await;
-            routes.insert(
-                "*.shared.example.com".to_string(),
-                TcpMuxRoute {
-                    proxy_name: "p2".to_string(),
-                    run_id: "run-2".to_string(),
-                    http_user: String::new(),
-                    http_pwd: String::new(),
-                },
-            );
+            routes
+                .entry("*.shared.example.com".to_string())
+                .or_default()
+                .insert(
+                    String::new(),
+                    TcpMuxRoute {
+                        proxy_name: "p2".to_string(),
+                        run_id: "run-2".to_string(),
+                        http_user: String::new(),
+                        http_pwd: String::new(),
+                        route_by_http_user: String::new(),
+                    },
+                );
         }
         mgr.unregister("p1").await;
         assert_eq!(mgr.wildcard_count.load(Ordering::Relaxed), 1);
         assert!(mgr
-            .lookup("x.shared.example.com")
+            .lookup("x.shared.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p2"));
     }

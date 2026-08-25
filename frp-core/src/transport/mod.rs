@@ -1338,7 +1338,11 @@ fn parse_proxy_url(url: &str) -> Result<(&str, Option<(&str, &str)>, &str, u16),
 
 /// Connect to the server with the given options.
 pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
-    #[cfg(any(feature = "tls", feature = "websocket"))]
+    // Round 6: was `any(tls, websocket)` — websocket-only builds warned
+    // unused (every write_all call site sits inside a `cfg(feature =
+    // "tls")` branch; the unconditional TCP branch guarantees use whenever
+    // tls is on).
+    #[cfg(feature = "tls")]
     use tokio::io::AsyncWriteExt;
 
     // Resolve server_addr via custom DNS server if configured.
@@ -1385,9 +1389,12 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             if opts.tls_enable {
                 #[cfg(not(feature = "tls"))]
                 {
-                    Err(crate::Error::Transport(
+                    // Round 6: missing `return` — e.g. `--features kcp` (no
+                    // tls) fell through to the function tail instead of
+                    // failing (E0308 in the feature-matrix check).
+                    return Err(crate::Error::Transport(
                         "TLS support not compiled (enable the 'tls' feature)".into(),
-                    ))
+                    ));
                 }
                 #[cfg(feature = "tls")]
                 {
@@ -1479,9 +1486,12 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             if opts.tls_enable {
                 #[cfg(not(feature = "tls"))]
                 {
-                    Err(crate::Error::Transport(
+                    // Round 6: missing `return` — e.g. `--features kcp` (no
+                    // tls) fell through to the function tail instead of
+                    // failing (E0308 in the feature-matrix check).
+                    return Err(crate::Error::Transport(
                         "TLS support not compiled (enable the 'tls' feature)".into(),
-                    ))
+                    ));
                 }
                 #[cfg(feature = "tls")]
                 {

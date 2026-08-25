@@ -46,6 +46,29 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
         ("vnet_mtu", p.vnet_mtu.to_string()),
         ("advertise_subnet", p.advertise_subnet.clone()),
         ("virtual_net", p.virtual_net.clone()),
+        // Round 6 (MEDIUM C1): health_check_* fields — a reload that only
+        // changes health parameters (e.g. interval/max_failed) must not
+        // hit the "no changes detected" early return and skip the health
+        // restart. health_check_http_headers included (reload restarts
+        // the health task on any health-field diff).
+        ("health_check_type", p.health_check_type.clone()),
+        ("health_check_url", p.health_check_url.clone()),
+        (
+            "health_check_http_headers",
+            format!("{:?}", p.health_check_http_headers),
+        ),
+        (
+            "health_check_interval_seconds",
+            p.health_check_interval_seconds.to_string(),
+        ),
+        (
+            "health_check_timeout_seconds",
+            p.health_check_timeout_seconds.to_string(),
+        ),
+        (
+            "health_check_max_failed",
+            p.health_check_max_failed.to_string(),
+        ),
     ];
 
     // Plugin fields — needed for detecting plugin config changes during reload

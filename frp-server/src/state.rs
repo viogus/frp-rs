@@ -689,6 +689,23 @@ impl ReplayTable {
             }
             self.total -= self.map.remove(&k).map_or(0, |v| v.len());
         }
+        // Round 6 (LOW B7): FUTURE timestamps sort to the map tail and
+        // were never pruned — an attacker recording now+window keys would
+        // park entries that outlive every legitimate one, pushing real
+        // keys toward the global cap's eviction order and shrinking their
+        // dedup coverage. Prune anything ahead of now in each precision
+        // domain. Anything further than `timeout` ahead is already
+        // rejected by validate_timestamp_freshness before record; a
+        // slightly-ahead key from a fast client clock costs only its own
+        // dedup coverage (the login itself is unaffected).
+        let future_s = (now_ms / 1000).saturating_add(1);
+        let future_ms = now_ms.saturating_add(1);
+        while let Some((&k, _)) = self.map.range(future_s..MS_EPOCH).next() {
+            self.total -= self.map.remove(&k).map_or(0, |v| v.len());
+        }
+        while let Some((&k, _)) = self.map.range(future_ms..).next() {
+            self.total -= self.map.remove(&k).map_or(0, |v| v.len());
+        }
         before - self.total
     }
 
@@ -1016,8 +1033,12 @@ impl AppState {
     /// Returns true if the login should be allowed, false if throttled.
     ///
     /// This method atomically checks AND reserves an attempt slot within
-    /// a single lock hold. Unlike the old two-phase design, this counts ALL
-    /// login attempts (both successes and failures) against the window.
+    /// a single lock hold. Counts FAILED login attempts only — the sole
+    /// caller is `throttled_login_error` (login.rs), which runs on failure
+    /// paths (bad token, replay, OIDC reject). Successful logins never
+    /// consume a slot, so a legitimate frpc reconnect loop is never
+    /// throttled (round 6, finding B9: the comment previously claimed
+    /// "counts ALL login attempts" — wrong; verified against call sites).
     /// This is acceptable because:
     /// - A successful login means the attacker knew the token — they don't
     ///   need to brute-force.
@@ -1084,6 +1105,39 @@ impl AppState {
         }
         *count += 1; // Reserve this attempt atomically
         true
+    }
+
+    /// Pure throttle check (no slot consumed, no mutation): is this IP
+    /// currently inside its throttle window?
+    ///
+    /// Used BEFORE auth runs (round 6, MEDIUM B5) so an already-throttled
+    /// brute-force IP is rejected without paying the CPU cost of a full
+    /// MD5 / OIDC JWT verify per attempt. Mirrors `check_login_throttle`
+    /// window semantics: main table 5 per 60s, overflow bucket 50 per 60s.
+    /// Lock order matches `check_login_throttle` (main table dropped before
+    /// overflow) — no nested acquisition.
+    pub async fn is_login_throttled(&self, addr: Option<std::net::SocketAddr>) -> bool {
+        let Some(addr) = addr else {
+            return false; // no peer address → cannot throttle
+        };
+        let ip = addr.ip();
+        let now = std::time::Instant::now();
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+        {
+            let throttle = self.login_throttle.lock().await;
+            if let Some((count, window_start)) = throttle.get(&ip) {
+                if now.duration_since(*window_start) <= WINDOW && *count >= 5 {
+                    return true;
+                }
+            }
+        }
+        let overflow = self.login_throttle_overflow.lock().await;
+        if let Some((count, window_start)) = overflow.get(&ip) {
+            if now.duration_since(*window_start) <= WINDOW && *count >= 50 {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get or create the per-run_id serialization mutex.
@@ -1553,6 +1607,34 @@ mod tests {
             ReplayCheck::Admitted,
             "non-duplicate logins still admitted at the cap"
         );
+    }
+
+    #[test]
+    fn replay_table_prunes_future_timestamps() {
+        // Round 6 (LOW B7): timestamps ahead of now sort to the map tail
+        // and must be pruned, not parked where they squeeze legitimate
+        // entries in the global cap's eviction order. (Keys further ahead
+        // than the freshness window never reach record — the login is
+        // rejected first.)
+        let mut t = ReplayTable::new();
+        let now_ms = 2_000_000_000_000i64; // epoch-ms anchor
+        let now_s = now_ms / 1000;
+        // stale (age-pruned, beyond the 10s window), live (kept), future
+        // (B7-pruned)
+        t.record(now_ms - 15_000, "old");
+        t.record(now_ms, "live");
+        t.record(now_ms + 3000, "future");
+        let pruned = t.prune_expired(now_ms, 10);
+        assert_eq!(pruned, 2, "stale + future key pruned");
+        assert_eq!(t.total(), 1);
+        assert!(t.map.contains_key(&now_ms));
+        // Seconds domain (Go frpc keys) gets the same tail treatment.
+        let mut t2 = ReplayTable::new();
+        t2.record(now_s, "live-s");
+        t2.record(now_s + 5, "future-s");
+        t2.prune_expired(now_ms, 10);
+        assert_eq!(t2.total(), 1);
+        assert!(t2.map.contains_key(&now_s));
     }
 
     #[test]

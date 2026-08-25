@@ -176,6 +176,30 @@ async fn verify_login_auth(
         );
     }
 
+    // Round 6 (MEDIUM B5): reject an already-throttled IP BEFORE auth —
+    // a brute-force flood of bad tokens must not pay full MD5 / OIDC JWT
+    // verify CPU per attempt. Pure check (no slot consumed): the failure
+    // paths below still consume a slot via `throttled_login_error`, so a
+    // successful login never counts and window semantics are unchanged.
+    // Skipped for internal AlwaysAuthPass (bypass paths never throttle).
+    if !is_auth_bypass && state.is_login_throttled(peer).await {
+        warn!(
+            peer = ?peer,
+            "Login rejected pre-auth: IP already throttled",
+        );
+        send_login_error(
+            stream,
+            err_msg(
+                state.detailed_errors_to_client,
+                "login throttled: too many failed attempts".to_string(),
+                "login throttled",
+            ),
+            v2,
+        )
+        .await;
+        return Err(());
+    }
+
     let oidc_subject: Option<String> = if is_auth_bypass {
         None
     } else if let Some(ref verifier) = state.oidc.verifier {

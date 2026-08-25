@@ -786,14 +786,6 @@ impl Service {
                                             // peer that sends the magic bytes but no yamux frame
                                             // would otherwise park the task and conn_semaphore
                                             // permit indefinitely (slowloris).
-                                            let accept_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-                                            // Post-handshake reads (V2 handshake, first frame,
-                                            // V1 Login) get their own deadline: the 10s accept
-                                            // deadline covers only magic detection + yamux/TLS
-                                            // handshakes; a slow pre-Login OIDC JWT fetch must
-                                            // not be cut off at 10s, nor left unbounded.
-                                            let post_deadline = accept_deadline
-                                                .max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT);
                                             let peer = stream.peer_addr;
                                     let conv = stream.conv();
                                     tracing::debug!(peer = %peer, conv = conv, "KCP HANDLER: spawned");
@@ -824,6 +816,19 @@ impl Service {
                                         }
                                     };
                                     tracing::info!(peer = %peer, first_byte = ?format_args!("0x{:02x}", magic[0]), is_v2, "KCP: new session from {} (first_byte=0x{:02x}, is_v2={})", peer, magic[0], is_v2);
+
+                                    // Handshake deadlines are anchored AFTER the 30s magic read,
+                                    // not at handler start: a slow KCP peer spending T seconds
+                                    // on the magic read must not erode the post-handshake budget
+                                    // — the pre-Login OIDC JWT fetch via proxyURL needs the full
+                                    // 30s (QUIC anchors the same way).
+                                    let accept_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                                    // Post-handshake reads (V2 handshake, first frame, V1 Login)
+                                    // get their own deadline: the 10s accept deadline covers only
+                                    // yamux/TLS handshakes; a slow pre-Login OIDC JWT fetch must
+                                    // not be cut off at 10s, nor left unbounded.
+                                    let post_deadline = accept_deadline
+                                        .max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT);
 
                                     if is_v2 {
                                         // V2 path: ClientHello/ServerHello + first frame,
@@ -1009,6 +1014,12 @@ impl Service {
                                                     // or run out of data. Each read() returns one TLS
                                                     // record's plaintext; Go frpc sends a small prefix
                                                     // record (~12 bytes) then the Login record (~200 bytes).
+                                                    //
+                                                    // All reads share the ONE absolute post-handshake
+                                                    // deadline anchored before the loop: a peer that
+                                                    // drips 1 byte per TLS record must not get a fresh
+                                                    // 30s per read and hold the task + conn_semaphore
+                                                    // permit for ~17h (slowloris).
                                                     let v1_offset = loop {
                                                         if let Some(off) = find_v1(&scan_data) {
                                                             break Some(off);
@@ -1017,13 +1028,7 @@ impl Service {
                                                             break None;
                                                         }
                                                         let mut buf = vec![0u8; 1024];
-                                                        // Each read is bounded by POST_HANDSHAKE_READ_TIMEOUT
-                                                        // (30s): the 2 KiB cap bounds iterations only while data
-                                                        // flows, so a peer that stalls mid-scan must not park
-                                                        // the task and conn_semaphore permit indefinitely
-                                                        // (slowloris).
-                                                        let scan_deadline = accept_deadline.max(tokio::time::Instant::now() + crate::handlers::POST_HANDSHAKE_READ_TIMEOUT);
-                                                        match tokio::time::timeout_at(scan_deadline, ctl.read(&mut buf)).await {
+                                                        match tokio::time::timeout_at(post_deadline, ctl.read(&mut buf)).await {
                                                             Ok(Ok(n)) if n > 0 => {
                                                                 scan_data.extend_from_slice(&buf[..n]);
                                                             }

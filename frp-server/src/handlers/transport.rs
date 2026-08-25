@@ -11,14 +11,23 @@ use tracing::{info, warn};
 
 use frp_core::mux;
 #[cfg(feature = "websocket")]
-use frp_core::transport::{accept_websocket, accept_websocket_from_peeked};
+use frp_core::transport::accept_websocket;
 use frp_core::transport::{IoStream, PreReadStream};
+// Round 6 (feature-matrix cleanup): split cfg — `accept_websocket` is used
+// only from `handle_websocket_connection` (cfg websocket), while
+// `accept_websocket_from_peeked` (TLS+WS upgrade, transport.rs:297) and
+// `RwLockExt` (read_ok in `handle_tls_connection`, cfg tls) live inside the
+// TLS handler. The old `any(tls, websocket)` gates warned unused on a
+// websocket-only build (no tls → whole TLS handler configured out); the
+// WS-over-TLS call site needs BOTH features.
+#[cfg(all(feature = "tls", feature = "websocket"))]
+use frp_core::transport::accept_websocket_from_peeked;
 #[cfg(feature = "quic")]
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "quic")]
 use crate::control;
-#[cfg(any(feature = "tls", feature = "websocket"))]
+#[cfg(feature = "tls")]
 use crate::lock::RwLockExt;
 use crate::state::AppState;
 #[cfg(feature = "tls")]
@@ -1630,7 +1639,12 @@ where
 
 /// Run V2 handshake then read the first message frame. Returns `None` on error
 /// (already logged). `addr` is `None` for listeners that don't capture peer addr.
-#[cfg(feature = "websocket")]
+///
+/// Round 6 (LOW B4): the gate was websocket-only, but the QUIC accept path
+/// (transport.rs:1729) and all 8 KCP accept paths (service.rs) call this —
+/// `cargo check -p frp-server --no-default-features --features quic` failed
+/// to compile (E0425). Gate covers every calling transport.
+#[cfg(any(feature = "websocket", feature = "kcp", feature = "quic"))]
 pub(crate) async fn v2_handshake_and_read(
     io: &mut IoStream,
     addr: Option<std::net::SocketAddr>,

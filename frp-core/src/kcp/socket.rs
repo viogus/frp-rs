@@ -345,8 +345,15 @@ impl KcpSocket {
                     // stream exists (KcpStream::new increments before
                     // dial_kcp returns), so this condition is never
                     // observed while a stream is alive.
-                    if self.alive_streams.load(Ordering::Acquire) == 0
-                        && self.register_rx.is_closed()
+                    // Check closed FIRST (round 6, LOW C2): observing the
+                    // channel close happens-after every register send, and
+                    // every send happens-after its stream's increment, so
+                    // the subsequent Acquire read of alive_streams is
+                    // guaranteed to see the final count. Reading the counter
+                    // first could observe a stale 0 while a concurrent
+                    // KcpStream::new is mid-increment.
+                    if self.register_rx.is_closed()
+                        && self.alive_streams.load(Ordering::Acquire) == 0
                     {
                         tracing::debug!(
                             "KCP SOCKET: dial driver exiting (no live streams, register channel closed)"

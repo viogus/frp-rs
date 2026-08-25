@@ -77,7 +77,11 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, Notify};
+// Round 6 (feature-matrix cleanup): `watch` is used only inside
+// `xtcp_p2p_connect_yamux` (cfg tcp-mux) — a kcp-only build warned unused.
+#[cfg(feature = "tcp-mux")]
+use tokio::sync::watch;
 
 use crate::kcp::{KcpConfig, KcpSession};
 

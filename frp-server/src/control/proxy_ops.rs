@@ -715,14 +715,13 @@ async fn register_http_vhost(
 
     let locations: Vec<String> = np.locations.clone().unwrap_or_default();
 
-    // Always register HTTP proxies with VHost manager.
-    // If both domains and locations are empty, register with empty
-    // strings as catch-all routes (matches any host/path).
+    // Always register HTTP proxies with VHost manager. Round 6 (A8): an
+    // HTTP proxy with BOTH empty customDomains and empty locations
+    // registers NOTHING — Go's buildDomains yields an empty list and the
+    // register loop (`for _, domain := range domains`) never runs, so the
+    // proxy is unreachable. The old "" catch-all route (match any
+    // host/path) was NOT Go parity: it hijacked every unmatched request.
     let mut locations = locations;
-    if domains.is_empty() && locations.is_empty() {
-        domains.push(String::new()); // catch-all domain
-        locations.push(String::new()); // catch-all path
-    }
     let hhr = np.host_header_rewrite.as_deref().unwrap_or("");
     let http_user = np.http_user.as_deref().unwrap_or("");
     let http_pwd = np.http_pwd.as_deref().unwrap_or("");
@@ -1706,6 +1705,10 @@ pub(crate) async fn handle_new_proxy(
                         run_id,
                         http_user,
                         http_pwd,
+                        // Round 6 (A2): route_by_http_user is the second
+                        // tcpmux routing dimension (Go RouteConfig) — CONNECT
+                        // lookups match the request user's bucket first.
+                        np.route_by_http_user.as_deref().unwrap_or(""),
                         &np.headers
                             .clone()
                             .unwrap_or_default()
@@ -3299,7 +3302,7 @@ pub(crate) mod unregister_generation_tests {
         );
         assert!(state
             .tcpmux_manager
-            .lookup("a.example.com")
+            .lookup("a.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "mux-a"));
 
@@ -3331,7 +3334,7 @@ pub(crate) mod unregister_generation_tests {
         assert!(
             state
                 .tcpmux_manager
-                .lookup("a.example.com")
+                .lookup("a.example.com", "")
                 .await
                 .is_some_and(|r| r.proxy_name == "mux-a"),
             "live sibling's route must survive the rejected registration"
@@ -3386,7 +3389,7 @@ pub(crate) mod unregister_generation_tests {
         assert!(
             state
                 .tcpmux_manager
-                .lookup("app.example.com")
+                .lookup("app.example.com", "")
                 .await
                 .is_some_and(|r| r.proxy_name == "mux-sub"),
             "expanded subdomain route must be registered"
