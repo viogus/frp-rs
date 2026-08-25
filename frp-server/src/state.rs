@@ -1,5 +1,7 @@
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "vnet")]
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock};
@@ -583,6 +585,175 @@ impl HttpGroupController {
     }
 }
 
+// ---------------------------------------------------------------
+// Replay-detection table (login timestamp → run_ids)
+// ---------------------------------------------------------------
+
+/// Threshold separating seconds-precision (Go frpc) from
+/// milliseconds-precision (Rust frpc) login timestamps. Keys < this
+/// are seconds, keys >= this are milliseconds.
+pub const MS_EPOCH: i64 = 1_000_000_000_000;
+
+/// Cap on distinct run_ids recorded per timestamp in the replay-detection
+/// table. Bounds memory for a single timestamp key (a token-holder could
+/// otherwise inject unique run_ids within one second and grow the table
+/// without bound). On cap-hit the OLDEST run_id is evicted to admit the
+/// new one (F3) — rejecting on cap-hit would lock out a legitimate
+/// same-run_id reconnect at a flooded timestamp.
+pub const MAX_ENTRIES_PER_TIMESTAMP: usize = 100;
+
+/// Global cap on replay-detection table entries (defense-in-depth against
+/// token-reachable memory growth). On cap-hit whole oldest timestamp keys
+/// are evicted until under the cap (F4), so in-window timestamps keep
+/// their duplicate detection — the previous behavior degraded dedup to
+/// freshness-only for ALL clients.
+pub const MAX_TOTAL_REPLAY_ENTRIES: usize = 100_000;
+
+/// Outcome of recording a (timestamp, run_id) pair.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplayCheck {
+    /// New (ts, run_id) pair recorded — the login may proceed.
+    Admitted,
+    /// run_id already logged at an identical seconds-precision timestamp.
+    /// Go frpc reuses its run_id and sends seconds keys, so a reconnect
+    /// within the same wall-clock second is indistinguishable from a
+    /// replay; the caller admits it (the freshness window still bounds
+    /// real replays).
+    DuplicateSecondsPrecision,
+    /// run_id already logged at an identical ms-precision timestamp — a
+    /// genuine replay (Rust frpc sends ms keys); the caller rejects.
+    Replay,
+}
+
+/// Timestamp-indexed run_id log for login replay-attack detection
+/// (`AppState::used_timestamps`).
+///
+/// The per-timestamp value is an insertion-ordered `Vec` (not a set) so
+/// the OLDEST run_id can be evicted deterministically when the
+/// per-timestamp cap is hit (F3). Both memory bounds evict instead of
+/// reject — a login is only ever refused here for an identical
+/// ms-precision (run_id, ts) replay.
+///
+/// `total` is maintained incrementally (increment on insert, decrement on
+/// prune/evict) so the global cap check is O(1) instead of a full-map
+/// sum, and cleanup is a leading-key drain — BTreeMap is ordered by
+/// timestamp, so expired keys are always the smallest keys — instead of
+/// a full-map `retain` scan (F4).
+#[derive(Default)]
+pub struct ReplayTable {
+    map: std::collections::BTreeMap<i64, Vec<String>>,
+    /// Running count of run_id entries across all timestamps.
+    total: usize,
+}
+
+impl ReplayTable {
+    pub fn new() -> Self {
+        Self {
+            map: std::collections::BTreeMap::new(),
+            total: 0,
+        }
+    }
+
+    /// Number of run_id entries currently tracked across all timestamps.
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// Prune timestamp keys outside the freshness window.
+    ///
+    /// O(expired keys) per call: timestamps are the map keys, so expired
+    /// keys are always the smallest ones. Two precision domains sort
+    /// together (seconds keys < `MS_EPOCH` < ms keys), so a live seconds
+    /// key does NOT imply the ms keys after it are live — each domain is
+    /// drained separately. Returns the number of entries pruned.
+    pub fn prune_expired(&mut self, now_ms: i64, timeout_secs: i64) -> usize {
+        if timeout_secs <= 0 {
+            return 0;
+        }
+        let threshold_ms = now_ms.saturating_sub(timeout_secs.saturating_mul(1000));
+        let threshold_s = (now_ms / 1000).saturating_sub(timeout_secs);
+        let before = self.total;
+        // Seconds-precision keys (Go frpc) form a prefix of the map.
+        while let Some((&k, _)) = self.map.first_key_value() {
+            if k >= MS_EPOCH || k >= threshold_s {
+                break;
+            }
+            self.total -= self.map.remove(&k).map_or(0, |v| v.len());
+        }
+        // ms-precision keys (Rust frpc) form a prefix of [MS_EPOCH, +∞),
+        // so a live seconds key left in place by the pass above is
+        // skipped without removal.
+        while let Some((&k, _)) = self.map.range(MS_EPOCH..).next() {
+            if k >= threshold_ms {
+                break;
+            }
+            self.total -= self.map.remove(&k).map_or(0, |v| v.len());
+        }
+        // Round 6 (LOW B7): FUTURE timestamps sort to the map tail and
+        // were never pruned — an attacker recording now+window keys would
+        // park entries that outlive every legitimate one, pushing real
+        // keys toward the global cap's eviction order and shrinking their
+        // dedup coverage. Prune anything ahead of now in each precision
+        // domain. Anything further than `timeout` ahead is already
+        // rejected by validate_timestamp_freshness before record; a
+        // slightly-ahead key from a fast client clock costs only its own
+        // dedup coverage (the login itself is unaffected).
+        let future_s = (now_ms / 1000).saturating_add(1);
+        let future_ms = now_ms.saturating_add(1);
+        while let Some((&k, _)) = self.map.range(future_s..MS_EPOCH).next() {
+            self.total -= self.map.remove(&k).map_or(0, |v| v.len());
+        }
+        while let Some((&k, _)) = self.map.range(future_ms..).next() {
+            self.total -= self.map.remove(&k).map_or(0, |v| v.len());
+        }
+        before - self.total
+    }
+
+    /// Record a (timestamp, run_id) pair for duplicate detection.
+    ///
+    /// Neither memory bound rejects a login:
+    /// - Global cap (`MAX_TOTAL_REPLAY_ENTRIES`): whole oldest timestamp
+    ///   keys are evicted until there is room (F4).
+    /// - Per-timestamp cap (`MAX_ENTRIES_PER_TIMESTAMP`): the OLDEST
+    ///   run_id is evicted to admit the new one (F3) — the evicted entry
+    ///   loses dedup coverage only.
+    pub fn record(&mut self, ts: i64, run_id: &str) -> ReplayCheck {
+        // Duplicate check FIRST: a duplicate login must never evict other
+        // entries to make room for itself — that would discard innocent
+        // run_ids' dedup coverage, and under the global cap would let an
+        // attacker replaying one (ts, run_id) pair repeatedly evict fresh
+        // keys, shrinking the replay window.
+        if let Some(entry) = self.map.get(&ts) {
+            if entry.iter().any(|r| r == run_id) {
+                return if ts < MS_EPOCH {
+                    ReplayCheck::DuplicateSecondsPrecision
+                } else {
+                    ReplayCheck::Replay
+                };
+            }
+        }
+        // Global cap: evict whole oldest keys until there is room. The
+        // caller prunes first, so the oldest remaining keys are the
+        // freshest possible eviction targets.
+        while self.total >= MAX_TOTAL_REPLAY_ENTRIES {
+            let Some((&oldest_ts, _)) = self.map.first_key_value() else {
+                break;
+            };
+            self.total -= self.map.remove(&oldest_ts).map_or(0, |v| v.len());
+        }
+        let entry = self.map.entry(ts).or_default();
+        // Per-timestamp cap: evict the oldest run_id (insertion-ordered
+        // Vec → index 0) and admit the new one.
+        if entry.len() >= MAX_ENTRIES_PER_TIMESTAMP {
+            entry.remove(0);
+            self.total -= 1;
+        }
+        entry.push(run_id.to_string());
+        self.total += 1;
+        ReplayCheck::Admitted
+    }
+}
+
 /// Shared state for cross-task communication
 pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
@@ -688,24 +859,27 @@ pub struct AppState {
     pub login_throttle_overflow: Arc<
         tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
     >,
-    /// Timestamp-indexed run_id set for replay attack detection.
+    /// Timestamp-indexed run_id log for replay attack detection.
     ///
-    /// Key: Unix timestamp (seconds). Value: set of run_ids that logged in
-    /// at that timestamp. Duplicate (run_id, ts) pairs within the freshness
-    /// window are rejected as replay attacks.
+    /// Key: Unix timestamp (seconds for Go frpc, milliseconds for Rust
+    /// frpc — see `MS_EPOCH`). Value: insertion-ordered run_ids that
+    /// logged in at that timestamp. Duplicate (run_id, ts) pairs within
+    /// the freshness window are rejected as replay attacks.
     ///
-    /// Cleanup uses a full `retain` scan (O(n)) over both precision domains
-    /// (ms keys for frpc, seconds keys for Go frpc — a single split_off cut
-    /// cannot handle the two domains). Bounded by `MAX_TOTAL_REPLAY_ENTRIES`
-    /// (100k) globally and 100 per timestamp, so the scan is bounded and the
-    /// lock-hold latency is a few microseconds per login. The comment
-    /// previously claimed `BTreeMap::split_off` (O(log n)); that was never
-    /// implemented — the claim was corrected 2026-08-09 (audit D3-5).
+    /// Memory is bounded two ways, and neither bound rejects a login:
+    /// `MAX_ENTRIES_PER_TIMESTAMP` (100) per timestamp key — on cap-hit
+    /// the oldest run_id is evicted to admit the new one (F3); and
+    /// `MAX_TOTAL_REPLAY_ENTRIES` (100k) globally — on cap-hit whole
+    /// oldest timestamp keys are evicted (F4), so in-window timestamps
+    /// keep their duplicate detection. Cleanup is a leading-key drain
+    /// (O(expired keys) per login) plus an incrementally tracked total,
+    /// not a full-map scan.
     ///
-    /// Memory bound: at `R` logins/sec and default 15s timeout, ~15·R entries,
-    /// or ~1,500 entries (~60 KB) at 100 QPS.
+    /// Memory bound: at `R` logins/sec and default 90s timeout, ~90·R
+    /// entries, or ~9,000 entries (~0.5 MB) at 100 QPS; hard-capped at
+    /// `MAX_TOTAL_REPLAY_ENTRIES`.
     /// Protected by a tokio::sync::Mutex (async-safe).
-    pub used_timestamps: tokio::sync::Mutex<std::collections::BTreeMap<i64, HashSet<String>>>,
+    pub used_timestamps: tokio::sync::Mutex<ReplayTable>,
     /// CancellationToken for graceful shutdown. Cancelled on SIGTERM/SIGINT.
     /// Main accept loop and control handlers watch this to stop accepting new
     /// connections while letting existing bridge tasks drain.
@@ -841,7 +1015,7 @@ impl AppState {
             login_throttle_overflow: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            used_timestamps: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+            used_timestamps: tokio::sync::Mutex::new(ReplayTable::new()),
             #[cfg(feature = "tls")]
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
             shutdown_token: CancellationToken::new(),
@@ -859,8 +1033,12 @@ impl AppState {
     /// Returns true if the login should be allowed, false if throttled.
     ///
     /// This method atomically checks AND reserves an attempt slot within
-    /// a single lock hold. Unlike the old two-phase design, this counts ALL
-    /// login attempts (both successes and failures) against the window.
+    /// a single lock hold. Counts FAILED login attempts only — the sole
+    /// caller is `throttled_login_error` (login.rs), which runs on failure
+    /// paths (bad token, replay, OIDC reject). Successful logins never
+    /// consume a slot, so a legitimate frpc reconnect loop is never
+    /// throttled (round 6, finding B9: the comment previously claimed
+    /// "counts ALL login attempts" — wrong; verified against call sites).
     /// This is acceptable because:
     /// - A successful login means the attacker knew the token — they don't
     ///   need to brute-force.
@@ -927,6 +1105,39 @@ impl AppState {
         }
         *count += 1; // Reserve this attempt atomically
         true
+    }
+
+    /// Pure throttle check (no slot consumed, no mutation): is this IP
+    /// currently inside its throttle window?
+    ///
+    /// Used BEFORE auth runs (round 6, MEDIUM B5) so an already-throttled
+    /// brute-force IP is rejected without paying the CPU cost of a full
+    /// MD5 / OIDC JWT verify per attempt. Mirrors `check_login_throttle`
+    /// window semantics: main table 5 per 60s, overflow bucket 50 per 60s.
+    /// Lock order matches `check_login_throttle` (main table dropped before
+    /// overflow) — no nested acquisition.
+    pub async fn is_login_throttled(&self, addr: Option<std::net::SocketAddr>) -> bool {
+        let Some(addr) = addr else {
+            return false; // no peer address → cannot throttle
+        };
+        let ip = addr.ip();
+        let now = std::time::Instant::now();
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+        {
+            let throttle = self.login_throttle.lock().await;
+            if let Some((count, window_start)) = throttle.get(&ip) {
+                if now.duration_since(*window_start) <= WINDOW && *count >= 5 {
+                    return true;
+                }
+            }
+        }
+        let overflow = self.login_throttle_overflow.lock().await;
+        if let Some((count, window_start)) = overflow.get(&ip) {
+            if now.duration_since(*window_start) <= WINDOW && *count >= 50 {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get or create the per-run_id serialization mutex.
@@ -1323,5 +1534,214 @@ mod tests {
         assert!(!state.vnet_packet_source_allowed("run-b", "target-c").await);
         // Unknown target routes are denied.
         assert!(!state.vnet_packet_source_allowed("run-a", "missing").await);
+    }
+
+    // --- ReplayTable tests (F3/F4) ---
+
+    /// ms-precision key, "now" for prune tests (>= MS_EPOCH).
+    const MS_NOW: i64 = 1_750_000_000_000;
+    const MS_TS: i64 = MS_NOW + 123;
+
+    #[test]
+    fn replay_table_dedup_rejects_ms_duplicate() {
+        let mut t = ReplayTable::new();
+        // ms-precision key (Rust frpc): an identical (run_id, ts) replay
+        // is rejected.
+        assert_eq!(t.record(MS_TS, "run-1"), ReplayCheck::Admitted);
+        assert_eq!(t.total(), 1);
+        assert_eq!(t.record(MS_TS, "run-1"), ReplayCheck::Replay);
+        assert_eq!(t.total(), 1, "duplicates must not count as new entries");
+        // Distinct run_ids at the same timestamp are fine.
+        assert_eq!(t.record(MS_TS, "run-2"), ReplayCheck::Admitted);
+        assert_eq!(t.total(), 2);
+    }
+
+    #[test]
+    fn replay_table_seconds_duplicate_is_admitted() {
+        // Go frpc reuses its run_id and sends seconds keys: a reconnect
+        // in the same wall-clock second is indistinguishable from a replay
+        // and must be admitted (freshness window still bounds real replays).
+        let mut t = ReplayTable::new();
+        let ts = MS_NOW / 1000; // < MS_EPOCH
+        assert_eq!(t.record(ts, "run-1"), ReplayCheck::Admitted);
+        assert_eq!(
+            t.record(ts, "run-1"),
+            ReplayCheck::DuplicateSecondsPrecision
+        );
+    }
+
+    #[test]
+    fn replay_table_duplicate_at_global_cap_does_not_evict() {
+        // S5: the duplicate check runs BEFORE the global-cap eviction — a
+        // replayed (ts, run_id) at (or over) the cap must return Replay
+        // without evicting anything. Otherwise an attacker replaying one
+        // captured pair could repeatedly evict fresh keys, shrinking the
+        // replay window.
+        let mut t = ReplayTable::new();
+        let n_ts = MAX_TOTAL_REPLAY_ENTRIES / MAX_ENTRIES_PER_TIMESTAMP;
+        for ts_i in 0..n_ts {
+            let ts = MS_NOW + ts_i as i64;
+            for i in 0..MAX_ENTRIES_PER_TIMESTAMP {
+                assert_eq!(
+                    t.record(ts, &format!("run-{ts_i}-{i}")),
+                    ReplayCheck::Admitted
+                );
+            }
+        }
+        assert_eq!(t.total(), MAX_TOTAL_REPLAY_ENTRIES);
+        let before = t.total();
+        let oldest_ts = MS_NOW; // still present at the cap
+        assert!(t.map.contains_key(&oldest_ts));
+
+        // A duplicate of the OLDEST still-present key: rejected, and
+        // neither the table nor any key is touched.
+        assert_eq!(t.record(oldest_ts, "run-0-0"), ReplayCheck::Replay);
+        assert_eq!(t.total(), before, "replay must not evict at the cap");
+        assert!(t.map.contains_key(&oldest_ts));
+        assert_eq!(t.map[&oldest_ts].len(), MAX_ENTRIES_PER_TIMESTAMP);
+        // The victim's coverage is intact: a fresh run_id at that key is
+        // still admitted — the whole oldest timestamp key is evicted
+        // first (global cap), so the fresh entry lands in an empty bucket.
+        assert_eq!(
+            t.record(oldest_ts, "run-new"),
+            ReplayCheck::Admitted,
+            "non-duplicate logins still admitted at the cap"
+        );
+    }
+
+    #[test]
+    fn replay_table_prunes_future_timestamps() {
+        // Round 6 (LOW B7): timestamps ahead of now sort to the map tail
+        // and must be pruned, not parked where they squeeze legitimate
+        // entries in the global cap's eviction order. (Keys further ahead
+        // than the freshness window never reach record — the login is
+        // rejected first.)
+        let mut t = ReplayTable::new();
+        let now_ms = 2_000_000_000_000i64; // epoch-ms anchor
+        let now_s = now_ms / 1000;
+        // stale (age-pruned, beyond the 10s window), live (kept), future
+        // (B7-pruned)
+        t.record(now_ms - 15_000, "old");
+        t.record(now_ms, "live");
+        t.record(now_ms + 3000, "future");
+        let pruned = t.prune_expired(now_ms, 10);
+        assert_eq!(pruned, 2, "stale + future key pruned");
+        assert_eq!(t.total(), 1);
+        assert!(t.map.contains_key(&now_ms));
+        // Seconds domain (Go frpc keys) gets the same tail treatment.
+        let mut t2 = ReplayTable::new();
+        t2.record(now_s, "live-s");
+        t2.record(now_s + 5, "future-s");
+        t2.prune_expired(now_ms, 10);
+        assert_eq!(t2.total(), 1);
+        assert!(t2.map.contains_key(&now_s));
+    }
+
+    #[test]
+    fn replay_table_per_timestamp_cap_evicts_oldest_and_admits() {
+        // 101 distinct run_ids at the same timestamp: ALL admitted (F3 —
+        // the old behavior rejected every login at a full key, locking
+        // out a legitimate same-run_id reconnect), with the OLDEST run_id
+        // evicted to keep the set bounded.
+        let mut t = ReplayTable::new();
+        for i in 0..MAX_ENTRIES_PER_TIMESTAMP {
+            assert_eq!(
+                t.record(MS_TS, &format!("run-{i:03}")),
+                ReplayCheck::Admitted
+            );
+        }
+        assert_eq!(t.total(), MAX_ENTRIES_PER_TIMESTAMP);
+        assert_eq!(
+            t.record(MS_TS, "run-100"),
+            ReplayCheck::Admitted,
+            "cap-hit must evict, not reject"
+        );
+        let entry = &t.map[&MS_TS];
+        assert_eq!(entry.len(), MAX_ENTRIES_PER_TIMESTAMP);
+        // The first-inserted run_id was evicted; the newest is kept.
+        assert!(
+            !entry.iter().any(|r| r == "run-000"),
+            "oldest run_id must be evicted, got: {entry:?}"
+        );
+        assert!(entry.iter().any(|r| r == "run-100"));
+        // The evicted run_id loses dedup coverage only; in-set run_ids
+        // still replay, and the total stays consistent through the
+        // evict+insert cycle.
+        assert_eq!(t.record(MS_TS, "run-001"), ReplayCheck::Replay);
+        assert_eq!(t.record(MS_TS, "run-000"), ReplayCheck::Admitted);
+        assert_eq!(t.total(), MAX_ENTRIES_PER_TIMESTAMP);
+    }
+
+    #[test]
+    fn replay_table_global_cap_evicts_oldest_keys_and_keeps_recent_dedup() {
+        // Fill the table to the global cap (100 run_ids per timestamp ×
+        // 1000 timestamps), then record one more login at a NEW timestamp.
+        // The OLDEST whole timestamp keys are evicted and the new login is
+        // admitted (F4 — the old behavior degraded to freshness-only dedup
+        // for ALL clients instead of evicting).
+        let mut t = ReplayTable::new();
+        let n_ts = MAX_TOTAL_REPLAY_ENTRIES / MAX_ENTRIES_PER_TIMESTAMP;
+        for ts_i in 0..n_ts {
+            let ts = MS_NOW + ts_i as i64;
+            for i in 0..MAX_ENTRIES_PER_TIMESTAMP {
+                assert_eq!(
+                    t.record(ts, &format!("run-{ts_i}-{i}")),
+                    ReplayCheck::Admitted
+                );
+            }
+        }
+        assert_eq!(t.total(), MAX_TOTAL_REPLAY_ENTRIES);
+
+        let newest_ts = MS_NOW + n_ts as i64;
+        assert_eq!(t.record(newest_ts, "run-new"), ReplayCheck::Admitted);
+        assert!(
+            t.total() <= MAX_TOTAL_REPLAY_ENTRIES,
+            "total must stay bounded after cap eviction"
+        );
+        assert!(t.map.contains_key(&newest_ts));
+        // The oldest timestamp key was evicted (the next-oldest stays —
+        // eviction drains one key per record, just enough to admit the
+        // new login)...
+        assert!(!t.map.contains_key(&MS_NOW));
+        assert!(
+            t.map.contains_key(&(MS_NOW + 1)),
+            "eviction must drain the oldest keys first"
+        );
+        // ...and dedup STILL works for a recent key — the security
+        // property the old global-degrade path lost.
+        assert_eq!(
+            t.record(newest_ts, "run-new"),
+            ReplayCheck::Replay,
+            "in-window timestamps must keep duplicate detection after cap eviction"
+        );
+    }
+
+    #[test]
+    fn replay_table_prune_drains_expired_keys_and_keeps_total_consistent() {
+        let mut t = ReplayTable::new();
+        // Expired seconds keys (Go frpc): 200s ago.
+        t.record(MS_NOW / 1000 - 200, "old-sec-1");
+        t.record(MS_NOW / 1000 - 200, "old-sec-2");
+        // Live seconds key: 30s ago.
+        t.record(MS_NOW / 1000 - 30, "live-sec");
+        // Expired ms key (Rust frpc): 200s ago — sorts AFTER the live
+        // seconds key, which is the two-precision-domain trap the prune
+        // must handle (a single leading-key break on the first live key
+        // would miss it).
+        t.record(MS_NOW - 200_000, "old-ms");
+        // Live ms key.
+        t.record(MS_NOW - 30_000, "live-ms");
+        assert_eq!(t.total(), 5);
+
+        let pruned = t.prune_expired(MS_NOW, 90);
+        assert_eq!(pruned, 3, "two old seconds keys + one old ms key");
+        assert_eq!(t.total(), 2, "total counter must track the prune");
+        assert!(!t.map.contains_key(&(MS_NOW / 1000 - 200)));
+        assert!(!t.map.contains_key(&(MS_NOW - 200_000)));
+        assert!(t.map.contains_key(&(MS_NOW / 1000 - 30)));
+        assert!(t.map.contains_key(&(MS_NOW - 30_000)));
+        // After the prune, dedup still works for the surviving keys.
+        assert_eq!(t.record(MS_NOW - 30_000, "live-ms"), ReplayCheck::Replay);
+        assert_eq!(t.total(), 2);
     }
 }

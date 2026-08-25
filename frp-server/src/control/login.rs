@@ -21,7 +21,7 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::IncomingStreams;
 
 use crate::lock::RwLockExt;
-use crate::state::{AppState, ControlTx, InternalMsg, PoolStats};
+use crate::state::{AppState, ControlTx, InternalMsg, PoolStats, ReplayCheck};
 
 use super::pool::{PendingRequest, PoolEntry, WORK_POOL_ABS_CEILING, WORK_POOL_EXTRA};
 use super::proxy_ops::{err_msg, unregister_control};
@@ -100,6 +100,40 @@ async fn send_login_error(
     let _ = write_ctl_msg(&mut writer, &resp, v2).await;
 }
 
+/// Consume a per-IP login-throttle slot for a FAILED auth attempt and
+/// return the throttled LoginResp message when the IP has exceeded its
+/// window quota (`None` → the attempt proceeds to the normal error
+/// response).
+///
+/// Deliberate frp-rs hardening (NOT Go frp parity — Go frp v0.71.0 has
+/// no login throttle in its source): only failures consume a slot — this
+/// helper is invoked on failure paths only, so successful logins are
+/// never counted and legitimate reconnects are never throttled (except
+/// a same-ms run_id replay from a sub-tick reconnect, which counts as
+/// a failure like any other replay). An IP is
+/// rejected for the 60s window after the 5th failure (per-IP fixed 60s
+/// window anchored at the first counted failure, capped table with a
+/// coarse overflow bucket).
+async fn throttled_login_error(state: &AppState, peer: Option<SocketAddr>) -> Option<String> {
+    let throttled = match peer {
+        Some(addr) => !state.check_login_throttle(addr).await,
+        None => false, // no peer address → cannot throttle
+    };
+    if !throttled {
+        return None;
+    }
+    warn!(
+        peer = ?peer,
+        "Login throttled for {:?} (too many failed attempts)",
+        peer
+    );
+    Some(err_msg(
+        state.detailed_errors_to_client,
+        "login throttled: too many failed attempts".to_string(),
+        "login throttled",
+    ))
+}
+
 /// Verify login credentials and run timestamp replay protection.
 ///
 /// On success returns the verified OIDC subject (if any) together with the
@@ -142,6 +176,30 @@ async fn verify_login_auth(
         );
     }
 
+    // Round 6 (MEDIUM B5): reject an already-throttled IP BEFORE auth —
+    // a brute-force flood of bad tokens must not pay full MD5 / OIDC JWT
+    // verify CPU per attempt. Pure check (no slot consumed): the failure
+    // paths below still consume a slot via `throttled_login_error`, so a
+    // successful login never counts and window semantics are unchanged.
+    // Skipped for internal AlwaysAuthPass (bypass paths never throttle).
+    if !is_auth_bypass && state.is_login_throttled(peer).await {
+        warn!(
+            peer = ?peer,
+            "Login rejected pre-auth: IP already throttled",
+        );
+        send_login_error(
+            stream,
+            err_msg(
+                state.detailed_errors_to_client,
+                "login throttled: too many failed attempts".to_string(),
+                "login throttled",
+            ),
+            v2,
+        )
+        .await;
+        return Err(());
+    }
+
     let oidc_subject: Option<String> = if is_auth_bypass {
         None
     } else if let Some(ref verifier) = state.oidc.verifier {
@@ -150,6 +208,24 @@ async fn verify_login_auth(
             Ok(oidc_token) => {
                 if oidc_token.subject.trim().is_empty() {
                     warn!(peer = ?peer, "OIDC auth failed: subject claim is empty");
+                    // Rate-limit failed logins per IP (F1): the OIDC path
+                    // must not be exempt from the login throttle, and the
+                    // client needs a LoginResp error rather than a silent
+                    // hang.
+                    if let Some(msg) = throttled_login_error(state, peer).await {
+                        send_login_error(stream, msg, v2).await;
+                        return Err(());
+                    }
+                    send_login_error(
+                        stream,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            "OIDC authentication failed".to_string(),
+                            "OIDC authentication failed",
+                        ),
+                        v2,
+                    )
+                    .await;
                     return Err(());
                 }
                 // jti replay protection: same jti + same subject is allowed
@@ -161,6 +237,12 @@ async fn verify_login_auth(
                     oidc_token.expiry,
                 ) {
                     warn!(peer = ?peer, error = %e, "OIDC login rejected: {}", e);
+                    // Rate-limit failed logins per IP — the OIDC path must
+                    // not be exempt from the login throttle (F1).
+                    if let Some(msg) = throttled_login_error(state, peer).await {
+                        send_login_error(stream, msg, v2).await;
+                        return Err(());
+                    }
                     send_login_error(
                         stream,
                         err_msg(
@@ -178,6 +260,16 @@ async fn verify_login_auth(
             }
             Err(e) => {
                 warn!(peer = ?peer, error = %e, "OIDC auth failed for {:?}: {}", peer, e);
+                // Rate-limit failed logins per IP (F1): the OIDC path must
+                // not be exempt from the login throttle — an
+                // unauthenticated attacker can otherwise send forged JWTs
+                // at any rate, each costing a signature verification (+ a
+                // JWKS refresh retry, itself cooldown-gated in the
+                // verifier).
+                if let Some(msg) = throttled_login_error(state, peer).await {
+                    send_login_error(stream, msg, v2).await;
+                    return Err(());
+                }
                 send_login_error(
                     stream,
                     err_msg(
@@ -202,24 +294,11 @@ async fn verify_login_auth(
         });
         if let Err(e) = login_auth {
             warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
-            // Rate-limit failed logins per IP (Go frp LoginThrottle parity).
-            // Only failures consume a slot — successful logins are not counted.
-            let throttled = match peer {
-                Some(addr) => !state.check_login_throttle(addr).await,
-                None => false, // no peer address → cannot throttle
-            };
-            if throttled {
-                warn!(peer = ?peer, "Login throttled for {:?} (too many failed attempts)", peer);
-                send_login_error(
-                    stream,
-                    err_msg(
-                        state.detailed_errors_to_client,
-                        "login throttled: too many failed attempts".to_string(),
-                        "login throttled",
-                    ),
-                    v2,
-                )
-                .await;
+            // Rate-limit failed logins per IP (deliberate frp-rs hardening
+            // — Go frp v0.71.0 has no login throttle). Only failures
+            // consume a slot — successful logins are not counted.
+            if let Some(msg) = throttled_login_error(state, peer).await {
+                send_login_error(stream, msg, v2).await;
                 return Err(());
             }
             // Emit WebSocket event for dashboard subscribers
@@ -306,98 +385,72 @@ async fn verify_login_auth(
                     .clone()
                     .filter(|id| !id.is_empty())
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let mut used = state.used_timestamps.lock().await;
-                // Bound the per-timestamp duplicate-detection set: a single
-                // timestamp key must not grow without bound. An attacker that
-                // can pass token auth can otherwise inject unique run_ids
-                // within one second and grow this map indefinitely
-                // (token-reachable OOM). Legitimate clients hitting the cap
-                // are rejected for this second and retry on the next timestamp.
-                const MAX_ENTRIES_PER_TIMESTAMP: usize = 100;
-                // Prune FIRST (both precisions): keys are milliseconds (frpc)
-                // or seconds (Go frpc). With seconds-only pruning, ms keys
-                // (~1.75e12) would never be < the seconds threshold and the
-                // table would grow unbounded. Running the prune before the
-                // cap check also means a full table drains stale entries and
-                // reopens — the cap check itself must never become a
-                // permanent login lockout.
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64;
-                let timeout_ms = auth_cfg.authentication_timeout.saturating_mul(1000);
-                let threshold_ms = now_ms.saturating_sub(timeout_ms);
-                let threshold_s = (now_ms / 1000).saturating_sub(auth_cfg.authentication_timeout);
-                // Keys < 1e12 are seconds-precision (Go frpc); >= 1e12 are ms.
-                const MS_EPOCH: i64 = 1_000_000_000_000;
-                used.retain(|k, _| {
-                    if *k >= MS_EPOCH {
-                        *k >= threshold_ms
-                    } else {
-                        *k >= threshold_s
-                    }
-                });
-                // Global bound on the whole table (defense-in-depth): with a
-                // large authenticationTimeout the per-second cap alone allows
-                // ~2*timeout*100 entries. If the table is STILL full after
-                // pruning (sustained attack), degrade to freshness-only
-                // duplicate detection (matching Go frps, which has no
-                // duplicate table) instead of rejecting every login — a
-                // reject-here would lock out all legitimate clients until
-                // frps restarts.
-                const MAX_TOTAL_REPLAY_ENTRIES: usize = 100_000;
-                let total: usize = used.values().map(|s| s.len()).sum();
-                if total >= MAX_TOTAL_REPLAY_ENTRIES {
-                    warn!(
-                        peer = ?peer,
-                        "Login: replay-detection table full ({} entries, cap {}); degraded to freshness-only duplicate detection",
-                        total, MAX_TOTAL_REPLAY_ENTRIES,
+                let mut used = state.used_timestamps.lock().await;
+                // Prune FIRST (both precisions): keys are milliseconds (frpc)
+                // or seconds (Go frpc). A leading-key drain (BTreeMap is
+                // ordered by timestamp, so expired keys are always the
+                // smallest) is O(expired keys) per login instead of a
+                // full-map scan; the total is tracked incrementally (F4).
+                // Running the prune before the record also means a full table
+                // drains stale entries and reopens — the caps themselves
+                // never become a permanent login lockout.
+                let pruned = used.prune_expired(now_ms, auth_cfg.authentication_timeout);
+                if pruned > 0 {
+                    debug!(
+                        peer = ?peer, pruned = pruned,
+                        "Login: pruned {} expired entries from the replay-detection table",
+                        pruned,
                     );
-                } else {
-                    let entry = used.entry(ts).or_default();
-                    if entry.len() >= MAX_ENTRIES_PER_TIMESTAMP {
-                        warn!(
-                            peer = ?peer, ts = ts,
-                            "Login rejected: too many unique run_ids for timestamp {} (cap {})",
-                            ts, MAX_ENTRIES_PER_TIMESTAMP,
+                }
+                // Record the (run_id, ts) pair. Neither memory cap rejects a
+                // login: the per-timestamp cap evicts the oldest run_id, the
+                // global cap evicts whole oldest keys (F3/F4) — only an
+                // identical ms-precision (run_id, ts) replay is rejected.
+                // The decision is produced under the lock, but the rejection
+                // write happens AFTER dropping it: send_login_error awaits a
+                // network write, which must not hold the shared
+                // used_timestamps lock (a slow/blocked peer would stall every
+                // concurrent login).
+                let reject_replay = match used.record(ts, &run_id_for_check) {
+                    ReplayCheck::Admitted => None,
+                    ReplayCheck::DuplicateSecondsPrecision => {
+                        // Duplicate (run_id, ts). Go frpc reuses its run_id
+                        // and sends SECONDS keys: a reconnect landing in the
+                        // same wall-clock second collides with the previous
+                        // login and is indistinguishable from a replay; admit
+                        // it (the freshness window still bounds real replays).
+                        debug!(
+                            peer = ?peer, run_id = %run_id_for_check, ts = %ts,
+                            "Login: duplicate seconds-precision (run_id, ts) — treating as same-second Go frpc reconnect"
                         );
-                        send_login_error(
-                            stream,
-                            "login rejected: too many login attempts for this timestamp".into(),
-                            v2,
-                        )
-                        .await;
-                        return Err(());
+                        None
                     }
-                    if !entry.insert(run_id_for_check.clone()) {
-                        // Duplicate (run_id, ts). Rust frpc sends
-                        // MILLISECONDS keys — a genuine replay reuses an
-                        // identical ms stamp, so reject. Go frpc reuses its
-                        // run_id and sends SECONDS keys: a reconnect landing
-                        // in the same wall-clock second collides with the
-                        // previous login and is indistinguishable from a
-                        // replay; admit it (the freshness window still
-                        // bounds real replays).
-                        if ts < MS_EPOCH {
-                            debug!(
-                                peer = ?peer, run_id = %run_id_for_check, ts = %ts,
-                                "Login: duplicate seconds-precision (run_id, ts) — treating as same-second Go frpc reconnect"
-                            );
-                        } else {
-                            warn!(
-                                peer = ?peer, run_id = %run_id_for_check, ts = %ts,
-                                "Replay attack detected: duplicate (run_id, timestamp) pair for run_id={} ts={}",
-                                run_id_for_check, ts,
-                            );
-                            send_login_error(
-                                stream,
-                                "replay attack detected: duplicate timestamp".into(),
-                                v2,
-                            )
-                            .await;
-                            return Err(());
-                        }
+                    ReplayCheck::Replay => {
+                        // Rust frpc sends MILLISECONDS keys — a genuine
+                        // replay reuses an identical ms stamp, so reject.
+                        warn!(
+                            peer = ?peer, run_id = %run_id_for_check, ts = %ts,
+                            "Replay attack detected: duplicate (run_id, timestamp) pair for run_id={} ts={}",
+                            run_id_for_check, ts,
+                        );
+                        Some("replay attack detected: duplicate timestamp".to_string())
                     }
+                };
+                drop(used);
+                if let Some(error) = reject_replay {
+                    // Replay rejections consume a throttle slot like any
+                    // other failure: without this, an attacker replaying
+                    // captured (ts, md5, run_id) triples could retry
+                    // freely — each rejection was uncounted — and never
+                    // advance toward the throttle that caps their later
+                    // guess attempts.
+                    let throttled = throttled_login_error(state, peer).await;
+                    send_login_error(stream, throttled.unwrap_or(error), v2).await;
+                    return Err(());
                 }
             }
         }
@@ -437,13 +490,15 @@ pub(crate) async fn authenticate(
     ),
     (),
 > {
-    // Login throttle: FAIL-ONLY rate limiting (Go frp LoginThrottle parity).
+    // Login throttle: FAIL-ONLY rate limiting (deliberate frp-rs hardening
+    // — Go frp v0.71.0 has no login throttle).
     // `check_login_throttle` is invoked on authentication failure below and
     // counts only failed attempts — successful logins never consume a slot,
     // so legitimate reconnects are never throttled. A throttled IP is
-    // rejected for the 60s window after the 5th failure (per-IP sliding
-    // window, capped table with a coarse overflow bucket). Rejection here
-    // returns Err(()) and the login error response is sent by the caller.
+    // rejected for the 60s window after the 5th failure (per-IP fixed 60s
+    // window anchored at the first counted failure, capped table with a
+    // coarse overflow bucket). Rejection here returns Err(()) and the
+    // login error response is sent by the caller.
 
     // --- Authenticate ---
     // Split into its own state machine (OIDC/token verification + timestamp
@@ -1063,5 +1118,223 @@ mod pool_count_tests {
         assert_eq!(capped_pool_count(None, 50), 1);
         // The configured cap still applies above the absolute ceiling.
         assert_eq!(capped_pool_count(Some(100_000), 10_000), 10_000);
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "oidc")]
+mod oidc_throttle_tests {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    use tokio::io::AsyncReadExt;
+
+    use super::authenticate;
+    use crate::state::AppState;
+
+    /// Minimal OIDC discovery + JWKS mock on 127.0.0.1, plain HTTP, so an
+    /// `OidcVerifier` can be built without external network access. Returns
+    /// the issuer URL and a stop signal for the serving thread.
+    fn oidc_mock_server() -> (String, std::sync::mpsc::Sender<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock OIDC server");
+        let addr = listener.local_addr().expect("mock OIDC address");
+        let issuer = format!("http://{addr}");
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "oct",
+                "kid": "k1",
+                "k": frp_core::base64::encode(b"mock-jwks-secret"),
+            }]
+        })
+        .to_string();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 8192];
+                        let n = Read::read(&mut stream, &mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let path = req.split_whitespace().nth(1).unwrap_or("/");
+                        let (status, body) = if path.contains(".well-known/openid-configuration") {
+                            let jwks_uri = format!("http://{addr}/jwks");
+                            (200, format!(r#"{{"jwks_uri":"{jwks_uri}"}}"#))
+                        } else if path == "/jwks" {
+                            (200, jwks.clone())
+                        } else {
+                            (404, String::new())
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = Write::write_all(&mut stream, resp.as_bytes());
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        });
+        (issuer, stop_tx)
+    }
+
+    /// Read one V1 LoginResp frame from the client side of the duplex and
+    /// return its error field (empty when the login succeeded).
+    async fn read_login_resp_error(client: &mut tokio::io::DuplexStream) -> String {
+        let mut header = [0u8; 9];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("read frame header");
+        let len = u64::from_be_bytes(header[1..9].try_into().unwrap()) as usize;
+        assert!(len < 4096, "implausible frame length {len}");
+        let mut payload = vec![0u8; len];
+        client
+            .read_exact(&mut payload)
+            .await
+            .expect("read frame payload");
+        // Deserialize the bare LoginResp struct directly. The untagged
+        // `FrpMessage` enum cannot be used here: `ReqWorkConn {}` (a
+        // zero-field struct) matches ANY JSON object in untagged serde
+        // matching, so even a genuine LoginResp payload would parse as
+        // ReqWorkConn. Production wire decoding is unaffected — V1
+        // dispatch (deserialize_v1) selects by type byte first.
+        let resp: frp_core::msg::LoginResp =
+            serde_json::from_slice(&payload).expect("parse LoginResp");
+        resp.error.unwrap_or_default()
+    }
+
+    fn state_with_oidc(verifier: frp_core::auth::OidcVerifier) -> Arc<AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(AppState::new(
+            frp_core::auth::AuthConfig::with_token("unused-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("unused-token"),
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
+            String::new(),
+            true,
+            30,
+            7200,
+            0,
+            0,
+            90,
+            1500,
+            false,
+            Some(Arc::new(verifier)),
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    #[tokio::test]
+    async fn oidc_failures_consume_login_throttle_slots() {
+        // F1: the OIDC branch of `verify_login_auth` must be subject to the
+        // per-IP login throttle like the token branch. An unauthenticated
+        // attacker sending forged JWTs (valid kid, garbage signature) must
+        // be throttled after 5 failed attempts instead of getting an
+        // unbounded per-IP failure rate.
+        let (issuer, _stop) = oidc_mock_server();
+        let verifier = frp_core::auth::OidcVerifier::new(
+            issuer,
+            "test-audience".into(),
+            false, // skip_expiry
+            false, // skip_issuer
+            false, // skip_nbf
+            false, // skip_audience
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("OidcVerifier against mock");
+        let state = state_with_oidc(verifier);
+
+        // Forged JWT: valid kid, signature that fails against the mock
+        // JWKS key → OIDC verification fails on every attempt (and the
+        // in-verifier JWKS refresh cooldown prevents outbound fetches
+        // beyond the first).
+        let forged = jsonwebtoken::encode(
+            &jsonwebtoken::Header {
+                alg: jsonwebtoken::Algorithm::HS256,
+                kid: Some("k1".into()),
+                ..jsonwebtoken::Header::default()
+            },
+            &serde_json::json!({"sub": "attacker", "exp": 4_102_444_800_u64}),
+            &jsonwebtoken::EncodingKey::from_secret(b"attacker-secret"),
+        )
+        .expect("encode forged JWT");
+
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = || frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(forged.clone()),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+
+        // Attempts 1..=5 fail auth (each consuming a throttle slot);
+        // attempt 6 must be rejected with the throttled message.
+        for attempt in 1..=6u32 {
+            let (server, mut client) = tokio::io::duplex(4096);
+            let result = authenticate(
+                Box::new(server),
+                &login(),
+                state.clone(),
+                Some(peer),
+                None,
+                false,
+                None,
+                false,
+                None,
+            )
+            .await;
+            assert!(result.is_err(), "attempt {attempt} must be rejected");
+            let error = read_login_resp_error(&mut client).await;
+            if attempt <= 5 {
+                assert!(
+                    error.contains("OIDC authentication failed"),
+                    "attempt {attempt} must fail auth, got: {error}"
+                );
+            } else {
+                assert!(
+                    error.contains("throttled"),
+                    "6th attempt must be throttled, got: {error}"
+                );
+            }
+        }
     }
 }

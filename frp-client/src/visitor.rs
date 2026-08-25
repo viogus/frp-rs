@@ -565,7 +565,19 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     "Visitor '{}': XTCP retry {}/{} after {:?}",
                                     visitor_name, attempt, max_retries, retry_delay
                                 );
-                                tokio::time::sleep(retry_delay).await;
+                                // Round 6 (LOW C4): the plain sleep was NOT
+                                // cancel-aware — a shutdown landing mid-delay
+                                // left the visitor parked for the full
+                                // retry_delay. Race the delay against the
+                                // cancellation token like every other
+                                // shutdown boundary in this loop.
+                                tokio::select! {
+                                    _ = tokio::time::sleep(retry_delay) => {}
+                                    _ = conn_cancel.cancelled() => {
+                                        info!(visitor_name = %visitor_name, "Visitor '{}': shutting down during retry delay, abandoning XTCP connection", visitor_name);
+                                        return; // drops the user connection unbridged
+                                    }
+                                }
                             }
 
                             // --- STUN Discovery (UDP socket for XTCP P2P) ---

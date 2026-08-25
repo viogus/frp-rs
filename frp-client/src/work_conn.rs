@@ -1430,22 +1430,47 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                     // Byte-peek: read 1 byte, check if it's NatHoleSid type.
                     if !v2 {
                         use tokio::io::AsyncReadExt;
+                        // Round 6 (LOW B3): the three probe reads below
+                        // (1-byte peek, 8-byte header, length payload) were
+                        // UNBOUNDED — a Go frps that sends StartWorkConn and
+                        // then goes silent would park this task (and its fd)
+                        // forever, since nothing else ever reads this conn.
+                        // Each step gets the same dial-phase timeout as the
+                        // StartWorkConn read; a timeout falls into the same
+                        // recovery as a read failure (wrap consumed bytes as
+                        // bridge data, or EOF-bridge for a timeout before any
+                        // byte arrived).
+                        let probe_timeout = start_work_conn_timeout(dial_timeout_secs);
                         let mut peek = [0u8; 1];
-                        match work.read_exact(&mut peek).await {
-                            Ok(_) if peek[0] == msg::TYPE_NAT_HOLE_SID => {
+                        match tokio::time::timeout(probe_timeout, work.read_exact(&mut peek)).await
+                        {
+                            Ok(Ok(_)) if peek[0] == msg::TYPE_NAT_HOLE_SID => {
                                 // Likely Go frps NatHoleSid V1 frame.
                                 // Read remaining 8 header bytes + payload.
                                 let mut header = [0u8; 8];
                                 let mut consumed = vec![msg::TYPE_NAT_HOLE_SID];
-                                match work.read_exact(&mut header).await {
-                                    Ok(_) => {
+                                match tokio::time::timeout(
+                                    probe_timeout,
+                                    work.read_exact(&mut header),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => {
                                         consumed.extend_from_slice(&header);
                                         let length = i64::from_be_bytes(header);
                                         if (0..=frp_core::protocol::V1_MAX_MSG_LENGTH)
                                             .contains(&length)
                                         {
                                             let mut payload = vec![0u8; length as usize];
-                                            if work.read_exact(&mut payload).await.is_ok() {
+                                            // B3: payload read bounded like the
+                                            // peek/header reads above.
+                                            if tokio::time::timeout(
+                                                probe_timeout,
+                                                work.read_exact(&mut payload),
+                                            )
+                                            .await
+                                            .is_ok_and(|r| r.is_ok())
+                                            {
                                                 consumed.extend_from_slice(&payload);
                                                 match serde_json::from_slice::<msg::NatHoleSid>(
                                                     &payload,
@@ -1489,19 +1514,24 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                                                 IoStream::BufferedRead(consumed, 0, Box::new(work));
                                         }
                                     }
-                                    Err(_) => {
-                                        // Header read failed after 0x35 — wrap 1 byte.
+                                    Ok(Err(_)) | Err(_) => {
+                                        // Header read failed after 0x35 (EOF, or
+                                        // B3 probe timeout) — wrap the 1 peeked byte.
                                         work = IoStream::BufferedRead(consumed, 0, Box::new(work));
                                     }
                                 }
                             }
-                            Ok(_) => {
+                            Ok(Ok(_)) => {
                                 // Not 0x35 — STCP fallback. Wrap the peeked byte
                                 // as pre-read bridge data.
                                 work = IoStream::BufferedRead(vec![peek[0]], 0, Box::new(work));
                             }
-                            Err(_) => {
+                            Ok(Err(_)) => {
                                 // EOF after StartWorkConn — bridge will get 0 bytes.
+                            }
+                            Err(_) => {
+                                // B3 probe timeout before any byte arrived —
+                                // nothing consumed, same recovery as EOF.
                             }
                         }
                     }

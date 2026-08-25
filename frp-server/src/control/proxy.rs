@@ -147,6 +147,13 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         } else {
             ctx.state.vhost_manager.unregister(&cp.proxy_name).await;
         }
+        // Clean up tcpmux domain routes: without this a CloseProxy of a
+        // tcpmux proxy leaves its domains (and wildcard_count) registered
+        // until control disconnect — a reload-rename (CloseProxy A then
+        // NewProxy B with A's domain) would be rejected with "tcpmux route
+        // conflict". Mirrors the unregister_control sweep (proxy_ops.rs)
+        // and dashboard delete path; no-op for non-tcpmux proxies.
+        ctx.state.tcpmux_manager.unregister(&cp.proxy_name).await;
         ctx.state.proxy_metrics.remove(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
         {

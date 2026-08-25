@@ -26,11 +26,18 @@ use crate::transport::IoStream;
 
 /// Timeout for V2 handshake reads.
 ///
-/// Aligned with the compile-time `connReadTimeout = 10 * time.Second` constant
-/// in Go frp v0.70.1 `server/service.go` (not configurable). Go applies this
-/// deadline to reading the wire magic and the first message, which includes
-/// the V2 ClientHello / ServerHello exchange.
-const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Post-handshake read bound, matching `POST_HANDSHAKE_READ_TIMEOUT` (30s)
+/// on the V1 paths. Go frp v0.70.1 applies a single `connReadTimeout = 10s`
+/// deadline to the whole initial read phase, but 10s is too tight for the
+/// pre-Login OIDC JWT fetch (fetched over the proxyURL after the handshake,
+/// before Login — killed a >10s fetch in test_g2r_oidc_proxy), so frp-rs
+/// deliberately hardens all post-magic reads to 30s. These reads are
+/// post-magic-detection on every path (TCP/WS/KCP/QUIC):
+/// `v2_handshake_server` first frame, `read_first_frame_after_handshake`,
+/// and the client-side ServerHello read. The server accept paths wrap
+/// handshake + first frame in an outer `timeout_at(post_deadline, …)` so
+/// the per-read 30s does not stack with the magic-read timeout.
+const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Crypto random size in bytes (matching Go frp CryptoRandomSize = 32).
 const CRYPTO_RANDOM_SIZE: usize = 32;
@@ -594,15 +601,14 @@ pub async fn v2_handshake_client(
 // ---------------------------------------------------------------------------
 
 /// Read the first message frame after a ClientHello-based V2 handshake,
-/// bounded by the same `V2_HANDSHAKE_TIMEOUT` (10s) as the handshake itself.
+/// bounded by the same `V2_HANDSHAKE_TIMEOUT` (30s) as the handshake itself.
 ///
 /// `v2_handshake_server` returns `Ok((None, crypto_ctx))` after it processed a
 /// ClientHello; the caller must then read the next frame (the Login message)
 /// itself. This helper wraps that read in `V2_HANDSHAKE_TIMEOUT` so a peer that
 /// completes ClientHello but never sends Login cannot pin the task and file
-/// descriptor forever. This matches Go frp v0.70.1, which applies a single
-/// `connReadTimeout = 10s` read deadline covering magic + V2 ClientHello
-/// exchange + first message.
+/// descriptor forever. 30s (not Go's 10s `connReadTimeout`) because the
+/// pre-Login OIDC JWT fetch can exceed 10s — see the constant's doc comment.
 ///
 /// Returns the same tuple as `IoStream::read_raw_v2_frame`:
 /// `(frame_type, flags, payload_bytes)`.
@@ -627,7 +633,8 @@ pub async fn read_first_frame_after_handshake(
 /// When the first frame was a ClientHello (return `Ok((None, _))`), the caller
 /// MUST use [`read_first_frame_after_handshake`] (not a bare
 /// `read_raw_v2_frame`) to read the next frame, so the read stays bounded by
-/// `V2_HANDSHAKE_TIMEOUT`.
+/// `V2_HANDSHAKE_TIMEOUT` (30s — the post-handshake deadline, matching the
+/// V1 paths; see the constant's doc comment).
 pub async fn v2_handshake_server(
     stream: &mut IoStream,
 ) -> Result<(Option<Vec<u8>>, Option<CryptoContext>), crate::Error> {

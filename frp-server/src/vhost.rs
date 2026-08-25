@@ -156,13 +156,28 @@ fn get_locked(
     None
 }
 
-/// Sort a Vec<VhostRoute> by longest location descending.
-/// Matches Go frp's sort order: longer location prefixes are tried first.
+/// Sort a Vec<VhostRoute> the way Go frp's vhost router does
+/// (`slices.SortFunc` with `-cmp.Compare(a.location, b.location)` in
+/// pkg/util/vhost/router.go — lexicographic DESCENDING on the location).
+///
+/// Round 6 (A6): the old comparator keyed on location LENGTH. Length
+/// sorting happens to agree with Go on single-location routes whose
+/// locations overlap as prefixes, but diverges across routes: with
+/// proxy A at "/aa" and proxy B at "/aa/bb/cc", Go tries "/aa/bb/cc"
+/// first for path "/aa/bb/cc..." (routing to B), while length-sort also
+/// puts B first — but for path "/aa/bb" Go's "/aa/bb/cc" misses and
+/// "/aa" hits (→ A), whereas length-sort's B would then match its
+/// shorter "/aa" first only if B were probed with that location; the
+/// flattened Go order is exact, so we reproduce it: the comparator key
+/// is the route's lexicographically-largest location — the first one Go
+/// would try for that route — and prefix-match order (the only case
+/// where ordering matters) then matches Go exactly. Empty-location
+/// routes (HTTPS SNI) sort last, like Go's empty location string.
 fn sort_by_longest_location(vrs: &mut [VhostRoute]) {
     vrs.sort_by(|a, b| {
-        let a_len = a.locations.iter().map(|l| l.len()).max().unwrap_or(0);
-        let b_len = b.locations.iter().map(|l| l.len()).max().unwrap_or(0);
-        b_len.cmp(&a_len) // descending: longest first
+        let a_max = a.locations.iter().max().map(|l| l.as_str()).unwrap_or("");
+        let b_max = b.locations.iter().max().map(|l| l.as_str()).unwrap_or("");
+        b_max.cmp(a_max) // lexicographic descending
     });
 }
 
@@ -670,22 +685,38 @@ async fn handle_http1_request<S>(
             &request_text_cow
         }
     };
-    let host = match extract_host_header(request_text) {
-        Some(h) => h.to_string(),
-        None => {
+    // Round 6 (A3/A4/A7): Go net/http request-line semantics — version
+    // gates (malformed shape → 400, non-1.x → 505), absolute-form routing
+    // (req.Host = req.URL.Host — Host header ignored), path minus query.
+    let (host, path) = match parse_vhost_request_line(request_text) {
+        RequestLine::Ok { host, path } => {
+            let Some(host) = host else {
+                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                return;
+            };
+            (host.to_string(), path.to_string())
+        }
+        RequestLine::BadRequest => {
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            return;
+        }
+        RequestLine::VersionNotSupported => {
+            let _ = stream
+                .write_all(b"HTTP/1.1 505 HTTP Version Not Supported\r\nConnection: close\r\n\r\n")
+                .await;
             return;
         }
     };
     // RFC 7230 §5.4: a request with more than one Host header is invalid.
     // Go's net/http server (which Go frp uses for vhost routing) rejects
     // such requests with 400; forwarding duplicates verbatim would let a
-    // second Host shadow the routed proxy's host_header_rewrite.
+    // second Host shadow the routed proxy's host_header_rewrite. Applies
+    // to origin-form and absolute-form alike (Go's readRequest rejects
+    // duplicate Host headers before either routing path).
     if count_host_headers(request_text) > 1 {
         let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
         return;
     }
-    let path = extract_path(request_text).unwrap_or("/").to_string();
 
     // Parse Basic Auth once — reused for route matching, auth check,
     // and per-user routing (Go frp compat: getByRoute(host, path, username)).
@@ -1137,13 +1168,109 @@ pub async fn run_vhost_https_listener(
     Err("TLS feature not enabled".into())
 }
 
-/// Extract the URL path from the HTTP request line.
-/// e.g. "GET /api/v1/users HTTP/1.1" → "/api/v1/users"
-fn extract_path(request: &str) -> Option<&str> {
-    let first_line = request.lines().next()?;
-    let mut parts = first_line.split_whitespace();
-    parts.next()?; // method
-    parts.next() // path
+/// Outcome of parsing the HTTP request line with Go net/http semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestLine<'a> {
+    /// host: None when no Host header is present (caller replies 400).
+    Ok {
+        host: Option<&'a str>,
+        path: &'a str,
+    },
+    /// Malformed version shape or malformed absolute URL (Go 400).
+    BadRequest,
+    /// Non-HTTP/1.x version (Go 505 HTTP Version Not Supported).
+    VersionNotSupported,
+}
+
+/// Parse the request line with Go net/http `readRequest` semantics for the
+/// vhost path (round 6: A3/A4/A7, verified against Go 1.25.0 stdlib).
+///
+/// Version handling mirrors `ParseHTTPVersion` + `http1ServerSupportsRequest`:
+/// - no version token (2-part line) → `VersionNotSupported`. Go's
+///   `parseRequestLine` defaults a missing version to "HTTP/0.9", which
+///   `http1ServerSupportsRequest` rejects (only major 1 passes, plus the
+///   binary-h2 PRI preface this text path never sees) → 505;
+/// - version not exactly 8 chars "HTTP/X.Y" with single digits
+///   ("HTTP/1.10", "HTTP/1.x", "HTTP/11.0") → `BadRequest` (Go 400
+///   "malformed HTTP version");
+/// - "HTTP/0.x" / "HTTP/2.x" / "HTTP/9.9" → `VersionNotSupported` (505);
+/// - "HTTP/1.x" → routed.
+///
+/// Host/path follow RFC 7230 §5.3 as implemented by `readRequest`: an
+/// absolute-form target ("GET http://host/path HTTP/1.1") routes on the
+/// URL authority — `req.Host = req.URL.Host`, ANY Host header is ignored —
+/// with the URL path minus query; origin-form routes on the Host header
+/// with the raw path minus query (Go `req.URL.Path` — query strings must
+/// not influence location matching).
+fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
+    let first_line = request.lines().next().unwrap_or("");
+    let mut parts = first_line.splitn(3, ' ');
+    let _method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("HTTP/0.9"); // Go: len(parts)<3 → HTTP/0.9
+
+    // ParseHTTPVersion: exactly 8 chars "HTTP/X.Y", single digits.
+    let valid_shape = version.len() == 8
+        && version.starts_with("HTTP/")
+        && version.as_bytes()[5].is_ascii_digit()
+        && version.as_bytes()[6] == b'.'
+        && version.as_bytes()[7].is_ascii_digit();
+    if !valid_shape {
+        return RequestLine::BadRequest;
+    }
+    // http1ServerSupportsRequest: only major 1 passes (PRI excluded).
+    if version.as_bytes()[5] != b'1' {
+        return RequestLine::VersionNotSupported;
+    }
+
+    // Absolute-form: "GET http://host[:port]/path?query HTTP/1.1".
+    let scheme_len = if target.starts_with("http://") {
+        Some(7)
+    } else if target.starts_with("https://") {
+        Some(8)
+    } else {
+        None
+    };
+    if let Some(scheme_len) = scheme_len {
+        let rest = &target[scheme_len..];
+        // Authority ends at the first '/', '?', or '#' (Go url.ParseRequestURI).
+        let (authority, url_path) = match rest.find(['/', '?', '#']) {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        if authority.is_empty() {
+            // Go url.ParseRequestURI errors on a missing host → 400.
+            return RequestLine::BadRequest;
+        }
+        let path = split_path_and_query(url_path);
+        let path = if path.is_empty() { "/" } else { path };
+        return RequestLine::Ok {
+            host: Some(canonicalize_authority(authority)),
+            path,
+        };
+    }
+
+    // Origin-form: Host header + raw path minus query.
+    RequestLine::Ok {
+        host: extract_host_header(request),
+        path: {
+            let path = split_path_and_query(target);
+            if path.is_empty() {
+                "/"
+            } else {
+                path
+            }
+        },
+    }
+}
+
+/// Strip the query/fragment from a URL path (Go `req.URL.Path` — vhost
+/// routes match locations against the path only).
+fn split_path_and_query(path: &str) -> &str {
+    match path.find(['?', '#']) {
+        Some(i) => &path[..i],
+        None => path,
+    }
 }
 
 /// Rewrite the Host header in an HTTP request's raw bytes.
@@ -1326,7 +1453,7 @@ fn extract_basic_auth(request: &str) -> Option<(String, String)> {
 
 /// Count Host header lines (RFC 7230 §5.4 allows at most one). Must only be
 /// called on the head (up to the first `\r\n\r\n`) — see `handle_http1_request`.
-fn count_host_headers(request: &str) -> usize {
+pub(crate) fn count_host_headers(request: &str) -> usize {
     // Skip the request line: it cannot carry a Host header (RFC 7230 §5.4),
     // and a request-target beginning with "host:" must not be miscounted.
     // Every later line whose name (before the first colon) equals "host"
@@ -1348,7 +1475,58 @@ fn count_host_headers(request: &str) -> usize {
         .count()
 }
 
-/// Extract the Host header value from an HTTP request (hostname only, no port).
+/// Extract the Host header value from an HTTP request (hostname only,
+/// exactly one trailing dot trimmed — Go frp `CanonicalHost`,
+/// pkg/util/http/http.go). Port handling follows Go's `hasPort` gate: the
+/// port is split only when the value has exactly one colon (host:port /
+/// IPv4:port) or is a bracket-start with `]:` (bracketed IPv6), and the
+/// port itself is never validated — `net.SplitHostPort` accepts any
+/// suffix, so Go routes "Host: example.com:abc" to example.com (the
+/// numeric gate exists only on the CONNECT request line via
+/// url.ParseRequestURI's validOptionalPort). Portless values are used
+/// as-is — "example.com", or "[::1]" which stays bracketed (unroutable,
+/// nothing registers brackets).
+/// Canonicalize an authority value (host[:port] or [v6]:port) for vhost
+/// routing — port strip, bracket handling, exactly one trailing dot.
+/// Go frp `CanonicalHost` semantics (pkg/util/http/http.go), shared by
+/// the Host-header path and the absolute-form URL authority path (A3).
+///
+/// Round 6 (A5): the bracket branch now requires the ']' to be
+/// immediately followed by ':'. Go `SplitHostPort` brackets the FIRST '['
+/// to the LAST ']' ("[::1]x]:8080" → host "::1]x" — unroutable); accepting
+/// the first ']' would route a malformed value as "::1" when that literal
+/// is registered.
+fn canonicalize_authority(value: &str) -> &str {
+    let colons = value.bytes().filter(|b| *b == b':').count();
+    let hostname = if colons == 1 {
+        // host:port — SplitHostPort never validates the port digits
+        // (Go frp routes "Host: example.com:abc" to example.com); the
+        // digit gate exists only on the CONNECT request line, where
+        // url.ParseRequestURI enforces it (validOptionalPort).
+        let (h, _port) = value.rsplit_once(':').unwrap_or((value, ""));
+        h
+    } else if colons >= 2 && value.starts_with('[') && value.contains("]:") {
+        let end = value.find(']').unwrap_or(0);
+        if !value[end + 1..].starts_with(':') {
+            // ']' not immediately followed by ':' — not a bracket form.
+            // Go routes the raw value (unroutable → 404); mirror that
+            // rather than 400ing (the header path has no 400 trigger).
+            value
+        } else {
+            &value[1..end]
+        }
+    } else {
+        // No port: portless hostname, bracketed IPv6 without "]:", or
+        // unbracketed multi-colon — Go leaves the value untouched.
+        value
+    };
+    // Strip exactly one trailing dot from FQDNs (Go TrimSuffix — one
+    // dot only, so "example.com.." stays unroutable; registration is
+    // not canonicalized, so a user-registered "example.com." is
+    // unroutable in Go too).
+    hostname.strip_suffix('.').unwrap_or(hostname)
+}
+
 fn extract_host_header(request: &str) -> Option<&str> {
     for line in request.lines() {
         if line.len() < 6 {
@@ -1358,11 +1536,7 @@ fn extract_host_header(request: &str) -> Option<&str> {
             continue;
         }
         let value = line[5..].trim();
-        // Handle IPv6: [::1]:8080 → ::1, example.com:8080 → example.com
-        if value.starts_with('[') {
-            return value.find(']').map(|end| &value[1..end]);
-        }
-        return Some(value.split(':').next().unwrap_or(value));
+        return Some(canonicalize_authority(value));
     }
     None
 }
@@ -1587,6 +1761,32 @@ mod tests {
         );
     }
 
+    /// Go frp CanonicalHost parity: port-strip, then TrimSuffix exactly one
+    /// trailing dot, before the vhost lookup ("example.com." and
+    /// "example.com" route identically; registration is not canonicalized,
+    /// so a user-registered "example.com." is unroutable in Go too).
+    #[test]
+    fn test_extract_host_header_trailing_dot() {
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nHost: example.com.:8080\r\n\r\n"),
+            Some("example.com")
+        );
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nHost: example.com.\r\n\r\n"),
+            Some("example.com")
+        );
+        // Two trailing dots: only one is trimmed (Go TrimSuffix trims one).
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nHost: example.com..\r\n\r\n"),
+            Some("example.com.")
+        );
+        // Bracketed IPv6 hosts are untouched.
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n"),
+            Some("::1")
+        );
+    }
+
     #[test]
     fn test_count_host_headers() {
         let single = "GET / HTTP/1.1\r\nHost: a.example.com\r\n\r\n";
@@ -1623,6 +1823,111 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn test_parse_vhost_request_line_versions() {
+        // A7: 2-token line → HTTP/0.9 → 505 (Go http1ServerSupportsRequest).
+        assert_eq!(
+            parse_vhost_request_line("GET /"),
+            RequestLine::VersionNotSupported
+        );
+        assert_eq!(
+            parse_vhost_request_line("GET / HTTP/0.9"),
+            RequestLine::VersionNotSupported
+        );
+        // Shape malformed → 400 (Go ParseHTTPVersion 8-char rule).
+        assert_eq!(
+            parse_vhost_request_line("GET / HTTP/1.10"),
+            RequestLine::BadRequest
+        );
+        assert_eq!(
+            parse_vhost_request_line("GET / HTTP/1.x"),
+            RequestLine::BadRequest
+        );
+        assert_eq!(
+            parse_vhost_request_line("GET / HTTP/11.0"),
+            RequestLine::BadRequest
+        );
+        // Non-1.x text versions → 505 (PRI excluded — binary h2 preface).
+        assert_eq!(
+            parse_vhost_request_line("GET / HTTP/2.0"),
+            RequestLine::VersionNotSupported
+        );
+        assert_eq!(
+            parse_vhost_request_line("GET / HTTP/9.9"),
+            RequestLine::VersionNotSupported
+        );
+        // HTTP/1.x routes.
+        let RequestLine::Ok { host, path } =
+            parse_vhost_request_line("GET /abc HTTP/1.1\r\nHost: x.example.com\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("x.example.com"));
+        assert_eq!(path, "/abc");
+    }
+
+    #[test]
+    fn test_parse_vhost_request_line_absolute_form() {
+        // A3/A4: absolute-form routes on the URL authority; ANY Host
+        // header is ignored (RFC 7230 §5.3, req.Host = req.URL.Host).
+        let RequestLine::Ok { host, path } = parse_vhost_request_line(
+            "GET http://a.example.com:8080/api?x=1 HTTP/1.1\r\nHost: ignored.example.com\r\n\r\n",
+        ) else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("a.example.com")); // port stripped
+        assert_eq!(path, "/api"); // query stripped, Go req.URL.Path
+                                  // Absolute-form with no path → "/".
+        let RequestLine::Ok { path, .. } =
+            parse_vhost_request_line("GET http://a.example.com HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(path, "/");
+        // Malformed absolute URL (empty authority) → 400.
+        assert_eq!(
+            parse_vhost_request_line("GET http:///x HTTP/1.1\r\nHost: x\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        assert_eq!(
+            parse_vhost_request_line("GET http:// HTTP/1.1\r\nHost: x\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        // Bracketed IPv6 authority.
+        let RequestLine::Ok { host, .. } =
+            parse_vhost_request_line("GET https://[::1]:8080/ HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("::1"));
+        // A5: mis-bracketed authority stays unroutable, never "::1".
+        let RequestLine::Ok { host, .. } =
+            parse_vhost_request_line("GET http://[::1]x]:8080/ HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("[::1]x]:8080"));
+    }
+
+    #[test]
+    fn test_parse_vhost_request_line_origin_form_query() {
+        // A4: origin-form path minus query (Go req.URL.Path) — query
+        // strings must not influence location matching.
+        let RequestLine::Ok { host, path } = parse_vhost_request_line(
+            "GET /api/v1?user=admin#frag HTTP/1.1\r\nHost: a.example.com:8080\r\n\r\n",
+        ) else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("a.example.com"));
+        assert_eq!(path, "/api/v1");
+        // Missing Host header → Ok with host None (caller 400s).
+        let RequestLine::Ok { host, .. } = parse_vhost_request_line("GET / HTTP/1.1\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, None);
     }
 
     #[tokio::test]

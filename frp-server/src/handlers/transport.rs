@@ -11,14 +11,23 @@ use tracing::{info, warn};
 
 use frp_core::mux;
 #[cfg(feature = "websocket")]
-use frp_core::transport::{accept_websocket, accept_websocket_from_peeked};
+use frp_core::transport::accept_websocket;
 use frp_core::transport::{IoStream, PreReadStream};
+// Round 6 (feature-matrix cleanup): split cfg — `accept_websocket` is used
+// only from `handle_websocket_connection` (cfg websocket), while
+// `accept_websocket_from_peeked` (TLS+WS upgrade, transport.rs:297) and
+// `RwLockExt` (read_ok in `handle_tls_connection`, cfg tls) live inside the
+// TLS handler. The old `any(tls, websocket)` gates warned unused on a
+// websocket-only build (no tls → whole TLS handler configured out); the
+// WS-over-TLS call site needs BOTH features.
+#[cfg(all(feature = "tls", feature = "websocket"))]
+use frp_core::transport::accept_websocket_from_peeked;
 #[cfg(feature = "quic")]
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "quic")]
 use crate::control;
-#[cfg(any(feature = "tls", feature = "websocket"))]
+#[cfg(feature = "tls")]
 use crate::lock::RwLockExt;
 use crate::state::AppState;
 #[cfg(feature = "tls")]
@@ -39,6 +48,18 @@ pub(crate) async fn handle_tls_connection(
     first_byte: u8,
     stream_io: IoStream,
 ) {
+    // Post-handshake reads (V2 handshake, first frame, V1 Login) get
+    // their own deadline anchored at handshake completion: the 10s
+    // accept_deadline covers magic detection + TLS/WS/yamux handshakes
+    // (Go connReadTimeout parity), but reads after those handshakes —
+    // including the pre-Login OIDC JWT fetch via proxyURL, which can
+    // take >10s — must not be cut off at 10s, nor be unbounded
+    // (slowloris holding every conn_semaphore permit indefinitely).
+    // POST_HANDSHAKE_READ_TIMEOUT (30s) is the bound; the max() keeps
+    // the deadline after accept_deadline even if the handshakes took
+    // the full 10s.
+    let post_deadline =
+        accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT);
     // Read the TLS acceptor lazily: only TLS
     // connections need it. Taking the RwLock read
     // + clone on every accepted connection
@@ -186,7 +207,7 @@ pub(crate) async fn handle_tls_connection(
                     Some(addr),
                     None,
                     Some(addr.to_string()),
-                    accept_deadline,
+                    post_deadline,
                 )
                 .await;
                 return;
@@ -286,15 +307,13 @@ pub(crate) async fn handle_tls_connection(
             Ok(mut ws) => {
                 info!(addr = %addr, "WebSocket upgrade over TLS for {}", addr);
                 let mut magic = [0u8; 7];
-                // Bounded by the same accept deadline as the TLS/WS accept
-                // above: a client that completes the WS upgrade then goes
-                // silent must not park the task/fd/permit forever (Go frp
-                // connReadTimeout=10s covers this post-upgrade read too).
-                let is_v2 = match tokio::time::timeout_at(
-                    accept_deadline,
-                    ws.read_exact(&mut magic),
-                )
-                .await
+                // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s), like the
+                // TLS/WS accept reads: a client that completes the WS
+                // upgrade then goes silent must not park the task/fd/permit
+                // forever (the 10s connReadTimeout covers only the accept
+                // phase, not a slow pre-Login OIDC token fetch).
+                let is_v2 = match tokio::time::timeout_at(post_deadline, ws.read_exact(&mut magic))
+                    .await
                 {
                     Ok(Ok(_)) => is_v2_magic(&magic),
                     Ok(Err(e)) => {
@@ -308,7 +327,7 @@ pub(crate) async fn handle_tls_connection(
                 };
                 if is_v2 {
                     let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
-                        accept_deadline,
+                        post_deadline,
                         frp_core::v2_handshake::v2_handshake_server(&mut ws),
                     )
                     .await
@@ -317,7 +336,7 @@ pub(crate) async fn handle_tls_connection(
                             Ok((Some(p), crypto)) => (p, crypto),
                             Ok((None, crypto)) => {
                                 match tokio::time::timeout_at(
-                                    accept_deadline,
+                                    post_deadline,
                                     frp_core::v2_handshake::read_first_frame_after_handshake(
                                         &mut ws,
                                     ),
@@ -380,18 +399,31 @@ pub(crate) async fn handle_tls_connection(
                             let mut io = IoStream::Yamux(control_stream);
                             info!(addr = %addr, "Yamux over WS+TLS session established for {}", addr);
 
-                            // Try V2 detection on yamux stream
+                            // Try V2 detection on yamux stream. Bounded by
+                            // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                            // completes the yamux handshake then sends nothing
+                            // must not park the task and conn_semaphore permit
+                            // indefinitely (slowloris).
                             let mut v2_magic = [0u8; 7];
-                            let is_v2 = match io.read_exact(&mut v2_magic).await {
-                                Ok(_) => is_v2_magic(&v2_magic),
-                                Err(_) => false,
+                            let is_v2 = match tokio::time::timeout_at(
+                                post_deadline,
+                                io.read_exact(&mut v2_magic),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => is_v2_magic(&v2_magic),
+                                Ok(Err(_)) => false,
+                                Err(_elapsed) => {
+                                    warn!(addr = %addr, "WS+TLS+yamux: timed out reading first 7 bytes from {}", addr);
+                                    return;
+                                }
                             };
                             if is_v2 {
-                                let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(post_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
                                                                 Ok(r) => match r {
                                                                     Ok((Some(p), crypto)) => (p, crypto),
                                                                     Ok((None, crypto)) => {
-                                                                        match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                                        match tokio::time::timeout_at(post_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
                                                                             Ok(r) => match r {
                                                                                 Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                                 Ok((ft, _, _)) => {
@@ -437,7 +469,7 @@ pub(crate) async fn handle_tls_connection(
                                     Some(addr),
                                     Some(incoming),
                                     None,
-                                    accept_deadline,
+                                    post_deadline,
                                 )
                                 .await;
                             }
@@ -454,7 +486,7 @@ pub(crate) async fn handle_tls_connection(
                         Some(addr),
                         None,
                         None,
-                        accept_deadline,
+                        post_deadline,
                     )
                     .await;
                 }
@@ -484,16 +516,26 @@ pub(crate) async fn handle_tls_connection(
                 let mut io = IoStream::Yamux(control_stream);
                 info!(addr = ?addr, "Yamux over TLS session established for {:?}", addr);
 
-                // Try V2 detection on yamux stream (Go frp: magic on stream)
+                // Try V2 detection on yamux stream (Go frp: magic on stream).
+                // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                // completes the yamux handshake then sends nothing must not
+                // park the task and conn_semaphore permit indefinitely
+                // (slowloris).
                 let mut magic = [0u8; 7];
-                let is_v2 = match io.read_exact(&mut magic).await {
-                    Ok(_) => is_v2_magic(&magic),
-                    Err(_) => false,
+                let is_v2 = match tokio::time::timeout_at(post_deadline, io.read_exact(&mut magic))
+                    .await
+                {
+                    Ok(Ok(_)) => is_v2_magic(&magic),
+                    Ok(Err(_)) => false,
+                    Err(_elapsed) => {
+                        warn!(addr = %addr, "TLS+yamux: timed out reading first 7 bytes from {}", addr);
+                        return;
+                    }
                 };
                 if is_v2 {
                     // V2 detected on TLS+yamux stream
                     let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
-                        accept_deadline,
+                        post_deadline,
                         frp_core::v2_handshake::v2_handshake_server(&mut io),
                     )
                     .await
@@ -504,7 +546,7 @@ pub(crate) async fn handle_tls_connection(
                                 // Read Login in plaintext. AEAD wrapping happens in
                                 // handle_control after LoginResp (matching Go frp flow).
                                 match tokio::time::timeout_at(
-                                    accept_deadline,
+                                    post_deadline,
                                     frp_core::v2_handshake::read_first_frame_after_handshake(
                                         &mut io,
                                     ),
@@ -559,7 +601,7 @@ pub(crate) async fn handle_tls_connection(
                         Some(addr),
                         Some(incoming),
                         None,
-                        accept_deadline,
+                        post_deadline,
                     )
                     .await;
                 }
@@ -571,13 +613,13 @@ pub(crate) async fn handle_tls_connection(
     } else {
         // io already includes peeked bytes via BufferedRead.
         // Proceed with V2/V1 detection on the TLS stream.
-        // Try V2 magic detection. Bounded by the accept deadline: a client
-        // that finishes the TLS handshake then sends nothing must be
-        // dropped instead of parking the task/fd/permit forever (Go frp
-        // connReadTimeout=10s covers this read).
+        // Try V2 magic detection. Bounded by POST_HANDSHAKE_READ_TIMEOUT
+        // (30s): a client that finishes the TLS handshake then sends
+        // nothing must be dropped instead of parking the task/fd/permit
+        // forever (the 10s connReadTimeout covers only the accept phase,
+        // not a slow pre-Login OIDC token fetch).
         let mut magic = [0u8; 7];
-        let is_v2 = match tokio::time::timeout_at(accept_deadline, io.read_exact(&mut magic)).await
-        {
+        let is_v2 = match tokio::time::timeout_at(post_deadline, io.read_exact(&mut magic)).await {
             Ok(Ok(_)) => is_v2_magic(&magic),
             Ok(Err(_)) => false,
             Err(_elapsed) => {
@@ -589,7 +631,7 @@ pub(crate) async fn handle_tls_connection(
         if is_v2 {
             // V2 path: ClientHello/ServerHello handshake
             let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
-                accept_deadline,
+                post_deadline,
                 frp_core::v2_handshake::v2_handshake_server(&mut io),
             )
             .await
@@ -598,7 +640,7 @@ pub(crate) async fn handle_tls_connection(
                     Ok((Some(p), crypto)) => (p, crypto),
                     Ok((None, crypto)) => {
                         match tokio::time::timeout_at(
-                            accept_deadline,
+                            post_deadline,
                             frp_core::v2_handshake::read_first_frame_after_handshake(&mut io),
                         )
                         .await
@@ -652,7 +694,7 @@ pub(crate) async fn handle_tls_connection(
                 Some(addr),
                 None,
                 Some(addr.to_string()),
-                accept_deadline,
+                post_deadline,
             )
             .await;
         }
@@ -668,6 +710,12 @@ pub(crate) async fn handle_tls_connection(
     first_byte: u8,
     stream_io: IoStream,
 ) {
+    // V1 Login read runs on the post-handshake deadline (30s): the 10s
+    // accept deadline covers only the magic detection phase; a slow
+    // pre-Login OIDC JWT fetch must not be cut off at 10s, nor left
+    // unbounded (slowloris).
+    let post_deadline =
+        accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT);
     // Go frp compat: when TLS feature is not compiled in
     // but frpc sends 0x17 prefix, fall back to V1.
     if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
@@ -690,7 +738,7 @@ pub(crate) async fn handle_tls_connection(
             Some(addr),
             None,
             Some(addr.to_string()),
-            accept_deadline,
+            post_deadline,
         )
         .await;
         return;
@@ -706,6 +754,13 @@ pub(crate) async fn handle_websocket_connection(
     accept_deadline: tokio::time::Instant,
     stream_io: IoStream,
 ) {
+    // Post-handshake reads (V2 handshake, first frame, V1 Login) run on
+    // their own deadline: accept_deadline.max(now + POST_HANDSHAKE_READ_TIMEOUT).
+    // The 10s accept deadline covers only magic detection + TLS/WS/yamux
+    // handshakes (Go connReadTimeout parity); a slow pre-Login OIDC JWT
+    // fetch via proxyURL must not be cut off at 10s, nor left unbounded.
+    let post_deadline =
+        accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT);
     if state.tls_only {
         warn!(addr = %addr, "TLS-only mode: rejected WebSocket from {}", addr);
         return;
@@ -716,12 +771,13 @@ pub(crate) async fn handle_websocket_connection(
         Ok(mut ws) => {
             info!(addr = %addr, "WebSocket upgrade on main port for {}", addr);
 
-            // Try V2 magic detection. Bounded by the accept deadline: a
-            // client that completes the WS upgrade then goes silent must
-            // not park the task/fd/permit forever (Go frp connReadTimeout
-            // =10s covers this post-upgrade read).
+            // Try V2 magic detection. Bounded by POST_HANDSHAKE_READ_TIMEOUT
+            // (30s): a client that completes the WS upgrade then goes silent
+            // must not park the task/fd/permit forever (the 10s
+            // connReadTimeout covers only the accept phase, not a slow
+            // pre-Login OIDC token fetch).
             let mut magic = [0u8; 7];
-            let is_v2 = match tokio::time::timeout_at(accept_deadline, ws.read_exact(&mut magic))
+            let is_v2 = match tokio::time::timeout_at(post_deadline, ws.read_exact(&mut magic))
                 .await
             {
                 Ok(Ok(_)) => {
@@ -802,18 +858,31 @@ pub(crate) async fn handle_websocket_connection(
                                 let mut io = IoStream::Yamux(control_stream);
                                 info!(addr = ?addr, "Yamux over WS+TLS session established for {:?}", addr);
 
-                                // V2 detection on yamux stream
+                                // V2 detection on yamux stream. Bounded by
+                                // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                                // completes the yamux handshake then sends nothing
+                                // must not park the task and conn_semaphore permit
+                                // indefinitely (slowloris).
                                 let mut magic = [0u8; 7];
-                                let is_v2 = match io.read_exact(&mut magic).await {
-                                    Ok(_) => is_v2_magic(&magic),
-                                    Err(_) => false,
+                                let is_v2 = match tokio::time::timeout_at(
+                                    post_deadline,
+                                    io.read_exact(&mut magic),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => is_v2_magic(&magic),
+                                    Ok(Err(_)) => false,
+                                    Err(_elapsed) => {
+                                        warn!(addr = ?addr, "WS+TLS+yamux: timed out reading first 7 bytes from {:?}", addr);
+                                        return;
+                                    }
                                 };
                                 if is_v2 {
-                                    let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
+                                    let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(post_deadline, frp_core::v2_handshake::v2_handshake_server(&mut io)).await {
                                                                     Ok(r) => match r {
                                                                         Ok((Some(p), crypto)) => (p, crypto),
                                                                         Ok((None, crypto)) => {
-                                                                            match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                                                            match tokio::time::timeout_at(post_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
                                                                                 Ok(r) => match r {
                                                                                     Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                                     Ok((ft, _, _)) => {
@@ -864,7 +933,7 @@ pub(crate) async fn handle_websocket_connection(
                                         Some(addr),
                                         Some(incoming),
                                         None,
-                                        accept_deadline,
+                                        post_deadline,
                                     )
                                     .await;
                                 }
@@ -877,12 +946,12 @@ pub(crate) async fn handle_websocket_connection(
                         let mut io = IoStream::Tls(Box::new(tls_stream), addr);
 
                         // V2 chicken check on the decrypted TLS stream.
-                        // Bounded by the accept deadline: a client that
+                        // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s): a client that
                         // stops after the WS+TLS handshakes must not park
                         // the task/fd/permit forever.
                         let mut chicken = [0u8; 7];
                         let is_tls_v2 = match tokio::time::timeout_at(
-                            accept_deadline,
+                            post_deadline,
                             io.read_exact(&mut chicken),
                         )
                         .await
@@ -896,7 +965,7 @@ pub(crate) async fn handle_websocket_connection(
                         };
                         if is_tls_v2 {
                             let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
-                                accept_deadline,
+                                post_deadline,
                                 frp_core::v2_handshake::v2_handshake_server(&mut io),
                             )
                             .await
@@ -904,7 +973,7 @@ pub(crate) async fn handle_websocket_connection(
                                 Ok(r) => match r {
                                     Ok((Some(p), crypto)) => (p, crypto),
                                     Ok((None, crypto)) => {
-                                        match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                        match tokio::time::timeout_at(post_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
                                                                         Ok(r) => match r {
                                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                             Ok((ft, _, _)) => {
@@ -955,7 +1024,7 @@ pub(crate) async fn handle_websocket_connection(
                                 Some(addr),
                                 None,
                                 None,
-                                accept_deadline,
+                                post_deadline,
                             )
                             .await;
                         }
@@ -982,15 +1051,28 @@ pub(crate) async fn handle_websocket_connection(
                         let mut io = IoStream::Yamux(control_stream);
                         info!(addr = ?addr, "Yamux over WebSocket session established for {:?}", addr);
 
-                        // V2 detection on yamux stream
+                        // V2 detection on yamux stream. Bounded by
+                        // POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that
+                        // completes the yamux handshake then sends nothing
+                        // must not park the task and conn_semaphore permit
+                        // indefinitely (slowloris).
                         let mut mux_magic = [0u8; 7];
-                        let is_v2 = match io.read_exact(&mut mux_magic).await {
-                            Ok(_) => is_v2_magic(&mux_magic),
-                            Err(_) => false,
+                        let is_v2 = match tokio::time::timeout_at(
+                            post_deadline,
+                            io.read_exact(&mut mux_magic),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => is_v2_magic(&mux_magic),
+                            Ok(Err(_)) => false,
+                            Err(_elapsed) => {
+                                warn!(addr = ?addr, "WS+yamux: timed out reading first 7 bytes from {:?}", addr);
+                                return;
+                            }
                         };
                         if is_v2 {
                             let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
-                                accept_deadline,
+                                post_deadline,
                                 frp_core::v2_handshake::v2_handshake_server(&mut io),
                             )
                             .await
@@ -998,7 +1080,7 @@ pub(crate) async fn handle_websocket_connection(
                                 Ok(r) => match r {
                                     Ok((Some(p), crypto)) => (p, crypto),
                                     Ok((None, crypto)) => {
-                                        match tokio::time::timeout_at(accept_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
+                                        match tokio::time::timeout_at(post_deadline, frp_core::v2_handshake::read_first_frame_after_handshake(&mut io)).await {
                                                                         Ok(r) => match r {
                                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                             Ok((ft, _, _)) => {
@@ -1045,7 +1127,7 @@ pub(crate) async fn handle_websocket_connection(
                                 Some(addr),
                                 Some(incoming),
                                 None,
-                                accept_deadline,
+                                post_deadline,
                             )
                             .await;
                         }
@@ -1057,7 +1139,7 @@ pub(crate) async fn handle_websocket_connection(
             } else if is_v2 {
                 // V2 path: ClientHello/ServerHello handshake
                 let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
-                    accept_deadline,
+                    post_deadline,
                     frp_core::v2_handshake::v2_handshake_server(&mut ws),
                 )
                 .await
@@ -1066,7 +1148,7 @@ pub(crate) async fn handle_websocket_connection(
                         Ok((Some(p), crypto)) => (p, crypto),
                         Ok((None, crypto)) => {
                             match tokio::time::timeout_at(
-                                accept_deadline,
+                                post_deadline,
                                 frp_core::v2_handshake::read_first_frame_after_handshake(&mut ws),
                             )
                             .await
@@ -1120,7 +1202,7 @@ pub(crate) async fn handle_websocket_connection(
                     Some(addr),
                     None,
                     None,
-                    accept_deadline,
+                    post_deadline,
                 )
                 .await;
             }
@@ -1138,6 +1220,13 @@ pub(crate) async fn handle_v2_connection(
     accept_deadline: tokio::time::Instant,
     stream_io: IoStream,
 ) {
+    // Post-handshake reads (V2 handshake, first frame) run on their own
+    // deadline: accept_deadline.max(now + POST_HANDSHAKE_READ_TIMEOUT).
+    // The 10s accept deadline covers only magic detection + yamux
+    // handshake; reads after that must not be cut off at 10s (slow OIDC
+    // JWT fetch) nor left unbounded (slowloris).
+    let post_deadline =
+        accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT);
     // Already consumed V2 magic. Extract TcpStream.
     let inner_stream = match stream_io.into_tcp() {
         Some(s) => s,
@@ -1166,22 +1255,34 @@ pub(crate) async fn handle_v2_connection(
                 let mut io = IoStream::Yamux(control_stream);
                 info!(addr = ?addr, "Yamux over V2 session established for {:?}", addr);
 
-                match frp_core::protocol::read_v2_magic_or_replay(&mut io).await {
-                    Ok(None) => {} // magic consumed
-                    Ok(Some(bytes)) => {
+                // Per-stream V2 magic is a post-handshake read: bound it
+                // by the post-handshake deadline like the handshake and
+                // first-frame reads that follow (slowloris).
+                let v2_magic_or_replay = tokio::time::timeout_at(
+                    post_deadline,
+                    frp_core::protocol::read_v2_magic_or_replay(&mut io),
+                )
+                .await;
+                match v2_magic_or_replay {
+                    Ok(Ok(None)) => {} // magic consumed
+                    Ok(Ok(Some(bytes))) => {
                         // Older V2 client without per-stream magic —
                         // replay bytes as start of next frame.
                         io = IoStream::BufferedRead(bytes, 0, Box::new(io));
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(error = %e, "Failed to read V2 magic from yamux stream: {}", e);
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        warn!(addr = %addr, "V2 yamux: timed out reading per-stream magic from {}", addr);
                         return;
                     }
                 }
 
                 // V2 handshake: may receive ClientHello or first message
                 let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
-                    accept_deadline,
+                    post_deadline,
                     frp_core::v2_handshake::v2_handshake_server(&mut io),
                 )
                 .await
@@ -1192,7 +1293,7 @@ pub(crate) async fn handle_v2_connection(
                             // Read Login in plaintext. AEAD wrapping happens in
                             // handle_control after LoginResp (matching Go frp flow).
                             match tokio::time::timeout_at(
-                                accept_deadline,
+                                post_deadline,
                                 frp_core::v2_handshake::read_first_frame_after_handshake(&mut io),
                             )
                             .await
@@ -1248,7 +1349,7 @@ pub(crate) async fn handle_v2_connection(
 
         // V2 handshake: may receive ClientHello or first message
         let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
-            accept_deadline,
+            post_deadline,
             frp_core::v2_handshake::v2_handshake_server(&mut io),
         )
         .await
@@ -1259,7 +1360,7 @@ pub(crate) async fn handle_v2_connection(
                     // Read Login in plaintext. AEAD wrapping happens in
                     // handle_control after LoginResp (matching Go frp flow).
                     match tokio::time::timeout_at(
-                        accept_deadline,
+                        post_deadline,
                         frp_core::v2_handshake::read_first_frame_after_handshake(&mut io),
                     )
                     .await
@@ -1312,6 +1413,13 @@ pub(crate) async fn handle_v1_connection(
     accept_deadline: tokio::time::Instant,
     stream_io: IoStream,
 ) {
+    // Post-handshake reads (V1 Login) run on their own deadline:
+    // accept_deadline.max(now + POST_HANDSHAKE_READ_TIMEOUT). The 10s
+    // accept deadline covers only magic detection + yamux handshake; the
+    // Login read after that must not be cut off at 10s (slow OIDC JWT
+    // fetch) nor left unbounded (slowloris).
+    let post_deadline =
+        accept_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT);
     if state.tls_only {
         warn!(addr = %addr, "TLS-only mode: rejected plain TCP from {}", addr);
         return;
@@ -1346,15 +1454,25 @@ pub(crate) async fn handle_v1_connection(
 
                 // Try V2 detection: read 7 magic bytes from yamux stream.
                 // Go frp sends V2 magic on yamux stream (not raw TCP) when tcpMux.
+                // Bounded by POST_HANDSHAKE_READ_TIMEOUT (30s): a peer that completes the
+                // yamux handshake then sends nothing must not park the task
+                // and conn_semaphore permit until yamux keepalive dead-time
+                // (slowloris).
                 let mut magic = [0u8; 7];
-                let is_v2 = match io.read_exact(&mut magic).await {
-                    Ok(_) => is_v2_magic(&magic),
-                    Err(_) => false,
+                let is_v2 = match tokio::time::timeout_at(post_deadline, io.read_exact(&mut magic))
+                    .await
+                {
+                    Ok(Ok(_)) => is_v2_magic(&magic),
+                    Ok(Err(_)) => false,
+                    Err(_elapsed) => {
+                        warn!(addr = ?addr, "TCP+yamux: timed out reading first 7 bytes from {:?}", addr);
+                        return;
+                    }
                 };
                 if is_v2 {
                     // V2 detected on yamux stream! Do V2 handshake + dispatch
                     let (msg_payload, crypto_ctx) = match tokio::time::timeout_at(
-                        accept_deadline,
+                        post_deadline,
                         frp_core::v2_handshake::v2_handshake_server(&mut io),
                     )
                     .await
@@ -1365,7 +1483,7 @@ pub(crate) async fn handle_v1_connection(
                                 // Read Login in plaintext. AEAD wrapping happens in
                                 // handle_control after LoginResp (matching Go frp flow).
                                 match tokio::time::timeout_at(
-                                    accept_deadline,
+                                    post_deadline,
                                     frp_core::v2_handshake::read_first_frame_after_handshake(
                                         &mut io,
                                     ),
@@ -1420,7 +1538,7 @@ pub(crate) async fn handle_v1_connection(
                         Some(addr),
                         Some(incoming),
                         None,
-                        accept_deadline,
+                        post_deadline,
                     )
                     .await;
                 }
@@ -1439,7 +1557,7 @@ pub(crate) async fn handle_v1_connection(
             Some(addr),
             None,
             Some(addr.to_string()),
-            accept_deadline,
+            post_deadline,
         )
         .await;
     }
@@ -1467,6 +1585,16 @@ pub(crate) fn is_v2_magic(buf: &[u8]) -> bool {
 pub(crate) fn is_v1_type_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
 }
+
+/// Generous fixed bound for post-handshake FRP first-byte reads (after
+/// TLS/WS/yamux setup, before Login). Never tighter than the yamux
+/// driver's own idle-kill floor (MIN_IDLE_DEAD_TIME = 30s, mux.rs): a
+/// legit client (Go frpc with OIDC) fetches its JWT via auth.oidc.proxyURL
+/// after the handshake and before Login, which can take >10s — the 10s
+/// accept deadline is reserved for pre-handshake reads (ClientHello, WS
+/// upgrade), which legit clients satisfy immediately.
+pub(crate) const POST_HANDSHAKE_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 #[cfg(feature = "quic")]
 pub(crate) const QUIC_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1511,7 +1639,12 @@ where
 
 /// Run V2 handshake then read the first message frame. Returns `None` on error
 /// (already logged). `addr` is `None` for listeners that don't capture peer addr.
-#[cfg(feature = "websocket")]
+///
+/// Round 6 (LOW B4): the gate was websocket-only, but the QUIC accept path
+/// (transport.rs:1729) and all 8 KCP accept paths (service.rs) call this —
+/// `cargo check -p frp-server --no-default-features --features quic` failed
+/// to compile (E0425). Gate covers every calling transport.
+#[cfg(any(feature = "websocket", feature = "kcp", feature = "quic"))]
 pub(crate) async fn v2_handshake_and_read(
     io: &mut IoStream,
     addr: Option<std::net::SocketAddr>,
@@ -1596,41 +1729,26 @@ pub(crate) async fn handle_quic_stream(
             }
         };
 
+    // Post-handshake reads (V2 handshake, first frame, V1 Login) get the
+    // 30s POST_HANDSHAKE_READ_TIMEOUT like every other accept path — the
+    // 10s QUIC_FIRST_FRAME_TIMEOUT covers magic detection only, so a slow
+    // pre-Login OIDC JWT fetch is not cut off (Go frpc fetches via
+    // proxyURL after the yamux/stream handshake, pre-Login).
+    let post_deadline =
+        first_frame_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT);
+
     if is_v2 {
         // --- V2 path ---
-        let first_message = tokio::time::timeout_at(first_frame_deadline, async {
-            match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
-            Ok((Some(p), crypto)) => (p, crypto),
-            Ok((None, crypto)) => match ctl.read_raw_v2_frame().await {
-                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                Ok((ft, _, _)) => {
-                    tracing::warn!(frame_type = ?ft, "QUIC V2: unexpected frame type {} after handshake", ft);
-                    return None;
+        let (msg_payload, crypto_ctx) =
+            match crate::handlers::v2_handshake_and_read(&mut ctl, None, post_deadline, "QUIC V2")
+                .await
+            {
+                Some((p, crypto)) => (p, crypto),
+                None => {
+                    conn.close(b"control stream error");
+                    return;
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "QUIC V2: failed to read message after handshake: {}", e);
-                    return None;
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "QUIC V2 handshake error: {}", e);
-                return None;
-            }
-            }.into()
-        }).await;
-        let (msg_payload, crypto_ctx) = match first_message {
-            Ok(Some(message)) => message,
-            Ok(None) => {
-                conn.close(b"control stream error");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!("QUIC V2 control stream timed out before first message");
-                conn.close(b"control stream timeout");
-                return;
-            }
-        };
-
+            };
         let addr: std::net::SocketAddr = conn.remote_address();
         let (auth_tx, auth_rx) = tokio::sync::oneshot::channel();
         let control = crate::handlers::dispatch_v2_message_with_auth_signal(
@@ -1668,11 +1786,8 @@ pub(crate) async fn handle_quic_stream(
         // --- V1 fallback ---
         let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
 
-        match tokio::time::timeout_at(
-            first_frame_deadline,
-            frp_core::protocol::read_msg_v1(&mut ctl),
-        )
-        .await
+        match tokio::time::timeout_at(post_deadline, frp_core::protocol::read_msg_v1(&mut ctl))
+            .await
         {
             Err(_) => {
                 tracing::warn!("QUIC V1 control stream timed out before Login");
