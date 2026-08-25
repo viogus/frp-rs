@@ -1023,9 +1023,10 @@ async fn dispatch_v2_message_inner(
 /// it to the matching handler. `addr`/`incoming`/`visitor_addr` vary per call
 /// site; everything else is uniform (V1 => v2=false, no crypto context).
 ///
-/// Go frp compat: applies a 10-second read deadline for the first message
-/// to prevent slow/malicious clients from holding connections open
-/// (connReadTimeout in Go service.go:553).
+/// Go frp compat: applies the post-handshake read deadline (30s,
+/// `POST_HANDSHAKE_READ_TIMEOUT` — deliberately longer than Go's 10s
+/// connReadTimeout, see v2_handshake.rs) to the first message to prevent
+/// slow/malicious clients from holding connections open.
 pub(crate) async fn dispatch_v1_message(
     mut io: IoStream,
     state: std::sync::Arc<AppState>,

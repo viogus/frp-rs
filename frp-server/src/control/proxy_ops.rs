@@ -4562,8 +4562,9 @@ mod subdomain_conflict_tests {
     // label ("*.example.com") or the bare catch-all ("*") for
     // http/https/tcpmux — routing (getByRoute) replaces the leftmost label
     // with "*" and walks, so those are routable. A "*" in any other
-    // position can never match a route in Go either — validation accepts
-    // it (Go has no structure check), but it stays unroutable.
+    // position is never treated as a wildcard by the walk — validation
+    // accepts it (Go has no structure check), and it is reachable only
+    // by a literal host match.
     #[test]
     fn leading_label_wildcard_allowed() {
         let np = np_with_domains(vec!["*.example.com"], None);

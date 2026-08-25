@@ -1715,41 +1715,26 @@ pub(crate) async fn handle_quic_stream(
             }
         };
 
+    // Post-handshake reads (V2 handshake, first frame, V1 Login) get the
+    // 30s POST_HANDSHAKE_READ_TIMEOUT like every other accept path — the
+    // 10s QUIC_FIRST_FRAME_TIMEOUT covers magic detection only, so a slow
+    // pre-Login OIDC JWT fetch is not cut off (Go frpc fetches via
+    // proxyURL after the yamux/stream handshake, pre-Login).
+    let post_deadline =
+        first_frame_deadline.max(tokio::time::Instant::now() + POST_HANDSHAKE_READ_TIMEOUT);
+
     if is_v2 {
         // --- V2 path ---
-        let first_message = tokio::time::timeout_at(first_frame_deadline, async {
-            match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
-            Ok((Some(p), crypto)) => (p, crypto),
-            Ok((None, crypto)) => match ctl.read_raw_v2_frame().await {
-                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                Ok((ft, _, _)) => {
-                    tracing::warn!(frame_type = ?ft, "QUIC V2: unexpected frame type {} after handshake", ft);
-                    return None;
+        let (msg_payload, crypto_ctx) =
+            match crate::handlers::v2_handshake_and_read(&mut ctl, None, post_deadline, "QUIC V2")
+                .await
+            {
+                Some((p, crypto)) => (p, crypto),
+                None => {
+                    conn.close(b"control stream error");
+                    return;
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "QUIC V2: failed to read message after handshake: {}", e);
-                    return None;
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "QUIC V2 handshake error: {}", e);
-                return None;
-            }
-            }.into()
-        }).await;
-        let (msg_payload, crypto_ctx) = match first_message {
-            Ok(Some(message)) => message,
-            Ok(None) => {
-                conn.close(b"control stream error");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!("QUIC V2 control stream timed out before first message");
-                conn.close(b"control stream timeout");
-                return;
-            }
-        };
-
+            };
         let addr: std::net::SocketAddr = conn.remote_address();
         let (auth_tx, auth_rx) = tokio::sync::oneshot::channel();
         let control = crate::handlers::dispatch_v2_message_with_auth_signal(
@@ -1787,11 +1772,8 @@ pub(crate) async fn handle_quic_stream(
         // --- V1 fallback ---
         let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
 
-        match tokio::time::timeout_at(
-            first_frame_deadline,
-            frp_core::protocol::read_msg_v1(&mut ctl),
-        )
-        .await
+        match tokio::time::timeout_at(post_deadline, frp_core::protocol::read_msg_v1(&mut ctl))
+            .await
         {
             Err(_) => {
                 tracing::warn!("QUIC V1 control stream timed out before Login");

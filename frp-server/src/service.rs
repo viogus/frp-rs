@@ -826,26 +826,13 @@ impl Service {
                                     tracing::info!(peer = %peer, first_byte = ?format_args!("0x{:02x}", magic[0]), is_v2, "KCP: new session from {} (first_byte=0x{:02x}, is_v2={})", peer, magic[0], is_v2);
 
                                     if is_v2 {
-                                        // V2 path: ClientHello/ServerHello handshake
-                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
-                                            Ok((Some(p), crypto)) => (p, crypto),
-                                            Ok((None, crypto)) => {
-                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut ctl).await {
-                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                    Ok((ft, _, _)) => {
-                                                        tracing::warn!(frame_type = ?ft, "KCP V2: unexpected frame type {} after handshake", ft);
-                                                        return;
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(error = %e, "KCP V2: failed to read message after handshake: {}", e);
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, "KCP V2 handshake error: {}", e);
-                                                return;
-                                            }
+                                        // V2 path: ClientHello/ServerHello + first frame,
+                                        // bounded by post_deadline (30s) like TCP/WS — the
+                                        // per-read 30s V2_HANDSHAKE_TIMEOUT would stack with
+                                        // KCP_AUTH_TIMEOUT to ~90s on this path.
+                                        let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut ctl, Some(peer), post_deadline, "KCP V2").await {
+                                            Some((p, crypto)) => (p, crypto),
+                                            None => return,
                                         };
                                         crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer, None, None, crypto_ctx).await;
                                     } else {
@@ -930,25 +917,9 @@ impl Service {
                                                                 }
                                                             };
                                                             if is_v2 {
-                                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                                    Ok((Some(p), crypto)) => (p, crypto),
-                                                                    Ok((None, crypto)) => {
-                                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                            Ok((ft, _, _)) => {
-                                                                                tracing::warn!(frame_type = ?ft, peer = %peer, "KCP TLS+yamux V2: unexpected frame type {}", ft);
-                                                                                return;
-                                                                            }
-                                                                            Err(e) => {
-                                                                                tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux V2: read error: {}", e);
-                                                                                return;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux V2 handshake error: {}", e);
-                                                                        return;
-                                                                    }
+                                                                let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(peer), post_deadline, "KCP TLS+yamux V2").await {
+                                                                    Some((p, crypto)) => (p, crypto),
+                                                                    None => return,
                                                                 };
                                                                 crate::handlers::dispatch_v2_message(io, msg_payload, state, peer, Some(incoming), None, crypto_ctx).await;
                                                             } else {
@@ -1009,25 +980,9 @@ impl Service {
                                                     }
                                                 };
                                                 if is_v2 {
-                                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
-                                                        Ok((Some(p), crypto)) => (p, crypto),
-                                                        Ok((None, crypto)) => {
-                                                            match frp_core::v2_handshake::read_first_frame_after_handshake(&mut ctl).await {
-                                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                Ok((ft, _, _)) => {
-                                                                    tracing::warn!(frame_type = ?ft, "KCP TLS V2: unexpected frame type {} after handshake", ft);
-                                                                    return;
-                                                                }
-                                                                Err(e) => {
-                                                                    tracing::warn!(error = %e, "KCP TLS V2: failed to read message after handshake: {}", e);
-                                                                    return;
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(error = %e, "KCP TLS V2 handshake error: {}", e);
-                                                            return;
-                                                        }
+                                                    let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut ctl, Some(peer), post_deadline, "KCP TLS V2").await {
+                                                        Some((p, crypto)) => (p, crypto),
+                                                        None => return,
                                                     };
                                                     crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer, None, None, crypto_ctx).await;
                                                 } else {
@@ -1173,25 +1128,9 @@ impl Service {
                                                         }
                                                     };
                                                     if is_v2 {
-                                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                            Ok((Some(p), crypto)) => (p, crypto),
-                                                            Ok((None, crypto)) => {
-                                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
-                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                    Ok((ft, _, _)) => {
-                                                                        tracing::warn!(frame_type = ?ft, peer = %peer, "KCP yamux V2: unexpected frame type {}", ft);
-                                                                        return;
-                                                                    }
-                                                                    Err(e) => {
-                                                                        tracing::warn!(peer = %peer, error = %e, "KCP yamux V2: read error: {}", e);
-                                                                        return;
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(peer = %peer, error = %e, "KCP yamux V2 handshake error: {}", e);
-                                                                return;
-                                                            }
+                                                        let (msg_payload, crypto_ctx) = match crate::handlers::v2_handshake_and_read(&mut io, Some(peer), post_deadline, "KCP yamux V2").await {
+                                                            Some((p, crypto)) => (p, crypto),
+                                                            None => return,
                                                         };
                                                         crate::handlers::dispatch_v2_message(io, msg_payload, state, peer, Some(incoming), None, crypto_ctx).await;
                                                     } else {

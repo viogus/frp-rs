@@ -1546,7 +1546,8 @@ mod tests {
         assert!(t.map.contains_key(&oldest_ts));
         assert_eq!(t.map[&oldest_ts].len(), MAX_ENTRIES_PER_TIMESTAMP);
         // The victim's coverage is intact: a fresh run_id at that key is
-        // still admitted (and evicts the oldest run_id there, as usual).
+        // still admitted — the whole oldest timestamp key is evicted
+        // first (global cap), so the fresh entry lands in an empty bucket.
         assert_eq!(
             t.record(oldest_ts, "run-new"),
             ReplayCheck::Admitted,

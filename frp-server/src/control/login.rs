@@ -108,7 +108,9 @@ async fn send_login_error(
 /// Deliberate frp-rs hardening (NOT Go frp parity — Go frp v0.71.0 has
 /// no login throttle in its source): only failures consume a slot — this
 /// helper is invoked on failure paths only, so successful logins are
-/// never counted and legitimate reconnects are never throttled. An IP is
+/// never counted and legitimate reconnects are never throttled (except
+/// a same-ms run_id replay from a sub-tick reconnect, which counts as
+/// a failure like any other replay). An IP is
 /// rejected for the 60s window after the 5th failure (per-IP fixed 60s
 /// window anchored at the first counted failure, capped table with a
 /// coarse overflow bucket).
@@ -417,10 +419,11 @@ async fn verify_login_auth(
                 drop(used);
                 if let Some(error) = reject_replay {
                     // Replay rejections consume a throttle slot like any
-                    // other failure: a captured (ts, md5, run_id) triple
-                    // can otherwise be replayed repeatedly, each attempt
-                    // costing an accept + MD5 + table lookup with no rate
-                    // limit until the ts ages out of the freshness window.
+                    // other failure: without this, an attacker replaying
+                    // captured (ts, md5, run_id) triples could retry
+                    // freely — each rejection was uncounted — and never
+                    // advance toward the throttle that caps their later
+                    // guess attempts.
                     let throttled = throttled_login_error(state, peer).await;
                     send_login_error(stream, throttled.unwrap_or(error), v2).await;
                     return Err(());

@@ -80,10 +80,26 @@ impl TcpMuxManager {
         // keeping register/unregister symmetric.
         let domains: Vec<String> = domains.iter().map(|d| d.to_lowercase()).collect();
 
+        // Validate every domain before inserting anything (no partial state).
+        // Re-registration by the same proxy name is allowed (idempotent).
+        for domain in &domains {
+            if let Some(existing) = routes.get(domain) {
+                if existing.proxy_name != proxy_name {
+                    return Err(format!(
+                        "tcpmux route conflict for domain '{}': proxy '{}' vs '{}'",
+                        domain, existing.proxy_name, proxy_name
+                    ));
+                }
+            }
+        }
+
         // Re-registration with a changed domain list (server reload): drop
         // routes that left the list — otherwise a shrunken reload orphans
-        // the dropped `*.` route (and its wildcard count) forever. Same
-        // ownership guard as unregister: a sibling's live route survives.
+        // the dropped `*.` route (and its wildcard count) forever. Runs
+        // AFTER the conflict check so a rejected registration leaves the
+        // old routes intact (no partial state — the caller's rollback is
+        // a no-op for tcpmux). Same ownership guard as unregister: a
+        // sibling's live route survives.
         if let Some(old) = by_proxy.get(proxy_name) {
             for domain in old {
                 if !domains.contains(domain)
@@ -96,19 +112,6 @@ impl TcpMuxManager {
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     routes.remove(domain);
-                }
-            }
-        }
-
-        // Validate every domain before inserting anything (no partial state).
-        // Re-registration by the same proxy name is allowed (idempotent).
-        for domain in &domains {
-            if let Some(existing) = routes.get(domain) {
-                if existing.proxy_name != proxy_name {
-                    return Err(format!(
-                        "tcpmux route conflict for domain '{}': proxy '{}' vs '{}'",
-                        domain, existing.proxy_name, proxy_name
-                    ));
                 }
             }
         }
@@ -166,7 +169,9 @@ impl TcpMuxManager {
         // Strip port if present: example.com:443 → example.com; bracketed
         // IPv6: [::1]:443 → ::1; then exactly one trailing dot (Go frp
         // CanonicalHost, pkg/util/http/http.go).
-        let hostname = canonicalize_host(host)?;
+        // Lenient port mode: the caller already applied the request-line
+        // (strict) or Host-header (lenient) gate before routing here.
+        let hostname = canonicalize_host(host, false)?;
         // Go frp compat (pkg/util/vhost/router.go): `Get` lowercases the
         // host — domains are stored lowercased at register. Alloc-free ASCII
         // fast path (Go's strings.ToLower skips allocation for all-lowercase
@@ -477,20 +482,24 @@ async fn read_http_headers(
 ///
 /// Port handling follows Go's `hasPort` gate: the port is split only when
 /// the value has exactly one colon (host:port / IPv4:port) or is a
-/// bracket-start with `]:` (bracketed IPv6). A split port must be numeric
-/// — `net.SplitHostPort` rejects anything else and Go frp discards the
-/// error, so "example.com:abc" is unroutable (caller replies 400).
-/// Portless values are used as-is: "example.com", "[::1]" (stays
-/// bracketed — nothing registers brackets, so it is unroutable), or
-/// unbracketed multi-colon "::1:443". Then trim exactly one trailing dot
-/// (Go TrimSuffix — one dot only, so "example.com.." stays unroutable).
-fn canonicalize_host(host: &str) -> Option<&str> {
+/// bracket-start with `]:` (bracketed IPv6). `strict_port` mirrors the
+/// source's validation: on the CONNECT request line, url.ParseRequestURI
+/// rejects a non-numeric port (validOptionalPort `^:\d*$` — an empty
+/// port is legal), so strict mode 400s "example.com:abc" but routes
+/// "example.com:"; on the Host header, `net.SplitHostPort` never
+/// validates the port (Go frp routes "Host: example.com:abc" to
+/// example.com), so lenient mode accepts any suffix. Portless values are
+/// used as-is: "example.com", "[::1]" (stays bracketed — nothing
+/// registers brackets, so it is unroutable), or unbracketed multi-colon
+/// "::1:443". Then trim exactly one trailing dot (Go TrimSuffix — one dot
+/// only, so "example.com.." stays unroutable).
+fn canonicalize_host(host: &str, strict_port: bool) -> Option<&str> {
     let colons = host.bytes().filter(|b| *b == b':').count();
     let hostname = if colons == 1 {
-        // host:port — the port must be numeric (SplitHostPort rejects
-        // "example.com:abc" and "example.com:").
+        // host:port — strict mode requires the port to be empty or
+        // numeric (url.ParseRequestURI); lenient mode takes any suffix.
         let (h, port) = host.rsplit_once(':')?;
-        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        if strict_port && !port.is_empty() && !port.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         h
@@ -500,7 +509,7 @@ fn canonicalize_host(host: &str) -> Option<&str> {
         // bracketed — unroutable.
         let end = host.find(']')?;
         let port = &host[end + 2..];
-        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        if strict_port && !port.is_empty() && !port.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         &host[1..end]
@@ -520,6 +529,8 @@ fn trim_trailing_dot(host: &str) -> &str {
 
 /// Extract the Host header value from an HTTP request (hostname only, no
 /// port, exactly one trailing dot trimmed — Go frp `CanonicalHost`).
+/// Lenient port mode: Go routes "Host: example.com:abc" (SplitHostPort
+/// never validates the port).
 fn extract_host_header(request: &str) -> Option<&str> {
     for line in request.lines() {
         if line.len() < 6 {
@@ -529,7 +540,7 @@ fn extract_host_header(request: &str) -> Option<&str> {
             continue;
         }
         let value = line[5..].trim();
-        return canonicalize_host(value);
+        return canonicalize_host(value, false);
     }
     None
 }
@@ -545,15 +556,24 @@ fn extract_host_header(request: &str) -> Option<&str> {
 /// line is malformed or neither source is present (caller replies 400).
 fn extract_route_host(request: &str) -> Option<&str> {
     let first_line = request.lines().next()?;
-    let mut parts = first_line.split_whitespace();
+    // Go net/http parseRequestLine splits on SPACE only, at most 3 tokens
+    // (SplitN(line, " ", 3)): "METHOD TARGET VERSION". A 2-part line
+    // (versionless, or "CONNECT HTTP/1.1" — the version string in the
+    // target slot) errors the whole ReadRequest regardless of any Host
+    // header → 400. Tab-separated versions merge into the target token
+    // and fail the authority parse below (Go's space-only split makes the
+    // whole line malformed). The version must be exactly "HTTP/1.x"
+    // (parseProtoVersion: major 1, numeric minor) — "HTTP/2", "garbage",
+    // and 4-token lines (version + trailing junk) all error in Go.
+    let mut parts = first_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
-    // Go net/http parseRequestLine requires "METHOD TARGET VERSION": a
-    // 2-part line ("CONNECT HTTP/1.1", versionless "CONNECT
-    // example.com:443") errors the whole ReadRequest regardless of any
-    // Host header, so the connection is closed with 400. A bare-version
-    // line must not route on the version string.
-    if target.is_empty() || parts.next().is_none() || target.starts_with("HTTP/") {
+    let version = parts.next().unwrap_or("");
+    if target.is_empty()
+        || version.is_empty()
+        || !is_valid_version(version)
+        || target.starts_with("HTTP/")
+    {
         return None;
     }
     // Path-form targets ("GET /path") carry no URL host in Go — fall back
@@ -565,8 +585,24 @@ fn extract_route_host(request: &str) -> Option<&str> {
         return extract_host_header(request);
     }
     // Authority-form: req.Host = req.URL.Host (RFC 7230 §5.3 — any Host
-    // header is ignored).
-    canonicalize_host(target)
+    // header is ignored). Strict port mode: url.ParseRequestURI rejects a
+    // non-numeric port ("example.com:abc" → 400) but accepts an empty
+    // one ("example.com:" routes to example.com).
+    canonicalize_host(target, true)
+}
+
+/// Go net/http parseProtoVersion: exactly "HTTP/" + numeric major +
+/// "." + numeric minor, with major 1 ("HTTP/2.0" is unsupported by the
+/// server). Any other shape — trailing junk included — errors the
+/// ReadRequest.
+fn is_valid_version(version: &str) -> bool {
+    let Some(rest) = version.strip_prefix("HTTP/") else {
+        return false;
+    };
+    let Some((maj, min)) = rest.split_once('.') else {
+        return false;
+    };
+    maj == "1" && !min.is_empty() && min.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Extract Proxy-Authorization Basic credentials.
@@ -668,35 +704,59 @@ mod tests {
             extract_route_host("CONNECT example.com HTTP/1.1\r\n\r\n"),
             Some("example.com")
         );
-        // Non-numeric port: net.SplitHostPort errors, Go frp discards the
-        // CanonicalHost error → host "" → unroutable → 400.
+        // Non-numeric port on the request line: url.ParseRequestURI's
+        // validOptionalPort rejects it → Go ReadRequest 400s.
         assert_eq!(
             extract_route_host("CONNECT example.com:abc HTTP/1.1\r\n\r\n"),
             None
         );
+        // Empty port is legal (validOptionalPort `^:\d*$`) — Go routes
+        // "CONNECT example.com:" to example.com.
         assert_eq!(
             extract_route_host("CONNECT example.com: HTTP/1.1\r\n\r\n"),
-            None
+            Some("example.com")
         );
         // Versionless request line: Go parseRequestLine needs 3 parts and
         // errors → 400, no routing on the Host header either.
         let req = "CONNECT example.com:443\r\nHost: other.net\r\n\r\n";
         assert_eq!(extract_route_host(req), None);
+        // Version content is validated (parseProtoVersion: major 1,
+        // numeric minor) — "HTTP/2" and trailing junk 400 in Go.
+        assert_eq!(
+            extract_route_host("CONNECT example.com:443 HTTP/2\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            extract_route_host("CONNECT example.com:443 HTTP/1.1 EXTRA\r\n\r\n"),
+            None
+        );
+        // Tab between target and version: Go splits on SPACE only → the
+        // line is malformed (2 tokens) → 400.
+        assert_eq!(
+            extract_route_host("CONNECT example.com:443\tHTTP/1.1\r\n\r\n"),
+            None
+        );
         // Lowercase method: Go justAuthority is case-sensitive → no URL
         // host → Host header fallback (the caller 405s non-"CONNECT").
         let req = "connect example.com:443 HTTP/1.1\r\nHost: header.net\r\n\r\n";
         assert_eq!(extract_route_host(req), Some("header.net"));
-        // Non-numeric port in the Host header fallback is unroutable too.
+        // Host header port is NOT validated (SplitHostPort accepts any
+        // suffix) — Go routes "Host: example.com:abc" to example.com.
         let req = "CONNECT /path HTTP/1.1\r\nHost: example.com:abc\r\n\r\n";
-        assert_eq!(extract_route_host(req), None);
+        assert_eq!(extract_route_host(req), Some("example.com"));
         // Bracketed IPv6 without a port stays bracketed (hasPort false) —
         // unroutable, but not an error.
         let req = "CONNECT [::1] HTTP/1.1\r\n\r\n";
         assert_eq!(extract_route_host(req), Some("[::1]"));
-        // Bracketed IPv6 with a non-numeric port is unroutable.
+        // Bracketed IPv6 with a non-numeric port is unroutable on the
+        // request line; an empty port routes.
         assert_eq!(
             extract_route_host("CONNECT [::1]:abc HTTP/1.1\r\n\r\n"),
             None
+        );
+        assert_eq!(
+            extract_route_host("CONNECT [::1]: HTTP/1.1\r\n\r\n"),
+            Some("::1")
         );
     }
 

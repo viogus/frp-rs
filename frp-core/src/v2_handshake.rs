@@ -32,9 +32,11 @@ use crate::transport::IoStream;
 /// pre-Login OIDC JWT fetch (fetched over the proxyURL after the handshake,
 /// before Login — killed a >10s fetch in test_g2r_oidc_proxy), so frp-rs
 /// deliberately hardens all post-magic reads to 30s. These reads are
-/// post-magic-detection on every path (TCP/WS/KCP): `v2_handshake_server`
-/// first frame, `read_first_frame_after_handshake`, and the client-side
-/// ServerHello read.
+/// post-magic-detection on every path (TCP/WS/KCP/QUIC):
+/// `v2_handshake_server` first frame, `read_first_frame_after_handshake`,
+/// and the client-side ServerHello read. The server accept paths wrap
+/// handshake + first frame in an outer `timeout_at(post_deadline, …)` so
+/// the per-read 30s does not stack with the magic-read timeout.
 const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Crypto random size in bytes (matching Go frp CryptoRandomSize = 32).
