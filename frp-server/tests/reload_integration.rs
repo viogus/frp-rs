@@ -3,14 +3,14 @@
 //! These tests verify that frpc correctly handles SIGUSR1 by reloading
 //! its proxy configuration and sending CloseProxy/NewProxy messages to frps.
 
+mod common;
+
 #[cfg(unix)]
 mod unix_tests {
-    use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
 
     /// Resolve binary path for a workspace member.
@@ -149,55 +149,13 @@ mod unix_tests {
         false
     }
 
-    /// Ports already handed out by this process — see allocate_port.
-    static USED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-
-    /// Find an available TCP port. Never re-issues a port already handed
-    /// out by this process, and re-verifies availability right before
-    /// returning (narrows the probe-then-drop window).
+    /// Find an available TCP port — delegates to the shared process-wide
+    /// allocator in `common`. A local copy of the USED_PORTS set (with
+    /// sandbox_fallback) let two test files hand out the same port under
+    /// parallel execution, flaking as EADDRINUSE on the second binder
+    /// (e.g. echo-server bind in test_reload_health_check_with_user).
     fn allocate_port() -> u16 {
-        use std::net::TcpListener;
-        for _ in 0..64 {
-            let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
-                break;
-            };
-            let Ok(addr) = listener.local_addr() else {
-                break;
-            };
-            let port = addr.port();
-            {
-                let mut used = USED_PORTS.lock().unwrap();
-                if !used.insert(port) {
-                    continue; // already handed out in this process — probe again
-                }
-                // Narrow the probe-then-drop window: confirm the port is
-                // still free before handing it out.
-                if TcpListener::bind(("127.0.0.1", port)).is_err() {
-                    used.remove(&port);
-                    continue;
-                }
-            }
-            return port;
-        }
-        sandbox_fallback()
-    }
-
-    /// Sandbox fallback: return an ephemeral port (49152-65535 range).
-    /// Deterministic per process, so walk past ports already handed out to
-    /// avoid handing the same fallback port to two tests.
-    fn sandbox_fallback() -> u16 {
-        use std::hash::{BuildHasher, Hasher};
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_usize(std::process::id() as usize);
-        let base = 49152 + (h.finish() % 16384) as u16;
-        let mut used = USED_PORTS.lock().unwrap();
-        for i in 0..16384u16 {
-            let port = 49152 + ((base - 49152 + i) % 16384);
-            if used.insert(port) {
-                return port;
-            }
-        }
-        base
+        crate::common::allocate_port()
     }
 
     /// Send data to a TCP port and read the response.
