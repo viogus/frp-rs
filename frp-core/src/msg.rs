@@ -1340,7 +1340,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // UdpAddr tests — serde JSON format matching Go frp v0.69.1
+    // UdpAddr tests — serde JSON format matching Go frp v0.71.0
     // ---------------------------------------------------------------
 
     #[test]

@@ -629,6 +629,16 @@ pub(crate) async fn authenticate(
                     .is_err()
                     {
                         debug!(run_id = %run_id, "Old control handler channel still full; Shutdown dropped after {SUPERSESSION_SHUTDOWN_TIMEOUT:?}");
+                        // Round-7 review finding: dropping the Shutdown left
+                        // the old control alive until its socket died or the
+                        // heartbeat fired (up to 90s), with stale
+                        // registrations + same-name re-registration conflicts
+                        // in the window. The flag the old handler checks at
+                        // its loop top makes it exit as soon as it is free —
+                        // eventual supersession without a parked task.
+                        old_ctl
+                            .superseded
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                     Some(rx)
                 }
@@ -645,6 +655,10 @@ pub(crate) async fn authenticate(
         .as_ref()
         .map(|c| c.udp_packet_codec.clone())
         .unwrap_or_default();
+    // Shared supersession flag (round-7 review finding): a later login with
+    // the same run_id sets it when it cannot deliver its Shutdown through a
+    // full channel; the old handler's loop-top check sees it.
+    let superseded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     state.run_id_to_ctl_tx.insert(
         run_id.clone(),
         ControlTx {
@@ -666,6 +680,7 @@ pub(crate) async fn authenticate(
             // Wire protocol of this control (Go v0.71.0 work/visitor conn
             // wire-protocol enforcement).
             wire_v2: v2,
+            superseded: superseded.clone(),
         },
     );
 
@@ -973,6 +988,7 @@ pub(crate) async fn authenticate(
             listener_handles,
             udp_sockets,
             last_ping,
+            superseded,
         },
         internal_tx,
         internal_rx,

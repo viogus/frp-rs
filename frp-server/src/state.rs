@@ -3,7 +3,9 @@ use std::collections::HashMap;
 #[cfg(feature = "vnet")]
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
+};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 #[cfg(feature = "dashboard")]
@@ -179,6 +181,12 @@ pub struct ControlTx {
     /// enforces that work connections and run_id-bearing visitor connections
     /// use the same wire protocol as the control they reference.
     pub wire_v2: bool,
+    /// Set by a superseding login (same run_id) whose Shutdown message could
+    /// not be delivered through a full internal channel: the old control
+    /// handler checks this at its loop top and exits as soon as it is free,
+    /// so cleanup (registrations, bridges, conn_semaphore) runs at wedge-end
+    /// instead of after the heartbeat timeout (round-7 review finding).
+    pub superseded: Arc<AtomicBool>,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -1412,6 +1420,7 @@ mod tests {
                 control_id: 1,
                 udp_packet_codec: String::new(),
                 wire_v2: false,
+                superseded: Arc::new(AtomicBool::new(false)),
             },
         );
         rx

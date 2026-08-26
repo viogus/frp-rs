@@ -73,6 +73,22 @@ fn addr_to_binary(addr: &UdpAddr) -> Result<BinaryUdpAddr, String> {
             })
         }
         std::net::IpAddr::V6(v6) => {
+            // Go frp's validateBinaryUDPAddr applies net.IP.To4() first: an
+            // IPv4-mapped IPv6 address (e.g. the JSON string
+            // "::ffff:192.168.0.1") is normalized to family 4 with the
+            // 4-byte dotted-quad form on the wire, never family 6 (review
+            // finding C1 — Go parity).
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if !addr.zone.is_empty() {
+                    return Err("IPv4 zone is forbidden".into());
+                }
+                return Ok(BinaryUdpAddr {
+                    family: 4,
+                    ip: v4.octets().to_vec(),
+                    port: addr.port,
+                    zone: String::new(),
+                });
+            }
             if addr.zone.len() > 255 {
                 return Err("zone exceeds 255 bytes".into());
             }
@@ -251,12 +267,27 @@ fn socket_addr_to_binary(addr: &std::net::SocketAddr) -> BinaryUdpAddr {
             port: v4.port(),
             zone: String::new(),
         },
-        std::net::SocketAddr::V6(v6) => BinaryUdpAddr {
-            family: 6,
-            ip: v6.ip().octets().to_vec(),
-            port: v6.port(),
-            zone: String::new(),
-        },
+        std::net::SocketAddr::V6(v6) => {
+            // Same To4() normalization as [`addr_to_binary`]: a dual-stack
+            // socket recv of an IPv4 peer yields an IPv4-mapped address,
+            // which must go on the wire as family 4 (Go parity, review
+            // finding C1).
+            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                BinaryUdpAddr {
+                    family: 4,
+                    ip: v4.octets().to_vec(),
+                    port: v6.port(),
+                    zone: String::new(),
+                }
+            } else {
+                BinaryUdpAddr {
+                    family: 6,
+                    ip: v6.ip().octets().to_vec(),
+                    port: v6.port(),
+                    zone: String::new(),
+                }
+            }
+        }
     }
 }
 
@@ -270,26 +301,40 @@ pub fn decode_udp_packet_binary(body: &[u8]) -> Result<UDPPacket, String> {
     })
 }
 
-/// Decode a UDPPacket from an owned binary codec body, taking ownership of
-/// the buffer on success: the packet's `content` IS the input buffer (payload
-/// memmoved to the front, buffer truncated to the payload), so the
-/// per-packet allocation + copy of [`decode_udp_packet_binary`] is avoided.
-/// On error the buffer is left untouched and still owned by the caller.
+/// Decode a UDPPacket from an owned binary codec body. For large datagrams
+/// (payload ≥ [`crate::buffer_pool::BUFFER_SIZE`]) ownership of the buffer is
+/// taken: the packet's `content` IS the input buffer (payload memmoved to the
+/// front, buffer truncated to the payload), so the per-packet allocation +
+/// copy of [`decode_udp_packet_binary`] is avoided and the caller's scratch is
+/// emptied. For typical smaller payloads the payload is copied out and `body`
+/// is left intact for reuse across frames. On error the buffer is left
+/// untouched and still owned by the caller.
 ///
 /// The parse is byte-for-byte the same as [`decode_udp_packet_binary`] (same
-/// checks, same error strings). The caller should refill the emptied buffer
-/// for the next read (the V2 UDP read path re-acquires from
-/// `frp_core::buffer_pool::BUFFER_POOL`, keeping the per-task scratch
-/// allocation-free).
+/// checks, same error strings). When the buffer was taken (empty on return),
+/// the caller should refill for the next read (the V2 UDP read path
+/// re-acquires from `frp_core::buffer_pool::BUFFER_POOL`).
 pub fn decode_udp_packet_binary_owned(body: &mut Vec<u8>) -> Result<UDPPacket, String> {
     let h = parse_udp_packet_header(body)?;
-    // The trailing-bytes check guarantees `payload_offset + payload_len ==
-    // body.len()`, so the payload is exactly the buffer tail: move it to the
-    // front and truncate — one in-place memmove, zero allocation.
-    body.copy_within(h.payload_offset.., 0);
-    body.truncate(h.payload_len);
+    // Steady-state path (review finding M2): copy the payload out and keep
+    // `body` in the caller's loop — the buffer pool is untouched, zero alloc
+    // per packet. Only for large datagrams (payload ≥ the 32 KiB pool buffer,
+    // where the copy would double the packet cost) is the buffer moved into
+    // the packet; that buffer then never returns to the pool, so the pool
+    // drains at most one buffer per large datagram — acceptable, they are
+    // the rare case (UDP payloads are typically ≤ 1.5 KiB MTU-sized).
+    let content = if h.payload_len < *crate::buffer_pool::BUFFER_SIZE {
+        body[h.payload_offset..h.payload_offset + h.payload_len].to_vec()
+    } else {
+        // The trailing-bytes check guarantees `payload_offset + payload_len
+        // == body.len()`, so the payload is exactly the buffer tail: move it
+        // to the front and truncate — one in-place memmove, zero allocation.
+        body.copy_within(h.payload_offset.., 0);
+        body.truncate(h.payload_len);
+        std::mem::take(body)
+    };
     Ok(UDPPacket {
-        content: std::mem::take(body),
+        content,
         local_addr: h.local_addr,
         remote_addr: Some(h.remote_addr),
     })
@@ -475,17 +520,38 @@ mod tests {
 
     #[test]
     fn owned_decode_matches_slice_decode_and_consumes_buffer() {
+        // Typical packet (payload < BUFFER_SIZE): copied out, caller's
+        // scratch buffer left intact so the read loop reuses it (the pool is
+        // untouched — review finding M2).
         let pkt = sample_packet();
         let body = encode_udp_packet_binary(&pkt).unwrap();
         let expected = decode_udp_packet_binary(&body).unwrap();
-        let mut owned = body;
+        let mut owned = body.clone();
         let out = decode_udp_packet_binary_owned(&mut owned).unwrap();
         assert_eq!(out.content, expected.content);
         assert_eq!(out.local_addr, expected.local_addr);
         assert_eq!(out.remote_addr, expected.remote_addr);
         assert_eq!(out.content, pkt.content);
-        // The packet content IS the caller's buffer: ownership moved out.
-        assert!(owned.is_empty(), "owned decode must consume the buffer");
+        assert_eq!(
+            owned, body,
+            "small payload must leave the caller's buffer intact"
+        );
+
+        // Large datagram (payload ≥ BUFFER_SIZE): the packet content IS the
+        // caller's buffer — ownership moved out, caller must refill.
+        let big = UDPPacket {
+            content: vec![0xabu8; *crate::buffer_pool::BUFFER_SIZE],
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "127.0.0.1".into(),
+                port: 1,
+                zone: String::new(),
+            }),
+        };
+        let mut owned = encode_udp_packet_binary(&big).unwrap();
+        let out = decode_udp_packet_binary_owned(&mut owned).unwrap();
+        assert_eq!(out.content, big.content);
+        assert!(owned.is_empty(), "large payload must consume the buffer");
     }
 
     #[test]
@@ -536,5 +602,19 @@ mod tests {
             .unwrap();
             assert_eq!(direct, via_string, "address {addr}");
         }
+    }
+
+    #[test]
+    fn ipv4_mapped_encodes_as_family_4() {
+        // Go frp's validateBinaryUDPAddr applies net.IP.To4() first: an
+        // IPv4-mapped IPv6 address must go on the wire as family 4 with the
+        // 4-byte dotted-quad form, never family 6 (review finding C1).
+        let sa: std::net::SocketAddr = "[::ffff:192.168.0.1]:12345".parse().unwrap();
+        let mut buf = Vec::new();
+        encode_udp_packet_binary_socket_addr(b"ping", None, &sa, &mut buf).unwrap();
+        // Layout: [flags=0] [family] [ip bytes] [port] [zone len] [zone] ...
+        assert_eq!(buf[1], 4, "mapped address must encode as family 4");
+        assert_eq!(&buf[2..6], &[192, 168, 0, 1], "4-byte dotted-quad form");
+        assert_eq!(buf[6..8], 12345u16.to_be_bytes(), "port");
     }
 }

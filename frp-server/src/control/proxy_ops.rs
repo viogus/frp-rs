@@ -2624,6 +2624,7 @@ pub(crate) mod unregister_generation_tests {
                 control_id,
                 udp_packet_codec: String::new(),
                 wire_v2: false,
+                superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         rx

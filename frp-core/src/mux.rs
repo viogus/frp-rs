@@ -79,6 +79,14 @@ const MIN_IDLE_DEAD_TIME: Duration = Duration::from_secs(30);
 #[cfg(feature = "tcp-mux")]
 const MAX_PENDING_OPEN_REQUESTS: usize = 64;
 
+/// Bounds the wait for the driver's answer to an open-stream request
+/// (review finding): a wedged driver — stalled peer that never acks, so the
+/// queued SYN is never served — would otherwise park the caller until the
+/// session dies, up to `MAX_PENDING_OPEN_REQUESTS` slots at once. One
+/// keepalive tick; a live driver answers within the same I/O pass.
+#[cfg(feature = "tcp-mux")]
+const MUX_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Wrapper type for a yamux stream compatible with tokio's AsyncRead/AsyncWrite.
 #[cfg(feature = "tcp-mux")]
 pub type YamuxStream = Compat<Stream>;
@@ -375,14 +383,21 @@ impl YamuxSession {
         // pass (the driver does not block on this channel; the notify is how
         // a quiet session learns a new open is queued).
         self.open_notify.notify_one();
-        let stream = match rx.await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
+        // Bound the answer wait (see `MUX_OPEN_TIMEOUT`): a wedged driver
+        // must not park this task indefinitely. On timeout return `None` —
+        // the caller retries through the control protocol.
+        let stream = match tokio::time::timeout(MUX_OPEN_TIMEOUT, rx).await {
+            Ok(Ok(Ok(s))) => s,
+            Ok(Ok(Err(e))) => {
                 warn!(error = %e, "yamux client: open stream failed: {e}");
                 return None;
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 // Driver dropped the sender without answering (shutdown).
+                return None;
+            }
+            Err(_) => {
+                warn!(timeout = ?MUX_OPEN_TIMEOUT, "yamux client: open stream timed out, dropping request");
                 return None;
             }
         };

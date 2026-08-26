@@ -455,7 +455,17 @@ async fn run_udp_work_conn(
                             content,
                             local_addr: local_addr.take(),
                             remote_addr: Some(msg::UdpAddr {
-                                ip: src.ip().to_string(),
+                                // Go net.IP.String() collapses IPv4-mapped
+                                // IPv6 to the dotted-quad form; mirror that
+                                // on the V1 JSON path too (same normalization
+                                // as the V2 binary codec, review finding C1).
+                                ip: match src.ip() {
+                                    std::net::IpAddr::V6(v6) => v6
+                                        .to_ipv4_mapped()
+                                        .map(|v4| v4.to_string())
+                                        .unwrap_or_else(|| src.ip().to_string()),
+                                    _ => src.ip().to_string(),
+                                },
                                 port: src.port(),
                                 zone: String::new(),
                             }),

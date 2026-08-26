@@ -666,16 +666,18 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
         }
         let packet = crate::udp_binary::decode_udp_packet_binary_owned(scratch)
             .map_err(|e| crate::Error::Protocol(format!("decode binary UDP packet: {e}").into()))?;
-        // The decoder moved `scratch`'s buffer into the packet's content
-        // Vec; refill from the global pool so the next frame read does not
-        // allocate per UDP packet. Note: the packet's content buffer is a
-        // plain Vec owned by the message until bridging completes, so it is
-        // freed to the allocator when the packet is dropped — it never
-        // returns to the pool (only PoolGuard drops call release). The
-        // per-packet steady-state cost is therefore one 32 KiB alloc + free
-        // with the byte copy eliminated; the reader side itself stays
-        // zero-alloc across packets (round-7 audit M2).
-        *scratch = crate::buffer_pool::BUFFER_POOL.acquire();
+        // Small packets: the decoder copied the payload out and left
+        // `scratch` intact — keep it in the loop, so the buffer pool is
+        // untouched and the steady-state read path is zero-alloc (round-7
+        // audit M2 follow-up: the unconditional refill drained one pool
+        // buffer per packet — the pool was exhausted after 128 packets and
+        // every packet cost a fresh 32 KiB malloc + free). Large datagrams
+        // (≥ BUFFER_SIZE): the decoder moved the buffer into the packet's
+        // content Vec (a plain Vec, freed to the allocator on drop — it
+        // never returns to the pool), so refill from the pool here.
+        if scratch.is_empty() {
+            *scratch = crate::buffer_pool::BUFFER_POOL.acquire();
+        }
         return Ok(FrpMessage::UDPPacket(packet));
     }
     if binary && type_id == msg::V2_TYPE_UDP_PACKET {

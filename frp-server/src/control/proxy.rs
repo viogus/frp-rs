@@ -529,6 +529,7 @@ mod tests {
             listener_handles: HashMap::new(),
             udp_sockets: HashMap::new(),
             last_ping: tokio::time::Instant::now(),
+            superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // Simulate the handle_new_proxy registration: per-proxy child token.
         let token = ctl.udp_cancel.child_token();
@@ -599,6 +600,7 @@ mod tests {
             listener_handles: HashMap::new(),
             udp_sockets: HashMap::new(),
             last_ping: tokio::time::Instant::now(),
+            superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let bridge_token = ctl.bridge_cancel.clone();
         assert!(!bridge_token.is_cancelled(), "token starts live");

@@ -928,6 +928,7 @@ mod tests {
             listener_handles: HashMap::new(),
             udp_sockets: HashMap::new(),
             last_ping: Instant::now(),
+            superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         (ctx, ctl)
     }
@@ -999,6 +1000,7 @@ mod tests {
                 control_id,
                 udp_packet_codec: String::new(),
                 wire_v2: false,
+                superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         rx
