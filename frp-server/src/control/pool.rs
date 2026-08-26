@@ -25,6 +25,15 @@ use super::{write_ctl_msg, ControlContext, ControlState};
 /// Default max age of a pending request when no user_conn_timeout configured.
 const DEFAULT_PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Hard cap for the control's pending work-request queues
+/// (pending_requests / pending_udp / pending_nat_hole_sids). Within the
+/// 10s expiry window a burst of user connections / UDP proxies /
+/// NatHoleSids with no work conns available can pile up live state; cap
+/// the queue and evict the OLDEST entry instead. For pending_requests,
+/// evicting closes the user's socket (HTTP-style backpressure) rather
+/// than holding the fd until expiry.
+pub(super) const MAX_PENDING_REQUESTS: usize = 256;
+
 /// Return the pending request timeout from the configured user_conn_timeout (seconds),
 /// or the 10s default when the configured value is 0 (unset).
 #[inline]
@@ -202,10 +211,11 @@ where
         pending_requests.push_back(req);
         // Bounded queue (audit round 5, MEDIUM): within the 10s expiry window
         // a burst of user connections with no work conns available can pile
-        // up live sockets; cap the queue and evict the oldest entry instead.
-        // Dropping the socket closes the user's connection (HTTP-style
-        // backpressure) rather than holding the fd until expiry.
-        const MAX_PENDING_REQUESTS: usize = 256;
+        // up live sockets; cap the queue and evict the oldest entry instead
+        // (module-level MAX_PENDING_REQUESTS, shared with pending_udp /
+        // pending_nat_hole_sids). Dropping the socket closes the user's
+        // connection (HTTP-style backpressure) rather than holding the fd
+        // until expiry.
         if pending_requests.len() > MAX_PENDING_REQUESTS {
             tracing::warn!(
                 pending = %pending_requests.len(),
@@ -776,6 +786,17 @@ pub(crate) async fn handle_udp_work_conn<W: AsyncWriteExt + Unpin>(
         return Err(());
     }
     ctl.pending_udp.push_back((proxy_name, Instant::now()));
+    // Bounded queue (finding 3): same cap + oldest-evict as
+    // pending_requests. A burst of UDP proxies requesting work conns with
+    // none available would otherwise grow the queue without bound (entries
+    // only expire when a work conn arrives or the loop-top expiry runs).
+    if ctl.pending_udp.len() > MAX_PENDING_REQUESTS {
+        tracing::warn!(
+            pending = %ctl.pending_udp.len(),
+            "pending_udp queue full (>{MAX_PENDING_REQUESTS}), dropping oldest"
+        );
+        ctl.pending_udp.pop_front();
+    }
     Ok(())
 }
 
@@ -1004,6 +1025,37 @@ mod tests {
         assert_eq!(removed, 2, "two stale entries must expire");
         assert_eq!(pending.len(), 1, "fresh entry must survive");
         assert_eq!(pending[0].0, "sid-fresh");
+    }
+
+    /// Finding 3: pending_udp must be bounded like pending_requests — a
+    /// burst of UDP proxies requesting work conns with none available evicts
+    /// the OLDEST entry instead of growing without bound.
+    #[tokio::test]
+    async fn pending_udp_queue_capped_with_oldest_eviction() {
+        let state = test_state();
+        let (mut ctx, mut ctl) = test_context(&state, "run-1");
+        let mut writer = Vec::new();
+        for i in 0..(MAX_PENDING_REQUESTS + 50) {
+            let res =
+                handle_udp_work_conn(&mut ctx, &mut ctl, &mut writer, format!("udp-proxy-{i}"))
+                    .await;
+            assert!(
+                res.is_ok(),
+                "handle_udp_work_conn must not fail the control"
+            );
+        }
+        assert_eq!(
+            ctl.pending_udp.len(),
+            MAX_PENDING_REQUESTS,
+            "pending_udp must be capped at MAX_PENDING_REQUESTS"
+        );
+        // Oldest entry was evicted: the front survivor is udp-proxy-50.
+        assert_eq!(ctl.pending_udp[0].0, "udp-proxy-50");
+        // The newest entry survives at the back.
+        assert_eq!(
+            ctl.pending_udp[MAX_PENDING_REQUESTS - 1].0,
+            format!("udp-proxy-{}", MAX_PENDING_REQUESTS + 49)
+        );
     }
 
     /// Audit M5: a group-LB cross-run_id forward to an at-cap backend must

@@ -1611,6 +1611,64 @@ impl Service {
                         state
                             .client_registry
                             .mark_offline_by_run_id_and_control_id(&run_id, control_id);
+                        // The handler exited WITHOUT running cleanup()
+                        // (panic/abort), so its registrations would otherwise
+                        // leak permanently: used_ports/used_udp_ports,
+                        // sk_index, vhost/tcpmux routes, TCP-group listeners,
+                        // per-client port counts, OIDC subjects, metrics, and
+                        // the proxy registry entries. Run the full
+                        // unregister_control sweep. Double-call safety: when
+                        // cleanup() DID run it removes the map entry first, so
+                        // remove_if above returned None and this code never
+                        // runs; unregister_control is also generation-guarded
+                        // (control_id) with per-proxy ownership re-checks, so
+                        // it can never tear down a superseding control's fresh
+                        // registrations (control_id >= 1 always, the counter
+                        // starts at 1).
+                        crate::control::proxy_ops::unregister_control(
+                            &state, &run_id, control_id, false, true,
+                        )
+                        .await;
+                        // Remove the proxy registry entries (mirroring
+                        // control::cleanup): unregister_control deliberately
+                        // leaves proxy_manager.remove() to the caller because
+                        // the https SNI-sniff gate count must only be
+                        // decremented when an entry was actually removed
+                        // (proxy_ops.rs note). Atomic generation-guarded
+                        // removal: remove_if_control_id compares control_id
+                        // inside the shard lock, so a superseding control
+                        // that re-registered this name between the sweep
+                        // list and the removal keeps its entry (round-7
+                        // audit MEDIUM — the previous get-then-remove raced
+                        // re-login and could destroy the fresh registration).
+                        // The removed entry's own type drives the https
+                        // gate-count decrement, so no separate get is needed.
+                        let proxy_names =
+                            state.proxy_manager.list_client_proxy_names(&run_id).await;
+                        for name in proxy_names {
+                            if let Some(removed) = state
+                                .proxy_manager
+                                .remove_if_control_id(&name, control_id)
+                                .await
+                            {
+                                if removed.proxy_type == "https" {
+                                    state.dec_https_proxy_count();
+                                }
+                            }
+                        }
+                        // OIDC subject mapping for this run_id: unregister_
+                        // control only clears it when IT removed the
+                        // run_id_to_ctl_tx entry (removed_control_id), but
+                        // this sweep's remove_if deleted that entry first, so
+                        // the (subject, generation) entry would leak forever
+                        // for an OIDC client that never reconnects. Clear it
+                        // directly — generation-guarded inside the lock, so a
+                        // newer control's subject entry survives (round-7
+                        // audit LOW).
+                        crate::control::login::remove_oidc_subject_generation(
+                            &state, &run_id, control_id,
+                        )
+                        .await;
                         tracing::info!(
                             run_id = %run_id,
                             "removed stale control entry (handler died)"

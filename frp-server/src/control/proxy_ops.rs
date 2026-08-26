@@ -345,20 +345,19 @@ async fn build_proxy_info(
 /// Register the STCP/XTCP secret-key index before proxy registration
 /// (visitor-before-provider race, Go frp `startVisitorListener` compat).
 /// Returns whether an index entry was inserted.
+///
+/// Sync (DashMap insert — no await needed): the caller invokes this BEFORE
+/// `proxy_manager.register()` so a visitor arriving in the registration
+/// window finds the entry via the `sk_index` fallback.
 #[inline(never)]
-async fn register_sk_index(state: &Arc<AppState>, np: &msg::NewProxy) -> bool {
+fn register_sk_index(state: &Arc<AppState>, np: &msg::NewProxy) -> bool {
     let needs_sk_index =
         (np.proxy_type == "stcp" || np.proxy_type == "xtcp" || np.proxy_type == "sudp")
             && np.sk.as_deref().filter(|s| !s.is_empty()).is_some();
     if needs_sk_index {
         let raw = np.sk.clone().unwrap_or_default();
         let vn = np.virtual_net.as_deref().unwrap_or("");
-        state
-            .xtcp
-            .sk_index
-            .write()
-            .await
-            .insert(np.proxy_name.clone(), raw);
+        state.xtcp.sk_index.insert(np.proxy_name.clone(), raw);
         info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP/SUDP sk_index registered for '{}'{}",
             np.proxy_name,
             if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
@@ -378,7 +377,7 @@ async fn rollback_port_allocation(
     needs_sk_index: bool,
 ) {
     if needs_sk_index {
-        state.xtcp.sk_index.write().await.remove(proxy_name);
+        state.xtcp.sk_index.remove(proxy_name);
     }
     state.used_ports.write().await.remove(&port);
     // For UDP proxies, also clean up used_udp_ports. The port
@@ -1520,7 +1519,7 @@ pub(crate) async fn handle_new_proxy(
             // proxyManager.Add(). Insert sk_index before proxy_manager.register()
             // so that STCP/XTCP visitors that arrive during the registration
             // window can find the proxy via sk_index fallback.
-            let needs_sk_index = register_sk_index(state, &np).await;
+            let needs_sk_index = register_sk_index(state, &np);
 
             // Supersession takeover: when the 10s handoff-barrier timeout
             // fires, the superseding control may re-register a name the old
@@ -2082,7 +2081,7 @@ pub(crate) async fn unregister_control(
             continue;
         }
         if let Some(key) = p.sk_index_key() {
-            state.xtcp.sk_index.write().await.remove(key);
+            state.xtcp.sk_index.remove(key);
         }
     }
     // UDP port cleanup (Go frp compat: separate port manager for UDP)
@@ -3967,8 +3966,6 @@ pub(crate) mod unregister_generation_tests {
         state
             .xtcp
             .sk_index
-            .write()
-            .await
             .insert("s".to_string(), "secret".to_string());
         state
             .client_ports_used
@@ -3992,7 +3989,7 @@ pub(crate) mod unregister_generation_tests {
             "live control's port mark must survive"
         );
         assert!(
-            state.xtcp.sk_index.read().await.contains_key("s"),
+            state.xtcp.sk_index.contains_key("s"),
             "live control's sk_index entry must survive"
         );
         assert_eq!(
@@ -4048,8 +4045,6 @@ pub(crate) mod unregister_generation_tests {
         state
             .xtcp
             .sk_index
-            .write()
-            .await
             .insert("s".to_string(), "secret".to_string());
 
         // Park the sweep after its snapshot, before the sk_index loop: hold
@@ -4081,8 +4076,6 @@ pub(crate) mod unregister_generation_tests {
         state
             .xtcp
             .sk_index
-            .write()
-            .await
             .insert("s".to_string(), "secret".to_string());
 
         drop(held_ports);
@@ -4092,7 +4085,7 @@ pub(crate) mod unregister_generation_tests {
             .expect("cleanup panicked");
 
         assert!(
-            state.xtcp.sk_index.read().await.contains_key("s"),
+            state.xtcp.sk_index.contains_key("s"),
             "superseding control's sk_index must survive the old sweep"
         );
         assert_eq!(

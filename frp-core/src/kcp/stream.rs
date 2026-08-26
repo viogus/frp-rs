@@ -5,13 +5,16 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Notify};
 
-use super::socket::{WriteRequest, KCP_SND_BACKLOG_THRESHOLD, KCP_WRITE_BACKLOG_THRESHOLD};
+use super::socket::{
+    chunk_pool_pop, chunk_pool_push, WriteRequest, KCP_SND_BACKLOG_THRESHOLD,
+    KCP_WRITE_BACKLOG_THRESHOLD,
+};
 
 static KCP_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 #[cfg(debug_assertions)]
@@ -58,6 +61,11 @@ pub struct KcpStream {
     /// construction, decremented on drop: the dial driver self-exits once
     /// the last stream is gone and no registrations can arrive.
     alive_streams: Arc<AtomicUsize>,
+    /// Recycled write-chunk pool shared with the KcpSocket driver (see
+    /// KcpSocketHandle::chunk_pool). poll_write pops a chunk here instead
+    /// of allocating a fresh Vec per bridge write; the driver returns
+    /// chunks once the session has segmented them. Bounded by CHUNK_POOL_CAP.
+    chunk_pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl KcpStream {
@@ -69,6 +77,7 @@ impl KcpStream {
         read_rx: mpsc::Receiver<Vec<u8>>,
         write_backlog: Arc<AtomicUsize>,
         write_notify: Arc<Notify>,
+        chunk_pool: Arc<Mutex<Vec<Vec<u8>>>>,
         snd_backlog: Arc<AtomicUsize>,
         snd_notify: Arc<Notify>,
         session_alive: Arc<AtomicBool>,
@@ -93,6 +102,7 @@ impl KcpStream {
             write_backlog,
             write_notify,
             backpressure_fut: None,
+            chunk_pool,
             snd_backlog,
             snd_notify,
             session_alive,
@@ -297,7 +307,14 @@ impl AsyncWrite for KcpStream {
             crate::hex_encode(&buf[..buf.len().min(32)])
         );
 
-        let req = WriteRequest::Data(buf.to_vec());
+        // M1 perf: pop a recycled chunk from the pool (or allocate with
+        // with_capacity when the pool is empty) instead of buf.to_vec()'s
+        // fresh 32 KiB alloc + memcpy on every bridge write. The driver
+        // returns the chunk to the pool once the session's segmentation has
+        // copied the payload out.
+        let mut chunk = chunk_pool_pop(&self.chunk_pool, buf.len());
+        chunk.extend_from_slice(buf);
+        let req = WriteRequest::Data(chunk);
 
         // Increment backlog BEFORE try_send so it reflects queued messages,
         // not just those being processed. Decrement on Full to avoid
@@ -305,8 +322,14 @@ impl AsyncWrite for KcpStream {
         self.write_backlog.fetch_add(1, Ordering::Relaxed);
         match self.write_tx.try_send((self.conv, req)) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(mpsc::error::TrySendError::Full(msg)) => {
                 self.write_backlog.fetch_sub(1, Ordering::Relaxed);
+                // The message was not queued — return the chunk to the pool
+                // (poll_write only ever sends Data payloads). Same
+                // backpressure as before.
+                if let WriteRequest::Data(chunk) = msg.1 {
+                    chunk_pool_push(&self.chunk_pool, chunk);
+                }
                 // Apply backpressure — wait for socket to drain.
                 let notified = self.write_notify.clone().notified_owned();
                 self.backpressure_fut = Some(Box::pin(notified));
@@ -315,8 +338,12 @@ impl AsyncWrite for KcpStream {
                 }
                 return Poll::Pending;
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(mpsc::error::TrySendError::Closed(msg)) => {
                 self.write_backlog.fetch_sub(1, Ordering::Relaxed);
+                // Channel closed — return the chunk to the pool as well.
+                if let WriteRequest::Data(chunk) = msg.1 {
+                    chunk_pool_push(&self.chunk_pool, chunk);
+                }
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "KCP driver closed",

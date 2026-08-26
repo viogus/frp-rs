@@ -533,6 +533,11 @@ pub struct TcpmuxArgs {
 #[derive(Debug, Clone)]
 pub struct VerifyArgs {
     pub config: String,
+    /// Go frp v0.70.1: `strict_config` is a persistent rootCmd flag
+    /// (cmd/frpc/sub/root.go), so `frpc verify` honors it too
+    /// (cmd/frpc/sub/verify.go passes strictConfigMode to
+    /// config.LoadClientConfig).
+    pub strict_config: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -981,7 +986,21 @@ fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
 
 fn verify_cmd() -> impl Parser<FrpcCmd> {
     let config = long("config").short('c').argument::<String>("FILE");
-    let args = construct!(VerifyArgs { config });
+    // Go frp v0.70.1 pflag bool semantics (same as run/reload): `strict_config`
+    // is a persistent rootCmd flag (default true), so `verify` inherits it —
+    // bare `--strict-config` → true, `--strict-config=false` /
+    // `--strict-config false` → false, absent → true. With strict off, verify
+    // accepts unknown fields, matching Go (cmd/frpc/sub/verify.go).
+    let strict_value = long("strict-config")
+        .long("strict_config")
+        .argument::<String>("BOOL")
+        .parse(parse_go_bool);
+    let strict_switch = long("strict-config").long("strict_config").flag(true, true);
+    let strict_config = construct!([strict_value, strict_switch]);
+    let args = construct!(VerifyArgs {
+        config,
+        strict_config
+    });
     args.to_options()
         .command("verify")
         .help("Verify that the configuration is valid")

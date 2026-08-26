@@ -19,6 +19,7 @@ use crate::nathole::NAT_HOLE_TIMEOUT;
 use crate::service::InternalMsg;
 
 use super::pool;
+use super::pool::MAX_PENDING_REQUESTS;
 use super::{write_ctl_msg, ControlContext, ControlState};
 
 // ── InternalMsg handlers ────────────────────────────────────────────
@@ -137,6 +138,17 @@ pub(crate) async fn handle_sid_on_work_conn<W: AsyncWriteExt + Unpin>(
         }
         ctl.pending_nat_hole_sids
             .push_back((sid, proxy_name, Instant::now()));
+        // Bounded queue (finding 3): same cap + oldest-evict as
+        // pending_requests (pool::MAX_PENDING_REQUESTS). A flood of
+        // NatHoleSids with no work conns available would otherwise grow
+        // the queue until the loop-top expiry prunes it.
+        if ctl.pending_nat_hole_sids.len() > MAX_PENDING_REQUESTS {
+            tracing::warn!(
+                pending = %ctl.pending_nat_hole_sids.len(),
+                "pending_nat_hole_sids queue full (>{MAX_PENDING_REQUESTS}), dropping oldest"
+            );
+            ctl.pending_nat_hole_sids.pop_front();
+        }
     }
     Ok(())
 }

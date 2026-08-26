@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
@@ -34,6 +34,33 @@ pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 200;
 /// Keep it below a single `Kcp`'s practical ceiling; it is a memory bound, not
 /// a flow-control signal (KCP's own window remains the flow-control authority).
 pub(crate) const KCP_SND_BACKLOG_THRESHOLD: usize = 2048;
+
+/// Max recycled write chunks kept in the per-socket chunk pool. Each chunk
+/// is a reused bridge-write buffer (~32 KiB), so the pool caps recycled
+/// memory at ~256 KiB per socket (8 × 32 KiB). Chunks beyond the cap are
+/// simply dropped on return.
+pub(crate) const CHUNK_POOL_CAP: usize = 8;
+
+/// Pop a reusable write chunk from the pool, or allocate one with
+/// `min_capacity` when the pool is empty (first write, or the pool drained
+/// by a burst of in-flight writes). The pool is bounded by CHUNK_POOL_CAP.
+pub(crate) fn chunk_pool_pop(pool: &Mutex<Vec<Vec<u8>>>, min_capacity: usize) -> Vec<u8> {
+    pool.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop()
+        .unwrap_or_else(|| Vec::with_capacity(min_capacity))
+}
+
+/// Return a consumed write chunk to the pool. Clears the payload (keeping
+/// the allocation so the next writer reuses it) and drops the chunk when
+/// the pool is at its cap.
+pub(crate) fn chunk_pool_push(pool: &Mutex<Vec<Vec<u8>>>, mut chunk: Vec<u8>) {
+    chunk.clear();
+    let mut pool = pool.lock().unwrap_or_else(|p| p.into_inner());
+    if pool.len() < CHUNK_POOL_CAP {
+        pool.push(chunk);
+    }
+}
 
 /// Hard limit on total KCP sessions. Prevents an attacker from exhausting
 /// server memory by sending UDP packets with random conv values.
@@ -101,6 +128,12 @@ pub(crate) struct KcpSocketHandle {
     /// closed (no listener to keep it alive); the listen path keeps
     /// register_tx open, so the driver never exits there.
     pub alive_streams: Arc<AtomicUsize>,
+    /// Recycled write-chunk pool shared with the streams of this socket.
+    /// poll_write pops a chunk (avoiding a fresh 32 KiB Vec + memcpy per
+    /// bridge write); the driver returns chunks after the session's
+    /// segmentation has copied the payload out. Bounded by CHUNK_POOL_CAP;
+    /// pops/pushes are mutex-serialized so a chunk is never in two hands.
+    pub chunk_pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 pub(crate) struct KcpSocket {
@@ -137,6 +170,10 @@ pub(crate) struct KcpSocket {
     /// Live KcpStream count — shared with KcpSocketHandle, drives the
     /// dial-path driver self-exit check in run().
     alive_streams: Arc<AtomicUsize>,
+    /// Recycled write-chunk pool (see KcpSocketHandle::chunk_pool). The
+    /// driver returns consumed chunks here after segmenting them into the
+    /// session's send queue.
+    chunk_pool: Arc<Mutex<Vec<Vec<u8>>>>,
     start: Instant,
     /// UDP packets that could not be sent immediately because the socket
     /// send buffer was full (try_send_to). Drained on the next tick — keeps
@@ -186,6 +223,7 @@ impl KcpSocket {
         let write_backlog = Arc::new(AtomicUsize::new(0));
         let write_notify = Arc::new(Notify::new());
         let alive_streams = Arc::new(AtomicUsize::new(0));
+        let chunk_pool = Arc::new(Mutex::new(Vec::with_capacity(CHUNK_POOL_CAP)));
         let this = Self {
             socket,
             config,
@@ -203,6 +241,7 @@ impl KcpSocket {
             write_backlog: write_backlog.clone(),
             write_notify: write_notify.clone(),
             alive_streams: alive_streams.clone(),
+            chunk_pool: chunk_pool.clone(),
             start: Instant::now(),
             pending_udp: VecDeque::new(),
             to_remove: Vec::with_capacity(16),
@@ -217,6 +256,7 @@ impl KcpSocket {
             write_backlog,
             write_notify,
             alive_streams,
+            chunk_pool,
         };
         (this, handle, accept_rx)
     }
@@ -371,10 +411,17 @@ impl KcpSocket {
                             let len = data.len();
                             // O(1) lookup via conv_index instead of O(n) iter().find().
                             let addr = self.conv_index.get(&conv).copied();
-                            let _result = addr
-                                .and_then(|a| self.sessions.get_mut(&(conv, a)))
-                                .map(|s| s.send(data))
-                                .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
+                            // Borrow the payload into the session: the KCP
+                            // segmentation copies it into segments, so the
+                            // chunk survives and is recycled into the pool
+                            // below (M1: no fresh Vec alloc per bridge write).
+                            let _result = match addr.and_then(|a| self.sessions.get_mut(&(conv, a))) {
+                                Some(session) => session.send(&data),
+                                None => Err(io::Error::new(
+                                    io::ErrorKind::NotConnected,
+                                    "session not found",
+                                )),
+                            };
                             if let Err(ref e) = _result {
                                 tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed — session not found");
                             } else {
@@ -389,6 +436,10 @@ impl KcpSocket {
                                     self.flush_session_output(conv, peer_addr).await;
                                 }
                             }
+                            // The session's segmentation copied the payload
+                            // out; clear the chunk and return it to the pool
+                            // (dropped if the pool is at its cap).
+                            chunk_pool_push(&self.chunk_pool, data);
                             // Decrement backlog and wake ONE blocked writer.
                             // notify_one() stores a permit if no waiters exist,
                             // preventing the lost-wake race between poll_write's
@@ -563,6 +614,7 @@ impl KcpSocket {
                                         read_rx,
                                         self.write_backlog.clone(),
                                         self.write_notify.clone(),
+                                        self.chunk_pool.clone(),
                                         snd_backlog,
                                         snd_notify,
                                         session.alive_handle(),

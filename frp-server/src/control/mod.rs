@@ -1,6 +1,9 @@
 pub(crate) mod bridge;
 mod dispatch;
-mod login;
+// pub(crate) so the stale-control reaper (service.rs) can clear the OIDC
+// subject mapping for a swept run_id (round-7 audit LOW — the generation-
+// guarded helper lives in login.rs).
+pub(crate) mod login;
 mod nathole;
 mod pool;
 mod proxy;
@@ -318,7 +321,16 @@ async fn handle_control_inner<S>(
             // client would never be disconnected. tokio::select re-evaluates
             // the sleep target on every iteration, so last_ping updates are
             // picked up automatically.
-            _ = tokio::time::sleep_until(ctl.last_ping + hb_timeout), if state.heartbeat_timeout > 0 => {
+            _ = async {
+                // checked_add (finding 5): the config-side clamp (≤3600s)
+                // makes overflow unreachable, but a hostile/legacy value
+                // must never panic the process — degrade to never firing
+                // this arm instead (the loop-top check above still applies).
+                match ctl.last_ping.checked_add(hb_timeout) {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if state.heartbeat_timeout > 0 => {
                 warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
                 break;
             }

@@ -481,6 +481,7 @@ pub fn build_tls_connector(
 /// files are only re-read when their stat changes and a cache hit costs one
 /// `metadata()` syscall, not a full file read + hash per dial.
 /// `tokio_rustls::TlsConnector` is an `Arc<ClientConfig>` — sharing is free.
+#[derive(Clone)]
 struct ConnectorKey {
     // (path, content hash) — hash None means "configured but file missing",
     // which must stay distinct from "not configured" (None) for cache
@@ -547,10 +548,18 @@ static FILE_HASH_MEMO: std::sync::LazyLock<
 /// changed or the mtime has not settled yet (see [`STAT_SETTLE_WINDOW`]) —
 /// a cache hit on an unchanged file costs one `metadata()` syscall instead
 /// of a full read + SHA-256 per dial.
-fn file_hash(path: &str) -> Option<[u8; 32]> {
-    let stat = std::fs::metadata(path)
+/// (mtime, size) of a PEM path, or None when it cannot be stat'ed. Shared by
+/// the hash memo ([`FileMemoEntry`]) and [`ConnectorInputs`], so an in-place
+/// rotation (mtime change) also invalidates the connector key cache
+/// (round-7 audit MEDIUM).
+fn file_stat(path: &str) -> Option<(std::time::SystemTime, u64)> {
+    std::fs::metadata(path)
         .ok()
-        .map(|m| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len()));
+        .map(|m| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len()))
+}
+
+fn file_hash(path: &str) -> Option<[u8; 32]> {
+    let stat = file_stat(path);
     // Settled = missing file (nothing to coalesce) or mtime at least
     // STAT_SETTLE_WINDOW old. A future mtime (utime'd forward) is settled
     // too — it cannot be re-coalesced by the lazy-timestamp window.
@@ -617,16 +626,61 @@ fn connector_key(
     }
 }
 
+/// Inputs that identify a TLS connector configuration: the PEM path strings,
+/// their current (mtime, size) stat, and the skip-verify flag. Two dials
+/// with identical inputs must produce the same connector; a config reload
+/// that changes any path (or the flag) changes the inputs and forces the key
+/// to be recomputed. The per-dial stat (one `metadata()` syscall per
+/// configured file) also re-detects a same-path in-place rotation (certbot
+/// style, mtime change) — without it the key cache would serve the stale
+/// connector forever (round-7 audit MEDIUM).
+#[derive(Clone, PartialEq)]
+struct ConnectorInputs {
+    ca: Option<(String, Option<(std::time::SystemTime, u64)>)>,
+    cert: Option<(String, Option<(std::time::SystemTime, u64)>)>,
+    key: Option<(String, Option<(std::time::SystemTime, u64)>)>,
+    skip_verify: bool,
+}
+
+/// Process-local "last connector key" cache keyed by [`ConnectorInputs`].
+///
+/// Computing a [`ConnectorKey`] hashes the PEM files: `file_hash` performs
+/// blocking `metadata()`/`read()` syscalls and takes the `FILE_HASH_MEMO`
+/// mutex. `dial_server` (transport/mod.rs) rebuilds `DialOptions` from the
+/// stored client config and calls `build_tls_connector_skip_verify` once per
+/// outbound connection (control, work, visitor), so the same inputs recur on
+/// every dial — per-dial key computation would repeat the syscalls and locks
+/// forever even though the config did not change.
+///
+/// Cache the computed key by its inputs: a steady-state dial (cache hit)
+/// costs one RwLock read, a few string/stamp compares, and at most three
+/// `metadata()` syscalls (one per configured PEM file) — no file reads, no
+/// `FILE_HASH_MEMO` locks. A config reload that changes any PEM path or the
+/// skip-verify flag misses, so the key is recomputed exactly once, via the
+/// stat→hash memo — memo semantics are preserved across reloads. A
+/// same-path in-place rotation (cert renewal without a path change) is also
+/// re-detected on the next dial: the inputs carry the current (mtime, size)
+/// stamp, a changed stamp misses, the memo re-reads the file (guarded by
+/// [`STAT_SETTLE_WINDOW`] against mid-write reads), and the connector cache
+/// below rebuilds on the fresh key.
+///
+/// RwLock: the hit path (every steady-state dial) only needs a read lock;
+/// the exclusive lock is taken only on the rare recompute.
+static CONNECTOR_KEY_CACHE: std::sync::RwLock<Option<(ConnectorInputs, ConnectorKey)>> =
+    std::sync::RwLock::new(None);
+
 // RwLock: the cache-hit path (every outbound TLS dial) only needs a read
 // lock; the exclusive lock is taken only on the rare rebuild (audit D3-4).
 static CONNECTOR_CACHE: std::sync::RwLock<Option<(ConnectorKey, TlsConnector)>> =
     std::sync::RwLock::new(None);
 
 /// Minimum interval between skip-verify warnings. The first occurrence logs
-/// immediately at error level (the security value); repeat occurrences
+/// immediately at warn level (the security value); repeat occurrences
 /// within the window are suppressed, then re-logged once per window at warn
 /// with a repeat note — a busy deployment running the insecure default must
-/// not get a per-connection log flood.
+/// not get a per-connection log flood. (Both levels are `warn`: this is the
+/// expected Go-frp-parity default, so it must be a prominent warning, not an
+/// error that trips alerting/error-count monitors.)
 const SKIP_VERIFY_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Last skip-verify warning time; `None` = never warned. `tokio::time::Instant`
@@ -648,7 +702,7 @@ fn skip_verify_warn_due(last: Option<tokio::time::Instant>, now: tokio::time::In
 }
 
 /// Log the InsecureSkipVerify warning at most once per
-/// [`SKIP_VERIFY_WARN_MIN_INTERVAL`] per process: error level on the first
+/// [`SKIP_VERIFY_WARN_MIN_INTERVAL`] per process: warn level on the first
 /// occurrence, then a shorter warn-level repeat carrying the interval.
 fn warn_skip_verify_rate_limited() {
     // Only the state update runs under the lock; logging happens outside so
@@ -671,8 +725,8 @@ fn warn_skip_verify_rate_limited() {
         return;
     }
     if first {
-        tracing::error!(
-            "TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
+        tracing::warn!(
+            "TLS certificate verification is DISABLED (InsecureSkipVerify=true, no tls.ca_file). \
              All control and data-plane traffic is vulnerable to MITM attacks and \
              authentication credentials can be captured and replayed. \
              For production, set tls.ca_file (frpc: tls.trusted_ca_file) to a CA \
@@ -720,9 +774,11 @@ fn file_read_count() -> usize {
 /// matching Go frp's default for auto-generated self-signed certs). With
 /// `ca_file`, verification runs against it (mTLS when client cert/key are
 /// also provided). Setting `skip_verify=true` forces verification off even
-/// when a CA file is configured. The most recent connector is cached per
-/// (path, content hash) — see [`ConnectorKey`]. When verification is skipped,
-/// a rate-limited MITM warning is logged (see the fn body).
+/// when a CA file is configured. The connector key is computed once per
+/// distinct input set (see [`CONNECTOR_KEY_CACHE`]) and the most recent
+/// connector is cached per (path, content hash) — see [`ConnectorKey`].
+/// When verification is skipped, a rate-limited MITM warning is logged (see
+/// the fn body).
 pub fn build_tls_connector_skip_verify(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
@@ -734,11 +790,41 @@ pub fn build_tls_connector_skip_verify(
     // miss). Fires for every dial that lands on the insecure skip-verify
     // path, i.e. whenever no CA file is configured (or skip_verify is
     // forced). Rate-limited so busy deployments get the first occurrence at
-    // error level but no flood.
+    // warn level but no flood.
     if non_empty(ca_file).is_none() || skip_verify {
         warn_skip_verify_rate_limited();
     }
-    let key = connector_key(ca_file, cert_file, key_file, skip_verify);
+    // Key-cache hit: same connector inputs as the last dial → reuse its
+    // key without re-stat'ing or re-hashing the PEM files. The per-dial
+    // path must be free of blocking filesystem calls — the key (and with
+    // it the connector) is computed once per distinct input set.
+    let inputs = ConnectorInputs {
+        ca: non_empty(ca_file).map(|p| (p.to_string(), file_stat(p))),
+        cert: non_empty(cert_file).map(|p| (p.to_string(), file_stat(p))),
+        key: non_empty(key_file).map(|p| (p.to_string(), file_stat(p))),
+        skip_verify,
+    };
+    // Clone the cached entry out of the read guard BEFORE the match below:
+    // the guard is a scrutinee temporary of the match, so it stays alive
+    // through every arm — taking `.write()` on the same lock inside the
+    // `_` arm would self-deadlock (std RwLock is not reentrant).
+    let cached: Option<(ConnectorInputs, ConnectorKey)> = CONNECTOR_KEY_CACHE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned();
+    let key = match cached {
+        Some((cached_inputs, cached_key)) if cached_inputs == inputs => cached_key,
+        _ => {
+            // Recompute once per input change; the stat→hash memo inside
+            // `connector_key` keeps even this path free of redundant reads.
+            let key = connector_key(ca_file, cert_file, key_file, skip_verify);
+            *CONNECTOR_KEY_CACHE
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some((inputs, key.clone()));
+            key
+        }
+    };
     if let Some((cached_key, cached)) = CONNECTOR_CACHE
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -1081,7 +1167,8 @@ mod connector_cache_tests {
             "second call with identical args must hit the cache"
         );
 
-        // 2) content change → new key → rebuild.
+        // 2) An input (path) change → new key → rebuild; identical inputs
+        //    → cache hit (key computed once per distinct input set).
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, dummy_ca_pem()).unwrap();
@@ -1094,25 +1181,35 @@ mod connector_cache_tests {
             before + 1,
             "unchanged CA must hit cache"
         );
-        // 2) content change → new key → rebuild. The key hashes file
-        //    *contents*, so a same-size rewrite (which the old mtime+size
-        //    key could miss) invalidates the cache entry — as long as the
-        //    stat→hash memo re-reads. An in-place rewrite can coalesce
-        //    into an unchanged mtime, so make the stat change explicit and
-        //    settled first (same mechanism as step 4): without it, a dial
-        //    landing ≥100ms after the (unchanged) mtime would hit the memo
-        //    and serve the stale hash of the old content.
-        std::fs::write(&ca_path, dummy_ca_pem().replace("MIID", "MIIE")).unwrap();
-        {
-            let f = std::fs::File::options().write(true).open(&ca_path).unwrap();
-            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
-                .unwrap();
-        }
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
+        // A different CA path → key recomputed → connector rebuilds.
+        let ca2_path = dir.path().join("ca2.pem");
+        std::fs::write(&ca2_path, dummy_ca_pem().replace("MIID", "MIIE")).unwrap();
+        let ca2 = ca2_path.to_str().unwrap().to_string();
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false).unwrap();
         assert_eq!(
             connector_build_count(),
             before + 2,
-            "changed CA file must rebuild the connector"
+            "a different CA path must rebuild the connector"
+        );
+        // Same-path in-place rotation IS re-detected: the connector-key
+        // inputs carry the current (mtime, size) stamp (round-7 audit
+        // MEDIUM), so a rewrite at an unchanged path changes the stamp,
+        // misses the key cache, and rebuilds the connector on the fresh
+        // content hash.
+        std::fs::write(&ca2_path, dummy_ca_pem().replace("MIIE", "MIID")).unwrap();
+        {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(&ca2_path)
+                .unwrap();
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false).unwrap();
+        assert_eq!(
+            connector_build_count(),
+            before + 3,
+            "same-path content rotation (mtime change) must rebuild the connector"
         );
 
         // 3) A failing build must not be cached (and a missing-file key must
@@ -1132,41 +1229,75 @@ mod connector_cache_tests {
             "failed builds must not be cached"
         );
 
-        // 4) Unchanged file → no re-read: the stat→hash memo must turn
-        //    per-dial file reads into per-dial metadata() syscalls. First
-        //    move the mtime far into the future: it changes the stat (so the
-        //    memo re-reads once) and, being a settled stat, makes the
-        //    subsequent memo hits trustworthy even under the kernel's lazy
-        //    timestamp coalescing.
+        // 4) A stamp-only change (content unchanged) must re-read the file
+        //    exactly once to re-hash it, but must NOT rebuild the connector:
+        //    the recomputed key is identical, so the connector cache hits.
+        //    Settle the mtime into the past first (authoritative — outside
+        //    the kernel's lazy-timestamp coalescing window), then dial
+        //    again; the stamp change misses the key cache, the stat→hash
+        //    memo turns the re-hash into one read.
         let before_builds = connector_build_count();
         let before_reads = file_read_count();
         {
-            let f = std::fs::File::options().write(true).open(&ca_path).unwrap();
-            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            let f = std::fs::File::options()
+                .write(true)
+                .open(&ca2_path)
+                .unwrap();
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
                 .unwrap();
         }
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false).unwrap();
         assert_eq!(
             file_read_count(),
             before_reads + 1,
-            "a stat change must re-read the file exactly once to re-hash it"
-        );
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
-        assert_eq!(
-            file_read_count(),
-            before_reads + 1,
-            "a second dial with an unchanged file must not re-read it"
+            "the first key computation for a (changed-stat) path must read+hash the file once"
         );
         assert_eq!(
             connector_build_count(),
             before_builds,
-            "unchanged content after a stat change must still hit the connector cache"
+            "a stamp-only change must not rebuild: same content, same key, connector cache hit"
         );
+        // Same stat, different inputs (skip_verify toggle) → key recompute
+        // hits the memo: zero file reads, connector rebuilds (distinct key).
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, true).unwrap();
+        assert_eq!(
+            file_read_count(),
+            before_reads + 1,
+            "recompute with an unchanged file must hit the stat→hash memo"
+        );
+        assert_eq!(
+            connector_build_count(),
+            before_builds + 1,
+            "skip_verify=true must rebuild (distinct key)"
+        );
+        // Content change at the same path + input change → recompute
+        // re-reads exactly once and rebuilds.
+        std::fs::write(&ca2_path, dummy_ca_pem().replace("MIID", "MIIX")).unwrap();
+        {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(&ca2_path)
+                .unwrap();
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false).unwrap();
+        assert_eq!(
+            file_read_count(),
+            before_reads + 2,
+            "a stat change must re-read the file exactly once to re-hash it"
+        );
+        assert_eq!(
+            connector_build_count(),
+            before_builds + 2,
+            "changed CA content at a changed input must rebuild the connector"
+        );
+
         // 5) skip_verify=true with a CA must NOT reuse the CA-verified
         //    connector cached above: the key differs by skip_verify, so it
         //    rebuilds (the insecure verifier is installed).
         let before_sv_builds = connector_build_count();
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, true).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, true).unwrap();
         assert_eq!(
             connector_build_count(),
             before_sv_builds + 1,

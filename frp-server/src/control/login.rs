@@ -14,6 +14,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
+
+/// Upper bound for the supersession Shutdown send when the old control's
+/// internal channel is full (round-7 audit LOW). A draining control frees a
+/// slot within this window; a wedged one costs at most this delay per
+/// reconnect — bounded, so no parked-task accumulation.
+const SUPERSESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 use tracing::{debug, info, warn};
 
 use frp_core::encryption;
@@ -54,7 +60,11 @@ fn capped_pool_count(pool_count: Option<i32>, max_pool_count: i64) -> usize {
     capped.max(1) as usize
 }
 
-async fn remove_oidc_subject_generation(state: &AppState, run_id: &str, control_id: u64) {
+pub(crate) async fn remove_oidc_subject_generation(
+    state: &AppState,
+    run_id: &str,
+    control_id: u64,
+) {
     let mut subjects = state.oidc.subjects.write().await;
     if subjects
         .get(run_id)
@@ -589,11 +599,37 @@ pub(crate) async fn authenticate(
                     None
                 }
                 Err(mpsc::error::TrySendError::Full(shutdown_msg)) => {
-                    debug!(run_id = %run_id, "Old control handler channel full; sending async");
-                    let old_tx = old_ctl.tx.clone();
-                    tokio::spawn(async move {
-                        let _ = old_tx.send(shutdown_msg).await;
-                    });
+                    // A wedged old control (dead-slow peer that never drains
+                    // its internal channel) would make `old_tx.send(...).await`
+                    // hang forever, accumulating one parked task per reconnect
+                    // — hence the try_send fast paths above. But a channel
+                    // that is full yet DRAINING (busy control briefly blocked
+                    // on read_msg while 1024 VisitorConns queue) was left
+                    // unsuperseded by a plain drop: its registrations, pending
+                    // queues, and bridges linger until the socket dies
+                    // (round-7 audit LOW). Park with a bounded timeout
+                    // instead: a draining control frees a slot and receives
+                    // the Shutdown; a wedged one costs at most
+                    // SUPERSESSION_SHUTDOWN_TIMEOUT. The wait is bounded per
+                    // reconnect, so no task accumulation. On timeout or close
+                    // the message drops and its `done` oneshot sender drops
+                    // with it, so the handoff barrier below resolves
+                    // immediately (Err) and the new login is never blocked.
+                    // The control loop's post-exit drain (control/mod.rs)
+                    // covers the delivered-but-undispatched case; a dropped
+                    // Shutdown needs no drain, and cleanup's generation guard
+                    // (unregister_control skips entries owned by a newer
+                    // control) protects this control's fresh entry.
+                    debug!(run_id = %run_id, "Old control handler channel full; bounded wait for a slot");
+                    if tokio::time::timeout(
+                        SUPERSESSION_SHUTDOWN_TIMEOUT,
+                        old_ctl.tx.send(shutdown_msg),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        debug!(run_id = %run_id, "Old control handler channel still full; Shutdown dropped after {SUPERSESSION_SHUTDOWN_TIMEOUT:?}");
+                    }
                     Some(rx)
                 }
             }

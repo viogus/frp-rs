@@ -3247,6 +3247,42 @@ totally_unknown_key = 1
 }
 
 #[test]
+fn test_strict_accepts_legacy_log_way() {
+    // Go frp legacy INI accepts `log_way` (pkg/config/legacy client.go/
+    // server.go LogWay `ini:"log_way"`) and silently drops it: the legacy
+    // conversion copies only LogFile/LogLevel/LogMaxDays into the new config
+    // (conversion.go), never LogWay. Rust strict mode (default ON) must
+    // accept-and-ignore it the same way, on both client and server sides.
+    let mut client_file = tempfile::NamedTempFile::new().unwrap();
+    client_file
+        .write_all(
+            br#"server_addr = "127.0.0.1"
+server_port = 7000
+log_way = "console"
+log_file = "./frpc.log"
+log_level = "info"
+log_max_days = 7
+"#,
+        )
+        .unwrap();
+    // strict = true (the default): legacy log_way is a known-and-ignored key.
+    load_client_config(client_file.path().to_str().unwrap(), true).unwrap();
+
+    let mut server_file = tempfile::NamedTempFile::new().unwrap();
+    server_file
+        .write_all(
+            br#"bind_port = 7000
+log_way = "console"
+log_file = "./frps.log"
+log_level = "info"
+log_max_days = 7
+"#,
+        )
+        .unwrap();
+    load_server_config(server_file.path().to_str().unwrap(), true).unwrap();
+}
+
+#[test]
 fn test_allow_ports_single_form_normalized() {
     // Go allowPorts [{single=N}] must normalize to "{single=N}", not the
     // previously emitted "0-0" (audit task 9 finding 6).

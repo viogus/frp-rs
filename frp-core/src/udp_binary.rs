@@ -166,18 +166,54 @@ pub fn encode_udp_packet_binary_into(packet: &UDPPacket, out: &mut Vec<u8>) -> R
             packet.content.len()
         ));
     }
-    let mut flags = UDP_PACKET_FLAG_REMOTE_ADDR;
-    let mut body_len = 1 + 2 + packet.content.len();
-    let local = if let Some(l) = packet.local_addr.as_ref() {
-        flags |= UDP_PACKET_FLAG_LOCAL_ADDR;
-        let b = addr_to_binary(l)?;
-        body_len += b.len();
-        Some(b)
-    } else {
-        None
-    };
+    let local_b = packet.local_addr.as_ref().map(addr_to_binary).transpose()?;
     let remote_b = addr_to_binary(remote)?;
-    body_len += remote_b.len();
+    encode_body(&packet.content, local_b.as_ref(), &remote_b, out)
+}
+
+/// Encode a UDP packet whose remote address is a `SocketAddr` directly into
+/// the binary codec body, appending after any existing content of `out`.
+///
+/// Equivalent to [`encode_udp_packet_binary_into`] with `remote_addr` built
+/// from `remote.ip().to_string()`, but skips that per-packet String alloc and
+/// the re-parse in [`addr_to_binary`]: the caller (frp-server UDP bridge
+/// writer) already holds a parsed `SocketAddr` on the V2 binary path, where
+/// the String form exists only for the V1 JSON codec. Output is byte-identical
+/// to the string round trip.
+pub fn encode_udp_packet_binary_socket_addr(
+    content: &[u8],
+    local: Option<&UdpAddr>,
+    remote: &std::net::SocketAddr,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    if content.len() > MAX_UDP_PAYLOAD_SIZE {
+        return Err(format!(
+            "UDP payload length {} exceeds limit {MAX_UDP_PAYLOAD_SIZE}",
+            content.len()
+        ));
+    }
+    let local_b = local.map(addr_to_binary).transpose()?;
+    let remote_b = socket_addr_to_binary(remote);
+    encode_body(content, local_b.as_ref(), &remote_b, out)
+}
+
+/// Shared body writer: flags, optional local addr, required remote addr,
+/// payload length, payload. Error precedence (missing remote → oversized
+/// payload → invalid local addr → invalid remote addr → frame-size cap)
+/// matches the callers' original ordering.
+fn encode_body(
+    content: &[u8],
+    local: Option<&BinaryUdpAddr>,
+    remote: &BinaryUdpAddr,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let mut flags = UDP_PACKET_FLAG_REMOTE_ADDR;
+    let mut body_len = 1 + 2 + content.len();
+    if let Some(l) = local {
+        flags |= UDP_PACKET_FLAG_LOCAL_ADDR;
+        body_len += l.len();
+    }
+    body_len += remote.len();
     // Go bounds the whole frame payload at DefaultMaxFramePayloadSize (64 KiB);
     // the 2 is the type-id prefix. Mirror the check so oversized bodies fail
     // before the frame layer would.
@@ -193,17 +229,84 @@ pub fn encode_udp_packet_binary_into(packet: &UDPPacket, out: &mut Vec<u8>) -> R
     out.reserve(body_len);
     out.push(flags);
     if let Some(l) = local {
-        put_addr(out, &l);
+        put_addr(out, l);
     }
-    put_addr(out, &remote_b);
-    out.extend_from_slice(&(packet.content.len() as u16).to_be_bytes());
-    out.extend_from_slice(&packet.content);
+    put_addr(out, remote);
+    out.extend_from_slice(&(content.len() as u16).to_be_bytes());
+    out.extend_from_slice(content);
     debug_assert_eq!(out.len() - start, body_len);
     Ok(())
 }
 
+/// Convert a parsed `SocketAddr` to its binaryUDPAddr form without the
+/// `ip.to_string()` + re-parse round trip. A `SocketAddr` is always valid
+/// (no error paths — no empty IP, no zone), and `SocketAddrV6`'s scope id
+/// is never rendered by `Ipv6Addr::to_string()`, so the resulting bytes are
+/// exactly what [`addr_to_binary`] would produce for the string form.
+fn socket_addr_to_binary(addr: &std::net::SocketAddr) -> BinaryUdpAddr {
+    match addr {
+        std::net::SocketAddr::V4(v4) => BinaryUdpAddr {
+            family: 4,
+            ip: v4.ip().octets().to_vec(),
+            port: v4.port(),
+            zone: String::new(),
+        },
+        std::net::SocketAddr::V6(v6) => BinaryUdpAddr {
+            family: 6,
+            ip: v6.ip().octets().to_vec(),
+            port: v6.port(),
+            zone: String::new(),
+        },
+    }
+}
+
 /// Decode a UDPPacket from a binary codec body.
 pub fn decode_udp_packet_binary(body: &[u8]) -> Result<UDPPacket, String> {
+    let h = parse_udp_packet_header(body)?;
+    Ok(UDPPacket {
+        content: body[h.payload_offset..h.payload_offset + h.payload_len].to_vec(),
+        local_addr: h.local_addr,
+        remote_addr: Some(h.remote_addr),
+    })
+}
+
+/// Decode a UDPPacket from an owned binary codec body, taking ownership of
+/// the buffer on success: the packet's `content` IS the input buffer (payload
+/// memmoved to the front, buffer truncated to the payload), so the
+/// per-packet allocation + copy of [`decode_udp_packet_binary`] is avoided.
+/// On error the buffer is left untouched and still owned by the caller.
+///
+/// The parse is byte-for-byte the same as [`decode_udp_packet_binary`] (same
+/// checks, same error strings). The caller should refill the emptied buffer
+/// for the next read (the V2 UDP read path re-acquires from
+/// `frp_core::buffer_pool::BUFFER_POOL`, keeping the per-task scratch
+/// allocation-free).
+pub fn decode_udp_packet_binary_owned(body: &mut Vec<u8>) -> Result<UDPPacket, String> {
+    let h = parse_udp_packet_header(body)?;
+    // The trailing-bytes check guarantees `payload_offset + payload_len ==
+    // body.len()`, so the payload is exactly the buffer tail: move it to the
+    // front and truncate — one in-place memmove, zero allocation.
+    body.copy_within(h.payload_offset.., 0);
+    body.truncate(h.payload_len);
+    Ok(UDPPacket {
+        content: std::mem::take(body),
+        local_addr: h.local_addr,
+        remote_addr: Some(h.remote_addr),
+    })
+}
+
+/// Parsed header of a binary codec body (everything before the payload).
+struct DecodedHeader {
+    local_addr: Option<UdpAddr>,
+    remote_addr: UdpAddr,
+    payload_len: usize,
+    /// Offset within the body of the first payload byte.
+    payload_offset: usize,
+}
+
+/// Shared body parser: flags, optional local addr, required remote addr,
+/// payload length — all strictness checks and error strings live here.
+fn parse_udp_packet_header(body: &[u8]) -> Result<DecodedHeader, String> {
     if body.len() < 3 {
         return Err(format!("UDP packet body too short: {}", body.len()));
     }
@@ -253,10 +356,11 @@ pub fn decode_udp_packet_binary(body: &[u8]) -> Result<UDPPacket, String> {
             remaining - payload_len
         ));
     }
-    Ok(UDPPacket {
-        content: body[offset..offset + payload_len].to_vec(),
+    Ok(DecodedHeader {
         local_addr,
-        remote_addr: Some(remote_addr),
+        remote_addr,
+        payload_len,
+        payload_offset: offset,
     })
 }
 
@@ -367,5 +471,70 @@ mod tests {
             }),
         };
         assert!(encode_udp_packet_binary(&pkt).is_err());
+    }
+
+    #[test]
+    fn owned_decode_matches_slice_decode_and_consumes_buffer() {
+        let pkt = sample_packet();
+        let body = encode_udp_packet_binary(&pkt).unwrap();
+        let expected = decode_udp_packet_binary(&body).unwrap();
+        let mut owned = body;
+        let out = decode_udp_packet_binary_owned(&mut owned).unwrap();
+        assert_eq!(out.content, expected.content);
+        assert_eq!(out.local_addr, expected.local_addr);
+        assert_eq!(out.remote_addr, expected.remote_addr);
+        assert_eq!(out.content, pkt.content);
+        // The packet content IS the caller's buffer: ownership moved out.
+        assert!(owned.is_empty(), "owned decode must consume the buffer");
+    }
+
+    #[test]
+    fn owned_decode_error_leaves_buffer_untouched() {
+        let pkt = sample_packet();
+        let mut body = encode_udp_packet_binary(&pkt).unwrap();
+        body.push(0); // trailing byte -> parse error
+        let before = body.clone();
+        assert!(decode_udp_packet_binary_owned(&mut body).is_err());
+        assert_eq!(body, before, "failed decode must not consume the buffer");
+    }
+
+    #[test]
+    fn socket_addr_encode_is_byte_identical_to_string_round_trip() {
+        // The direct-SocketAddr encoder must produce the same bytes as the
+        // UdpAddr-string round trip the V1/JSON path uses — this is the
+        // Rust↔Rust + Rust↔Go V2 interop invariant.
+        for addr in [
+            "127.0.0.1:53001",
+            "10.0.0.2:53",
+            "[::1]:8080",
+            "[fe80::1]:5353",
+            "[::ffff:192.168.0.1]:12345",
+        ] {
+            let sa: std::net::SocketAddr = addr.parse().unwrap();
+            let pkt = UDPPacket {
+                content: b"ping".to_vec(),
+                local_addr: Some(UdpAddr {
+                    ip: "127.0.0.1".into(),
+                    port: 1,
+                    zone: String::new(),
+                }),
+                remote_addr: Some(UdpAddr {
+                    ip: sa.ip().to_string(),
+                    port: sa.port(),
+                    zone: String::new(),
+                }),
+            };
+            let mut via_string = Vec::new();
+            encode_udp_packet_binary_into(&pkt, &mut via_string).unwrap();
+            let mut direct = Vec::new();
+            encode_udp_packet_binary_socket_addr(
+                &pkt.content,
+                pkt.local_addr.as_ref(),
+                &sa,
+                &mut direct,
+            )
+            .unwrap();
+            assert_eq!(direct, via_string, "address {addr}");
+        }
     }
 }

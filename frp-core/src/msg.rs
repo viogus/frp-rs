@@ -372,13 +372,17 @@ pub struct NewVisitorConnResp {
 }
 
 /// UDP address matching Go frp v0.69.1 `net.UDPAddr` JSON representation.
+///
+/// Go's `net.UDPAddr` has no `omitempty` on `Zone`, so it is ALWAYS emitted
+/// on the wire (`"Zone":""` when empty). The `default` keeps deserialization
+/// lenient — Go-form JSON without the key still parses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UdpAddr {
     #[serde(rename = "IP")]
     pub ip: String,
     #[serde(rename = "Port")]
     pub port: u16,
-    #[serde(rename = "Zone", skip_serializing_if = "String::is_empty", default)]
+    #[serde(rename = "Zone", default)]
     pub zone: String,
 }
 
@@ -425,7 +429,9 @@ pub struct UDPPacket {
 pub struct NatHoleVisitor {
     pub transaction_id: String,
     pub proxy_name: String,
-    #[serde(default)]
+    // Go frp v0.71.0: PreCheck bool `json:"pre_check,omitempty"` — false is
+    // omitted on the wire; both forms still parse (default).
+    #[serde(default, skip_serializing_if = "is_false")]
     pub pre_check: bool,
     // Phase 2 fields (pre_check=false, NAT info exchange):
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -547,7 +553,9 @@ pub struct NatHoleSid {
 pub struct NatHoleReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
-    #[serde(default)]
+    // Go frp v0.71.0: Success bool `json:"success,omitempty"` — false is
+    // omitted on the wire; both forms still parse (default).
+    #[serde(default, skip_serializing_if = "is_false")]
     pub success: bool,
 }
 
@@ -1191,6 +1199,83 @@ mod tests {
     }
 
     #[test]
+    fn test_nat_hole_report_success_go_compat() {
+        // Go frp v0.71.0: Success bool `json:"success,omitempty"` — false is
+        // omitted, true is emitted. Rust must serialize byte-identically.
+        let ok = NatHoleReport {
+            sid: Some("s1".into()),
+            success: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&ok).expect("serialize"),
+            r#"{"sid":"s1","success":true}"#,
+            "success=true must be emitted"
+        );
+
+        let fail = NatHoleReport {
+            sid: Some("s1".into()),
+            success: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&fail).expect("serialize"),
+            r#"{"sid":"s1"}"#,
+            "success=false must be omitted (Go omitempty parity)"
+        );
+
+        // Deserialization accepts both forms.
+        let from_true: NatHoleReport =
+            serde_json::from_str(r#"{"sid":"s1","success":true}"#).expect("parse");
+        assert!(from_true.success);
+        let from_false: NatHoleReport =
+            serde_json::from_str(r#"{"sid":"s1","success":false}"#).expect("parse");
+        assert!(!from_false.success);
+        let from_absent: NatHoleReport = serde_json::from_str(r#"{"sid":"s1"}"#).expect("parse");
+        assert!(!from_absent.success);
+    }
+
+    #[test]
+    fn test_nat_hole_visitor_pre_check_go_compat() {
+        // Go frp v0.71.0: PreCheck bool `json:"pre_check,omitempty"` — false
+        // is omitted, true is emitted.
+        let pre = NatHoleVisitor {
+            transaction_id: "t1".into(),
+            proxy_name: "p1".into(),
+            pre_check: true,
+            ..NatHoleVisitor::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&pre).expect("serialize"),
+            r#"{"transaction_id":"t1","proxy_name":"p1","pre_check":true}"#,
+            "pre_check=true must be emitted"
+        );
+
+        let full = NatHoleVisitor {
+            transaction_id: "t1".into(),
+            proxy_name: "p1".into(),
+            pre_check: false,
+            ..NatHoleVisitor::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&full).expect("serialize"),
+            r#"{"transaction_id":"t1","proxy_name":"p1"}"#,
+            "pre_check=false must be omitted (Go omitempty parity)"
+        );
+
+        // Deserialization accepts both forms.
+        let from_true: NatHoleVisitor =
+            serde_json::from_str(r#"{"transaction_id":"t1","proxy_name":"p1","pre_check":true}"#)
+                .expect("parse");
+        assert!(from_true.pre_check);
+        let from_false: NatHoleVisitor =
+            serde_json::from_str(r#"{"transaction_id":"t1","proxy_name":"p1","pre_check":false}"#)
+                .expect("parse");
+        assert!(!from_false.pre_check);
+        let from_absent: NatHoleVisitor =
+            serde_json::from_str(r#"{"transaction_id":"t1","proxy_name":"p1"}"#).expect("parse");
+        assert!(!from_absent.pre_check);
+    }
+
+    #[test]
     fn test_frp_message_v1_type_bytes() {
         // Verify every known type byte maps to the correct variant
         let cases: Vec<(u8, &str)> = vec![
@@ -1260,32 +1345,42 @@ mod tests {
 
     #[test]
     fn test_udp_addr_serialize_matches_go_format() {
+        // Go's net.UDPAddr has no omitempty on Zone: it is ALWAYS emitted,
+        // `"Zone":""` when empty (Go frp v0.71.0 byte-identical output).
         let addr = UdpAddr {
             ip: "127.0.0.1".into(),
             port: 8080,
             zone: String::new(),
         };
         let json = serde_json::to_string(&addr).expect("serialize");
-        // Zone is omitted when empty due to skip_serializing_if
-        // Go frp v0.69.1 includes "Zone":"" but both forms are
-        // semantically equivalent (empty zone = absent zone).
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["IP"].as_str(), Some("127.0.0.1"));
-        assert_eq!(v["Port"].as_u64(), Some(8080));
+        assert_eq!(
+            json, r#"{"IP":"127.0.0.1","Port":8080,"Zone":""}"#,
+            "Zone must always be emitted, matching Go net.UDPAddr"
+        );
 
-        // Round-trip through deserialization verifies the wire format
-        // is compatible: both with and without Zone key.
+        // Round-trip through deserialization.
         let back: UdpAddr = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.ip, "127.0.0.1");
         assert_eq!(back.port, 8080);
         assert_eq!(back.zone, "");
 
-        // Also verify deserialization from Go-form JSON that includes Zone
+        // Deserialization from Go-form JSON that includes Zone.
         let go_json = r#"{"IP":"127.0.0.1","Port":8080,"Zone":""}"#;
         let from_go: UdpAddr = serde_json::from_str(go_json).expect("deserialize Go format");
         assert_eq!(from_go.ip, "127.0.0.1");
         assert_eq!(from_go.port, 8080);
         assert_eq!(from_go.zone, "");
+
+        // A non-empty zone also round-trips byte-identically.
+        let zoned = UdpAddr {
+            ip: "fe80::1".into(),
+            port: 8080,
+            zone: "eth0".into(),
+        };
+        let zoned_json = serde_json::to_string(&zoned).expect("serialize");
+        assert_eq!(zoned_json, r#"{"IP":"fe80::1","Port":8080,"Zone":"eth0"}"#);
+        let from_zoned: UdpAddr = serde_json::from_str(&zoned_json).expect("deserialize");
+        assert_eq!(from_zoned.zone, "eth0");
     }
 
     #[test]

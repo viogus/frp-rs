@@ -877,7 +877,7 @@ async fn handle_store_proxy_delete(
     cleanup_deleted_proxy_port(&state, &proxy).await;
     // Clean up sk_index (indexed by proxy_name)
     if let Some(key) = proxy.sk_index_key() {
-        state.xtcp.sk_index.write().await.remove(key);
+        state.xtcp.sk_index.remove(key);
     }
     // Clean up VHost and TCPMux routes. HTTP/HTTPS group members share one
     // route: remove from the group first, drop the route with the OWNER's
@@ -942,7 +942,7 @@ async fn handle_proxies_delete(
             // and per-client port quota — same lifecycle as CloseProxy).
             cleanup_deleted_proxy_port(&state, &proxy).await;
             if let Some(key) = proxy.sk_index_key() {
-                state.xtcp.sk_index.write().await.remove(key);
+                state.xtcp.sk_index.remove(key);
             }
             if (proxy.proxy_type == "http" || proxy.proxy_type == "https")
                 && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some()

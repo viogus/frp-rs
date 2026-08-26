@@ -898,6 +898,14 @@ impl Default for ServerTransportConfig {
 pub(super) fn default_heartbeat_timeout() -> i64 {
     90
 }
+
+/// Upper bound for `heartbeat_timeout` in seconds. Larger positive values
+/// are clamped during config completion: the control loop computes
+/// `last_ping + hb_timeout` (an `Instant` add), which would
+/// overflow-panic on a huge value (finding 5). 3600s is far beyond any
+/// sane heartbeat interval.
+pub(super) const MAX_HEARTBEAT_TIMEOUT_SECS: i64 = 3600;
+
 fn default_tcp_keepalive() -> i64 {
     7200
 }
@@ -922,6 +930,58 @@ impl ServerTransportConfig {
                 self.heartbeat_timeout = -1;
             }
         }
+        // Clamp the raw passthrough (finding 5): a huge positive value would
+        // overflow `last_ping + hb_timeout` in the control loop's heartbeat
+        // watchdog (Instant add panics). Values <= 0 keep their disable
+        // semantics untouched.
+        if self.heartbeat_timeout > MAX_HEARTBEAT_TIMEOUT_SECS {
+            self.heartbeat_timeout = MAX_HEARTBEAT_TIMEOUT_SECS;
+        }
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_timeout_clamp_tests {
+    use super::*;
+
+    #[test]
+    fn huge_heartbeat_timeout_is_clamped_to_max() {
+        let mut t = ServerTransportConfig {
+            heartbeat_timeout: i64::MAX,
+            ..Default::default()
+        };
+        t.complete_with_heartbeat_timeout_set(true);
+        assert_eq!(t.heartbeat_timeout, MAX_HEARTBEAT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn negative_heartbeat_timeout_preserves_disable_semantics() {
+        let mut t = ServerTransportConfig {
+            heartbeat_timeout: -1,
+            ..Default::default()
+        };
+        t.complete_with_heartbeat_timeout_set(true);
+        assert_eq!(t.heartbeat_timeout, -1);
+    }
+
+    #[test]
+    fn regular_heartbeat_timeout_is_preserved() {
+        let mut t = ServerTransportConfig {
+            heartbeat_timeout: 90,
+            ..Default::default()
+        };
+        t.complete_with_heartbeat_timeout_set(true);
+        assert_eq!(t.heartbeat_timeout, 90);
+    }
+
+    #[test]
+    fn boundary_max_heartbeat_timeout_is_preserved() {
+        let mut t = ServerTransportConfig {
+            heartbeat_timeout: MAX_HEARTBEAT_TIMEOUT_SECS,
+            ..Default::default()
+        };
+        t.complete_with_heartbeat_timeout_set(true);
+        assert_eq!(t.heartbeat_timeout, MAX_HEARTBEAT_TIMEOUT_SECS);
     }
 }
 

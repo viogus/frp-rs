@@ -174,6 +174,7 @@ pub async fn dial_kcp_with_driver(
             read_rx,
             handle.write_backlog.clone(),
             handle.write_notify.clone(),
+            handle.chunk_pool.clone(),
             snd_backlog,
             snd_notify,
             alive_handle,

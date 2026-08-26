@@ -61,6 +61,11 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "log_level",
         "log_max_days",
         "log_format",
+        // Go legacy INI `log_way` (pkg/config/legacy client.go/server.go
+        // LogWay `ini:"log_way"`): accepted by Go and silently dropped —
+        // legacy conversion never maps it into the new config (conversion.go
+        // copies only LogFile/LogLevel/LogMaxDays). Accept-and-ignore here.
+        "log_way",
         "web_server_addr",
         "web_server_port",
         "web_server_user",
@@ -179,6 +184,9 @@ pub(super) fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "log_level",
         "log_max_days",
         "log_format",
+        // Go legacy INI `log_way`: accepted and silently dropped by Go (see
+        // the server-side comment) — accept-and-ignore here too.
+        "log_way",
         "observability",
         // Go frp v0.70.1 compat — new fields
         "quic",

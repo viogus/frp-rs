@@ -2471,6 +2471,66 @@ impl Service {
                             if let Some(token) = tokens.remove(&cp.proxy_name) {
                                 token.cancel();
                             }
+                            // Mirror the reload-removal path (try_reload
+                            // commit phase): drop the local plugin listener
+                            // handle — PluginHandle::Drop fires the shutdown
+                            // oneshot, so the plugin task exits and its bind
+                            // port is released — and tear down the vnet TUN
+                            // controller. Without this, a server-initiated
+                            // CloseProxy (dashboard delete) leaves the plugin
+                            // listener and TUN running even though the proxy
+                            // is gone (finding 2).
+                            //
+                            // plugin_handles and the vnet maps are keyed by
+                            // the BARE proxy name (start_plugin /
+                            // register_vnet_tun), while the wire CloseProxy
+                            // name carries the {user.} prefix — strip it.
+                            let bare_name = if ctx.cfg_user.is_empty() {
+                                cp.proxy_name.clone()
+                            } else {
+                                let prefix = format!("{}.", ctx.cfg_user);
+                                cp.proxy_name
+                                    .strip_prefix(&prefix)
+                                    .unwrap_or(&cp.proxy_name)
+                                    .to_string()
+                            };
+                            // Teardown order mirrors try_reload: vnet TUN
+                            // removal first, then the plugin handle drop.
+                            #[cfg(feature = "vnet")]
+                            {
+                                let vnet = self
+                                    .cfg
+                                    .read()
+                                    .await
+                                    .proxies
+                                    .iter()
+                                    .find(|p| p.name == bare_name)
+                                    .map(|p| p.virtual_net.clone())
+                                    .unwrap_or_default();
+                                remove_vnet_tun(
+                                    &self.vnet_tuns,
+                                    &self.vnet_tun_tx,
+                                    &self.vnet_tun_cancels,
+                                    &self.vnet_tun_names,
+                                    &self.vnet_tun_subnets,
+                                    &self.vnet_controller.route_table(),
+                                    &self.vnet_peer_routes,
+                                    &writer,
+                                    ctx.v2,
+                                    &bare_name,
+                                    &vnet,
+                                )
+                                .await;
+                            }
+                            {
+                                let mut handles = self
+                                    .plugin_handles
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if handles.remove(&bare_name).is_some() {
+                                    debug!(proxy_name = %bare_name, "CloseProxy: dropped plugin handle for '{}'", bare_name);
+                                }
+                            }
                             // The Closed phase (set above, outside the lock
                             // order used by HealthEvent): the server's nathole
                             // session outlives the close (NAT_HOLE_TIMEOUT =

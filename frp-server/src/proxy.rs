@@ -343,49 +343,81 @@ impl ProxyManager {
         // return; no guard is held across the .await calls below.
         let info = self.proxies.remove(name).map(|(_, v)| v);
         if let Some(info) = info {
-            // A concurrent register() may have re-inserted a proxy under the
-            // same name between our remove and the index cleanup below
-            // (register() only touches `proxies` first, then the indexes).
-            // Re-check the registry: if the name is live again, its fresh
-            // indexes must not be deleted — doing so would leave the new
-            // registration unreachable by group selection and list_client
-            // (audit finding 6).
-            if self.proxies.contains_key(name) {
-                return true;
-            }
-            // Clean up group index
-            if let Some(ref group) = info.group {
-                if !group.is_empty() {
-                    let mut groups = self.groups.write().await;
-                    if let Some(members) = groups.get_mut(group) {
-                        members.retain(|n| n != name);
-                        if members.is_empty() {
-                            groups.remove(group);
-                            // Clean up stale round-robin counter
-                            let mut counters = self
-                                .group_counters
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            counters.remove(group);
-                        }
-                    }
-                }
-            }
-            // Clean up health tracking for this proxy
-            {
-                let mut health = self.group_health.write().await;
-                health.remove(name);
-                if health.is_empty() {
-                    self.health_tracking_active.store(false, Ordering::Release);
-                }
-            }
-            let mut by_client = self.by_client.write().await;
-            if let Some(client_proxies) = by_client.get_mut(&info.run_id) {
-                client_proxies.remove(name);
-            }
+            self.cleanup_removed(name, info).await;
             true
         } else {
             false
+        }
+    }
+
+    /// Generation-guarded removal: remove only when the entry still belongs
+    /// to `control_id` (round-7 audit MEDIUM — the stale-control reaper's
+    /// get-then-remove could destroy a superseding control's fresh
+    /// registration that landed between the check and the removal).
+    /// Returns the removed entry, or None when the name is absent or owned
+    /// by a different generation. `control_id == 0` entries (legacy callers,
+    /// no owning control) are always removable, mirroring the reaper's old
+    /// sweep semantics.
+    pub async fn remove_if_control_id(
+        &self,
+        name: &str,
+        control_id: u64,
+    ) -> Option<Arc<ProxyInfo>> {
+        let info = self
+            .proxies
+            .remove_if(name, |_, info| {
+                info.control_id == 0 || info.control_id == control_id
+            })
+            .map(|(_, v)| v);
+        if let Some(info) = info {
+            self.cleanup_removed(name, info.clone()).await;
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    /// Index cleanup after a proxy entry was removed from `proxies`.
+    async fn cleanup_removed(&self, name: &str, info: Arc<ProxyInfo>) {
+        // A concurrent register() may have re-inserted a proxy under the
+        // same name between our remove and the index cleanup below
+        // (register() only touches `proxies` first, then the indexes).
+        // Re-check the registry: if the name is live again, its fresh
+        // indexes must not be deleted — doing so would leave the new
+        // registration unreachable by group selection and list_client
+        // (audit finding 6).
+        if self.proxies.contains_key(name) {
+            return;
+        }
+        // Clean up group index
+        if let Some(ref group) = info.group {
+            if !group.is_empty() {
+                let mut groups = self.groups.write().await;
+                if let Some(members) = groups.get_mut(group) {
+                    members.retain(|n| n != name);
+                    if members.is_empty() {
+                        groups.remove(group);
+                        // Clean up stale round-robin counter
+                        let mut counters = self
+                            .group_counters
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        counters.remove(group);
+                    }
+                }
+            }
+        }
+        // Clean up health tracking for this proxy
+        {
+            let mut health = self.group_health.write().await;
+            health.remove(name);
+            if health.is_empty() {
+                self.health_tracking_active.store(false, Ordering::Release);
+            }
+        }
+        let mut by_client = self.by_client.write().await;
+        if let Some(client_proxies) = by_client.get_mut(&info.run_id) {
+            client_proxies.remove(name);
         }
     }
 

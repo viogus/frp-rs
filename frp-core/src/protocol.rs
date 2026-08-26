@@ -460,25 +460,19 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
 ) -> Result<(u16, u16, Vec<u8>), crate::Error> {
     let (frame_type, flags, payload_len) = read_v2_frame_header(reader).await?;
 
-    // Use global buffer pool for small payloads (<= BUFFER_SIZE, 32 KiB
-    // by default), matching the V1 read path in read_msg_v1.  Larger
-    // payloads fall back to a direct heap allocation.
-    let pool_size = *crate::buffer_pool::BUFFER_SIZE;
-    let payload = if payload_len <= pool_size {
-        let mut guard = crate::buffer_pool::PoolGuard::acquire();
-        reader
-            .read_exact(&mut guard.as_mut_slice()[..payload_len])
-            .await
-            .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
-        guard.raw_buf()[..payload_len].to_vec()
-    } else {
-        let mut payload = vec![0u8; payload_len];
-        reader
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
-        payload
-    };
+    // Read directly into the returned Vec, mirroring read_v1_frame. The
+    // global buffer pool is deliberately not used here: its payoff is
+    // avoiding copies for buffers that outlive one message, but this API
+    // must hand back an owned `Vec<u8>`, so a pooled read would still
+    // `to_vec` the payload before the guard drops — one extra copy plus
+    // pool acquire/release traffic for nothing. The per-message control-path
+    // reader (`read_msg_v2`) keeps the pooled no-copy fast path; this
+    // raw-frame reader is handshake / once-per-connection only.
+    let mut payload = vec![0u8; payload_len];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
 
     Ok((frame_type, flags, payload))
 }
@@ -626,8 +620,22 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
     // duplicating here since UDP payloads are typically small). The caller
     // holds `scratch` outside its message loop and reuses it across frames,
     // avoiding a heap allocation per UDP packet.
+    //
+    // The 2-byte type ID is read into a stack array so the codec body lands
+    // at the start of `scratch`: the binary UDP decoder then hands
+    // `scratch`'s buffer to the packet content Vec (zero copy, zero alloc),
+    // and this function refills `scratch` from the global pool for the next
+    // read. All callers wrap the read half in a BufReader, so the extra
+    // read_exact is a buffer hit, not a syscall.
+    let mut type_id_buf = [0u8; 2];
+    reader
+        .read_exact(&mut type_id_buf)
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+    let type_id = u16::from_be_bytes(type_id_buf);
+    let body_len = payload_len - 2;
     scratch.clear();
-    scratch.reserve(payload_len);
+    scratch.reserve(body_len);
     // Set the length without the `resize`-style zero-fill: `read_exact`
     // below immediately overwrites the entire buffer, so the memset would be
     // pure waste on the per-UDP-packet hot path (audit #14d).
@@ -638,13 +646,12 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
     // precisely the intentional use here.
     #[allow(clippy::uninit_vec)]
     unsafe {
-        scratch.set_len(payload_len);
+        scratch.set_len(body_len);
     }
     reader
         .read_exact(scratch.as_mut_slice())
         .await
         .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
-    let type_id = u16::from_be_bytes([scratch[0], scratch[1]]);
 
     let binary = udp_packet_codec == Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY);
     if type_id == msg::V2_TYPE_UDP_PACKET_BINARY {
@@ -657,8 +664,18 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
                 .into(),
             ));
         }
-        let packet = crate::udp_binary::decode_udp_packet_binary(&scratch[2..])
+        let packet = crate::udp_binary::decode_udp_packet_binary_owned(scratch)
             .map_err(|e| crate::Error::Protocol(format!("decode binary UDP packet: {e}").into()))?;
+        // The decoder moved `scratch`'s buffer into the packet's content
+        // Vec; refill from the global pool so the next frame read does not
+        // allocate per UDP packet. Note: the packet's content buffer is a
+        // plain Vec owned by the message until bridging completes, so it is
+        // freed to the allocator when the packet is dropped — it never
+        // returns to the pool (only PoolGuard drops call release). The
+        // per-packet steady-state cost is therefore one 32 KiB alloc + free
+        // with the byte copy eliminated; the reader side itself stays
+        // zero-alloc across packets (round-7 audit M2).
+        *scratch = crate::buffer_pool::BUFFER_POOL.acquire();
         return Ok(FrpMessage::UDPPacket(packet));
     }
     if binary && type_id == msg::V2_TYPE_UDP_PACKET {
@@ -667,7 +684,7 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
             "received JSON UDP packet after binary codec negotiation".into(),
         ));
     }
-    deserialize_v2(type_id, &scratch[2..])
+    deserialize_v2(type_id, scratch)
 }
 
 /// Write a V2 message frame, using the binary UDP packet codec for

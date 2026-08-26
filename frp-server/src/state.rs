@@ -316,7 +316,12 @@ pub struct XtcpState {
     /// multiple STCP/XTCP proxies share the same secret key).
     /// Value: `raw_sk` — used for fallback auth during the
     /// NewVisitorConn-before-registration race window.
-    pub sk_index: Arc<RwLock<HashMap<String, String>>>,
+    ///
+    /// DashMap (like `run_id_to_ctl_tx`): the per-NewVisitorConn lookup is
+    /// lock-free and never queues behind STCP registration/unregister
+    /// writes (a tokio RwLock is writer-fair, so visitor-lookup readers
+    /// could serialize behind sk_index writes).
+    pub sk_index: Arc<DashMap<String, String>>,
 }
 
 /// Token bucket rate limiter for connection accept loops.
@@ -974,7 +979,7 @@ impl AppState {
                 nat_hole: Arc::new(Controller::new(Duration::from_secs(
                     nat_hole_analysis_data_reserve_hours.saturating_mul(3600),
                 ))),
-                sk_index: Arc::new(RwLock::new(HashMap::new())),
+                sk_index: Arc::new(DashMap::new()),
             },
             sub_domain_host,
             tcp_mux,
