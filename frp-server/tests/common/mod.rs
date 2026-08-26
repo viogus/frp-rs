@@ -20,12 +20,77 @@ use frp_server::service::Service;
 /// a foreign listener → connection reset).
 static USED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// RAII guard holding an exclusive flock(2) on the shared port-allocation
+/// lock file. Every integration-test **bin** is a separate process, so each
+/// compiles its own copy of `common` with its own `USED_PORTS` set; the
+/// kernel-level flock is the only thing that serializes the probe-then-drop
+/// window **across** those processes. The lock is held for the duration of
+/// one `allocate_port` call, so two bins can never both confirm the same
+/// ephemeral port is free and hand it out at once.
+#[cfg(unix)]
+struct PortRequestGuard {
+    file: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl Drop for PortRequestGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `fd` is a live OwnedFd held by self until this Drop ends;
+        // flock(LOCK_UN) is always safe on a valid fd. The OwnedFd's own Drop
+        // then closes the descriptor after we release the lock.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Acquire the cross-process port-allocation lock (blocking). The lock file
+/// is kept in the OS temp dir so every test-bin process resolves the same
+/// path; the file is never deleted (it is a persistent flock anchor).
+#[cfg(unix)]
+fn acquire_port_request_lock() -> PortRequestGuard {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    let path = std::env::temp_dir().join("frp-test-port-alloc.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .expect("open shared port-alloc lock file");
+    // Transfer the raw fd ownership into an OwnedFd; it (not the File) is what
+    // the guard holds, so the descriptor stays live for the whole lock.
+    // SAFETY: `fd` is a valid, owned descriptor freshly produced by open(2)
+    // above; transferring it into OwnedFd::from_raw_fd is the canonical idiom.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(file.into_raw_fd()) };
+    // Exclusive, blocking: concurrent bins queue here so only one probes-and-
+    // confirms at a time. Failures from environmental fd exhaustion abort the
+    // test loudly rather than silently racing for ports.
+    let ret = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(ret, 0, "flock on shared port-alloc lock file failed: errno");
+    PortRequestGuard { file: fd }
+}
+
+/// Non-unix fallback: a no-op guard so `allocate_port` compiles everywhere
+/// (flock(2) is unix-only; the target platforms are macOS + Linux CI). Keeps
+/// the `let _lock = acquire_port_request_lock();` call site cfg-free.
+#[cfg(not(unix))]
+struct PortRequestGuard;
+
+#[cfg(not(unix))]
+fn acquire_port_request_lock() -> PortRequestGuard {
+    PortRequestGuard
+}
+
 /// Bind to a random port, return the port number, then drop the socket.
 /// Never returns a port already handed out by this process, and re-verifies
 /// the port is still bindable right before returning (narrows the
 /// probe-then-drop window). Falls back to a random ephemeral port on
 /// sandboxed environments where explicit binding is disallowed.
 pub fn allocate_port() -> u16 {
+    // Serialize the whole probe→confirm→hand-out across processes so the
+    // probe-then-drop window cannot be interleaved by another test bin.
+    let _lock = acquire_port_request_lock();
     for _ in 0..64 {
         let Some(port) = probe_ephemeral_port() else {
             return sandbox_fallback();

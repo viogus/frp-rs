@@ -42,11 +42,23 @@ jobs:
         # dashboard_integration.rs / dashboard_v2_integration.rs are cfg-gated
         # on the `dashboard` feature and never compile under default features;
         # run them here so the only opt-in business feature has CI coverage.
-        run: cargo test -p frp-server --features dashboard --test dashboard_integration --test dashboard_v2_integration
+        # -j 1: both bins bind ephemeral ports and parallel execution lets the
+        # two *processes* collide on the same 127.0.0.1 port (each test bin is
+        # a separate process with its own port bookkeeping), flaking as
+        # "dashboard_port not ready". Serialize them. The common::allocate_port
+        # flock lock narrows the window; -j 1 removes it entirely.
+        run: cargo test -p frp-server --features dashboard --test dashboard_integration --test dashboard_v2_integration -j 1
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
       - name: Run tests
-        run: cargo test --workspace
+        # -j 1: frp-server/frp-client integration bins each spawn their own
+        # frps/frpc and bind ephemeral 127.0.0.1 ports. Cargo runs test *bins*
+        # as separate processes in parallel, and each process re-allocates
+        # ports independently, so parallel bins can grab the same port and
+        # flake (observed reload_integration / dashboard_integration). The
+        # common::allocate_port flock lock narrows the window; `-j 1` runs the
+        # bins one at a time and removes it entirely.
+        run: cargo test --workspace -j 1
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
           FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
