@@ -60,6 +60,10 @@ mem-profile = ["frp-core/mem-profile"]
 profiling = ["frp-core/profiling"]
 
 [dev-dependencies]
+# flock(2) for the cross-process port-allocation guard shared by the
+# integration-test bins (see common::allocate_port). Already a workspace dep
+# pulled in transitively by frp-core — only the direct test reference is new.
+libc.workspace = true
 tracing-subscriber.workspace = true
 tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
