@@ -45,8 +45,8 @@ impl std::error::Error for Base64Error {}
 /// Encode `data` as base64 with the standard alphabet and `=` padding.
 pub fn encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    let mut chunks = data.chunks_exact(3);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = data.as_chunks::<3>();
+    for chunk in chunks {
         let b0 = chunk[0];
         let b1 = chunk[1];
         let b2 = chunk[2];
@@ -55,7 +55,7 @@ pub fn encode(data: &[u8]) -> String {
         out.push(ALPHABET[((b1 & 0x0f) << 2 | b2 >> 6) as usize] as char);
         out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
     }
-    match chunks.remainder() {
+    match remainder {
         [] => {}
         [b0] => {
             out.push(ALPHABET[(b0 >> 2) as usize] as char);
@@ -69,7 +69,7 @@ pub fn encode(data: &[u8]) -> String {
             out.push(ALPHABET[((b1 & 0x0f) << 2) as usize] as char);
             out.push('=');
         }
-        _ => unreachable!("chunks_exact remainder has at most 2 bytes"),
+        _ => unreachable!("remainder is at most 2 bytes"),
     }
     out
 }

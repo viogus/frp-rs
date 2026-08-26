@@ -1527,7 +1527,8 @@ async fn run_sudp_message_bridge(
 /// conn is dead and the request (with its user conn) is returned so the
 /// caller can retry it against a fresh work conn instead of dropping the
 /// user connection (audit fix: dead pooled work conns used to fail the user
-/// conn with no retry).
+/// conn with no retry). Boxed: the request is large and this error is cold
+/// (one alloc on the retry path; keeps `result_large_err` quiet).
 pub(crate) async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
@@ -1535,14 +1536,14 @@ pub(crate) async fn assign_work_to_proxy(
     state: Arc<AppState>,
     v2: bool,
     bridge_cancel: tokio_util::sync::CancellationToken,
-) -> Result<(), PendingRequest> {
+) -> Result<(), Box<PendingRequest>> {
     // Extract peer address from user connection for PROXY protocol support
     let (src_addr, src_port) = req
         .user_conn
         .try_tcp()
         .and_then(|s| s.peer_addr().ok())
         .map(|a| (a.ip().to_string(), a.port() as i32))
-        .map_or((String::new(), 0), |(ip, port)| (ip, port));
+        .unwrap_or_default();
 
     // Proxy metadata is carried in the request (fetched once by the
     // dispatcher). When the snapshot is None — the STCP/XTCP
@@ -1580,7 +1581,7 @@ pub(crate) async fn assign_work_to_proxy(
         // The work conn is dead (e.g. the client closed it while pooled).
         // Return the request so the caller can re-enqueue it against a
         // fresh work conn instead of failing the user connection.
-        return Err(req);
+        return Err(Box::new(req));
     }
 
     // Flush StartWorkConn to wire before bridge data. KcpStream::poll_flush
