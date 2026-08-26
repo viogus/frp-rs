@@ -181,7 +181,7 @@ where
             // failing the user connection (audit fix).
             Err(req) => {
                 warn!(proxy_name = %req.proxy_name, "Pooled work conn died before StartWorkConn; re-enqueueing request for replacement");
-                pending_requests.push_back(req);
+                pending_requests.push_back(*req);
                 ctx.pool_stats
                     .pending_requests
                     .store(pending_requests.len() as i64, Ordering::Relaxed);
