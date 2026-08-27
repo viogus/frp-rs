@@ -13,6 +13,7 @@ use frp_core::transport::IoStream;
 use crate::lock::RwLockExt;
 use crate::proxy::ProxyInfo;
 use crate::service::{AppState, InternalMsg};
+use crate::state::ControlTx;
 
 /// Returns full detail when detailed_errors is enabled, otherwise generic message.
 pub(crate) fn err_msg(detailed: bool, detail: String, generic: &str) -> String {
@@ -1962,20 +1963,33 @@ pub(crate) async fn unregister_control(
     sweep: bool,
 ) {
     let removed_control_id = if !skip_ctl_unregister {
-        let current_control_id = state
-            .run_id_to_ctl_tx
-            .get(run_id)
-            .map(|c| c.control_id)
-            .unwrap_or(0);
-        if control_id != 0 && current_control_id != control_id {
-            None
+        // Atomic generation-guarded removal: remove_if compares control_id
+        // inside the shard lock, so a fresh re-login's insert can never land
+        // between a check and the removal (the previous get-then-remove
+        // TOCTOU — in the disconnect+reconnect path it could delete the
+        // fresh ControlTx entry, and then its fresh user record via
+        // remove_user below). The entry is removed only when it still holds
+        // THIS control's control_id; control_id == 0 (legacy callers that
+        // do not track generations) sweeps unconditionally. remove_user
+        // below fires only when the removal actually matched (i.e. the
+        // returned value held this control's id), so a superseding
+        // control's fresh entry and user record are never touched.
+        let removed: Option<(String, ControlTx)> = if control_id == 0 {
+            state.run_id_to_ctl_tx.remove(run_id)
         } else {
-            state.run_id_to_ctl_tx.remove(run_id);
-            // Mark the client offline in the registry, generation-aware.
             state
-                .client_registry
-                .mark_offline_by_run_id_and_control_id(run_id, current_control_id);
-            Some(current_control_id)
+                .run_id_to_ctl_tx
+                .remove_if(run_id, |_, cur| cur.control_id == control_id)
+        };
+        match removed {
+            Some((_, removed)) => {
+                // Mark the client offline in the registry, generation-aware.
+                state
+                    .client_registry
+                    .mark_offline_by_run_id_and_control_id(run_id, removed.control_id);
+                Some(removed.control_id)
+            }
+            None => None,
         }
     } else {
         None
@@ -2803,6 +2817,48 @@ pub(crate) mod unregister_generation_tests {
         // The replacement itself may still clean up its own generation.
         unregister_control(&state, "run-1", 7, false, true).await;
         assert!(!state.run_id_to_ctl_tx.contains_key("run-1"));
+    }
+
+    /// Round-4 audit finding: unregister_control's entry removal used to be
+    /// `get` then unconditional `remove` — a fresh re-login's insert landing
+    /// between them deleted the fresh ControlTx entry, and remove_user then
+    /// deleted its fresh user record. The removal is now a single atomic
+    /// remove_if keyed on control_id: a stale generation's cleanup is a
+    /// no-op for BOTH the routing entry and the user record, and a matching
+    /// cleanup drops both.
+    #[tokio::test]
+    async fn stale_unregister_keeps_fresh_user_record() {
+        let state = test_state();
+        state.plugin_manager.record_login_user(
+            "run-1",
+            &crate::plugin::UserInfo {
+                user: "fresh".to_string(),
+                metas: std::collections::HashMap::new(),
+                run_id: "run-1".to_string(),
+            },
+        );
+        insert_control(&state, "run-1", 7).await;
+
+        // Stale generation 3's cleanup must not touch generation 7's routing
+        // entry or its user record.
+        unregister_control(&state, "run-1", 3, false, true).await;
+        assert!(
+            state.run_id_to_ctl_tx.contains_key("run-1"),
+            "stale cleanup must not delete the fresh ControlTx entry"
+        );
+        assert_eq!(
+            state.plugin_manager.user_info("run-1").map(|u| u.user),
+            Some("fresh".to_string()),
+            "stale cleanup must not delete the fresh control's user record"
+        );
+
+        // The fresh control's own cleanup removes both.
+        unregister_control(&state, "run-1", 7, false, true).await;
+        assert!(!state.run_id_to_ctl_tx.contains_key("run-1"));
+        assert!(
+            state.plugin_manager.user_info("run-1").is_none(),
+            "matching cleanup must drop the user record"
+        );
     }
 
     /// Regression test for the used_ports ↔ port_reservations lock-order

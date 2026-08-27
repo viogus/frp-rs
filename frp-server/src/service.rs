@@ -1702,13 +1702,29 @@ impl Service {
                         // would still delete a fresh entry recorded before
                         // this re-check (the old comment's "re-recorded on
                         // the next login hook" claim was wrong: that login
-                        // already ran). Re-check run_id_to_ctl_tx: a NEWER
-                        // control_id → the fresh control re-logged in and its
-                        // record is in place or lands after this removal →
+                        // already ran).
+                        //
+                        // Round-4 audit finding: the re-check and remove_user
+                        // used to be two separate steps, so a same-run_id
+                        // re-login's insert+record (login.rs, under its own
+                        // run_mu — which the reaper did not hold) could land
+                        // between them and delete the fresh record. Hold the
+                        // per-run_id run_mu across both steps, mirroring the
+                        // login path's acquisition and lock order (run_mu →
+                        // run_id_to_ctl_tx → users RwLock; the reaper
+                        // otherwise takes no run_mu and no path takes the
+                        // users lock then run_mu, so no inversion): a
+                        // re-login either completed before us (its fresh
+                        // generation is visible in the re-check below →
+                        // skip) or is queued on run_mu until this removal is
+                        // done (its record is not yet made → remove_user
+                        // cannot delete it). With run_mu held, re-check
+                        // run_id_to_ctl_tx: a NEWER control_id → the fresh
+                        // control re-logged in and its record is in place →
                         // skip; no entry (or still the swept generation) →
-                        // any in-flight re-login records only after its
-                        // insert, i.e. after this removal → remove_user (leak
-                        // fix stands) cannot delete a fresh record.
+                        // remove_user (leak fix stands).
+                        let (run_mu, _run_mu_guard) = state.get_run_mu(&run_id);
+                        let reaper_run_guard = run_mu.lock().await;
                         let fresh_generation_present = state
                             .run_id_to_ctl_tx
                             .get(&run_id)
@@ -1716,6 +1732,7 @@ impl Service {
                         if !fresh_generation_present {
                             state.plugin_manager.remove_user(&run_id);
                         }
+                        drop(reaper_run_guard);
                         tracing::info!(
                             run_id = %run_id,
                             "removed stale control entry (handler died)"

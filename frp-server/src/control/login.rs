@@ -802,16 +802,18 @@ pub(crate) async fn authenticate(
     // Record the (possibly plugin-mutated) client identity for the `user`
     // object of later plugin hooks (Go loginUserInfo: LoginMsg.User/Metas
     // + runID). Deliberately AFTER the run_id_to_ctl_tx insert (audit
-    // finding): every remove_user is generation-guarded by a
-    // run_id_to_ctl_tx re-check (the stale-control reaper in service.rs;
-    // removed_control_id in unregister_control), so a record made BEFORE
-    // its own insert can sit in the users map while that re-check still
-    // sees no fresh generation — a control re-logging in with the same
-    // run_id during the reaper's sweep would have its entry deleted,
+    // finding): every remove_user is generation-guarded by an atomic
+    // guard — the stale-control reaper in service.rs holds this run_id's
+    // run_mu across its re-check + remove_user; unregister_control fires
+    // remove_user only when its run_id_to_ctl_tx removal actually matched
+    // this control's control_id (a single atomic remove_if) — so a record
+    // made BEFORE its own insert can sit in the users map while a guard
+    // still sees no fresh generation: a control re-logging in with the
+    // same run_id during the reaper's sweep would have its entry deleted,
     // leaving `user` empty in all later plugin hooks. Recording here, in
     // the same run_mu critical section, makes the record strictly follow
-    // the insert (no await between): a guard whose re-check runs before
-    // the insert cannot find the fresh record yet; one that runs after it
+    // the insert (no await between): a guard whose check runs before the
+    // insert cannot find the fresh record yet; one that runs after it
     // sees the fresh generation and skips.
     if !state.plugin_manager.is_empty() {
         state.plugin_manager.record_login_user(
