@@ -1694,16 +1694,21 @@ impl Service {
                         // Same-run_id reconnect guard: a control that died
                         // uncleanly and reconnected with the SAME run_id (frpc
                         // reuses its run_id) between the sweep's remove_if and
-                        // here has ALREADY run its login hook and recorded its
-                        // identity entry — an unconditional remove_user by
-                        // run_id would delete the fresh control's entry for
-                        // its whole lifetime (the old comment's "re-recorded
-                        // on the next login hook" claim was wrong: that login
-                        // already ran). Re-check run_id_to_ctl_tx: no entry
-                        // (or still the swept generation) → nothing fresh to
-                        // protect → remove_user (leak fix stands); a NEWER
-                        // control_id → the fresh control re-logged in and
-                        // recorded its user → skip.
+                        // here may be mid-login. login.rs records the plugin
+                        // user entry AFTER its run_id_to_ctl_tx insert (same
+                        // run_mu critical section — audit-fix ordering), so a
+                        // fresh record only exists once a fresh generation is
+                        // registered; an unconditional remove_user by run_id
+                        // would still delete a fresh entry recorded before
+                        // this re-check (the old comment's "re-recorded on
+                        // the next login hook" claim was wrong: that login
+                        // already ran). Re-check run_id_to_ctl_tx: a NEWER
+                        // control_id → the fresh control re-logged in and its
+                        // record is in place or lands after this removal →
+                        // skip; no entry (or still the swept generation) →
+                        // any in-flight re-login records only after its
+                        // insert, i.e. after this removal → remove_user (leak
+                        // fix stands) cannot delete a fresh record.
                         let fresh_generation_present = state
                             .run_id_to_ctl_tx
                             .get(&run_id)

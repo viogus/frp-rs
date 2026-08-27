@@ -390,16 +390,21 @@ impl HttpPluginManager {
                 return Err(reason);
             }
             if !pr.unchange {
-                // Go http.go:78: the response `content` is decoded into a
-                // FRESH zero-value struct (`reflect.New` + `json.Unmarshal`)
-                // — when the response omits `content` or sends null, the
-                // fresh struct stays all-zero ("" / nil / 0). Silently
-                // skipping the mutation would leave the ORIGINAL content in
-                // place (fail-open divergence): apply an empty-object
-                // mutation instead so the typed struct's fields zero out —
-                // Login's all-Option fields → auth fails on the missing
-                // privilege_key/timestamp (Go parity), and NewProxy fails
-                // closed on the missing proxy_name.
+                // Go http.go:78 pre-sets `res.Content = reflect.New(T)`, so
+                // an ABSENT `content` key leaves the zero-value *T — the
+                // mutation zeroes the typed struct ("" / nil / 0), which
+                // frp-rs mirrors with an empty-object mutation below. An
+                // EXPLICIT `"content": null` differs in Go: json.Unmarshal
+                // nil-fills that interface, and handleMutableContent's
+                // `content = retContent.(*T)` (manager.go:99-102) then
+                // PANICS on the nil — panicking by design ("Buggy Plugin
+                // implementations still panic here, by design"). frp-rs maps
+                // explicit-null to the same empty-object zero-fill as absent:
+                // strictly more graceful than Go's panic and still
+                // fail-closed — Login's all-Option fields → auth fails on
+                // the missing privilege_key/timestamp, and NewProxy fails
+                // closed on the missing proxy_name. Deliberate deviation,
+                // not parity.
                 cur = if pr.content.is_null() {
                     serde_json::Value::Object(serde_json::Map::new())
                 } else {

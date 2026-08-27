@@ -520,13 +520,17 @@ pub(crate) async fn authenticate(
     // Effective run_id: computed up-front (pre-plugin) so the Login hook
     // payload can carry it — a client that omits run_id still appears as
     // the assigned UUID (the value registration actually uses).
-    // NOTE: plugin mutations of run_id are deliberately NOT honored —
-    // bookkeeping (run_id_to_ctl_tx, plugin users map, client registry,
-    // OIDC subjects) and the login replay table all key off this
-    // pre-plugin value. Honoring a mutated run_id would desync them and
-    // let a plugin bypass replay protection by changing the key mid-flight
-    // (echo-style plugins preserve run_id, so this is a non-issue in
-    // practice — pathological plugins get the pre-plugin value).
+    // NOTE: plugin mutations of run_id are deliberately NOT honored for
+    // BOOKKEEPING — run_id_to_ctl_tx, the plugin users map, client
+    // registry, and OIDC subjects all key off this pre-plugin value
+    // (honoring a mutated run_id would desync them). The login replay
+    // table is the exception: verify_login_auth derives run_id_for_check
+    // from the MUTATED login, so a plugin-mutated run_id DOES change the
+    // replay key — Go parity (Go uses the mutated `m` throughout
+    // RegisterControl, including the ctlsByRunID key). Echo-style
+    // plugins preserve run_id, so the split is invisible in practice;
+    // pathological plugins get the pre-plugin value in the bookkeeping
+    // maps and the mutated value in the replay table.
     let run_id = login
         .run_id
         .clone()
@@ -673,20 +677,6 @@ pub(crate) async fn authenticate(
     let authenticated_user = authenticated_user(login.user.as_deref(), oidc_subject.as_deref());
     info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
 
-    // Record the (possibly plugin-mutated) client identity for the `user`
-    // object of later plugin hooks (Go loginUserInfo: LoginMsg.User/Metas
-    // + runID).
-    if !state.plugin_manager.is_empty() {
-        state.plugin_manager.record_login_user(
-            &run_id,
-            &crate::plugin::UserInfo {
-                user: login.user.clone().unwrap_or_default(),
-                metas: login.metas.clone().unwrap_or_default(),
-                run_id: run_id.clone(),
-            },
-        );
-    }
-
     // --- Set up internal channel ---
     let (internal_tx, internal_rx) = mpsc::channel::<InternalMsg>(1024);
     let pool_stats = Arc::new(PoolStats::default());
@@ -808,6 +798,31 @@ pub(crate) async fn authenticate(
             superseded: superseded.clone(),
         },
     );
+
+    // Record the (possibly plugin-mutated) client identity for the `user`
+    // object of later plugin hooks (Go loginUserInfo: LoginMsg.User/Metas
+    // + runID). Deliberately AFTER the run_id_to_ctl_tx insert (audit
+    // finding): every remove_user is generation-guarded by a
+    // run_id_to_ctl_tx re-check (the stale-control reaper in service.rs;
+    // removed_control_id in unregister_control), so a record made BEFORE
+    // its own insert can sit in the users map while that re-check still
+    // sees no fresh generation — a control re-logging in with the same
+    // run_id during the reaper's sweep would have its entry deleted,
+    // leaving `user` empty in all later plugin hooks. Recording here, in
+    // the same run_mu critical section, makes the record strictly follow
+    // the insert (no await between): a guard whose re-check runs before
+    // the insert cannot find the fresh record yet; one that runs after it
+    // sees the fresh generation and skips.
+    if !state.plugin_manager.is_empty() {
+        state.plugin_manager.record_login_user(
+            &run_id,
+            &crate::plugin::UserInfo {
+                user: login.user.clone().unwrap_or_default(),
+                metas: login.metas.clone().unwrap_or_default(),
+                run_id: run_id.clone(),
+            },
+        );
+    }
 
     // Release run_mu before waiting for the handoff barrier — the old
     // handler's cleanup may need to acquire run_mu (via unregister_control
