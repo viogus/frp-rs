@@ -42,16 +42,32 @@ async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
     }
 }
 
-/// Protocol-aware write: dispatches to V1 or V2 framing based on the `v2` flag.
+/// Deadline for control-plane writes (audit H2). A wedged-but-alive peer
+/// must not pin the control task + fd + semaphore permit forever: the
+/// heartbeat timeout can never fire while the select loop is blocked inside
+/// a write, so every control write gets this bound. Longer than the 5s
+/// login reject/success deadlines — those keep their tighter budget.
+const CTL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Protocol-aware write: dispatches to V1 or V2 framing based on the `v2`
+/// flag. Bounded by `CTL_WRITE_TIMEOUT` (30s): on timeout the write is
+/// abandoned and a Protocol error is returned, which control-loop callers
+/// treat as fatal — the connection closes and its resources release.
 async fn write_ctl_msg<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
     v2: bool,
 ) -> Result<(), frp_core::Error> {
-    if v2 {
-        write_msg_v2(writer, msg).await
-    } else {
-        write_msg_v1(writer, msg).await
+    let write = async {
+        if v2 {
+            write_msg_v2(writer, msg).await
+        } else {
+            write_msg_v1(writer, msg).await
+        }
+    };
+    match tokio::time::timeout(CTL_WRITE_TIMEOUT, write).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(frp_core::Error::Protocol("control write timed out".into())),
     }
 }
 use frp_core::transport::IoStream;
@@ -599,5 +615,65 @@ mod fairness_tests {
                 == 1,
             "control select must remain fair under sustained internal pressure"
         );
+    }
+}
+
+#[cfg(test)]
+mod ctl_write_timeout_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// AsyncWrite whose poll_write never completes — simulates a
+    /// wedged-but-alive peer whose TCP window is exhausted.
+    struct StalledWriter;
+
+    impl tokio::io::AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// Audit H2 regression: write_ctl_msg must be bounded by
+    /// CTL_WRITE_TIMEOUT — a wedged peer must not pin the control task
+    /// forever (the heartbeat timeout cannot fire while the select loop is
+    /// blocked inside the write), and the timeout must surface as a
+    /// Protocol error so the control loop tears the connection down.
+    /// Paused time keeps the test instant.
+    #[tokio::test(start_paused = true)]
+    async fn write_ctl_msg_bounded_by_ctl_write_timeout() {
+        let mut stalled = StalledWriter;
+        let msg = FrpMessage::ReqWorkConn(msg::ReqWorkConn {});
+        // Outer +1s guard: without the fix (bare unbounded write) the outer
+        // timeout would fire and the match below would hit the Elapsed arm.
+        let result = tokio::time::timeout(
+            CTL_WRITE_TIMEOUT + Duration::from_secs(1),
+            write_ctl_msg(&mut stalled, &msg, false),
+        )
+        .await;
+        match result {
+            Ok(Err(frp_core::Error::Protocol(_))) => {}
+            other => panic!("expected Protocol error at CTL_WRITE_TIMEOUT, got {other:?}"),
+        }
+        // Same for the V2 path.
+        let result = tokio::time::timeout(
+            CTL_WRITE_TIMEOUT + Duration::from_secs(1),
+            write_ctl_msg(&mut stalled, &msg, true),
+        )
+        .await;
+        match result {
+            Ok(Err(frp_core::Error::Protocol(_))) => {}
+            other => panic!("expected Protocol error on V2 write, got {other:?}"),
+        }
     }
 }

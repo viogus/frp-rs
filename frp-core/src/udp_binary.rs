@@ -92,11 +92,12 @@ fn addr_to_binary(addr: &UdpAddr) -> Result<BinaryUdpAddr, String> {
             if addr.zone.len() > 255 {
                 return Err("zone exceeds 255 bytes".into());
             }
-            if !addr.zone.is_ascii() {
-                // Go checks UTF-8 validity; scope zones are ascii in practice,
-                // and we mirror the rejection of non-UTF-8 zone strings.
-                return Err("zone is not valid UTF-8".into());
-            }
+            // Go validates the zone with utf8.ValidString (udp_binary.go:160-162)
+            // and accepts any valid UTF-8 — scope zones need not be ASCII. The
+            // zone here is a Rust String, so valid UTF-8 is guaranteed by
+            // construction and no check is needed: non-ASCII valid-UTF-8 zones
+            // (e.g. "接口") encode exactly as Go does (review finding W1). The
+            // byte-length cap above matches Go's `len(addr.Zone) > 255`.
             Ok(BinaryUdpAddr {
                 family: 6,
                 ip: v6.octets().to_vec(),
@@ -456,6 +457,27 @@ mod tests {
         assert_eq!(out.remote_addr.as_ref().unwrap().port, 8080);
         assert_eq!(out.remote_addr.as_ref().unwrap().zone, "eth0");
         assert!(out.local_addr.is_none());
+    }
+
+    #[test]
+    fn roundtrip_v6_with_unicode_zone() {
+        // Go accepts any valid-UTF-8 zone (utf8.ValidString, udp_binary.go:160-162);
+        // a Rust String is always valid UTF-8, so a non-ASCII zone must encode and
+        // round-trip — the old is_ascii() check rejected it (review finding W1).
+        let pkt = UDPPacket {
+            content: vec![1u8, 2, 3],
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "fe80::1".into(),
+                port: 8080,
+                zone: "接口".into(),
+            }),
+        };
+        let body = encode_udp_packet_binary(&pkt).unwrap();
+        let out = decode_udp_packet_binary(&body).unwrap();
+        assert_eq!(out.remote_addr.as_ref().unwrap().ip, "fe80::1");
+        assert_eq!(out.remote_addr.as_ref().unwrap().port, 8080);
+        assert_eq!(out.remote_addr.as_ref().unwrap().zone, "接口");
     }
 
     #[test]

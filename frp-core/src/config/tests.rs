@@ -1163,12 +1163,12 @@ token = "test-token"
     // default fn — a plain `#[serde(default)]` would yield 0 (disabled),
     // silently diverging from the documented default.
     assert_eq!(cfg.dial_server_keepalive, 7200);
-    // An explicit 0 still disables.
+    // An explicit 0 is the Go zero value (util.EmptyOr) → the default 7200.
     let cfg0: ClientConfig = load_client_config_from_str(
         "server_addr = '127.0.0.1'\n[transport]\ndial_server_keepalive = 0",
     )
     .unwrap();
-    assert_eq!(cfg0.dial_server_keepalive, 0);
+    assert_eq!(cfg0.dial_server_keepalive, 7200);
 }
 
 #[test]
@@ -1225,6 +1225,94 @@ dialServerTimeout = 0
     .unwrap();
 
     assert_eq!(cfg.dial_server_timeout, default_dial_server_timeout());
+}
+
+#[test]
+fn test_explicit_zero_client_heartbeats_use_go_defaults_when_tcp_mux_off() {
+    // Go v0.71.0 ClientTransportConfig.Complete(): with tcpMux off,
+    // HeartbeatInterval/HeartbeatTimeout = util.EmptyOr(0, 30/90) — an
+    // explicit 0 means "use the default", NOT "disabled".
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+tcpMux = false
+heartbeatInterval = 0
+heartbeatTimeout = 0
+"#,
+    )
+    .unwrap();
+
+    assert!(!cfg.tcp_mux);
+    assert_eq!(cfg.heartbeat_interval, default_heartbeat_interval());
+    assert_eq!(cfg.heartbeat_timeout, default_heartbeat_timeout());
+}
+
+#[test]
+fn test_explicit_zero_client_pool_count_and_keepalive_use_go_defaults() {
+    // Go v0.71.0 ClientTransportConfig.Complete(): PoolCount =
+    // util.EmptyOr(0, 1) and DialServerKeepAlive = util.EmptyOr(0, 7200) —
+    // an explicit 0 means "use the default", NOT "disabled".
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+poolCount = 0
+dialServerKeepalive = 0
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(cfg.pool_count, 1);
+    assert_eq!(cfg.dial_server_keepalive, default_dial_server_keepalive());
+}
+
+#[test]
+fn test_explicit_zero_client_heartbeats_preserved_with_tcp_mux() {
+    // The tcpMux-on branch is unchanged by the 0→default rules (which apply
+    // only when tcpMux is off, matching Go's per-branch EmptyOr): an
+    // explicit value is preserved — only an absent heartbeat is forced -1.
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+heartbeatInterval = 0
+heartbeatTimeout = 0
+"#,
+    )
+    .unwrap();
+
+    assert!(cfg.tcp_mux);
+    assert_eq!(cfg.heartbeat_interval, 0);
+    assert_eq!(cfg.heartbeat_timeout, 0);
+}
+
+#[test]
+fn test_explicit_zero_server_heartbeat_timeout_uses_go_default_when_tcp_mux_off() {
+    // Go v0.71.0 ServerTransportConfig.Complete(): with tcpMux off,
+    // HeartbeatTimeout = util.EmptyOr(0, 90) — an explicit 0 means
+    // "use the default", NOT "disabled".
+    let cfg = load_server_config_from_str(
+        r#"
+bindPort = 7000
+[transport]
+tcpMux = false
+heartbeatTimeout = 0
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(cfg.transport.tcp_mux, Some(false));
+    assert_eq!(cfg.transport.heartbeat_timeout, default_heartbeat_timeout());
+}
+
+#[test]
+fn test_server_tcp_mux_default_forces_heartbeat_timeout_disabled() {
+    // Go v0.71.0: with tcpMux on (default) and no explicit heartbeat
+    // timeout, the application-layer heartbeat is forced to -1 (yamux
+    // keepalive covers liveness).
+    let cfg = load_server_config_from_str("bindPort = 7000").unwrap();
+    assert_eq!(cfg.transport.heartbeat_timeout, -1);
 }
 
 #[test]
@@ -3283,6 +3371,24 @@ log_max_days = 7
 }
 
 #[test]
+fn test_strict_accepts_top_level_sub_domain_host() {
+    // Go frp v0.71.0 canonical frps_full_example.toml sets the camelCase
+    // top-level `subDomainHost`. normalize does not rename it away, so
+    // strict mode (default ON) must accept the alias that the serde field
+    // (ServerConfig.sub_domain_host) recognizes.
+    let mut server_file = tempfile::NamedTempFile::new().unwrap();
+    server_file
+        .write_all(
+            br#"bind_port = 7000
+subDomainHost = "frps.com"
+"#,
+        )
+        .unwrap();
+    let cfg = load_server_config(server_file.path().to_str().unwrap(), true).unwrap();
+    assert_eq!(cfg.sub_domain_host, "frps.com");
+}
+
+#[test]
 fn test_allow_ports_single_form_normalized() {
     // Go allowPorts [{single=N}] must normalize to "{single=N}", not the
     // previously emitted "0-0" (audit task 9 finding 6).
@@ -3534,6 +3640,28 @@ oidc_additional_aud = "baz"
     assert_eq!(oidc_params.get("aud"), Some(&"baz".to_string()));
 }
 
+#[test]
+fn test_legacy_ini_client_quic_keys_folded() {
+    // Go legacy INI client keys quic_keepalive_period / quic_max_idle_timeout
+    // / quic_max_incoming_streams -> [transport.quic] (Go legacy client.go
+    // QUICKeepalivePeriod/QUICMaxIdleTimeout/QUICMaxIncomingStreams,
+    // conversion.go -> Transport.QUIC), which the client normalize then
+    // flattens into the top-level `quic` table.
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+quic_keepalive_period = 15
+quic_max_idle_timeout = 60
+quic_max_incoming_streams = 4096
+"#,
+    )
+    .unwrap();
+    let q = cfg.quic_options.expect("quic_options populated");
+    assert_eq!(q.keepalive_period, 15);
+    assert_eq!(q.max_idle_timeout, 60);
+    assert_eq!(q.max_incoming_streams, 4096);
+}
+
 /// Go legacy INI server keys (pprof_enable, dashboard_tls_mode, and the
 /// dashboard_* -> web_server migration) are accepted without strict-mode
 /// rejection and land in the canonical fields.
@@ -3550,6 +3678,9 @@ dashboard_tls_cert_file = "/tmp/cert.pem"
 dashboard_tls_key_file = "/tmp/key.pem"
 dashboard_tls_mode = true
 pprof_enable = true
+assets_dir = "/srv/frp/assets"
+disable_log_color = true
+log_way = "console"
 "#,
     )
     .unwrap();
@@ -3562,6 +3693,13 @@ pprof_enable = true
     assert!(cfg.web_server.pprof_enable);
     // dashboard_tls_mode is consumed as a no-op (TLS driven by cert/key).
     assert!(cfg.web_server.tls_cert_file.contains("cert.pem"));
+    // Go legacy server keys: assets_dir -> web_server.assets_dir (Go
+    // conversion.go WebServer.AssetsDir), disable_log_color -> [log]
+    // disable_print_color (conversion.go Log.DisablePrintColor), and
+    // log_way consumed-and-dropped (Go never maps LogWay into the new
+    // config).
+    assert_eq!(cfg.web_server.assets_dir, "/srv/frp/assets");
+    assert!(cfg.log.disable_print_color);
 }
 
 /// The new web_server whitelist keys are accepted in strict mode.

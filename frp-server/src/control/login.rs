@@ -107,7 +107,15 @@ async fn send_login_error(
         error: Some(error),
         server_additional_auth_scopes: None,
     });
-    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+    // Go frp compat: reject-path LoginResp writes carry the same 5-second
+    // deadline as the success path (audit H4). This helper is the single
+    // choke point for every reject path, so the deadline covers them all.
+    // The error frame is best-effort — on timeout the stream drops with it.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        write_ctl_msg(&mut writer, &resp, v2),
+    )
+    .await;
 }
 
 /// Consume a per-IP login-throttle slot for a FAILED auth attempt and
@@ -542,24 +550,85 @@ pub(crate) async fn authenticate(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
 
+    // The login is cloned into an owned copy so a plugin's mutated content
+    // (unchange:false) can replace fields before pool allocation and
+    // registration — Go ordering (server/service.go:457-475): the plugin
+    // runs after auth verify, and the mutated Login feeds RegisterControl.
+    let mut login = login.clone();
     // --- Server plugin: login hook ---
     // Skip payload construction entirely when no plugins are configured
     // (the default) — json! builds a full Value on every login otherwise.
     if !state.plugin_manager.is_empty() {
-        let login_content = serde_json::json!({
-            "version": login.version,
-            "hostname": login.hostname,
-            "os": login.os,
-            "user": login.user,
-            "run_id": run_id,
-            "remote_addr": peer.map(|a| a.to_string()),
-            "metas": login.metas,
-        });
-        if let Err(reason) = state.plugin_manager.notify("login", login_content).await {
-            warn!(run_id = %run_id, reason = %reason, "Login for run_id {} rejected by server plugin: {}", run_id, reason);
-            send_login_error(stream, reason, v2).await;
-            return Err(());
+        // Go pkg/plugin/server/types.go LoginContent: the full flat Login
+        // msg plus `client_address` (the peer address). Serializing the
+        // struct guarantees every Go field is present with Go wire names;
+        // `remote_addr` stays as a frp-rs extra (additive).
+        let mut login_content = match serde_json::to_value(&login) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "Server plugin login content serialize error: {}", e);
+                send_login_error(
+                    stream,
+                    format!("server plugin login content error: {e}"),
+                    v2,
+                )
+                .await;
+                return Err(());
+            }
+        };
+        if let Some(obj) = login_content.as_object_mut() {
+            let peer_str = peer.map(|a| a.to_string()).unwrap_or_default();
+            obj.insert("client_address".into(), serde_json::json!(peer_str));
+            obj.insert("remote_addr".into(), serde_json::json!(peer_str));
+            // Go always serializes client_spec (omitempty is a no-op on
+            // structs); emit {} when unset for exact payload parity.
+            let client_spec = match &login.client_spec {
+                Some(spec) => serde_json::to_value(spec).unwrap_or_default(),
+                None => serde_json::json!({}),
+            };
+            obj.insert("client_spec".into(), client_spec);
+            // Effective run_id: a client that omits it still appears as the
+            // assigned UUID (the value registration actually uses), so the
+            // plugin payload always matches Go's (Go frpc always sends one).
+            if login.run_id.is_none() {
+                obj.insert("run_id".into(), serde_json::json!(run_id));
+            }
         }
+        match state.plugin_manager.notify("login", login_content).await {
+            Err(reason) => {
+                warn!(run_id = %run_id, reason = %reason, "Login for run_id {} rejected by server plugin: {}", run_id, reason);
+                send_login_error(stream, reason, v2).await;
+                return Err(());
+            }
+            Ok(Some(mutated)) => {
+                // Go handleMutableContent (manager.go:75-96): a plugin with
+                // unchange:false replaces the typed Login. Fail closed on
+                // invalid content — a malformed mutation must not silently
+                // pass through.
+                match crate::plugin::apply_plugin_mutation(&login, mutated) {
+                    Ok(m) => login = m,
+                    Err(e) => {
+                        warn!(run_id = %run_id, error = %e, "Login plugin returned invalid content for run_id {}: {}", run_id, e);
+                        send_login_error(stream, e, v2).await;
+                        return Err(());
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+    // Record the (possibly plugin-mutated) client identity for the `user`
+    // object of later plugin hooks (Go loginUserInfo: LoginMsg.User/Metas
+    // + runID).
+    if !state.plugin_manager.is_empty() {
+        state.plugin_manager.record_login_user(
+            &run_id,
+            &crate::plugin::UserInfo {
+                user: login.user.clone().unwrap_or_default(),
+                metas: login.metas.clone().unwrap_or_default(),
+                run_id: run_id.clone(),
+            },
+        );
     }
 
     // --- Set up internal channel ---
@@ -730,7 +799,14 @@ pub(crate) async fn authenticate(
             error: Some("client already online".into()),
             server_additional_auth_scopes: None,
         });
-        let _ = write_ctl_msg(&mut stream, &resp, v2).await;
+        // Go frp compat: same 5-second deadline as the success-path
+        // LoginResp write (audit H4) — a wedged client must not pin this
+        // login task + fd + semaphore permit while it holds run_mu.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_ctl_msg(&mut stream, &resp, v2),
+        )
+        .await;
         // Sweep-free unregister. NOTE: on THIS path a full sweep would be
         // vacuous anyway — register_with_control_id only reports conflict
         // when the existing entry's run_id DIFFERS (registry.rs), and the
@@ -1142,6 +1218,64 @@ mod auth_signal_tests {
         assert!(result.is_err());
         assert!(rx.await.is_err(), "bad token must drop the unsent signal");
         drain.abort();
+    }
+}
+
+#[cfg(test)]
+mod send_login_error_deadline_tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    use super::send_login_error;
+
+    /// Stream whose read/write never complete — simulates a wedged-but-alive
+    /// client the LoginResp error frame cannot be delivered to.
+    struct StalledStream;
+
+    impl AsyncRead for StalledStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for StalledStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// Audit H4 regression: send_login_error (the single choke point for
+    /// every reject-path LoginResp) must carry the same 5-second deadline as
+    /// the success path. A stalled client must not pin the login task + fd +
+    /// permit forever. Paused time keeps the test instant.
+    #[tokio::test(start_paused = true)]
+    async fn send_login_error_bounded_by_5s_deadline() {
+        let stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin> = Box::new(StalledStream);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_login_error(stream, "rejected".into(), false),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "send_login_error must complete at the 5s deadline, got {result:?}"
+        );
     }
 }
 

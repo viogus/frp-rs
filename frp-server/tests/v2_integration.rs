@@ -7,7 +7,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use common::{allocate_port, test_auth_cfg};
 use frp_core::auth;
 use frp_core::config::ServerConfig;
-use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage, NewProxy, NewWorkConn};
 use frp_core::mux;
 use frp_core::transport::{DialOptions, IoStream};
@@ -89,15 +88,16 @@ async fn test_v2_tcp_proxy() {
         .await
         .expect("write v2 magic on yamux");
     // V2 ClientHello / ServerHello handshake on the yamux control stream
-    v2_handshake::v2_handshake_client(
+    let crypto_ctx = v2_handshake::v2_handshake_client(
         &mut control,
         "tcp",
         false,
         true,
-        false, /* with_crypto */
+        true, /* with_crypto */
     )
     .await
-    .expect("V2 handshake");
+    .expect("V2 handshake")
+    .expect("crypto must be negotiated");
 
     // ---- Login via V2 on yamux control stream ----
     let ts = SystemTime::now()
@@ -139,11 +139,21 @@ async fn test_v2_tcp_proxy() {
     };
     println!("V2 login succeeded, run_id: {run_id}");
 
-    // ---- Wrap control stream in AES-128-CFB encryption (matching server post-login) ----
-    let enc_key = encryption::derive_key("test-token");
-    let mut control = control
-        .into_encrypted(enc_key)
-        .expect("plain test stream is encryptable");
+    // ---- Wrap control stream in AEAD after LoginResp (matching Go frp flow) ----
+    let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
+        b"test-token",
+        crypto_ctx.algorithm,
+        &crypto_ctx.transcript_hash,
+    )
+    .expect("derive AEAD keys");
+    let aead = frp_core::crypto::AeadStream::new(
+        Box::new(control),
+        crypto_ctx.algorithm,
+        &read_key,
+        &write_key,
+    )
+    .expect("create AeadStream");
+    let mut control = IoStream::Aead(Box::new(aead));
 
     // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
     for _ in 0..1 {
@@ -332,15 +342,16 @@ async fn test_v2_ping_pong_raw_tcp() {
         .expect("write v2 magic");
 
     // V2 handshake on raw TCP (no yamux)
-    v2_handshake::v2_handshake_client(
+    let crypto_ctx = v2_handshake::v2_handshake_client(
         &mut stream,
         "tcp",
         false,
         false,
-        false, /* with_crypto */
+        true, /* with_crypto */
     )
     .await
-    .expect("V2 handshake");
+    .expect("V2 handshake")
+    .expect("crypto must be negotiated");
 
     // Login
     let ts = SystemTime::now()
@@ -374,11 +385,21 @@ async fn test_v2_ping_pong_raw_tcp() {
     }
     println!("V2 login OK (raw TCP)");
 
-    // Wrap in encryption
-    let enc_key = encryption::derive_key("test-token");
-    let mut stream = stream
-        .into_encrypted(enc_key)
-        .expect("plain test stream is encryptable");
+    // Wrap in AEAD after LoginResp (matching Go frp flow)
+    let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
+        b"test-token",
+        crypto_ctx.algorithm,
+        &crypto_ctx.transcript_hash,
+    )
+    .expect("derive AEAD keys");
+    let aead = frp_core::crypto::AeadStream::new(
+        Box::new(stream),
+        crypto_ctx.algorithm,
+        &read_key,
+        &write_key,
+    )
+    .expect("create AeadStream");
+    let mut stream = IoStream::Aead(Box::new(aead));
 
     // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
     for _ in 0..1 {
@@ -451,15 +472,16 @@ async fn test_v2_ping_pong_yamux() {
         .await
         .expect("write v2 magic on yamux");
     // V2 handshake on yamux stream
-    v2_handshake::v2_handshake_client(
+    let crypto_ctx = v2_handshake::v2_handshake_client(
         &mut control,
         "tcp",
         false,
         true,
-        false, /* with_crypto */
+        true, /* with_crypto */
     )
     .await
-    .expect("V2 handshake");
+    .expect("V2 handshake")
+    .expect("crypto must be negotiated");
 
     // Login
     let ts = SystemTime::now()
@@ -493,11 +515,21 @@ async fn test_v2_ping_pong_yamux() {
     }
     println!("V2 login OK (yamux)");
 
-    // Wrap in encryption
-    let enc_key = encryption::derive_key("test-token");
-    let mut control = control
-        .into_encrypted(enc_key)
-        .expect("plain test stream is encryptable");
+    // Wrap in AEAD after LoginResp (matching Go frp flow)
+    let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
+        b"test-token",
+        crypto_ctx.algorithm,
+        &crypto_ctx.transcript_hash,
+    )
+    .expect("derive AEAD keys");
+    let aead = frp_core::crypto::AeadStream::new(
+        Box::new(control),
+        crypto_ctx.algorithm,
+        &read_key,
+        &write_key,
+    )
+    .expect("create AeadStream");
+    let mut control = IoStream::Aead(Box::new(aead));
 
     // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
     for _ in 0..1 {

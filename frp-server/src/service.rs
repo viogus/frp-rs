@@ -104,6 +104,20 @@ fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<frp_core::config::PortsRange> 
     }
 }
 
+/// Resolve the `max_connections` server config into the connection-semaphore
+/// size. `Some(0)` means unlimited and MUST resolve to 0 (not `usize::MAX`):
+/// `AppState::new` builds `Semaphore::new(n)` whenever n > 0, and tokio
+/// panics on `usize::MAX` (batch_semaphore asserts permits <= MAX_PERMITS);
+/// with panic=abort in release, `usize::MAX` would crash frps at boot on the
+/// documented "0 = unlimited" setting (audit H1). `None` defaults to 512.
+fn resolve_max_connections(max_connections: Option<u32>) -> usize {
+    match max_connections {
+        Some(0) => 0, // 0 = unlimited → no semaphore
+        Some(n) => n as usize,
+        None => 512, // default
+    }
+}
+
 /// Record a "restart required" change entry when `old != new`. Used by
 /// `reload()` for settings that only take effect on a full restart.
 fn note_restart_change<T: PartialEq + std::fmt::Display>(
@@ -191,11 +205,7 @@ impl Service {
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
         let allow_ports = resolve_allow_ports(&cfg);
         let sub_host = cfg.sub_domain_host.clone();
-        let max_connections: usize = match cfg.max_connections {
-            Some(0) => usize::MAX, // 0 = unlimited
-            Some(n) => n as usize,
-            None => 512, // default
-        };
+        let max_connections = resolve_max_connections(cfg.max_connections);
         let max_accept_rate = cfg.max_accept_rate.unwrap_or(0);
         let mut state = AppState::new(
             auth_cfg,
@@ -1983,6 +1993,18 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (audit H1): `Some(0)` ("0 = unlimited") must resolve to 0,
+    /// not `usize::MAX` — `AppState::new` builds `Semaphore::new(n)` whenever
+    /// n > 0, and tokio panics on `usize::MAX` (MAX_PERMITS assertion); with
+    /// panic=abort in release, frps would crash at boot on the documented
+    /// "0 = unlimited" setting.
+    #[test]
+    fn resolve_max_connections_zero_means_unlimited() {
+        assert_eq!(resolve_max_connections(Some(0)), 0);
+        assert_eq!(resolve_max_connections(Some(5)), 5);
+        assert_eq!(resolve_max_connections(None), 512);
+    }
 
     /// Regression: a failing dynamic token source is a startup error — it
     /// must not silently fall back to an empty token (when both sides'

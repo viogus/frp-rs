@@ -446,6 +446,7 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 ("dashboard_port", "port"),
                 ("dashboard_user", "user"),
                 ("dashboard_pwd", "password"),
+                ("assets_dir", "assets_dir"),
                 ("dashboard_assets_dir", "assets_dir"),
                 ("dashboard_tls_cert_file", "tls_cert_file"),
                 ("dashboard_tls_key_file", "tls_key_file"),
@@ -531,6 +532,26 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             "log",
             &["log_"],
         );
+
+        // Go legacy INI: disable_log_color -> [log] disable_print_color (Go
+        // pkg/config/legacy conversion.go Log.DisablePrintColor — mirrors the
+        // client-side mapping below).
+        if let Some(v) = table.remove("disable_log_color") {
+            let lg = table
+                .entry("log".to_string())
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(l) = lg {
+                l.entry("disable_print_color".to_string()).or_insert(v);
+            }
+        }
+
+        // Go legacy INI `log_way` (pkg/config/legacy server.go LogWay
+        // `ini:"log_way"`): accepted by Go and silently dropped — the legacy
+        // conversion never maps it into the new config (conversion.go copies
+        // only LogFile/LogLevel/LogMaxDays). Consume it here so strict mode
+        // never sees it.
+        let _ = table.remove("log_way");
+
         flatten_to_table(
             table,
             &[
@@ -989,6 +1010,58 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
             table.entry("token").or_insert(token_val);
         }
 
+        // Go legacy INI top-level quic_* keys -> [transport.quic]
+        // (Go legacy client.go QUICKeepalivePeriod/QUICMaxIdleTimeout/
+        // QUICMaxIncomingStreams; conversion.go maps them into
+        // Transport.QUIC). Runs BEFORE the transport fold below so the
+        // folded [transport.quic] table is flattened to the top-level
+        // `quic` key together with an explicit [transport.quic].
+        let quic_keys: Vec<String> = table
+            .keys()
+            .filter(|k| k.starts_with("quic_"))
+            .cloned()
+            .collect();
+        if !quic_keys.is_empty() {
+            // Detach the values first so the [transport.quic] borrow below
+            // does not overlap a table.remove().
+            let mut folded: Vec<(String, toml::Value)> = Vec::new();
+            let mut kept: Vec<(String, toml::Value)> = Vec::new();
+            for k in quic_keys {
+                let Some(v) = table.remove(&k) else { continue };
+                // Only the three documented legacy keys are folded; unknown
+                // quic_* keys stay top-level so strict mode reports them
+                // clearly instead of hiding them.
+                let flat_key = match k.as_str() {
+                    "quic_keepalive_period" => Some("keepalive_period"),
+                    "quic_max_idle_timeout" => Some("max_idle_timeout"),
+                    "quic_max_incoming_streams" => Some("max_incoming_streams"),
+                    _ => None,
+                };
+                match flat_key {
+                    Some(fk) => folded.push((fk.to_string(), v)),
+                    None => kept.push((k, v)),
+                }
+            }
+            if !folded.is_empty() {
+                let tr = table
+                    .entry("transport".to_string())
+                    .or_insert_with(|| Value::Table(Default::default()));
+                if let Value::Table(transport) = tr {
+                    let quic = transport
+                        .entry("quic".to_string())
+                        .or_insert_with(|| Value::Table(Default::default()));
+                    if let Value::Table(q) = quic {
+                        for (k, v) in folded {
+                            q.entry(k).or_insert(v);
+                        }
+                    }
+                }
+            }
+            for (k, v) in kept {
+                table.insert(k, v);
+            }
+        }
+
         // Flatten [transport] section → top-level (ClientConfig has tcp_mux at top level,
         // but Go frp config puts it under [transport])
         if let Some(Value::Table(tr_table)) = table.remove("transport") {
@@ -1061,6 +1134,11 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
             "log",
             &["log_"],
         );
+
+        // Go legacy INI `log_way` (pkg/config/legacy client.go LogWay
+        // `ini:"log_way"`): accepted by Go and silently dropped (see the
+        // server-side comment). Consume it here so strict mode never sees it.
+        let _ = table.remove("log_way");
 
         // Normalize Go-format proxy sub-tables into flat fields
         normalize_proxies(table);

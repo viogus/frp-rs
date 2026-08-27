@@ -625,8 +625,10 @@ pub async fn read_first_frame_after_handshake(
 /// Handle V2 server handshake: read first frame, respond if ClientHello.
 ///
 /// Returns `Ok((None, Some(crypto_ctx)))` if ClientHello was handled with crypto,
-/// `Ok((None, None))` if ClientHello was handled without crypto,
 /// `Ok((Some(payload), None))` if the first frame was already a Message (type=16).
+/// A ClientHello offering no supported AEAD algorithm is rejected with a
+/// ServerHello carrying the error (Go parity — see the negotiation branch
+/// below), so the no-crypto `Ok((None, None))` case no longer exists.
 ///
 /// `payload` is the raw V2 message payload: [type_id: u16 BE][JSON bytes].
 ///
@@ -718,20 +720,27 @@ pub async fn v2_handshake_server(
                     }),
                 ))
             } else {
-                // No crypto: send plain ServerHello
-                tracing::debug!(client_algorithms = ?client_algorithms, "[V2-HS] No crypto negotiated (client offered {:?})", client_algorithms);
-                let udp_codec =
-                    select_udp_packet_codec(&client_hello.capabilities.message.udp_packet_codecs);
-                let mut server_hello = ServerHello::default_ok();
-                server_hello.selected.message.udp_packet_codec =
-                    std::borrow::Cow::Borrowed(udp_codec);
-                let json = serde_json::to_vec(&server_hello).map_err(|e| {
+                // Go's NewServerHello rejects a ClientHello offering no
+                // supported AEAD algorithm ("no supported crypto algorithm",
+                // pkg/proto/wire/crypto.go:60-63); the server sends a
+                // ServerHello carrying the error before tearing down the
+                // connection (server/service.go handleClientHello). Mirror
+                // that rejection (same shape as the unsupported-codec path
+                // above) instead of proceeding without crypto. Rust↔Rust-only
+                // behavior: Rust clients always offer aes-256-gcm
+                // (ClientHello::new → preferred_aead_algorithms), so the Go
+                // compat matrix is unaffected.
+                tracing::debug!(client_algorithms = ?client_algorithms, "[V2-HS] No supported crypto algorithm (client offered {:?})", client_algorithms);
+                let err_hello = ServerHello::with_error("no supported crypto algorithm");
+                let json = serde_json::to_vec(&err_hello).map_err(|e| {
                     crate::Error::Protocol(format!("serialize ServerHello: {e}").into())
                 })?;
                 stream
                     .write_raw_v2_frame(V2_FRAME_TYPE_SERVER_HELLO, 0, &json)
                     .await?;
-                Ok((None, None))
+                Err(crate::Error::Protocol(
+                    "ClientHello rejected: no supported crypto algorithm".into(),
+                ))
             }
         }
         V2_FRAME_TYPE_MESSAGE => {
@@ -861,5 +870,49 @@ mod tests {
             udp_packet_codec: String::new(),
         };
         assert!(ctx.udp_packet_codec.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_rejects_client_hello_without_supported_crypto() {
+        // Go's NewServerHello errors a ClientHello offering no supported AEAD
+        // algorithm ("no supported crypto algorithm", crypto.go:60-63) and the
+        // server sends a ServerHello carrying the error before tearing down
+        // (server/service.go handleClientHello). The Rust server must reject
+        // with a ServerHello error, not proceed without crypto (review
+        // finding W2).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            v2_handshake_server(&mut io).await
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        let mut hello = ClientHello::new("tcp", false, true);
+        hello.capabilities.crypto.algorithms = vec![Cow::Borrowed("unsupported-alg")];
+        let hello_json = serde_json::to_vec(&hello).unwrap();
+        client_io
+            .write_raw_v2_frame(V2_FRAME_TYPE_CLIENT_HELLO, 0, &hello_json)
+            .await
+            .unwrap();
+
+        // Server must answer with a ServerHello carrying the error, not a
+        // crypto-less success.
+        let (frame_type, _flags, payload) = client_io.read_raw_v2_frame().await.unwrap();
+        assert_eq!(frame_type, V2_FRAME_TYPE_SERVER_HELLO);
+        let server_hello: ServerHello = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            server_hello.error.as_deref(),
+            Some("no supported crypto algorithm")
+        );
+        assert!(server_hello.selected.crypto.is_none());
+
+        let result = server.await.unwrap();
+        assert!(
+            matches!(result, Err(crate::Error::Protocol(_))),
+            "server must reject the ClientHello, got {result:?}"
+        );
     }
 }

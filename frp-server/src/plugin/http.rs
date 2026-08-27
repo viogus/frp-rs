@@ -8,6 +8,8 @@ use serde::Serialize;
 
 use frp_core::config::HttpPluginConfig;
 
+use super::UserInfo;
+
 /// Go frp v0.70.1 compat: pkg/plugin/server API version.
 const PLUGIN_API_VERSION: &str = "0.1.0";
 
@@ -55,8 +57,19 @@ struct PluginResponse {
 
 /// Manages a collection of HTTP plugin servers.
 ///
-/// On lifecycle events (login, new_proxy, close_proxy), notifies
-/// matching plugins via HTTP POST. Plugins with `enable_control: true`
+/// On lifecycle events (login, new_proxy, close_proxy, ping,
+/// new_work_conn, new_user_conn), notifies matching plugins via HTTP POST
+/// and applies their reject/approve verdict — any transport error,
+/// timeout, non-200 status, or malformed response fails the operation
+/// closed (Go handleMutableContent parity: a plugin outage must not
+/// silently pass operations through).
+///
+/// Timeout deviation from Go: every plugin call is bounded by the
+/// per-plugin `timeout` (default 5s, config default_plugin_timeout). Go
+/// frp v0.71.0 uses a bare `http.Client{}` with NO timeout and waits
+/// indefinitely; frp-rs fail-closes after the timeout — deliberately
+/// safer.
+///
 /// Join an HTTP plugin addr + path into a base URL, forgiving style:
 /// - trailing '/' on addr is trimmed (the `http://` scheme is preserved);
 /// - a path without a leading '/' gets one (so host:port + handler never
@@ -81,6 +94,12 @@ fn join_plugin_base(addr: &str, path: &str) -> String {
 /// can approve or reject operations.
 pub struct HttpPluginManager {
     plugins: Arc<Vec<PluginDef>>,
+    /// Per-run_id client identity for the `user` object in plugin payloads
+    /// (Go loginUserInfo). Populated at login from the (possibly
+    /// plugin-mutated) Login, consulted by the NewProxy/CloseProxy/Ping/
+    /// NewWorkConn/NewUserConn hooks, dropped at control unregister — the
+    /// map is bounded by live controls.
+    users: std::sync::RwLock<std::collections::HashMap<String, UserInfo>>,
 }
 
 struct PluginDef {
@@ -138,6 +157,7 @@ impl HttpPluginManager {
             .collect();
         Self {
             plugins: Arc::new(plugins),
+            users: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -146,6 +166,36 @@ impl HttpPluginManager {
     /// loop entirely when this is true.
     pub fn is_empty(&self) -> bool {
         self.plugins.is_empty()
+    }
+
+    /// Record the (possibly plugin-mutated) login identity for later hooks'
+    /// `user` object (Go `ctl.loginUserInfo()`). Called once per control at
+    /// login; the entry is removed by `remove_user` at control unregister.
+    pub fn record_login_user(&self, run_id: &str, user: &UserInfo) {
+        self.users
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run_id.to_string(), user.clone());
+    }
+
+    /// The recorded client identity for `run_id`, or default when unknown
+    /// (no login recorded — e.g. legacy test setups).
+    pub fn user_info(&self, run_id: &str) -> Option<UserInfo> {
+        self.users
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(run_id)
+            .cloned()
+    }
+
+    /// Drop the identity entry when a control unregisters, bounding the map
+    /// to live controls (generation-guarded by the caller so a superseding
+    /// control's fresh entry is never removed).
+    pub fn remove_user(&self, run_id: &str) {
+        self.users
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(run_id);
     }
 
     /// Notify all plugins about an event.
@@ -167,10 +217,17 @@ impl HttpPluginManager {
         let go_op = go_op_name(op);
         let mut mutated: Option<serde_json::Value> = None;
         for plugin in self.plugins.iter() {
-            // Filter by ops list if non-empty (case-insensitive so Rust-style
-            // lowercase "login" matches Go-style "Login").
+            // Filter by ops list if non-empty. Configured ops are Go-style
+            // names (Login, NewProxy, ...) while call sites pass Rust-style
+            // snake_case — compare against the mapped Go op name so both
+            // styles match (a pure eq_ignore_ascii_case comparison would
+            // miss the '_' in new_proxy vs NewProxy).
             if !plugin.cfg.ops.is_empty()
-                && !plugin.cfg.ops.iter().any(|o| o.eq_ignore_ascii_case(op))
+                && !plugin
+                    .cfg
+                    .ops
+                    .iter()
+                    .any(|o| o.eq_ignore_ascii_case(&go_op))
             {
                 continue;
             }

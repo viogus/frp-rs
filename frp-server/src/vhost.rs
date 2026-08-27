@@ -745,21 +745,31 @@ async fn handle_http1_request<S>(
                 // channel must not silently drop a user connection (Go frp
                 // blocks and lets the TCP backlog absorb the burst). This
                 // runs in a per-connection spawned task, so the await is
-                // free. A closed channel means the control handler died
-                // between lookup and dispatch; the connection drops.
-                if let Err(e) = ctl_tx
-                    .tx
-                    .send(InternalMsg::ProxyUserConn {
+                // free. Bounded (audit H3): a control handler that stops
+                // draining must not pin this task + fd + permit forever;
+                // after CTL_SEND_TIMEOUT the connection drops.
+                match tokio::time::timeout(
+                    crate::state::CTL_SEND_TIMEOUT,
+                    ctl_tx.tx.send(InternalMsg::ProxyUserConn {
                         proxy_name: forward.proxy_name,
                         user_conn: wrap(stream),
                         pre_read: forward.request_head,
                         user_conn_permit: None,
                         // Local sender — no group selection was done.
                         group_selected: false,
-                    })
-                    .await
+                    }),
+                )
+                .await
                 {
-                    warn!(host = %host, path = %path, error = %e, "{} VHost route for '{}' path '{}' found but control channel closed", scheme, host, path);
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        // Channel closed: control handler died between lookup
+                        // and dispatch; the connection drops.
+                        warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control channel closed", scheme, host, path);
+                    }
+                    Err(_elapsed) => {
+                        warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control channel send timed out; dropping conn", scheme, host, path);
+                    }
                 }
             } else {
                 warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control handler gone", scheme, host, path);
@@ -1087,10 +1097,14 @@ pub async fn run_vhost_https_listener(
                         if let Some(ctl_tx) = internal_tx {
                             // send().await: same backpressure rationale as the
                             // HTTP vhost path — runs in a per-connection
-                            // spawned task, so the await is free.
-                            if let Err(e) = ctl_tx
-                                .tx
-                                .send(InternalMsg::ProxyUserConn {
+                            // spawned task, so the await is free. Bounded
+                            // (audit H3, same as the HTTP path above): a
+                            // control handler that stops draining must not
+                            // pin this task + fd + permit forever; after
+                            // CTL_SEND_TIMEOUT the connection drops.
+                            match tokio::time::timeout(
+                                crate::state::CTL_SEND_TIMEOUT,
+                                ctl_tx.tx.send(InternalMsg::ProxyUserConn {
                                     proxy_name: route.proxy_name.to_string(),
                                     // Passthrough: raw encrypted bytes, no TLS wrap.
                                     user_conn: frp_core::transport::IoStream::Tcp(stream),
@@ -1098,10 +1112,17 @@ pub async fn run_vhost_https_listener(
                                     user_conn_permit: None,
                                     // Local sender — no group selection was done.
                                     group_selected: false,
-                                })
-                                .await
+                                }),
+                            )
+                            .await
                             {
-                                warn!(sni = %sni, error = %e, "HTTPS VHost route for '{}' found but control channel closed", sni);
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => {
+                                    warn!(sni = %sni, "HTTPS VHost route for '{}' found but control channel closed", sni);
+                                }
+                                Err(_elapsed) => {
+                                    warn!(sni = %sni, "HTTPS VHost route for '{}' found but control channel send timed out; dropping conn", sni);
+                                }
                             }
                         } else {
                             warn!(sni = %sni, "HTTPS VHost route for '{}' found but control handler gone", sni);

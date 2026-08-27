@@ -213,16 +213,29 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
                 run_id: ctx.run_id.clone(),
             });
     }
-    // Server plugin: close_proxy hook (fire-and-forget)
+    // Server plugin: close_proxy hook (fire-and-forget — Go closeProxy
+    // spawns a goroutine for the notify, and Go discards the returned
+    // content here too: manager.go CloseProxy is notify-only). Payload is
+    // Go's CloseProxyContent: `user` object + proxy_name; `run_id` stays
+    // as a frp-rs extra (additive).
     let plugin_state = ctx.state.clone();
     let pn = cp.proxy_name.clone();
     let rid = ctx.run_id.clone();
+    let user_info = ctx
+        .state
+        .plugin_manager
+        .user_info(&ctx.run_id)
+        .unwrap_or_default();
     tokio::spawn(async move {
         let _ = plugin_state
             .plugin_manager
             .notify(
                 "close_proxy",
-                serde_json::json!({ "proxy_name": pn, "run_id": rid }),
+                serde_json::json!({
+                    "user": user_info,
+                    "proxy_name": pn,
+                    "run_id": rid,
+                }),
             )
             .await;
     });
@@ -265,6 +278,83 @@ pub(crate) async fn handle_ping<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     ping_msg: msg::Ping,
 ) -> Result<(), ()> {
+    // Go parity (server/control.go handlePing): the Ping plugin hook runs
+    // BEFORE ping auth verification. A plugin may reject the ping (Pong
+    // with an error, lastPing NOT updated — the control stays up, Go
+    // tolerates a failed ping) or mutate it (the mutation feeds
+    // VerifyPing below).
+    let mut ping_msg = ping_msg;
+    if !ctx.state.plugin_manager.is_empty() {
+        // Go pkg/plugin/server/types.go PingContent: `user` object + the
+        // flat Ping msg (privilege_key, timestamp); `run_id`/`remote_addr`
+        // stay as frp-rs extras (additive).
+        let user_info = ctx
+            .state
+            .plugin_manager
+            .user_info(&ctx.run_id)
+            .unwrap_or_default();
+        let mut ping_content = match serde_json::to_value(&ping_msg) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(peer = ?ctx.peer, error = %e, "Ping plugin content serialize error for {:?}: {}", ctx.peer, e);
+                let pong = FrpMessage::Pong(msg::Pong {
+                    error: Some(proxy_ops::err_msg(
+                        ctx.state.detailed_errors_to_client,
+                        format!("server plugin ping content error: {e}"),
+                        "invalid ping",
+                    )),
+                });
+                let _ = write_ctl_msg(writer, &pong, ctx.v2).await;
+                return Ok(());
+            }
+        };
+        if let Some(obj) = ping_content.as_object_mut() {
+            obj.insert(
+                "user".into(),
+                serde_json::to_value(&user_info).unwrap_or_default(),
+            );
+            obj.insert("run_id".into(), serde_json::json!(ctx.run_id));
+            obj.insert(
+                "remote_addr".into(),
+                serde_json::json!(ctx.peer.map(|a| a.to_string()).unwrap_or_default()),
+            );
+        }
+        match ctx.state.plugin_manager.notify("ping", ping_content).await {
+            Err(reason) => {
+                warn!(peer = ?ctx.peer, reason = %reason, "Ping rejected by server plugin from {:?}: {}", ctx.peer, reason);
+                let pong = FrpMessage::Pong(msg::Pong {
+                    error: Some(proxy_ops::err_msg(
+                        ctx.state.detailed_errors_to_client,
+                        reason,
+                        "invalid ping",
+                    )),
+                });
+                let _ = write_ctl_msg(writer, &pong, ctx.v2).await;
+                return Ok(());
+            }
+            Ok(Some(mutated)) => {
+                // Go handleMutableContent: the plugin's returned content
+                // replaces the typed Ping before VerifyPing. Fail closed on
+                // invalid content.
+                match crate::plugin::apply_plugin_mutation(&ping_msg, mutated) {
+                    Ok(m) => ping_msg = m,
+                    Err(e) => {
+                        warn!(peer = ?ctx.peer, error = %e, "Ping plugin returned invalid content from {:?}: {}", ctx.peer, e);
+                        let pong = FrpMessage::Pong(msg::Pong {
+                            error: Some(proxy_ops::err_msg(
+                                ctx.state.detailed_errors_to_client,
+                                e,
+                                "invalid ping",
+                            )),
+                        });
+                        let _ = write_ctl_msg(writer, &pong, ctx.v2).await;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
     // Validate ping auth (Go frp v0.69.1 compat).
     // Only validate when "HeartBeats" is in additional_auth_scopes.
     let requires_ping_auth = ctx
@@ -320,18 +410,6 @@ pub(crate) async fn handle_ping<W: AsyncWriteExt + Unpin>(
         return Ok(());
     }
     ctl.last_ping = tokio::time::Instant::now();
-    // Fire ping plugin hook (fire-and-forget — don't block control loop)
-    let ping_content = serde_json::json!({
-        "run_id": ctx.run_id,
-        "remote_addr": ctx.peer.map(|a| a.to_string()).unwrap_or_default(),
-        "timestamp": ping_msg.timestamp,
-    });
-    let plugin_mgr = ctx.state.plugin_manager.clone();
-    tokio::spawn(async move {
-        if let Err(e) = plugin_mgr.notify("ping", ping_content).await {
-            debug!(error = %e, "Ping plugin hook failed");
-        }
-    });
     let pong = FrpMessage::Pong(msg::Pong { error: None });
     if let Err(e) = write_ctl_msg(writer, &pong, ctx.v2).await {
         warn!(error = %e, "Failed to send pong: {}", e);
