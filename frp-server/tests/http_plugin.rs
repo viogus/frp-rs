@@ -73,6 +73,17 @@ async fn mock_handler(
         })));
     }
     if let Some(mutation) = state.mutate_response.clone() {
+        if mutation.is_null() {
+            // unchange:false + null content: Go decodes the response
+            // `content` into a FRESH zero-value struct (http.go:78) — null
+            // leaves it all-zero. Serve the null verbatim so the server
+            // applies an empty mutation instead of skipping it.
+            return axum::response::IntoResponse::into_response(axum::Json(json!({
+                "reject": false,
+                "unchange": false,
+                "content": null,
+            })));
+        }
         // Real Go plugins echo the received content with their changes:
         // the server decodes the response `content` into a FRESH struct
         // (http.go:78), so fields the plugin omits are zeroed. Echo the
@@ -253,6 +264,59 @@ async fn test_plugin_reject_rejects_login() {
     drop(conn);
 }
 
+/// Round-6 B5 DoS gate: the pre-auth plugin failure paths must consume a
+/// login-throttle slot like the auth failure paths do (verify_login_auth →
+/// throttled_login_error). A plugin that rejects on attacker-controlled
+/// fields (user, metas) must not get unbounded pre-auth HTTP calls per IP:
+/// 5 plugin-rejected logins from one IP → the 6th is rejected pre-auth by
+/// the throttle gate and never reaches the plugin.
+#[tokio::test]
+async fn test_plugin_reject_consumes_login_throttle_slots() {
+    let state = Arc::new(MockPluginState {
+        reject: true,
+        reject_reason: "denied by policy".into(),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(state.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: test_auth_cfg(),
+        http_plugins: vec![plugin_cfg(port, vec!["login"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+
+    for attempt in 1..=6u32 {
+        let (conn, resp) = login_with_test_token(addr)
+            .await
+            .expect("login returns a response");
+        let error = resp.error.unwrap_or_default();
+        if attempt <= 5 {
+            assert!(
+                error.contains("denied by policy"),
+                "attempt {attempt} must be plugin-rejected, got: {error}"
+            );
+        } else {
+            assert!(
+                error.contains("throttled"),
+                "6th attempt must hit the throttle gate, got: {error}"
+            );
+        }
+        drop(conn);
+    }
+    // The 6th attempt was rejected pre-auth: the plugin must have seen
+    // exactly 5 requests (one per slot-consuming plugin rejection).
+    assert_eq!(
+        state.requests.lock().unwrap().len(),
+        5,
+        "the throttled attempt must not reach the plugin"
+    );
+}
+
 /// An unreachable plugin fails closed: login is rejected.
 #[tokio::test]
 async fn test_plugin_unreachable_fails_closed() {
@@ -334,11 +398,17 @@ async fn test_plugin_ops_filtering() {
     );
 }
 
-/// ops filtering: a config op Go would never match (unknown name) must
-/// silently never fire — the notify filter exact-compares against the
-/// fixed Go op set after load-time normalization.
+/// ops filtering is exact-after-load-time-normalization: a config op the
+/// OLD case-insensitive filter (`eq_ignore_ascii_case`) would have matched
+/// must NOT fire now. "newProxy" is only a case mismatch from "NewProxy"
+/// — normalization has no mapping for it and the exact compare fails, so
+/// the plugin is never called. The snake_case "new_proxy" (mapped to
+/// "NewProxy" at load) still fires. ("bogus" never matched under either
+/// filter, so a bogus-only test proved nothing — this test discriminates.)
 #[tokio::test]
 async fn test_plugin_unknown_op_never_fires() {
+    // Case-mismatch-only op "newProxy": the OLD filter matched it against
+    // "NewProxy"; the new exact compare must not.
     let state = Arc::new(MockPluginState::default());
     let port = start_mock_plugin(state.clone()).await;
 
@@ -346,18 +416,67 @@ async fn test_plugin_unknown_op_never_fires() {
         bind_addr: "127.0.0.1".into(),
         bind_port: allocate_port(),
         auth: test_auth_cfg(),
-        http_plugins: vec![plugin_cfg(port, vec!["bogus"], true)],
+        http_plugins: vec![plugin_cfg(port, vec!["newProxy"], true)],
         ..Default::default()
     };
     let bind_port = cfg.bind_port;
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
-    let (provider, resp) = login_with_test_token(addr).await.expect("login succeeds");
+
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("login succeeds");
     assert!(resp.error.is_none(), "login rejected: {:?}", resp.error);
+    // Fire the NewProxy hook too: a login-only check would be vacuous for
+    // this op — "newProxy" only conflicts with "NewProxy".
+    let remote_port = allocate_port();
+    let resp = send_new_proxy(
+        &mut provider,
+        full_new_proxy("case-mismatch-tcp", remote_port as i32),
+    )
+    .await;
+    assert!(resp.error.is_none(), "NewProxy rejected: {:?}", resp.error);
     drop(provider);
     assert!(
         state.captured.lock().unwrap().is_none(),
-        "plugin with an unknown op must never be called"
+        "plugin with a case-mismatched op must never be called"
+    );
+
+    // Control: the snake_case spelling is normalized to the Go name at
+    // load (HttpPluginManager::new) and the same NewProxy hook fires.
+    let snake = Arc::new(MockPluginState::default());
+    let snake_port = start_mock_plugin(snake.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: test_auth_cfg(),
+        http_plugins: vec![plugin_cfg(snake_port, vec!["new_proxy"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("login succeeds");
+    assert!(resp.error.is_none(), "login rejected: {:?}", resp.error);
+    let remote_port = allocate_port();
+    let resp = send_new_proxy(
+        &mut provider,
+        full_new_proxy("snake-case-tcp", remote_port as i32),
+    )
+    .await;
+    assert!(resp.error.is_none(), "NewProxy rejected: {:?}", resp.error);
+    drop(provider);
+
+    let requests = snake.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "snake_case op must fire exactly once (NewProxy hook only), got: {requests:?}"
+    );
+    assert_eq!(requests[0].0, "NewProxy", "wire op is the Go name");
+    assert!(
+        snake.captured.lock().unwrap().is_some(),
+        "plugin with a snake_case op must fire after load-time normalization"
     );
 }
 
@@ -617,6 +736,43 @@ async fn test_plugin_login_mutation_applied() {
         content["user"]["metas"].get("orig").is_none(),
         "the original metas key must be replaced by the mutation"
     );
+}
+
+/// Go parity (http.go:78): `unchange:false` with a null/absent `content`
+/// zero-fills the fresh struct (`reflect.New` + `json.Unmarshal` of absent
+/// content leaves the zero *T) — the original content must NOT survive.
+/// Login's fields are all Option: an empty-object mutation zeroes
+/// privilege_key/timestamp, so auth fails on the mutated login instead of
+/// the login proceeding with the original credentials (fail-open
+/// divergence).
+#[tokio::test]
+async fn test_plugin_null_content_mutation_rejects_login() {
+    let state = Arc::new(MockPluginState {
+        mutate_response: Some(serde_json::Value::Null),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(state.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: test_auth_cfg(),
+        http_plugins: vec![plugin_cfg(port, vec!["login"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+
+    let (conn, resp) = login_with_test_token(addr)
+        .await
+        .expect("login returns a response");
+    assert!(
+        resp.error.is_some(),
+        "a null-content unchange:false mutation must zero the Login fields and fail auth, got: {:?}",
+        resp.error
+    );
+    drop(conn);
 }
 
 /// A plugin returning unchange:false + mutated NewProxy content has its

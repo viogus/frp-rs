@@ -1689,17 +1689,28 @@ impl Service {
                         // "bounded by live controls") would otherwise grow by
                         // one entry per control that exited without a clean
                         // unregister: exactly the path this reaper exists
-                        // for. Removal is unconditional on run_id (the map
-                        // carries no control_id); the remove_if above already
-                        // verified this run_id's entry belonged to the swept
-                        // generation, so a control that re-logged in with a
-                        // fresh generation between the sweep list and here
-                        // can only lose its identity entry in a narrow race
-                        // already present in unregister_control's own
-                        // generation-guarded removal — and the entry is
-                        // re-recorded on the next login hook, which the
-                        // fresh control runs on its accept path.
-                        state.plugin_manager.remove_user(&run_id);
+                        // for.
+                        //
+                        // Same-run_id reconnect guard: a control that died
+                        // uncleanly and reconnected with the SAME run_id (frpc
+                        // reuses its run_id) between the sweep's remove_if and
+                        // here has ALREADY run its login hook and recorded its
+                        // identity entry — an unconditional remove_user by
+                        // run_id would delete the fresh control's entry for
+                        // its whole lifetime (the old comment's "re-recorded
+                        // on the next login hook" claim was wrong: that login
+                        // already ran). Re-check run_id_to_ctl_tx: no entry
+                        // (or still the swept generation) → nothing fresh to
+                        // protect → remove_user (leak fix stands); a NEWER
+                        // control_id → the fresh control re-logged in and
+                        // recorded its user → skip.
+                        let fresh_generation_present = state
+                            .run_id_to_ctl_tx
+                            .get(&run_id)
+                            .is_some_and(|cur| cur.control_id != control_id);
+                        if !fresh_generation_present {
+                            state.plugin_manager.remove_user(&run_id);
+                        }
                         tracing::info!(
                             run_id = %run_id,
                             "removed stale control entry (handler died)"

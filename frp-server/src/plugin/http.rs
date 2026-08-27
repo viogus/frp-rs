@@ -389,8 +389,22 @@ impl HttpPluginManager {
                 );
                 return Err(reason);
             }
-            if !pr.unchange && !pr.content.is_null() {
-                cur = pr.content;
+            if !pr.unchange {
+                // Go http.go:78: the response `content` is decoded into a
+                // FRESH zero-value struct (`reflect.New` + `json.Unmarshal`)
+                // — when the response omits `content` or sends null, the
+                // fresh struct stays all-zero ("" / nil / 0). Silently
+                // skipping the mutation would leave the ORIGINAL content in
+                // place (fail-open divergence): apply an empty-object
+                // mutation instead so the typed struct's fields zero out —
+                // Login's all-Option fields → auth fails on the missing
+                // privilege_key/timestamp (Go parity), and NewProxy fails
+                // closed on the missing proxy_name.
+                cur = if pr.content.is_null() {
+                    serde_json::Value::Object(serde_json::Map::new())
+                } else {
+                    pr.content
+                };
                 mutated = Some(cur.clone());
             }
         }

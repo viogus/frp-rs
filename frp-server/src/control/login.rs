@@ -520,6 +520,13 @@ pub(crate) async fn authenticate(
     // Effective run_id: computed up-front (pre-plugin) so the Login hook
     // payload can carry it — a client that omits run_id still appears as
     // the assigned UUID (the value registration actually uses).
+    // NOTE: plugin mutations of run_id are deliberately NOT honored —
+    // bookkeeping (run_id_to_ctl_tx, plugin users map, client registry,
+    // OIDC subjects) and the login replay table all key off this
+    // pre-plugin value. Honoring a mutated run_id would desync them and
+    // let a plugin bypass replay protection by changing the key mid-flight
+    // (echo-style plugins preserve run_id, so this is a non-issue in
+    // practice — pathological plugins get the pre-plugin value).
     let run_id = login
         .run_id
         .clone()
@@ -547,6 +554,13 @@ pub(crate) async fn authenticate(
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "Server plugin login content serialize error: {}", e);
+                // Consume a throttle slot: this is a pre-auth failure (round
+                // 6 B5 DoS gate) — without it an attacker could trigger
+                // plugin HTTP round-trips at any rate.
+                if let Some(msg) = throttled_login_error(&state, peer).await {
+                    send_login_error(stream, msg, v2).await;
+                    return Err(());
+                }
                 send_login_error(
                     stream,
                     format!("server plugin login content error: {e}"),
@@ -577,6 +591,13 @@ pub(crate) async fn authenticate(
         match state.plugin_manager.notify("login", login_content).await {
             Err(reason) => {
                 warn!(run_id = %run_id, reason = %reason, "Login for run_id {} rejected by server plugin: {}", run_id, reason);
+                // Consume a throttle slot: a plugin that rejects on
+                // attacker-controlled fields (user, metas) must not get
+                // unbounded pre-auth HTTP calls per IP (round-6 B5 DoS gate).
+                if let Some(msg) = throttled_login_error(&state, peer).await {
+                    send_login_error(stream, msg, v2).await;
+                    return Err(());
+                }
                 send_login_error(stream, reason, v2).await;
                 return Err(());
             }
@@ -589,6 +610,13 @@ pub(crate) async fn authenticate(
                     Ok(m) => login = m,
                     Err(e) => {
                         warn!(run_id = %run_id, error = %e, "Login plugin returned invalid content for run_id {}: {}", run_id, e);
+                        // Consume a throttle slot: a pre-auth failure must
+                        // not be exempt from the login throttle (round-6 B5
+                        // DoS gate — the plugin hook runs BEFORE auth).
+                        if let Some(msg) = throttled_login_error(&state, peer).await {
+                            send_login_error(stream, msg, v2).await;
+                            return Err(());
+                        }
                         send_login_error(stream, e, v2).await;
                         return Err(());
                     }
