@@ -16,6 +16,7 @@ use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{
     read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v1, write_msg_v2_with_udp_codec,
+    write_v2_frame_raw, V2_FRAME_TYPE_MESSAGE,
 };
 use frp_core::snappy_stream::{SnappyStreamReader, SnappyStreamWriter};
 use frp_core::transport::{split_work_conn_halves, IoStream};
@@ -407,36 +408,88 @@ async fn run_udp_work_conn(
                     spare.clear();
                     spare.extend_from_slice(&buf[..n]);
                     let content = std::mem::take(&mut spare);
-                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                        content,
-                        local_addr: local_addr.take(),
-                        remote_addr: Some(msg::UdpAddr {
-                            ip: src.ip().to_string(),
-                            port: src.port(),
-                            zone: String::new(),
-                        }),
-                    });
                     if let Some(lim) = &mut write_lim {
                         lim.consume(n).await;
                     }
-                    let result = if v2 {
-                        write_msg_v2_with_udp_codec(
-                            &mut w_w,
-                            &pkt,
-                            udp_codec_opt,
-                            no_flush,
-                            &mut wire_scratch,
-                        )
-                        .await
+                    let result = if v2 && udp_codec_opt.is_some() {
+                        // V2 binary codec path: encode the remote `SocketAddr`
+                        // straight into the wire body — the per-packet
+                        // `ip.to_string()` String alloc + reparse is only
+                        // needed for the V1 JSON path, where the address is
+                        // serialized as text (audit: LOW). Output bytes are
+                        // identical to the string round trip
+                        // (`encode_udp_packet_binary_socket_addr`). `content`
+                        // is borrowed here and returned to `spare` below;
+                        // `local_addr` is loop-invariant and only borrowed.
+                        let encode = async {
+                            wire_scratch.clear();
+                            wire_scratch
+                                .extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
+                            frp_core::udp_binary::encode_udp_packet_binary_socket_addr(
+                                &content,
+                                local_addr.as_ref(),
+                                &src,
+                                &mut wire_scratch,
+                            )
+                            .map_err(|e| {
+                                frp_core::Error::Protocol(
+                                    format!("encode binary UDP packet: {e}").into(),
+                                )
+                            })?;
+                            write_v2_frame_raw(&mut w_w, V2_FRAME_TYPE_MESSAGE, 0, &wire_scratch)
+                                .await?;
+                            if !no_flush {
+                                w_w.flush().await.map_err(|e| {
+                                    frp_core::Error::Protocol(
+                                        format!("flush after binary UDP packet: {e}").into(),
+                                    )
+                                })?;
+                            }
+                            Ok(())
+                        };
+                        let r = encode.await;
+                        spare = content;
+                        r
                     } else {
-                        write_msg_v1(&mut w_w, &pkt).await
+                        let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+                            content,
+                            local_addr: local_addr.take(),
+                            remote_addr: Some(msg::UdpAddr {
+                                // Go net.IP.String() collapses IPv4-mapped
+                                // IPv6 to the dotted-quad form; mirror that
+                                // on the V1 JSON path too (same normalization
+                                // as the V2 binary codec, review finding C1).
+                                ip: match src.ip() {
+                                    std::net::IpAddr::V6(v6) => v6
+                                        .to_ipv4_mapped()
+                                        .map(|v4| v4.to_string())
+                                        .unwrap_or_else(|| src.ip().to_string()),
+                                    _ => src.ip().to_string(),
+                                },
+                                port: src.port(),
+                                zone: String::new(),
+                            }),
+                        });
+                        let r = if v2 {
+                            write_msg_v2_with_udp_codec(
+                                &mut w_w,
+                                &pkt,
+                                udp_codec_opt,
+                                no_flush,
+                                &mut wire_scratch,
+                            )
+                            .await
+                        } else {
+                            write_msg_v1(&mut w_w, &pkt).await
+                        };
+                        // Return the invariant values to their locals for the
+                        // next packet before checking the write result.
+                        if let FrpMessage::UDPPacket(p) = pkt {
+                            local_addr = p.local_addr;
+                            spare = p.content;
+                        }
+                        r
                     };
-                    // Return the invariant values to their locals for the
-                    // next packet before checking the write result.
-                    if let FrpMessage::UDPPacket(p) = pkt {
-                        local_addr = p.local_addr;
-                        spare = p.content;
-                    }
                     if let Err(e) = result {
                         debug!(proxy_name = %writer_name, error = %e,
                             "UDP work conn write failed for '{}': {}", writer_name, e);
@@ -1484,7 +1537,8 @@ async fn run_sudp_message_bridge(
 /// conn is dead and the request (with its user conn) is returned so the
 /// caller can retry it against a fresh work conn instead of dropping the
 /// user connection (audit fix: dead pooled work conns used to fail the user
-/// conn with no retry).
+/// conn with no retry). Boxed: the request is large and this error is cold
+/// (one alloc on the retry path; keeps `result_large_err` quiet).
 pub(crate) async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
@@ -1492,14 +1546,14 @@ pub(crate) async fn assign_work_to_proxy(
     state: Arc<AppState>,
     v2: bool,
     bridge_cancel: tokio_util::sync::CancellationToken,
-) -> Result<(), PendingRequest> {
+) -> Result<(), Box<PendingRequest>> {
     // Extract peer address from user connection for PROXY protocol support
     let (src_addr, src_port) = req
         .user_conn
         .try_tcp()
         .and_then(|s| s.peer_addr().ok())
         .map(|a| (a.ip().to_string(), a.port() as i32))
-        .map_or((String::new(), 0), |(ip, port)| (ip, port));
+        .unwrap_or_default();
 
     // Proxy metadata is carried in the request (fetched once by the
     // dispatcher). When the snapshot is None — the STCP/XTCP
@@ -1537,7 +1591,7 @@ pub(crate) async fn assign_work_to_proxy(
         // The work conn is dead (e.g. the client closed it while pooled).
         // Return the request so the caller can re-enqueue it against a
         // fresh work conn instead of failing the user connection.
-        return Err(req);
+        return Err(Box::new(req));
     }
 
     // Flush StartWorkConn to wire before bridge data. KcpStream::poll_flush

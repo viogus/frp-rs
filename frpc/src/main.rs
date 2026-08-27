@@ -228,7 +228,7 @@ async fn main() {
             )
             .await
         }
-        FrpcCmd::Verify(args) => run_verify(&args.config).await,
+        FrpcCmd::Verify(args) => run_verify(&args.config, args.strict_config).await,
         FrpcCmd::Reload(args) => run_reload(args).await,
         FrpcCmd::Status(args) => run_status(args).await,
     }
@@ -604,14 +604,17 @@ async fn run_single_proxy(
     }
 }
 
-async fn run_verify(config_path: &str) {
+async fn run_verify(config_path: &str, strict_config: bool) {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    match load_client_config(config_path, true) {
+    // Go frp v0.70.1: `frpc verify` honors the persistent strictConfigMode
+    // root flag (cmd/frpc/sub/verify.go) — with --strict-config=false, unknown
+    // fields are accepted.
+    match load_client_config(config_path, strict_config) {
         Ok(cfg) => {
             println!("Config file {} is valid", config_path);
             println!("  Server: {}:{}", cfg.server_addr, cfg.server_port);

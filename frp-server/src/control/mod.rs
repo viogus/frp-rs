@@ -1,6 +1,9 @@
 pub(crate) mod bridge;
 mod dispatch;
-mod login;
+// pub(crate) so the stale-control reaper (service.rs) can clear the OIDC
+// subject mapping for a swept run_id (round-7 audit LOW — the generation-
+// guarded helper lives in login.rs).
+pub(crate) mod login;
 mod nathole;
 mod pool;
 mod proxy;
@@ -93,6 +96,10 @@ pub(crate) struct ControlState {
     pub listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     pub udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     pub last_ping: Instant,
+    /// Set by a superseding login (same run_id) whose Shutdown message could
+    /// not be delivered through a full channel; checked at loop top so the
+    /// handler exits as soon as it is free (see `ControlTx::superseded`).
+    pub superseded: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Immutable/shared context passed to every handler. Owns its data —
@@ -236,6 +243,16 @@ async fn handle_control_inner<S>(
         Duration::ZERO
     };
     loop {
+        // Superseded by a newer login (same run_id) whose Shutdown message
+        // could not be delivered through a full channel (round-7 review
+        // finding): exit as soon as the loop is free so cleanup — proxy
+        // registrations, bridges, conn_semaphore permit — runs at wedge-end
+        // instead of lingering until the socket dies or the heartbeat fires.
+        if ctl.superseded.load(std::sync::atomic::Ordering::Acquire) {
+            warn!(peer = ?peer, run_id = %run_id, "Control superseded (Shutdown could not be delivered); closing");
+            break;
+        }
+
         // Expire stale pending requests
         while let Some(req) = ctl.pending_requests.pop_front() {
             if req.created_at.elapsed() >= pool::pending_request_timeout(state.user_conn_timeout) {
@@ -287,19 +304,23 @@ async fn handle_control_inner<S>(
         // could pin pending_requests entries + user fds forever. This branch
         // wakes the select at the earliest deadline; loop-top does the
         // cleanup (audit D2-1).
+        let pending_timeout = pool::pending_request_timeout(state.user_conn_timeout);
         let pending_deadline = ctl
             .pending_requests
             .front()
-            .map(|r| r.created_at + pool::pending_request_timeout(state.user_conn_timeout))
+            // checked_add (review finding): a hostile/legacy user_conn_timeout
+            // must never panic the process — degrade to never firing this
+            // wake arm instead (the loop-top expiry above still applies).
+            .and_then(|r| r.created_at.checked_add(pending_timeout))
             .or_else(|| {
                 ctl.pending_udp
                     .front()
-                    .map(|(_, ts)| *ts + pool::pending_request_timeout(state.user_conn_timeout))
+                    .and_then(|(_, ts)| ts.checked_add(pending_timeout))
             })
             .or_else(|| {
                 ctl.pending_nat_hole_sids
                     .front()
-                    .map(|(_, _, ts)| *ts + pool::pending_request_timeout(state.user_conn_timeout))
+                    .and_then(|(_, _, ts)| ts.checked_add(pending_timeout))
             });
 
         tokio::select! {
@@ -318,7 +339,16 @@ async fn handle_control_inner<S>(
             // client would never be disconnected. tokio::select re-evaluates
             // the sleep target on every iteration, so last_ping updates are
             // picked up automatically.
-            _ = tokio::time::sleep_until(ctl.last_ping + hb_timeout), if state.heartbeat_timeout > 0 => {
+            _ = async {
+                // checked_add (finding 5): the config-side clamp (≤3600s)
+                // makes overflow unreachable, but a hostile/legacy value
+                // must never panic the process — degrade to never firing
+                // this arm instead (the loop-top check above still applies).
+                match ctl.last_ping.checked_add(hb_timeout) {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if state.heartbeat_timeout > 0 => {
                 warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
                 break;
             }

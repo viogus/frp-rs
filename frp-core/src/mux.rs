@@ -70,6 +70,23 @@ const MAX_IDLE_KEEPALIVE_TICKS: u32 = 3;
 #[cfg(feature = "tcp-mux")]
 const MIN_IDLE_DEAD_TIME: Duration = Duration::from_secs(30);
 
+/// Cap on concurrently queued client `open_stream()` requests — the bound on
+/// BOTH the open request channel and the driver's stalled-open queue. The
+/// driver drains the channel into the pending queue up to this cap; when both
+/// are full (a peer with a permanently full ACK backlog stalls the serve
+/// loop), `open_stream()` refuses promptly instead of letting requests — each
+/// a parked caller awaiting a oneshot reply — accumulate without bound.
+#[cfg(feature = "tcp-mux")]
+const MAX_PENDING_OPEN_REQUESTS: usize = 64;
+
+/// Bounds the wait for the driver's answer to an open-stream request
+/// (review finding): a wedged driver — stalled peer that never acks, so the
+/// queued SYN is never served — would otherwise park the caller until the
+/// session dies, up to `MAX_PENDING_OPEN_REQUESTS` slots at once. One
+/// keepalive tick; a live driver answers within the same I/O pass.
+#[cfg(feature = "tcp-mux")]
+const MUX_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Wrapper type for a yamux stream compatible with tokio's AsyncRead/AsyncWrite.
 #[cfg(feature = "tcp-mux")]
 pub type YamuxStream = Compat<Stream>;
@@ -298,18 +315,23 @@ impl IncomingStreams {
 #[cfg(feature = "tcp-mux")]
 #[derive(Clone)]
 pub struct YamuxSession {
-    /// Request channel to the background driver task. `open_stream()` sends a
-    /// one-shot request here and awaits the result — the OPENING task does NOT
-    /// take the shared Connection lock. The driver owns the connection and
-    /// both opens the stream AND drives connection I/O, so it keeps reading
-    /// inbound (ACK) frames while an open is in flight; a caller holding the
-    /// lock to poll_new_outbound would stall the driver's ACK reads and add
-    /// measurable setup latency (measured: setup_cold p50 +38% vs the
-    /// request-channel design). See `client_mux` for the non-blocking open
-    /// service that prevents the driver from parking inside an open (the
+    /// Bounded request channel to the background driver task. `open_stream()`
+    /// sends a one-shot request here and awaits the result — the OPENING task
+    /// does NOT take the shared Connection lock. The driver owns the
+    /// connection and both opens the stream AND drives connection I/O, so it
+    /// keeps reading inbound (ACK) frames while an open is in flight; a caller
+    /// holding the lock to poll_new_outbound would stall the driver's ACK
+    /// reads and add measurable setup latency (measured: setup_cold p50 +38%
+    /// vs the request-channel design). See `client_mux` for the non-blocking
+    /// open service that prevents the driver from parking inside an open (the
     /// rebuild that made request-channel safe).
-    open_tx:
-        mpsc::UnboundedSender<oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>>,
+    ///
+    /// Bounded (MAX_PENDING_OPEN_REQUESTS): a stalled peer (ACK backlog
+    /// permanently full) leaves the driver's serve loop unable to make
+    /// progress, and an unbounded channel would accumulate requests — each a
+    /// parked caller awaiting its oneshot — without limit. When the queue is
+    /// full, `open_stream()` fails fast instead of queueing.
+    open_tx: mpsc::Sender<oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>>,
     /// Set false when the background driver exits (I/O error, keepalive
     /// bound, or session drop). open_stream() checks it to fail fast
     /// instead of polling a connection whose driver is gone.
@@ -328,7 +350,9 @@ pub struct YamuxSession {
 #[cfg(feature = "tcp-mux")]
 impl YamuxSession {
     /// Open a new yamux stream on the shared session.
-    /// Returns `None` if the yamux session is closed/dropped.
+    /// Returns `None` if the yamux session is closed/dropped, or when the
+    /// bounded open-request queue is full (driver backlog saturated by a
+    /// stalled peer).
     pub async fn open_stream(&self) -> Option<YamuxStream> {
         // Fail fast when the driver has exited: a request would otherwise
         // sit unserved (the fresh sender would never be polled to output and
@@ -337,23 +361,43 @@ impl YamuxSession {
             return None;
         }
         let (tx, rx) = oneshot::channel();
-        if self.open_tx.send(tx).is_err() {
-            // Driver has exited (channel closed) between the alive check and
-            // here.
-            return None;
+        // Bounded try_send — NOT an awaited send: with a stalled peer the
+        // channel (and the driver's pending queue) are full, and callers
+        // queueing here would accumulate without bound. Refuse promptly; the
+        // caller retries through the control protocol.
+        match self.open_tx.try_send(tx) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "yamux client: open request queue full (driver backlog saturated), refusing open"
+                );
+                return None;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Driver has exited (channel closed) between the alive check
+                // and here.
+                return None;
+            }
         }
         // Wake the driver so it picks up this open request on its next I/O
         // pass (the driver does not block on this channel; the notify is how
         // a quiet session learns a new open is queued).
         self.open_notify.notify_one();
-        let stream = match rx.await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
+        // Bound the answer wait (see `MUX_OPEN_TIMEOUT`): a wedged driver
+        // must not park this task indefinitely. On timeout return `None` —
+        // the caller retries through the control protocol.
+        let stream = match tokio::time::timeout(MUX_OPEN_TIMEOUT, rx).await {
+            Ok(Ok(Ok(s))) => s,
+            Ok(Ok(Err(e))) => {
                 warn!(error = %e, "yamux client: open stream failed: {e}");
                 return None;
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 // Driver dropped the sender without answering (shutdown).
+                return None;
+            }
+            Err(_) => {
+                warn!(timeout = ?MUX_OPEN_TIMEOUT, "yamux client: open stream timed out, dropping request");
                 return None;
             }
         };
@@ -620,9 +664,14 @@ where
     // Request channel by which open_stream() asks the driver to open a new
     // outbound stream; the driver answers with the yamux Stream (or error).
     // The caller never touches the Connection: it only sends + awaits.
-    let (open_tx, mut bg_open_rx) = mpsc::unbounded_channel::<
+    // BOUNDED: with a stalled peer (yamux MAX_ACK_BACKLOG permanently full)
+    // the driver's serve loop cannot answer opens, and an unbounded channel
+    // — drained unconditionally into the pending queue — would accumulate
+    // requests (each a parked awaiting caller) without limit. Capacity
+    // MAX_PENDING_OPEN_REQUESTS; open_stream() fails fast when it is full.
+    let (open_tx, mut bg_open_rx) = mpsc::channel::<
         oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
-    >();
+    >(MAX_PENDING_OPEN_REQUESTS);
     // Used by open_stream() to wake the driver so a queued open is served on
     // the next I/O pass even on an otherwise-quiet session.
     let open_notify = Arc::new(tokio::sync::Notify::new());
@@ -640,6 +689,9 @@ where
         // inside poll_new_outbound, so it keeps reading ACK frames and the
         // session can always make progress — this is what makes the
         // request-channel driver safe from the PERMANENT wedge (#1).
+        // Bounded at MAX_PENDING_OPEN_REQUESTS: the drain loop stops at the
+        // cap, leaving the overflow in the channel so open_stream()'s
+        // try_send fails fast instead of growing this queue without bound.
         let mut pending_opens: std::collections::VecDeque<
             oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
         > = std::collections::VecDeque::new();
@@ -672,8 +724,16 @@ where
                 // poll: it would stall ACK processing and wedge the session.
                 result = poll_fn(|cx| {
                     // (1) drain any enqueued open requests into the local
-                    // pending queue (open_stream never touches the connection).
+                    // pending queue (open_stream never touches the
+                    // connection). Stop at MAX_PENDING_OPEN_REQUESTS: with a
+                    // stalled peer the serve loop below cannot make progress,
+                    // and an unconditional drain would accumulate requests
+                    // without bound. Leaving the overflow IN the channel is
+                    // what makes open_stream()'s try_send fail fast.
                     loop {
+                        if pending_opens.len() >= MAX_PENDING_OPEN_REQUESTS {
+                            break;
+                        }
                         match bg_open_rx.try_recv() {
                             Ok(req) => pending_opens.push_back(req),
                             Err(mpsc::error::TryRecvError::Empty) => break,
@@ -822,4 +882,51 @@ where
     Err(crate::Error::Protocol(
         "tcp_mux is disabled (compile-time feature 'tcp-mux' not enabled)".into(),
     ))
+}
+
+#[cfg(all(test, feature = "tcp-mux"))]
+mod tests {
+    use super::*;
+
+    /// Regression: a stalled peer (ACK backlog permanently full) leaves the
+    /// driver unable to serve opens. The bounded request queue must then make
+    /// `open_stream()` fail fast instead of queueing awaiting callers without
+    /// bound (the unbounded-channel regression).
+    #[tokio::test]
+    async fn mux_open_stream_refuses_when_request_queue_full() {
+        // A YamuxSession whose driver never drains the request channel —
+        // simulates the stalled state. `_undrained` must stay alive: dropping
+        // the receiver would CLOSE the channel, and the probe would then fail
+        // via TrySendError::Closed instead of exercising the Full path.
+        let (open_tx, _undrained) = mpsc::channel::<
+            oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
+        >(MAX_PENDING_OPEN_REQUESTS);
+        let (shutdown_send, _shutdown_recv) = oneshot::channel::<()>();
+        let session = YamuxSession {
+            open_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            open_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_tx: Arc::new(shutdown_send),
+        };
+
+        // Fill the request queue to capacity (the driver is not draining).
+        for _ in 0..MAX_PENDING_OPEN_REQUESTS {
+            let (tx, _rx) = oneshot::channel();
+            session
+                .open_tx
+                .try_send(tx)
+                .expect("queue has room below capacity");
+        }
+
+        // Queue full: open_stream() must be REFUSED promptly, not park
+        // awaiting queue space (or, with the old unbounded channel, park
+        // awaiting a driver reply that can never come).
+        let refused = tokio::time::timeout(Duration::from_secs(2), session.open_stream())
+            .await
+            .expect("open_stream must return promptly when the request queue is full");
+        assert!(
+            refused.is_none(),
+            "expected the open to be refused with a full request queue"
+        );
+    }
 }

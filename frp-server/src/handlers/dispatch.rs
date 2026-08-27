@@ -120,8 +120,11 @@ pub(crate) async fn handle_visitor_conn_inner(
             // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key.
             // Look up by msg.proxy_name directly — do NOT iterate the whole map:
             // multiple proxies sharing the same sk would route to the wrong one.
-            let sk_map = state.xtcp.sk_index.read().await;
-            let pn = match sk_map.get(&msg.proxy_name) {
+            // DashMap: lock-free per-key lookup — a visitor read never queues
+            // behind an STCP registration/unregister write (the old
+            // tokio RwLock was writer-fair, so NewVisitorConn readers could
+            // serialize behind registration writes).
+            let pn = match state.xtcp.sk_index.get(&msg.proxy_name) {
                 Some(stored_sk) if *stored_sk == sign_key => {
                     debug!(proxy_name = %msg.proxy_name, "STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", msg.proxy_name);
                     Some(msg.proxy_name.clone())

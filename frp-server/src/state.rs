@@ -3,7 +3,9 @@ use std::collections::HashMap;
 #[cfg(feature = "vnet")]
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
+};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 #[cfg(feature = "dashboard")]
@@ -179,6 +181,12 @@ pub struct ControlTx {
     /// enforces that work connections and run_id-bearing visitor connections
     /// use the same wire protocol as the control they reference.
     pub wire_v2: bool,
+    /// Set by a superseding login (same run_id) whose Shutdown message could
+    /// not be delivered through a full internal channel: the old control
+    /// handler checks this at its loop top and exits as soon as it is free,
+    /// so cleanup (registrations, bridges, conn_semaphore) runs at wedge-end
+    /// instead of after the heartbeat timeout (round-7 review finding).
+    pub superseded: Arc<AtomicBool>,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -316,7 +324,12 @@ pub struct XtcpState {
     /// multiple STCP/XTCP proxies share the same secret key).
     /// Value: `raw_sk` — used for fallback auth during the
     /// NewVisitorConn-before-registration race window.
-    pub sk_index: Arc<RwLock<HashMap<String, String>>>,
+    ///
+    /// DashMap (like `run_id_to_ctl_tx`): the per-NewVisitorConn lookup is
+    /// lock-free and never queues behind STCP registration/unregister
+    /// writes (a tokio RwLock is writer-fair, so visitor-lookup readers
+    /// could serialize behind sk_index writes).
+    pub sk_index: Arc<DashMap<String, String>>,
 }
 
 /// Token bucket rate limiter for connection accept loops.
@@ -974,7 +987,7 @@ impl AppState {
                 nat_hole: Arc::new(Controller::new(Duration::from_secs(
                     nat_hole_analysis_data_reserve_hours.saturating_mul(3600),
                 ))),
-                sk_index: Arc::new(RwLock::new(HashMap::new())),
+                sk_index: Arc::new(DashMap::new()),
             },
             sub_domain_host,
             tcp_mux,
@@ -1407,6 +1420,7 @@ mod tests {
                 control_id: 1,
                 udp_packet_codec: String::new(),
                 wire_v2: false,
+                superseded: Arc::new(AtomicBool::new(false)),
             },
         );
         rx

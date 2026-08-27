@@ -15,10 +15,11 @@
 //! timing sidechannel (RUSTSEC-2023-0071, Marvin Attack). Only affects the SSH
 //! gateway feature. Monitor upstream for fix.
 
-use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+
+use dashmap::DashMap;
 
 use anyhow::anyhow;
 use frp_core::msg::{FrpMessage, NewProxy};
@@ -353,8 +354,16 @@ pub struct SshSession {
     /// forwarded-tcpip channel payload.
     reverse_forward: Arc<std::sync::Mutex<Option<(String, u32)>>>,
     /// Data routing table for forwarded-tcpip channels: SSH client → bridge
-    /// task read half.
-    reverse_data_tx: Arc<std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>>,
+    /// task read half. Sharded by ChannelId (DashMap), so the per-chunk
+    /// `data` callback lock for one reverse channel never serializes against
+    /// the other reverse channels of this session.
+    reverse_data_tx: Arc<DashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>,
+    /// Cancelled when the virtual control handler exits (e.g. the server's
+    /// heartbeat-timeout cleanup kills it — the SSH virtual client never
+    /// sends Ping). The listener task and the work-conn bridge race on it so
+    /// the whole SSH session is torn down deterministically instead of
+    /// lingering with a dead control.
+    control_exit: tokio_util::sync::CancellationToken,
 }
 
 impl Drop for SshSession {
@@ -364,6 +373,7 @@ impl Drop for SshSession {
 }
 
 impl SshSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         server_token: String,
         authorized_keys: Vec<russh::keys::PublicKey>,
@@ -372,6 +382,7 @@ impl SshSession {
         auth_complete_tx: tokio::sync::watch::Sender<bool>,
         authenticated_run_id: Arc<std::sync::Mutex<Option<String>>>,
         auth_deadline: tokio::time::Instant,
+        control_exit: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
             run_id: String::new(),
@@ -387,7 +398,8 @@ impl SshSession {
             authenticated_run_id,
             auth_deadline,
             reverse_forward: Arc::new(std::sync::Mutex::new(None)),
-            reverse_data_tx: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reverse_data_tx: Arc::new(DashMap::new()),
+            control_exit,
         }
     }
 
@@ -605,7 +617,7 @@ impl Handler for SshSession {
         };
         let ctrl_state = self.state.clone();
         let peer_addr = self.peer_addr;
-        tokio::spawn(async move {
+        let ctl_task = tokio::spawn(async move {
             crate::control::handle_control(
                 vc,
                 login,
@@ -617,6 +629,22 @@ impl Handler for SshSession {
                 true,
             )
             .await;
+        });
+        // The SSH virtual client never sends Ping, so with an operator-set
+        // transport.heartbeatTimeout the server's heartbeat cleanup kills
+        // handle_control (and sweeps the SSH-registered proxies) while the
+        // russh session would otherwise keep running — holding the SSH fd +
+        // conn_semaphore permit and silently dropping every later -R
+        // tcpip-forward work conn. Watch the control handler: when it exits
+        // for any reason, cancel the session-wide token so the listener task
+        // terminates the SSH session deterministically.
+        let control_exit = self.control_exit.clone();
+        tokio::spawn(async move {
+            let _ = ctl_task.await;
+            tracing::debug!(
+                "SSH session: virtual control handler exited; requesting session termination"
+            );
+            control_exit.cancel();
         });
 
         *self
@@ -633,6 +661,7 @@ impl Handler for SshSession {
         let state = self.state.clone();
         let reverse_forward = self.reverse_forward.clone();
         let reverse_data_tx = self.reverse_data_tx.clone();
+        let control_exit = self.control_exit.clone();
         tokio::spawn(async move {
             handle_work_conn_requests(
                 work_conn_rx,
@@ -641,6 +670,7 @@ impl Handler for SshSession {
                 state,
                 reverse_forward,
                 reverse_data_tx,
+                control_exit,
             )
             .await;
         });
@@ -828,21 +858,18 @@ impl Handler for SshSession {
         // half (data from the SSH client = local service response). The
         // bounded channel provides backpressure when the frps side reads
         // slower than the SSH client sends (Go net.Pipe is blocking too).
-        // Clone the sender under the lock, then await the send outside it so
-        // the future stays Send.
+        // Clone the sender under the shard lock, then await the send outside
+        // it so the future stays Send. The map is sharded per ChannelId
+        // (DashMap), so concurrent reverse channels do not serialize their
+        // data callback on a single mutex.
         let tx = self
             .reverse_data_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .get(&channel)
-            .cloned();
+            .map(|e| e.value().clone());
         if let Some(tx) = tx {
             if tx.send(data.to_vec()).await.is_err() {
                 // Bridge task exited (channel closed) — drop the entry.
-                self.reverse_data_tx
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&channel);
+                self.reverse_data_tx.remove(&channel);
             }
         }
         Ok(())
@@ -857,13 +884,7 @@ impl Handler for SshSession {
         // Drop the data sender so the bridge task's `data_rx.recv()` returns
         // and the task (plus its duplex) exits — otherwise the bridge hangs
         // forever holding the channel entry in the map.
-        if self
-            .reverse_data_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&channel)
-            .is_some()
-        {
+        if self.reverse_data_tx.remove(&channel).is_some() {
             tracing::debug!(
                 run_id = %self.run_id,
                 channel = ?channel,
@@ -885,9 +906,29 @@ async fn handle_work_conn_requests(
     handle: russh::server::Handle,
     state: Arc<AppState>,
     reverse_forward: Arc<std::sync::Mutex<Option<(String, u32)>>>,
-    reverse_data_tx: Arc<std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>>,
+    reverse_data_tx: Arc<DashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>,
+    control_exit: tokio_util::sync::CancellationToken,
 ) {
-    while let Some(_req) = work_rx.recv().await {
+    loop {
+        // Race the recv against the session's control-exit token: when the
+        // virtual control handler exits, the session is being torn down —
+        // stop accepting work-conn requests instead of silently dropping
+        // them (no control handler remains to deliver them to).
+        let req = tokio::select! {
+            biased;
+            _ = control_exit.cancelled() => {
+                tracing::debug!(
+                    run_id = %run_id,
+                    "SSH session {} work-connection handler exiting on control exit",
+                    run_id
+                );
+                break;
+            }
+            req = work_rx.recv() => req,
+        };
+        let Some(_req) = req else {
+            break;
+        };
         let Some((addr, port)) = reverse_forward
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -924,10 +965,7 @@ async fn handle_work_conn_requests(
         // Register the data route (SSH client → bridge read half).
         // Bounded: backpressure via the SSH data callback above.
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
-        reverse_data_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(channel_id, data_tx);
+        reverse_data_tx.insert(channel_id, data_tx);
 
         // In-memory pipe: one end is the work conn, the other is bridged
         // with the SSH channel (Go virtual client net.Pipe).
@@ -937,10 +975,7 @@ async fn handle_work_conn_requests(
         let Some(tx) = ctl_tx else {
             tracing::warn!(run_id = %run_id, "SSH: control handler gone; dropping work conn");
             let _ = handle.close(channel_id).await;
-            reverse_data_tx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&channel_id);
+            reverse_data_tx.remove(&channel_id);
             continue;
         };
         let work_io = frp_core::transport::IoStream::SshChannel(Box::new(work_side));
@@ -951,10 +986,7 @@ async fn handle_work_conn_requests(
         {
             tracing::debug!(run_id = %run_id, "SSH: control gone while delivering work conn");
             let _ = handle.close(channel_id).await;
-            reverse_data_tx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&channel_id);
+            reverse_data_tx.remove(&channel_id);
             continue;
         }
 
@@ -963,9 +995,7 @@ async fn handle_work_conn_requests(
         tokio::spawn(async move {
             bridge_ssh_side(ssh_side, data_rx, handle2.clone(), channel_id).await;
             let _ = handle2.close(channel_id).await;
-            reg.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&channel_id);
+            reg.remove(&channel_id);
         });
     }
 
@@ -1107,6 +1137,7 @@ mod tests {
             auth_tx,
             run_id.clone(),
             tokio::time::Instant::now() + SSH_AUTH_DEADLINE,
+            tokio_util::sync::CancellationToken::new(),
         );
         (session, auth_rx, run_id)
     }
@@ -1186,6 +1217,7 @@ mod tests {
             auth_tx,
             run_id_arc,
             tokio::time::Instant::now() + SSH_AUTH_DEADLINE,
+            tokio_util::sync::CancellationToken::new(),
         );
         let result = session.auth_none("v0").await.unwrap();
         assert!(matches!(result, Auth::Accept));
@@ -1209,6 +1241,7 @@ mod tests {
             auth_tx,
             run_id_arc,
             tokio::time::Instant::now() + SSH_AUTH_DEADLINE,
+            tokio_util::sync::CancellationToken::new(),
         );
         let result = session.auth_none("v0").await.unwrap();
         assert!(matches!(result, Auth::Reject { .. }));
@@ -1385,6 +1418,68 @@ mod tests {
         })
         .await
         .unwrap();
+        listener_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_control_exit_terminates_session_and_releases_permit() {
+        // Regression (M6): when the SSH virtual control handler exits — the
+        // server's heartbeat-timeout cleanup kills it because the SSH
+        // virtual client never sends Ping — the russh session must be torn
+        // down deterministically. Before the fix the session stayed open,
+        // holding the SSH fd + conn_semaphore permit and silently dropping
+        // every later -R tcpip-forward work conn. Here the shutdown token
+        // drives the control handler down the same exit path (break ->
+        // cleanup) as a heartbeat timeout.
+        let (addr, state, listener_task) =
+            start_test_ssh_listener(std::time::Duration::from_secs(2)).await;
+        let client_config = Arc::new(russh::client::Config::default());
+        let mut client = russh::client::connect(client_config, addr, TestSshClient)
+            .await
+            .unwrap();
+
+        let auth = client
+            .authenticate_password("v0", "test-token")
+            .await
+            .unwrap();
+        assert!(auth.success());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.run_id_to_ctl_tx.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.run_id_to_ctl_tx.len(), 1);
+        assert_eq!(
+            state.conn_semaphore.as_ref().unwrap().available_permits(),
+            0
+        );
+
+        // Kill the control handler the same way a heartbeat timeout does.
+        state.shutdown_token.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !client.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("SSH session must be terminated when the control handler exits");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.conn_semaphore.as_ref().unwrap().available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.run_id_to_ctl_tx.is_empty());
         listener_task.abort();
     }
 
@@ -1959,6 +2054,9 @@ impl SshListener {
                 let (stream, stream_closer) = CloseableSshStream::new(stream);
                 let (auth_complete_tx, mut auth_complete_rx) = tokio::sync::watch::channel(false);
                 let authenticated_run_id = Arc::new(std::sync::Mutex::new(None));
+                // Session-wide teardown signal: cancelled when the SSH
+                // virtual control handler exits (see auth_succeeded).
+                let control_exit = tokio_util::sync::CancellationToken::new();
                 let session = SshSession::new(
                     server_token,
                     authorized_keys,
@@ -1967,6 +2065,7 @@ impl SshListener {
                     auth_complete_tx,
                     authenticated_run_id.clone(),
                     auth_deadline,
+                    control_exit.clone(),
                 );
 
                 let running = match tokio::time::timeout_at(
@@ -2040,34 +2139,78 @@ impl SshListener {
                         // so an idle session cannot hold its conn_semaphore
                         // permit / task / fd forever. 0 = disabled (Go frp
                         // parity — Go has no SSH idle timeout).
-                        if ssh_session_idle_timeout > 0 {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(ssh_session_idle_timeout),
-                                &mut session_task,
-                            )
-                            .await
-                            {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    let run_id = authenticated_run_id
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .clone();
-                                    tracing::warn!(
-                                        run_id = ?run_id,
-                                        idle_timeout_secs = ssh_session_idle_timeout,
-                                        "SSH session idle timeout ({}s), closing",
-                                        ssh_session_idle_timeout
-                                    );
-                                    session_task.abort();
-                                    if let Some(run_id) = run_id {
-                                        cleanup_session(&run_id, &state).await;
-                                    }
-                                    return;
+                        //
+                        // The wait is also raced against the virtual control
+                        // handler's exit: the SSH virtual client never sends
+                        // Ping, so with an operator-set
+                        // transport.heartbeatTimeout the server's heartbeat
+                        // cleanup kills handle_control (and sweeps the
+                        // SSH-registered proxies) while the russh session
+                        // would otherwise keep running — holding the SSH fd +
+                        // conn_semaphore permit and silently dropping every
+                        // later -R tcpip-forward work conn. When the control
+                        // handler exits we terminate the SSH session
+                        // deterministically instead.
+                        let outcome = tokio::select! {
+                            biased;
+                            _ = control_exit.cancelled() => {
+                                let run_id = authenticated_run_id
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                tracing::warn!(
+                                    run_id = ?run_id,
+                                    "SSH session: virtual control handler exited; closing SSH session"
+                                );
+                                terminate_ssh_session(
+                                    async {
+                                        let _ = session_handle.disconnect(
+                                            russh::Disconnect::ByApplication,
+                                            "control handler exited".into(),
+                                            String::new(),
+                                        )
+                                        .await;
+                                    },
+                                    &mut session_task,
+                                    &stream_closer,
+                                    SSH_DISCONNECT_GRACE,
+                                ).await;
+                                if let Some(run_id) = run_id {
+                                    cleanup_session(&run_id, &state).await;
                                 }
+                                return;
                             }
-                        } else {
-                            session_task.await
+                            r = async {
+                                if ssh_session_idle_timeout > 0 {
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(ssh_session_idle_timeout),
+                                        &mut session_task,
+                                    )
+                                    .await
+                                } else {
+                                    Ok((&mut session_task).await)
+                                }
+                            } => r,
+                        };
+                        match outcome {
+                            Ok(r) => r,
+                            Err(_) => {
+                                let run_id = authenticated_run_id
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                tracing::warn!(
+                                    run_id = ?run_id,
+                                    idle_timeout_secs = ssh_session_idle_timeout,
+                                    "SSH session idle timeout ({}s), closing",
+                                    ssh_session_idle_timeout
+                                );
+                                session_task.abort();
+                                if let Some(run_id) = run_id {
+                                    cleanup_session(&run_id, &state).await;
+                                }
+                                return;
+                            }
                         }
                     }
                 };

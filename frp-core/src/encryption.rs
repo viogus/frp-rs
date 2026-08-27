@@ -164,7 +164,8 @@ pub fn compress_into(data: &[u8], buf: &mut Vec<u8>) -> Result<(), String> {
 /// Frames are the Snappy stream framing: an optional `0xFF` `sNaPpY`
 /// identifier is emitted before the first data frame (Go frp's `snappy.Reader`
 /// accepts either form), and each data frame carries a masked CRC-32C that the
-/// decoder skips (not verified) on read. An empty input emits nothing.
+/// decoder verifies on read (Go parity — golang/snappy v0.0.4 rejects a
+/// mismatch with `ErrCorrupt`). An empty input emits nothing.
 #[cfg(feature = "compression")]
 pub struct SnappyCompressor {
     /// Reused streaming encoder. Its internal sink is swapped with the
@@ -462,22 +463,22 @@ impl SnappyDecompressor {
                     if chunk_len < 4 {
                         return Err("snappy: compressed chunk length too small".into());
                     }
-                    // Skip 4-byte header (already read) + 4-byte CRC.
-                    //
-                    // INTENTIONAL DIVERGENCE (documented per audit): Go's
-                    // `golang/snappy` Reader verifies the CRC32C (Castagnoli)
-                    // of the uncompressed data against this field
-                    // (github.com/golang/snappy decode.go — `if crc(...) !=
-                    // checksum { err = ErrCorrupt }`), we deliberately do not.
-                    // Rationale: this decoder sits inside the encrypted
-                    // bridge/visitor tunnel (AES-128-CFB) whose ciphers are
-                    // Go-compat primitives, and implementing CRC32C would
-                    // require a new dependency or a hand-rolled hot-path
-                    // implementation for a check that catches only accidental
-                    // corruption — a deliberate attacker would recompute the
-                    // CRC. The data-plane cost is nonzero on every chunk.
-                    // Wire compatibility is unaffected (the CRC field is
-                    // still skipped/consumed, so framing stays aligned).
+                    // Verify the masked CRC-32C (Castagnoli) of the
+                    // decompressed data against the 4-byte field, matching Go
+                    // frp exactly: golang/snappy v0.0.4 (via fatedier/golib
+                    // v0.8.2 `WithCompressionFromPool`) reads the checksum and
+                    // rejects a mismatch with `ErrCorrupt` — decode.go:
+                    // `if crc(r.decoded[:n]) != checksum { r.err = ErrCorrupt }`
+                    // (both the compressed 0x00 and uncompressed 0x01 arms).
+                    // Our writers (snap FrameEncoder and the in-tree
+                    // `crate::crc32c` masked checksum) always emit correct
+                    // CRCs, so this fires only on genuinely corrupt input.
+                    let checksum = u32::from_le_bytes([
+                        self.buf[start + 4],
+                        self.buf[start + 5],
+                        self.buf[start + 6],
+                        self.buf[start + 7],
+                    ]);
                     let compressed = &self.buf[start + 8..start + total];
                     let decompressed_len = snap::raw::decompress_len(compressed)
                         .map_err(|e| format!("snappy decompress: {e}"))?;
@@ -496,19 +497,34 @@ impl SnappyDecompressor {
                     if written != decompressed_len {
                         return Err("snappy: decompressed output length changed".into());
                     }
+                    if crate::crc32c::crc32c_masked(&self.scratch[..written]) != checksum {
+                        return Err(format!(
+                            "snappy: crc32c checksum mismatch (expected {checksum:08x}): corrupt input"
+                        ));
+                    }
                     out.extend_from_slice(&self.scratch[..written]);
                     self.offset += total;
                     return Ok(());
                 }
                 0x01 => {
                     // Uncompressed data: length field includes 4-byte CRC.
-                    // CRC32C is intentionally not verified — same rationale
-                    // as the compressed arm above (Go verifies; we skip for
-                    // the encrypted-tunnel integrity argument).
+                    // Verified against the chunk's own bytes (no
+                    // decompression), matching Go frp (see the 0x00 arm).
                     if chunk_len < 4 {
                         return Err("snappy: uncompressed chunk length too small".into());
                     }
+                    let checksum = u32::from_le_bytes([
+                        self.buf[start + 4],
+                        self.buf[start + 5],
+                        self.buf[start + 6],
+                        self.buf[start + 7],
+                    ]);
                     let chunk_data = &self.buf[start + 8..start + total];
+                    if crate::crc32c::crc32c_masked(chunk_data) != checksum {
+                        return Err(format!(
+                            "snappy: crc32c checksum mismatch (expected {checksum:08x}): corrupt input"
+                        ));
+                    }
                     out.extend_from_slice(chunk_data);
                     self.offset += total;
                     return Ok(());
@@ -1072,6 +1088,61 @@ mod tests {
             chunk = dec.feed(&[]).unwrap();
         }
         assert_eq!(reconstructed, plaintext);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_rejects_compressed_chunk_with_bad_crc() {
+        // Go parity: golang/snappy v0.0.4 verifies the masked CRC-32C of the
+        // decompressed data and fails with ErrCorrupt on mismatch. Corrupt
+        // the CRC field of an otherwise-valid compressed chunk — the decoder
+        // must reject it instead of silently accepting the data.
+        let plaintext = vec![0x42u8; 5000]; // repetitive → compresses (0x00 chunk)
+        let compressed = compress(&plaintext).unwrap();
+        assert!(compressed.starts_with(b"\xff\x06\x00\x00sNaPpY"));
+        // First data chunk: 4-byte header at 10, CRC field at 14..18.
+        assert_eq!(compressed[10], 0x00, "expected a compressed data chunk");
+        let mut corrupted = compressed.clone();
+        corrupted[14] ^= 0xFF; // flip the CRC field, payload untouched
+
+        let mut dec = SnappyDecompressor::new();
+        let error = dec.feed(&corrupted).unwrap_err();
+        assert!(error.contains("crc32c"), "unexpected error: {error}");
+
+        // The unmodified stream still decodes (control).
+        let mut dec = SnappyDecompressor::new();
+        assert_eq!(dec.feed(&compressed).unwrap(), plaintext);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_rejects_uncompressed_chunk_with_bad_crc() {
+        // Same parity check for the uncompressed (0x01) chunk arm: Go reads
+        // the checksum and compares it against the raw chunk bytes.
+        let plaintext = b"uncompressed-chunk-crc-data";
+        let crc = crate::crc32c::crc32c_masked(plaintext).to_le_bytes();
+        let chunk_len = (4 + plaintext.len()) as u32;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"\xff\x06\x00\x00sNaPpY");
+        frame.push(0x01);
+        frame.push(chunk_len as u8);
+        frame.push((chunk_len >> 8) as u8);
+        frame.push((chunk_len >> 16) as u8);
+        frame.extend_from_slice(&crc);
+        frame.extend_from_slice(plaintext);
+
+        // Correct CRC round-trips.
+        let mut dec = SnappyDecompressor::new();
+        assert_eq!(dec.feed(&frame).unwrap(), plaintext);
+
+        // Flip one payload byte while keeping the original CRC: the checksum
+        // no longer matches and the decoder must reject the chunk.
+        let mut corrupted = frame.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0x01;
+        let mut dec = SnappyDecompressor::new();
+        let error = dec.feed(&corrupted).unwrap_err();
+        assert!(error.contains("crc32c"), "unexpected error: {error}");
     }
 
     #[test]

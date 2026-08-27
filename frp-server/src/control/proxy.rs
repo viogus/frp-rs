@@ -126,7 +126,7 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         }
         // Clean up STCP sk_index (indexed by proxy_name)
         if let Some(key) = info.sk_index_key() {
-            ctx.state.xtcp.sk_index.write().await.remove(key);
+            ctx.state.xtcp.sk_index.remove(key);
         }
         // Clean up VHost routes — HTTP/HTTPS group members share one route:
         // remove the member from the group first; only drop the shared
@@ -529,6 +529,7 @@ mod tests {
             listener_handles: HashMap::new(),
             udp_sockets: HashMap::new(),
             last_ping: tokio::time::Instant::now(),
+            superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // Simulate the handle_new_proxy registration: per-proxy child token.
         let token = ctl.udp_cancel.child_token();
@@ -599,6 +600,7 @@ mod tests {
             listener_handles: HashMap::new(),
             udp_sockets: HashMap::new(),
             last_ping: tokio::time::Instant::now(),
+            superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let bridge_token = ctl.bridge_cancel.clone();
         assert!(!bridge_token.is_cancelled(), "token starts live");
