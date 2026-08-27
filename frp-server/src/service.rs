@@ -1679,6 +1679,27 @@ impl Service {
                             &state, &run_id, control_id,
                         )
                         .await;
+                        // Plugin user-info entry for this run_id: same leak
+                        // shape as the OIDC subject above. unregister_control
+                        // only drops it when IT removed the run_id_to_ctl_tx
+                        // entry (removed_control_id), but this sweep's
+                        // remove_if deleted that entry first, so the
+                        // generation guard fails there and remove_user is
+                        // skipped — the plugin `users` map (http.rs:97-101,
+                        // "bounded by live controls") would otherwise grow by
+                        // one entry per control that exited without a clean
+                        // unregister: exactly the path this reaper exists
+                        // for. Removal is unconditional on run_id (the map
+                        // carries no control_id); the remove_if above already
+                        // verified this run_id's entry belonged to the swept
+                        // generation, so a control that re-logged in with a
+                        // fresh generation between the sweep list and here
+                        // can only lose its identity entry in a narrow race
+                        // already present in unregister_control's own
+                        // generation-guarded removal — and the entry is
+                        // re-recorded on the next login hook, which the
+                        // fresh control runs on its accept path.
+                        state.plugin_manager.remove_user(&run_id);
                         tracing::info!(
                             run_id = %run_id,
                             "removed stale control entry (handler died)"

@@ -12,7 +12,8 @@ use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use serde_json::json;
 
 use common::{
-    allocate_port, login_with_identity, login_with_test_token, start_test_server, test_auth_cfg,
+    allocate_port, login_with_identity, login_with_test_token, raw_login_full, start_test_server,
+    test_auth_cfg, TEST_TOKEN,
 };
 use frp_core::config::{HttpPluginConfig, ServerConfig};
 use frp_core::msg::{self, FrpMessage, NewProxy};
@@ -71,7 +72,20 @@ async fn mock_handler(
             "rejectReason": state.reject_reason,
         })));
     }
-    if let Some(content) = state.mutate_response.clone() {
+    if let Some(mutation) = state.mutate_response.clone() {
+        // Real Go plugins echo the received content with their changes:
+        // the server decodes the response `content` into a FRESH struct
+        // (http.go:78), so fields the plugin omits are zeroed. Echo the
+        // request content with the mutation's keys applied on top.
+        let mut content = body
+            .get("content")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let (Some(c), Some(m)) = (content.as_object_mut(), mutation.as_object()) {
+            for (k, v) in m {
+                c.insert(k.clone(), v.clone());
+            }
+        }
         // unchange:false + content → the server must apply the mutation.
         return axum::response::IntoResponse::into_response(axum::Json(json!({
             "reject": false,
@@ -320,6 +334,33 @@ async fn test_plugin_ops_filtering() {
     );
 }
 
+/// ops filtering: a config op Go would never match (unknown name) must
+/// silently never fire — the notify filter exact-compares against the
+/// fixed Go op set after load-time normalization.
+#[tokio::test]
+async fn test_plugin_unknown_op_never_fires() {
+    let state = Arc::new(MockPluginState::default());
+    let port = start_mock_plugin(state.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: test_auth_cfg(),
+        http_plugins: vec![plugin_cfg(port, vec!["bogus"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+    let (provider, resp) = login_with_test_token(addr).await.expect("login succeeds");
+    assert!(resp.error.is_none(), "login rejected: {:?}", resp.error);
+    drop(provider);
+    assert!(
+        state.captured.lock().unwrap().is_none(),
+        "plugin with an unknown op must never be called"
+    );
+}
+
 /// A malformed (non-JSON) plugin response fails closed — the operation must
 /// be rejected, not silently passed through (Go handleMutableContent parity).
 #[tokio::test]
@@ -496,7 +537,7 @@ async fn test_plugin_new_proxy_content_user_object_and_fields() {
         .find(|(op, _)| op == "Login")
         .expect("Login hook must fire");
     assert!(
-        login_content.get("user").map_or(true, |u| u.is_string()),
+        login_content.get("user").is_none_or(|u| u.is_string()),
         "Login content carries the flat user string, never the user object (Go LoginContent parity)"
     );
     assert_eq!(
@@ -615,4 +656,192 @@ async fn test_plugin_new_proxy_mutation_applied() {
     );
     assert!(resp.error.is_none(), "NewProxy rejected: {:?}", resp.error);
     drop(provider);
+}
+
+/// Mutating plugins chain (Go handleMutableContent, manager.go:79-83):
+/// plugin N receives plugin N-1's output, not the original content.
+#[tokio::test]
+async fn test_plugin_mutations_chain() {
+    let first = Arc::new(MockPluginState {
+        mutate_response: Some(json!({ "chain_stage": 1 })),
+        ..Default::default()
+    });
+    let second = Arc::new(MockPluginState {
+        mutate_response: Some(json!({ "chain_stage": 2 })),
+        ..Default::default()
+    });
+    let first_port = start_mock_plugin(first.clone()).await;
+    let second_port = start_mock_plugin(second.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: test_auth_cfg(),
+        http_plugins: vec![
+            plugin_cfg(first_port, vec!["Login"], true),
+            plugin_cfg(second_port, vec!["Login"], true),
+        ],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+    let (provider, resp) = login_with_test_token(addr).await.expect("login succeeds");
+    assert!(resp.error.is_none(), "login rejected: {:?}", resp.error);
+    drop(provider);
+
+    // The second plugin must have received the FIRST plugin's output
+    // (chain_stage:1) — not the original login content.
+    let requests = second.requests.lock().unwrap();
+    let (_, content) = requests
+        .iter()
+        .find(|(op, _)| op == "Login")
+        .expect("second plugin's Login hook must fire");
+    assert_eq!(
+        content["chain_stage"], 1,
+        "plugin 2 must see plugin 1's mutated content (chaining)"
+    );
+}
+
+/// Go parity (server/service.go handleConnection): the plugin hook runs
+/// BEFORE VerifyLogin (inside RegisterControl) — a failed-auth (bad token)
+/// login STILL reaches the plugin. Monitoring/security plugins depend on
+/// seeing every login attempt. The plugin's rejection reason surfaces in
+/// the LoginResp error, not the token-auth error.
+#[tokio::test]
+async fn test_plugin_reached_before_auth_on_bad_token() {
+    let state = Arc::new(MockPluginState {
+        reject: true,
+        reject_reason: "denied by policy".into(),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(state.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: test_auth_cfg(),
+        http_plugins: vec![plugin_cfg(port, vec!["Login"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let (conn, resp) = raw_login_full(
+        addr,
+        Some("wrong-privilege-key".into()),
+        Some(ts),
+        TEST_TOKEN,
+        None,
+        None,
+        Some(1),
+    )
+    .await
+    .expect("login returns a response");
+    assert!(
+        resp.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("denied by policy"),
+        "the plugin (not auth) must reject a bad-token login, got: {:?}",
+        resp.error
+    );
+    assert!(
+        state.captured.lock().unwrap().is_some(),
+        "the Login hook must fire before auth — a failed-auth login still reaches the plugin"
+    );
+    drop(conn);
+}
+
+/// Go parity: VerifyLogin verifies the MUTATED login (`m = &retContent.Login`,
+/// service.go:467-473) — a plugin that repairs the privilege_key (and
+/// timestamp) turns a bad-token login into a successful one.
+#[tokio::test]
+async fn test_plugin_mutation_repairs_bad_token() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let good_key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let mutator = Arc::new(MockPluginState {
+        mutate_response: Some(json!({
+            "privilege_key": good_key,
+            "timestamp": ts,
+        })),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(mutator.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: test_auth_cfg(),
+        http_plugins: vec![plugin_cfg(port, vec!["Login"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+
+    let (conn, resp) = raw_login_full(
+        addr,
+        Some("wrong-privilege-key".into()),
+        Some(ts),
+        TEST_TOKEN,
+        None,
+        None,
+        Some(1),
+    )
+    .await
+    .expect("login returns a response");
+    assert!(
+        resp.error.is_none(),
+        "auth must verify the MUTATED login (plugin repaired the token), got: {:?}",
+        resp.error
+    );
+    drop(conn);
+}
+
+/// Go parity: the negative pool_count rejection runs in NewControl AFTER
+/// VerifyLogin (server/control.go:437), so it sees the MUTATED login — a
+/// plugin that repairs pool_count (-1 → 1) lets the login proceed instead
+/// of the rejection firing on the pre-mutation value.
+#[tokio::test]
+async fn test_plugin_mutation_repairs_negative_pool_count() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let mutator = Arc::new(MockPluginState {
+        mutate_response: Some(json!({ "pool_count": 1 })),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(mutator.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: test_auth_cfg(),
+        http_plugins: vec![plugin_cfg(port, vec!["Login"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+
+    let (conn, resp) = raw_login_full(addr, Some(key), Some(ts), TEST_TOKEN, None, None, Some(-1))
+        .await
+        .expect("login returns a response");
+    assert!(
+        resp.error.is_none(),
+        "pool_count must be validated on the MUTATED login (plugin repaired -1), got: {:?}",
+        resp.error
+    );
+    drop(conn);
 }

@@ -194,29 +194,10 @@ async fn verify_login_auth(
         );
     }
 
-    // Round 6 (MEDIUM B5): reject an already-throttled IP BEFORE auth —
-    // a brute-force flood of bad tokens must not pay full MD5 / OIDC JWT
-    // verify CPU per attempt. Pure check (no slot consumed): the failure
-    // paths below still consume a slot via `throttled_login_error`, so a
-    // successful login never counts and window semantics are unchanged.
-    // Skipped for internal AlwaysAuthPass (bypass paths never throttle).
-    if !is_auth_bypass && state.is_login_throttled(peer).await {
-        warn!(
-            peer = ?peer,
-            "Login rejected pre-auth: IP already throttled",
-        );
-        send_login_error(
-            stream,
-            err_msg(
-                state.detailed_errors_to_client,
-                "login throttled: too many failed attempts".to_string(),
-                "login throttled",
-            ),
-            v2,
-        )
-        .await;
-        return Err(());
-    }
+    // The pre-auth throttle gate lives in `authenticate`, BEFORE the plugin
+    // hook (see there — a throttled IP must not trigger plugin HTTP calls
+    // either). The failure paths below still consume a slot via
+    // `throttled_login_error`.
 
     let oidc_subject: Option<String> = if is_auth_bypass {
         None
@@ -340,23 +321,9 @@ async fn verify_login_auth(
             return Err(());
         }
 
-        // --- Reject negative pool_count (Go frp v0.71.0 fix) ---
-        // Go frp 0.71.0 fixed a server panic / remote DoS caused by a client
-        // sending a negative pool_count: negative values are rejected before
-        // work-connection pool resources are allocated. frp-rs previously
-        // clamped to 1 (no panic), but reject to match Go behavior.
-        if let Some(pc) = login.pool_count {
-            if pc < 0 {
-                warn!(peer = ?peer, pool_count = %pc, "Login rejected: negative pool_count {}", pc);
-                send_login_error(
-                    stream,
-                    format!("invalid pool count {pc}: must be non-negative"),
-                    v2,
-                )
-                .await;
-                return Err(());
-            }
-        }
+        // The negative pool_count rejection now lives in `authenticate`,
+        // AFTER the plugin hook and auth — Go NewControl parity, validated
+        // against the MUTATED login (control.go:437).
 
         // --- Validate run_id (Go frp v0.71.0 ValidateRunID) ---
         // Go 0.71.0 server/service.go rejects a client-supplied run id that is
@@ -515,47 +482,60 @@ pub(crate) async fn authenticate(
     // so legitimate reconnects are never throttled. A throttled IP is
     // rejected for the 60s window after the 5th failure (per-IP fixed 60s
     // window anchored at the first counted failure, capped table with a
-    // coarse overflow bucket). Rejection here returns Err(()) and the
-    // login error response is sent by the caller.
+    // coarse overflow bucket).
 
-    // --- Authenticate ---
-    // Split into its own state machine (OIDC/token verification + timestamp
-    // replay protection) so this function and the auth phase are each much
-    // smaller than the previous single 45 KiB future.
-    //
-    // The auth future is polled through a `dyn Future` vtable: `#[inline(never)]`
-    // does not stop LLVM from inlining an async fn's poll into its single
-    // caller, which would merge the two state machines back into one giant
-    // function. One vtable call per connection is irrelevant (auth runs once).
-    type AuthFuture<'a> = dyn Future<
-            Output = Result<
-                (
-                    Option<String>,
-                    Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
-                ),
-                (),
-            >,
-        > + Send
-        + 'a;
-    let auth_fut: Pin<Box<AuthFuture<'_>>> =
-        Box::pin(verify_login_auth(stream, login, &state, peer, v2, internal));
-    let (oidc_subject, mut stream) = auth_fut.await?;
+    // --- Throttle gate FIRST (frp-rs DoS protection — no Go equivalent) ---
+    // Round 6 (MEDIUM B5): reject an already-throttled IP BEFORE any work —
+    // before auth AND before the server plugin hook, so a brute-force flood
+    // of bad tokens pays neither MD5 / OIDC JWT verify CPU per attempt nor
+    // triggers plugin HTTP round-trips (the plugin can be a remote service).
+    // Pure check (no slot consumed): the failure paths below still consume
+    // a slot via `throttled_login_error`, so a successful login never
+    // counts and window semantics are unchanged. Skipped for internal
+    // AlwaysAuthPass (bypass paths never throttle).
+    let is_auth_bypass = internal
+        && login
+            .client_spec
+            .as_ref()
+            .and_then(|cs| cs.always_auth_pass)
+            .unwrap_or(false);
+    if !is_auth_bypass && state.is_login_throttled(peer).await {
+        warn!(
+            peer = ?peer,
+            "Login rejected pre-auth: IP already throttled",
+        );
+        send_login_error(
+            stream,
+            err_msg(
+                state.detailed_errors_to_client,
+                "login throttled: too many failed attempts".to_string(),
+                "login throttled",
+            ),
+            v2,
+        )
+        .await;
+        return Err(());
+    }
 
-    let reloadable = state.reloadable.read_ok().clone();
-    let authenticated_user = authenticated_user(login.user.as_deref(), oidc_subject.as_deref());
-
+    // Effective run_id: computed up-front (pre-plugin) so the Login hook
+    // payload can carry it — a client that omits run_id still appears as
+    // the assigned UUID (the value registration actually uses).
     let run_id = login
         .run_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
 
-    // The login is cloned into an owned copy so a plugin's mutated content
-    // (unchange:false) can replace fields before pool allocation and
-    // registration — Go ordering (server/service.go:457-475): the plugin
-    // runs after auth verify, and the mutated Login feeds RegisterControl.
+    // --- Server plugin: login hook (Go parity: BEFORE auth verify) ---
+    // Go frp v0.71.0 server/service.go handleConnection: the plugin hook
+    // runs FIRST, and on success the mutated login (`m = &retContent.Login`)
+    // is what RegisterControl consumes — VerifyLogin (token OR OIDC) runs
+    // inside RegisterControl, and the negative pool_count check runs inside
+    // NewControl, both AFTER the plugin. Consequences (Go parity): failed-
+    // auth logins STILL reach plugins (monitoring/security plugins depend
+    // on it), plugin mutations of auth fields (privilege_key / timestamp /
+    // pool_count / user) are honored, and a plugin can repair or reject a
+    // negative pool_count before it is validated.
     let mut login = login.clone();
-    // --- Server plugin: login hook ---
     // Skip payload construction entirely when no plugins are configured
     // (the default) — json! builds a full Value on every login otherwise.
     if !state.plugin_manager.is_empty() {
@@ -617,6 +597,54 @@ pub(crate) async fn authenticate(
             Ok(None) => {}
         }
     }
+
+    // --- Authenticate on the MUTATED login ---
+    // Split into its own state machine (OIDC/token verification + timestamp
+    // replay protection) so this function and the auth phase are each much
+    // smaller than the previous single 45 KiB future.
+    //
+    // The auth future is polled through a `dyn Future` vtable: `#[inline(never)]`
+    // does not stop LLVM from inlining an async fn's poll into its single
+    // caller, which would merge the two state machines back into one giant
+    // function. One vtable call per connection is irrelevant (auth runs once).
+    type AuthFuture<'a> = dyn Future<
+            Output = Result<
+                (
+                    Option<String>,
+                    Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
+                ),
+                (),
+            >,
+        > + Send
+        + 'a;
+    let auth_fut: Pin<Box<AuthFuture<'_>>> = Box::pin(verify_login_auth(
+        stream, &login, &state, peer, v2, internal,
+    ));
+    let (oidc_subject, mut stream) = auth_fut.await?;
+
+    // --- Reject negative pool_count (Go frp v0.71.0 fix; NewControl parity) ---
+    // Go rejects a negative pool_count in NewControl (server/control.go:437),
+    // AFTER RegisterControl's VerifyLogin — so the check runs on the
+    // MUTATED login: a plugin mutation can repair a negative value, and a
+    // negative value introduced by a mutation is rejected here. frp-rs
+    // previously clamped to 1 (no panic), but reject to match Go behavior.
+    if let Some(pc) = login.pool_count {
+        if pc < 0 {
+            warn!(peer = ?peer, pool_count = %pc, "Login rejected: negative pool_count {}", pc);
+            send_login_error(
+                stream,
+                format!("invalid pool count {pc}: must be non-negative"),
+                v2,
+            )
+            .await;
+            return Err(());
+        }
+    }
+
+    let reloadable = state.reloadable.read_ok().clone();
+    let authenticated_user = authenticated_user(login.user.as_deref(), oidc_subject.as_deref());
+    info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
+
     // Record the (possibly plugin-mutated) client identity for the `user`
     // object of later plugin hooks (Go loginUserInfo: LoginMsg.User/Metas
     // + runID).

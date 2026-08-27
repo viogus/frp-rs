@@ -13,19 +13,32 @@ use super::UserInfo;
 /// Go frp v0.70.1 compat: pkg/plugin/server API version.
 const PLUGIN_API_VERSION: &str = "0.1.0";
 
-/// Map Rust snake_case op names to the Go wire names (pkg/plugin/server/manager.go).
-/// Unknown ops pass through unchanged.
+/// Map an op spelling to the Go wire name (pkg/plugin/server/manager.go).
+/// Both the call-site snake_case ("login") and the config-file Go name
+/// ("Login") normalize to the exact Go name; config ops are passed through
+/// this at load time (HttpPluginManager::new) so the notify filter can
+/// exact-compare. Unknown ops pass through unchanged (Go has a fixed op
+/// set — an unknown config op never fires).
 fn go_op_name(op: &str) -> String {
     match op {
-        "login" => "Login".to_string(),
-        "new_proxy" => "NewProxy".to_string(),
-        "close_proxy" => "CloseProxy".to_string(),
-        "ping" => "Ping".to_string(),
-        "new_work_conn" => "NewWorkConn".to_string(),
-        "new_user_conn" => "NewUserConn".to_string(),
+        "login" | "Login" => "Login".to_string(),
+        "new_proxy" | "NewProxy" => "NewProxy".to_string(),
+        "close_proxy" | "CloseProxy" => "CloseProxy".to_string(),
+        "ping" | "Ping" => "Ping".to_string(),
+        "new_work_conn" | "NewWorkConn" => "NewWorkConn".to_string(),
+        "new_user_conn" | "NewUserConn" => "NewUserConn".to_string(),
         // Unknown ops pass through unchanged (call sites use a fixed set).
         other => other.to_string(),
     }
+}
+
+/// Whether `cfg_ops` (already normalized to Go names at load) includes
+/// `go_op`. Exact compare only — Go `IsSupport` is `slices.Contains`
+/// against the Go op name (case-sensitive): a config op spelled "login" or
+/// "new_proxy" fires because load-time normalization mapped it to the Go
+/// name, never because the comparison is lenient.
+fn ops_match(cfg_ops: &[String], go_op: &str) -> bool {
+    cfg_ops.iter().any(|o| o == go_op)
 }
 
 /// JSON payload sent to plugin servers on lifecycle events (Go wire shape:
@@ -131,7 +144,14 @@ impl HttpPluginManager {
         };
         let plugins = configs
             .into_iter()
-            .map(|cfg| {
+            .map(|mut cfg| {
+                // Go matches config ops EXACTLY against the Go op names
+                // (slices.Contains) — a config op spelled "login" or
+                // "new_proxy" never fires on Go. Normalize the Rust-style
+                // spellings to the Go names at load so both styles fire;
+                // the notify filter then exact-compares (unknown ops stay
+                // as-is and never fire, matching Go's fixed op set).
+                cfg.ops = cfg.ops.iter().map(|o| go_op_name(o)).collect();
                 let base = join_plugin_base(&cfg.addr, &cfg.path);
                 let client = if base.starts_with("https://") && !cfg.tls_verify {
                     // Go compat: tlsVerify=false → InsecureSkipVerify.
@@ -206,6 +226,9 @@ impl HttpPluginManager {
     ///   (the operation is rejected, matching Go handleMutableContent).
     /// - `reject:true` rejects with `rejectReason`; `unchange:false` returns
     ///   the mutated content as `Ok(Some(value))`.
+    /// - Mutations chain (Go manager.go:79-83): each plugin receives the
+    ///   previous plugin's output, and `Ok(Some(..))` carries the last
+    ///   mutator's content.
     ///
     /// Returns `Err(reason)` on rejection or plugin failure (fail-closed),
     /// `Ok(Some(mutated))` when a plugin mutated the content, else `Ok(None)`.
@@ -215,27 +238,27 @@ impl HttpPluginManager {
         content: serde_json::Value,
     ) -> Result<Option<serde_json::Value>, String> {
         let go_op = go_op_name(op);
+        // Go handleMutableContent (manager.go:79-83) reassigns `content`
+        // after every unchange:false plugin, so plugin N receives plugin
+        // N-1's output — NOT the original. `cur` is the content each
+        // plugin sees; a mutation replaces it for the next plugin in the
+        // list, and the final value is what the caller applies to the
+        // typed message.
+        let mut cur = content;
         let mut mutated: Option<serde_json::Value> = None;
         for plugin in self.plugins.iter() {
-            // Filter by ops list if non-empty. Configured ops are Go-style
-            // names (Login, NewProxy, ...) while call sites pass Rust-style
-            // snake_case — compare against the mapped Go op name so both
-            // styles match (a pure eq_ignore_ascii_case comparison would
-            // miss the '_' in new_proxy vs NewProxy).
-            if !plugin.cfg.ops.is_empty()
-                && !plugin
-                    .cfg
-                    .ops
-                    .iter()
-                    .any(|o| o.eq_ignore_ascii_case(&go_op))
-            {
+            // Filter by ops list if non-empty. Config ops were normalized
+            // to the Go names at load (HttpPluginManager::new), so this is
+            // an exact compare — Go parity: a config op Go would reject
+            // (lowercase, snake_case, unknown) never fires here either.
+            if !plugin.cfg.ops.is_empty() && !ops_match(&plugin.cfg.ops, &go_op) {
                 continue;
             }
 
             let event = PluginEvent {
                 version: PLUGIN_API_VERSION,
                 op: go_op.clone(),
-                content: content.clone(),
+                content: cur.clone(),
             };
             let timeout = Duration::from_secs(plugin.cfg.timeout.max(1));
 
@@ -367,7 +390,8 @@ impl HttpPluginManager {
                 return Err(reason);
             }
             if !pr.unchange && !pr.content.is_null() {
-                mutated = Some(pr.content);
+                cur = pr.content;
+                mutated = Some(cur.clone());
             }
         }
         Ok(mutated)
@@ -376,7 +400,53 @@ impl HttpPluginManager {
 
 #[cfg(test)]
 mod tests {
-    use super::join_plugin_base;
+    use super::{go_op_name, join_plugin_base, ops_match};
+
+    #[test]
+    fn test_go_op_name_normalizes_both_styles() {
+        // Call-site snake_case and config-file Go names both normalize to
+        // the exact Go wire name.
+        assert_eq!(go_op_name("login"), "Login");
+        assert_eq!(go_op_name("Login"), "Login");
+        assert_eq!(go_op_name("new_proxy"), "NewProxy");
+        assert_eq!(go_op_name("NewProxy"), "NewProxy");
+        assert_eq!(go_op_name("close_proxy"), "CloseProxy");
+        assert_eq!(go_op_name("ping"), "Ping");
+        assert_eq!(go_op_name("new_work_conn"), "NewWorkConn");
+        assert_eq!(go_op_name("new_user_conn"), "NewUserConn");
+        // Unknown ops pass through unchanged.
+        assert_eq!(go_op_name("bogus"), "bogus");
+    }
+
+    #[test]
+    fn test_ops_filter_is_exact_after_normalization() {
+        // snake_case config ops are normalized at load and fire.
+        let snake: Vec<String> = ["new_proxy", "login"].into_iter().map(go_op_name).collect();
+        assert!(
+            ops_match(&snake, "NewProxy"),
+            "normalized snake_case must fire"
+        );
+        assert!(ops_match(&snake, "Login"), "normalized lowercase must fire");
+        assert!(!ops_match(&snake, "Ping"), "unsubscribed op must not fire");
+
+        // CamelCase (Go-style) config ops fire as-is.
+        let camel: Vec<String> = ["NewProxy"].into_iter().map(go_op_name).collect();
+        assert!(ops_match(&camel, "NewProxy"), "CamelCase op must fire");
+
+        // An unknown config op is normalized to itself and exact-compares:
+        // it can never match a fixed Go op name, so it silently never fires.
+        let unknown: Vec<String> = ["bogus"].into_iter().map(go_op_name).collect();
+        assert!(
+            !ops_match(&unknown, "Login"),
+            "unknown op must silently not fire"
+        );
+
+        // A raw lowercase op the loader never normalized must NOT match —
+        // the filter is exact; load-time normalization is what makes
+        // lowercase config ops fire (Go parity for everything else).
+        let raw: Vec<String> = vec!["login".into()];
+        assert!(!ops_match(&raw, "Login"), "unnormalized op must not match");
+    }
 
     #[test]
     fn test_join_plugin_base_variants() {

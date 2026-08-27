@@ -48,66 +48,86 @@ pub struct UserInfo {
     pub run_id: String,
 }
 
-/// Apply a plugin's mutated content (`unchange:false` + `content`) over
-/// the current message, mirroring Go's `handleMutableContent`
+/// Apply a plugin's mutated content (`unchange:false` + `content`) to the
+/// typed message, mirroring Go's `handleMutableContent`
 /// (pkg/plugin/server/manager.go:75-96): a plugin that returns
 /// `unchange:false` replaces the typed struct, and the operation proceeds
 /// with the mutated message.
 ///
-/// Merge semantics: keys present in the mutation replace the current
-/// values; absent keys keep them (Go plugins echo the full received
-/// content with their changes — a partial response works too). Keys the
-/// typed message does not know (`user`, `client_address`, frp-rs extras)
-/// are ignored by the typed deserialization (serde default), so the
-/// plugin-only fields Go adds survive the round-trip harmlessly.
+/// Go semantics (http.go:78): the response `content` is decoded into a
+/// FRESH zero-value struct (`reflect.New` + `json.Unmarshal`) — absent
+/// fields take Go's zero value ("" / nil / 0); they do NOT keep the
+/// current value. `serde_json::from_value::<T>` matches: absent fields
+/// take T's serde defaults (Option fields → None, Go nil/"" parity), so a
+/// plugin that clears a field by omitting it actually clears it. `current`
+/// is deliberately NOT merged into the mutation — Go plugins echo the full
+/// received content with their changes; what they omit is zeroed, not
+/// preserved. Keys the typed message does not know (`user`,
+/// `client_address`, frp-rs extras) are ignored by the typed
+/// deserialization, so plugin-only fields survive the round-trip
+/// harmlessly.
 ///
-/// Returns `Err` (never panics) when the merged content does not
+/// Required non-Option fields absent from the mutation (e.g.
+/// `msg::NewProxy`'s `proxy_name`/`proxy_type`) fail closed here — Go
+/// would zero them and reject the proxy downstream at registration; same
+/// net rejection, explicit error.
+///
+/// Returns `Err` (never panics) when the mutated content does not
 /// deserialize into `T`; callers fail closed on that error.
-pub(crate) fn apply_plugin_mutation<T>(current: &T, mutated: serde_json::Value) -> Result<T, String>
+pub(crate) fn apply_plugin_mutation<T>(
+    _current: &T,
+    mutated: serde_json::Value,
+) -> Result<T, String>
 where
-    T: Serialize + serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned,
 {
-    let mut base = serde_json::to_value(current)
-        .map_err(|e| format!("failed to serialize current content: {e}"))?;
-    if let (Some(obj), serde_json::Value::Object(mutated_obj)) = (base.as_object_mut(), mutated) {
-        for (key, value) in mutated_obj {
-            obj.insert(key, value);
-        }
-    }
-    serde_json::from_value(base).map_err(|e| format!("invalid plugin content mutation: {e}"))
+    serde_json::from_value(mutated).map_err(|e| format!("invalid plugin content mutation: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::apply_plugin_mutation;
 
+    /// Models msg::Login (all optional fields — absent → None) plus one
+    /// required field like msg::NewProxy's proxy_name (absent → fail
+    /// closed).
     #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
     struct TestMsg {
         name: String,
-        count: i32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        count: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         extra: Option<String>,
     }
 
     #[test]
-    fn mutation_replaces_present_keys_keeps_absent() {
+    fn mutation_zeroes_absent_option_fields() {
+        // Go http.go:78: the response content is decoded into a FRESH
+        // zero-value struct — a field the plugin omits takes Go's zero
+        // value, it does NOT keep the current value.
         let current = TestMsg {
             name: "a".into(),
-            count: 1,
+            count: Some(1),
             extra: Some("keep".into()),
         };
-        let mutated = serde_json::json!({ "count": 7 });
+        let mutated = serde_json::json!({ "name": "b" });
         let out = apply_plugin_mutation(&current, mutated).expect("valid mutation");
-        assert_eq!(out.name, "a", "absent key must keep the current value");
-        assert_eq!(out.count, 7, "present key must replace the current value");
-        assert_eq!(out.extra.as_deref(), Some("keep"));
+        assert_eq!(out.name, "b");
+        assert_eq!(
+            out.count, None,
+            "absent field must be zeroed (Go parity), not kept"
+        );
+        assert_eq!(
+            out.extra, None,
+            "absent field must be zeroed (Go parity), not kept"
+        );
     }
 
     #[test]
     fn mutation_ignores_plugin_only_keys() {
         let current = TestMsg {
             name: "a".into(),
-            count: 1,
+            count: Some(1),
             extra: None,
         };
         // Go plugins echo content with the plugin-only `user` object and
@@ -121,17 +141,39 @@ mod tests {
         });
         let out = apply_plugin_mutation(&current, mutated).expect("valid mutation");
         assert_eq!(out.name, "b");
-        assert_eq!(out.count, 1);
+        assert_eq!(
+            out.count, None,
+            "absent optional fields are zeroed, not kept"
+        );
     }
 
     #[test]
     fn mutation_with_wrong_types_fails_closed() {
         let current = TestMsg {
             name: "a".into(),
-            count: 1,
+            count: Some(1),
             extra: None,
         };
-        let mutated = serde_json::json!({ "count": "not-a-number" });
+        let mutated = serde_json::json!({ "name": "a", "count": "not-a-number" });
+        let err = apply_plugin_mutation(&current, mutated).expect_err("must fail");
+        assert!(
+            err.contains("invalid plugin content mutation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mutation_omitting_required_field_fails_closed() {
+        // msg::NewProxy's proxy_name/proxy_type are required (non-Option):
+        // a mutation omitting them cannot deserialize. Go would zero them
+        // and reject the proxy downstream at registration; frp-rs fails
+        // closed at deserialize with an explicit plugin error.
+        let current = TestMsg {
+            name: "a".into(),
+            count: Some(1),
+            extra: None,
+        };
+        let mutated = serde_json::json!({ "count": 7 });
         let err = apply_plugin_mutation(&current, mutated).expect_err("must fail");
         assert!(
             err.contains("invalid plugin content mutation"),
@@ -143,7 +185,7 @@ mod tests {
     fn mutation_full_replacement_echo_works() {
         let current = TestMsg {
             name: "a".into(),
-            count: 1,
+            count: Some(1),
             extra: Some("x".into()),
         };
         // A Go-style plugin echoes the full received content with changes.
@@ -154,7 +196,7 @@ mod tests {
         });
         let out = apply_plugin_mutation(&current, mutated).expect("valid mutation");
         assert_eq!(out.name, "echoed");
-        assert_eq!(out.count, 1);
+        assert_eq!(out.count, Some(1));
         assert_eq!(out.extra.as_deref(), Some("x"));
     }
 }
