@@ -1236,7 +1236,12 @@ impl Service {
             // Reset the consecutive-error count when the previous session was
             // healthy for ≥5 minutes, so a stable connection followed by an
             // occasional blip reconnects from Phase 1 instead of the 20s cap.
-            if ctx.session_started_at.elapsed() > Duration::from_secs(300) {
+            if healthy_resets_error_count(
+                consecutive_err_count,
+                Some(ctx.session_started_at),
+                Instant::now(),
+                Duration::from_secs(300),
+            ) {
                 consecutive_err_count = 0;
             }
             let delay = crate::backoff::reconnect_delay_after_session(
@@ -4231,6 +4236,28 @@ impl Service {
         Ok(format!("reload success: {summary}"))
     }
 }
+/// Whether a session that stayed up for at least `healthy_duration` warrants
+/// resetting the consecutive-error count before the next reconnect backoff.
+///
+/// A long-healthy session followed by an occasional blip must reconnect from
+/// Phase 1 (fast retry) instead of the 20s exponential cap — Go frp's
+/// FastBackoffManager only counts consecutive failures. Sessions shorter than
+/// the healthy duration keep their error count so the backoff cap is
+/// preserved across rapid reconnects.
+///
+/// Pure decision (no clock reads) so the 5-minute production window can be
+/// unit-tested without wall-clock sleeps; the call site supplies `now` and
+/// the production healthy duration.
+fn healthy_resets_error_count(
+    consecutive_err_count: u32,
+    last_session_start: Option<Instant>,
+    now: Instant,
+    healthy_duration: Duration,
+) -> bool {
+    consecutive_err_count > 0
+        && last_session_start.is_some_and(|start| now.duration_since(start) > healthy_duration)
+}
+
 /// Reclaim a stale XTCP entry whose NatHoleResp never arrived in time.
 ///
 /// `key` carries two independent namespaces: it is a provider-side NAT session
@@ -5673,5 +5700,50 @@ mod tests {
                 "dead-proxy NatHoleResp must not spawn a punch task holding the STUN socket"
             );
         }
+    }
+
+    /// The ≥5-minute-healthy-session error-count reset, extracted into a
+    /// pure function so the production window needs no wall-clock sleeps.
+    /// A session that lasted at least the healthy duration resets the
+    /// consecutive-error count (the next reconnect comes back at Phase 1
+    /// instead of the 20s exponential cap); a shorter session keeps the
+    /// count. The comparison is strict (`>`), matching the production
+    /// `elapsed() > 300s` semantics exactly.
+    #[test]
+    fn healthy_session_resets_consecutive_error_count() {
+        let now = Instant::now();
+        let healthy = Duration::from_secs(300);
+
+        // Short session with prior errors: no reset — the backoff cap is
+        // preserved across rapid reconnects.
+        assert!(!healthy_resets_error_count(
+            3,
+            Some(now - Duration::from_secs(60)),
+            now,
+            healthy
+        ));
+        // Session started exactly `healthy` ago: NOT a reset (strict `>`).
+        assert!(!healthy_resets_error_count(
+            3,
+            Some(now - healthy),
+            now,
+            healthy
+        ));
+        // Session longer than the healthy duration with prior errors: reset.
+        assert!(healthy_resets_error_count(
+            3,
+            Some(now - healthy - Duration::from_millis(1)),
+            now,
+            healthy
+        ));
+        // No prior errors: the reset is a no-op — and must not report one.
+        assert!(!healthy_resets_error_count(
+            0,
+            Some(now - healthy - Duration::from_secs(60)),
+            now,
+            healthy
+        ));
+        // No session start (never logged in): no reset.
+        assert!(!healthy_resets_error_count(3, None, now, healthy));
     }
 }

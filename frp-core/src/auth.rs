@@ -384,6 +384,7 @@ mod oidc_impl {
     /// Internal verification error that also records whether a JWKS refresh
     /// could plausibly fix the failure (signature/key material changed) as
     /// opposed to a semantic token error (expired, missing claims, etc.).
+    #[derive(Debug)]
     struct OidcVerifyError {
         message: String,
         refresh_warranted: bool,
@@ -1447,6 +1448,302 @@ mod oidc_impl {
                 "cooldown-elapsed retry must attempt the outbound fetch, got: {err}"
             );
         }
+
+        /// Seed the verifier's JWKS cache with the given keys JSON — same
+        /// no-network fixture pattern as
+        /// `refresh_warranted_retry_skips_outbound_fetch_within_cooldown`.
+        async fn test_verifier_with_jwks(keys: serde_json::Value) -> OidcVerifier {
+            let v = test_verifier();
+            *v.jwks.write().await = Some(CachedJwks {
+                keys,
+                fetched_at: std::time::Instant::now(),
+                refresh_after: std::time::Duration::from_secs(3600),
+            });
+            v
+        }
+
+        /// Encode an HS256 JWT with the given kid and claims.
+        fn encode_hs256(kid: &str, secret: &[u8], claims: &serde_json::Value) -> String {
+            jsonwebtoken::encode(
+                &jsonwebtoken::Header {
+                    alg: jsonwebtoken::Algorithm::HS256,
+                    kid: Some(kid.to_string()),
+                    ..jsonwebtoken::Header::default()
+                },
+                claims,
+                &jsonwebtoken::EncodingKey::from_secret(secret),
+            )
+            .expect("encode HS256 token")
+        }
+
+        #[tokio::test]
+        async fn oidc_verify_login_valid_hs256_token_extracts_claims() {
+            // A VALID HS256 JWT (oct JWKS key, kid match) must verify through
+            // the full verify_login path — algorithm allowlist, kid-key
+            // selection, claim validation (sub/exp) — and yield the extracted
+            // subject, expiry and jti (auth.rs:856-871).
+            const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
+            let v = test_verifier_with_jwks(serde_json::json!({
+                "keys": [{
+                    "kty": "oct",
+                    "kid": "k1",
+                    "k": crate::base64::encode(SECRET),
+                }]
+            }))
+            .await;
+            let future = now() + 3600;
+            let token = encode_hs256(
+                "k1",
+                SECRET,
+                &serde_json::json!({"sub": "alice", "exp": future, "jti": "jti-1"}),
+            );
+
+            let ok = v
+                .verify_login(&token)
+                .await
+                .expect("valid HS256 token must verify");
+            assert_eq!(ok.subject, "alice", "sub claim extraction");
+            assert_eq!(ok.expiry, future, "exp claim extraction");
+            assert_eq!(ok.jti.as_deref(), Some("jti-1"), "jti claim extraction");
+        }
+
+        #[tokio::test]
+        async fn oidc_verify_login_token_with_unknown_kid_rejected() {
+            // kid-selection (auth.rs:839-843): a token whose kid is not
+            // present in the JWKS must fail WITHOUT trying any key — and
+            // because no key was tried the failure is not key-related, so no
+            // refresh-warranted retry (and no outbound JWKS fetch) happens.
+            const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
+            let v = test_verifier_with_jwks(serde_json::json!({
+                "keys": [{
+                    "kty": "oct",
+                    "kid": "k1",
+                    "k": crate::base64::encode(SECRET),
+                }]
+            }))
+            .await;
+            let token = encode_hs256(
+                "missing-kid",
+                SECRET,
+                &serde_json::json!({"sub": "alice", "exp": now() + 3600}),
+            );
+
+            let err = v
+                .verify_login(&token)
+                .await
+                .expect_err("token with an unknown kid must be rejected");
+            assert!(
+                err.contains("JWT verification failed"),
+                "unexpected error: {err}"
+            );
+            assert!(
+                !err.contains("fetch JWKS"),
+                "kid-skip must not trigger an outbound JWKS refresh: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn oidc_try_verify_token_kid_selects_matching_jwks_key() {
+            // Two JWKS keys with distinct secrets: kid-selection must skip
+            // the non-matching key — a token signed with secret B verifies
+            // when presented with kid kB, and fails (InvalidSignature, not a
+            // successful kB decode) when presented with kid kA.
+            const SECRET_A: &[u8] = b"oidc-test-hs256-secret";
+            const SECRET_B: &[u8] = b"oidc-verifier-secret";
+            let v = test_verifier_with_jwks(serde_json::json!({
+                "keys": [
+                    {"kty": "oct", "kid": "kA", "k": crate::base64::encode(SECRET_A)},
+                    {"kty": "oct", "kid": "kB", "k": crate::base64::encode(SECRET_B)},
+                ]
+            }))
+            .await;
+            let validation = {
+                let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+                val.required_spec_claims.insert("sub".to_string());
+                val
+            };
+            let claims = serde_json::json!({"sub": "alice", "exp": now() + 3600});
+
+            // kid kB + secret B → selects the kB key → verifies.
+            let token_b = encode_hs256("kB", SECRET_B, &claims);
+            let ok = v
+                .try_verify_token(&token_b, &validation, Some("kB"))
+                .await
+                .expect("kid kB must select the kB key");
+            assert_eq!(ok.subject, "alice");
+
+            // kid kA + secret B → kid-selection picks kA whose secret
+            // differs; the kB key must NOT be tried, so this is a key-related
+            // signature failure (refresh_warranted).
+            let wrong_kid = encode_hs256("kA", SECRET_B, &claims);
+            let e = v
+                .try_verify_token(&wrong_kid, &validation, Some("kA"))
+                .await
+                .expect_err("wrong key selected for the kid must fail");
+            assert!(
+                e.refresh_warranted,
+                "signature failure with the selected key is key-related"
+            );
+        }
+
+        #[tokio::test]
+        async fn oidc_try_verify_token_rejects_empty_subject() {
+            // "sub" is a required claim (presence is enforced by
+            // jsonwebtoken), but an EMPTY subject must still be rejected —
+            // subject-based proxy routing would otherwise be bypassable
+            // (auth.rs:860-864).
+            const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
+            let v = test_verifier_with_jwks(serde_json::json!({
+                "keys": [{
+                    "kty": "oct",
+                    "kid": "k1",
+                    "k": crate::base64::encode(SECRET),
+                }]
+            }))
+            .await;
+            let validation = {
+                let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+                val.required_spec_claims.insert("sub".to_string());
+                val
+            };
+            // Signed correctly (kid k1 + matching secret) — only sub is empty,
+            // so the rejection must come from the empty-sub check.
+            let token = encode_hs256(
+                "k1",
+                SECRET,
+                &serde_json::json!({"sub": "", "exp": now() + 3600}),
+            );
+
+            let e = v
+                .try_verify_token(&token, &validation, Some("k1"))
+                .await
+                .expect_err("empty subject must be rejected");
+            assert!(
+                e.message.contains("subject (sub) is empty"),
+                "unexpected error: {}",
+                e.message
+            );
+            assert!(
+                !e.refresh_warranted,
+                "empty-sub is a semantic error, not key-related"
+            );
+        }
+
+        /// Counting token endpoint for OidcClient caching tests: serves every
+        /// request with a fixed JSON body and counts how many requests
+        /// arrived. Unlike `TokenEndpointCapture` (which handles exactly one
+        /// request and captures its form body), this variant accepts an
+        /// arbitrary number of connections so cache-hit vs re-fetch behavior
+        /// can be asserted via the request count.
+        struct CountingTokenEndpoint {
+            _addr: std::net::SocketAddr,
+            served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl CountingTokenEndpoint {
+            /// Response includes `expires_in` → the client may cache the token.
+            async fn with_expires_in() -> CountingTokenEndpoint {
+                Self::start(r#"{"access_token":"tok-1","expires_in":3600}"#)
+            }
+
+            /// Response omits `expires_in` → the client must switch to
+            /// non-caching mode (Go frp nonCachingTokenSource parity).
+            async fn without_expires_in() -> CountingTokenEndpoint {
+                Self::start(r#"{"access_token":"tok-1"}"#)
+            }
+
+            fn start(body: &'static str) -> CountingTokenEndpoint {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let served_for_thread = served.clone();
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        let mut stream = match stream {
+                            Ok(s) => s,
+                            Err(_) => break,
+                        };
+                        served_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let mut buf = [0u8; 16384];
+                        let _ = std::io::Read::read(&mut stream, &mut buf);
+                        // Connection: close makes hyper open a fresh connection
+                        // per request, so the counter is per-request exact.
+                        let _ = std::io::Write::write_all(
+                            &mut stream,
+                            format!(
+                                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                });
+                CountingTokenEndpoint {
+                    _addr: addr,
+                    served,
+                }
+            }
+
+            fn count(&self) -> usize {
+                self.served.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+
+        async fn test_oidc_client_with_endpoint(endpoint: &str) -> OidcClient {
+            OidcClient::new(
+                "client-1".into(),
+                "secret".into(),
+                "api-prod".into(),
+                Some(endpoint.to_string()),
+                "openid".into(),
+                None,
+                &std::collections::HashMap::new(),
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("OidcClient::new")
+        }
+
+        #[tokio::test]
+        async fn test_oidc_client_fetches_fresh_token_when_expires_in_omitted() {
+            // Go frp parity (nonCachingTokenSource): when the token endpoint
+            // omits `expires_in` the client cannot know when the token
+            // expires, so every get_token call must hit the network again
+            // instead of serving from the cache (auth.rs:1209-1212).
+            let endpoint = CountingTokenEndpoint::without_expires_in().await;
+            let client =
+                test_oidc_client_with_endpoint(&format!("http://{}/token", endpoint._addr)).await;
+
+            let t1 = client.get_token().await.expect("first fetch");
+            let t2 = client.get_token().await.expect("second fetch");
+            assert_eq!(t1, "tok-1");
+            assert_eq!(t2, "tok-1");
+            assert_eq!(
+                endpoint.count(),
+                2,
+                "missing expires_in must force a fresh fetch per call"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_oidc_client_caches_token_until_expiry() {
+            // With expires_in present, the second call inside the expiry
+            // window must be served from the cache — exactly one HTTP fetch
+            // total (auth.rs:1214-1219).
+            let endpoint = CountingTokenEndpoint::with_expires_in().await;
+            let client =
+                test_oidc_client_with_endpoint(&format!("http://{}/token", endpoint._addr)).await;
+
+            let t1 = client.get_token().await.expect("first fetch");
+            let t2 = client.get_token().await.expect("cached token");
+            assert_eq!(t1, "tok-1");
+            assert_eq!(t2, "tok-1");
+            assert_eq!(endpoint.count(), 1, "second call must hit the cache");
+        }
     }
 }
 
@@ -1813,6 +2110,39 @@ mod tests {
         let gen = generate_token(token, ts);
         assert!(verify_token(token, ts, &gen));
         assert!(!verify_token(token, ts + 1, &gen));
+    }
+
+    #[test]
+    fn test_validate_timestamp_freshness_table() {
+        use crate::auth::validate_timestamp_freshness;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // timeout 关闭
+        assert!(validate_timestamp_freshness(now, 0).is_ok());
+        // 秒精度: 窗口内通过, 窗口外拒绝 (边界留 2s 余量防时钟秒翻转)
+        assert!(validate_timestamp_freshness(now + 59, 60).is_ok());
+        assert!(validate_timestamp_freshness(now - 59, 60).is_ok());
+        assert!(validate_timestamp_freshness(now + 62, 60).is_err());
+        assert!(validate_timestamp_freshness(now - 62, 60).is_err());
+        // 毫秒精度时间戳: 任一解释入窗即通过
+        let now_ms = now.saturating_mul(1000);
+        assert!(validate_timestamp_freshness(now_ms + 30_000, 60).is_ok());
+        assert!(validate_timestamp_freshness(now_ms - 30_000, 60).is_ok());
+        assert!(validate_timestamp_freshness(now_ms + 70_000, 60).is_err());
+        assert!(validate_timestamp_freshness(now_ms - 70_000, 60).is_err());
+        // 溢出防线: 极端输入必须 Err, 永不 panic
+        assert!(validate_timestamp_freshness(i64::MAX, 60).is_err());
+        assert!(validate_timestamp_freshness(i64::MIN, 60).is_err());
+    }
+
+    #[test]
+    fn test_generate_token_golden_go_vector() {
+        assert_eq!(
+            generate_token("frp-golden-vector", 1234567890),
+            "4f5c0efd73397dd75b0524aaff772dd4"
+        );
     }
 
     /// Local capture server for OIDC token-endpoint requests. Parses the

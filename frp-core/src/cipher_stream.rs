@@ -1344,6 +1344,42 @@ mod tests {
         assert_eq!(n, 0, "should get EOF after IV with no data");
     }
 
+    /// Peer closes after writing only PART of the 16-byte IV: the read must
+    /// return UnexpectedEof — not hang, and not decrypt with a partial IV.
+    #[tokio::test]
+    async fn eof_mid_iv_returns_unexpected_eof() {
+        let (mut client, server) = duplex(1024);
+        // Write 5 of the 16 IV bytes, then close.
+        client.write_all(&[0xABu8; 5]).await.unwrap();
+        drop(client);
+
+        let mut reader = CipherReader::new(server, TEST_KEY);
+        let mut buf = [0u8; 64];
+        let err = reader.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("EOF while reading IV"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Same EOF-mid-IV contract for the combined CipherStream reader.
+    #[tokio::test]
+    async fn cipher_stream_eof_mid_iv_returns_unexpected_eof() {
+        let (mut client, server) = duplex(1024);
+        client.write_all(&[0xCDu8; 5]).await.unwrap();
+        drop(client);
+
+        let mut stream = CipherStream::new(server, TEST_KEY);
+        let mut buf = [0u8; 64];
+        let err = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("EOF while reading IV"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// Verify that the scratch buffer is reused across multiple sequential writes,
     /// producing correct round-trip decryption for each chunk and the concatenated result.
     #[tokio::test]

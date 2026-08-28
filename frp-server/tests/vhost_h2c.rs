@@ -21,7 +21,12 @@ use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
-fn http_proxy(name: &str, domains: Vec<String>) -> NewProxy {
+fn http_proxy(
+    name: &str,
+    domains: Vec<String>,
+    http_user: Option<&str>,
+    http_pwd: Option<&str>,
+) -> NewProxy {
     NewProxy {
         proxy_name: name.into(),
         proxy_type: "http".into(),
@@ -35,8 +40,8 @@ fn http_proxy(name: &str, domains: Vec<String>) -> NewProxy {
         custom_domains: Some(domains),
         subdomain: None,
         locations: None,
-        http_user: None,
-        http_pwd: None,
+        http_user: http_user.map(String::from),
+        http_pwd: http_pwd.map(String::from),
         host_header_rewrite: None,
         headers: None,
         response_headers: None,
@@ -56,13 +61,22 @@ fn http_proxy(name: &str, domains: Vec<String>) -> NewProxy {
     }
 }
 
-/// Start a test frps + a provider registered with an HTTP proxy for `domain`,
-/// with one work conn already pooled. Returns
-/// `(bind_addr, vhost_addr, provider_control, work_conn)`.
-async fn setup(
+/// Start a test frps + a provider registered with an HTTP proxy for `domain`
+/// (optionally Basic-auth protected) with one work conn already pooled.
+/// Returns `(bind_addr, vhost_addr, provider_control, run_id, work_conn)`.
+async fn setup_auth(
     proxy_name: &str,
     domain: &str,
-) -> (SocketAddr, SocketAddr, IoStream, tokio::net::TcpStream) {
+    http_user: Option<&str>,
+    http_pwd: Option<&str>,
+    vhost_http_timeout: u64,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    IoStream,
+    String,
+    tokio::net::TcpStream,
+) {
     let bind_port = allocate_port();
     let vhost_port = allocate_port();
 
@@ -70,6 +84,7 @@ async fn setup(
         bind_addr: "127.0.0.1".into(),
         bind_port,
         vhost_http_port: vhost_port,
+        vhost_http_timeout,
         auth: test_auth_cfg(),
         ..Default::default()
     };
@@ -80,7 +95,12 @@ async fn setup(
     // Provider registers an HTTP proxy.
     let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("run_id");
-    let np = FrpMessage::NewProxy(Box::new(http_proxy(proxy_name, vec![domain.into()])));
+    let np = FrpMessage::NewProxy(Box::new(http_proxy(
+        proxy_name,
+        vec![domain.into()],
+        http_user,
+        http_pwd,
+    )));
     write_msg_v1(&mut provider, &np)
         .await
         .expect("send NewProxy");
@@ -106,7 +126,21 @@ async fn setup(
     .await
     .expect("send NewWorkConn");
 
-    (addr, vhost_addr, provider, work_conn)
+    (addr, vhost_addr, provider, run_id, work_conn)
+}
+
+/// Convenience wrapper: default vhost_http_timeout (30s), no Basic auth.
+async fn setup(
+    proxy_name: &str,
+    domain: &str,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    IoStream,
+    String,
+    tokio::net::TcpStream,
+) {
+    setup_auth(proxy_name, domain, None, None, 30).await
 }
 
 /// Connect an h2 client to the vhost port and drive its connection task.
@@ -163,7 +197,8 @@ async fn read_h2_body(mut body: h2::RecvStream) -> Vec<u8> {
 
 #[tokio::test]
 async fn test_h2c_get_forwarded_as_http1() {
-    let (_bind, vhost_addr, _provider, mut work_conn) = setup("h2c-get", "h2c.example.com").await;
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-get", "h2c.example.com").await;
 
     let mut client = h2_connect(vhost_addr).await;
     let request = http::Request::builder()
@@ -212,7 +247,7 @@ async fn test_h2c_get_forwarded_as_http1() {
 
 #[tokio::test]
 async fn test_h2c_chunked_backend_response() {
-    let (_bind, vhost_addr, _provider, mut work_conn) =
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
         setup("h2c-chunked", "chunk.example.com").await;
 
     let mut client = h2_connect(vhost_addr).await;
@@ -255,7 +290,8 @@ async fn test_h2c_chunked_backend_response() {
 
 #[tokio::test]
 async fn test_h2c_post_body_forwarded_chunked() {
-    let (_bind, vhost_addr, _provider, mut work_conn) = setup("h2c-post", "post.example.com").await;
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-post", "post.example.com").await;
 
     let mut client = h2_connect(vhost_addr).await;
     let request = http::Request::builder()
@@ -327,7 +363,8 @@ async fn test_h2c_post_body_forwarded_chunked() {
 
 #[tokio::test]
 async fn test_h2c_404_unmapped_host() {
-    let (_bind, vhost_addr, _provider, _work_conn) = setup("h2c-404", "mapped.example.com").await;
+    let (_bind, vhost_addr, _provider, _run_id, _work_conn) =
+        setup("h2c-404", "mapped.example.com").await;
 
     let mut client = h2_connect(vhost_addr).await;
     let request = http::Request::builder()
@@ -394,4 +431,155 @@ async fn test_h2c_preface_then_silence_dropped_at_timeout() {
         closed.is_ok(),
         "h2c handshake deadline did not release the connection within 5s"
     );
+}
+
+/// h2c Basic-auth branch: a request without credentials against an
+/// `http_user`/`http_pwd` route must get an HTTP/2 401 (with the
+/// `www-authenticate` challenge) and must NOT be forwarded to a backend;
+/// the same connection then succeeds with the correct Authorization header
+/// (base64("user:pass") = dXNlcjpwYXNz), proving the auth check matches
+/// credentials rather than blanket-rejecting h2.
+#[tokio::test]
+async fn test_h2c_401_without_credentials() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) = setup_auth(
+        "h2c-auth",
+        "auth.example.com",
+        Some("user"),
+        Some("pass"),
+        30,
+    )
+    .await;
+
+    let mut client = h2_connect(vhost_addr).await;
+
+    // No credentials → HTTP/2 401, never forwarded.
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://auth.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+    let response = response_fut.await.expect("h2 response");
+    assert_eq!(response.status().as_u16(), 401);
+    assert_eq!(
+        response.headers()["www-authenticate"].to_str().unwrap(),
+        "Basic realm=\"frp\""
+    );
+    let body = read_h2_body(response.into_body()).await;
+    assert!(body.is_empty());
+    // The pooled work conn must stay silent — the 401 was generated in the
+    // vhost layer, no StartWorkConn reached a backend.
+    let swc = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        read_msg_v1(&mut work_conn),
+    )
+    .await;
+    assert!(
+        swc.is_err(),
+        "401 request must not be forwarded to a backend (StartWorkConn sent)"
+    );
+
+    // Correct credentials on the SAME h2 connection → forwarded, 200.
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://auth.example.com/")
+        .header("authorization", "Basic dXNlcjpwYXNz")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+    read_start_work_conn(&mut work_conn).await;
+    let head = read_request_bytes(&mut work_conn).await;
+    // h2 header names are lowercase (HPACK); the module re-encodes them
+    // as-is into the HTTP/1.1 head (Go's net/http would title-case them —
+    // both are legal, RFC 7230 §3.2 makes field names case-insensitive).
+    // The property under test is the VALUE arriving intact.
+    assert!(
+        String::from_utf8_lossy(&head).contains("authorization: Basic dXNlcjpwYXNz\r\n"),
+        "authorization header must be forwarded intact: {}",
+        String::from_utf8_lossy(&head),
+    );
+    work_conn
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        .await
+        .expect("write backend response");
+    let response = response_fut.await.expect("h2 response");
+    assert_eq!(response.status().as_u16(), 200);
+    let body = read_h2_body(response.into_body()).await;
+    assert_eq!(body, b"ok");
+}
+
+/// h2c keep-alive reuse across the vhost_http_timeout: two sequential
+/// requests over ONE h2 connection, the second arriving after an idle
+/// period longer than vhost_http_timeout (2s). The round-8 handshake
+/// deadline applies only to the first accept; later accepts must not be
+/// killed at the deadline or the second request fails.
+#[tokio::test]
+async fn test_h2c_keepalive_reuse_survives_http_timeout() {
+    let (_bind, vhost_addr, mut provider, run_id, mut work_conn) =
+        setup_auth("h2c-ka", "ka.example.com", None, None, 2).await;
+
+    let mut client = h2_connect(vhost_addr).await;
+
+    // Request 1: consumes the pooled work conn.
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://ka.example.com/one")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+    read_start_work_conn(&mut work_conn).await;
+    read_request_bytes(&mut work_conn).await;
+    work_conn
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none")
+        .await
+        .expect("write backend response");
+    let response = response_fut.await.expect("h2 response");
+    assert_eq!(response.status().as_u16(), 200);
+    let body = read_h2_body(response.into_body()).await;
+    assert_eq!(body, b"one");
+
+    // Idle past vhost_http_timeout: if the connection were pinned to the
+    // handshake deadline it would be closed here and request 2 would fail.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Request 2 on the same connection: pool is empty, so the server
+    // requests a fresh work conn via ReqWorkConn on the control channel.
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://ka.example.com/two")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    match read_msg_v1(&mut provider).await.expect("ReqWorkConn") {
+        FrpMessage::ReqWorkConn(_) => {}
+        other => panic!("expected ReqWorkConn, got {:?}", other.v1_type_byte()),
+    }
+    let mut work_conn2 = tokio::net::TcpStream::connect(_bind)
+        .await
+        .expect("second work conn");
+    write_msg_v1(
+        &mut work_conn2,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+    read_start_work_conn(&mut work_conn2).await;
+    let head = read_request_bytes(&mut work_conn2).await;
+    assert!(
+        String::from_utf8_lossy(&head).contains("Host: ka.example.com\r\n"),
+        "head must carry the second request's Host"
+    );
+    work_conn2
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo")
+        .await
+        .expect("write backend response");
+    let response = response_fut.await.expect("h2 response");
+    assert_eq!(response.status().as_u16(), 200);
+    let body = read_h2_body(response.into_body()).await;
+    assert_eq!(body, b"two");
 }

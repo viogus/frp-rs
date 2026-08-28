@@ -915,3 +915,156 @@ async fn test_duplicate_run_id_supersedes_old_control() {
         other => panic!("expected Pong, got type byte: {:?}", other.v1_type_byte()),
     }
 }
+
+/// Supersession under a burst: the old control is mid-work (a burst of
+/// proxy registrations) when the superseding login lands. The old control
+/// must still be torn down promptly — the Shutdown/teardown must not get
+/// stuck behind the burst — and the NEW control must be fully functional
+/// (NewProxyResp resolves, Ping→Pong clean).
+#[tokio::test]
+async fn test_duplicate_run_id_supersedes_under_proxy_burst() {
+    let port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let mk_burst_proxy = |i: usize| {
+        FrpMessage::NewProxy(Box::new(msg::NewProxy {
+            proxy_name: format!("burst-{i}"),
+            proxy_type: "tcp".into(),
+            local_str: Some("127.0.0.1:9876".into()),
+            remote_port: Some(0), // auto-assign
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: None,
+            sk: None,
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: None,
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        }))
+    };
+
+    // First login with an explicit run_id at millisecond ts.
+    let (mut first, resp1) = raw_login_with_run_id(addr, "burst-r1", ts)
+        .await
+        .expect("first login should succeed");
+    assert!(
+        resp1.error.is_none(),
+        "first login should succeed, got: {:?}",
+        resp1.error
+    );
+
+    // Burst of proxy registrations on the OLD control.
+    for i in 0..200 {
+        write_msg_v1(&mut first, &mk_burst_proxy(i))
+            .await
+            .expect("send NewProxy");
+        match read_msg_v1(&mut first).await.expect("read NewProxyResp") {
+            FrpMessage::NewProxyResp(r) => {
+                assert!(
+                    r.error.is_none(),
+                    "burst registration {i} failed: {:?}",
+                    r.error
+                );
+            }
+            other => panic!(
+                "expected NewProxyResp, got type byte {:?}",
+                other.v1_type_byte()
+            ),
+        }
+    }
+
+    // Second login with the SAME run_id (fresh timestamp ts + 1). Wrapped
+    // in a 10s timeout: the supersession handoff must not be blocked
+    // behind the old control's in-flight work.
+    let (mut second, resp2) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_login_with_run_id(addr, "burst-r1", ts + 1),
+    )
+    .await
+    .expect("superseding login hung behind the burst (handoff blocked?)")
+    .expect("second login with same run_id should succeed");
+    assert!(
+        resp2.error.is_none(),
+        "second login should succeed, got: {:?}",
+        resp2.error
+    );
+
+    // The OLD control must be torn down within 5s despite the burst.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while read_msg_v1(&mut first).await.is_ok() {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "old control connection was not closed within 5s of the superseding login (under burst)"
+    );
+
+    // The NEW control must be fully functional: a fresh registration gets
+    // its NewProxyResp.
+    write_msg_v1(&mut second, &mk_burst_proxy(999))
+        .await
+        .expect("send NewProxy on new control");
+    match read_msg_v1(&mut second)
+        .await
+        .expect("read NewProxyResp on new control")
+    {
+        FrpMessage::NewProxyResp(r) => {
+            assert!(
+                r.error.is_none(),
+                "post-supersession registration failed: {:?}",
+                r.error
+            );
+        }
+        other => panic!(
+            "expected NewProxyResp, got type byte {:?}",
+            other.v1_type_byte()
+        ),
+    }
+
+    // And Ping → Pong with no error.
+    let ping = FrpMessage::Ping(msg::Ping {
+        privilege_key: None,
+        timestamp: None,
+    });
+    write_msg_v1(&mut second, &ping)
+        .await
+        .expect("send ping on new control");
+    match read_msg_v1(&mut second).await.expect("read pong") {
+        FrpMessage::Pong(pong) => assert!(
+            pong.error.is_none(),
+            "expected clean Pong on new control, got: {:?}",
+            pong.error
+        ),
+        other => panic!("expected Pong, got type byte: {:?}", other.v1_type_byte()),
+    }
+}

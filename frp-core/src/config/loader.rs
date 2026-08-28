@@ -498,6 +498,18 @@ pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
 pub(super) fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
     validate_proxy_configs(&cfg.proxies)?;
     validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
+    // Go frp v0.71.0: a negative transport.poolCount is invalid client-side
+    // (pkg/config/v1/validation/client.go validateClientTransportConfig).
+    // frp-rs previously accepted negatives silently; 0 keeps its
+    // "use the default" semantics (complete_with_heartbeat_set maps 0 → 1,
+    // Go util.EmptyOr — pinned by
+    // test_explicit_zero_client_pool_count_and_keepalive_use_go_defaults).
+    if cfg.pool_count < 0 {
+        return Err(format!(
+            "client config: invalid poolCount {}, must be non-negative",
+            cfg.pool_count
+        ));
+    }
     // Go frp v0.71.0: unknown feature gates are config errors (featuregate
     // SetFromMap "unrecognized feature gate").
     if !cfg.feature.gates.is_empty() {

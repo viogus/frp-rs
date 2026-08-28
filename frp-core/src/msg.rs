@@ -94,7 +94,7 @@ fn b64_de<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
 // ---------------------------------------------------------------
 
 /// ClientSpec carries client-specific metadata (Go frp compat).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ClientSpec {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub client_type: Option<String>,
@@ -102,7 +102,7 @@ pub struct ClientSpec {
     pub always_auth_pass: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Login {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -132,7 +132,7 @@ pub struct Login {
     pub multiplexer: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoginResp {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -155,7 +155,7 @@ pub struct LoginResp {
 
 pub type LoginResponse = LoginResp;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewProxy {
     pub proxy_name: String,
     pub proxy_type: String,
@@ -226,7 +226,7 @@ pub struct NewProxy {
     pub vnet_mtu: Option<u16>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewProxyResp {
     pub proxy_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,17 +237,17 @@ pub struct NewProxyResp {
 
 pub type NewProxyResponse = NewProxyResp;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CloseProxy {
     pub proxy_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CloseProxyResp {
     pub proxy_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg(feature = "vnet")]
 pub struct VnetRouteAdvertise {
     pub proxy_name: String,
@@ -256,7 +256,7 @@ pub struct VnetRouteAdvertise {
     pub virtual_net: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg(feature = "vnet")]
 pub struct VnetRouteRemove {
     pub proxy_name: String,
@@ -264,7 +264,7 @@ pub struct VnetRouteRemove {
     pub virtual_net: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg(feature = "vnet")]
 pub struct VnetPacket {
     pub proxy_name: String,
@@ -272,12 +272,12 @@ pub struct VnetPacket {
     pub data: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Error {
     pub error: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewWorkConn {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -292,10 +292,10 @@ pub struct NewWorkConn {
 /// `deny_unknown_fields` is intentionally omitted for forward
 /// compatibility with Go frp protocol evolution — new fields added
 /// by future Go frp versions must not cause deserialization failures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReqWorkConn {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StartWorkConn {
     pub proxy_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -335,7 +335,7 @@ pub struct StartWorkConn {
     pub sk: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ping {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub privilege_key: Option<String>,
@@ -343,13 +343,13 @@ pub struct Ping {
     pub timestamp: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pong {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewVisitorConn {
     pub proxy_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -364,7 +364,7 @@ pub struct NewVisitorConn {
     pub use_compression: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewVisitorConnResp {
     pub proxy_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,7 +402,7 @@ impl fmt::Display for UdpAddr {
         write!(f, "{}:{}", self.ip, self.port)
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UDPPacket {
     // Go frp v0.71.0: Content []byte `json:"c,omitempty"` — an empty datagram
     // OMITS "c"; default lets us deserialize it (missing field 'c' would
@@ -425,7 +425,7 @@ pub struct UDPPacket {
 // NAT hole punch messages (Go frp v0.69.1 STCP/XTCP)
 // ---------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NatHoleVisitor {
     pub transaction_id: String,
     pub proxy_name: String,
@@ -448,7 +448,7 @@ pub struct NatHoleVisitor {
 
 /// Port range for NAT hole punch candidate selection.
 /// Go frp v0.69.1 compat.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PortsRange {
     #[serde(default)]
     pub from: i32,
@@ -461,7 +461,7 @@ pub struct PortsRange {
 /// CRITICAL: Go frps uses `json:"...,omitempty"` on ALL fields.
 /// When an integer field is 0, Go omits it from the JSON.
 /// All i32 fields below MUST have #[serde(default)] to handle this.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NatHoleDetectBehavior {
     /// Behavior mode (0-4). Determines role assignment.
     #[serde(default)]
@@ -489,7 +489,7 @@ pub struct NatHoleDetectBehavior {
     pub candidate_ports: Option<Vec<PortsRange>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NatHoleClient {
     pub transaction_id: String,
     pub proxy_name: String,
@@ -511,7 +511,7 @@ pub struct NatHoleClient {
     pub visitor_addr: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NatHoleResp {
     pub transaction_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -537,7 +537,7 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NatHoleSid {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction_id: Option<String>,
@@ -549,7 +549,7 @@ pub struct NatHoleSid {
     pub nonce: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NatHoleReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
@@ -578,7 +578,7 @@ pub struct NatHoleReport {
 // proxy_name-only message without handling CloseProxyResp first.
 // ---------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum FrpMessage {
@@ -899,7 +899,7 @@ impl FrpMessage {
 mod tests {
     use super::*;
 
-    fn roundtrip<T: Serialize + serde::de::DeserializeOwned + std::fmt::Debug>(
+    fn roundtrip<T: Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq>(
         val: &T,
         expected_json: &str,
     ) {
@@ -909,7 +909,11 @@ mod tests {
         let expected: serde_json::Value =
             serde_json::from_str(expected_json).expect("parse expected");
         assert_eq!(v, expected, "serialized JSON mismatch");
-        let _back: T = serde_json::from_str(&json).expect("deserialize");
+        let back: T = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            &back, val,
+            "deserialize must round-trip to the original value"
+        );
     }
 
     #[test]
@@ -954,13 +958,14 @@ mod tests {
             }),
             multiplexer: Some("yamux".into()),
         };
-        let json = serde_json::to_string(&login).expect("serialize");
-        let back: Login = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.version.as_deref(), Some("0.69.1"));
-        assert_eq!(back.hostname.as_deref(), Some("testhost"));
-        assert_eq!(back.pool_count, Some(5));
-        assert_eq!(back.multiplexer.as_deref(), Some("yamux"));
-        assert!(back.metas.as_ref().unwrap().contains_key("k"));
+        // Golden wire format: client_spec serializes as `type` (Go frp
+        // ClientSpec JSON key, msg.rs ClientSpec rename) and must come back
+        // on deserialization — the roundtrip helper's equality assert pins
+        // both directions.
+        roundtrip(
+            &login,
+            r#"{"version":"0.69.1","hostname":"testhost","os":"linux","arch":"amd64","user":"admin","run_id":"abc123","client_id":"cid1","pool_count":5,"timestamp":1234567890,"privilege_key":"key123","metas":{"k":"v"},"client_spec":{"type":"frpc","always_auth_pass":false},"multiplexer":"yamux"}"#,
+        );
     }
 
     #[test]
@@ -1037,6 +1042,120 @@ mod tests {
         assert_eq!(back.host_header_rewrite.as_deref(), Some("backend.local"));
         assert_eq!(back.bandwidth_limit.as_deref(), Some("1MB"));
         assert_eq!(back.group.as_deref(), Some("web"));
+        assert_eq!(
+            back, np,
+            "deserialize must round-trip to the original value"
+        );
+    }
+
+    /// Every NewProxy field must serialize under its snake_case Go wire key.
+    /// Go frp silently ignores unknown keys — a rename typo on ANY field
+    /// would break interop without an error, so each key is pinned here.
+    #[test]
+    fn test_new_proxy_all_fields_wire_keys() {
+        let mut response_headers = std::collections::HashMap::new();
+        response_headers.insert("X-Custom".into(), "v1".into());
+        let mut annotations = std::collections::HashMap::new();
+        annotations.insert("env".into(), "prod".into());
+        let mut metas = std::collections::HashMap::new();
+        metas.insert("region".into(), "us-east".into());
+
+        let np = NewProxy {
+            proxy_name: "all-fields".into(),
+            proxy_type: "http".into(),
+            use_encryption: Some(true),
+            use_compression: Some(true),
+            group: Some("g1".into()),
+            group_key: Some("gk".into()),
+            local_str: Some("127.0.0.1:80".into()),
+            remote_port: Some(8080),
+            sk: Some("sk1".into()),
+            custom_domains: Some(vec!["a.example.com".into(), "b.example.com".into()]),
+            subdomain: Some("sub".into()),
+            locations: Some(vec!["/api".into(), "/admin".into()]),
+            http_user: Some("user".into()),
+            http_pwd: Some("pass".into()),
+            host_header_rewrite: Some("backend.local".into()),
+            headers: None,
+            response_headers: Some(response_headers),
+            route_by_http_user: Some("alice".into()),
+            allow_users: Some(vec!["alice".into(), "bob".into()]),
+            bandwidth_limit: Some("1MB".into()),
+            bandwidth_limit_mode: Some("client".into()),
+            annotations: Some(annotations),
+            metas: Some(metas),
+            multiplexer: Some("yamux".into()),
+            virtual_net: Some("vn1".into()),
+            proxy_protocol_version: Some("v2".into()),
+            advertise_subnet: Some("10.0.0.0/8".into()),
+            vnet_ip: Some("10.0.0.1".into()),
+            vnet_netmask: Some("255.0.0.0".into()),
+            vnet_mtu: Some(1500),
+        };
+        let json = serde_json::to_string(&np).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
+
+        assert_eq!(v["proxy_name"], "all-fields", "proxy_name wire key");
+        assert_eq!(v["proxy_type"], "http", "proxy_type wire key");
+        assert_eq!(v["use_encryption"], true, "use_encryption wire key");
+        assert_eq!(v["use_compression"], true, "use_compression wire key");
+        assert_eq!(v["group"], "g1", "group wire key");
+        assert_eq!(v["group_key"], "gk", "group_key wire key");
+        assert_eq!(v["local_str"], "127.0.0.1:80", "local_str wire key");
+        assert_eq!(v["remote_port"], 8080, "remote_port wire key");
+        assert_eq!(v["sk"], "sk1", "sk wire key");
+        assert_eq!(
+            v["custom_domains"][0], "a.example.com",
+            "custom_domains wire key"
+        );
+        assert_eq!(
+            v["custom_domains"][1], "b.example.com",
+            "custom_domains wire key"
+        );
+        assert_eq!(v["subdomain"], "sub", "subdomain wire key");
+        assert_eq!(v["locations"][0], "/api", "locations wire key");
+        assert_eq!(v["locations"][1], "/admin", "locations wire key");
+        assert_eq!(v["http_user"], "user", "http_user wire key");
+        assert_eq!(v["http_pwd"], "pass", "http_pwd wire key");
+        assert_eq!(
+            v["host_header_rewrite"], "backend.local",
+            "host_header_rewrite wire key"
+        );
+        assert_eq!(
+            v["response_headers"]["X-Custom"], "v1",
+            "response_headers wire key"
+        );
+        assert_eq!(
+            v["route_by_http_user"], "alice",
+            "route_by_http_user wire key"
+        );
+        assert_eq!(v["allow_users"][0], "alice", "allow_users wire key");
+        assert_eq!(v["allow_users"][1], "bob", "allow_users wire key");
+        assert_eq!(v["bandwidth_limit"], "1MB", "bandwidth_limit wire key");
+        assert_eq!(
+            v["bandwidth_limit_mode"], "client",
+            "bandwidth_limit_mode wire key"
+        );
+        assert_eq!(v["annotations"]["env"], "prod", "annotations wire key");
+        assert_eq!(v["metas"]["region"], "us-east", "metas wire key");
+        assert_eq!(v["multiplexer"], "yamux", "multiplexer wire key");
+        assert_eq!(v["virtual_net"], "vn1", "virtual_net wire key");
+        assert_eq!(
+            v["proxy_protocol_version"], "v2",
+            "proxy_protocol_version wire key"
+        );
+        assert_eq!(
+            v["advertise_subnet"], "10.0.0.0/8",
+            "advertise_subnet wire key"
+        );
+        assert_eq!(v["vnet_ip"], "10.0.0.1", "vnet_ip wire key");
+        assert_eq!(v["vnet_netmask"], "255.0.0.0", "vnet_netmask wire key");
+        assert_eq!(v["vnet_mtu"], 1500, "vnet_mtu wire key");
+
+        // Deserialization must recover the exact value (a rename typo in
+        // either direction would surface here as a mismatch).
+        let back: NewProxy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, np);
     }
 
     #[test]
@@ -1155,6 +1274,24 @@ mod tests {
     }
 
     #[test]
+    fn test_new_visitor_conn_resp_roundtrip() {
+        roundtrip(
+            &NewVisitorConnResp {
+                proxy_name: "stcp1".into(),
+                error: None,
+            },
+            r#"{"proxy_name":"stcp1"}"#,
+        );
+        roundtrip(
+            &NewVisitorConnResp {
+                proxy_name: "stcp1".into(),
+                error: Some("denied".into()),
+            },
+            r#"{"proxy_name":"stcp1","error":"denied"}"#,
+        );
+    }
+
+    #[test]
     fn test_udp_packet_base64_roundtrip() {
         let data = vec![0, 1, 2, 255, 100];
         let pkt = UDPPacket {
@@ -1196,6 +1333,29 @@ mod tests {
         // And Rust->Go stays byte-identical: empty content is NOT serialized.
         let out = serde_json::to_string(&pkt).expect("serialize");
         assert_eq!(out, r#"{}"#);
+    }
+
+    #[test]
+    fn test_udp_packet_invalid_base64_rejected() {
+        // Garbage in the base64 "c" content must make deserialization return
+        // Err — never panic and never silently decode to empty (b64_de maps
+        // the decode failure through serde::de::Error::custom).
+        let json = r#"{"c":"!!!not-base64!!!","l":{"IP":"127.0.0.1","Port":53,"Zone":""},"r":{"IP":"10.0.0.1","Port":9999,"Zone":""}}"#;
+        let result = serde_json::from_str::<UDPPacket>(json);
+        assert!(
+            result.is_err(),
+            "garbage base64 content must fail UDPPacket deserialization"
+        );
+
+        // Padding violations are also rejected, not silently tolerated.
+        let bad_padding =
+            r#"{"c":"aGVsbG8=","r":{"IP":"10.0.0.1","Port":9999,"Zone":""},"featureFlags":["x"]}"#;
+        // "aGVsbG8=" is valid; corrupt it: drop the padding.
+        let corrupt = bad_padding.replace("aGVsbG8=", "aGVsbG8");
+        assert!(
+            serde_json::from_str::<UDPPacket>(&corrupt).is_err(),
+            "invalid base64 length must fail deserialization"
+        );
     }
 
     #[test]
@@ -1273,6 +1433,76 @@ mod tests {
         let from_absent: NatHoleVisitor =
             serde_json::from_str(r#"{"transaction_id":"t1","proxy_name":"p1"}"#).expect("parse");
         assert!(!from_absent.pre_check);
+    }
+
+    #[test]
+    fn test_nat_hole_client_roundtrip() {
+        let client = NatHoleClient {
+            transaction_id: "t1".into(),
+            proxy_name: "xtcp-provider".into(),
+            sid: Some("s1".into()),
+            protocol: Some("quic".into()),
+            mapped_addrs: Some(vec!["1.2.3.4:1000".into(), "5.6.7.8:2000".into()]),
+            assisted_addrs: Some(vec!["9.9.9.9:3000".into()]),
+            visitor_addr: Some("8.8.8.8:4000".into()),
+        };
+        roundtrip(
+            &client,
+            r#"{"transaction_id":"t1","proxy_name":"xtcp-provider","sid":"s1","protocol":"quic","mapped_addrs":["1.2.3.4:1000","5.6.7.8:2000"],"assisted_addrs":["9.9.9.9:3000"],"visitor_addr":"8.8.8.8:4000"}"#,
+        );
+    }
+
+    #[test]
+    fn test_nat_hole_resp_roundtrip() {
+        let resp = NatHoleResp {
+            transaction_id: "t1".into(),
+            error: Some("e1".into()),
+            sid: Some("s1".into()),
+            protocol: Some("quic".into()),
+            candidate_addrs: Some(vec!["1.2.3.4:1000".into()]),
+            assisted_addrs: Some(vec!["5.6.7.8:2000".into()]),
+            detect_behavior: Some(NatHoleDetectBehavior {
+                mode: 3,
+                role: Some("sender".into()),
+                ttl: 64,
+                send_delay_ms: 10,
+                // Go wire key is "read_timeout" (rename pins the alias).
+                read_timeout_ms: 5000,
+                send_random_ports: 4,
+                listen_random_ports: 4,
+                candidate_ports: Some(vec![PortsRange {
+                    from: 1000,
+                    to: 2000,
+                }]),
+            }),
+        };
+        roundtrip(
+            &resp,
+            r#"{"transaction_id":"t1","error":"e1","sid":"s1","protocol":"quic","candidate_addrs":["1.2.3.4:1000"],"assisted_addrs":["5.6.7.8:2000"],"detect_behavior":{"mode":3,"role":"sender","ttl":64,"send_delay_ms":10,"read_timeout":5000,"send_random_ports":4,"listen_random_ports":4,"candidate_ports":[{"from":1000,"to":2000}]}}"#,
+        );
+    }
+
+    #[test]
+    fn test_nat_hole_sid_roundtrip() {
+        // response=true is emitted; response=false is omitted (Go omitempty
+        // parity) and defaults back to false on deserialization.
+        let sid = NatHoleSid {
+            transaction_id: Some("t1".into()),
+            sid: Some("s1".into()),
+            response: true,
+            nonce: Some("n1".into()),
+        };
+        roundtrip(
+            &sid,
+            r#"{"transaction_id":"t1","sid":"s1","response":true,"nonce":"n1"}"#,
+        );
+        let quiet = NatHoleSid {
+            transaction_id: Some("t1".into()),
+            sid: Some("s1".into()),
+            response: false,
+            nonce: Some("n1".into()),
+        };
+        roundtrip(&quiet, r#"{"transaction_id":"t1","sid":"s1","nonce":"n1"}"#);
     }
 
     #[test]
@@ -1390,6 +1620,17 @@ mod tests {
         assert_eq!(addr.ip, "10.0.0.1");
         assert_eq!(addr.port, 53);
         assert_eq!(addr.zone, "");
+    }
+
+    #[test]
+    fn test_udp_addr_zone_defaults_to_empty() {
+        // Go's net.UDPAddr always emits Zone, but hand-written JSON may
+        // omit it: the `default` on Zone must fill "" (lenient parse).
+        let addr: UdpAddr =
+            serde_json::from_str(r#"{"IP":"1.2.3.4","Port":53}"#).expect("deserialize");
+        assert_eq!(addr.ip, "1.2.3.4");
+        assert_eq!(addr.port, 53);
+        assert_eq!(addr.zone, "", "missing Zone must default to empty");
     }
 
     #[test]

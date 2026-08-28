@@ -504,4 +504,105 @@ mod tests {
         assert_eq!(mode3_table().len(), MODE_COUNTS[3]);
         assert_eq!(mode4_table().len(), MODE_COUNTS[4]);
     }
+
+    #[test]
+    fn test_hard_nat_modes_1_through_4() {
+        let analyzer = Analyzer::new(Duration::from_secs(3600));
+        // 端口随探针变化 => port_changed => 硬 NAT
+        let hard_addrs = vec!["1.2.3.4:1234".into(), "1.2.3.4:5678".into()];
+        let easy_addrs = vec!["1.2.3.4:1234".into(), "1.2.3.4:1234".into()];
+        let hard = classify_nat_feature(&hard_addrs, &[]).unwrap();
+        let easy = classify_nat_feature(&easy_addrs, &[]).unwrap();
+        for (i, (cf, vf)) in [(&hard, &hard), (&hard, &easy), (&easy, &hard)]
+            .iter()
+            .enumerate()
+        {
+            let (mode, _idx, cb, vb) =
+                analyzer.get_recommend_behaviors(&format!("combo-{i}"), cf, vf);
+            assert!(
+                (0..=4).contains(&mode),
+                "combo {i}: mode {mode} out of range"
+            );
+            assert_ne!(
+                cb.role, vb.role,
+                "combo {i}: roles must pair sender/receiver"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hard_nat_regular_port_change_reaches_modes_3_and_4() {
+        let analyzer = Analyzer::new(Duration::from_secs(3600));
+        // Ports within 1..=5 of each other => regular_ports_change=true
+        // (classify.rs: only PORT_CHANGED behavior with a 1..=5 difference
+        // counts as regular).
+        let regular =
+            classify_nat_feature(&["1.2.3.4:1234".into(), "1.2.3.4:1236".into()], &[]).unwrap();
+        assert!(
+            regular.regular_ports_change,
+            "1234->1236 must classify as a regular port change"
+        );
+        let easy =
+            classify_nat_feature(&["1.2.3.4:1234".into(), "1.2.3.4:1234".into()], &[]).unwrap();
+
+        // Both hard, both regular: the score list is modes 3 + 4; the first
+        // recommend picks mode 3 entry 0.
+        let (mode, index, cb, vb) =
+            analyzer.get_recommend_behaviors("regular-both", &regular, &regular);
+        assert_eq!(mode, 3, "both-regular must start in mode 3");
+        assert_eq!(index, 0);
+        assert_ne!(cb.role, vb.role);
+
+        // One hard regular + one easy: the score list is modes 1, 2, 0; the
+        // first recommend picks mode 1 entry 0.
+        let (mode, _idx, cb, vb) = analyzer.get_recommend_behaviors("regular-one", &regular, &easy);
+        assert_eq!(mode, 1, "hard-regular vs easy must start in mode 1");
+        assert_ne!(cb.role, vb.role);
+
+        // Easy client + hard-regular visitor: mode 1 with the swap rule —
+        // the EasyNAT client must become the receiver (Go frp role-swap).
+        let (mode, _idx, cb, vb) =
+            analyzer.get_recommend_behaviors("regular-one-swap", &easy, &regular);
+        assert_eq!(mode, 1);
+        assert_eq!(
+            cb.role, "receiver",
+            "EasyNAT client must swap to receiver in mode 1"
+        );
+        assert_eq!(vb.role, "sender");
+    }
+
+    #[test]
+    fn test_score_decrement_rotates_modes_3_and_4() {
+        // Modes 3 and 4 both start at score 0. `recommend()` picks the first
+        // max-scored entry and decrements it, so repeated calls must walk
+        // all six mode-3 entries, then rotate into the three mode-4 entries
+        // as the mode-3 scores fall to -1 — without panicking on any table
+        // boundary and with the mode always in 0..=4.
+        let analyzer = Analyzer::new(Duration::from_secs(3600));
+        let regular =
+            classify_nat_feature(&["1.2.3.4:1234".into(), "1.2.3.4:1236".into()], &[]).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..12 {
+            let (mode, index, cb, vb) =
+                analyzer.get_recommend_behaviors("rotate", &regular, &regular);
+            assert!(
+                (0..=4).contains(&mode),
+                "iteration {i}: mode {mode} out of range"
+            );
+            assert_ne!(cb.role, vb.role, "iteration {i}: roles must pair");
+            seen.insert((mode, index));
+        }
+        assert!(
+            seen.iter().any(|(m, _)| *m == 3),
+            "mode 3 must appear in the rotation: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|(m, _)| *m == 4),
+            "score decrements must rotate into mode 4: {seen:?}"
+        );
+        assert!(
+            seen.len() >= 9,
+            "all 6 mode-3 + 3 mode-4 entries must be visited: {seen:?}"
+        );
+    }
 }

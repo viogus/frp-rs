@@ -939,6 +939,95 @@ mod tests {
         assert_eq!(&data, &payload);
     }
 
+    /// UDPPacket whose JSON serialization length grows monotonically with
+    /// `n` (base64 "c" content) — used to hit the write-side length
+    /// boundaries exactly.
+    fn udp_packet_with_content(n: usize) -> crate::msg::UDPPacket {
+        crate::msg::UDPPacket {
+            content: vec![b'x'; n],
+            local_addr: Some(crate::msg::UdpAddr {
+                ip: "127.0.0.1".into(),
+                port: 53,
+                zone: String::new(),
+            }),
+            remote_addr: Some(crate::msg::UdpAddr {
+                ip: "10.0.0.1".into(),
+                port: 9999,
+                zone: String::new(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v1_frame_write_boundary() {
+        // The write path must accept a payload of at most V1_MAX_MSG_LENGTH
+        // (Go defaultMaxMsgLength) and reject anything larger — the exact
+        // boundary is found by growing the base64 content.
+        let json_len = |n: usize| -> usize {
+            serde_json::to_string(&FrpMessage::UDPPacket(udp_packet_with_content(n)))
+                .expect("serialize")
+                .len()
+        };
+        let mut n = 0usize;
+        while json_len(n + 1) <= V1_MAX_MSG_LENGTH as usize {
+            n += 1;
+        }
+        assert!(json_len(n) <= V1_MAX_MSG_LENGTH as usize);
+        assert!(json_len(n + 1) > V1_MAX_MSG_LENGTH as usize);
+
+        let (mut client, mut server) = duplex(V1_MAX_MSG_LENGTH as usize * 2);
+        let ok = FrpMessage::UDPPacket(udp_packet_with_content(n));
+        let json = serde_json::to_string(&ok).expect("serialize");
+        write_v1_frame(&mut client, &ok)
+            .await
+            .expect("payload at V1_MAX_MSG_LENGTH must write");
+        let (_ty, data) = read_v1_frame(&mut server).await.expect("read back");
+        assert_eq!(
+            &data,
+            json.as_bytes(),
+            "max-size frame round-trips byte-identical"
+        );
+
+        let too_big = FrpMessage::UDPPacket(udp_packet_with_content(n + 1));
+        let err = write_v1_frame(&mut client, &too_big).await;
+        assert!(
+            err.is_err(),
+            "payload one byte above V1_MAX_MSG_LENGTH must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_write_boundary() {
+        // write_msg_v2 accepts a payload (2-byte type id + JSON) of at most
+        // V2_MAX_FRAME_PAYLOAD and rejects anything larger.
+        let payload_len = |n: usize| -> usize {
+            2 + serde_json::to_string(&FrpMessage::UDPPacket(udp_packet_with_content(n)))
+                .expect("serialize")
+                .len()
+        };
+        let mut n = 0usize;
+        while payload_len(n + 1) <= V2_MAX_FRAME_PAYLOAD as usize {
+            n += 1;
+        }
+        assert!(payload_len(n) <= V2_MAX_FRAME_PAYLOAD as usize);
+        assert!(payload_len(n + 1) > V2_MAX_FRAME_PAYLOAD as usize);
+
+        let (mut client, mut server) = duplex((V2_MAX_FRAME_PAYLOAD * 2) as usize);
+        let ok = FrpMessage::UDPPacket(udp_packet_with_content(n));
+        write_msg_v2(&mut client, &ok)
+            .await
+            .expect("payload at V2_MAX_FRAME_PAYLOAD must write");
+        let back = read_msg_v2(&mut server).await.expect("read back");
+        assert!(matches!(back, FrpMessage::UDPPacket(_)));
+
+        let too_big = FrpMessage::UDPPacket(udp_packet_with_content(n + 1));
+        let err = write_msg_v2(&mut client, &too_big).await;
+        assert!(
+            err.is_err(),
+            "payload one byte above V2_MAX_FRAME_PAYLOAD must be rejected"
+        );
+    }
+
     #[tokio::test]
     async fn test_v1_frame_truncated_header() {
         let (mut client, mut server) = duplex(1024);
@@ -1076,9 +1165,9 @@ mod tests {
             write_msg_v2(&mut client, msg).await.expect("write V2");
             let back = read_msg_v2(&mut server).await.expect("read V2");
             assert_eq!(
-                back.v2_type_id(),
-                msg.v2_type_id(),
-                "roundtrip type mismatch for {:?}",
+                &back,
+                msg,
+                "roundtrip value mismatch for {:?}",
                 msg.v2_type_id()
             );
         }
@@ -1120,6 +1209,92 @@ mod tests {
         assert!(
             result.is_err(),
             "non-zero flags should be rejected (Go frp dev compat)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_frame_truncated_header() {
+        // Only 3 of the 8 header bytes arrive, then EOF (the V1
+        // truncated-header analogue): read_v2_frame_header's read_exact must
+        // error, not hang waiting for the remaining 5 bytes.
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(&[0x00, 0x10, 0x00])
+            .await
+            .expect("write partial header");
+        drop(client); // close write side
+        let result = read_v2_frame_raw(&mut server).await;
+        assert!(result.is_err(), "truncated V2 header should error");
+    }
+
+    #[tokio::test]
+    async fn test_v2_frame_truncated_payload() {
+        // Header claims 100 payload bytes but only 50 arrive before EOF:
+        // the payload read_exact must error, never a short silent success.
+        let (mut client, mut server) = duplex(1024);
+        let mut header = [0u8; V2_FRAME_HEADER_LEN];
+        header[0..2].copy_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
+        header[4..8].copy_from_slice(&100u32.to_be_bytes());
+        client.write_all(&header).await.expect("write header");
+        client
+            .write_all(&[0u8; 50])
+            .await
+            .expect("write partial payload");
+        drop(client);
+        let result = read_v2_frame_raw(&mut server).await;
+        assert!(result.is_err(), "truncated V2 payload should error");
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_truncated_payload() {
+        // Same truncation through read_msg_v2 (its pooled/heap payload read).
+        let (mut client, mut server) = duplex(1024);
+        let mut header = [0u8; V2_FRAME_HEADER_LEN];
+        header[0..2].copy_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
+        header[4..8].copy_from_slice(&100u32.to_be_bytes());
+        client.write_all(&header).await.expect("write header");
+        client
+            .write_all(&[0u8; 50])
+            .await
+            .expect("write partial payload");
+        drop(client);
+        let result = read_msg_v2(&mut server).await;
+        assert!(
+            result.is_err(),
+            "truncated V2 payload should error on read_msg_v2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_frame_read_rejects_oversized_length() {
+        // A header claiming V2_MAX_FRAME_PAYLOAD+1 bytes must be rejected on
+        // read BEFORE any payload allocation/read (only the 8 header bytes
+        // are ever on the wire).
+        let (mut client, mut server) = duplex(1024);
+        let mut header = [0u8; V2_FRAME_HEADER_LEN];
+        header[0..2].copy_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
+        header[4..8].copy_from_slice(&(V2_MAX_FRAME_PAYLOAD + 1).to_be_bytes());
+        client.write_all(&header).await.expect("write header");
+        drop(client);
+        let result = read_v2_frame_raw(&mut server).await;
+        assert!(result.is_err(), "oversized V2 length should error");
+        assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_frame_raw_write_boundary() {
+        // write_v2_frame_raw accepts exactly V2_MAX_FRAME_PAYLOAD and
+        // rejects one byte more.
+        let (mut client, _server) = duplex((V2_MAX_FRAME_PAYLOAD * 2) as usize);
+        let exact = vec![0u8; V2_MAX_FRAME_PAYLOAD as usize];
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, &exact)
+            .await
+            .expect("payload exactly V2_MAX_FRAME_PAYLOAD must write");
+        let too_big = vec![0u8; V2_MAX_FRAME_PAYLOAD as usize + 1];
+        let err = write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, &too_big).await;
+        assert!(
+            err.is_err(),
+            "payload above V2_MAX_FRAME_PAYLOAD must be rejected"
         );
     }
 
@@ -1268,9 +1443,9 @@ mod tests {
             write_msg_v2(&mut client, msg).await.expect("write v2");
             let back = read_msg_v2(&mut server).await.expect("read v2");
             assert_eq!(
-                back.v2_type_id(),
-                msg.v2_type_id(),
-                "roundtrip type mismatch for {:?}",
+                &back,
+                msg,
+                "roundtrip value mismatch for {:?}",
                 msg.v2_type_id()
             );
         }
@@ -1486,7 +1661,7 @@ mod tests {
             #[test]
             fn fuzz_v1_frame_header(
                 header_bytes in prop::array::uniform9(any::<u8>()),
-                payload_len in 0usize..=65536usize,
+                payload_len in 0usize..=(V1_MAX_MSG_LENGTH as usize),
             ) {
                 // Construct a full frame: 9-byte header + payload bytes
                 // Encode the payload length in big-endian bytes 1..9
@@ -1512,8 +1687,9 @@ mod tests {
                 }));
                 match result {
                     Ok(Ok(_)) => {
-                        // Valid frame: payload_len must be within 0..=65536
-                        prop_assert!(payload_len <= 65536,
+                        // Valid frame: payload_len must be within the real V1
+                        // cap (V1_MAX_MSG_LENGTH, not 65536)
+                        prop_assert!(payload_len <= V1_MAX_MSG_LENGTH as usize,
                             "read_v1_frame accepted oversized payload_len={payload_len}");
                     }
                     Ok(Err(_)) => { /* expected for oversized/invalid */ }
@@ -1527,7 +1703,7 @@ mod tests {
             /// but actual buffer is shorter (truncation attack).
             #[test]
             fn fuzz_v1_frame_truncated_payload(
-                claimed_len in 1i64..65536i64,
+                claimed_len in 1i64..=V1_MAX_MSG_LENGTH,
                 actual_len in 0usize..100usize,
             ) {
                 let mut header = [0u8; 9];
@@ -1862,6 +2038,37 @@ mod tests {
             .await
             .unwrap();
             assert!(matches!(got, FrpMessage::UDPPacket(_)));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn udp_codec_binary_frame_without_negotiation_rejected() {
+            // A frame carrying the binary UDP packet type ID (19) is a
+            // protocol error when the codec was NOT negotiated
+            // (udp_packet_codec=None): Go parity — the binary read/writer is
+            // only active after `udpPacketCodecs` capability negotiation.
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+            let pkt = FrpMessage::UDPPacket(sample_udp_packet());
+            // Write a binary-codec frame as the writer would with the codec
+            // negotiated...
+            write_msg_v2_with_udp_codec(
+                &mut w,
+                &pkt,
+                Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+                false,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+            // ...and read it back on a connection that did NOT negotiate it.
+            let err = read_msg_v2_with_udp_codec(&mut r, None, &mut Vec::new())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("without negotiated codec"),
+                "unexpected error: {err}"
+            );
         }
     }
 }

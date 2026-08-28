@@ -150,6 +150,143 @@ async fn assert_rejected_and_not_forwarded(
     );
 }
 
+/// Read raw bytes until the end of the HTTP/1.1 request head (`\r\n\r\n`).
+/// Returns the head plus any body bytes that arrived with it.
+async fn read_forwarded_head(work_conn: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            return buf;
+        }
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            work_conn.read(&mut chunk),
+        )
+        .await
+        .expect("timeout reading forwarded request")
+        .expect("read forwarded request");
+        assert!(n > 0, "unexpected EOF while reading request head");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+// ---------------------------------------------------------------
+// HTTP Basic Auth matrix (positive path + rejection variants)
+// ---------------------------------------------------------------
+
+/// Correct Basic credentials must be forwarded to the provider: the work
+/// conn receives StartWorkConn and the request head (with the
+/// Authorization header intact).
+#[tokio::test]
+async fn test_vhost_basic_auth_correct_credentials_forwarded() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "auth-pos",
+            vec!["pos.example.com".into()],
+            Some("user"),
+            Some("pass"),
+        ))),
+    )
+    .await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    // base64("user:pass") = dXNlcjpwYXNz
+    client
+        .write_all(
+            b"GET / HTTP/1.1\r\n\
+              Host: pos.example.com\r\n\
+              Authorization: Basic dXNlcjpwYXNz\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send request");
+
+    // The request must be dispatched: StartWorkConn on the work conn…
+    match read_msg_v1(&mut work_conn).await.expect("StartWorkConn") {
+        FrpMessage::StartWorkConn(swc) => {
+            assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+    // …and the head forwarded with the Authorization header intact.
+    let head = read_forwarded_head(&mut work_conn).await;
+    let text = String::from_utf8_lossy(&head);
+    assert!(text.starts_with("GET / HTTP/1.1\r\n"), "head: {text}");
+    assert!(
+        text.contains("Authorization: Basic dXNlcjpwYXNz\r\n"),
+        "Authorization must be forwarded intact, head: {text}"
+    );
+    drop(client);
+}
+
+/// Wrong password, wrong username, and a missing Authorization header must
+/// all yield 401 and never reach a backend.
+#[tokio::test]
+async fn test_vhost_basic_auth_rejects_bad_or_missing_credentials() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "auth-matrix",
+            vec!["matrix.example.com".into()],
+            Some("user"),
+            Some("pass"),
+        ))),
+    )
+    .await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    // base64("user:wrong") = dXNlcjp3cm9uZw==
+    let wrong_pwd = b"dXNlcjp3cm9uZw==";
+    // base64("evil:pass") = ZXZpbDpwYXNz
+    let wrong_user = b"ZXZpbDpwYXNz";
+
+    for (label, auth_line) in [
+        (
+            "wrong password",
+            Some(format!(
+                "Authorization: Basic {}\r\n",
+                String::from_utf8_lossy(wrong_pwd)
+            )),
+        ),
+        (
+            "wrong username",
+            Some(format!(
+                "Authorization: Basic {}\r\n",
+                String::from_utf8_lossy(wrong_user)
+            )),
+        ),
+        ("missing header", None),
+    ] {
+        let mut client = tokio::net::TcpStream::connect(vhost_addr)
+            .await
+            .expect("vhost connect");
+        let mut request = format!(
+            "GET / HTTP/1.1\r\nHost: matrix.example.com\r\n{}",
+            auth_line.unwrap_or_default()
+        );
+        request.push_str("\r\n");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("send request");
+        assert_rejected_and_not_forwarded(&mut client, &mut work_conn, "HTTP/1.1 401").await;
+        drop(client);
+        println!("{label}: 401 verified");
+    }
+    drop(_provider);
+}
+
 // ---------------------------------------------------------------
 // Finding 3: duplicate Host headers → 400
 // ---------------------------------------------------------------

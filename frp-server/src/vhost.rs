@@ -2038,4 +2038,636 @@ mod tests {
         mgr.unregister("p1").await;
         assert!(mgr.lookup("mixedcase.example.com", "/", "").await.is_none());
     }
+
+    /// Minimal AppState for routing-only tests (mirrors state.rs test_state).
+    fn test_app_state() -> Arc<AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(AppState::new(
+            frp_core::auth::AuthConfig::with_token("test-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("test-token"),
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
+            String::new(),
+            true,
+            30,
+            7200,
+            0,
+            0,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    /// Hand-built VhostRoute for find_matching_route / sort_by_longest_location.
+    fn route(name: &str, locations: &[String]) -> VhostRoute {
+        VhostRoute {
+            proxy_name: name.into(),
+            run_id: "run".into(),
+            group: "".into(),
+            locations: locations.to_vec(),
+            host_header_rewrite: "".into(),
+            http_user: "".into(),
+            http_pwd: "".into(),
+            route_by_http_user: "".into(),
+            headers: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Go frp v0.71.0 compat (pkg/util/vhost/router.go getByRoute): vhost
+    /// lookup walks exact → leftmost-label wildcard (>=3 labels) → "*"
+    /// catch-all — the same walk tcpmux uses (see the tcpmux tests).
+    #[tokio::test]
+    async fn test_vhost_lookup_wildcard_leftmost_label() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["*.example.com".into()],
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("wildcard registration must succeed");
+
+        // A 4-label host walks "*.b.example.com" (miss) then "*.example.com"
+        // (hit) — the progressive leftmost-label replacement.
+        let r = mgr
+            .lookup_wildcard("a.b.example.com", "/", "")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        // A 3-label host walks straight to "*.example.com".
+        let r = mgr.lookup_wildcard("b.example.com", "/", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        // Two-label hosts never match the wildcard (Go's >=3-label guard
+        // keeps `*.com` from matching `example.com`) — and no catch-all is
+        // registered, so the lookup misses entirely.
+        assert!(mgr.lookup_wildcard("example.com", "/", "").await.is_none());
+        // Unrelated suffixes stay misses.
+        assert!(mgr
+            .lookup_wildcard("a.example.net", "/", "")
+            .await
+            .is_none());
+    }
+
+    /// When both a specific wildcard and a broader one are registered, the
+    /// first (more specific) candidate in the leftmost-label walk wins.
+    #[tokio::test]
+    async fn test_vhost_lookup_wildcard_most_specific_wins() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "specific",
+            &["*.b.example.com".into()],
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("specific wildcard registration must succeed");
+        mgr.register(
+            "broad",
+            &["*.example.com".into()],
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("broad wildcard registration must succeed");
+
+        // "a.b.example.com": the walk hits "*.b.example.com" first.
+        let r = mgr
+            .lookup_wildcard("a.b.example.com", "/", "")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "specific");
+        // "c.example.com": "*.b.example.com" misses, "*.example.com" hits.
+        let r = mgr.lookup_wildcard("c.example.com", "/", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "broad");
+    }
+
+    #[tokio::test]
+    async fn test_vhost_lookup_wildcard_catch_all() {
+        let mgr = VhostManager::new();
+        mgr.register("p1", &["*".into()], &[], "run-1", "", "", "", "", &[], "")
+            .await
+            .expect("catch-all registration must succeed");
+
+        for host in ["anything.example.com", "example.com", "localhost"] {
+            let r = mgr
+                .lookup_wildcard(host, "/", "")
+                .await
+                .unwrap_or_else(|| panic!("catch-all must match '{host}'"));
+            assert_eq!(r.proxy_name.as_ref(), "p1");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vhost_lookup_exact_beats_wildcard() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("exact registration must succeed");
+        mgr.register(
+            "p2",
+            &["*.example.com".into()],
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("wildcard registration must succeed");
+
+        // Exact match wins; the wildcard catches everything else under the
+        // domain.
+        let r = mgr.lookup_wildcard("a.example.com", "/", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        let r = mgr.lookup_wildcard("b.example.com", "/", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p2");
+    }
+
+    /// proxy_ops expands a subdomain + sub_domain_host to
+    /// `format!("{}.{}", subdomain, sub_host)` before registering the vhost
+    /// route; the expanded domain must register and route like any other
+    /// domain, while the bare sub_domain_host itself stays unrouted.
+    #[tokio::test]
+    async fn test_vhost_register_subdomain_expansion_routes() {
+        let mgr = VhostManager::new();
+        let sub_domain_host = "example.com";
+        let expanded = format!("app.{sub_domain_host}");
+        mgr.register(
+            "p1",
+            std::slice::from_ref(&expanded),
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("expanded subdomain registration must succeed");
+
+        let r = mgr.lookup_wildcard(&expanded, "/", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        // The bare host has no route — the subdomain supplies the first label.
+        assert!(mgr
+            .lookup_wildcard(sub_domain_host, "/", "")
+            .await
+            .is_none());
+    }
+
+    /// Go frp compat (pkg/util/vhost/router.go): routes are sorted by
+    /// lexicographically-DESCENDING location (`slices.SortFunc` with
+    /// `-cmp.Compare`), and `find_matching_route` returns the FIRST route in
+    /// that order whose location prefix-matches — so the longest-prefix
+    /// match is found without a length comparison at match time. Routes with
+    /// no locations (HTTPS SNI) sort last and match any path.
+    #[test]
+    fn test_find_matching_route_longest_location_precedence() {
+        let mut routes = vec![
+            route("a", &["/aa".into()]),
+            route("b", &["/aa/bb/cc".into()]),
+            route("c", &[]),
+        ];
+        sort_by_longest_location(&mut routes);
+        assert_eq!(routes[0].proxy_name.as_ref(), "b");
+        assert_eq!(routes[1].proxy_name.as_ref(), "a");
+        assert_eq!(routes[2].proxy_name.as_ref(), "c");
+
+        // Path under the longest location → b.
+        let m = find_matching_route(&routes, "/aa/bb/cc/d").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "b");
+        // "/aa/bb" misses b's "/aa/bb/cc" and hits a's "/aa".
+        let m = find_matching_route(&routes, "/aa/bb").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "a");
+        // No prefix matches → falls through to the no-location route.
+        let m = find_matching_route(&routes, "/zz").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "c");
+        // A no-location route matches ANY path (even an empty one).
+        assert_eq!(
+            find_matching_route(&routes, "")
+                .unwrap()
+                .proxy_name
+                .as_ref(),
+            "c"
+        );
+    }
+
+    /// Re-registration must restore the sorted order, and the httpUser-
+    /// specific bucket must win over the "" (all-users) fallback bucket.
+    #[tokio::test]
+    async fn test_vhost_sort_stable_after_reregistration_and_http_user_bucket() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["example.com".into()],
+            &["/".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        mgr.register(
+            "p2",
+            &["example.com".into()],
+            &["/api".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        // Longest location prefix wins.
+        let r = mgr.lookup("example.com", "/api/users", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p2");
+        let r = mgr.lookup("example.com", "/other", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+
+        // Unregister + re-register p2: the sort must be restored so the
+        // longer "/api" location still wins over "/".
+        mgr.unregister("p2").await;
+        mgr.register(
+            "p2",
+            &["example.com".into()],
+            &["/api".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        let r = mgr.lookup("example.com", "/api/users", "").await.unwrap();
+        assert_eq!(
+            r.proxy_name.as_ref(),
+            "p2",
+            "re-registration must restore longest-location order"
+        );
+
+        // httpUser-specific bucket wins for matching users; everyone else
+        // falls back to the "" bucket (Go getExactOrAllUsersLocked). The
+        // bucket key is route_by_http_user at register (8th arg) and the
+        // request's username at lookup.
+        mgr.register(
+            "auth-p",
+            &["example.com".into()],
+            &["/".into()],
+            "run-3",
+            "",
+            "",
+            "",
+            "alice",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        let r = mgr.lookup("example.com", "/x", "alice").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "auth-p");
+        let r = mgr.lookup("example.com", "/x", "bob").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+    }
+
+    #[tokio::test]
+    async fn test_vhost_lookup_by_path_longest_prefix() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &[],
+            &["/static".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        mgr.register(
+            "p2",
+            &[],
+            &["/static/img".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        let r = mgr
+            .lookup_by_path("/static/img/logo.png", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            r.proxy_name.as_ref(),
+            "p2",
+            "longest location prefix must win"
+        );
+        let r = mgr
+            .lookup_by_path("/static/css/site.css", "")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        assert!(mgr.lookup_by_path("/other", "").await.is_none());
+    }
+
+    #[test]
+    fn test_extract_basic_auth_valid() {
+        // base64("user:pass") = "dXNlcjpwYXNz".
+        let req = "GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n";
+        assert_eq!(
+            extract_basic_auth(req),
+            Some(("user".into(), "pass".into()))
+        );
+        // Header name is matched case-insensitively.
+        let req = "GET / HTTP/1.1\r\nauthorization: Basic dXNlcjpwYXNz\r\n\r\n";
+        assert_eq!(
+            extract_basic_auth(req),
+            Some(("user".into(), "pass".into()))
+        );
+        // Whitespace between "Basic" and the payload is trimmed.
+        let req = "GET / HTTP/1.1\r\nAuthorization: Basic   dXNlcjpwYXNz\r\n\r\n";
+        assert_eq!(
+            extract_basic_auth(req),
+            Some(("user".into(), "pass".into()))
+        );
+        // Empty password after the colon.
+        let req = "GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjo=\r\n\r\n";
+        assert_eq!(extract_basic_auth(req), Some(("user".into(), "".into())));
+    }
+
+    #[test]
+    fn test_extract_basic_auth_invalid_and_missing() {
+        // Missing header.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+            None
+        );
+        // Wrong scheme.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Bearer abc\r\n\r\n"),
+            None
+        );
+        // "Basic" without a trailing space.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic\r\n\r\n"),
+            None
+        );
+        // "Basic" with an empty payload.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic \r\n\r\n"),
+            None
+        );
+        // Decodes but has no colon separator (base64("use") = "dXNl").
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic dXNl\r\n\r\n"),
+            None
+        );
+        // Not valid base64.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic !!!\r\n\r\n"),
+            None
+        );
+        // Decodes to non-UTF-8 bytes (base64(0xff) = "/w==").
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic /w==\r\n\r\n"),
+            None
+        );
+        // The caller bounds the text to the head (up to \r\n\r\n); given an
+        // unbounded string a body line IS found — mirroring the fn's
+        // documented contract.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\n\r\nAuthorization: Basic dXNlcjpwYXNz"),
+            Some(("user".into(), "pass".into()))
+        );
+    }
+
+    /// HTTP Basic Auth enforcement in resolve_vhost_request uses
+    /// constant_time_eq_str on both the username and the password — a wrong
+    /// password (or username, or no credentials) must produce
+    /// VhostResolveError::Unauthorized, and only the exact pair forwards.
+    #[tokio::test]
+    async fn test_vhost_resolve_auth_rejects_wrong_password() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "auth-p",
+                &["auth.example.com".into()],
+                &[],
+                "run-1",
+                "",
+                "user1",
+                "pass1",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect("auth route registration must succeed");
+        let head = b"GET / HTTP/1.1\r\nHost: auth.example.com\r\n\r\n".to_vec();
+        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 1234));
+
+        let resolve = |auth: Option<(&str, &str)>| {
+            let auth = auth.map(|(u, p)| (u.to_string(), p.to_string()));
+            let head = head.clone();
+            // Shadow `state` with a Copy reference: the move future copies
+            // the reference instead of consuming the fn-local AppState, so
+            // the outer closure stays Fn and can be called repeatedly.
+            let state = &state;
+            async move {
+                resolve_vhost_request(
+                    state,
+                    "auth.example.com",
+                    "/",
+                    auth.as_ref(),
+                    head,
+                    peer,
+                    "HTTP",
+                )
+                .await
+            }
+        };
+
+        // No credentials → 401.
+        assert!(matches!(
+            resolve(None).await,
+            Err(VhostResolveError::Unauthorized)
+        ));
+        // Wrong password → 401.
+        assert!(matches!(
+            resolve(Some(("user1", "wrong"))).await,
+            Err(VhostResolveError::Unauthorized)
+        ));
+        // Wrong username → 401.
+        assert!(matches!(
+            resolve(Some(("other", "pass1"))).await,
+            Err(VhostResolveError::Unauthorized)
+        ));
+        // Correct credentials → forward to the route's proxy.
+        let fwd = resolve(Some(("user1", "pass1")))
+            .await
+            .expect("valid credentials must forward");
+        assert_eq!(fwd.proxy_name, "auth-p");
+        assert_eq!(fwd.run_id, "run-1");
+    }
+
+    /// Go frp v0.71.0 HTTPGroup.chooseEndpoint fallback: when the chosen
+    /// group member is not registered in the proxy manager (gone between
+    /// choose_endpoint and lookup), the route's recorded proxy — the first
+    /// member that owns the shared route — is the fallback target.
+    #[tokio::test]
+    async fn test_vhost_group_member_gone_falls_back_to_recorded_proxy() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "owner-p",
+                &["g.example.com".into()],
+                &[],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "grp-1",
+            )
+            .await
+            .expect("route registration must succeed");
+        // The group lists "member-1", but the proxy manager has no such
+        // proxy — exactly the "gone between choose and lookup" state.
+        state
+            .http_group_ctl
+            .register_member("grp-1", "key", "g.example.com", "/", "", "member-1")
+            .await
+            .expect("member registration must succeed");
+
+        let fwd = resolve_vhost_request(
+            &state,
+            "g.example.com",
+            "/",
+            None,
+            b"GET / HTTP/1.1\r\nHost: g.example.com\r\n\r\n".to_vec(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            "HTTP",
+        )
+        .await
+        .expect("member-gone fallback must forward");
+        assert_eq!(
+            fwd.proxy_name, "owner-p",
+            "member gone → recorded proxy fallback"
+        );
+        assert_eq!(fwd.run_id, "run-1");
+    }
+
+    /// choose_endpoint returns None when the group is not registered (or has
+    /// no members) — the request routes to the route's recorded proxy.
+    #[tokio::test]
+    async fn test_vhost_group_no_members_falls_back_to_recorded_proxy() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "owner-p",
+                &["g2.example.com".into()],
+                &[],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "grp-ghost",
+            )
+            .await
+            .expect("route registration must succeed");
+        // "grp-ghost" is never registered with the controller, so
+        // choose_endpoint returns None.
+        let fwd = resolve_vhost_request(
+            &state,
+            "g2.example.com",
+            "/",
+            None,
+            b"GET / HTTP/1.1\r\nHost: g2.example.com\r\n\r\n".to_vec(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            "HTTP",
+        )
+        .await
+        .expect("no-member fallback must forward");
+        assert_eq!(
+            fwd.proxy_name, "owner-p",
+            "no members → recorded proxy fallback"
+        );
+        assert_eq!(fwd.run_id, "run-1");
+    }
 }

@@ -526,6 +526,134 @@ mod tests {
         assert!(decode_udp_packet_binary(&body).is_err());
     }
 
+    /// Per-branch malformed decode table: every strictness check in
+    /// `parse_udp_packet_header`/`read_addr` must return Err (with the
+    /// branch's error text), never panic and never silently succeed.
+    #[test]
+    fn malformed_decode_branch_errors() {
+        let ipv4 = [192u8, 168, 0, 1];
+        let ipv6 = [0u8; 16];
+
+        let mut truncated_zone = vec![UDP_PACKET_FLAG_REMOTE_ADDR, 6];
+        truncated_zone.extend_from_slice(&ipv6);
+        truncated_zone.extend_from_slice(&8080u16.to_be_bytes());
+        truncated_zone.push(10); // zone_len claims 10...
+        truncated_zone.extend_from_slice(b"abc"); // ...but only 3 bytes follow
+
+        let mut ipv4_with_zone = vec![UDP_PACKET_FLAG_REMOTE_ADDR, 4];
+        ipv4_with_zone.extend_from_slice(&ipv4);
+        ipv4_with_zone.extend_from_slice(&53u16.to_be_bytes());
+        ipv4_with_zone.push(1);
+        ipv4_with_zone.push(b'z');
+
+        let mut bad_utf8_zone = vec![UDP_PACKET_FLAG_REMOTE_ADDR, 6];
+        bad_utf8_zone.extend_from_slice(&ipv6);
+        bad_utf8_zone.extend_from_slice(&8080u16.to_be_bytes());
+        bad_utf8_zone.push(2);
+        bad_utf8_zone.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+
+        let mut oversized_payload_len = vec![UDP_PACKET_FLAG_REMOTE_ADDR, 4];
+        oversized_payload_len.extend_from_slice(&ipv4);
+        oversized_payload_len.extend_from_slice(&53u16.to_be_bytes());
+        oversized_payload_len.push(0); // empty zone
+        oversized_payload_len.extend_from_slice(&65535u16.to_be_bytes()); // > 65507
+
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("empty body", vec![], "too short"),
+            (
+                "one-byte body",
+                vec![UDP_PACKET_FLAG_REMOTE_ADDR],
+                "too short",
+            ),
+            (
+                "two-byte body",
+                vec![UDP_PACKET_FLAG_REMOTE_ADDR, 0],
+                "too short",
+            ),
+            (
+                "invalid address family",
+                vec![UDP_PACKET_FLAG_REMOTE_ADDR, 7, 0, 0, 0],
+                "invalid address family",
+            ),
+            (
+                "truncated mid-IP",
+                vec![UDP_PACKET_FLAG_REMOTE_ADDR, 4, 192, 168],
+                "truncated address",
+            ),
+            ("truncated mid-zone", truncated_zone, "truncated zone"),
+            (
+                "IPv4 with non-empty zone",
+                ipv4_with_zone,
+                "IPv4 zone is forbidden",
+            ),
+            ("invalid UTF-8 zone", bad_utf8_zone, "invalid zone UTF-8"),
+            (
+                "payload length above 65507",
+                oversized_payload_len,
+                "exceeds limit",
+            ),
+        ];
+
+        for (name, body, expected) in cases {
+            let err = decode_udp_packet_binary(&body)
+                .err()
+                .unwrap_or_else(|| panic!("{name} must be rejected, not panic"));
+            assert!(
+                err.contains(expected),
+                "{name}: expected error containing {expected:?}, got {err:?}"
+            );
+            // The owned decode path shares the parser — same rejection.
+            let mut owned = body.clone();
+            assert!(
+                decode_udp_packet_binary_owned(&mut owned).is_err(),
+                "{name}: owned decode must reject too"
+            );
+        }
+    }
+
+    /// Encode-side branch errors: empty (zero-valued) addresses and
+    /// over-long zones must be rejected, never panic or emit garbage.
+    #[test]
+    fn malformed_encode_branch_errors() {
+        let empty = UDPPacket {
+            content: vec![],
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: String::new(),
+                port: 0,
+                zone: String::new(),
+            }),
+        };
+        let err = encode_udp_packet_binary(&empty).unwrap_err();
+        assert!(err.contains("empty UDP address"), "got {err:?}");
+
+        let big_zone = UDPPacket {
+            content: vec![],
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "fe80::1".into(),
+                port: 8080,
+                zone: "a".repeat(256),
+            }),
+        };
+        let err = encode_udp_packet_binary(&big_zone).unwrap_err();
+        assert!(err.contains("zone exceeds 255 bytes"), "got {err:?}");
+
+        // A non-empty zone on an IPv4 address is also rejected on encode
+        // (Go validateBinaryUDPAddr parity).
+        let v4_zone = UDPPacket {
+            content: vec![],
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "192.168.0.1".into(),
+                port: 53,
+                zone: "eth0".into(),
+            }),
+        };
+        let err = encode_udp_packet_binary(&v4_zone).unwrap_err();
+        assert!(err.contains("IPv4 zone is forbidden"), "got {err:?}");
+    }
+
     #[test]
     fn oversized_payload_rejected() {
         let pkt = UDPPacket {

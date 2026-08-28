@@ -1784,4 +1784,193 @@ mod tests {
         assert_eq!(t.record(MS_NOW - 30_000, "live-ms"), ReplayCheck::Replay);
         assert_eq!(t.total(), 2);
     }
+
+    // --- Login throttle tests (check_login_throttle) ---
+    //
+    // check_login_throttle keys on `addr.ip()` and reads std::time::Instant,
+    // which tokio's test-util clock does NOT mock: `tokio::time::pause` /
+    // `advance` only affect tokio::time utilities, and clock.rs's mocked
+    // `now()` falls through to real std::time::Instant for everything else.
+    // The 60s-window and 90s-cleanup branches are therefore exercised by
+    // seeding stale `window_start` values directly into the (pub) throttle
+    // maps — deterministic, no 60s real sleeps, and it hits the exact
+    // `duration_since(window_start)` comparisons the production paths use.
+
+    #[tokio::test]
+    async fn check_login_throttle_five_allowed_then_sixth_rejected() {
+        let state = test_state();
+        let addr = |port: u16| std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        // 5 attempts per 60s window per IP; distinct ports still hit the
+        // same per-IP bucket (keyed by addr.ip()).
+        for port in 1..=5 {
+            assert!(
+                state.check_login_throttle(addr(port)).await,
+                "attempt {port} must be allowed"
+            );
+        }
+        assert!(
+            !state.check_login_throttle(addr(6)).await,
+            "6th attempt must be throttled"
+        );
+        // Same IP, different port: still throttled (per-IP, not per-addr).
+        assert!(!state.check_login_throttle(addr(7)).await);
+        // The pre-auth gate (is_login_throttled) mirrors the same table
+        // state; a missing peer address is never throttled.
+        assert!(state.is_login_throttled(Some(addr(8))).await);
+        assert!(!state.is_login_throttled(None).await);
+        // A different IP is unaffected by the throttled one.
+        assert!(
+            state
+                .check_login_throttle(std::net::SocketAddr::from(([127, 0, 0, 2], 1)))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn check_login_throttle_window_expiry_resets_count() {
+        let state = test_state();
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        let addr = |port: u16| std::net::SocketAddr::from((ip, port));
+        // Seed a stale entry: 5 failures whose 60s window started 61s ago.
+        {
+            let mut t = state.login_throttle.lock().await;
+            t.insert(
+                ip,
+                (
+                    5,
+                    std::time::Instant::now() - std::time::Duration::from_secs(61),
+                ),
+            );
+        }
+        // Window expired → attempt allowed, count resets to 1.
+        assert!(state.check_login_throttle(addr(1)).await);
+        // Fresh window: 4 more allowed (counts 2..=5), then throttled.
+        for port in 2..=5 {
+            assert!(
+                state.check_login_throttle(addr(port)).await,
+                "post-reset attempt {port} must be allowed"
+            );
+        }
+        assert!(!state.check_login_throttle(addr(6)).await);
+        // A full count INSIDE its window stays throttled (no reset).
+        let ip2 = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 9));
+        {
+            let mut t = state.login_throttle.lock().await;
+            t.insert(
+                ip2,
+                (
+                    5,
+                    std::time::Instant::now() - std::time::Duration::from_secs(1),
+                ),
+            );
+        }
+        assert!(
+            !state
+                .check_login_throttle(std::net::SocketAddr::from((ip2, 1)))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn check_login_throttle_cleanup_removes_entries_older_than_90s() {
+        let state = test_state();
+        let stale_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 77));
+        let fresh_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 78));
+        {
+            let mut t = state.login_throttle.lock().await;
+            t.insert(
+                stale_ip,
+                (
+                    5,
+                    std::time::Instant::now() - std::time::Duration::from_secs(91),
+                ),
+            );
+            t.insert(fresh_ip, (1, std::time::Instant::now()));
+        }
+        // Any call runs the inline cleanup (90s grace) — the stale entry
+        // must go, the fresh one must survive.
+        assert!(
+            state
+                .check_login_throttle(std::net::SocketAddr::from(([127, 0, 0, 79], 1)))
+                .await
+        );
+        let t = state.login_throttle.lock().await;
+        assert!(!t.contains_key(&stale_ip), "91s-old entry must be cleaned");
+        assert!(t.contains_key(&fresh_ip), "fresh entry must survive");
+    }
+
+    #[tokio::test]
+    async fn check_login_throttle_overflow_bucket_caps_untracked_ips() {
+        let state = test_state();
+        // Fill the main table to the 512-entry cap with distinct IPs.
+        for i in 0u16..512 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                127,
+                (i >> 8) as u8,
+                (i & 0xff) as u8,
+                1,
+            ));
+            assert!(
+                state
+                    .check_login_throttle(std::net::SocketAddr::from((ip, 1)))
+                    .await
+            );
+        }
+        {
+            let t = state.login_throttle.lock().await;
+            assert_eq!(t.len(), 512, "main table must be full at the cap");
+        }
+        // A TRACKED IP still uses the main table (not the coarse overflow).
+        let tracked = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        assert!(state.check_login_throttle(tracked).await);
+        // An untracked IP hits the overflow bucket: 50 allowed, then false.
+        let untracked = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 99, 0, 1));
+        for i in 1..=50 {
+            assert!(
+                state
+                    .check_login_throttle(std::net::SocketAddr::from((untracked, i)))
+                    .await,
+                "overflow attempt {i} must be allowed"
+            );
+        }
+        assert!(
+            !state
+                .check_login_throttle(std::net::SocketAddr::from((untracked, 51)))
+                .await,
+            "51st overflow attempt must be throttled"
+        );
+        // The pre-auth gate sees the coarse cap too.
+        assert!(
+            state
+                .is_login_throttled(Some(std::net::SocketAddr::from((untracked, 52))))
+                .await
+        );
+        // Overflow window expiry resets the coarse counter (count -> 1).
+        {
+            let mut o = state.login_throttle_overflow.lock().await;
+            o.get_mut(&untracked).expect("overflow entry").1 =
+                std::time::Instant::now() - std::time::Duration::from_secs(61);
+        }
+        assert!(
+            state
+                .check_login_throttle(std::net::SocketAddr::from((untracked, 53)))
+                .await,
+            "expired overflow window must reset the counter"
+        );
+        // 49 more allowed after the reset (counts 2..=50)...
+        for i in 54..=102 {
+            assert!(
+                state
+                    .check_login_throttle(std::net::SocketAddr::from((untracked, i)))
+                    .await,
+                "post-reset overflow attempt {i} must be allowed"
+            );
+        }
+        // ...then capped again.
+        assert!(
+            !state
+                .check_login_throttle(std::net::SocketAddr::from((untracked, 103)))
+                .await
+        );
+    }
 }

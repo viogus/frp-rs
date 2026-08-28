@@ -813,3 +813,286 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     send.send_data(Bytes::new(), true)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_hop_by_hop() {
+        // RFC 7540 §8.1.2.2 forbids these on the HTTP/2 side; they must be
+        // dropped when re-encoding to HTTP/1.1 (Go net/http drops them too).
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert!(is_hop_by_hop(name), "{name} must be hop-by-hop");
+            assert!(
+                is_hop_by_hop(&name.to_uppercase()),
+                "hop-by-hop check must be case-insensitive: {name}"
+            );
+        }
+        // End-to-end headers pass through.
+        for name in ["content-length", "host", "authorization", "x-custom", "te"] {
+            assert!(!is_hop_by_hop(name), "{name} must NOT be hop-by-hop");
+        }
+    }
+
+    #[test]
+    fn test_host_from_authority() {
+        assert_eq!(host_from_authority("example.com"), "example.com");
+        // Port is stripped (host:port).
+        assert_eq!(host_from_authority("example.com:8080"), "example.com");
+        // Bracketed IPv6 keeps the bare address, with or without a port.
+        assert_eq!(host_from_authority("[::1]:8080"), "::1");
+        assert_eq!(host_from_authority("[2001:db8::1]"), "2001:db8::1");
+        // Empty authority.
+        assert_eq!(host_from_authority(""), "");
+        // An UNBRACKETED IPv6 literal splits at the first colon — garbage-in
+        // (RFC 9110 requires brackets for IPv6 authorities), but the
+        // behavior must not panic.
+        assert_eq!(host_from_authority("::1"), "");
+    }
+
+    #[test]
+    fn test_parse_hex() {
+        assert_eq!(parse_hex(b"1a").unwrap(), 26);
+        assert_eq!(parse_hex(b"0").unwrap(), 0);
+        assert_eq!(parse_hex(b"ff").unwrap(), 255);
+        assert_eq!(parse_hex(b" 1A ").unwrap(), 26); // whitespace trimmed
+        assert!(parse_hex(b"").is_err());
+        assert!(parse_hex(b"zz").is_err());
+        assert!(parse_hex(b"-1").is_err());
+        assert!(parse_hex(b"1g").is_err());
+        // Not valid UTF-8 → InvalidData.
+        assert!(parse_hex(&[0xff, 0xfe]).is_err());
+    }
+
+    #[test]
+    fn test_parse_response_head() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nbody";
+        let parsed = parse_response_head(head).expect("valid head");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(
+            parsed.body_offset,
+            head.len() - 4,
+            "body starts after the blank line"
+        );
+        assert_eq!(
+            header_value(&parsed.headers, "content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/plain"
+        );
+        assert_eq!(
+            header_value(&parsed.headers, "content-length")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "11"
+        );
+
+        // Header values are whitespace-trimmed; status 404 parses.
+        let head = b"HTTP/1.1 404 Not Found\r\nX-Pad:   value  \r\n\r\n";
+        let parsed = parse_response_head(head).unwrap();
+        assert_eq!(parsed.status, 404);
+        assert_eq!(
+            header_value(&parsed.headers, "x-pad")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "value"
+        );
+
+        // Malformed heads → None (caller answers 502).
+        assert!(parse_response_head(b"").is_none());
+        assert!(parse_response_head(b"HTTP/1.1 200 OK\r\n").is_none()); // no blank line
+        assert!(parse_response_head(b"not-http\r\n\r\n").is_none()); // no status token
+        assert!(parse_response_head(b"HTTP/1.1 abc\r\n\r\n").is_none()); // non-numeric status
+    }
+
+    #[test]
+    fn test_extract_basic_auth_headers() {
+        // base64("user:pass") = "dXNlcjpwYXNz".
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "authorization",
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(
+            extract_basic_auth_headers(&h),
+            Some(("user".into(), "pass".into()))
+        );
+
+        // Missing header → None.
+        assert_eq!(extract_basic_auth_headers(&http::HeaderMap::new()), None);
+        // Wrong scheme → None.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer abc"),
+        );
+        assert_eq!(extract_basic_auth_headers(&h), None);
+        // Decodes but has no colon separator (base64("use") = "dXNl") → None.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "authorization",
+            http::HeaderValue::from_static("Basic dXNl"),
+        );
+        assert_eq!(extract_basic_auth_headers(&h), None);
+        // Decodes to non-UTF-8 bytes (base64(0xff) = "/w==") → None.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "authorization",
+            http::HeaderValue::from_static("Basic /w=="),
+        );
+        assert_eq!(extract_basic_auth_headers(&h), None);
+        // Not valid base64 → None.
+        let mut h = http::HeaderMap::new();
+        h.insert("authorization", http::HeaderValue::from_static("Basic !!!"));
+        assert_eq!(extract_basic_auth_headers(&h), None);
+    }
+
+    /// Drive a real h2 client/server pair over an in-memory duplex and hand
+    /// the server-side request to `f`. h2::RecvStream has no public
+    /// constructor, so `build_http1_request_head` can only be exercised
+    /// through a live handshake (same pattern as tests/vhost_h2c.rs).
+    ///
+    /// `end_stream` is pinned on the wire, not left to handshake timing:
+    /// the client ends the stream with an explicit empty DATA frame and the
+    /// server task exhausts the body before `f` runs, so `is_end_stream()`
+    /// is deterministic on both sides (whether the HEADERS-frame END_STREAM
+    /// flag is observable at `accept()` time was a CI race). Both halves
+    /// are kept alive while `f` runs: dropping `respond` (SendResponse),
+    /// the connection, or the client's send half resets the stream, which
+    /// flips `is_end_stream()` on the server side and would mask the
+    /// branch under test — the connection survives in a driver task that
+    /// keeps polling it until the client closes.
+    async fn with_h2_request(
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        end_stream: bool,
+        f: impl FnOnce(&http::Request<h2::RecvStream>),
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io)
+                .await
+                .expect("server handshake");
+            let (mut request, respond) = conn.accept().await.expect("accept").expect("request");
+            if end_stream {
+                // Exhaust the body while polling the connection: the
+                // RecvStream only observes stream state — the connection
+                // drives the codec.
+                tokio::select! {
+                    _ = async {
+                        while matches!(request.body_mut().data().await, Some(Ok(_))) {}
+                    } => {}
+                    _ = conn.accept() => {
+                        panic!("server conn ended before the request body drained")
+                    }
+                }
+            }
+            let driver =
+                tokio::spawn(async move { while let Some(Ok(_)) = conn.accept().await {} });
+            (request, respond, driver)
+        });
+        let (mut client, client_conn) = h2::client::handshake(client_io)
+            .await
+            .expect("client handshake");
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+        client.clone().ready().await.expect("client ready");
+
+        let mut builder = http::Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let (response_fut, mut stream) = client
+            .send_request(builder.body(()).unwrap(), false)
+            .expect("send_request");
+        if end_stream {
+            // Empty DATA frame with END_STREAM set: the end marker goes out
+            // unconditionally (an end flag riding on HEADERS alone was not
+            // reliably visible at the server's accept()).
+            stream
+                .send_data(Bytes::new(), true)
+                .expect("send end-of-stream frame");
+        }
+        let (request, respond, _driver) = server_task.await.expect("server task");
+        let _respond = respond; // keep the server send half open while f runs
+        let _stream = stream; // keep the client send half open while f runs
+        let _response_fut = response_fut;
+        f(&request);
+    }
+
+    #[tokio::test]
+    async fn test_build_http1_request_head_end_stream() {
+        with_h2_request(
+            "GET",
+            "http://h2c.example.com/",
+            &[("x-custom", "v1"), ("x-second", "two")],
+            true,
+            |req| {
+                let head = build_http1_request_head(req);
+                let head_text = String::from_utf8_lossy(&head);
+                assert!(
+                    head_text.starts_with("GET / HTTP/1.1\r\n"),
+                    "head: {head_text}"
+                );
+                assert!(
+                    head_text.contains("Host: h2c.example.com\r\n"),
+                    "head: {head_text}"
+                );
+                assert!(head_text.contains("x-custom: v1\r\n"), "head: {head_text}");
+                assert!(head_text.contains("x-second: two\r\n"), "head: {head_text}");
+                assert!(
+                    head_text.contains("Content-Length: 0\r\n"),
+                    "end_stream request needs Content-Length: 0: {head_text}"
+                );
+                assert!(
+                    head_text.ends_with("\r\n"),
+                    "head must end with the blank line: {head_text}"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_build_http1_request_head_open_stream_chunked() {
+        with_h2_request(
+            "POST",
+            "http://h2c.example.com/submit?q=1",
+            &[],
+            false,
+            |req| {
+                let head = build_http1_request_head(req);
+                let head_text = String::from_utf8_lossy(&head);
+                assert!(
+                    head_text.starts_with("POST /submit?q=1 HTTP/1.1\r\n"),
+                    "path_and_query must be preserved: {head_text}"
+                );
+                assert!(
+                    head_text.contains("Host: h2c.example.com\r\n"),
+                    "head: {head_text}"
+                );
+                assert!(
+                    head_text.contains("Transfer-Encoding: chunked\r\n"),
+                    "open stream must be chunked-framed: {head_text}"
+                );
+                assert!(
+                    !head_text.contains("Content-Length"),
+                    "no content length for an open stream: {head_text}"
+                );
+            },
+        )
+        .await;
+    }
+}

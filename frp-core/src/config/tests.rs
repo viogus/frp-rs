@@ -20,7 +20,15 @@ remote_port = 7001
 "#;
     let cfg: ClientConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(cfg.proxies.len(), 1);
-    assert_eq!(cfg.proxies[0].proxy_type, "tcp");
+    assert_eq!(cfg.server_addr, "127.0.0.1");
+    assert_eq!(cfg.server_port, 7000);
+    assert_eq!(cfg.token, "my-token");
+    let p = &cfg.proxies[0];
+    assert_eq!(p.name, "test-tcp");
+    assert_eq!(p.proxy_type, "tcp");
+    assert_eq!(p.local_ip, "127.0.0.1");
+    assert_eq!(p.local_port, 80);
+    assert_eq!(p.remote_port, 7001);
 }
 
 #[test]
@@ -877,9 +885,18 @@ local_port = 80
 remote_port = 7001
 "#;
     let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+    assert_eq!(cfg.server_addr, "127.0.0.1");
     assert_eq!(cfg.server_port, 7000);
+    assert_eq!(cfg.token, "my-token");
     assert_eq!(cfg.transport_protocol, "tcp");
+    assert_eq!(cfg.pool_count, 1);
     assert_eq!(cfg.proxies.len(), 1);
+    let p = &cfg.proxies[0];
+    assert_eq!(p.name, "test-tcp");
+    assert_eq!(p.proxy_type, "tcp");
+    assert_eq!(p.local_ip, "127.0.0.1");
+    assert_eq!(p.local_port, 80);
+    assert_eq!(p.remote_port, 7001);
 }
 
 #[test]
@@ -2118,6 +2135,108 @@ mod proptest_tests {
             norm.contains("v2 = true"),
             "wireProtocol=v2 not converted to v2=true: {norm}"
         );
+    }
+
+    // ── Proxy/visitor sub-table normalization (flat vs nested) ─────────
+
+    proptest! {
+        /// A proxy expressed with Go-format sub-tables
+        /// ([proxies.transport] / [proxies.healthCheck] /
+        /// [proxies.loadBalancer]) normalizes to the same TOML as the
+        /// equivalent flat fields. normalize_proxies (normalize.rs:1354)
+        /// flattens the sub-tables in the order transport → healthCheck →
+        /// loadBalancer; the flat form below lists the fields in exactly
+        /// that order so the serialized outputs match.
+        #[test]
+        fn proxy_subtables_flat_vs_nested_equivalent(
+            use_enc in any::<bool>(),
+            bw in "1MB|2MB|1KB",
+            interval in 1u64..3600,
+            group in "[a-z]{1,8}",
+        ) {
+            let nested = format!(
+                "server_addr = \"127.0.0.1\"\n\
+                 server_port = 7000\n\
+                 [[proxies]]\n\
+                 name = \"p\"\n\
+                 type = \"tcp\"\n\
+                 local_ip = \"127.0.0.1\"\n\
+                 local_port = 80\n\
+                 remote_port = 7001\n\
+                 [proxies.transport]\n\
+                 useEncryption = {use_enc}\n\
+                 bandwidthLimit = \"{bw}\"\n\
+                 [proxies.healthCheck]\n\
+                 type = \"tcp\"\n\
+                 intervalSeconds = {interval}\n\
+                 [proxies.loadBalancer]\n\
+                 group = \"{group}\"\n\
+                 groupKey = \"k\"\n"
+            );
+            let flat = format!(
+                "server_addr = \"127.0.0.1\"\n\
+                 server_port = 7000\n\
+                 [[proxies]]\n\
+                 name = \"p\"\n\
+                 type = \"tcp\"\n\
+                 local_ip = \"127.0.0.1\"\n\
+                 local_port = 80\n\
+                 remote_port = 7001\n\
+                 use_encryption = {use_enc}\n\
+                 bandwidth_limit = \"{bw}\"\n\
+                 health_check_type = \"tcp\"\n\
+                 health_check_interval_seconds = {interval}\n\
+                 group = \"{group}\"\n\
+                 group_key = \"k\"\n"
+            );
+            let nested_norm = super::normalize_client_toml(&nested);
+            let flat_norm = super::normalize_client_toml(&flat);
+            prop_assert_eq!(nested_norm, flat_norm);
+        }
+    }
+
+    proptest! {
+        /// Same equivalence for visitor sub-tables
+        /// ([visitors.transport] / [visitors.natTraversal],
+        /// normalize_visitors at normalize.rs:1551).
+        #[test]
+        fn visitor_subtables_flat_vs_nested_equivalent(
+            use_enc in any::<bool>(),
+            use_comp in any::<bool>(),
+            bind_port in 1000i32..60000,
+        ) {
+            let nested = format!(
+                "server_addr = \"127.0.0.1\"\n\
+                 server_port = 7000\n\
+                 [[visitors]]\n\
+                 name = \"v\"\n\
+                 type = \"stcp\"\n\
+                 server_name = \"s\"\n\
+                 secret_key = \"sk\"\n\
+                 bind_port = {bind_port}\n\
+                 [visitors.transport]\n\
+                 useEncryption = {use_enc}\n\
+                 useCompression = {use_comp}\n\
+                 [visitors.natTraversal]\n\
+                 disableAssistedAddrs = true\n"
+            );
+            let flat = format!(
+                "server_addr = \"127.0.0.1\"\n\
+                 server_port = 7000\n\
+                 [[visitors]]\n\
+                 name = \"v\"\n\
+                 type = \"stcp\"\n\
+                 server_name = \"s\"\n\
+                 secret_key = \"sk\"\n\
+                 bind_port = {bind_port}\n\
+                 use_encryption = {use_enc}\n\
+                 use_compression = {use_comp}\n\
+                 disable_assisted_addrs = true\n"
+            );
+            let nested_norm = super::normalize_client_toml(&nested);
+            let flat_norm = super::normalize_client_toml(&flat);
+            prop_assert_eq!(nested_norm, flat_norm);
+        }
     }
 }
 
@@ -4308,4 +4427,916 @@ fn test_ini_lone_quote_token_through_pipeline() {
     let cfg: ClientConfig =
         load_client_ini("server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"\n").unwrap();
     assert_eq!(cfg.token, "\"", "lone quote token survives the pipeline");
+}
+
+// ─── Pre-release hardening round 8: config coverage gaps ──────────────
+//
+// Before this round, `type = "udp"` appeared ZERO times in workspace tests;
+// udp/sudp/stcp/xtcp/https had no coverage at all. The blocks below add
+// full-sample + minimal-defaults tests for every proxy type, plus the other
+// verified gaps: malformed formats, negative poolCount/maxPoolCount,
+// strict-mode section recursion, include variants, exec token-source
+// validation, the client heartbeat clamp, full Client/Server config samples,
+// and a proxy/visitor sub-table proptest (in mod proptest_tests).
+
+#[test]
+fn test_proxy_minimal_defaults_for_every_type() {
+    // serde defaults on ProxyConfig (client.rs): local_ip "127.0.0.1",
+    // bandwidth_limit_mode "client", health_check_interval_seconds 10,
+    // health_check_timeout_seconds 3, health_check_max_failed 1, enabled
+    // true, proxy_protocol_version "".
+    for proxy_type in ["tcp", "udp", "sudp", "stcp", "xtcp", "https"] {
+        // https requires a domain (Go validateDomainConfigForClient); the
+        // other five types have no required fields.
+        let extra = if proxy_type == "https" {
+            "\ncustom_domains = [\"example.com\"]"
+        } else {
+            ""
+        };
+        let toml = format!(
+            "server_addr = \"127.0.0.1\"\n[[proxies]]\nname = \"p\"\ntype = \"{proxy_type}\"{extra}\n"
+        );
+        let cfg: ClientConfig = load_client_config_from_str(&toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert_eq!(p.proxy_type, proxy_type);
+        assert_eq!(p.local_ip, "127.0.0.1", "{proxy_type}: local_ip default");
+        assert_eq!(
+            p.bandwidth_limit_mode, "client",
+            "{proxy_type}: bandwidth_limit_mode default"
+        );
+        assert_eq!(
+            p.health_check_interval_seconds, 10,
+            "{proxy_type}: health_check_interval_seconds default"
+        );
+        assert_eq!(
+            p.health_check_timeout_seconds, 3,
+            "{proxy_type}: health_check_timeout_seconds default"
+        );
+        assert_eq!(
+            p.health_check_max_failed, 1,
+            "{proxy_type}: health_check_max_failed default"
+        );
+        assert!(p.enabled, "{proxy_type}: enabled default true");
+        assert_eq!(
+            p.proxy_protocol_version, "",
+            "{proxy_type}: proxy_protocol_version default"
+        );
+        assert_eq!(p.local_port, 0, "{proxy_type}: local_port default");
+        assert_eq!(p.remote_port, 0, "{proxy_type}: remote_port default");
+        assert!(!p.use_encryption, "{proxy_type}: use_encryption default");
+        assert!(!p.use_compression, "{proxy_type}: use_compression default");
+    }
+}
+
+#[test]
+fn test_udp_proxy_full_sample() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "udp-echo"
+type = "udp"
+localIp = "10.0.0.5"
+localPort = 5353
+remotePort = 5353
+useEncryption = true
+useCompression = true
+bandwidthLimit = "1MB"
+bandwidthLimitMode = "server"
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    let p = &cfg.proxies[0];
+    assert_eq!(p.name, "udp-echo");
+    assert_eq!(p.proxy_type, "udp");
+    assert_eq!(p.local_ip, "10.0.0.5");
+    assert_eq!(p.local_port, 5353);
+    assert_eq!(p.remote_port, 5353);
+    assert!(p.use_encryption);
+    assert!(p.use_compression);
+    assert_eq!(p.bandwidth_limit, "1MB");
+    assert_eq!(p.bandwidth_limit_mode, "server");
+}
+
+#[test]
+fn test_sudp_proxy_full_sample() {
+    // SUDP shares the ProxyBackend/Transport/BandwidthLimit shape of UDP
+    // (Go SUDPServerProxyConfig).
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "sudp-syslog"
+type = "sudp"
+local_ip = "10.0.0.9"
+local_port = 514
+remote_port = 5514
+use_encryption = true
+use_compression = true
+bandwidth_limit = "512KB"
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    let p = &cfg.proxies[0];
+    assert_eq!(p.proxy_type, "sudp");
+    assert_eq!(p.local_ip, "10.0.0.9");
+    assert_eq!(p.local_port, 514);
+    assert_eq!(p.remote_port, 5514);
+    assert!(p.use_encryption);
+    assert!(p.use_compression);
+    assert_eq!(p.bandwidth_limit, "512KB");
+}
+
+#[test]
+fn test_stcp_proxy_full_sample() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "stcp-db"
+type = "stcp"
+local_ip = "10.0.0.6"
+local_port = 5432
+sk = "stcp-secret"
+virtual_net = "prod"
+disable_assisted_addrs = true
+use_encryption = true
+allow_users = ["alice", "bob"]
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    let p = &cfg.proxies[0];
+    assert_eq!(p.proxy_type, "stcp");
+    assert_eq!(p.local_ip, "10.0.0.6");
+    assert_eq!(p.local_port, 5432);
+    assert_eq!(p.sk, "stcp-secret");
+    assert_eq!(p.virtual_net, "prod");
+    assert!(p.disable_assisted_addrs);
+    assert!(p.use_encryption);
+    assert_eq!(p.allow_users, vec!["alice".to_string(), "bob".to_string()]);
+}
+
+#[test]
+fn test_xtcp_proxy_full_sample() {
+    // CamelCase aliases (secretKey/allowUsers/disableAssistedAddrs) exercise
+    // the Go field names on the wire.
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "xtcp-game"
+type = "xtcp"
+local_ip = "10.0.0.7"
+local_port = 7777
+secretKey = "xtcp-key"
+virtual_net = "game"
+disableAssistedAddrs = true
+useEncryption = true
+useCompression = true
+allowUsers = ["carol"]
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    let p = &cfg.proxies[0];
+    assert_eq!(p.proxy_type, "xtcp");
+    assert_eq!(p.local_ip, "10.0.0.7");
+    assert_eq!(p.local_port, 7777);
+    assert_eq!(p.sk, "xtcp-key");
+    assert_eq!(p.virtual_net, "game");
+    assert!(p.disable_assisted_addrs);
+    assert!(p.use_encryption);
+    assert!(p.use_compression);
+    assert_eq!(p.allow_users, vec!["carol".to_string()]);
+}
+
+#[test]
+fn test_https_proxy_full_sample() {
+    // https2http/https2https plugins with crt/key/enableHTTP2 land on
+    // PluginConfig.crt_file/key_file/enable_http2 (serde aliases crtPath,
+    // keyPath, enableHTTP2).
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "web-https"
+type = "https"
+custom_domains = ["secure.example.com", "api.example.com"]
+use_encryption = true
+use_compression = true
+
+[proxies.plugin]
+type = "https2http"
+crtPath = "/etc/frp/https.crt"
+keyPath = "/etc/frp/https.key"
+enableHTTP2 = false
+
+[[proxies]]
+name = "web-https2https"
+type = "https"
+custom_domains = ["tls.example.com"]
+useEncryption = true
+
+[proxies.plugin]
+type = "https2https"
+crtPath = "/etc/frp/tls.crt"
+keyPath = "/etc/frp/tls.key"
+enableHTTP2 = true
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.proxies.len(), 2);
+    let p = &cfg.proxies[0];
+    assert_eq!(p.proxy_type, "https");
+    assert_eq!(
+        p.custom_domains,
+        vec![
+            "secure.example.com".to_string(),
+            "api.example.com".to_string()
+        ]
+    );
+    assert!(p.use_encryption);
+    assert!(p.use_compression);
+    let plugin = p.plugin.as_ref().expect("https2http plugin");
+    assert_eq!(plugin.plugin_type, "https2http");
+    assert_eq!(plugin.crt_file, "/etc/frp/https.crt");
+    assert_eq!(plugin.key_file, "/etc/frp/https.key");
+    assert_eq!(plugin.enable_http2, Some(false));
+
+    let p2 = &cfg.proxies[1];
+    let plugin2 = p2.plugin.as_ref().expect("https2https plugin");
+    assert_eq!(plugin2.plugin_type, "https2https");
+    assert_eq!(plugin2.crt_file, "/etc/frp/tls.crt");
+    assert_eq!(plugin2.key_file, "/etc/frp/tls.key");
+    assert_eq!(plugin2.enable_http2, Some(true));
+}
+
+#[test]
+fn test_http_proxy_full_sample_extended() {
+    // Extends the http coverage with http_user/http_pwd/host_header_rewrite/
+    // locations/route_by_http_user/subdomain (Go HTTPProxyConfig fields).
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "web-http"
+type = "http"
+local_ip = "10.0.0.8"
+local_port = 8080
+custom_domains = ["web.example.com"]
+subdomain = "web"
+http_user = "admin"
+http_pwd = "s3cret"
+host_header_rewrite = "internal.example.com"
+locations = ["/", "/api"]
+route_by_http_user = "alice"
+use_encryption = true
+bandwidth_limit = "2MB"
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    let p = &cfg.proxies[0];
+    assert_eq!(p.proxy_type, "http");
+    assert_eq!(p.local_ip, "10.0.0.8");
+    assert_eq!(p.local_port, 8080);
+    assert_eq!(p.custom_domains, vec!["web.example.com".to_string()]);
+    assert_eq!(p.subdomain, "web");
+    assert_eq!(p.http_user, "admin");
+    assert_eq!(p.http_pwd, "s3cret");
+    assert_eq!(p.host_header_rewrite, "internal.example.com");
+    assert_eq!(p.locations, vec!["/".to_string(), "/api".to_string()]);
+    assert_eq!(p.route_by_http_user, "alice");
+    assert!(p.use_encryption);
+    assert_eq!(p.bandwidth_limit, "2MB");
+}
+
+#[test]
+fn test_tcpmux_proxy_full_sample() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "mux-ssh"
+type = "tcpmux"
+multiplexer = "httpconnect"
+custom_domains = ["mux.example.com"]
+subdomain = "mux"
+http_user = "mux-user"
+http_pwd = "mux-pass"
+route_by_http_user = "bob"
+proxy_protocol_version = "v2"
+use_encryption = true
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    let p = &cfg.proxies[0];
+    assert_eq!(p.proxy_type, "tcpmux");
+    assert_eq!(p.multiplexer, "httpconnect");
+    assert_eq!(p.custom_domains, vec!["mux.example.com".to_string()]);
+    assert_eq!(p.subdomain, "mux");
+    assert_eq!(p.http_user, "mux-user");
+    assert_eq!(p.http_pwd, "mux-pass");
+    assert_eq!(p.route_by_http_user, "bob");
+    assert_eq!(p.proxy_protocol_version, "v2");
+    assert!(p.use_encryption);
+}
+
+// ─── Malformed formats → Err, never panic ─────────────────────────────
+
+#[test]
+fn test_malformed_toml_returns_err() {
+    // Malformed TOML surfaces as an Err from parse and from the full
+    // pipeline (before round 8 only malformed JSON was tested).
+    assert!(
+        super::format::parse_to_toml_value("bind_port = ]", super::format::ConfigFormat::Toml)
+            .is_err()
+    );
+    let err = load_server_config_from_str("bind_port = ]\n");
+    assert!(err.is_err(), "malformed TOML must not panic: {err:?}");
+    let err = load_client_config_from_str("server_addr = [\n");
+    assert!(err.is_err(), "malformed TOML must not panic: {err:?}");
+}
+
+#[test]
+fn test_malformed_yaml_returns_err() {
+    // Malformed YAML (unclosed flow sequence) surfaces as an Err, never a
+    // panic.
+    assert!(super::format::parse_to_toml_value("a: [", super::format::ConfigFormat::Yaml).is_err());
+    let err = load_client_config_from_yaml("server_addr: [\n");
+    assert!(err.is_err(), "malformed YAML must not panic: {err:?}");
+}
+
+#[test]
+fn test_malformed_ini_value_through_pipeline_returns_err() {
+    // INI parsing is deliberately lenient (Go Viper parity) and never fails
+    // at parse time; a value the schema cannot accept (string where an
+    // integer is required) surfaces as a config validation error from the
+    // pipeline — never a panic.
+    let err = load_server_ini("bind_port = not-a-number\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("config validation error"), "got: {err}");
+    // Lenient parse: an unclosed section header is skipped, not an error.
+    let value = super::format::parse_to_toml_value(
+        "[broken\ntoken = x\n",
+        super::format::ConfigFormat::Ini,
+    )
+    .unwrap();
+    assert!(value.as_table().unwrap().contains_key("token"));
+}
+
+// ─── Negative pool counts ─────────────────────────────────────────────
+
+#[test]
+fn test_client_negative_pool_count_rejected() {
+    // Go frp v0.71.0 rejects a negative poolCount client-side
+    // (validateClientTransportConfig); frp-rs previously accepted it
+    // silently (round-8 addition in loader.rs validate_client_config).
+    // 0 keeps the use-the-default semantics (util.EmptyOr → 1), pinned by
+    // test_explicit_zero_client_pool_count_and_keepalive_use_go_defaults.
+    let err = load_client_config_from_str("server_addr = '127.0.0.1'\npool_count = -1\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid poolCount"), "got: {err}");
+
+    let err =
+        load_client_config_from_str("serverAddr = '127.0.0.1'\n[transport]\npoolCount = -1\n")
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("invalid poolCount"), "got: {err}");
+
+    let cfg = load_client_config_from_str("serverAddr = '127.0.0.1'\n[transport]\npoolCount = 0\n")
+        .unwrap();
+    assert_eq!(cfg.pool_count, 1, "explicit 0 still means the default (1)");
+}
+
+#[test]
+fn test_server_negative_max_pool_count_rejected() {
+    // loader.rs validate_server_config already rejects a negative
+    // transport.maxPoolCount (Go v0.71.0); this pins the config-layer
+    // rejection, which had no test.
+    let err = load_server_config_from_str("bindPort = 7000\n[transport]\nmaxPoolCount = -1\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid transport.maxPoolCount"), "got: {err}");
+
+    // 0 and positive values are accepted.
+    load_server_config_from_str("bindPort = 7000\n[transport]\nmaxPoolCount = 0\n").unwrap();
+    load_server_config_from_str("bindPort = 7000\n[transport]\nmaxPoolCount = 10\n").unwrap();
+}
+
+// ─── Strict mode: section recursion ───────────────────────────────────
+
+#[test]
+fn test_strict_accepts_unknown_proxy_field_deliberate_divergence() {
+    // strict.rs deliberately does NOT recurse into `proxies`/`visitors`
+    // arrays (section_known_keys returns None for them): per-type keys
+    // would make the check a maintenance hazard, and skipping the recursion
+    // is the looser direction, keeping valid frp-rs configs loading (Go's
+    // RejectUnknownMembers rejects unknown proxy fields). Pin the
+    // divergence: an unknown field inside [[proxies]] is ACCEPTED.
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"serverAddr = "127.0.0.1"
+serverPort = 7000
+[[proxies]]
+name = "p"
+type = "tcp"
+local_port = 80
+remote_port = 7001
+totally_unknown_proxy_field = 1
+"#,
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true).unwrap();
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].remote_port, 7001);
+}
+
+#[test]
+fn test_strict_rejects_unknown_web_server_key() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"bindPort = 7000
+[web_server]
+addr = "0.0.0.0"
+port = 7500
+unknown_web_server_key = 1
+"#,
+    )
+    .unwrap();
+    let err = load_server_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"web_server.unknown_web_server_key\""),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_strict_rejects_unknown_quic_key() {
+    // Client-side top-level [quic] (normalize flattens [transport.quic] to
+    // the top-level `quic` table) and server-side [transport.quic].
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"serverAddr = "127.0.0.1"
+[quic]
+keepalive_period = 10
+unknown_quic_key = 1
+"#,
+    )
+    .unwrap();
+    let err = load_client_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"quic.unknown_quic_key\""),
+        "got: {err}"
+    );
+
+    let mut sf = tempfile::NamedTempFile::new().unwrap();
+    sf.write_all(
+        br#"bindPort = 7000
+[transport]
+[transport.quic]
+keepalive_period = 10
+unknown_quic_key = 1
+"#,
+    )
+    .unwrap();
+    let err = load_server_config(sf.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"transport.quic.unknown_quic_key\""),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_strict_rejects_unknown_ssh_tunnel_gateway_key() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"bindPort = 7000
+[ssh_tunnel_gateway]
+bind_port = 2200
+unknown_ssh_key = 1
+"#,
+    )
+    .unwrap();
+    let err = load_server_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"ssh_tunnel_gateway.unknown_ssh_key\""),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_strict_rejects_unknown_observability_key() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"bindPort = 7000
+[observability]
+otlp_endpoint = "http://otel.example.com:4317"
+unknown_obs_key = 1
+"#,
+    )
+    .unwrap();
+    let err = load_server_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"observability.unknown_obs_key\""),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_strict_rejects_unknown_virtual_net_key() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"serverAddr = "127.0.0.1"
+[virtual_net]
+address = "10.0.0.1"
+unknown_vnet_key = 1
+"#,
+    )
+    .unwrap();
+    let err = load_client_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"virtual_net.unknown_vnet_key\""),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_strict_rejects_unknown_store_key() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"serverAddr = "127.0.0.1"
+[store]
+path = "./frpc_store.json"
+unknown_store_key = 1
+"#,
+    )
+    .unwrap();
+    let err = load_client_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"store.unknown_store_key\""),
+        "got: {err}"
+    );
+}
+
+// ─── ClientConfig / ServerConfig full samples ─────────────────────────
+
+#[test]
+fn test_client_config_full_sample() {
+    let toml = r#"
+server_addr = "10.1.2.3"
+server_port = 7001
+user = "bob"
+clientID = "client-42"
+start = ["web", "ssh"]
+connectServerLocalIP = "192.168.1.10"
+natHoleStunServer = "stun.example.com:3478"
+loginFailExit = true
+metas = { env = "prod", region = "eu" }
+udpPacketSize = 2048
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.server_addr, "10.1.2.3");
+    assert_eq!(cfg.server_port, 7001);
+    assert_eq!(cfg.user, "bob");
+    assert_eq!(cfg.client_id, "client-42");
+    assert_eq!(cfg.start, vec!["web".to_string(), "ssh".to_string()]);
+    assert_eq!(cfg.connect_server_local_ip, "192.168.1.10");
+    assert_eq!(cfg.nat_hole_stun_server, "stun.example.com:3478");
+    assert!(cfg.login_fail_exit);
+    assert_eq!(cfg.metas.get("env").map(String::as_str), Some("prod"));
+    assert_eq!(cfg.metas.get("region").map(String::as_str), Some("eu"));
+    assert_eq!(cfg.udp_packet_size, 2048);
+}
+
+#[test]
+fn test_client_config_defaults_pinned() {
+    // login_fail_exit's TRUE default is deliberate (CLAUDE.md: the code
+    // default differs from the README example); udp_packet_size defaults to
+    // 1500 and nat_hole_stun_server to stun.easyvoip.com:3478.
+    let cfg: ClientConfig = load_client_config_from_str("server_addr = '127.0.0.1'\n").unwrap();
+    assert!(cfg.login_fail_exit, "login_fail_exit defaults to TRUE");
+    assert_eq!(cfg.udp_packet_size, 1500);
+    assert_eq!(cfg.nat_hole_stun_server, "stun.easyvoip.com:3478");
+    assert!(cfg.start.is_empty());
+    assert!(cfg.user.is_empty());
+    assert!(cfg.client_id.is_empty());
+    assert!(cfg.connect_server_local_ip.is_empty());
+}
+
+#[test]
+fn test_server_config_full_sample() {
+    let toml = r#"
+bind_port = 7000
+maxConnsPerProxy = 1000
+graceful_shutdown_timeout = 60
+natholeAnalysisDataReserveHours = 336
+maxAcceptRate = 500
+
+[observability]
+otlp_endpoint = "http://otel.example.com:4317"
+service_name = "frps-prod"
+"#;
+    let cfg: ServerConfig = load_server_config_from_str(toml).unwrap();
+    assert_eq!(cfg.max_conns_per_proxy, 1000);
+    assert_eq!(cfg.graceful_shutdown_timeout, 60);
+    assert_eq!(cfg.nat_hole_analysis_data_reserve_hours, 336);
+    assert_eq!(cfg.max_accept_rate, Some(500));
+    assert_eq!(
+        cfg.observability.otlp_endpoint,
+        "http://otel.example.com:4317"
+    );
+    assert_eq!(cfg.observability.service_name, "frps-prod");
+}
+
+#[test]
+fn test_server_config_defaults_pinned() {
+    let cfg: ServerConfig = load_server_config_from_str("bind_port = 7000\n").unwrap();
+    assert_eq!(cfg.allow_port_start, 1);
+    assert_eq!(cfg.allow_port_end, 65535);
+    assert_eq!(cfg.graceful_shutdown_timeout, 30);
+    assert_eq!(cfg.nat_hole_analysis_data_reserve_hours, 168);
+    assert_eq!(cfg.max_accept_rate, None);
+    assert_eq!(cfg.max_conns_per_proxy, 0);
+}
+
+#[test]
+fn test_max_conns_per_proxy_snapshot_clamped_to_2pow20() {
+    // server.rs:195: ServerConfigSnapshot clamps max_conns_per_proxy to
+    // 2^20 — a u64::MAX value would overflow the i64 normalized field
+    // (u64::MAX -> -1) and truncate on 32-bit usize.
+    let cfg = ServerConfig {
+        max_conns_per_proxy: u64::MAX,
+        ..Default::default()
+    };
+    let snap = ServerConfigSnapshot::from_config(&cfg);
+    assert_eq!(snap.max_conns_per_proxy, 1_048_576);
+
+    let cfg = ServerConfig {
+        max_conns_per_proxy: 1000,
+        ..Default::default()
+    };
+    let snap = ServerConfigSnapshot::from_config(&cfg);
+    assert_eq!(snap.max_conns_per_proxy, 1000);
+}
+
+// ─── Exec token-source validation branches ────────────────────────────
+
+#[test]
+fn test_exec_token_source_validation_errors() {
+    // server.rs ValueSource::validate error branches: empty command, empty
+    // env name, env name containing '='. (File-source errors were already
+    // covered; exec had none.)
+    let err = load_server_config_from_str(
+        r#"
+bind_port = 7000
+[auth.tokenSource]
+type = "exec"
+exec = {}
+"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("exec command cannot be empty"), "got: {err}");
+
+    let err = load_server_config_from_str(
+        r#"
+bind_port = 7000
+[auth.tokenSource]
+type = "exec"
+exec.command = "/bin/sh"
+exec.env = [{ name = "", value = "x" }]
+"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("exec env name cannot be empty"), "got: {err}");
+
+    let err = load_server_config_from_str(
+        r#"
+bind_port = 7000
+[auth.tokenSource]
+type = "exec"
+exec.command = "/bin/sh"
+exec.env = [{ name = "A=B", value = "x" }]
+"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("exec env name cannot contain '='"),
+        "got: {err}"
+    );
+
+    // A valid exec source still parses.
+    let cfg = load_server_config_from_str(
+        r#"
+bind_port = 7000
+[auth.tokenSource]
+type = "exec"
+exec.command = "/bin/sh"
+exec.args = ["-c", "echo secret"]
+exec.env = [{ name = "TOKEN", value = "abc" }]
+"#,
+    )
+    .unwrap();
+    let exec = cfg.auth.token_source.unwrap().exec.unwrap();
+    assert_eq!(exec.command, "/bin/sh");
+    assert_eq!(exec.args, vec!["-c".to_string(), "echo secret".to_string()]);
+    assert_eq!(exec.env[0].name, "TOKEN");
+    assert_eq!(exec.env[0].value, "abc");
+}
+
+// ─── Client heartbeat clamp (round-8 parity with the server) ──────────
+
+#[test]
+fn test_client_heartbeat_huge_values_clamped_to_3600() {
+    // Parity with the server-side clamp
+    // (ServerTransportConfig::complete_with_heartbeat_timeout_set): huge
+    // explicit heartbeat values are clamped to MAX_HEARTBEAT_TIMEOUT_SECS
+    // (3600s). The server clamp has tests; the client had none and did not
+    // clamp (round-8 addition in client.rs complete_with_heartbeat_set).
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+heartbeatInterval = 9999999999
+heartbeatTimeout = 9999999999
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.heartbeat_interval,
+        super::server::MAX_HEARTBEAT_TIMEOUT_SECS
+    );
+    assert_eq!(
+        cfg.heartbeat_timeout,
+        super::server::MAX_HEARTBEAT_TIMEOUT_SECS
+    );
+}
+
+#[test]
+fn test_client_heartbeat_clamp_preserves_disable_boundary_and_normal_values() {
+    // -1 (explicit disable), the 3600 boundary, and normal values are
+    // untouched by the clamp.
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+heartbeatInterval = -1
+heartbeatTimeout = 90
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.heartbeat_interval, -1);
+    assert_eq!(cfg.heartbeat_timeout, 90);
+
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+heartbeatInterval = 3600
+heartbeatTimeout = 3600
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.heartbeat_interval, 3600);
+    assert_eq!(cfg.heartbeat_timeout, 3600);
+}
+
+// ─── include / includes variants (file.rs) ────────────────────────────
+
+#[test]
+fn test_include_singular_alias() {
+    // file.rs process_includes: the singular `include` key (string form) is
+    // an alias for `includes = ["..."]`.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("frpc.toml"),
+        "server_addr = \"127.0.0.1\"\ninclude = \"extra.toml\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("extra.toml"),
+        "server_port = 7001\ntoken = \"inc\"\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(dir.path().join("frpc.toml").to_str().unwrap(), true).unwrap();
+    assert_eq!(cfg.server_port, 7001, "include file merged");
+    assert_eq!(cfg.token, "inc");
+}
+
+#[test]
+fn test_includes_glob_pattern_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("frps.toml"),
+        "bind_port = 7000\nincludes = [\"conf.d/*.toml\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("conf.d")).unwrap();
+    std::fs::write(
+        dir.path().join("conf.d").join("a.toml"),
+        "vhost_http_port = 8080\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("conf.d").join("b.toml"),
+        "vhost_https_port = 8443\n",
+    )
+    .unwrap();
+    // Non-matching extension must not be picked up by the glob.
+    std::fs::write(dir.path().join("conf.d").join("ignore.txt"), "garbage").unwrap();
+    let cfg = load_server_config(dir.path().join("frps.toml").to_str().unwrap(), false).unwrap();
+    assert_eq!(cfg.vhost_http_port, 8080);
+    assert_eq!(cfg.vhost_https_port, 8443);
+}
+
+#[test]
+fn test_include_array_concatenation_deep_merge() {
+    // file.rs deep_merge_toml: arrays CONCATENATE (base + overlay) — the
+    // include file's [[proxies]] entries append to the main config's.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("frpc.toml"),
+        r#"server_addr = "127.0.0.1"
+includes = ["extra.toml"]
+[[proxies]]
+name = "p1"
+type = "tcp"
+local_port = 1000
+remote_port = 2000
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("extra.toml"),
+        r#"[[proxies]]
+name = "p2"
+type = "tcp"
+local_port = 1001
+remote_port = 2001
+"#,
+    )
+    .unwrap();
+    let cfg = load_client_config(dir.path().join("frpc.toml").to_str().unwrap(), false).unwrap();
+    let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["p1", "p2"],
+        "arrays concatenated by deep_merge_toml"
+    );
+    assert_eq!(cfg.proxies[0].local_port, 1000);
+    assert_eq!(cfg.proxies[1].local_port, 1001);
+    assert_eq!(cfg.proxies[1].remote_port, 2001);
+}
+
+// ─── Type-mismatch values ─────────────────────────────────────────────
+
+#[test]
+fn test_type_mismatch_toml_values_rejected() {
+    // A string where a bool is required (tcp_mux) and a string where an
+    // integer is required (bind_port) fail deserialization in the pipeline
+    // instead of being silently coerced.
+    let err = load_client_config_from_str("server_addr = '127.0.0.1'\ntcp_mux = \"true\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("config validation error"), "got: {err}");
+
+    let err = load_server_config_from_str("bind_port = \"7000\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("config validation error"), "got: {err}");
+}
+
+#[test]
+fn test_ini_yes_no_bool_inference() {
+    // format.rs infer_ini_value: yes/no → true/false (Go Viper parity).
+    let value =
+        super::format::parse_to_toml_value("a = yes\nb = no\n", super::format::ConfigFormat::Ini)
+            .unwrap();
+    let table = value.as_table().unwrap();
+    assert_eq!(table.get("a"), Some(&toml::Value::Boolean(true)));
+    assert_eq!(table.get("b"), Some(&toml::Value::Boolean(false)));
+
+    // Through the full pipeline: login_fail_exit = yes → true, tcp_mux = no
+    // → false.
+    let cfg = load_client_ini("server_addr = \"127.0.0.1\"\nlogin_fail_exit = yes\ntcp_mux = no\n")
+        .unwrap();
+    assert!(cfg.login_fail_exit);
+    assert!(!cfg.tcp_mux);
 }

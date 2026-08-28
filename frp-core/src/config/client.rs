@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::server::{
     default_authentication_timeout, default_heartbeat_timeout, default_token_auth_timeout,
     default_true, FeatureConfig, LogConfig, ObservabilityConfig, PluginConfig, QuicOptions,
-    StoreConfig, ValueSource, WebServerConfig,
+    StoreConfig, ValueSource, WebServerConfig, MAX_HEARTBEAT_TIMEOUT_SECS,
 };
 
 fn default_udp_packet_size_i64() -> i64 {
@@ -422,6 +422,20 @@ impl ClientConfig {
         // Go v0.70.1: dialServerTimeout = 0 means "use the default" (10s).
         if self.dial_server_timeout == 0 {
             self.dial_server_timeout = default_dial_server_timeout();
+        }
+
+        // Clamp huge explicit heartbeat values — parity with the server-side
+        // clamp in ServerTransportConfig::complete_with_heartbeat_timeout_set
+        // (round-7 finding 5). The client control watchdog computes
+        // `last_pong + hb_timeout` and sleeps `hb_timeout - elapsed`
+        // (frp-client/src/service.rs), so an enormous value would overflow
+        // the Instant arithmetic; 3600s is far beyond any sane heartbeat
+        // interval. Values <= 0 (explicit disable) keep their semantics.
+        if self.heartbeat_interval > MAX_HEARTBEAT_TIMEOUT_SECS {
+            self.heartbeat_interval = MAX_HEARTBEAT_TIMEOUT_SECS;
+        }
+        if self.heartbeat_timeout > MAX_HEARTBEAT_TIMEOUT_SECS {
+            self.heartbeat_timeout = MAX_HEARTBEAT_TIMEOUT_SECS;
         }
     }
 

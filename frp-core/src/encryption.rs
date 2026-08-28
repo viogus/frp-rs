@@ -1237,6 +1237,154 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_key_golden_go_vector() {
+        assert_eq!(
+            derive_key("frp-golden-vector"),
+            [
+                0x5a, 0x1c, 0x43, 0x44, 0x97, 0x1e, 0x3f, 0x0c, 0xaa, 0x58, 0xbb, 0xcf, 0xc5, 0x84,
+                0xa4, 0x40,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_decrypt_rejects_short_input() {
+        // Inputs shorter than the 16-byte IV must return Err, never panic
+        // (a panic here would abort under panic=abort — reachable from the
+        // wire on a truncated frame).
+        let key = derive_key("token");
+        assert!(decrypt(&[], &key).is_err());
+        assert!(decrypt(&[0u8; 5], &key).is_err());
+        assert!(decrypt(&[0u8; 15], &key).is_err());
+        let err = decrypt(&[0u8; 15], &key).unwrap_err();
+        assert!(err.contains("too short"), "unexpected error: {err}");
+
+        let mut out = Vec::new();
+        assert!(decrypt_into(&[], &key, &mut out).is_err());
+        assert!(decrypt_into(&[0u8; 15], &key, &mut out).is_err());
+
+        // Boundary: exactly 16 bytes (IV only, no ciphertext) is legal and
+        // decrypts to empty plaintext.
+        let iv_only = encrypt(b"", &key).unwrap();
+        assert_eq!(iv_only.len(), 16);
+        assert!(decrypt(&iv_only, &key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_decrypt_wrong_key_returns_garbage_not_error() {
+        // CFB is confidentiality-only (no integrity): decrypting with the
+        // WRONG key must NOT error — it returns deterministic garbage.
+        // Callers detect a wrong key structurally (JSON parse failure), not
+        // via an auth error. Pin that contract so an integrity layer is never
+        // silently assumed here.
+        let key_a = derive_key("token-a");
+        let key_b = derive_key("token-b");
+        let plaintext = b"confidential payload";
+        let ciphertext = encrypt(plaintext, &key_a).unwrap();
+
+        let wrong =
+            decrypt(&ciphertext, &key_b).expect("CFB has no integrity: wrong key must not error");
+        assert_ne!(
+            wrong.as_slice(),
+            &plaintext[..],
+            "wrong key must not recover the plaintext"
+        );
+
+        // Same contract through decrypt_into.
+        let mut out = Vec::new();
+        decrypt_into(&ciphertext, &key_b, &mut out)
+            .expect("decrypt_into: wrong key must not error");
+        assert_ne!(out.as_slice(), &plaintext[..]);
+
+        // Control: the right key still round-trips.
+        assert_eq!(decrypt(&ciphertext, &key_a).unwrap(), plaintext);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_partial_eof_and_flush_error_paths() {
+        // Truncate a valid framed stream mid-data-chunk: the decoder must
+        // buffer the tail without erroring on feed, then report the
+        // incomplete frame at EOF via validate_partial_eof and flush — Err,
+        // never a panic.
+        let plaintext = b"eof-path-decompression-test";
+        let compressed = compress(plaintext).unwrap();
+        assert!(
+            compressed.len() > 12,
+            "framed stream must be longer than the identifier"
+        );
+        let truncated = &compressed[..compressed.len() - 3];
+
+        let mut dec = SnappyDecompressor::new();
+        assert!(
+            dec.feed(truncated).unwrap().is_empty(),
+            "truncated tail must be buffered, not decoded"
+        );
+        let err = dec
+            .validate_partial_eof()
+            .expect_err("partial frame at EOF must be an error");
+        assert!(err.contains("incomplete frame"), "unexpected: {err}");
+
+        // flush() reports the same condition (the empty feed made no offset
+        // progress) and clears the pending buffer on error.
+        let mut dec = SnappyDecompressor::new();
+        assert!(dec.feed(truncated).unwrap().is_empty());
+        let err = dec
+            .flush()
+            .expect_err("flush must report the incomplete frame");
+        assert!(err.contains("incomplete frame"), "unexpected: {err}");
+        assert!(
+            dec.validate_partial_eof().is_ok(),
+            "flush must clear the pending buffer on error"
+        );
+
+        // Control: the full stream decodes, then EOF validation passes.
+        let mut dec = SnappyDecompressor::new();
+        let mut out = dec.feed(&compressed).unwrap();
+        loop {
+            let chunk = dec.feed(&[]).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        assert_eq!(out, plaintext);
+        assert!(
+            dec.validate_partial_eof().is_ok(),
+            "clean EOF must validate"
+        );
+        assert!(
+            dec.flush().unwrap().is_empty(),
+            "clean flush yields nothing"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_validate_partial_eof_rejects_undrained_complete_frame() {
+        // Two independent framed streams concatenated: feed() processes at
+        // most one data frame per call, so a complete second frame remains
+        // buffered. validate_partial_eof must refuse (drain first) instead of
+        // silently dropping it.
+        let c1 = compress(b"frame-one").unwrap();
+        let c2 = compress(b"frame-two").unwrap();
+        let mut stream = c1;
+        stream.extend_from_slice(&c2);
+
+        let mut dec = SnappyDecompressor::new();
+        assert_eq!(dec.feed(&stream).unwrap(), b"frame-one");
+
+        let err = dec
+            .validate_partial_eof()
+            .expect_err("complete frame at EOF must be reported");
+        assert!(err.contains("complete frame remains"), "unexpected: {err}");
+
+        // Draining the remaining frame makes EOF validation pass.
+        assert_eq!(dec.feed(&[]).unwrap(), b"frame-two");
+        assert!(dec.validate_partial_eof().is_ok());
+    }
+
+    #[test]
     fn test_encrypt_decrypt_into_roundtrip_and_wire_equiv() {
         let key: [u8; 16] = *b"0123456789abcdef";
         let data = b"udp payload payload payload";

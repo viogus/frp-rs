@@ -1,0 +1,226 @@
+//! Yamux work-connection validation chain (control/mod.rs yamux accept
+//! path). With tcp_mux (yamux) enabled, work connections arrive as NEW
+//! yamux streams on the client's control session and must be validated
+//! exactly like standalone TCP work connections — this was a real prior
+//! auth-bypass bug class (yamux streams skipped NewWorkConn verification).
+//!
+//! Each invalid stream must be dropped by the server: a wrong run_id
+//! (control/mod.rs run_id mismatch), a bad privilege_key
+//! (validate_new_work_conn_auth), or an unexpected message type (Login).
+//! And no StartWorkConn may ever be written back. A stream the server
+//! accepted would be pooled (kept OPEN); a rejected stream is closed.
+
+mod common;
+
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+
+use common::{allocate_port, start_test_server_tcpmux_on, test_auth_cfg, TEST_TOKEN};
+use frp_core::auth;
+use frp_core::config::ServerConfig;
+use frp_core::encryption;
+use frp_core::msg::{self, FrpMessage};
+use frp_core::mux;
+use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::transport::IoStream;
+
+/// Log in over a yamux control stream (V1, tcp_mux ON): dial, wrap in
+/// yamux, open the control stream, send Login, read LoginResp. Returns the
+/// encrypted control stream, the yamux session (for opening work streams),
+/// and the run_id.
+///
+/// NOTE: the control stream is NOT silent right after login — Go frps
+/// `ctl.Start()` sends one ReqWorkConn pre-warming request immediately
+/// after LoginResp, and login.rs `capped_pool_count` floors at 1 (even
+/// pool_count 0 gets one). This helper drains it, so callers can assert
+/// silence afterwards.
+async fn yamux_login(addr: SocketAddr) -> (IoStream, mux::YamuxSession, String) {
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to server");
+    let (control_yamux, session) = mux::client_mux(tcp, &mux::TcpMuxConfig::default())
+        .await
+        .expect("yamux client init");
+    let mut control = IoStream::Yamux(control_yamux);
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = auth::generate_token(TEST_TOKEN, ts);
+    let login = FrpMessage::Login(Box::new(msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("yamux-auth-test".into()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: None,
+        run_id: None,
+        client_id: None,
+        pool_count: Some(0),
+        timestamp: Some(ts),
+        privilege_key: Some(key),
+        metas: None,
+        client_spec: None,
+        multiplexer: Some("yamux".into()),
+    }));
+    write_msg_v1(&mut control, &login)
+        .await
+        .expect("send Login");
+
+    let run_id = match read_msg_v1(&mut control).await.expect("read LoginResp") {
+        FrpMessage::LoginResp(resp) => {
+            assert!(resp.error.is_none(), "login failed: {:?}", resp.error);
+            resp.run_id.expect("run_id")
+        }
+        other => panic!("expected LoginResp, got {:?}", other.v1_type_byte()),
+    };
+
+    // V1 wraps the control stream in AES-128-CFB after LoginResp (matching
+    // the server); the pre-warm ReqWorkConn arrives through the encrypted
+    // writer, so drain it here (see the doc comment above).
+    let mut control = control
+        .into_encrypted(encryption::derive_key(TEST_TOKEN))
+        .expect("wrap control in encryption");
+    let warm = tokio::time::timeout(Duration::from_secs(2), read_msg_v1(&mut control))
+        .await
+        .expect("pre-warm ReqWorkConn must arrive after LoginResp")
+        .expect("read pre-warm ReqWorkConn");
+    match warm {
+        FrpMessage::ReqWorkConn(_) => {}
+        other => panic!(
+            "expected pre-warm ReqWorkConn after login, got type {}",
+            other.v1_type_byte(),
+        ),
+    }
+    (control, session, run_id)
+}
+
+/// Assert the server DROPS the yamux stream: the read must return EOF
+/// (Ok(0), clean FIN) or an error (RST) within 2s. A timeout — the stream
+/// still open — means the server pooled/accepted it instead of rejecting.
+async fn assert_stream_closed(mut io: IoStream, what: &str) {
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(2), io.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!("{what}: expected EOF, got {n} bytes"),
+        Ok(Err(_)) => {} // RST is also a valid close
+        Err(_) => panic!("{what}: stream was NOT closed by the server (still open / pooled)"),
+    }
+}
+
+/// Open a fresh yamux stream on `session` and write one message on it.
+async fn open_and_write(session: &mux::YamuxSession, msg: &FrpMessage) -> IoStream {
+    let stream = session.open_stream().await.expect("open yamux stream");
+    let mut io = IoStream::Yamux(stream);
+    write_msg_v1(&mut io, msg)
+        .await
+        .expect("write message on yamux stream");
+    io
+}
+
+/// The validation chain on yamux work streams:
+/// (a) wrong run_id, (b) bad privilege_key, (c) unexpected message type —
+/// each stream must be dropped by the server with no StartWorkConn ever
+/// sent back. A subsequent VALID NewWorkConn must still be accepted
+/// (pooled, i.e. kept open), proving the rejections were validation, not a
+/// broken yamux accept path.
+#[tokio::test]
+async fn test_yamux_work_conn_validation_drops_bad_streams() {
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server_tcpmux_on(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let (mut control, session, run_id) = yamux_login(addr).await;
+
+    // (a) wrong run_id → dropped, never pooled.
+    let io = open_and_write(
+        &session,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some("wrong-run-id".into()),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await;
+    assert_stream_closed(io, "wrong run_id").await;
+
+    // (b) correct run_id but bad privilege_key → dropped by auth validation.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let io = open_and_write(
+        &session,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: Some(ts),
+            privilege_key: Some("bogus-key".into()),
+        }),
+    )
+    .await;
+    assert_stream_closed(io, "bad privilege_key").await;
+
+    // (c) unexpected message type (a Login frame) → dropped.
+    let io = open_and_write(
+        &session,
+        &FrpMessage::Login(Box::new(msg::Login {
+            version: Some(frp_core::VERSION.into()),
+            hostname: Some("work-stream-login".into()),
+            os: Some(std::env::consts::OS.into()),
+            arch: Some(std::env::consts::ARCH.into()),
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: Some(0),
+            timestamp: Some(ts),
+            privilege_key: None,
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        })),
+    )
+    .await;
+    assert_stream_closed(io, "Login message on work stream").await;
+
+    // No StartWorkConn / ReqWorkConn leaked onto the control stream from
+    // the rejections: it must stay silent (the login pre-warm ReqWorkConn
+    // was already drained in yamux_login, and no work was requested).
+    let silent = tokio::time::timeout(Duration::from_millis(300), read_msg_v1(&mut control)).await;
+    match silent {
+        Ok(Ok(msg)) => panic!(
+            "control stream must stay silent after rejected work conns, got type {}: {:?}",
+            msg.v1_type_byte(),
+            msg.v1_type_byte(),
+        ),
+        Ok(Err(e)) => panic!("control stream read errored after rejected work conns: {e}"),
+        Err(_) => {}
+    }
+
+    // (d) a VALID NewWorkConn is still accepted: the server pools it, so
+    // the stream stays OPEN (the read must time out, not return EOF).
+    let mut io = open_and_write(
+        &session,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await;
+    let mut buf2 = [0u8; 64];
+    let kept = tokio::time::timeout(Duration::from_millis(300), async {
+        io.read(&mut buf2).await
+    })
+    .await;
+    assert!(
+        kept.is_err(),
+        "valid NewWorkConn must be pooled (stream stays open), not closed"
+    );
+}
