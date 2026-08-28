@@ -922,13 +922,19 @@ impl ServerTransportConfig {
     }
 
     pub(super) fn complete_with_heartbeat_timeout_set(&mut self, heartbeat_timeout_set: bool) {
-        if self.tcp_mux.unwrap_or(true) && !heartbeat_timeout_set {
+        let tcp_mux = self.tcp_mux.unwrap_or(true);
+        if tcp_mux && !heartbeat_timeout_set {
             // When tcpMux is enabled, heartbeat of application layer is
             // unnecessary — rely on yamux keepalive instead (Go compat).
+            // This branch keeps its exact current behavior.
             if self.heartbeat_timeout == default_heartbeat_timeout() || self.heartbeat_timeout == 0
             {
                 self.heartbeat_timeout = -1;
             }
+        } else if !tcp_mux && self.heartbeat_timeout == 0 {
+            // Go v0.71.0: with tcpMux off, an explicit 0 is the Go zero
+            // value (util.EmptyOr) → the default (90), not "disabled".
+            self.heartbeat_timeout = default_heartbeat_timeout();
         }
         // Clamp the raw passthrough (finding 5): a huge positive value would
         // overflow `last_ping + hb_timeout` in the control loop's heartbeat

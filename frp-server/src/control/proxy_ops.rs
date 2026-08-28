@@ -13,6 +13,7 @@ use frp_core::transport::IoStream;
 use crate::lock::RwLockExt;
 use crate::proxy::ProxyInfo;
 use crate::service::{AppState, InternalMsg};
+use crate::state::ControlTx;
 
 /// Returns full detail when detailed_errors is enabled, otherwise generic message.
 pub(crate) fn err_msg(detailed: bool, detail: String, generic: &str) -> String {
@@ -1372,7 +1373,7 @@ async fn setup_proxy_listeners(
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(state, writer, internal_tx, listener_handles, udp_sockets), fields(proxy_name = %np.proxy_name, proxy_type = %np.proxy_type, run_id = %run_id))]
 pub(crate) async fn handle_new_proxy(
-    np: msg::NewProxy,
+    mut np: msg::NewProxy,
     run_id: &str,
     control_id: u64,
     state: &Arc<AppState>,
@@ -1382,36 +1383,87 @@ pub(crate) async fn handle_new_proxy(
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     v2: bool,
 ) -> bool {
+    // Server plugin: new_proxy hook — Go ordering (server/control.go
+    // handleNewProxy): the plugin runs BEFORE validation and port
+    // allocation, and a plugin's mutated content feeds registration.
+    if !state.plugin_manager.is_empty() {
+        // Go pkg/plugin/server/types.go NewProxyContent: the full flat
+        // NewProxy msg plus a `user` object (loginUserInfo). Serializing
+        // the struct guarantees every Go field is present with Go wire
+        // names; `run_id` stays as a frp-rs extra (additive).
+        let user_info = state.plugin_manager.user_info(run_id).unwrap_or_default();
+        let mut np_content = match serde_json::to_value(&np) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(proxy_name = %np.proxy_name, error = %e, "Server plugin new_proxy content serialize error for '{}': {}", np.proxy_name, e);
+                reject_new_proxy(
+                    writer,
+                    &np.proxy_name,
+                    format!("server plugin new_proxy content error: {e}"),
+                    v2,
+                )
+                .await;
+                return false;
+            }
+        };
+        if let Some(obj) = np_content.as_object_mut() {
+            obj.insert(
+                "user".into(),
+                serde_json::to_value(&user_info).unwrap_or_default(),
+            );
+            obj.insert("run_id".into(), serde_json::json!(run_id));
+        }
+        match state.plugin_manager.notify("new_proxy", np_content).await {
+            Err(reason) => {
+                // Emit WebSocket event for dashboard subscribers
+                #[cfg(feature = "dashboard")]
+                {
+                    let _ = state.event_tx.send(crate::event::ServerEvent::Error {
+                        message: format!(
+                            "Plugin 'new_proxy' rejected proxy '{}': {}",
+                            np.proxy_name, reason
+                        ),
+                        context: Some("new_proxy".into()),
+                    });
+                }
+                reject_new_proxy(writer, &np.proxy_name, reason, v2).await;
+                return false;
+            }
+            Ok(Some(mutated)) => {
+                // Go handleMutableContent (manager.go:75-96): a plugin with
+                // unchange:false replaces the typed NewProxy before
+                // registration. Fail closed on invalid content.
+                match crate::plugin::apply_plugin_mutation(&np, mutated) {
+                    Ok(m) => np = m,
+                    Err(e) => {
+                        warn!(proxy_name = %np.proxy_name, error = %e, "NewProxy plugin returned invalid content for '{}': {}", np.proxy_name, e);
+                        #[cfg(feature = "dashboard")]
+                        {
+                            let _ = state.event_tx.send(crate::event::ServerEvent::Error {
+                                message: format!(
+                                    "Plugin 'new_proxy' invalid mutation for proxy '{}': {}",
+                                    np.proxy_name, e
+                                ),
+                                context: Some("new_proxy".into()),
+                            });
+                        }
+                        reject_new_proxy(writer, &np.proxy_name, e, v2).await;
+                        return false;
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+
+    // Go parity ordering: validation runs on the post-plugin message (Go's
+    // RegisterProxy validates after the plugin hook), so a plugin can fix
+    // an otherwise-invalid proxy exactly as in Go.
     if let Err(e) = validate_new_proxy(&np, &state.sub_domain_host) {
         reject_new_proxy(writer, &np.proxy_name, e, v2).await;
         return false;
     }
     let remote_port = np.remote_port.unwrap_or(0) as u16;
-
-    // Server plugin: new_proxy hook (before port allocation).
-    // Control-enabled plugins can reject the proxy registration.
-    let np_content = serde_json::json!({
-        "proxy_name": np.proxy_name,
-        "proxy_type": np.proxy_type,
-        "remote_port": remote_port,
-        "custom_domains": np.custom_domains,
-        "run_id": run_id,
-    });
-    if let Err(reason) = state.plugin_manager.notify("new_proxy", np_content).await {
-        // Emit WebSocket event for dashboard subscribers
-        #[cfg(feature = "dashboard")]
-        {
-            let _ = state.event_tx.send(crate::event::ServerEvent::Error {
-                message: format!(
-                    "Plugin 'new_proxy' rejected proxy '{}': {}",
-                    np.proxy_name, reason
-                ),
-                context: Some("new_proxy".into()),
-            });
-        }
-        reject_new_proxy(writer, &np.proxy_name, reason, v2).await;
-        return false;
-    }
 
     // Go frp compat: only TCP/UDP proxies consume ports. HTTP/HTTPS/TCPMux
     // share the vhost/tcpmux listeners; STCP/XTCP have no remote port.
@@ -1858,21 +1910,33 @@ pub(crate) async fn listen_and_proxy(
                 // (cap 1024) can fill under a burst of user connections; Go frp
                 // blocks here and lets the TCP backlog absorb the burst. This
                 // accept loop is single-task, so stalling it only pauses this
-                // proxy's accepts. A closed channel means the control handler
-                // is gone — stop the listener.
-                if let Err(e) = internal_tx
-                    .send(InternalMsg::ProxyUserConn {
+                // proxy's accepts. Bounded (same pattern as dispatch.rs
+                // visitor/NewWorkConn sends): a control handler that stops
+                // draining must not pin this task + fd forever — after
+                // CTL_SEND_TIMEOUT the user conn drops (the kernel backlog
+                // absorbs the burst; the peer retries). A closed channel
+                // means the control handler is gone — stop the listener.
+                match tokio::time::timeout(
+                    crate::state::CTL_SEND_TIMEOUT,
+                    internal_tx.send(InternalMsg::ProxyUserConn {
                         proxy_name: proxy_name.clone(),
                         user_conn: IoStream::Tcp(user_conn),
                         pre_read: vec![],
                         user_conn_permit: None,
                         // Local sender — no group selection was done.
                         group_selected: false,
-                    })
-                    .await
+                    }),
+                )
+                .await
                 {
-                    warn!(proxy_name = %proxy_name, error = %e, "Control handler gone, stopping proxy listener for '{}'", proxy_name);
-                    break;
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        warn!(proxy_name = %proxy_name, "Control handler gone, stopping proxy listener for '{}'", proxy_name);
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        warn!(proxy_name = %proxy_name, "User-conn dispatch for proxy '{}' timed out; dropping connection", proxy_name);
+                    }
                 }
             }
             Err(e) => {
@@ -1899,20 +1963,38 @@ pub(crate) async fn unregister_control(
     sweep: bool,
 ) {
     let removed_control_id = if !skip_ctl_unregister {
-        let current_control_id = state
-            .run_id_to_ctl_tx
-            .get(run_id)
-            .map(|c| c.control_id)
-            .unwrap_or(0);
-        if control_id != 0 && current_control_id != control_id {
-            None
+        // Atomic generation-guarded removal: remove_if compares control_id
+        // inside the shard lock, so a fresh re-login's insert can never land
+        // between a check and the removal (the previous get-then-remove
+        // TOCTOU — in the disconnect+reconnect path it could delete the
+        // fresh ControlTx entry, and then its fresh user record via
+        // remove_user below). The entry is removed only when it still holds
+        // THIS control's control_id; control_id == 0 (legacy callers that
+        // do not track generations) sweeps unconditionally. remove_user
+        // below fires only when the removal actually matched (i.e. the
+        // returned value held this control's id), so a superseding
+        // control's fresh entry and user record are never touched.
+        // remove_user itself is now generation-exact too (the users map
+        // stores (control_id, UserInfo); the entry check happens inside
+        // remove_user, under its write lock), so even a remove that landed
+        // between a re-login's insert+record could not delete the fresh
+        // record — the gate below is belt-and-suspenders.
+        let removed: Option<(String, ControlTx)> = if control_id == 0 {
+            state.run_id_to_ctl_tx.remove(run_id)
         } else {
-            state.run_id_to_ctl_tx.remove(run_id);
-            // Mark the client offline in the registry, generation-aware.
             state
-                .client_registry
-                .mark_offline_by_run_id_and_control_id(run_id, current_control_id);
-            Some(current_control_id)
+                .run_id_to_ctl_tx
+                .remove_if(run_id, |_, cur| cur.control_id == control_id)
+        };
+        match removed {
+            Some((_, removed)) => {
+                // Mark the client offline in the registry, generation-aware.
+                state
+                    .client_registry
+                    .mark_offline_by_run_id_and_control_id(run_id, removed.control_id);
+                Some(removed.control_id)
+            }
+            None => None,
         }
     } else {
         None
@@ -1950,6 +2032,18 @@ pub(crate) async fn unregister_control(
                 subjects.remove(run_id);
             }
         }
+    }
+
+    // Drop this control's plugin user-info entry (bounds the manager's
+    // identity store to live controls). Fired only when the run_id_to_ctl_tx
+    // removal actually matched this control (`removed_control_id`), and the
+    // entry removal is itself generation-exact (`remove_user` drops the
+    // entry only when it still holds the removing control_id), so on
+    // supersession the old control's cleanup can never remove the new
+    // control's freshly recorded identity — even if a same-run_id re-login
+    // lands between the remove_if above and this call.
+    if let Some(control_id) = removed_control_id {
+        state.plugin_manager.remove_user(run_id, control_id);
     }
 
     // Sweep-free mode: the duplicate-login conflict path in login.rs calls
@@ -2325,12 +2419,19 @@ async fn tcp_group_listener(
                                 // listen_and_proxy — the group accept loop
                                 // stalls until the backend control handler
                                 // drains, letting the kernel backlog absorb
-                                // bursts. A closed channel means the backend
-                                // control is gone; the message (with its
-                                // permit) is dropped, returning the permit
-                                // to the semaphore — nothing leaks.
-                                if let Err(e) = tx
-                                    .send(InternalMsg::ProxyUserConn {
+                                // bursts. Bounded (same pattern as dispatch.rs
+                                // visitor/NewWorkConn sends): a backend
+                                // control that stops draining must not pin
+                                // this task + fd forever — after
+                                // CTL_SEND_TIMEOUT the conn (and its
+                                // forwarded permit) drops, returning the
+                                // permit to the semaphore — nothing leaks. A
+                                // closed channel means the backend control is
+                                // gone; the message (with its permit) is
+                                // dropped the same way.
+                                match tokio::time::timeout(
+                                    crate::state::CTL_SEND_TIMEOUT,
+                                    tx.send(InternalMsg::ProxyUserConn {
                                         proxy_name: backend,
                                         user_conn: frp_core::transport::IoStream::Tcp(conn),
                                         pre_read: vec![],
@@ -2341,15 +2442,26 @@ async fn tcp_group_listener(
                                         // selection (would bounce the conn
                                         // between members forever).
                                         group_selected: true,
-                                    })
-                                    .await
+                                    }),
+                                )
+                                .await
                                 {
-                                    debug!(
-                                        group = %group_name,
-                                        error = %e,
-                                        "Failed to dispatch connection from group '{}': {}",
-                                        group_name, e,
-                                    );
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        debug!(
+                                            group = %group_name,
+                                            error = %e,
+                                            "Failed to dispatch connection from group '{}': {}",
+                                            group_name, e,
+                                        );
+                                    }
+                                    Err(_elapsed) => {
+                                        debug!(
+                                            group = %group_name,
+                                            "Failed to dispatch connection from group '{}': backend control send timed out",
+                                            group_name,
+                                        );
+                                    }
                                 }
                             } else {
                                 debug!(
@@ -2714,6 +2826,54 @@ pub(crate) mod unregister_generation_tests {
         // The replacement itself may still clean up its own generation.
         unregister_control(&state, "run-1", 7, false, true).await;
         assert!(!state.run_id_to_ctl_tx.contains_key("run-1"));
+    }
+
+    /// Round-4 audit finding: unregister_control's entry removal used to be
+    /// `get` then unconditional `remove` — a fresh re-login's insert landing
+    /// between them deleted the fresh ControlTx entry, and remove_user then
+    /// deleted its fresh user record. The removal is now a single atomic
+    /// remove_if keyed on control_id: a stale generation's cleanup is a
+    /// no-op for BOTH the routing entry and the user record, and a matching
+    /// cleanup drops both. The user record is additionally generation-exact
+    /// on its own: it is stored as (control_id, UserInfo) and remove_user
+    /// removes only when the stored control_id matches, so a stale remover is
+    /// a no-op regardless of interleaving. (This test exercises the atomic
+    /// remove_if gate; the generation-exact user record itself is covered by
+    /// `remove_user_is_generation_exact` in plugin/http.rs.)
+    #[tokio::test]
+    async fn stale_unregister_keeps_fresh_user_record() {
+        let state = test_state();
+        state.plugin_manager.record_login_user(
+            "run-1",
+            7, // the fresh control's generation — remove_user is generation-exact
+            &crate::plugin::UserInfo {
+                user: "fresh".to_string(),
+                metas: std::collections::HashMap::new(),
+                run_id: "run-1".to_string(),
+            },
+        );
+        insert_control(&state, "run-1", 7).await;
+
+        // Stale generation 3's cleanup must not touch generation 7's routing
+        // entry or its user record.
+        unregister_control(&state, "run-1", 3, false, true).await;
+        assert!(
+            state.run_id_to_ctl_tx.contains_key("run-1"),
+            "stale cleanup must not delete the fresh ControlTx entry"
+        );
+        assert_eq!(
+            state.plugin_manager.user_info("run-1").map(|u| u.user),
+            Some("fresh".to_string()),
+            "stale cleanup must not delete the fresh control's user record"
+        );
+
+        // The fresh control's own cleanup removes both.
+        unregister_control(&state, "run-1", 7, false, true).await;
+        assert!(!state.run_id_to_ctl_tx.contains_key("run-1"));
+        assert!(
+            state.plugin_manager.user_info("run-1").is_none(),
+            "matching cleanup must drop the user record"
+        );
     }
 
     /// Regression test for the used_ports ↔ port_reservations lock-order

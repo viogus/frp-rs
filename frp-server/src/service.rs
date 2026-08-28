@@ -104,6 +104,20 @@ fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<frp_core::config::PortsRange> 
     }
 }
 
+/// Resolve the `max_connections` server config into the connection-semaphore
+/// size. `Some(0)` means unlimited and MUST resolve to 0 (not `usize::MAX`):
+/// `AppState::new` builds `Semaphore::new(n)` whenever n > 0, and tokio
+/// panics on `usize::MAX` (batch_semaphore asserts permits <= MAX_PERMITS);
+/// with panic=abort in release, `usize::MAX` would crash frps at boot on the
+/// documented "0 = unlimited" setting (audit H1). `None` defaults to 512.
+fn resolve_max_connections(max_connections: Option<u32>) -> usize {
+    match max_connections {
+        Some(0) => 0, // 0 = unlimited → no semaphore
+        Some(n) => n as usize,
+        None => 512, // default
+    }
+}
+
 /// Record a "restart required" change entry when `old != new`. Used by
 /// `reload()` for settings that only take effect on a full restart.
 fn note_restart_change<T: PartialEq + std::fmt::Display>(
@@ -191,11 +205,7 @@ impl Service {
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
         let allow_ports = resolve_allow_ports(&cfg);
         let sub_host = cfg.sub_domain_host.clone();
-        let max_connections: usize = match cfg.max_connections {
-            Some(0) => usize::MAX, // 0 = unlimited
-            Some(n) => n as usize,
-            None => 512, // default
-        };
+        let max_connections = resolve_max_connections(cfg.max_connections);
         let max_accept_rate = cfg.max_accept_rate.unwrap_or(0);
         let mut state = AppState::new(
             auth_cfg,
@@ -1669,6 +1679,68 @@ impl Service {
                             &state, &run_id, control_id,
                         )
                         .await;
+                        // Plugin user-info entry for this run_id: same leak
+                        // shape as the OIDC subject above. unregister_control
+                        // only drops it when IT removed the run_id_to_ctl_tx
+                        // entry (removed_control_id), but this sweep's
+                        // remove_if deleted that entry first, so the
+                        // generation guard fails there and remove_user is
+                        // skipped — the plugin `users` map (http.rs:97-101,
+                        // "bounded by live controls") would otherwise grow by
+                        // one entry per control that exited without a clean
+                        // unregister: exactly the path this reaper exists
+                        // for.
+                        //
+                        // Same-run_id reconnect guard: a control that died
+                        // uncleanly and reconnected with the SAME run_id (frpc
+                        // reuses its run_id) between the sweep's remove_if and
+                        // here may be mid-login. login.rs records the plugin
+                        // user entry AFTER its run_id_to_ctl_tx insert (same
+                        // run_mu critical section — audit-fix ordering), so a
+                        // fresh record only exists once a fresh generation is
+                        // registered. remove_user is now generation-exact —
+                        // the users map stores (control_id, UserInfo) and the
+                        // entry is removed only when it still holds THIS
+                        // sweep's control_id (remove-if-match under the users
+                        // map's write lock) — so even an unconditional call
+                        // here could no longer delete the record of a control
+                        // that re-logged in with a fresh control_id (the old
+                        // comment's "re-recorded on the next login hook"
+                        // claim was wrong: that login already ran).
+                        //
+                        // Round-4 audit finding: the re-check and remove_user
+                        // used to be two separate steps, so a same-run_id
+                        // re-login's insert+record (login.rs, under its own
+                        // run_mu — which the reaper did not hold) could land
+                        // between them and delete the fresh record. The
+                        // generation-exact remove_user closes that window
+                        // structurally. Hold the per-run_id run_mu across
+                        // both steps anyway, mirroring the login path's
+                        // acquisition and lock order (run_mu →
+                        // run_id_to_ctl_tx → users RwLock; the reaper
+                        // otherwise takes no run_mu and no path takes the
+                        // users lock then run_mu, so no inversion) — defense
+                        // in depth, not the sole guard: a re-login either
+                        // completed before us (its fresh generation is
+                        // visible in the re-check below → skip) or is queued
+                        // on run_mu until this removal is done (its record is
+                        // not yet made → remove_user cannot delete it). With
+                        // run_mu held, re-check run_id_to_ctl_tx: a NEWER
+                        // control_id → the fresh control re-logged in and its
+                        // record is in place → skip; no entry (or still the
+                        // swept generation) → remove_user (leak fix stands;
+                        // the generation-exact entry check makes even a
+                        // racing re-login's fresh record immune).
+                        let (run_mu, _run_mu_guard) = state.get_run_mu(&run_id);
+                        let reaper_run_guard = run_mu.lock().await;
+                        let fresh_generation_present = state
+                            .run_id_to_ctl_tx
+                            .get(&run_id)
+                            .is_some_and(|cur| cur.control_id != control_id);
+                        if !fresh_generation_present {
+                            state.plugin_manager.remove_user(&run_id, control_id);
+                        }
+                        drop(reaper_run_guard);
                         tracing::info!(
                             run_id = %run_id,
                             "removed stale control entry (handler died)"
@@ -1983,6 +2055,18 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (audit H1): `Some(0)` ("0 = unlimited") must resolve to 0,
+    /// not `usize::MAX` — `AppState::new` builds `Semaphore::new(n)` whenever
+    /// n > 0, and tokio panics on `usize::MAX` (MAX_PERMITS assertion); with
+    /// panic=abort in release, frps would crash at boot on the documented
+    /// "0 = unlimited" setting.
+    #[test]
+    fn resolve_max_connections_zero_means_unlimited() {
+        assert_eq!(resolve_max_connections(Some(0)), 0);
+        assert_eq!(resolve_max_connections(Some(5)), 5);
+        assert_eq!(resolve_max_connections(None), 512);
+    }
 
     /// Regression: a failing dynamic token source is a startup error — it
     /// must not silently fall back to an empty token (when both sides'

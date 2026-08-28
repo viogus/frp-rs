@@ -465,8 +465,27 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
     // default) — every user conn used to build a full json! Value
     // just for the notify loop.
     if !ctx.state.plugin_manager.is_empty() {
+        // Go pkg/plugin/server/types.go NewUserConnContent: `user` object
+        // + proxy_name + proxy_type + remote_addr (server/proxy/proxy.go:275).
+        // Go discards the plugin's returned content here too (the call is
+        // `_, err := ...`), so notify-only matches Go.
+        let user_info = ctx
+            .state
+            .plugin_manager
+            .user_info(&ctx.run_id)
+            .unwrap_or_default();
+        let proxy_type = ctx
+            .state
+            .proxy_manager
+            .get(&proxy_name)
+            .await
+            .map(|p| p.proxy_type.clone())
+            .unwrap_or_default();
         let user_content = serde_json::json!({
+            "user": user_info,
             "proxy_name": proxy_name,
+            "proxy_type": proxy_type,
+            "remote_addr": visitor_conn.peer_addr().map(|a| a.to_string()),
             "run_id": ctx.run_id,
         });
         if let Err(reason) = ctx
@@ -552,8 +571,27 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
     // default) — every user conn used to build a full json! Value
     // just for the notify loop.
     if !ctx.state.plugin_manager.is_empty() {
+        // Go pkg/plugin/server/types.go NewUserConnContent: `user` object
+        // + proxy_name + proxy_type + remote_addr (server/proxy/proxy.go:275).
+        // Go discards the plugin's returned content here too (the call is
+        // `_, err := ...`), so notify-only matches Go.
+        let user_info = ctx
+            .state
+            .plugin_manager
+            .user_info(&ctx.run_id)
+            .unwrap_or_default();
+        let proxy_type = ctx
+            .state
+            .proxy_manager
+            .get(&proxy_name)
+            .await
+            .map(|p| p.proxy_type.clone())
+            .unwrap_or_default();
         let user_content = serde_json::json!({
+            "user": user_info,
             "proxy_name": proxy_name,
+            "proxy_type": proxy_type,
+            "remote_addr": user_conn.peer_addr().map(|a| a.to_string()),
             "run_id": ctx.run_id,
         });
         if let Err(reason) = ctx

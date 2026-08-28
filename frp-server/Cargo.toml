@@ -60,6 +60,11 @@ mem-profile = ["frp-core/mem-profile"]
 profiling = ["frp-core/profiling"]
 
 [dev-dependencies]
+# test-util enables `#[tokio::test(start_paused = true)]` + time::pause for
+# the audit deadline tests (write_ctl_msg / send_login_error timeouts) —
+# same pattern as frp-core's dev-dependencies; never compiled into
+# non-test builds.
+tokio = { workspace = true, features = ["test-util"] }
 # flock(2) for the cross-process port-allocation guard shared by the
 # integration-test bins (see common::allocate_port). Already a workspace dep
 # pulled in transitively by frp-core — only the direct test reference is new.

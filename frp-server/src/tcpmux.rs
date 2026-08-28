@@ -474,21 +474,31 @@ pub async fn run_tcpmux_listener(
                 // channel must not silently drop a user connection (Go frp
                 // blocks and lets the TCP backlog absorb the burst). This
                 // runs in a per-connection spawned task, so the await is
-                // free. A closed channel means the control handler died
-                // between lookup and dispatch; the connection drops.
-                if let Err(e) = ctl_tx
-                    .tx
-                    .send(InternalMsg::ProxyUserConn {
+                // free. Bounded (audit H3): a control handler that stops
+                // draining must not pin this task + fd + permit forever;
+                // after CTL_SEND_TIMEOUT the connection drops.
+                match tokio::time::timeout(
+                    crate::state::CTL_SEND_TIMEOUT,
+                    ctl_tx.tx.send(InternalMsg::ProxyUserConn {
                         proxy_name: route.proxy_name.clone(),
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
                         pre_read,
                         user_conn_permit: None,
                         // Local sender — no group selection was done.
                         group_selected: false,
-                    })
-                    .await
+                    }),
+                )
+                .await
                 {
-                    warn!(host = %host, error = %e, "TCPMux: route for '{}' found but control channel closed", host);
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        // Channel closed: control handler died between lookup
+                        // and dispatch; the connection drops.
+                        warn!(host = %host, "TCPMux: route for '{}' found but control channel closed", host);
+                    }
+                    Err(_elapsed) => {
+                        warn!(host = %host, "TCPMux: route for '{}' found but control channel send timed out; dropping conn", host);
+                    }
                 }
             } else {
                 warn!(

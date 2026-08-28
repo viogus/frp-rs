@@ -34,6 +34,14 @@ type VnetRouteMap = Arc<RwLock<HashMap<(String, String), (String, String)>>>;
 // Shared state for cross-task communication
 // ---------------------------------------------------------------
 
+/// Deadline for `InternalMsg` channel sends from accept-path tasks
+/// (NewWorkConn / VisitorConn / ProxyUserConn) into a control handler.
+/// A control handler that stops draining its channel (wedged but alive)
+/// must not pin the accept-path task + fd + conn_semaphore permit forever;
+/// on timeout the sender drops the connection instead — the control-side
+/// work pool re-requests work conns and frpc retries (audit H3).
+pub(crate) const CTL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Debug)]
 pub enum InternalMsg {
     NewWorkConn(IoStream),
@@ -787,6 +795,9 @@ pub struct AppState {
     /// Client registry tracking connected frpc instances with metadata.
     pub client_registry: Arc<ClientRegistry>,
     /// Monotonically increasing counter for control generation IDs.
+    /// Starts at 1; 0 is reserved as the "no generation" sentinel in
+    /// `unregister_control`'s legacy remove path. Never reset — a wrap back
+    /// to 0 (after 2^64 logins) would over-match there.
     pub control_id_counter: AtomicU64,
     /// Per-runID mutex for serializing control lifecycle transitions
     /// (Add/Activate/completeLogin/Remove). Inherited from old to new control
@@ -1380,6 +1391,21 @@ mod tests {
             0,
             frp_core::config::ServerConfigSnapshot::from_config(&cfg),
         ))
+    }
+
+    /// Audit H1 regression: "0 = unlimited" must build NO connection
+    /// semaphore (`conn_semaphore = None`). The old service.rs mapping
+    /// `Some(0) => usize::MAX` passed the `> 0` gate and called
+    /// `Semaphore::new(usize::MAX)`, which panics (tokio MAX_PERMITS
+    /// assertion) — aborting frps at boot with panic=abort.
+    #[test]
+    fn max_connections_zero_creates_no_semaphore() {
+        // test_state() constructs AppState::new with max_connections = 0.
+        let state = test_state();
+        assert!(
+            state.conn_semaphore.is_none(),
+            "max_connections = 0 must mean unlimited (no semaphore)"
+        );
     }
 
     #[tokio::test]

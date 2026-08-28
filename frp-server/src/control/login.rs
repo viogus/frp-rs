@@ -107,7 +107,15 @@ async fn send_login_error(
         error: Some(error),
         server_additional_auth_scopes: None,
     });
-    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+    // Go frp compat: reject-path LoginResp writes carry the same 5-second
+    // deadline as the success path (audit H4). This helper is the single
+    // choke point for every reject path, so the deadline covers them all.
+    // The error frame is best-effort — on timeout the stream drops with it.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        write_ctl_msg(&mut writer, &resp, v2),
+    )
+    .await;
 }
 
 /// Consume a per-IP login-throttle slot for a FAILED auth attempt and
@@ -186,29 +194,10 @@ async fn verify_login_auth(
         );
     }
 
-    // Round 6 (MEDIUM B5): reject an already-throttled IP BEFORE auth —
-    // a brute-force flood of bad tokens must not pay full MD5 / OIDC JWT
-    // verify CPU per attempt. Pure check (no slot consumed): the failure
-    // paths below still consume a slot via `throttled_login_error`, so a
-    // successful login never counts and window semantics are unchanged.
-    // Skipped for internal AlwaysAuthPass (bypass paths never throttle).
-    if !is_auth_bypass && state.is_login_throttled(peer).await {
-        warn!(
-            peer = ?peer,
-            "Login rejected pre-auth: IP already throttled",
-        );
-        send_login_error(
-            stream,
-            err_msg(
-                state.detailed_errors_to_client,
-                "login throttled: too many failed attempts".to_string(),
-                "login throttled",
-            ),
-            v2,
-        )
-        .await;
-        return Err(());
-    }
+    // The pre-auth throttle gate lives in `authenticate`, BEFORE the plugin
+    // hook (see there — a throttled IP must not trigger plugin HTTP calls
+    // either). The failure paths below still consume a slot via
+    // `throttled_login_error`.
 
     let oidc_subject: Option<String> = if is_auth_bypass {
         None
@@ -332,23 +321,9 @@ async fn verify_login_auth(
             return Err(());
         }
 
-        // --- Reject negative pool_count (Go frp v0.71.0 fix) ---
-        // Go frp 0.71.0 fixed a server panic / remote DoS caused by a client
-        // sending a negative pool_count: negative values are rejected before
-        // work-connection pool resources are allocated. frp-rs previously
-        // clamped to 1 (no panic), but reject to match Go behavior.
-        if let Some(pc) = login.pool_count {
-            if pc < 0 {
-                warn!(peer = ?peer, pool_count = %pc, "Login rejected: negative pool_count {}", pc);
-                send_login_error(
-                    stream,
-                    format!("invalid pool count {pc}: must be non-negative"),
-                    v2,
-                )
-                .await;
-                return Err(());
-            }
-        }
+        // The negative pool_count rejection now lives in `authenticate`,
+        // AFTER the plugin hook and auth — Go NewControl parity, validated
+        // against the MUTATED login (control.go:437).
 
         // --- Validate run_id (Go frp v0.71.0 ValidateRunID) ---
         // Go 0.71.0 server/service.go rejects a client-supplied run id that is
@@ -507,10 +482,155 @@ pub(crate) async fn authenticate(
     // so legitimate reconnects are never throttled. A throttled IP is
     // rejected for the 60s window after the 5th failure (per-IP fixed 60s
     // window anchored at the first counted failure, capped table with a
-    // coarse overflow bucket). Rejection here returns Err(()) and the
-    // login error response is sent by the caller.
+    // coarse overflow bucket).
 
-    // --- Authenticate ---
+    // --- Throttle gate FIRST (frp-rs DoS protection — no Go equivalent) ---
+    // Round 6 (MEDIUM B5): reject an already-throttled IP BEFORE any work —
+    // before auth AND before the server plugin hook, so a brute-force flood
+    // of bad tokens pays neither MD5 / OIDC JWT verify CPU per attempt nor
+    // triggers plugin HTTP round-trips (the plugin can be a remote service).
+    // Pure check (no slot consumed): the failure paths below still consume
+    // a slot via `throttled_login_error`, so a successful login never
+    // counts and window semantics are unchanged. Skipped for internal
+    // AlwaysAuthPass (bypass paths never throttle).
+    let is_auth_bypass = internal
+        && login
+            .client_spec
+            .as_ref()
+            .and_then(|cs| cs.always_auth_pass)
+            .unwrap_or(false);
+    if !is_auth_bypass && state.is_login_throttled(peer).await {
+        warn!(
+            peer = ?peer,
+            "Login rejected pre-auth: IP already throttled",
+        );
+        send_login_error(
+            stream,
+            err_msg(
+                state.detailed_errors_to_client,
+                "login throttled: too many failed attempts".to_string(),
+                "login throttled",
+            ),
+            v2,
+        )
+        .await;
+        return Err(());
+    }
+
+    // Effective run_id: computed up-front (pre-plugin) so the Login hook
+    // payload can carry it — a client that omits run_id still appears as
+    // the assigned UUID (the value registration actually uses).
+    // NOTE: plugin mutations of run_id are deliberately NOT honored for
+    // BOOKKEEPING — run_id_to_ctl_tx, the plugin users map, client
+    // registry, and OIDC subjects all key off this pre-plugin value
+    // (honoring a mutated run_id would desync them). The login replay
+    // table is the exception: verify_login_auth derives run_id_for_check
+    // from the MUTATED login, so a plugin-mutated run_id DOES change the
+    // replay key — Go parity (Go uses the mutated `m` throughout
+    // RegisterControl, including the ctlsByRunID key). Echo-style
+    // plugins preserve run_id, so the split is invisible in practice;
+    // pathological plugins get the pre-plugin value in the bookkeeping
+    // maps and the mutated value in the replay table.
+    let run_id = login
+        .run_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // --- Server plugin: login hook (Go parity: BEFORE auth verify) ---
+    // Go frp v0.71.0 server/service.go handleConnection: the plugin hook
+    // runs FIRST, and on success the mutated login (`m = &retContent.Login`)
+    // is what RegisterControl consumes — VerifyLogin (token OR OIDC) runs
+    // inside RegisterControl, and the negative pool_count check runs inside
+    // NewControl, both AFTER the plugin. Consequences (Go parity): failed-
+    // auth logins STILL reach plugins (monitoring/security plugins depend
+    // on it), plugin mutations of auth fields (privilege_key / timestamp /
+    // pool_count / user) are honored, and a plugin can repair or reject a
+    // negative pool_count before it is validated.
+    let mut login = login.clone();
+    // Skip payload construction entirely when no plugins are configured
+    // (the default) — json! builds a full Value on every login otherwise.
+    if !state.plugin_manager.is_empty() {
+        // Go pkg/plugin/server/types.go LoginContent: the full flat Login
+        // msg plus `client_address` (the peer address). Serializing the
+        // struct guarantees every Go field is present with Go wire names;
+        // `remote_addr` stays as a frp-rs extra (additive).
+        let mut login_content = match serde_json::to_value(&login) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "Server plugin login content serialize error: {}", e);
+                // Consume a throttle slot: this is a pre-auth failure (round
+                // 6 B5 DoS gate) — without it an attacker could trigger
+                // plugin HTTP round-trips at any rate.
+                if let Some(msg) = throttled_login_error(&state, peer).await {
+                    send_login_error(stream, msg, v2).await;
+                    return Err(());
+                }
+                send_login_error(
+                    stream,
+                    format!("server plugin login content error: {e}"),
+                    v2,
+                )
+                .await;
+                return Err(());
+            }
+        };
+        if let Some(obj) = login_content.as_object_mut() {
+            let peer_str = peer.map(|a| a.to_string()).unwrap_or_default();
+            obj.insert("client_address".into(), serde_json::json!(peer_str));
+            obj.insert("remote_addr".into(), serde_json::json!(peer_str));
+            // Go always serializes client_spec (omitempty is a no-op on
+            // structs); emit {} when unset for exact payload parity.
+            let client_spec = match &login.client_spec {
+                Some(spec) => serde_json::to_value(spec).unwrap_or_default(),
+                None => serde_json::json!({}),
+            };
+            obj.insert("client_spec".into(), client_spec);
+            // Effective run_id: a client that omits it still appears as the
+            // assigned UUID (the value registration actually uses), so the
+            // plugin payload always matches Go's (Go frpc always sends one).
+            if login.run_id.is_none() {
+                obj.insert("run_id".into(), serde_json::json!(run_id));
+            }
+        }
+        match state.plugin_manager.notify("login", login_content).await {
+            Err(reason) => {
+                warn!(run_id = %run_id, reason = %reason, "Login for run_id {} rejected by server plugin: {}", run_id, reason);
+                // Consume a throttle slot: a plugin that rejects on
+                // attacker-controlled fields (user, metas) must not get
+                // unbounded pre-auth HTTP calls per IP (round-6 B5 DoS gate).
+                if let Some(msg) = throttled_login_error(&state, peer).await {
+                    send_login_error(stream, msg, v2).await;
+                    return Err(());
+                }
+                send_login_error(stream, reason, v2).await;
+                return Err(());
+            }
+            Ok(Some(mutated)) => {
+                // Go handleMutableContent (manager.go:75-96): a plugin with
+                // unchange:false replaces the typed Login. Fail closed on
+                // invalid content — a malformed mutation must not silently
+                // pass through.
+                match crate::plugin::apply_plugin_mutation(&login, mutated) {
+                    Ok(m) => login = m,
+                    Err(e) => {
+                        warn!(run_id = %run_id, error = %e, "Login plugin returned invalid content for run_id {}: {}", run_id, e);
+                        // Consume a throttle slot: a pre-auth failure must
+                        // not be exempt from the login throttle (round-6 B5
+                        // DoS gate — the plugin hook runs BEFORE auth).
+                        if let Some(msg) = throttled_login_error(&state, peer).await {
+                            send_login_error(stream, msg, v2).await;
+                            return Err(());
+                        }
+                        send_login_error(stream, e, v2).await;
+                        return Err(());
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+
+    // --- Authenticate on the MUTATED login ---
     // Split into its own state machine (OIDC/token verification + timestamp
     // replay protection) so this function and the auth phase are each much
     // smaller than the previous single 45 KiB future.
@@ -529,38 +649,33 @@ pub(crate) async fn authenticate(
             >,
         > + Send
         + 'a;
-    let auth_fut: Pin<Box<AuthFuture<'_>>> =
-        Box::pin(verify_login_auth(stream, login, &state, peer, v2, internal));
+    let auth_fut: Pin<Box<AuthFuture<'_>>> = Box::pin(verify_login_auth(
+        stream, &login, &state, peer, v2, internal,
+    ));
     let (oidc_subject, mut stream) = auth_fut.await?;
 
-    let reloadable = state.reloadable.read_ok().clone();
-    let authenticated_user = authenticated_user(login.user.as_deref(), oidc_subject.as_deref());
-
-    let run_id = login
-        .run_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
-
-    // --- Server plugin: login hook ---
-    // Skip payload construction entirely when no plugins are configured
-    // (the default) — json! builds a full Value on every login otherwise.
-    if !state.plugin_manager.is_empty() {
-        let login_content = serde_json::json!({
-            "version": login.version,
-            "hostname": login.hostname,
-            "os": login.os,
-            "user": login.user,
-            "run_id": run_id,
-            "remote_addr": peer.map(|a| a.to_string()),
-            "metas": login.metas,
-        });
-        if let Err(reason) = state.plugin_manager.notify("login", login_content).await {
-            warn!(run_id = %run_id, reason = %reason, "Login for run_id {} rejected by server plugin: {}", run_id, reason);
-            send_login_error(stream, reason, v2).await;
+    // --- Reject negative pool_count (Go frp v0.71.0 fix; NewControl parity) ---
+    // Go rejects a negative pool_count in NewControl (server/control.go:437),
+    // AFTER RegisterControl's VerifyLogin — so the check runs on the
+    // MUTATED login: a plugin mutation can repair a negative value, and a
+    // negative value introduced by a mutation is rejected here. frp-rs
+    // previously clamped to 1 (no panic), but reject to match Go behavior.
+    if let Some(pc) = login.pool_count {
+        if pc < 0 {
+            warn!(peer = ?peer, pool_count = %pc, "Login rejected: negative pool_count {}", pc);
+            send_login_error(
+                stream,
+                format!("invalid pool count {pc}: must be non-negative"),
+                v2,
+            )
+            .await;
             return Err(());
         }
     }
+
+    let reloadable = state.reloadable.read_ok().clone();
+    let authenticated_user = authenticated_user(login.user.as_deref(), oidc_subject.as_deref());
+    info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
 
     // --- Set up internal channel ---
     let (internal_tx, internal_rx) = mpsc::channel::<InternalMsg>(1024);
@@ -684,6 +799,38 @@ pub(crate) async fn authenticate(
         },
     );
 
+    // Record the (possibly plugin-mutated) client identity for the `user`
+    // object of later plugin hooks (Go loginUserInfo: LoginMsg.User/Metas
+    // + runID). Deliberately AFTER the run_id_to_ctl_tx insert (audit
+    // finding): the record carries this control's own control_id, so
+    // remove_user is generation-exact — it removes an entry only when it
+    // still holds the removing control's control_id (remove-if-match inside
+    // the users-map write lock). A stale control's cleanup can therefore
+    // never delete the fresh record of a control that re-logged in with the
+    // same run_id, even when it lands between the re-login's insert and its
+    // own removal step (the residual window in unregister_control: its
+    // atomic remove_if drops the old ctl_tx entry, and remove_user then ran
+    // on the run_id alone). The caller-side guards — the stale-control
+    // reaper's run_mu hold across its re-check + remove_user, and
+    // unregister_control firing remove_user only when its run_id_to_ctl_tx
+    // removal actually matched this control's control_id (a single atomic
+    // remove_if) — remain as defense in depth. Recording here, in the same
+    // run_mu critical section, makes the record strictly follow the insert
+    // (no await between): a guard whose check runs before the insert cannot
+    // find the fresh record yet; one that runs after it sees the fresh
+    // generation and skips.
+    if !state.plugin_manager.is_empty() {
+        state.plugin_manager.record_login_user(
+            &run_id,
+            control_id,
+            &crate::plugin::UserInfo {
+                user: login.user.clone().unwrap_or_default(),
+                metas: login.metas.clone().unwrap_or_default(),
+                run_id: run_id.clone(),
+            },
+        );
+    }
+
     // Release run_mu before waiting for the handoff barrier — the old
     // handler's cleanup may need to acquire run_mu (via unregister_control
     // or future code paths). This matches Go frp dev's WaitForHandoff()
@@ -730,7 +877,14 @@ pub(crate) async fn authenticate(
             error: Some("client already online".into()),
             server_additional_auth_scopes: None,
         });
-        let _ = write_ctl_msg(&mut stream, &resp, v2).await;
+        // Go frp compat: same 5-second deadline as the success-path
+        // LoginResp write (audit H4) — a wedged client must not pin this
+        // login task + fd + semaphore permit while it holds run_mu.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_ctl_msg(&mut stream, &resp, v2),
+        )
+        .await;
         // Sweep-free unregister. NOTE: on THIS path a full sweep would be
         // vacuous anyway — register_with_control_id only reports conflict
         // when the existing entry's run_id DIFFERS (registry.rs), and the
@@ -1142,6 +1296,64 @@ mod auth_signal_tests {
         assert!(result.is_err());
         assert!(rx.await.is_err(), "bad token must drop the unsent signal");
         drain.abort();
+    }
+}
+
+#[cfg(test)]
+mod send_login_error_deadline_tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    use super::send_login_error;
+
+    /// Stream whose read/write never complete — simulates a wedged-but-alive
+    /// client the LoginResp error frame cannot be delivered to.
+    struct StalledStream;
+
+    impl AsyncRead for StalledStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for StalledStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// Audit H4 regression: send_login_error (the single choke point for
+    /// every reject-path LoginResp) must carry the same 5-second deadline as
+    /// the success path. A stalled client must not pin the login task + fd +
+    /// permit forever. Paused time keeps the test instant.
+    #[tokio::test(start_paused = true)]
+    async fn send_login_error_bounded_by_5s_deadline() {
+        let stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin> = Box::new(StalledStream);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_login_error(stream, "rejected".into(), false),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "send_login_error must complete at the 5s deadline, got {result:?}"
+        );
     }
 }
 

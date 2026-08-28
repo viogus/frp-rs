@@ -35,7 +35,11 @@ async fn handshake_v2(
         frp_core::protocol::write_v2_magic(&mut io)
             .await
             .expect("write v2 magic");
-        v2_handshake::v2_handshake_client(&mut io, "tcp", false, false, false)
+        // with_crypto=true: the server rejects a crypto-less ClientHello with
+        // a ServerHello error (Go parity — v2_handshake_server). The tests
+        // exercise the post-handshake Login-read timeout, which is bounded
+        // identically with or without negotiated crypto.
+        v2_handshake::v2_handshake_client(&mut io, "tcp", false, false, true)
             .await
             .expect("V2 handshake");
         return (io, None);
@@ -53,7 +57,7 @@ async fn handshake_v2(
     frp_core::protocol::write_v2_magic(&mut control)
         .await
         .expect("write v2 magic on yamux");
-    v2_handshake::v2_handshake_client(&mut control, "tcp", false, true, false)
+    v2_handshake::v2_handshake_client(&mut control, "tcp", false, true, true)
         .await
         .expect("V2 handshake");
     (control, Some(yamux_session))

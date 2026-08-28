@@ -105,6 +105,7 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         // Go frp v0.70.1 camelCase aliases accepted by serde that are not
         // renamed away by normalize_server_config (audit task 9 finding 1).
         "detailedErrorsToClient",
+        "subDomainHost",
         "udpPacketSize",
         "tcpmuxPassthrough",
         "vhostHTTPTimeout",
@@ -267,8 +268,11 @@ pub(super) fn levenshtein(a: &str, b: &str) -> usize {
 /// Each entry lists the snake_case fields the frp-rs structs deserialize plus
 /// the Go frp v0.70.1 camelCase aliases serde accepts (normalization does not
 /// rename keys inside these sections). Sections not listed are not recursed
-/// into (e.g. `proxies`/`visitors` arrays — per-type keys would make the
-/// check a maintenance hazard and Go accepts type-specific fields there).
+/// into (e.g. `proxies`/`visitors` arrays). Go's RejectUnknownMembers
+/// (pkg/config/v1/decode.go) rejects unknown proxy/visitor/plugin fields;
+/// frp-rs deliberately does not recurse into them — per-type keys would make
+/// the check a maintenance hazard, and skipping the recursion is the looser
+/// direction, keeping valid frp-rs configs loading.
 fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
     let keys: &'static [&'static str] = match section {
         // Union of client and server auth flat fields (normalization flattens

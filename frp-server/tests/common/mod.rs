@@ -176,15 +176,17 @@ pub async fn start_test_server(mut cfg: ServerConfig) -> (JoinHandle<()>, u16) {
     (handle, port)
 }
 
-/// Connect to the server and send a Login message.
-/// Returns the encrypted IoStream (AES-128-CFB, matching server post-login)
-/// and the LoginResp. Caller can continue sending/receiving messages.
-/// `token` is the shared auth secret (empty = no auth); used for key derivation.
-pub async fn raw_login(
+/// Fully parametrized login: like `raw_login` plus the client identity
+/// (`user`, `metas`) and `pool_count` Go frpc sends. Used by the plugin
+/// tests to assert the `user` object and flat Login fields in payloads.
+pub async fn raw_login_full(
     addr: SocketAddr,
     privilege_key: Option<String>,
     timestamp: Option<i64>,
     token: &str,
+    user: Option<String>,
+    metas: Option<std::collections::HashMap<String, String>>,
+    pool_count: Option<i32>,
 ) -> Result<(IoStream, LoginResp), frp_core::Error> {
     let stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -195,13 +197,13 @@ pub async fn raw_login(
         hostname: Some("test-host".into()),
         os: Some(std::env::consts::OS.into()),
         arch: Some(std::env::consts::ARCH.into()),
-        user: None,
+        user,
         run_id: None,
         client_id: None,
-        pool_count: Some(1),
+        pool_count,
         timestamp,
         privilege_key,
-        metas: None,
+        metas,
         client_spec: None,
         multiplexer: None,
     }));
@@ -240,6 +242,44 @@ pub async fn raw_login(
             .into(),
         )),
     }
+}
+
+/// Connect to the server and send a Login message.
+/// Returns the encrypted IoStream (AES-128-CFB, matching server post-login)
+/// and the LoginResp. Caller can continue sending/receiving messages.
+/// `token` is the shared auth secret (empty = no auth); used for key derivation.
+pub async fn raw_login(
+    addr: SocketAddr,
+    privilege_key: Option<String>,
+    timestamp: Option<i64>,
+    token: &str,
+) -> Result<(IoStream, LoginResp), frp_core::Error> {
+    raw_login_full(addr, privilege_key, timestamp, token, None, None, Some(1)).await
+}
+
+/// Log in with the default test token plus a client identity (user + metas),
+/// generating a fresh timestamp and privilege_key (like login_with_test_token).
+#[allow(dead_code)]
+pub async fn login_with_identity(
+    addr: SocketAddr,
+    user: &str,
+    metas: std::collections::HashMap<String, String>,
+) -> Result<(IoStream, LoginResp), frp_core::Error> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    raw_login_full(
+        addr,
+        Some(key),
+        Some(ts),
+        TEST_TOKEN,
+        Some(user.into()),
+        Some(metas),
+        Some(1),
+    )
+    .await
 }
 
 /// Like raw_login but discards the stream, returning only the LoginResp.

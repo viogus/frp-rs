@@ -306,10 +306,13 @@ pub(crate) async fn handle_visitor_conn_inner(
             }
             // Use send().await, not try_send: we already sent success to the
             // visitor, so this connection MUST be delivered. Backpressure is
-            // correct here — the visitor is waiting anyway.
-            if ctl
-                .tx
-                .send(InternalMsg::VisitorConn {
+            // correct here — the visitor is waiting anyway. Bounded (audit
+            // H3): a provider control that stops draining must not pin this
+            // task + fd + permit forever; after CTL_SEND_TIMEOUT the visitor
+            // conn drops and the visitor retries.
+            match tokio::time::timeout(
+                crate::state::CTL_SEND_TIMEOUT,
+                ctl.tx.send(InternalMsg::VisitorConn {
                     proxy_name,
                     visitor_conn: stream,
                     visitor_use_encryption,
@@ -320,13 +323,19 @@ pub(crate) async fn handle_visitor_conn_inner(
                     // RegisterVisitorConn wireProtocol).
                     visitor_v2: v2,
                     visitor_udp_packet_codec,
-                })
-                .await
-                .is_err()
+                }),
+            )
+            .await
             {
-                // Channel closed: provider disconnected between auth check
-                // and delivery. Visitor will time out and retry.
-                warn!(run_id = %run_id, "Provider for run_id {} disconnected during visitor delivery", run_id);
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    // Channel closed: provider disconnected between auth check
+                    // and delivery. Visitor will time out and retry.
+                    warn!(run_id = %run_id, "Provider for run_id {} disconnected during visitor delivery", run_id);
+                }
+                Err(_elapsed) => {
+                    warn!(run_id = %run_id, "Visitor delivery for run_id {} timed out; dropping visitor conn", run_id);
+                }
             }
         }
         None => {
@@ -1124,25 +1133,56 @@ pub(crate) async fn validate_new_work_conn_auth(
 
 /// Run the NewWorkConn plugin hook. Returns `Err(reason)` if a plugin
 /// rejects the connection.
+///
+/// Yamux work-conn path (control/mod.rs): no `NewWorkConn` message is
+/// available, so the payload carries the user object + run_id only.
 #[instrument(skip(state), fields(run_id = %run_id))]
 pub(crate) async fn run_new_work_conn_plugin(run_id: &str, state: &AppState) -> Result<(), String> {
+    run_new_work_conn_plugin_inner(None, run_id, state).await
+}
+
+/// Standalone work-conn path (dispatch.rs): full Go payload — the `user`
+/// object + the flat NewWorkConn msg (run_id, timestamp, privilege_key).
+#[instrument(skip(state), fields(run_id = %run_id))]
+pub(crate) async fn run_new_work_conn_plugin_with_msg(
+    msg: &msg::NewWorkConn,
+    run_id: &str,
+    state: &AppState,
+) -> Result<(), String> {
+    run_new_work_conn_plugin_inner(Some(msg), run_id, state).await
+}
+
+async fn run_new_work_conn_plugin_inner(
+    msg: Option<&msg::NewWorkConn>,
+    run_id: &str,
+    state: &AppState,
+) -> Result<(), String> {
     // Skip payload construction entirely when no plugins are configured
     // (the default) — every work conn / yamux stream used to build a
     // full json! Value just for the notify loop.
     if state.plugin_manager.is_empty() {
         return Ok(());
     }
+    // Go pkg/plugin/server/types.go NewWorkConnContent: `user` object +
+    // the flat NewWorkConn msg (run_id, timestamp, privilege_key).
+    let user_info = state.plugin_manager.user_info(run_id).unwrap_or_default();
     let nwc_content = serde_json::json!({
+        "user": user_info,
         "run_id": run_id,
+        "timestamp": msg.and_then(|m| m.timestamp),
+        "privilege_key": msg.and_then(|m| m.privilege_key.clone()),
     });
     state
         .plugin_manager
         .notify("new_work_conn", nwc_content)
         .await
-        // Mutated content from plugins is intentionally not consumed here:
-        // frp-rs applies reject/approve but not content mutation (Go's
-        // handleMutableContent mutation path is not wired into the server
-        // lifecycle). Noted so the Ok(Some(..)) return is understood.
+        // Deviation from Go v0.71.0 (server/service.go:878-885): Go
+        // applies the plugin's mutated content to the NewWorkConn before
+        // auth verification (`newMsg = &retContent.NewWorkConn`); frp-rs
+        // keeps the notify-only behavior and deliberately discards the
+        // mutation because validate_new_work_conn_auth runs BEFORE this
+        // hook — consuming a plugin mutation here would bypass that
+        // verification.
         .map(|_| ())
 }
 
@@ -1188,7 +1228,7 @@ pub(crate) async fn handle_work_conn_inner(
     }
 
     // NewWorkConn plugin hook — control-enabled plugins can reject
-    if let Err(reason) = run_new_work_conn_plugin(&run_id, &state).await {
+    if let Err(reason) = run_new_work_conn_plugin_with_msg(&msg, &run_id, &state).await {
         warn!(run_id = %run_id, reason = %reason, "NewWorkConn plugin hook rejected: {}", reason);
         return;
     }
@@ -1199,9 +1239,24 @@ pub(crate) async fn handle_work_conn_inner(
         Some(ctl) => {
             // Use send().await: a dropped NewWorkConn leaves the proxy
             // without a work connection until the control handler times out
-            // and requests a new one. Backpressure is correct.
-            if ctl.tx.send(InternalMsg::NewWorkConn(stream)).await.is_err() {
-                warn!(run_id = %run_id, "Control handler for {} has gone away", run_id);
+            // and requests a new one. Backpressure is correct — but bounded
+            // (audit H3): a control handler that stops draining its channel
+            // must not pin this task + fd + permit forever; after
+            // CTL_SEND_TIMEOUT the work conn drops and the control side
+            // re-requests.
+            match tokio::time::timeout(
+                crate::state::CTL_SEND_TIMEOUT,
+                ctl.tx.send(InternalMsg::NewWorkConn(stream)),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    warn!(run_id = %run_id, "Control handler for {} has gone away", run_id);
+                }
+                Err(_elapsed) => {
+                    warn!(run_id = %run_id, "NewWorkConn delivery for {} timed out; dropping work conn", run_id);
+                }
             }
         }
         None => {

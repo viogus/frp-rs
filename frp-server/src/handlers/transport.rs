@@ -144,18 +144,31 @@ pub(crate) async fn handle_tls_connection(
                         // send().await: backpressure is correct —
                         // silently dropping the connection after
                         // consuming TLS ClientHello bytes would
-                        // confuse the client.
-                        let _ = ctl
-                            .tx
-                            .send(InternalMsg::ProxyUserConn {
+                        // confuse the client. Bounded (audit H3): a
+                        // control handler that stops draining must not
+                        // pin this task + fd + permit forever; after
+                        // CTL_SEND_TIMEOUT the connection drops.
+                        match tokio::time::timeout(
+                            crate::state::CTL_SEND_TIMEOUT,
+                            ctl.tx.send(InternalMsg::ProxyUserConn {
                                 proxy_name: route.proxy_name.to_string(),
                                 user_conn: IoStream::from(inner_stream),
                                 pre_read: sni_data,
                                 user_conn_permit: None,
                                 // Local sender — no group selection was done.
                                 group_selected: false,
-                            })
-                            .await;
+                            }),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                debug!(sni_host = %sni_host, proxy_name = %route.proxy_name, "SNI route '{}' → '{}': control handler gone, dropping conn", sni_host, route.proxy_name);
+                            }
+                            Err(_elapsed) => {
+                                warn!(sni_host = %sni_host, proxy_name = %route.proxy_name, "SNI route '{}' → '{}': control channel send timed out, dropping conn", sni_host, route.proxy_name);
+                            }
+                        }
                         return;
                     }
                 }

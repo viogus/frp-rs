@@ -252,8 +252,8 @@ pub struct ClientConfig {
     #[serde(default, alias = "dnsServer")]
     pub dns_server: String,
     /// TCP keepalive interval in seconds for outbound connections to the
-    /// frp server. 0 disables. Go frp compat: dialServerKeepalive.
-    /// frp-rs production default: 300 (Go default: 7200).
+    /// frp server. An explicit 0 means "use the default" (Go
+    /// util.EmptyOr): 7200s. Go frp compat: dialServerKeepalive.
     #[serde(
         default = "default_dial_server_keepalive",
         alias = "dialServerKeepalive"
@@ -387,7 +387,8 @@ impl ClientConfig {
 
         // Go v0.70.1: with tcpMux enabled, application-layer heartbeats are
         // disabled by default (-1) and yamux keepalive covers liveness. An
-        // explicit value is preserved (Option-style set tracking).
+        // explicit value is preserved (Option-style set tracking). This
+        // branch keeps its exact current behavior.
         if self.tcp_mux {
             if !heartbeat_interval_set {
                 self.heartbeat_interval = -1;
@@ -395,6 +396,27 @@ impl ClientConfig {
             if !heartbeat_timeout_set {
                 self.heartbeat_timeout = -1;
             }
+        } else {
+            // Go v0.71.0: with tcpMux off, an explicit 0 is the Go zero
+            // value (util.EmptyOr) → the default: 30 / 90.
+            if self.heartbeat_interval == 0 {
+                self.heartbeat_interval = default_heartbeat_interval();
+            }
+            if self.heartbeat_timeout == 0 {
+                self.heartbeat_timeout = default_heartbeat_timeout();
+            }
+        }
+
+        // Go v0.71.0: PoolCount = EmptyOr(0, 1) — an explicit 0 means
+        // "use the default" (1), not "disabled".
+        if self.pool_count == 0 {
+            self.pool_count = default_pool_count();
+        }
+
+        // Go v0.71.0: DialServerKeepAlive = EmptyOr(0, 7200) — an explicit
+        // 0 means "use the default" (7200), not "disabled".
+        if self.dial_server_keepalive == 0 {
+            self.dial_server_keepalive = default_dial_server_keepalive();
         }
 
         // Go v0.70.1: dialServerTimeout = 0 means "use the default" (10s).
