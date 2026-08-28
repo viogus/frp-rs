@@ -2836,9 +2836,10 @@ pub(crate) mod unregister_generation_tests {
     /// no-op for BOTH the routing entry and the user record, and a matching
     /// cleanup drops both. The user record is additionally generation-exact
     /// on its own: it is stored as (control_id, UserInfo) and remove_user
-    /// removes only when the stored control_id matches — so even a stale
-    /// remove_user that lands after a fresh record was made (the residual
-    /// ns-window between the remove_if and remove_user) is a no-op.
+    /// removes only when the stored control_id matches, so a stale remover is
+    /// a no-op regardless of interleaving. (This test exercises the atomic
+    /// remove_if gate; the generation-exact user record itself is covered by
+    /// `remove_user_is_generation_exact` in plugin/http.rs.)
     #[tokio::test]
     async fn stale_unregister_keeps_fresh_user_record() {
         let state = test_state();

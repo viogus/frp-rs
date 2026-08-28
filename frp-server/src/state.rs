@@ -795,6 +795,9 @@ pub struct AppState {
     /// Client registry tracking connected frpc instances with metadata.
     pub client_registry: Arc<ClientRegistry>,
     /// Monotonically increasing counter for control generation IDs.
+    /// Starts at 1; 0 is reserved as the "no generation" sentinel in
+    /// `unregister_control`'s legacy remove path. Never reset — a wrap back
+    /// to 0 (after 2^64 logins) would over-match there.
     pub control_id_counter: AtomicU64,
     /// Per-runID mutex for serializing control lifecycle transitions
     /// (Add/Activate/completeLogin/Remove). Inherited from old to new control
