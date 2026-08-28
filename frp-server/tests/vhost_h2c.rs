@@ -342,3 +342,56 @@ async fn test_h2c_404_unmapped_host() {
     let body = read_h2_body(response.into_body()).await;
     assert!(body.is_empty());
 }
+
+#[tokio::test]
+async fn test_h2c_preface_then_silence_dropped_at_timeout() {
+    let bind_port = allocate_port();
+    let vhost_port = allocate_port();
+
+    // Short vhost_http_timeout so the handshake deadline fires quickly.
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        vhost_http_port: vhost_port,
+        vhost_http_timeout: 1,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let vhost_addr: SocketAddr = format!("127.0.0.1:{vhost_port}").parse().unwrap();
+
+    // Send only the 24-byte HTTP/2 prior-knowledge preface, then go silent —
+    // no client SETTINGS frame, no HEADERS. Pre-fix this parked the h2
+    // handshake forever (task + fd + conn_semaphore permit when max_connections
+    // is configured); the vhost_http_timeout handshake deadline must close
+    // the connection.
+    let mut stream = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    stream
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .expect("write h2 preface");
+    stream.flush().await.expect("flush h2 preface");
+
+    // The server should close the connection once the ~1s handshake deadline
+    // fires. h2 writes its own SETTINGS frame eagerly during the handshake, so
+    // drain whatever the server sends and wait for EOF (or a reset). Bounded by
+    // 5s: if that elapses the deadline never fired and the connection is parked
+    // forever — fail loudly instead of hanging.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut buf = [0u8; 256];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,    // clean EOF — deadline closed the connection
+                Ok(_) => continue, // server SETTINGS / GOAWAY — keep draining
+                Err(_) => break,   // RST is also a valid release
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "h2c handshake deadline did not release the connection within 5s"
+    );
+}

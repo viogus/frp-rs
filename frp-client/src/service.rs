@@ -1082,7 +1082,25 @@ impl Service {
                             (rand::thread_rng().gen::<f64>() * 0.1 * delay_ms as f64) as u64;
                         Duration::from_millis(delay_ms.saturating_add(jitter_ms).min(10_000))
                     };
-                    tokio::time::sleep(delay).await;
+                    // Race the backoff against a stop request: with
+                    // login_fail_exit = false and an unreachable server, the
+                    // plain sleep below would hold a buffered admin/signal
+                    // stop (cap-1 stop_tx) until a login eventually succeeds —
+                    // shutdown would hang indefinitely (Go client/service.go
+                    // loopLoginUntilSuccess has no stop path either; this is
+                    // client-side robustness beyond parity, same shape as the
+                    // reconnect-sleep select below). There is no ctx on the
+                    // login-failure path (it is bound only in the Ok arm
+                    // above), so this branch only cancels the detached
+                    // health/admin tasks and returns.
+                    tokio::select! {
+                        Some(()) = stop_rx.recv() => {
+                            info!("Stop requested while waiting to retry login, shutting down");
+                            self.cancel_detached_tasks(&health_cancels, admin_handle).await;
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
                     continue;
                 }
             };

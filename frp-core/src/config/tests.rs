@@ -2687,6 +2687,102 @@ fn test_collect_config_files_includes_yaml_and_yml() {
     );
 }
 
+// ─── JSON config support (Go frp Viper parity) ───────────────────────
+
+/// Parse a JSON client config through the full pipeline (JSON → toml::Value
+/// → normalize → deserialize), mirroring `load_client_config_from_yaml` for
+/// YAML.
+fn load_client_config_from_json(json: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let mut value = super::format::parse_to_toml_value(json, super::format::ConfigFormat::Json)?;
+    expand_env_vars(&mut value);
+    normalize_client_config(&mut value);
+    let presence = super::loader::ConfigPresence::from_normalized_value(&value);
+    let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
+        .map_err(|e| format!("config validation error: {e}"))?;
+    super::loader::validate_client_config(&cfg)?;
+    cfg.complete_with_heartbeat_set(
+        presence.client_heartbeat_interval_set,
+        presence.client_heartbeat_timeout_set,
+    );
+    Ok(cfg)
+}
+
+#[test]
+fn test_detect_format_json_and_ini_extensions() {
+    use super::format::{detect_format, ConfigFormat};
+    assert_eq!(detect_format("frps.json"), ConfigFormat::Json);
+    assert_eq!(
+        detect_format("frpc.JSON"),
+        ConfigFormat::Json,
+        "case-insensitive"
+    );
+    assert_eq!(detect_format("frpc.ini"), ConfigFormat::Ini);
+    assert_eq!(
+        detect_format("frps.INI"),
+        ConfigFormat::Ini,
+        "case-insensitive"
+    );
+    assert_eq!(
+        detect_format("frps.cfg"),
+        ConfigFormat::Toml,
+        "unknown extension falls back to TOML (Go Viper default)"
+    );
+}
+
+#[test]
+fn test_client_json_equivalent_to_toml() {
+    let toml = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "client-token"
+
+[[proxies]]
+name = "web"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 8080
+remote_port = 7001
+"#;
+    let json = r#"{
+  "server_addr": "127.0.0.1",
+  "server_port": 7000,
+  "token": "client-token",
+  "proxies": [
+    {
+      "name": "web",
+      "type": "tcp",
+      "local_ip": "127.0.0.1",
+      "local_port": 8080,
+      "remote_port": 7001
+    }
+  ]
+}"#;
+    let toml_cfg = super::load_client_config_from_str(toml).unwrap();
+    let json_cfg = load_client_config_from_json(json).unwrap();
+    assert_eq!(toml_cfg.server_addr, json_cfg.server_addr);
+    assert_eq!(toml_cfg.server_port, json_cfg.server_port);
+    assert_eq!(toml_cfg.token, json_cfg.token);
+    assert_eq!(toml_cfg.proxies.len(), json_cfg.proxies.len());
+    let (tp, jp) = (&toml_cfg.proxies[0], &json_cfg.proxies[0]);
+    assert_eq!(tp.name, jp.name);
+    assert_eq!(tp.proxy_type, jp.proxy_type);
+    assert_eq!(tp.local_ip, jp.local_ip);
+    assert_eq!(tp.local_port, jp.local_port);
+    assert_eq!(tp.remote_port, jp.remote_port);
+}
+
+#[test]
+fn test_json_malformed_returns_err() {
+    // Malformed JSON surfaces as an Err from the parse entrypoint (and the
+    // full pipeline), never a panic.
+    assert!(
+        super::format::parse_to_toml_value("{ not json", super::format::ConfigFormat::Json)
+            .is_err()
+    );
+    let err = load_client_config_from_json(r#"{ "server_addr": }"#);
+    assert!(err.is_err(), "malformed JSON must not panic: {err:?}");
+}
+
 // ─── Env var expansion (Go frp Viper `${ENV_VAR}` parity) ───────────
 //
 // All variable names use the unique `FRP_RS_TEST_ENV_` prefix. Tests run in
@@ -4174,4 +4270,42 @@ ops = ["login", "new_proxy"]
     .unwrap();
     let p = cfg.http_plugins.iter().find(|p| p.name == "arr").unwrap();
     assert_eq!(p.ops, vec!["login", "new_proxy"]);
+}
+
+/// infer_ini_value: a lone quote character as the whole value must not
+/// panic. `token = "` and `token = '` used to hit `s[1..s.len() - 1]` →
+/// `s[1..0]` ("slice index starts at 1 but ends at 0"), which aborts in
+/// release builds (panic = "abort") and is reachable at startup AND on
+/// runtime reload (frpc SIGUSR1 / admin API). Go ini.v1 keeps a lone quote
+/// as a one-character literal string, so it must parse to `"` / `'`.
+#[test]
+fn test_ini_lone_quote_char_no_panic() {
+    for (raw_value, expected) in [
+        ("\"", "\""),
+        ("'", "'"),
+        ("\"abc\"", "abc"),
+        ("\"\"", ""),
+        ("\"abc", "\"abc"),
+        ("abc\"", "abc\""),
+    ] {
+        // Each value on its own line so a lone quote is the complete value.
+        let content = format!("token = {raw_value}\nserver_port = 7000\n");
+        let value =
+            super::format::parse_to_toml_value(&content, super::format::ConfigFormat::Ini).unwrap();
+        let table = value.as_table().unwrap();
+        assert_eq!(
+            table.get("token"),
+            Some(&toml::Value::String(expected.to_string())),
+            "INI value {raw_value:?} should parse to {expected:?}"
+        );
+    }
+}
+
+/// The lone-quote token through the FULL client pipeline (parse → normalize
+/// → validate → deserialize), proving the panic fix survives reload paths.
+#[test]
+fn test_ini_lone_quote_token_through_pipeline() {
+    let cfg: ClientConfig =
+        load_client_ini("server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"\n").unwrap();
+    assert_eq!(cfg.token, "\"", "lone quote token survives the pipeline");
 }

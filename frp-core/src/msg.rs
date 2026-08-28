@@ -1554,4 +1554,76 @@ mod tests {
         assert_eq!(from_go.bandwidth_limit_mode.as_deref(), Some("client"));
         assert_eq!(from_go.proxy_protocol_version.as_deref(), Some("v1"));
     }
+
+    // ---------------------------------------------------------------
+    // Forward compatibility: unknown fields must be tolerated
+    // ---------------------------------------------------------------
+
+    /// Assert that a JSON literal with an extra unknown key deserializes
+    /// into `T`. Future Go frp releases will add fields to wire messages;
+    /// serde ignores unknown fields by default and no struct here uses
+    /// `deny_unknown_fields` — this pins that property so a refactor
+    /// adding it is caught by tests instead of silently breaking every Go
+    /// peer on the wire.
+    fn accepts<T: serde::de::DeserializeOwned>(json: &str) {
+        serde_json::from_str::<T>(json).unwrap_or_else(|e| {
+            panic!(
+                "expected {} to tolerate unknown fields in {}: {}",
+                std::any::type_name::<T>(),
+                json,
+                e
+            )
+        });
+    }
+
+    #[test]
+    fn test_unknown_fields_are_tolerated_go_forward_compat() {
+        // Every literal carries a plausible future-Go field
+        // ("featureFlags") that no current struct declares, alongside each
+        // struct's REAL required fields (Login.client_spec serializes as
+        // `client_spec` — verified against the Go v0.71.0 binary).
+        accepts::<Login>(
+            r#"{"version":"0.71.0","hostname":"h1","os":"linux","arch":"amd64","user":"u1","run_id":"r1","client_id":"c1","pool_count":2,"timestamp":1234567890123,"privilege_key":"pk","metas":{"k":"v"},"client_spec":{"type":"frpc","always_auth_pass":false},"multiplexer":"yamux","featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<LoginResp>(
+            r#"{"version":"0.71.0","run_id":"r1","serverAdditionalAuthScopes":["HeartBeats"],"featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<NewProxy>(
+            r#"{"proxy_name":"p1","proxy_type":"tcp","remote_port":7001,"local_str":"127.0.0.1:80","featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<NewProxyResp>(
+            r#"{"proxy_name":"p1","remote_addr":"0.0.0.0:7001","featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<CloseProxy>(r#"{"proxy_name":"p1","featureFlags":["quic-ack"]}"#);
+        accepts::<StartWorkConn>(
+            r#"{"proxy_name":"p1","src_addr":"1.2.3.4","src_port":12345,"dst_addr":"5.6.7.8","dst_port":80,"featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<NewWorkConn>(
+            r#"{"run_id":"r1","timestamp":123,"privilege_key":"pk","featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<ReqWorkConn>(r#"{"featureFlags":["quic-ack"]}"#);
+        accepts::<Ping>(r#"{"timestamp":123,"privilege_key":"pk","featureFlags":["quic-ack"]}"#);
+        accepts::<Pong>(r#"{"error":"ok","featureFlags":["quic-ack"]}"#);
+        accepts::<NewVisitorConn>(
+            r#"{"proxy_name":"stcp1","sign_key":"sk","timestamp":99,"run_id":"r1","use_encryption":true,"use_compression":false,"featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<NewVisitorConnResp>(r#"{"proxy_name":"stcp1","featureFlags":["quic-ack"]}"#);
+        accepts::<UDPPacket>(
+            r#"{"c":"AQID","l":{"IP":"127.0.0.1","Port":53,"Zone":""},"r":{"IP":"10.0.0.1","Port":9999,"Zone":""},"featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<NatHoleVisitor>(
+            r#"{"transaction_id":"t1","proxy_name":"p1","pre_check":true,"protocol":"quic","sign_key":"sk","timestamp":123,"mapped_addrs":["1.2.3.4:1000"],"assisted_addrs":["5.6.7.8:2000"],"featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<NatHoleClient>(
+            r#"{"transaction_id":"t1","proxy_name":"p1","sid":"s1","protocol":"quic","mapped_addrs":["1.2.3.4:1000"],"assisted_addrs":["5.6.7.8:2000"],"featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<NatHoleResp>(
+            r#"{"transaction_id":"t1","sid":"s1","protocol":"quic","candidate_addrs":["1.2.3.4:1000"],"assisted_addrs":["5.6.7.8:2000"],"featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<NatHoleSid>(
+            r#"{"transaction_id":"t1","sid":"s1","response":true,"nonce":"n1","featureFlags":["quic-ack"]}"#,
+        );
+        accepts::<NatHoleReport>(r#"{"sid":"s1","success":true,"featureFlags":["quic-ack"]}"#);
+        accepts::<Error>(r#"{"error":"boom","featureFlags":["quic-ack"]}"#);
+    }
 }

@@ -110,6 +110,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
 /// 24-byte preface plus any frames that arrived with it). They are replayed
 /// into the `h2` server handshake; every inbound stream is then handled by
 /// [`handle_stream`].
+///
+/// The handshake and the first accept are bounded by a single absolute
+/// `vhost_http_timeout` deadline — the exact parallel of the HTTP/1.1 head
+/// read at vhost.rs:635-640 (same `.max(1)` floor, same
+/// `Instant::now() + from_secs` idiom). An unauthenticated client that sends
+/// the 24-byte preface and then goes silent must not park a task, an fd, and
+/// — when `max_connections` is configured — a `conn_semaphore` permit (held
+/// by `let _permit = permit;` in the spawned task at vhost.rs:980) forever.
+/// Only the pre-first-stream phase is bounded: once the first stream is
+/// established, later accepts are deliberately NOT deadlined, since a
+/// legitimately idle keep-alive h2c connection between requests is normal
+/// (the HTTP/1.1 path likewise stops clocking the client once the head is in).
 pub(crate) async fn serve_h2c_request<S>(
     stream: S,
     pre_read: Vec<u8>,
@@ -118,28 +130,64 @@ pub(crate) async fn serve_h2c_request<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Same absolute-deadline idiom as the HTTP/1.1 head read (vhost.rs:635-
+    // 640): the whole handshake must complete within vhost_http_timeout, not
+    // a per-read timeout a drip-feeding client could stretch indefinitely.
+    let timeout_secs = state.vhost_http_timeout.max(1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let io = PreReadStream {
         pre_read,
         pos: 0,
         inner: stream,
     };
     let mut connection: h2::server::Connection<PreReadStream<S>, Bytes> =
-        match h2::server::Builder::new()
-            // Bound concurrent streams like Go's http.Server (default 250) to
-            // cap per-connection memory.
-            .max_concurrent_streams(100)
-            .handshake(io)
-            .await
+        match tokio::time::timeout_at(
+            deadline,
+            h2::server::Builder::new()
+                // Bound concurrent streams like Go's http.Server (default 250) to
+                // cap per-connection memory.
+                .max_concurrent_streams(100)
+                // Cap the header block at the same 4096-byte bound the HTTP/1.1
+                // head path enforces (vhost.rs:641, 650-655). h2's 16 MiB default
+                // × 100 concurrent streams would otherwise leave an
+                // unauthenticated client a ~1.6 GiB per-connection memory ceiling
+                // to park on.
+                .max_header_list_size(4096)
+                .handshake(io),
+        )
+        .await
         {
-            Ok(c) => c,
-            Err(e) => {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 tracing::debug!(peer = %peer, error = %e, "h2c handshake failed from {}", peer);
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::debug!(peer = %peer, "h2c handshake from {} timed out after {}s", peer, timeout_secs);
                 return;
             }
         };
 
+    // The first accept is bounded by the same absolute deadline: a client
+    // that completes the handshake but never opens a stream is the
+    // post-preface variant of the same attack and must also be released.
+    // Subsequent accepts are NOT deadlined — an established h2c connection
+    // idling between requests is legitimate and must be allowed to sit.
+    let mut first = true;
     loop {
-        match connection.accept().await {
+        let accepted = if first {
+            first = false;
+            match tokio::time::timeout_at(deadline, connection.accept()).await {
+                Err(_elapsed) => {
+                    tracing::debug!(peer = %peer, "h2c first stream from {} timed out after {}s", peer, timeout_secs);
+                    return;
+                }
+                Ok(a) => a,
+            }
+        } else {
+            connection.accept().await
+        };
+        match accepted {
             Some(Ok((request, respond))) => {
                 let state = state.clone();
                 tokio::spawn(async move {
