@@ -66,7 +66,6 @@
 //! Go's TTL set/restore races under concurrent random-port probing while we
 //! keep a constant probe-phase TTL (cleaner, same observable behavior).
 
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -654,16 +653,32 @@ impl AsyncWrite for XtcpP2pStream {
 
         // Backpressure: if the pending send buffer exceeds the high-water
         // mark, return Pending and register the waker. The waker is woken
-        // in drive_kcp after pending_send is flushed to KCP. Without this,
-        // a write-heavy one-directional stream could grow pending_send
-        // without bound if UDP sends are slower than data arrival.
+        // in drive_kcp (and poll_flush) after pending_send is flushed to
+        // KCP. Without this, a write-heavy one-directional stream could
+        // grow pending_send without bound if UDP sends are slower than
+        // data arrival.
+        //
+        // Round 10 (MEDIUM): the raw-KCP path (tcp-mux off, micro builds)
+        // has no background yamux driver re-polling this stream, so a
+        // silent peer deadlocks: the write half parks here, the read half
+        // parks on the empty read channel, and drive_kcp — the only drain
+        // site — never runs again. A timer wake alongside the notify
+        // guarantees a re-poll, and the drain below forces one KCP tick
+        // so parked writers make progress even without peer traffic.
         if self.pending_send.len() >= PENDING_SEND_HIGH_WATER {
+            // Both futures are !Unpin (tokio Notify waiter / Sleep), so
+            // box-pin them to satisfy futures_util select's Unpin bounds.
+            // Two box allocs on the rare HWM-parked path only.
             let notified = self.write_notify.clone().notified_owned();
-            let mut pinned = Box::pin(notified);
-            match pinned.as_mut().poll(cx) {
-                Poll::Ready(()) => {
-                    // pending_send was drained between check and here.
-                    // Fall through to append data.
+            let wake = tokio::time::sleep(std::time::Duration::from_millis(KCP_TICK_MS as u64));
+            let mut select = futures_util::future::select(Box::pin(notified), Box::pin(wake));
+            match futures_util::FutureExt::poll_unpin(&mut select, cx) {
+                Poll::Ready(_) => {
+                    // Drain pending_send immediately: bypass the 10ms tick
+                    // gate, which the yamux driver path does not need but
+                    // the raw path cannot afford (see above).
+                    let now_ms = self.created.elapsed().as_millis() as u32;
+                    self.drive_kcp(now_ms)?;
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -707,10 +722,17 @@ impl AsyncWrite for XtcpP2pStream {
         // Drain any pending_send buffered during the current tick window
         // (maybe_tick skips drive_kcp when elapsed < KCP_TICK_MS, so poll_write
         // data may sit in pending_send without reaching KCP's snd_queue).
+        let was_full = self.pending_send.len() >= PENDING_SEND_HIGH_WATER;
         let pending_drain_len = self.pending_send.len();
         if !self.pending_send.is_empty() {
             let data = std::mem::take(&mut self.pending_send);
             let _ = self.session.send(data);
+            // Round 10 (LOW): symmetric with drive_kcp's was_full notify —
+            // a flush-drain landing between a writer's gate check and the
+            // next drive_kcp must still wake parked writers.
+            if was_full {
+                self.write_notify.notify_one();
+            }
         }
 
         // Force-flush: update KCP and send all output immediately.

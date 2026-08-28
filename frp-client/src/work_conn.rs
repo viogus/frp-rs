@@ -1680,8 +1680,8 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                                             frp_core::proxy_protocol::build_proxy_protocol_v1(
                                                 src,
                                                 swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
-                                                swc.src_port.unwrap_or(0) as u16,
-                                                swc.dst_port.unwrap_or(0) as u16,
+                                                swc.src_port.unwrap_or(0),
+                                                swc.dst_port.unwrap_or(0),
                                             );
                                         if let Err(e) = local.write_all(header.as_bytes()).await {
                                             warn!(error = %e, "Failed to write PROXY v1 header: {}", e);
@@ -1690,8 +1690,8 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                                         match frp_core::proxy_protocol::build_proxy_protocol_v2(
                                             src,
                                             swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
-                                            swc.src_port.unwrap_or(0) as u16,
-                                            swc.dst_port.unwrap_or(0) as u16,
+                                            swc.src_port.unwrap_or(0),
+                                            swc.dst_port.unwrap_or(0),
                                         ) {
                                             Ok(header) => {
                                                 if let Err(e) = local.write_all(&header).await {

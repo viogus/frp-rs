@@ -409,6 +409,11 @@ mod oidc_impl {
     /// soonest-expiring entry is evicted to make room for the new jti.
     const MAX_SEEN_JTIS: usize = 100_000;
 
+    /// Byte cap on a single jti claim (round 10 LOW): the count cap above
+    /// does not bound entry BYTES. Real jtis are UUIDs (36 bytes); 4 KiB is
+    /// orders of magnitude beyond any legitimate IdP.
+    const MAX_JTI_LEN_BYTES: usize = 4 * 1024;
+
     /// Minimum interval between attacker-triggered JWKS refreshes on the
     /// `refresh_warranted` retry path. A forged JWT (valid kid, garbage
     /// signature) fails with a key-related error and would otherwise trigger
@@ -904,6 +909,14 @@ mod oidc_impl {
                 // primary defenses.
                 return Ok(());
             };
+            // Round 10 (LOW): the cache caps entry COUNT, not bytes — IdPs
+            // commonly echo a client-supplied jti, so a long one (tens of MB
+            // would need to be rejected by JWT size limits first, but a 100 KB
+            // jti is realistic) would grow the map toward gigabytes at the
+            // 100k-entry cap. Real jtis are UUIDs; reject anything absurd.
+            if jti.len() > MAX_JTI_LEN_BYTES {
+                return Err("OIDC: jti claim too large".to_string());
+            }
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -919,7 +932,10 @@ mod oidc_impl {
             // the token's realistic lifetime.
             const MAX_JTI_TTL_SECS: i64 = 24 * 3600;
             let deadline = if expiry > now {
-                (expiry + 60).min(now + MAX_JTI_TTL_SECS)
+                // saturating_add (round 10 LOW): a hostile exp within 60 of
+                // i64::MAX would wrap negative in release, land the deadline
+                // in the past, and silently disable replay tracking.
+                expiry.saturating_add(60).min(now + MAX_JTI_TTL_SECS)
             } else {
                 now + 3600
             };

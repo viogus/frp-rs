@@ -498,6 +498,27 @@ pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
 pub(super) fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
     validate_proxy_configs(&cfg.proxies)?;
     validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
+    // Go frp v0.71.0 validation/visitor.go:42-63 (round 10 MEDIUM): visitors
+    // were never validated — an empty name/serverName or bindPort==0 loaded
+    // silently and the visitor never connected. Mirror Go's checks exactly:
+    // bindPort -1 (no-bind) and positive ports pass; only 0 is rejected.
+    for v in &cfg.visitors {
+        if v.name.is_empty() {
+            return Err("visitor config: name is required".to_string());
+        }
+        if v.server_name.is_empty() {
+            return Err(format!("visitor '{}': server name is required", v.name));
+        }
+        if v.bind_port == 0 {
+            return Err(format!("visitor '{}': bind port is required", v.name));
+        }
+        if v.visitor_type == "xtcp" && v.protocol != "kcp" && v.protocol != "quic" {
+            return Err(format!(
+                "visitor '{}': protocol should be kcp or quic",
+                v.name
+            ));
+        }
+    }
     // Negative poolCount: Go frp v0.71.0 has NO client-side check —
     // Go frpc loads the config fine and the SERVER rejects the negative at
     // login (server/control.go:438 "invalid pool count %d, must be

@@ -105,6 +105,10 @@ impl frp_core::ControlSink for ControlWriter {
     fn send_msg(&self, msg: FrpMessage, v2: bool) -> Result<(), String> {
         self.send(msg, v2)
     }
+
+    fn is_failed(&self) -> bool {
+        ControlWriter::is_failed(self)
+    }
 }
 #[cfg(feature = "vnet")]
 use crate::vnet::{
@@ -3613,9 +3617,27 @@ impl Service {
                 .map(|info| info.local_addr.clone())
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
             let pn = wn.clone();
-            let interval = std::time::Duration::from_secs(p.health_check_interval_seconds.max(10));
-            let timeout = std::time::Duration::from_secs(p.health_check_timeout_seconds.max(3));
-            let max_failed = p.health_check_max_failed.max(1);
+            // Round 10 (MEDIUM, Go parity): Go only substitutes defaults when
+            // the configured value is <= 0 (health.go:57-64; the fields are
+            // u64 here, so a negative config fails deserialization up front).
+            // `.max(N)` silently rewrote an explicit 1-9s value, so an
+            // operator asking for fast 2s checks got 10s instead.
+            let interval =
+                std::time::Duration::from_secs(if p.health_check_interval_seconds == 0 {
+                    10
+                } else {
+                    p.health_check_interval_seconds
+                });
+            let timeout = std::time::Duration::from_secs(if p.health_check_timeout_seconds == 0 {
+                3
+            } else {
+                p.health_check_timeout_seconds
+            });
+            let max_failed = if p.health_check_max_failed == 0 {
+                1
+            } else {
+                p.health_check_max_failed
+            };
             let tx = health_tx.clone();
             let hc_url = if hc_type == "http" {
                 let url = p.health_check_url.clone();

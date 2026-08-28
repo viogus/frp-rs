@@ -198,11 +198,14 @@ impl QuicConnection {
 /// all come from the same `QuicTransportParams`.
 fn build_quic_transport_config(params: &QuicTransportParams) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        std::time::Duration::from_secs(params.max_idle_timeout_secs as u64)
-            .try_into()
-            .expect("idle timeout in seconds always fits quinn VarInt"),
-    ));
+    // Round 10 (LOW): a hostile/legacy config value (negative or near
+    // u64::MAX seconds) used to make the VarInt conversion panic —
+    // panic=abort kills the whole process on a config typo. On overflow
+    // leave quinn's default (no idle timeout) instead.
+    if let Ok(idle) = std::time::Duration::from_secs(params.max_idle_timeout_secs as u64).try_into()
+    {
+        transport.max_idle_timeout(Some(idle));
+    }
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(
         params.keepalive_period_secs as u64,
     )));

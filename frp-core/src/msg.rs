@@ -301,11 +301,11 @@ pub struct StartWorkConn {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub src_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub src_port: Option<i32>,
+    pub src_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dst_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dst_port: Option<i32>,
+    pub dst_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Whether encryption is enabled for the data bridge (Rust frp extension;
@@ -1235,6 +1235,25 @@ mod tests {
             &swc,
             r#"{"proxy_name":"p1","src_addr":"1.2.3.4","src_port":12345}"#,
         );
+    }
+
+    #[test]
+    fn test_start_work_conn_ports_are_u16() {
+        // Round 10 (LOW): Go StartWorkConn ports are uint16 — a hostile frame
+        // with -1 or 70000 fails json.Unmarshal in Go. frp-rs used Option<i32>
+        // which accepted both; the fields are now Option<u16>, so the same
+        // frames fail deserialization here too.
+        let bad_neg = r#"{"proxy_name":"p","src_port":-1}"#;
+        let bad_big = r#"{"proxy_name":"p","dst_port":70000}"#;
+        assert!(serde_json::from_str::<StartWorkConn>(bad_neg).is_err());
+        assert!(serde_json::from_str::<StartWorkConn>(bad_big).is_err());
+        // In-range values still parse.
+        let ok = serde_json::from_str::<StartWorkConn>(
+            r#"{"proxy_name":"p","src_port":65535,"dst_port":0}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.src_port, Some(65535));
+        assert_eq!(ok.dst_port, Some(0));
     }
 
     #[test]

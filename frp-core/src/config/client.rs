@@ -165,6 +165,7 @@ pub struct HealthCheckHttpHeader {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
+    #[serde(default = "default_server_addr")]
     pub server_addr: String,
     #[serde(default = "default_server_port")]
     pub server_port: u16,
@@ -483,6 +484,12 @@ impl ClientConfig {
 
 fn default_server_port() -> u16 {
     7000
+}
+/// Go `ClientCommonConfig.Complete()` defaults `serverAddr` to "0.0.0.0"
+/// (client.go:86) — `server_addr` is the only Go-defaulted field that had no
+/// serde default, so a config omitting it failed at load (round 10 MEDIUM).
+fn default_server_addr() -> String {
+    "0.0.0.0".into()
 }
 fn default_transport_protocol() -> String {
     "tcp".into()

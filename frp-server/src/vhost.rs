@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -188,24 +187,13 @@ struct VhostTables {
     /// have different location prefixes (matching Go frp's `map[string]routerByHTTPUser`
     /// where each httpUser maps to a slice of Routers sorted by location descending).
     routes: HashMap<String, HashMap<String, Vec<VhostRoute>>>,
-    /// path prefix -> { route_by_http_user -> Vec<VhostRoute> }
-    location_routes: HashMap<String, HashMap<String, Vec<VhostRoute>>>,
     /// proxy_name -> Vec<(domain, route_by_http_user)>
     by_proxy: HashMap<String, Vec<(String, String)>>,
-    /// proxy_name -> Vec<(location, route_by_http_user)>
-    by_proxy_locations: HashMap<String, Vec<(String, String)>>,
 }
 
 /// Manages HTTP VHost routing table (domain + location -> proxy).
 pub struct VhostManager {
     inner: RwLock<VhostTables>,
-    /// Gate for `lookup_by_path`: true while any location route exists.
-    /// Every HTTP request used to linearly scan all location routes even
-    /// when none were registered; the flag skips the scan (and the RwLock
-    /// read) in that common case. Relaxed ordering is fine — a stale false
-    /// after a register only defers the scan by one request, and a stale
-    /// true after unregister just runs a scan that finds nothing.
-    has_location_routes: AtomicBool,
 }
 
 impl Default for VhostManager {
@@ -219,11 +207,8 @@ impl VhostManager {
         Self {
             inner: RwLock::new(VhostTables {
                 routes: HashMap::new(),
-                location_routes: HashMap::new(),
                 by_proxy: HashMap::new(),
-                by_proxy_locations: HashMap::new(),
             }),
-            has_location_routes: AtomicBool::new(false),
         }
     }
 
@@ -312,35 +297,6 @@ impl VhostManager {
                 .insert(proxy_name.to_string(), domain_entries);
         }
 
-        // Register location routes (path-only routing)
-        let mut loc_entries = Vec::new();
-        for loc in locations {
-            let vrs = tables
-                .location_routes
-                .entry(loc.clone())
-                .or_default()
-                .entry(route_by_http_user.to_string())
-                .or_default();
-            vrs.push(route.clone());
-            loc_entries.push((loc.clone(), route_by_http_user.to_string()));
-        }
-        // Sort once after all location insertions.
-        for loc in locations {
-            if let Some(user_map) = tables.location_routes.get_mut(loc) {
-                if let Some(vrs) = user_map.get_mut(route_by_http_user) {
-                    sort_by_longest_location(vrs);
-                }
-            }
-        }
-        if !loc_entries.is_empty() {
-            tables
-                .by_proxy_locations
-                .insert(proxy_name.to_string(), loc_entries);
-            // Enable the lookup_by_path scan gate (held under the write lock,
-            // so it stays consistent with the tables).
-            self.has_location_routes.store(true, Ordering::Relaxed);
-        }
-
         Ok(())
     }
 
@@ -362,26 +318,6 @@ impl VhostManager {
                         tables.routes.remove(domain);
                     }
                 }
-            }
-        }
-        if let Some(entries) = tables.by_proxy_locations.remove(proxy_name) {
-            for (loc, rubu) in &entries {
-                if let Some(user_map) = tables.location_routes.get_mut(loc) {
-                    if let Some(vrs) = user_map.get_mut(rubu) {
-                        vrs.retain(|r| r.proxy_name.as_ref() != proxy_name);
-                        if vrs.is_empty() {
-                            user_map.remove(rubu);
-                        }
-                    }
-                    if user_map.is_empty() {
-                        tables.location_routes.remove(loc);
-                    }
-                }
-            }
-            // Clear the scan gate when the last location route is removed
-            // (held under the write lock, so it stays consistent).
-            if tables.location_routes.is_empty() {
-                self.has_location_routes.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -436,64 +372,29 @@ impl VhostManager {
         get_locked(&tables.routes, "*", path, http_user)
     }
 
-    /// Look up by URL path (longest prefix match among registered locations).
-    /// Returns the VhostRoute whose location prefix best matches the given path.
-    /// Tries httpUser-specific routes first, then falls back to empty-string httpUser.
-    /// For each matching prefix, finds the first route whose location prefix-matches
-    /// the path by iterating the sorted Vec (matching Go's getLocked pattern).
-    pub async fn lookup_by_path(&self, path: &str, http_user: &str) -> Option<VhostRouteMatch> {
-        // Fast path: with no location routes registered the scan below can
-        // never match — skip the RwLock read and the linear iteration (every
-        // HTTP request used to pay this scan).
-        if !self.has_location_routes.load(Ordering::Relaxed) {
-            return None;
-        }
-        let tables = self.inner.read().await;
-        // Find longest matching prefix
-        let mut best: Option<(usize, VhostRouteMatch)> = None;
-        for (prefix, user_map) in tables.location_routes.iter() {
-            if path.starts_with(prefix.as_str()) {
-                // Try httpUser-specific first, then empty-string fallback,
-                // then find first matching route in the Vec.
-                let route = user_map
-                    .get(http_user)
-                    .or_else(|| user_map.get(""))
-                    .and_then(|vrs| find_matching_route(vrs, path));
-                if let Some(route) = route {
-                    match best {
-                        Some((best_len, _)) if prefix.len() > best_len => {
-                            best = Some((prefix.len(), route));
-                        }
-                        None => {
-                            best = Some((prefix.len(), route));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        best.map(|(_, route)| route)
-    }
-
-    /// Combined lookup: tries domain match first, then falls back to path-only match.
-    /// Calls `lookup_wildcard` which handles both domain wildcard expansion and
-    /// location prefix matching (Go frp's getLocked/getByRoute pattern).
-    /// If no domain match, tries location-only routing (for proxies without custom_domains).
+    /// Combined lookup: domain match with wildcard expansion and location
+    /// prefix matching (Go frp's getLocked/getByRoute pattern).
     /// `http_user` is the Basic Auth username from the request (empty if none).
+    ///
+    /// Round 10 (MEDIUM, Go parity): the path-only fallback was removed. Go
+    /// registers HTTP proxies as `for domain { for location { register } }`
+    /// (server/proxy/http.go:78-101) — a proxy with empty customDomains gets
+    /// ZERO routes, and every location is always scoped under a domain. The
+    /// host-agnostic `lookup_by_path` fallback let an authenticated client
+    /// register `custom_domains=[]` + `locations=[""]` and capture every
+    /// fallthrough request on the vhost port (the round-6 catch-all hijack
+    /// recreated via the path table). Domain-scoped locations still work
+    /// through `lookup_wildcard`'s get_locked path-matching.
     pub async fn lookup_combined(
         &self,
         domain: &str,
         path: &str,
         http_user: &str,
     ) -> Option<VhostRouteMatch> {
-        // Try host-based routing first (with wildcard support and path matching)
+        // Host-based routing with wildcard support and path matching.
         // lookup_wildcard internally calls get_locked which finds the first
         // route whose location prefix-matches the path.
-        if let Some(route) = self.lookup_wildcard(domain, path, http_user).await {
-            return Some(route);
-        }
-        // Try location-only routing (for proxies without custom_domains)
-        self.lookup_by_path(path, http_user).await
+        self.lookup_wildcard(domain, path, http_user).await
     }
 }
 /// Write an HTTP error response, optionally with a custom body.
@@ -2393,7 +2294,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_vhost_lookup_by_path_longest_prefix() {
+    async fn test_vhost_locations_require_a_domain() {
+        // Round 10 (MEDIUM, Go parity): Go registers HTTP proxies as
+        // `for domain { for location { register } }` — zero domains means
+        // zero routes, so a location without a custom_domain must never
+        // route (the removed host-agnostic path-only fallback would have
+        // matched "/static/...", recreating the vhost-port catch-all).
         let mgr = VhostManager::new();
         mgr.register(
             "p1",
@@ -2409,10 +2315,17 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            mgr.lookup_combined("example.com", "/static/img/logo.png", "")
+                .await
+                .is_none(),
+            "locations without custom_domains must register zero routes (Go parity)"
+        );
+        // Domain-scoped locations still match: same location with a domain.
         mgr.register(
             "p2",
-            &[],
-            &["/static/img".into()],
+            &["example.com".into()],
+            &["/static".into()],
             "run-2",
             "",
             "",
@@ -2424,20 +2337,10 @@ mod tests {
         .await
         .unwrap();
         let r = mgr
-            .lookup_by_path("/static/img/logo.png", "")
+            .lookup_combined("example.com", "/static/css/site.css", "")
             .await
             .unwrap();
-        assert_eq!(
-            r.proxy_name.as_ref(),
-            "p2",
-            "longest location prefix must win"
-        );
-        let r = mgr
-            .lookup_by_path("/static/css/site.css", "")
-            .await
-            .unwrap();
-        assert_eq!(r.proxy_name.as_ref(), "p1");
-        assert!(mgr.lookup_by_path("/other", "").await.is_none());
+        assert_eq!(r.proxy_name.as_ref(), "p2");
     }
 
     #[test]

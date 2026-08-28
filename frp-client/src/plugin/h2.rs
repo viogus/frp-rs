@@ -462,6 +462,10 @@ fn parse_hex(b: &[u8]) -> std::io::Result<usize> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))
 }
 
+/// Per-slice cap for streaming chunked bodies (round 10 MEDIUM): a chunk is
+/// forwarded in bounded slices instead of one `read_exact(size)` allocation.
+const MAX_CHUNK_SIZE: usize = 64 * 1024;
+
 /// Incremental response-body reader that starts with the bytes that arrived
 /// together with the response head.
 struct BodyReader<'a, R: AsyncRead + Unpin> {
@@ -622,14 +626,25 @@ async fn stream_chunked_body(
             }
             return Ok(());
         }
-        let data = match reader.read_exact(size).await {
-            Ok(d) => d,
-            Err(_) => return Ok(()),
-        };
+        // Round 10 (MEDIUM): `size` comes from the backend's chunk-size
+        // line — buffering it in one `read_exact(size)` allocates
+        // attacker-influenced memory (a misbehaving backend or proxied
+        // origin can emit an arbitrarily large chunk). Stream the chunk
+        // in bounded slices instead; the frame stays chunked
+        // (end_stream=false on every slice).
+        let mut remaining = size;
+        while remaining > 0 {
+            let n = remaining.min(MAX_CHUNK_SIZE);
+            let data = match reader.read_exact(n).await {
+                Ok(d) => d,
+                Err(_) => return Ok(()),
+            };
+            send.send_data(Bytes::from(data), false)?;
+            remaining -= n;
+        }
         if reader.read_exact(2).await.is_err() {
             return Ok(()); // missing trailing CRLF
         }
-        send.send_data(Bytes::from(data), false)?;
     }
 }
 

@@ -67,6 +67,52 @@ fn test_xtcp_visitor_defaults_to_quic() {
 }
 
 #[test]
+fn test_visitor_config_validation_matches_go() {
+    // Round 10 (MEDIUM): Go validation/visitor.go:42-63 — name/serverName
+    // required, bindPort==0 rejected (negative = no-bind passes), XTCP
+    // protocol restricted to kcp/quic. Mirrored in validate_client_config.
+    let mk = |name: &str, server: &str, port: i32, proto: &str| VisitorConfig {
+        name: name.into(),
+        server_name: server.into(),
+        bind_port: port,
+        protocol: proto.into(),
+        visitor_type: "xtcp".into(),
+        ..Default::default()
+    };
+    let err = |v: VisitorConfig| {
+        super::loader::validate_client_config(&ClientConfig {
+            visitors: vec![v],
+            ..Default::default()
+        })
+        .unwrap_err()
+    };
+    assert_eq!(
+        err(mk("", "s", 7000, "kcp")),
+        "visitor config: name is required"
+    );
+    assert_eq!(
+        err(mk("v", "", 7000, "kcp")),
+        "visitor 'v': server name is required"
+    );
+    assert_eq!(
+        err(mk("v", "s", 0, "kcp")),
+        "visitor 'v': bind port is required"
+    );
+    assert_eq!(
+        err(mk("v", "s", 7000, "tcp")),
+        "visitor 'v': protocol should be kcp or quic"
+    );
+    // Negative bind_port is Go's no-bind sentinel — must pass validation.
+    let mut ok = mk("v", "s", -1, "quic");
+    ok.bind_port = -1;
+    assert!(super::loader::validate_client_config(&ClientConfig {
+        visitors: vec![ok],
+        ..Default::default()
+    })
+    .is_ok());
+}
+
+#[test]
 fn test_merge_store_items_overlays_by_name() {
     let base = ClientConfig {
         server_addr: "127.0.0.1".into(),

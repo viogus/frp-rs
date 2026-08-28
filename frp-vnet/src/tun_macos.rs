@@ -322,10 +322,20 @@ impl AsyncWrite for MacOSTun {
 
             match guard.try_io(|fd| {
                 let fd = fd.as_raw_fd();
-                // Prepend the 4-byte AF header (AF_INET = 2 in network
-                // byte order) with a single writev: header and payload
-                // form one datagram without a per-packet heap allocation.
-                let header: [u8; 4] = [0, 0, 0, 2];
+                // Prepend the 4-byte AF header with a single writev: header
+                // and payload form one datagram without a per-packet heap
+                // allocation. The family is in network byte order and must
+                // match the packet: AF_INET (2) for IPv4, AF_INET6 (30 on
+                // macOS/BSD — not Linux's 10) for IPv6. Round 10 (MEDIUM):
+                // the old code hardcoded AF_INET, so every IPv6 packet was
+                // tagged IPv4 and dropped by the kernel — macOS vnet IPv6
+                // TX was broken (RX stripping below is unaffected).
+                let family: u8 = if !buf.is_empty() && (buf[0] >> 4) == 6 {
+                    30
+                } else {
+                    2
+                };
+                let header: [u8; 4] = [0, 0, 0, family];
                 let iovs = [
                     libc::iovec {
                         iov_base: header.as_ptr() as *mut libc::c_void,

@@ -335,7 +335,12 @@ async fn verify_login_auth(
         // well-formed). Rust Strings are always valid UTF-8, so only the
         // length and printable-character checks apply.
         if let Some(rid) = login.run_id.as_deref() {
-            if !rid.is_empty() && (rid.len() > 64 || rid.chars().any(|c| c.is_control())) {
+            // Round 10 (LOW): an empty client-supplied run_id must also be
+            // rejected (Go ValidateRunID "run id cannot be empty") — the
+            // old `!rid.is_empty()` exception let `Some("")` flow into
+            // routing tables and logs as the key "". None (absent) still
+            // normalizes to a generated UUID below.
+            if rid.len() > 64 || rid.chars().any(|c| c.is_control()) {
                 warn!(peer = ?peer, run_id_len = %rid.len(), "Login rejected: invalid run_id (max 64 printable bytes)");
                 send_login_error(
                     stream,

@@ -49,6 +49,19 @@ async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
 /// login reject/success deadlines — those keep their tighter budget.
 const CTL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Deadline for yamux-stream reads in the control select loop (round 10
+/// HIGH). Unlike the main `read_ctl_msg(&mut reader, v2)` select branch —
+/// which yields back to the select when the peer trickles, so the heartbeat
+/// and shutdown arms stay live — the yamux arm's reads run inside the arm
+/// body, where no other arm can fire. A post-auth client trickling partial
+/// frame bytes on a yamux stream would pin the task + fd + semaphore permit
+/// + run_id registration forever (Go bounds this via its independent
+///   heartbeatWorker goroutine calling `ctl.Close()`).
+///
+/// A read timeout behaves like the Err branch: drop the stream, keep the
+/// control loop alive.
+const CTL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Protocol-aware write: dispatches to V1 or V2 framing based on the `v2`
 /// flag. Bounded by `CTL_WRITE_TIMEOUT` (30s): on timeout the write is
 /// abandoned and a Protocol error is returned, which control-loop callers
@@ -395,58 +408,74 @@ async fn handle_control_inner<S>(
                 }
             } => {
                 if let Some(stream) = incoming_msg {
-                    let mut io = IoStream::Yamux(stream);
-                    if v2 {
-                        match frp_core::protocol::read_v2_magic_or_replay(&mut io).await {
-                            Ok(None) => {} // magic consumed
-                            Ok(Some(bytes)) => {
-                                // Older V2 client without per-stream magic —
-                                // replay bytes as start of next frame.
-                                io = IoStream::BufferedRead(bytes, 0, Box::new(io));
-                            }
-                            Err(e) => {
-                                warn!(run_id = %run_id, error = %e, "Failed to read V2 magic from yamux stream for {run_id}: {e}");
-                                continue;
+                    // Bounded by CTL_READ_TIMEOUT: see the const doc — these
+                    // arm-body reads must not outlive the select's other arms.
+                    // The block owns the stream and hands back the (possibly
+                    // re-wrapped) IoStream with the message; a timeout drops
+                    // the stream.
+                    let run_id_log = run_id.clone();
+                    let stream_read = tokio::time::timeout(CTL_READ_TIMEOUT, async move {
+                        let mut io = IoStream::Yamux(stream);
+                        if v2 {
+                            match frp_core::protocol::read_v2_magic_or_replay(&mut io).await {
+                                Ok(None) => {} // magic consumed
+                                Ok(Some(bytes)) => {
+                                    // Older V2 client without per-stream magic —
+                                    // replay bytes as start of next frame.
+                                    io = IoStream::BufferedRead(bytes, 0, Box::new(io));
+                                }
+                                Err(e) => {
+                                    return Err(format!(
+                                        "Failed to read V2 magic from yamux stream for {run_id_log}: {e}"
+                                    ));
+                                }
                             }
                         }
-                    }
-                    match read_ctl_msg(&mut io, v2).await {
-                        Ok(FrpMessage::NewWorkConn(nwc)) => {
-                            let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
-                            if stream_run_id != run_id {
-                                debug!(expected_run_id = %run_id, got_run_id = %stream_run_id, "Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
-                                continue;
-                            }
-                            // Validate NewWorkConn credentials (privilege_key + timestamp).
-                            // Standalone TCP work connections go through handle_work_conn_inner
-                            // which validates auth. Yamux work connections must apply the
-                            // same validation — without it, tcp_mux (default on) creates an
-                            // auth bypass: yamux streams skip NewWorkConn verification that
-                            // standalone TCP work connections require.
-                            if let Err(e) = crate::handlers::validate_new_work_conn_auth(
-                                &nwc, &run_id, &state,
-                            )
+                        let msg = read_ctl_msg(&mut io, v2)
                             .await
-                            {
-                                warn!(run_id = %run_id, error = %e, "Yamux work conn auth failed for {run_id}: {e}");
-                                continue;
-                            }
-                            // NewWorkConn plugin hook — control-enabled plugins can reject
-                            if let Err(reason) =
-                                crate::handlers::run_new_work_conn_plugin(&run_id, &state).await
-                            {
-                                warn!(run_id = %run_id, reason = %reason, "Yamux work conn plugin hook rejected: {reason}");
-                                continue;
-                            }
-                        }
-                        Ok(other) => {
+                            .map_err(|e| e.to_string())?;
+                        Ok((msg, io))
+                    });
+                    let (nwc, io) = match stream_read.await {
+                        Ok(Ok((FrpMessage::NewWorkConn(nwc), io))) => (nwc, io),
+                        Ok(Ok((other, _io))) => {
                             debug!(run_id = %run_id, msg_type = ?other.v1_type_byte(), "Unexpected yamux stream message for {run_id}: {:?}", other.v1_type_byte());
                             continue;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(run_id = %run_id, error = %e, "Failed to read from yamux stream for {run_id}: {e}");
                             continue;
                         }
+                        Err(_elapsed) => {
+                            warn!(run_id = %run_id, "Yamux stream read timed out after {CTL_READ_TIMEOUT:?} for {run_id}");
+                            continue;
+                        }
+                    };
+                    let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
+                    if stream_run_id != run_id {
+                        debug!(expected_run_id = %run_id, got_run_id = %stream_run_id, "Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
+                        continue;
+                    }
+                    // Validate NewWorkConn credentials (privilege_key + timestamp).
+                    // Standalone TCP work connections go through handle_work_conn_inner
+                    // which validates auth. Yamux work connections must apply the
+                    // same validation — without it, tcp_mux (default on) creates an
+                    // auth bypass: yamux streams skip NewWorkConn verification that
+                    // standalone TCP work connections require.
+                    if let Err(e) = crate::handlers::validate_new_work_conn_auth(
+                        &nwc, &run_id, &state,
+                    )
+                    .await
+                    {
+                        warn!(run_id = %run_id, error = %e, "Yamux work conn auth failed for {run_id}: {e}");
+                        continue;
+                    }
+                    // NewWorkConn plugin hook — control-enabled plugins can reject
+                    if let Err(reason) =
+                        crate::handlers::run_new_work_conn_plugin(&run_id, &state).await
+                    {
+                        warn!(run_id = %run_id, reason = %reason, "Yamux work conn plugin hook rejected: {reason}");
+                        continue;
                     }
                     // Route through pool::handle_new_work_conn for consistent
                     // priority: NatHoleSid → UDP → pending requests → pool → drop.

@@ -149,8 +149,20 @@ impl VnetController {
                             };
                             let msg = frp_core::msg::FrpMessage::VnetPacket(vnet_pkt);
                             if let Err(e) = ctl_writer.send_msg(msg, self.v2) {
-                                tracing::error!(%self.proxy_name, %e, "control write error");
-                                break;
+                                // Round 10 (MEDIUM): a transient channel-full
+                                // error must not kill the whole TUN pump —
+                                // the ControlSink contract is drop-when-full
+                                // (Go frp parity), so only a failed writer
+                                // (control connection gone) is terminal.
+                                if ctl_writer.is_failed() {
+                                    tracing::error!(%self.proxy_name, %e, "control write error");
+                                    break;
+                                }
+                                tracing::warn!(
+                                    %self.proxy_name,
+                                    %e,
+                                    "vnet control queue full; dropping packet"
+                                );
                             }
                         }
                         // If no route match, packet dropped (not destined for this vnet).
