@@ -506,27 +506,29 @@ mod tests {
     }
 
     #[test]
-    fn test_hard_nat_modes_1_through_4() {
+    fn test_hard_nat_combos_recommend_modes() {
         let analyzer = Analyzer::new(Duration::from_secs(3600));
         // 端口随探针变化 => port_changed => 硬 NAT
         let hard_addrs = vec!["1.2.3.4:1234".into(), "1.2.3.4:5678".into()];
         let easy_addrs = vec!["1.2.3.4:1234".into(), "1.2.3.4:1234".into()];
         let hard = classify_nat_feature(&hard_addrs, &[]).unwrap();
         let easy = classify_nat_feature(&easy_addrs, &[]).unwrap();
-        for (i, (cf, vf)) in [(&hard, &hard), (&hard, &easy), (&easy, &hard)]
-            .iter()
-            .enumerate()
-        {
+        // (client, visitor) combos with the exact (mode, roles) the scorer
+        // picks for them (verified against the Go v0.69.1 scoring tables):
+        //   (hard, hard): both peers irregular → mode-0 fallback table
+        //   (hard, easy): mode 2 — HardNAT is always receiver (client is hard)
+        //   (easy, hard): mode 2 — HardNAT is always receiver (visitor is hard)
+        let expected = [
+            (&hard, &hard, 0, "sender", "receiver"),
+            (&hard, &easy, 2, "receiver", "sender"),
+            (&easy, &hard, 2, "sender", "receiver"),
+        ];
+        for (i, (cf, vf, want_mode, want_c_role, want_v_role)) in expected.iter().enumerate() {
             let (mode, _idx, cb, vb) =
                 analyzer.get_recommend_behaviors(&format!("combo-{i}"), cf, vf);
-            assert!(
-                (0..=4).contains(&mode),
-                "combo {i}: mode {mode} out of range"
-            );
-            assert_ne!(
-                cb.role, vb.role,
-                "combo {i}: roles must pair sender/receiver"
-            );
+            assert_eq!(mode, *want_mode, "combo {i}: mode");
+            assert_eq!(cb.role, *want_c_role, "combo {i}: client role");
+            assert_eq!(vb.role, *want_v_role, "combo {i}: visitor role");
         }
     }
 

@@ -7,8 +7,9 @@
 //! Flow (pool_count=2):
 //!   1. mock completes Login (asserting the client declared pool_count=2)
 //!      and registration (NewProxy → NewProxyResp);
-//!   2. mock sends ReqWorkConn ×2 (Go frps pool pre-warm, written right
-//!      after LoginResp) → the client dials exactly 2 work conns;
+//!   2. mock sends ReqWorkConn ×2 (simplified from Go frps: one pool
+//!      pre-warm right after LoginResp + on-demand requests) → the client
+//!      dials exactly 2 work conns;
 //!   3. mock CONSUMES one pooled conn: sends StartWorkConn for the proxy
 //!      and verifies real data bridges through to the local echo server
 //!      and back — the pool is now down to 1;

@@ -4788,9 +4788,12 @@ fn test_malformed_ini_value_through_pipeline_returns_err() {
 
 #[test]
 fn test_client_negative_pool_count_rejected() {
-    // Go frp v0.71.0 rejects a negative poolCount client-side
-    // (validateClientTransportConfig); frp-rs previously accepted it
-    // silently (round-8 addition in loader.rs validate_client_config).
+    // Fail-fast divergence, NOT Go client parity: Go frp v0.71.0 has no
+    // client-side poolCount check (Go frpc loads the config; the SERVER
+    // rejects the negative at login — control.go:438, mirrored in frp-rs
+    // control/login.rs). frp-rs frpc now refuses the misconfig at load
+    // instead of dialing first (round-9 addition in loader.rs
+    // validate_client_config).
     // 0 keeps the use-the-default semantics (util.EmptyOr → 1), pinned by
     // test_explicit_zero_client_pool_count_and_keepalive_use_go_defaults.
     let err = load_client_config_from_str("server_addr = '127.0.0.1'\npool_count = -1\n")

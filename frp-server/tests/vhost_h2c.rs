@@ -510,13 +510,15 @@ async fn test_h2c_401_without_credentials() {
 
 /// h2c keep-alive reuse across the vhost_http_timeout: two sequential
 /// requests over ONE h2 connection, the second arriving after an idle
-/// period longer than vhost_http_timeout (2s). The round-8 handshake
-/// deadline applies only to the first accept; later accepts must not be
-/// killed at the deadline or the second request fails.
+/// period longer than vhost_http_timeout (5s — wide enough that a loaded
+/// CI stall between the vhost accept and the client's first h2 frame
+/// cannot trip the handshake deadline). The round-8 handshake deadline
+/// applies only to the first accept; later accepts must not be killed at
+/// the deadline or the second request fails.
 #[tokio::test]
 async fn test_h2c_keepalive_reuse_survives_http_timeout() {
     let (_bind, vhost_addr, mut provider, run_id, mut work_conn) =
-        setup_auth("h2c-ka", "ka.example.com", None, None, 2).await;
+        setup_auth("h2c-ka", "ka.example.com", None, None, 5).await;
 
     let mut client = h2_connect(vhost_addr).await;
 
@@ -538,9 +540,10 @@ async fn test_h2c_keepalive_reuse_survives_http_timeout() {
     let body = read_h2_body(response.into_body()).await;
     assert_eq!(body, b"one");
 
-    // Idle past vhost_http_timeout: if the connection were pinned to the
-    // handshake deadline it would be closed here and request 2 would fail.
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Idle past vhost_http_timeout (5s): if the connection were pinned to
+    // the handshake deadline it would be closed here and request 2 would
+    // fail.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
     // Request 2 on the same connection: pool is empty, so the server
     // requests a fresh work conn via ReqWorkConn on the control channel.

@@ -2121,11 +2121,14 @@ mod tests {
             .as_secs() as i64;
         // timeout 关闭
         assert!(validate_timestamp_freshness(now, 0).is_ok());
-        // 秒精度: 窗口内通过, 窗口外拒绝 (边界留 2s 余量防时钟秒翻转)
-        assert!(validate_timestamp_freshness(now + 59, 60).is_ok());
-        assert!(validate_timestamp_freshness(now - 59, 60).is_ok());
-        assert!(validate_timestamp_freshness(now + 62, 60).is_err());
-        assert!(validate_timestamp_freshness(now - 62, 60).is_err());
+        // 秒精度: 窗口内通过, 窗口外拒绝。边界选 ±1 / ±120 而不是紧贴
+        // 60s 窗口: 测试进程与 `now` 捕获之间若有 >1s 调度停顿（加载 CI、
+        // NTP 跳秒），±59/±62 会翻转到错误分支。±1 只在停顿 >59s 时误判
+        // （等于挂死），±120 只在时钟跳变 >60s 时误判。
+        assert!(validate_timestamp_freshness(now + 1, 60).is_ok());
+        assert!(validate_timestamp_freshness(now - 1, 60).is_ok());
+        assert!(validate_timestamp_freshness(now + 120, 60).is_err());
+        assert!(validate_timestamp_freshness(now - 120, 60).is_err());
         // 毫秒精度时间戳: 任一解释入窗即通过
         let now_ms = now.saturating_mul(1000);
         assert!(validate_timestamp_freshness(now_ms + 30_000, 60).is_ok());

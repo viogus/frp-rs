@@ -875,10 +875,16 @@ async fn test_duplicate_run_id_supersedes_old_control() {
 
     // Second login with the SAME run_id at ts + 1 (fresh auth key for the
     // new timestamp — an identical (ts, run_id) pair would be rejected as
-    // a replay, so the timestamp MUST differ).
-    let (mut second, resp2) = raw_login_with_run_id(addr, "r1", ts + 1)
-        .await
-        .expect("second login with same run_id should succeed");
+    // a replay, so the timestamp MUST differ). Wrapped in a 10s timeout so
+    // a handoff-barrier deadlock fails the test instead of hanging the
+    // whole suite.
+    let (mut second, resp2) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_login_with_run_id(addr, "r1", ts + 1),
+    )
+    .await
+    .expect("superseding login hung (handoff blocked?)")
+    .expect("second login with same run_id should succeed");
     assert!(
         resp2.error.is_none(),
         "second login should succeed, got: {:?}",
@@ -916,11 +922,11 @@ async fn test_duplicate_run_id_supersedes_old_control() {
     }
 }
 
-/// Supersession under a burst: the old control is mid-work (a burst of
-/// proxy registrations) when the superseding login lands. The old control
-/// must still be torn down promptly — the Shutdown/teardown must not get
-/// stuck behind the burst — and the NEW control must be fully functional
-/// (NewProxyResp resolves, Ping→Pong clean).
+/// Supersession after a burst: the old control completes a burst of 200
+/// proxy registrations, then the superseding login lands. The old control
+/// must still be torn down promptly — the Shutdown/teardown must not hang
+/// behind the 200 registered proxies — and the NEW control must be fully
+/// functional (NewProxyResp resolves, Ping→Pong clean).
 #[tokio::test]
 async fn test_duplicate_run_id_supersedes_under_proxy_burst() {
     let port = allocate_port();

@@ -498,11 +498,14 @@ pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
 pub(super) fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
     validate_proxy_configs(&cfg.proxies)?;
     validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
-    // Go frp v0.71.0: a negative transport.poolCount is invalid client-side
-    // (pkg/config/v1/validation/client.go validateClientTransportConfig).
-    // frp-rs previously accepted negatives silently; 0 keeps its
-    // "use the default" semantics (complete_with_heartbeat_set maps 0 → 1,
-    // Go util.EmptyOr — pinned by
+    // Negative poolCount: Go frp v0.71.0 has NO client-side check —
+    // Go frpc loads the config fine and the SERVER rejects the negative at
+    // login (server/control.go:438 "invalid pool count %d, must be
+    // non-negative"), which frp-rs already mirrors (control/login.rs
+    // "Login rejected: negative pool_count"). This is a deliberate
+    // fail-fast divergence: frp-rs frpc refuses the misconfig at load
+    // instead of dialing first. 0 keeps its "use the default" semantics
+    // (complete_with_heartbeat_set maps 0 → 1, Go util.EmptyOr — pinned by
     // test_explicit_zero_client_pool_count_and_keepalive_use_go_defaults).
     if cfg.pool_count < 0 {
         return Err(format!(

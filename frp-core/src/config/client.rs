@@ -426,11 +426,15 @@ impl ClientConfig {
 
         // Clamp huge explicit heartbeat values — parity with the server-side
         // clamp in ServerTransportConfig::complete_with_heartbeat_timeout_set
-        // (round-7 finding 5). The client control watchdog computes
-        // `last_pong + hb_timeout` and sleeps `hb_timeout - elapsed`
-        // (frp-client/src/service.rs), so an enormous value would overflow
-        // the Instant arithmetic; 3600s is far beyond any sane heartbeat
-        // interval. Values <= 0 (explicit disable) keep their semantics.
+        // (round-7 finding 5). The client control watchdog sleeps
+        // `hb_timeout.saturating_sub(last_pong.elapsed())`
+        // (frp-client/src/service.rs), and tokio's internal sleep-deadline
+        // math (Instant + duration, i64-scale) overflows only at values far
+        // beyond 3600s — but Go frp has no clamp at all and accepts e.g.
+        // 7200, so this deliberately rewrites pathological values instead of
+        // honoring them (documented divergence, not parity). 3600s is far
+        // beyond any sane heartbeat interval. Values <= 0 (explicit disable)
+        // keep their semantics.
         if self.heartbeat_interval > MAX_HEARTBEAT_TIMEOUT_SECS {
             self.heartbeat_interval = MAX_HEARTBEAT_TIMEOUT_SECS;
         }

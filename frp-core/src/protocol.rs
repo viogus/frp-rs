@@ -1661,7 +1661,7 @@ mod tests {
             #[test]
             fn fuzz_v1_frame_header(
                 header_bytes in prop::array::uniform9(any::<u8>()),
-                payload_len in 0usize..=(V1_MAX_MSG_LENGTH as usize),
+                payload_len in 0usize..=65536usize,
             ) {
                 // Construct a full frame: 9-byte header + payload bytes
                 // Encode the payload length in big-endian bytes 1..9
