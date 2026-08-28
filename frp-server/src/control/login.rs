@@ -802,22 +802,27 @@ pub(crate) async fn authenticate(
     // Record the (possibly plugin-mutated) client identity for the `user`
     // object of later plugin hooks (Go loginUserInfo: LoginMsg.User/Metas
     // + runID). Deliberately AFTER the run_id_to_ctl_tx insert (audit
-    // finding): every remove_user is generation-guarded by an atomic
-    // guard — the stale-control reaper in service.rs holds this run_id's
-    // run_mu across its re-check + remove_user; unregister_control fires
-    // remove_user only when its run_id_to_ctl_tx removal actually matched
-    // this control's control_id (a single atomic remove_if) — so a record
-    // made BEFORE its own insert can sit in the users map while a guard
-    // still sees no fresh generation: a control re-logging in with the
-    // same run_id during the reaper's sweep would have its entry deleted,
-    // leaving `user` empty in all later plugin hooks. Recording here, in
-    // the same run_mu critical section, makes the record strictly follow
-    // the insert (no await between): a guard whose check runs before the
-    // insert cannot find the fresh record yet; one that runs after it
-    // sees the fresh generation and skips.
+    // finding): the record carries this control's own control_id, so
+    // remove_user is generation-exact — it removes an entry only when it
+    // still holds the removing control's control_id (remove-if-match inside
+    // the users-map write lock). A stale control's cleanup can therefore
+    // never delete the fresh record of a control that re-logged in with the
+    // same run_id, even when it lands between the re-login's insert and its
+    // own removal step (the residual window in unregister_control: its
+    // atomic remove_if drops the old ctl_tx entry, and remove_user then ran
+    // on the run_id alone). The caller-side guards — the stale-control
+    // reaper's run_mu hold across its re-check + remove_user, and
+    // unregister_control firing remove_user only when its run_id_to_ctl_tx
+    // removal actually matched this control's control_id (a single atomic
+    // remove_if) — remain as defense in depth. Recording here, in the same
+    // run_mu critical section, makes the record strictly follow the insert
+    // (no await between): a guard whose check runs before the insert cannot
+    // find the fresh record yet; one that runs after it sees the fresh
+    // generation and skips.
     if !state.plugin_manager.is_empty() {
         state.plugin_manager.record_login_user(
             &run_id,
+            control_id,
             &crate::plugin::UserInfo {
                 user: login.user.clone().unwrap_or_default(),
                 metas: login.metas.clone().unwrap_or_default(),

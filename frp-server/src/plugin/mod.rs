@@ -26,11 +26,11 @@ impl HttpPluginManager {
         Ok(None)
     }
     /// Stub: no-op (no plugins, so no hook ever reads the identity).
-    pub fn record_login_user(&self, _run_id: &str, _user: &UserInfo) {}
+    pub fn record_login_user(&self, _run_id: &str, _control_id: u64, _user: &UserInfo) {}
     pub fn user_info(&self, _run_id: &str) -> Option<UserInfo> {
         None
     }
-    pub fn remove_user(&self, _run_id: &str) {}
+    pub fn remove_user(&self, _run_id: &str, _control_id: u64) {}
 }
 
 /// Go frp v0.71.0 `plugin.UserInfo` (pkg/plugin/server/types.go): the
@@ -39,8 +39,9 @@ impl HttpPluginManager {
 /// (Go `ctl.loginUserInfo()` = LoginMsg.User/Metas + runID).
 ///
 /// Populated from the (possibly plugin-mutated) Login at control setup
-/// (`login.rs`) and keyed by run_id on the plugin manager; dropped when
-/// the control unregisters (`proxy_ops.rs::unregister_control`).
+/// (`login.rs`) and keyed by run_id on the plugin manager (each entry
+/// carrying its control's generation — `remove_user` is remove-if-match);
+/// dropped when the control unregisters (`proxy_ops.rs::unregister_control`).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UserInfo {
     pub user: String,

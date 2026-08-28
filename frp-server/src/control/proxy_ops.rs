@@ -1974,6 +1974,11 @@ pub(crate) async fn unregister_control(
         // below fires only when the removal actually matched (i.e. the
         // returned value held this control's id), so a superseding
         // control's fresh entry and user record are never touched.
+        // remove_user itself is now generation-exact too (the users map
+        // stores (control_id, UserInfo); the entry check happens inside
+        // remove_user, under its write lock), so even a remove that landed
+        // between a re-login's insert+record could not delete the fresh
+        // record — the gate below is belt-and-suspenders.
         let removed: Option<(String, ControlTx)> = if control_id == 0 {
             state.run_id_to_ctl_tx.remove(run_id)
         } else {
@@ -2030,11 +2035,15 @@ pub(crate) async fn unregister_control(
     }
 
     // Drop this control's plugin user-info entry (bounds the manager's
-    // identity store to live controls). Generation-guarded by
-    // `removed_control_id`: on supersession the old control's cleanup must
-    // not remove the new control's freshly recorded identity.
-    if removed_control_id.is_some() {
-        state.plugin_manager.remove_user(run_id);
+    // identity store to live controls). Fired only when the run_id_to_ctl_tx
+    // removal actually matched this control (`removed_control_id`), and the
+    // entry removal is itself generation-exact (`remove_user` drops the
+    // entry only when it still holds the removing control_id), so on
+    // supersession the old control's cleanup can never remove the new
+    // control's freshly recorded identity — even if a same-run_id re-login
+    // lands between the remove_if above and this call.
+    if let Some(control_id) = removed_control_id {
+        state.plugin_manager.remove_user(run_id, control_id);
     }
 
     // Sweep-free mode: the duplicate-login conflict path in login.rs calls
@@ -2825,12 +2834,17 @@ pub(crate) mod unregister_generation_tests {
     /// deleted its fresh user record. The removal is now a single atomic
     /// remove_if keyed on control_id: a stale generation's cleanup is a
     /// no-op for BOTH the routing entry and the user record, and a matching
-    /// cleanup drops both.
+    /// cleanup drops both. The user record is additionally generation-exact
+    /// on its own: it is stored as (control_id, UserInfo) and remove_user
+    /// removes only when the stored control_id matches — so even a stale
+    /// remove_user that lands after a fresh record was made (the residual
+    /// ns-window between the remove_if and remove_user) is a no-op.
     #[tokio::test]
     async fn stale_unregister_keeps_fresh_user_record() {
         let state = test_state();
         state.plugin_manager.record_login_user(
             "run-1",
+            7, // the fresh control's generation — remove_user is generation-exact
             &crate::plugin::UserInfo {
                 user: "fresh".to_string(),
                 metas: std::collections::HashMap::new(),

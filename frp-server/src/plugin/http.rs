@@ -112,7 +112,12 @@ pub struct HttpPluginManager {
     /// plugin-mutated) Login, consulted by the NewProxy/CloseProxy/Ping/
     /// NewWorkConn/NewUserConn hooks, dropped at control unregister — the
     /// map is bounded by live controls.
-    users: std::sync::RwLock<std::collections::HashMap<String, UserInfo>>,
+    ///
+    /// Values carry the recording control's generation (`control_id`):
+    /// `remove_user` is remove-if-match, so a stale control's cleanup can
+    /// only drop an entry still holding ITS control_id, never a superseding
+    /// control's fresh record.
+    users: std::sync::RwLock<std::collections::HashMap<String, (u64, UserInfo)>>,
 }
 
 struct PluginDef {
@@ -190,12 +195,13 @@ impl HttpPluginManager {
 
     /// Record the (possibly plugin-mutated) login identity for later hooks'
     /// `user` object (Go `ctl.loginUserInfo()`). Called once per control at
-    /// login; the entry is removed by `remove_user` at control unregister.
-    pub fn record_login_user(&self, run_id: &str, user: &UserInfo) {
+    /// login, storing the control's own generation alongside the identity;
+    /// the entry is removed by `remove_user` at control unregister.
+    pub fn record_login_user(&self, run_id: &str, control_id: u64, user: &UserInfo) {
         self.users
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(run_id.to_string(), user.clone());
+            .insert(run_id.to_string(), (control_id, user.clone()));
     }
 
     /// The recorded client identity for `run_id`, or default when unknown
@@ -205,17 +211,25 @@ impl HttpPluginManager {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(run_id)
-            .cloned()
+            .map(|(_, user)| user.clone())
     }
 
     /// Drop the identity entry when a control unregisters, bounding the map
-    /// to live controls (generation-guarded by the caller so a superseding
-    /// control's fresh entry is never removed).
-    pub fn remove_user(&self, run_id: &str) {
-        self.users
+    /// to live controls. Generation-exact: the entry is removed only when it
+    /// still belongs to `control_id`, so a stale control's cleanup can never
+    /// delete a superseding control's fresh record — the caller's
+    /// generation guard is now defense in depth, not the sole guard.
+    pub fn remove_user(&self, run_id: &str, control_id: u64) {
+        let mut users = self
+            .users
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(run_id);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if users
+            .get(run_id)
+            .is_some_and(|(stored, _)| *stored == control_id)
+        {
+            users.remove(run_id);
+        }
     }
 
     /// Notify all plugins about an event.
@@ -420,6 +434,45 @@ impl HttpPluginManager {
 #[cfg(test)]
 mod tests {
     use super::{go_op_name, join_plugin_base, ops_match};
+    use crate::plugin::HttpPluginManager;
+
+    fn user(run_id: &str, name: &str) -> super::UserInfo {
+        super::UserInfo {
+            user: name.to_string(),
+            metas: std::collections::HashMap::new(),
+            run_id: run_id.to_string(),
+        }
+    }
+
+    /// Generation-exact removal (audit-fix): `remove_user` must be a no-op
+    /// when the entry belongs to a different control_id (a stale cleanup
+    /// after a same-run_id re-login) and must remove only for the matching
+    /// generation.
+    #[test]
+    fn remove_user_is_generation_exact() {
+        let m = HttpPluginManager::new(vec![]);
+        m.record_login_user("run-1", 7, &user("run-1", "fresh"));
+
+        // A stale control's cleanup (generation 3) must not delete
+        // generation 7's record.
+        m.remove_user("run-1", 3);
+        assert_eq!(
+            m.user_info("run-1").map(|u| u.user),
+            Some("fresh".to_string()),
+            "stale remove_user must not delete a fresh control's record"
+        );
+
+        // The matching generation's cleanup removes it.
+        m.remove_user("run-1", 7);
+        assert!(
+            m.user_info("run-1").is_none(),
+            "matching remove_user must drop the record"
+        );
+
+        // A subsequent stale remove stays a no-op (no entry, no panic).
+        m.remove_user("run-1", 3);
+        assert!(m.user_info("run-1").is_none());
+    }
 
     #[test]
     fn test_go_op_name_normalizes_both_styles() {
