@@ -47,6 +47,21 @@ async fn reject_new_proxy(
     write_resp(writer, &resp, v2).await;
 }
 
+/// First duplicated domain in a list, compared case-insensitively (Go's
+/// `Routers.Add` lowercases the domain before `exist()`, so a case-only
+/// variant of an earlier entry is a duplicate). Returns the lowercased
+/// duplicate, or None when every entry is distinct.
+fn duplicate_domain(domains: &[String]) -> Option<String> {
+    let mut seen = std::collections::HashSet::with_capacity(domains.len());
+    for d in domains {
+        let lowered = d.to_lowercase();
+        if !seen.insert(lowered.clone()) {
+            return Some(lowered);
+        }
+    }
+    None
+}
+
 /// Check whether a UDP port is available at the OS level by attempting a bind.
 /// Immediately drops the socket if successful (just a probe).
 /// Matches Go frp's `Manager.isPortAvailable` for UDP netType.
@@ -707,9 +722,13 @@ async fn register_http_vhost(
             }
             let full_domain = format!("{}.{}", subdomain, sub_host);
             info!(full_domain = %full_domain, proxy_name = %np.proxy_name, "Subdomain route: {} → {}", full_domain, np.proxy_name);
-            if !domains.contains(&full_domain) {
-                domains.push(full_domain);
-            }
+            // Go frp v0.71.0 parity: buildDomains (proxy.go:218-229) does NO
+            // dedup — a subdomain expansion colliding with a custom_domains
+            // entry produces a duplicate domain, and the registration loop's
+            // repeated (domain, location, routeByHTTPUser) triple is then
+            // rejected as a router config conflict by VhostManager::register
+            // (Go: ErrRouterConfigConflict on the second Routers.Add).
+            domains.push(full_domain);
         }
     }
 
@@ -780,6 +799,7 @@ async fn register_http_vhost(
                         .register(
                             &np.proxy_name,
                             &domains,
+                            "http",
                             &locations,
                             run_id,
                             hhr,
@@ -839,6 +859,7 @@ async fn register_http_vhost(
         .register(
             &np.proxy_name,
             &domains,
+            "http",
             &locations,
             run_id,
             hhr,
@@ -910,9 +931,11 @@ async fn register_https_vhost(
                 return false;
             }
             let full_domain = format!("{}.{}", subdomain, sub_host);
-            if !domains.contains(&full_domain) {
-                domains.push(full_domain);
-            }
+            // No dedup (Go buildDomains parity): a subdomain expansion
+            // colliding with a custom_domains entry is a duplicate domain,
+            // and VhostManager::register rejects the repeated
+            // (domain, "", routeByHTTPUser) SNI triple as a config conflict.
+            domains.push(full_domain);
         }
     }
 
@@ -966,6 +989,7 @@ async fn register_https_vhost(
                         .register(
                             &np.proxy_name,
                             &domains,
+                            "https",
                             &[], // no locations for HTTPS SNI routing
                             run_id,
                             hhr,
@@ -1025,6 +1049,7 @@ async fn register_https_vhost(
         .register(
             &np.proxy_name,
             &domains,
+            "https",
             &[], // no locations for HTTPS SNI routing
             run_id,
             hhr,
@@ -1727,9 +1752,12 @@ pub(crate) async fn handle_new_proxy(
                         }
                         let full_domain = format!("{}.{}", subdomain, sub_host);
                         info!(full_domain = %full_domain, proxy_name = %np.proxy_name, "Subdomain route: {} → {}", full_domain, np.proxy_name);
-                        if !domains.contains(&full_domain) {
-                            domains.push(full_domain);
-                        }
+                        // No dedup (Go buildDomains parity): a subdomain
+                        // expansion colliding with a custom_domains entry is
+                        // a duplicate domain — rejected below by the
+                        // duplicate-domain gate (Go: the second Muxer.Listen
+                        // → Routers.Add hits exist() and rejects).
+                        domains.push(full_domain);
                     }
                 }
 
@@ -1744,6 +1772,44 @@ pub(crate) async fn handle_new_proxy(
                     )
                     .await;
                     state.proxy_manager.remove(&np.proxy_name).await;
+                    return false;
+                }
+                // Go buildDomains parity (server/proxy/proxy.go:218-229):
+                // empty custom_domains entries are SKIPPED (`if d != ""`),
+                // so custom_domains=["",""] yields zero domains and the
+                // proxy is ACCEPTED (Muxer.Listen never runs, listens
+                // nothing). Filter before the duplicate gate so ["",""]
+                // can't trip it; the register below with an empty list is a
+                // no-op. The len(customDomains)==0 gate above stays on the
+                // raw list (Go checks it before buildDomains).
+                let domains: Vec<String> = domains.into_iter().filter(|d| !d.is_empty()).collect();
+                // Go frp v0.71.0 parity (tcpmux.go httpConnectRun →
+                // httpConnectListen → Muxer.Listen → Routers.Add): buildDomains
+                // does no dedup, so a duplicate domain within one proxy's own
+                // list (duplicate custom_domains entry, subdomain expansion
+                // colliding with a custom_domains entry, or a case-only
+                // variant — Add lowercases before exist()) repeats the
+                // (domain, "", routeByHTTPUser) triple and the second Add
+                // REJECTS the whole registration. The tcpmux manager's
+                // per-(domain, routeByHTTPUser) HashMap insert is idempotent
+                // for same-proxy re-registration, so the reject happens here.
+                if let Some(dup) = duplicate_domain(&domains) {
+                    rollback_vhost_conflict(state, run_id, port, false).await;
+                    state.proxy_manager.remove(&np.proxy_name).await;
+                    reject_new_proxy(
+                        writer,
+                        &np.proxy_name,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            format!(
+                                "tcpmux proxy custom_domains contains duplicate domain '{}'",
+                                dup
+                            ),
+                            "tcpmux route config conflict",
+                        ),
+                        v2,
+                    )
+                    .await;
                     return false;
                 }
                 let http_user = np.http_user.as_deref().unwrap_or("");
@@ -3553,6 +3619,215 @@ pub(crate) mod unregister_generation_tests {
                 .await
                 .is_some_and(|r| r.proxy_name == "mux-sub"),
             "expanded subdomain route must be registered"
+        );
+    }
+
+    /// Go frp v0.71.0 parity (round 8): buildDomains does no dedup, so a
+    /// duplicate custom_domains entry repeats the (domain, "", rubu) triple
+    /// and Go's second Muxer.Listen → Routers.Add rejects the whole
+    /// registration. The tcpmux manager's HashMap insert is idempotent for
+    /// same-proxy re-registration, so proxy_ops must reject the duplicate
+    /// itself.
+    #[tokio::test]
+    async fn tcpmux_duplicate_domain_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("mux-dup", "tcpmux");
+        np.custom_domains = Some(vec![
+            "a.example.com".to_string(),
+            "a.example.com".to_string(),
+        ]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(!ok, "tcpmux proxy with a duplicate domain must be rejected");
+        assert!(
+            state.proxy_manager.get("mux-dup").await.is_none(),
+            "rejected tcpmux proxy must be rolled back"
+        );
+        assert!(
+            String::from_utf8_lossy(&writer).contains("duplicate domain"),
+            "rejection response must surface the duplicate domain"
+        );
+        assert!(
+            state
+                .tcpmux_manager
+                .lookup("a.example.com", "")
+                .await
+                .is_none(),
+            "no route may be left behind by the rejected registration"
+        );
+    }
+
+    /// Go parity: the same duplicate-domain rejection on the tcpmux path
+    /// for CASE-ONLY duplicates (Routers.Add lowercases before exist()).
+    /// (A subdomain-expansion collision with a custom_domains entry is
+    /// pre-empted by validateDomainConfigForServer — a custom domain under
+    /// subDomainHost is rejected before buildDomains runs — so the
+    /// reachable duplicate is a repeated custom_domains entry.)
+    #[tokio::test]
+    async fn tcpmux_case_variant_duplicate_domain_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("mux-case", "tcpmux");
+        np.custom_domains = Some(vec![
+            "a.example.net".to_string(),
+            "A.EXAMPLE.NET".to_string(),
+        ]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(!ok, "case-variant duplicate tcpmux domain must be rejected");
+        assert!(state.proxy_manager.get("mux-case").await.is_none());
+        assert!(
+            String::from_utf8_lossy(&writer).contains("duplicate domain"),
+            "rejection must name the duplicated domain: {}",
+            String::from_utf8_lossy(&writer)
+        );
+    }
+
+    /// Go parity (round 8): duplicate custom_domains entries flow through
+    /// to VhostManager::register, whose same-call duplicate detection
+    /// rejects the repeated (domain, location, routeByHTTPUser) triple —
+    /// previously the duplicate silently double-registered the vhost route.
+    /// (subdomain-expansion collisions are pre-empted by
+    /// validateDomainConfigForServer, Go validation/proxy.go:81-99.)
+    #[tokio::test]
+    async fn http_duplicate_custom_domains_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("http-dup", "http");
+        np.custom_domains = Some(vec![
+            "a.example.net".to_string(),
+            "a.example.net".to_string(),
+        ]);
+        np.locations = Some(vec!["/".to_string()]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(
+            !ok,
+            "http proxy with duplicate custom_domains must be rejected"
+        );
+        assert!(state.proxy_manager.get("http-dup").await.is_none());
+        assert!(
+            String::from_utf8_lossy(&writer).contains("conflict"),
+            "rejection response must surface the router config conflict"
+        );
+        assert!(
+            state
+                .vhost_manager
+                .lookup("a.example.net", "/", "")
+                .await
+                .is_none(),
+            "no vhost route may be left behind by the rejected registration"
+        );
+    }
+
+    /// Go parity: the same duplicate-custom_domains rejection on the HTTPS
+    /// (SNI, empty locations) path — VhostManager::register treats an empty
+    /// location list as the single location "" (Go https.go listenForDomain
+    /// → Add(domain, "")).
+    #[tokio::test]
+    async fn https_duplicate_custom_domains_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("https-dup", "https");
+        np.custom_domains = Some(vec![
+            "a.example.net".to_string(),
+            "a.example.net".to_string(),
+        ]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(
+            !ok,
+            "https proxy with duplicate custom_domains must be rejected"
+        );
+        assert!(state.proxy_manager.get("https-dup").await.is_none());
+        assert!(
+            String::from_utf8_lossy(&writer).contains("conflict"),
+            "rejection response must surface the router config conflict"
+        );
+        assert!(
+            state
+                .vhost_manager
+                .lookup("a.example.net", "", "")
+                .await
+                .is_none(),
+            "no SNI route may be left behind by the rejected registration"
         );
     }
 

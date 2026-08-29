@@ -98,6 +98,8 @@ pub mod unsafe_features;
 pub mod v2_handshake;
 #[cfg(feature = "kcp")]
 pub mod xtcp_p2p;
+#[cfg(feature = "kcp")]
+pub mod xtcp_session;
 
 #[cfg(not(feature = "kcp"))]
 pub mod kcp {
@@ -110,6 +112,8 @@ pub mod kcp {
 #[cfg(not(feature = "kcp"))]
 pub mod xtcp_p2p {
     use tokio::net::UdpSocket;
+    /// Mirror of the real `DEFAULT_HOLE_PUNCH_TIMEOUT_MS` (Go MakeHole 5s).
+    pub const DEFAULT_HOLE_PUNCH_TIMEOUT_MS: u64 = 5000;
     pub fn conv_from_sid(_sid: &str) -> u32 {
         0
     }
@@ -134,6 +138,45 @@ pub mod xtcp_p2p {
         _sid: Option<&str>,
         _key: Option<&[u8; 16]>,
     ) -> Result<tokio::net::TcpStream, String> {
+        Err("KCP feature not compiled".into())
+    }
+    /// Stub of the persistent tunnel session ([`crate::xtcp_session::XtcpTunnelSession`])
+    /// for builds without `kcp`: every method errors so frp-client's session
+    /// dispatch compiles uniformly and XTCP visitors fall back to STCP.
+    pub struct XtcpTunnelSession {
+        _priv: (),
+    }
+    impl XtcpTunnelSession {
+        pub async fn open_stream(
+            &self,
+            _timeout: std::time::Duration,
+        ) -> Result<Box<dyn P2pStream>, String> {
+            Err("KCP feature not compiled".into())
+        }
+        pub async fn accept_stream(
+            &self,
+            _timeout: std::time::Duration,
+        ) -> Result<Box<dyn P2pStream>, String> {
+            Err("KCP feature not compiled".into())
+        }
+        pub fn is_alive(&self) -> bool {
+            false
+        }
+        pub async fn close(&self) {}
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn xtcp_p2p_connect_yamux_session(
+        _socket: UdpSocket,
+        _candidates: &[String],
+        _assisted: &[String],
+        _behavior: Option<&crate::msg::NatHoleDetectBehavior>,
+        _conv: u32,
+        _kcp_config: super::kcp::KcpConfig,
+        _hole_punch_timeout_ms: u64,
+        _yamux_client: bool,
+        _sid: Option<&str>,
+        _key: Option<&[u8; 16]>,
+    ) -> Result<XtcpTunnelSession, String> {
         Err("KCP feature not compiled".into())
     }
 }

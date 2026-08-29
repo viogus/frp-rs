@@ -88,10 +88,21 @@ use crate::kcp::{KcpConfig, KcpSession};
 const HOLE_PUNCH_MAGIC: &[u8] = b"frp";
 
 /// Default KCP tick interval (ms). 10 ms matches Go frp kcp-go default.
-const KCP_TICK_MS: u32 = 10;
+/// `pub(crate)` — the persistent tunnel-session driver (xtcp_session.rs)
+/// uses the same tick to keep the KCP state machine alive.
+pub(crate) const KCP_TICK_MS: u32 = 10;
 
 /// Default timeout for hole-punch response.
 pub const DEFAULT_HOLE_PUNCH_TIMEOUT_MS: u64 = 5000;
+
+// Persistent tunnel-session API (Go frp v0.71 keepTunnelOpenWorker): the
+// one hole-punched session per XTCP proxy, reused across user connections.
+// Implemented in xtcp_session.rs; re-exported here so callers have a single
+// XTCP entry point.
+#[cfg(all(feature = "kcp", feature = "quic"))]
+pub use crate::xtcp_session::{xtcp_p2p_connect_quic_session, QuicTunnelSession};
+#[cfg(feature = "kcp")]
+pub use crate::xtcp_session::{xtcp_p2p_connect_yamux_session, XtcpTunnelSession};
 
 /// Derive a KCP conversation ID from a shared session identifier.
 ///

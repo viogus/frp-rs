@@ -456,25 +456,37 @@ async fn handle_control_inner<S>(
                         debug!(expected_run_id = %run_id, got_run_id = %stream_run_id, "Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
                         continue;
                     }
-                    // Validate NewWorkConn credentials (privilege_key + timestamp).
-                    // Standalone TCP work connections go through handle_work_conn_inner
-                    // which validates auth. Yamux work connections must apply the
-                    // same validation — without it, tcp_mux (default on) creates an
-                    // auth bypass: yamux streams skip NewWorkConn verification that
-                    // standalone TCP work connections require.
+                    // NewWorkConn plugin hook — Go frp v0.71.0 RegisterWorkConn
+                    // ordering (server/service.go:852-888): the hook runs BEFORE
+                    // auth and may REPLACE the message (`newMsg =
+                    // &retContent.NewWorkConn`), so a plugin that rewrites
+                    // privilege_key/timestamp changes what auth validates.
+                    // Control-enabled plugins can also reject.
+                    let nwc = match crate::handlers::run_new_work_conn_plugin_with_msg(
+                        &nwc, &run_id, &state,
+                    )
+                    .await
+                    {
+                        Ok(Some(mutated)) => mutated,
+                        Ok(None) => nwc,
+                        Err(reason) => {
+                            warn!(run_id = %run_id, reason = %reason, "Yamux work conn plugin hook rejected: {reason}");
+                            continue;
+                        }
+                    };
+                    // Validate NewWorkConn credentials (privilege_key + timestamp)
+                    // on the possibly plugin-mutated message. Standalone TCP work
+                    // connections go through handle_work_conn_inner which
+                    // validates auth. Yamux work connections must apply the same
+                    // validation — without it, tcp_mux (default on) creates an
+                    // auth bypass: yamux streams skip NewWorkConn verification
+                    // that standalone TCP work connections require.
                     if let Err(e) = crate::handlers::validate_new_work_conn_auth(
                         &nwc, &run_id, &state,
                     )
                     .await
                     {
                         warn!(run_id = %run_id, error = %e, "Yamux work conn auth failed for {run_id}: {e}");
-                        continue;
-                    }
-                    // NewWorkConn plugin hook — control-enabled plugins can reject
-                    if let Err(reason) =
-                        crate::handlers::run_new_work_conn_plugin(&run_id, &state).await
-                    {
-                        warn!(run_id = %run_id, reason = %reason, "Yamux work conn plugin hook rejected: {reason}");
                         continue;
                     }
                     // Route through pool::handle_new_work_conn for consistent

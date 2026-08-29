@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -23,6 +23,15 @@ mod vhost_h2c;
 pub struct VhostRoute {
     pub proxy_name: Arc<str>,
     pub run_id: Arc<str>,
+    /// Scheme this route was registered under: "http" or "https". Go frp
+    /// keeps SEPARATE router sets per muxer — HTTP proxies share
+    /// `httpVhostRouter` (server/service.go:179) while HTTPS proxies
+    /// register in their own Muxer's `registryRouter` (vhost/vhost.go:56-70)
+    /// — so an HTTP proxy and an HTTPS proxy for the same domain never
+    /// conflict in Go. frp-rs stores both schemes in one VhostTables, so the
+    /// scheme partitions the cross-call conflict check. Lookup ignores it
+    /// (cross-scheme lookup ambiguity is pre-existing, not a regression).
+    pub scheme: String,
     /// Non-empty when this route belongs to an HTTP/HTTPS group (Go frp
     /// v0.71.0 HTTPGroup): requests are dispatched round-robin across the
     /// group's members instead of always to `proxy_name`. The route is
@@ -218,6 +227,7 @@ impl VhostManager {
         &self,
         proxy_name: &str,
         domains: &[String],
+        scheme: &str,
         locations: &[String],
         run_id: &str,
         host_header_rewrite: &str,
@@ -230,6 +240,7 @@ impl VhostManager {
         let route = VhostRoute {
             proxy_name: proxy_name.into(),
             run_id: run_id.into(),
+            scheme: scheme.to_string(),
             group: group.into(),
             locations: locations.to_vec(),
             host_header_rewrite: host_header_rewrite.into(),
@@ -247,17 +258,54 @@ impl VhostManager {
         // the conflict check, the routes insert, and the by_proxy
         // bookkeeping, keeping register/unregister symmetric (unregister
         // looks up by the same lowered key).
-        let domains: Vec<String> = domains.iter().map(|d| d.to_lowercase()).collect();
+        //
+        // Go buildDomains parity (server/proxy/proxy.go:218-229): empty
+        // custom_domains entries are SKIPPED (`if d != ""`) — so
+        // custom_domains=["",""] yields ZERO domains, the register loop
+        // never runs, and the proxy is accepted (listening nothing). The
+        // skip happens before lowercasing in Go; filtering here is
+        // equivalent. An empty domains list also keeps the same-call
+        // dedup from tripping on the ("","") duplicate.
+        let domains: Vec<String> = domains
+            .iter()
+            .filter(|d| !d.is_empty())
+            .map(|d| d.to_lowercase())
+            .collect();
 
-        // Check for conflicts: each (domain, route_by_http_user, location) triple
-        // must be unique. Matching Go's exist() which checks exact location match.
+        // Effective location set for conflict checking. HTTPS/SNI (and the
+        // tcpmux-mirroring) registrations pass an empty location list, but Go
+        // registers them with location "" (`listenForDomain` → `Muxer.Listen`
+        // → `Routers.Add(domain, "", routeByHTTPUser)`), so an empty list
+        // means the single location "".
+        let effective_locations: Vec<&str> = if locations.is_empty() {
+            vec![""]
+        } else {
+            locations.iter().map(String::as_str).collect()
+        };
+
+        // A route registered with an empty location list covers ONLY the
+        // location "" — Go stores the catch-all as `Router.location = ""`
+        // and `exist()` compares `path == route.location` exactly. The
+        // lookup-side "empty locations match any path" convenience
+        // (find_matching_route) must not widen the conflict check.
+        let route_covers = |vr: &VhostRoute, loc: &str| {
+            (vr.locations.is_empty() && loc.is_empty()) || vr.locations.iter().any(|vl| vl == loc)
+        };
+
+        // Cross-call conflicts: each (domain, route_by_http_user, location)
+        // triple must be unique against already-registered routes. Matching
+        // Go's exist() which checks exact location match. The scheme
+        // partitions the check: Go keeps separate router sets for HTTP and
+        // HTTPS (shared httpVhostRouter vs per-muxer registryRouter), so an
+        // HTTP and an HTTPS proxy for the same domain never conflict even
+        // when both would land on effective location "".
         for domain in &domains {
             if let Some(user_map) = tables.routes.get(domain) {
                 if let Some(vrs) = user_map.get(route_by_http_user) {
-                    for loc in locations {
+                    for loc in &effective_locations {
                         if let Some(vr) = vrs
                             .iter()
-                            .find(|vr| vr.locations.iter().any(|vl| vl == loc))
+                            .find(|vr| vr.scheme == scheme && route_covers(vr, loc))
                         {
                             return Err(RouterConfigConflict {
                                 domain: domain.clone(),
@@ -267,6 +315,32 @@ impl VhostManager {
                             });
                         }
                     }
+                }
+            }
+        }
+
+        // Same-call duplicate detection. Go's registration loops call
+        // `Routers.Add` once per (domain, location, routeByHTTPUser) triple
+        // (http.go:78-101, https.go:54-90, tcpmux.go:73-105) and buildDomains
+        // (proxy.go:218-229) does NO dedup — so a triple that repeats WITHIN
+        // one proxy's own domain list — a duplicate custom_domains entry,
+        // subdomain expansion (`subDomain + "." + SubDomainHost`) colliding
+        // with a custom_domains entry, or a case-only variant (Add
+        // lowercases) — hits exist() on the second Add and REJECTS the whole
+        // registration. The old proxy_ops `contains` guards made frp-rs more
+        // lenient than Go; duplicates now flow through to this check.
+        // route_by_http_user is registration-constant, so (domain, location)
+        // is the full triple.
+        let mut seen: HashSet<(&str, &str)> = HashSet::with_capacity(domains.len());
+        for domain in &domains {
+            for loc in &effective_locations {
+                if !seen.insert((domain.as_str(), *loc)) {
+                    return Err(RouterConfigConflict {
+                        domain: domain.clone(),
+                        route_by_http_user: route_by_http_user.to_string(),
+                        existing_proxy: proxy_name.to_string(),
+                        incoming_proxy: proxy_name.to_string(),
+                    });
                 }
             }
         }
@@ -1886,6 +1960,7 @@ mod tests {
         mgr.register(
             "p1",
             &["MixedCase.Example.com".into()],
+            "http",
             &["/".into()],
             "run-1",
             "",
@@ -1918,6 +1993,7 @@ mod tests {
             .register(
                 "p2",
                 &["MIXEDCASE.EXAMPLE.COM".into()],
+                "http",
                 &["/".into()],
                 "run-2",
                 "",
@@ -1938,6 +2014,421 @@ mod tests {
         // (by_proxy bookkeeping holds the same lowered keys).
         mgr.unregister("p1").await;
         assert!(mgr.lookup("mixedcase.example.com", "/", "").await.is_none());
+    }
+
+    /// Go frp parity (round 8): buildDomains does no dedup, so a duplicate
+    /// custom_domains entry produces a repeated (domain, location,
+    /// routeByHTTPUser) triple WITHIN one registration — Go's registration
+    /// loop hits ErrRouterConfigConflict on the second Routers.Add and
+    /// rejects the whole proxy. The old proxy_ops `contains` guards were
+    /// more lenient than Go.
+    #[tokio::test]
+    async fn test_vhost_register_same_call_duplicate_domain_rejected() {
+        let mgr = VhostManager::new();
+        let err = mgr
+            .register(
+                "p1",
+                &["a.example.com".into(), "a.example.com".into()],
+                "http",
+                &["/".into()],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect_err("duplicate custom_domains entry must be a config conflict");
+        assert!(
+            err.to_string().contains("a.example.com"),
+            "conflict must name the duplicated domain: {err}"
+        );
+        // Nothing was inserted — no half-registered route.
+        assert!(mgr.lookup("a.example.com", "/", "").await.is_none());
+    }
+
+    /// Go parity: Routers.Add lowercases before exist(), so a case-only
+    /// variant of an earlier entry in the same registration is a duplicate
+    /// and rejects the registration (custom_domains "a.example.com" +
+    /// "A.example.com").
+    #[tokio::test]
+    async fn test_vhost_register_same_call_case_variant_rejected() {
+        let mgr = VhostManager::new();
+        let err = mgr
+            .register(
+                "p1",
+                &["a.example.com".into(), "A.EXAMPLE.COM".into()],
+                "http",
+                &["/".into()],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect_err("case-only duplicate must be a config conflict");
+        assert!(
+            err.to_string().contains("a.example.com"),
+            "conflict must name the lowered domain: {err}"
+        );
+    }
+
+    /// Go parity: the registration loop is `for domain { for location { Add } }`,
+    /// so a duplicate domain repeats every (domain, location) triple — the
+    /// second domain iteration conflicts even when locations differ.
+    #[tokio::test]
+    async fn test_vhost_register_duplicate_domain_with_multi_locations_rejected() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["d.example.com".into(), "d.example.com".into()],
+            "http",
+            &["/".into(), "/api".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect_err("duplicate domain × locations must conflict on the second domain");
+    }
+
+    /// Go parity: distinct (domain, location) triples within one
+    /// registration are legal — one domain with several locations registers
+    /// each as its own Router (http.go `for _, location := range locations`).
+    #[tokio::test]
+    async fn test_vhost_register_same_domain_different_locations_accepted() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["example.com".into()],
+            "http",
+            &["/".into(), "/api".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("one domain with distinct locations must register");
+        let r = mgr.lookup("example.com", "/api/users", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        let r = mgr.lookup("example.com", "/other", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+    }
+
+    /// Go parity: HTTPS registration passes location "" (https.go
+    /// listenForDomain → Muxer.Listen → Routers.Add(domain, "", ...)), so a
+    /// duplicate domain WITHIN one HTTPS registration (duplicate
+    /// custom_domains entry, or subdomain expansion colliding with a custom
+    /// domain) repeats the (domain, "") SNI triple and rejects.
+    #[tokio::test]
+    async fn test_vhost_register_https_same_call_duplicate_domain_rejected() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["tls.example.com".into(), "tls.example.com".into()],
+            "https",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect_err("HTTPS duplicate SNI domain must be a config conflict");
+    }
+
+    /// Go parity: HTTPS (empty locations = location "") also conflicts
+    /// ACROSS registrations — two HTTPS proxies with the same domain are
+    /// rejected by the muxer's Routers.Add (previously frp-rs skipped the
+    /// conflict check entirely for empty-location registrations, letting
+    /// the first proxy silently win).
+    #[tokio::test]
+    async fn test_vhost_register_https_cross_call_duplicate_domain_rejected() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["tls.example.com".into()],
+            "https",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("first HTTPS registration must succeed");
+        let err = mgr
+            .register(
+                "p2",
+                &["tls.example.com".into()],
+                "https",
+                &[],
+                "run-2",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect_err("second HTTPS proxy claiming the same SNI domain must be rejected");
+        assert!(
+            err.to_string().contains("p1"),
+            "conflict must name the existing proxy: {err}"
+        );
+        // The first route survives.
+        let r = mgr.lookup("tls.example.com", "", "").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+    }
+
+    /// Go parity: a location-less (catch-all) route is registered with
+    /// location "", so it conflicts with a new HTTPS (location "") route on
+    /// the same domain — but NOT with a location-scoped HTTP route.
+    #[tokio::test]
+    async fn test_vhost_register_catch_all_location_conflict_parity() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["c.example.com".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("catch-all registration must succeed");
+        // Location-scoped route on the same domain is a distinct triple.
+        mgr.register(
+            "p2",
+            &["c.example.com".into()],
+            "http",
+            &["/".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("location-scoped route must coexist with the catch-all");
+        // A second location-less route is the same (domain, "") triple.
+        mgr.register(
+            "p3",
+            &["c.example.com".into()],
+            "http",
+            &[],
+            "run-3",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect_err("second location-less route must conflict with the catch-all");
+    }
+
+    /// Go parity: HTTP and HTTPS vhost routes live in SEPARATE router sets
+    /// in Go frp — HTTP proxies share `httpVhostRouter`
+    /// (server/service.go:179), HTTPS proxies register in their own Muxer's
+    /// `registryRouter` (vhost/vhost.go:56-70) — so an HTTP proxy and an
+    /// HTTPS proxy for the SAME domain never conflict, whatever their
+    /// locations. frp-rs stores both schemes in one VhostTables, so the
+    /// scheme partitions the cross-call conflict check (round-10 regression:
+    /// both defaulted to effective location "" and cross-rejected a pair Go
+    /// accepts).
+    #[tokio::test]
+    async fn test_vhost_http_https_same_domain_both_accepted() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "http-p",
+            &["example.com".into()],
+            "http",
+            &["/a".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTP registration must succeed");
+        mgr.register(
+            "https-p",
+            &["example.com".into()],
+            "https",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTPS registration for the same domain must not conflict with the HTTP route");
+    }
+
+    /// The scheme partition must hold even when BOTH registrations land on
+    /// effective location "" (empty locations list → [""]) — pre-diff this
+    /// pair was cross-rejected as a duplicate (domain, "", "") triple,
+    /// while Go accepts it (separate router sets).
+    #[tokio::test]
+    async fn test_vhost_http_https_same_effective_location_accepted() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "http-p",
+            &["same.example.com".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTP catch-all registration must succeed");
+        mgr.register(
+            "https-p",
+            &["same.example.com".into()],
+            "https",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTPS registration must not conflict with the HTTP catch-all");
+    }
+
+    /// Within one scheme, the (domain, route_by_http_user, location) triple
+    /// stays unique: a second HTTP proxy with the same domain and same
+    /// location is rejected (Go httpVhostRouter Routers.Add exist()).
+    #[tokio::test]
+    async fn test_vhost_http_same_domain_same_location_conflict() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["dup.example.com".into()],
+            "http",
+            &["/".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("first HTTP registration must succeed");
+        let err = mgr
+            .register(
+                "p2",
+                &["dup.example.com".into()],
+                "http",
+                &["/".into()],
+                "run-2",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect_err("second HTTP proxy with the same domain+location must conflict");
+        assert!(
+            err.to_string().contains("p1"),
+            "conflict must name the existing proxy: {err}"
+        );
+    }
+
+    /// Go buildDomains parity (server/proxy/proxy.go:218-229): empty-string
+    /// custom_domains entries are skipped (`if d != ""`), so
+    /// custom_domains=["",""] produces ZERO domains, the register loop
+    /// never runs, and the proxy is ACCEPTED (listening nothing) — for both
+    /// HTTP and HTTPS. The registration must not trip the same-call dedup
+    /// on the ("","") duplicate, and nothing must be routable for "".
+    #[tokio::test]
+    async fn test_vhost_empty_custom_domains_accepted() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "http-p",
+            &["".into(), "".into()],
+            "http",
+            &["/".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTP custom_domains=[\"\",\"\"] must be accepted (Go buildDomains skips empties)");
+        mgr.register(
+            "https-p",
+            &["".into(), "".into()],
+            "https",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect(
+            "HTTPS custom_domains=[\"\",\"\"] must be accepted (Go buildDomains skips empties)",
+        );
+        // Zero domains registered — nothing resolves for "".
+        assert!(mgr.lookup("", "/", "").await.is_none());
+        assert!(mgr.lookup_combined("", "/", "").await.is_none());
+        // A real domain must not resolve to either proxy either (zero
+        // routes were inserted, not just ""-keyed ones).
+        assert!(mgr.lookup("example.com", "/", "").await.is_none());
     }
 
     /// Minimal AppState for routing-only tests (mirrors state.rs test_state).
@@ -1983,6 +2474,7 @@ mod tests {
         VhostRoute {
             proxy_name: name.into(),
             run_id: "run".into(),
+            scheme: "http".into(),
             group: "".into(),
             locations: locations.to_vec(),
             host_header_rewrite: "".into(),
@@ -2002,6 +2494,7 @@ mod tests {
         mgr.register(
             "p1",
             &["*.example.com".into()],
+            "http",
             &[],
             "run-1",
             "",
@@ -2043,6 +2536,7 @@ mod tests {
         mgr.register(
             "specific",
             &["*.b.example.com".into()],
+            "http",
             &[],
             "run-1",
             "",
@@ -2057,6 +2551,7 @@ mod tests {
         mgr.register(
             "broad",
             &["*.example.com".into()],
+            "http",
             &[],
             "run-2",
             "",
@@ -2083,9 +2578,21 @@ mod tests {
     #[tokio::test]
     async fn test_vhost_lookup_wildcard_catch_all() {
         let mgr = VhostManager::new();
-        mgr.register("p1", &["*".into()], &[], "run-1", "", "", "", "", &[], "")
-            .await
-            .expect("catch-all registration must succeed");
+        mgr.register(
+            "p1",
+            &["*".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("catch-all registration must succeed");
 
         for host in ["anything.example.com", "example.com", "localhost"] {
             let r = mgr
@@ -2102,6 +2609,7 @@ mod tests {
         mgr.register(
             "p1",
             &["a.example.com".into()],
+            "http",
             &[],
             "run-1",
             "",
@@ -2116,6 +2624,7 @@ mod tests {
         mgr.register(
             "p2",
             &["*.example.com".into()],
+            "http",
             &[],
             "run-2",
             "",
@@ -2148,6 +2657,7 @@ mod tests {
         mgr.register(
             "p1",
             std::slice::from_ref(&expanded),
+            "http",
             &[],
             "run-1",
             "",
@@ -2214,6 +2724,7 @@ mod tests {
         mgr.register(
             "p1",
             &["example.com".into()],
+            "http",
             &["/".into()],
             "run-1",
             "",
@@ -2228,6 +2739,7 @@ mod tests {
         mgr.register(
             "p2",
             &["example.com".into()],
+            "http",
             &["/api".into()],
             "run-2",
             "",
@@ -2251,6 +2763,7 @@ mod tests {
         mgr.register(
             "p2",
             &["example.com".into()],
+            "http",
             &["/api".into()],
             "run-2",
             "",
@@ -2276,6 +2789,7 @@ mod tests {
         mgr.register(
             "auth-p",
             &["example.com".into()],
+            "http",
             &["/".into()],
             "run-3",
             "",
@@ -2304,6 +2818,7 @@ mod tests {
         mgr.register(
             "p1",
             &[],
+            "http",
             &["/static".into()],
             "run-1",
             "",
@@ -2325,6 +2840,7 @@ mod tests {
         mgr.register(
             "p2",
             &["example.com".into()],
+            "http",
             &["/static".into()],
             "run-2",
             "",
@@ -2426,6 +2942,7 @@ mod tests {
             .register(
                 "auth-p",
                 &["auth.example.com".into()],
+                "http",
                 &[],
                 "run-1",
                 "",
@@ -2496,6 +3013,7 @@ mod tests {
             .register(
                 "owner-p",
                 &["g.example.com".into()],
+                "http",
                 &[],
                 "run-1",
                 "",
@@ -2543,6 +3061,7 @@ mod tests {
             .register(
                 "owner-p",
                 &["g2.example.com".into()],
+                "http",
                 &[],
                 "run-1",
                 "",

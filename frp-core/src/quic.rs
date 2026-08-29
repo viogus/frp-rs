@@ -482,14 +482,15 @@ pub async fn dial_quic_connection_with_params(
 /// NAT mapping is preserved — matching Go frp v0.70.1's `quic.Dial` on the
 /// hole-punched UDP conn. TLS skips certificate verification
 /// (InsecureSkipVerify=true) because Go frp uses a runtime self-signed cert,
-/// and the ALPN is `frp`. Returns the first bidirectional stream plus the
-/// `QuicConnection` handle.
-pub async fn quic_dial_on_socket(
+/// and the ALPN is `frp`. Returns only the `QuicConnection` handle — used by
+/// the persistent XTCP tunnel session (Go `QUICTunnelSession.Init` dials
+/// without opening a stream).
+pub async fn quic_dial_conn_on_socket(
     socket: std::net::UdpSocket,
     remote: SocketAddr,
     server_name: &str,
     params: QuicTransportParams,
-) -> io::Result<(QuicStream, QuicConnection)> {
+) -> io::Result<QuicConnection> {
     // No CA on a hole-punched peer socket: skip certificate verification
     // (InsecureSkipVerify=true), matching Go frp's auto-generated certs.
     let verifier = std::sync::Arc::new(crate::transport::InsecureSkipVerify);
@@ -520,7 +521,21 @@ pub async fn quic_dial_on_socket(
         .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?
         .await
         .map_err(|e| io::Error::other(format!("quinn connecting: {e}")))?;
-    let connection = QuicConnection { conn };
+    Ok(QuicConnection { conn })
+}
+
+/// Dial a QUIC connection on an existing UDP socket and open the first
+/// bidirectional stream (legacy per-stream XTCP QUIC data plane).
+///
+/// Thin wrapper over [`quic_dial_conn_on_socket`] preserving the old
+/// signature: dial + first stream in one call.
+pub async fn quic_dial_on_socket(
+    socket: std::net::UdpSocket,
+    remote: SocketAddr,
+    server_name: &str,
+    params: QuicTransportParams,
+) -> io::Result<(QuicStream, QuicConnection)> {
+    let connection = quic_dial_conn_on_socket(socket, remote, server_name, params).await?;
     let stream = connection.open_bi().await?;
     Ok((stream, connection))
 }

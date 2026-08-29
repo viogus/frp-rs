@@ -265,15 +265,16 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // auto-tuning, but its default stream cap is 512 — NOT 8192 (the
     // old comment here was wrong). Hitting the cap is asymmetric: a
     // client open returns TooManyStreams promptly BUT takes the whole
-    // client session with it (crates.io yamux 0.14 runs ConnectionState::
-    // Cleanup + drop_all_streams on ANY poll_new_outbound error — every
-    // stream goes Closed, the session can never open again; see the cap
-    // test in this module), and a server-side SYN at the cap sends GoAway
-    // and kills the ENTIRE mux connection (control channel + all work
-    // streams). Go frp's yamux fork survives a client-side cap refusal.
-    // frp-rs reconnects the mux session through the control layer after a
-    // cap hit. 1024 streams removes the cliff for realistic workloads
-    // while keeping the OOM surface bounded.
+    // client session with it (yamux 0.14 runs ConnectionState::Cleanup +
+    // drop_all_streams on ANY poll_new_outbound error — every stream
+    // goes Closed, the session can never open again; see the cap test in
+    // this module), while an inbound SYN at the cap is answered with a
+    // per-stream RST (the vendored yamux patch mirrors Go's fatedier
+    // fork) — the refused opener's stream dies but the session and every
+    // existing stream keep working. Go frp's yamux fork survives a
+    // client-side cap refusal; frp-rs reconnects the mux session through
+    // the control layer after a cap hit. 1024 streams removes the cliff
+    // for realistic workloads while keeping the OOM surface bounded.
     //
     // yamux-rs asserts conn_window >= max_streams * 256 KiB (reserved
     // per-stream credit) — 1024 * 256 KiB = 256 MiB. The old
@@ -980,50 +981,214 @@ mod tests {
         drop(opened);
     }
 
-    /// The session must cap concurrent streams at `max_num_streams` (1024,
-    /// yamux_config): the 1025th open fails fast with TooManyStreams instead
-    /// of growing the stream map without bound. A real server-mode yamux peer
-    /// accepts every stream and replies with one byte — the reply's ACK flag
-    /// clears the client's ack backlog, which would otherwise park opens at
-    /// 256 (yamux MAX_ACK_BACKLOG) and never reach the cap. Held stream
-    /// handles keep the streams in the map (RSTs only remove them when the
-    /// local handle drops).
+    /// `client_mux` with a caller-supplied yamux `Config`. The production
+    /// entry hardcodes `yamux_config`'s 1024 cap on BOTH sides; the cap test
+    /// needs ASYMMETRIC caps (client 1025 / server 1024) so one side can
+    /// refuse an inbound SYN while the other still opens. Mirrors the
+    /// production driver's request-channel architecture (bounded queue,
+    /// non-blocking serve, double-poll I/O, notify, shutdown signal) minus
+    /// the keepalive/dead-session bookkeeping — the test peer is a live
+    /// duplex socket and the test runs for seconds.
+    async fn client_mux_with_config<S>(
+        stream: S,
+        yamux_cfg: Config,
+    ) -> Result<(YamuxStream, YamuxSession), crate::Error>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut conn: Connection<Box<dyn MuxSocket>> = Connection::new(
+            Box::new(ActivityIo::new(stream, Arc::new(ActivityState::default())).compat()),
+            yamux_cfg,
+            Mode::Client,
+        );
+
+        // First outbound stream is the control channel.
+        let control = poll_fn(|cx| conn.poll_new_outbound(cx))
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("yamux: {e}").into()))?;
+        let control_compat = control.compat();
+
+        // Session-drop shutdown signal (mirrors client_mux).
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_tx = Arc::new(shutdown_tx);
+        let alive = Arc::new(AtomicBool::new(true));
+        let bg_alive = alive.clone();
+        let (open_tx, mut bg_open_rx) = mpsc::channel::<
+            oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
+        >(MAX_PENDING_OPEN_REQUESTS);
+        let open_notify = Arc::new(tokio::sync::Notify::new());
+        let bg_open_notify = open_notify.clone();
+
+        tokio::task::spawn(async move {
+            let mut pending_opens: std::collections::VecDeque<
+                oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
+            > = std::collections::VecDeque::new();
+            loop {
+                tokio::select! {
+                    result = poll_fn(|cx| {
+                        // (1) drain queued open requests into the local
+                        // pending queue, bounded (mirrors client_mux).
+                        loop {
+                            if pending_opens.len() >= MAX_PENDING_OPEN_REQUESTS {
+                                break;
+                            }
+                            match bg_open_rx.try_recv() {
+                                Ok(req) => pending_opens.push_back(req),
+                                Err(_) => break,
+                            }
+                        }
+                        // (2) serve as many as the ack backlog admits.
+                        loop {
+                            let Some(req) = pending_opens.pop_front() else {
+                                break;
+                            };
+                            if req.is_closed() {
+                                continue;
+                            }
+                            match conn.poll_new_outbound(cx) {
+                                Poll::Ready(Ok(stream)) => {
+                                    let _ = req.send(Ok(stream));
+                                }
+                                Poll::Ready(Err(e)) => {
+                                    let _ = req.send(Err(e));
+                                }
+                                Poll::Pending => {
+                                    pending_opens.push_front(req);
+                                    break;
+                                }
+                            }
+                        }
+                        // (3) double-poll inbound (ACKs + flush).
+                        let first = conn.poll_next_inbound(cx);
+                        match first {
+                            Poll::Ready(r) => return Poll::Ready(r),
+                            Poll::Pending => {}
+                        }
+                        conn.poll_next_inbound(cx)
+                    }) => {
+                        match result {
+                            Some(Ok(_)) => {
+                                // Unexpected inbound stream in client mode —
+                                // dropped, like client_mux.
+                            }
+                            Some(Err(_)) | None => {
+                                bg_alive.store(false, Ordering::Release);
+                                break;
+                            }
+                        }
+                    }
+                    _ = bg_open_notify.notified() => {}
+                    _ = &mut shutdown_rx => {
+                        bg_alive.store(false, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok((
+            control_compat,
+            YamuxSession {
+                open_tx,
+                alive,
+                open_notify,
+                shutdown_tx,
+            },
+        ))
+    }
+
+    /// The session must cap concurrent streams at `max_num_streams`. The
+    /// caps here are asymmetric (client 1025 via `client_mux_with_config`,
+    /// server 1024 — production `yamux_config`) so each direction's cap
+    /// behavior is pinned:
+    ///
+    /// - INBOUND cap (server side): the 1025th inbound SYN is answered with
+    ///   a per-stream RST (vendored yamux patch, Go fatedier/yamux parity).
+    ///   The opener's stream dies — its read returns EOF — but the session
+    ///   and every existing stream keep working: an existing stream still
+    ///   exchanges data, and a NEW stream opens once a slot frees.
+    /// - OUTBOUND cap (client side): the open past the cap fails fast with
+    ///   TooManyStreams, which yamux 0.14 turns into a full session cleanup
+    ///   (ConnectionState::Cleanup + drop_all_streams) — every stream moves
+    ///   to Closed and no further open is served (Go frp's yamux fork keeps
+    ///   the session alive here; frp-rs reconnects the mux session through
+    ///   the control layer). Pin that too: a held stream reads EOF after the
+    ///   refusal.
+    ///
+    /// A real server-mode yamux peer echoes every byte — the reply's ACK
+    /// flag clears the client's ack backlog, which would otherwise park
+    /// opens at 256 (yamux MAX_ACK_BACKLOG) and never reach the cap. Held
+    /// stream handles keep the streams in the map (RSTs only remove them
+    /// when the local handle drops).
     #[tokio::test(flavor = "current_thread")]
-    async fn mux_stream_cap_1024_fails_fast() {
+    async fn mux_stream_cap_hit_resets_offending_stream() {
         // client-side streams arrive as tokio_util::compat::Compat<Stream>,
-        // which implements the tokio traits (raw yamux Streams above use the
-        // futures traits from the module import).
+        // which implements the tokio traits (raw yamux Streams in the server
+        // task use the futures traits from the module import).
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (client_io, server_io) = tokio::io::duplex(65536);
 
+        // The connection must be polled CONTINUOUSLY while stream handlers
+        // read: the connection is the only poller, and a data frame for a
+        // stream whose handler parked would otherwise never be delivered (a
+        // sequential read-then-poll loop stalls the moment a stream's data
+        // arrives one flush later than its SYN). Each inbound stream gets its
+        // own handler that echoes every byte and HOLDS its stream open until
+        // the peer closes it: the server-side map entry lives until the
+        // handler's handle drops (yamux on_drop_stream), and the handler
+        // signals closed_tx AFTER that drop, so the map removal is queued
+        // before the test's next open (deterministic on current_thread).
+        // accepted_tx counts accepts; closed_tx counts drained handlers —
+        // closed_rx stays in the TEST so the drop step can await it.
+        let (closed_tx, mut closed_rx) = tokio::sync::mpsc::channel::<()>(64);
         let server_task = tokio::task::spawn(async move {
             let mut sconn = Connection::new(
                 server_io.compat(),
                 yamux_config(&TcpMuxConfig::default()),
                 Mode::Server,
             );
-            // The connection must be polled CONTINUOUSLY while stream
-            // handlers read: the connection is the only poller, and a data
-            // frame for a stream whose handler parked would otherwise never
-            // be delivered (a sequential read-then-poll loop stalls the
-            // moment a stream's data arrives one flush later than its SYN).
-            // Each inbound stream gets its own handler; accepts are counted
-            // via a channel drained after the connection closes.
             let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel::<()>(64);
             while let Some(Ok(mut stream)) = poll_fn(|cx| sconn.poll_next_inbound(cx)).await {
                 let tx = accepted_tx.clone();
+                let closed_tx = closed_tx.clone();
                 tokio::spawn(async move {
-                    // Read the SYN+data frame, then reply — the ACK
-                    // flag on the reply clears the client's ack
-                    // backlog for this stream.
                     let mut buf = [0u8; 16];
-                    let _ = stream.read(&mut buf).await;
-                    let _ = stream.write_all(b"x").await;
+                    // SYN+data: echo the first chunk (the reply's ACK flag
+                    // clears the client's ack backlog for this stream), then
+                    // echo until the peer closes the stream. The control
+                    // stream never carries data: its handler parks here
+                    // until the connection closes at teardown.
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => 0,
+                        Ok(n) => {
+                            let _ = stream.write_all(&buf[..n]).await;
+                            n
+                        }
+                    };
+                    if n > 0 {
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if stream.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Explicit drop BEFORE the signals: the server map entry
+                    // is removed when the connection polls this handle's
+                    // CloseStream command — queued before the test's reopen
+                    // sees the closed signal.
+                    drop(stream);
                     let _ = tx.send(()).await;
+                    let _ = closed_tx.send(()).await;
                 });
             }
             drop(accepted_tx);
+            drop(closed_tx);
             let mut accepted = 0;
             while accepted_rx.recv().await.is_some() {
                 accepted += 1;
@@ -1031,15 +1196,37 @@ mod tests {
             accepted
         });
 
-        let (_control, session) = client_mux(client_io, &TcpMuxConfig::default())
+        // Client cap 1025: one above the server, so the 1025th INBOUND SYN
+        // (the client's 1024th work open) hits the SERVER's cap first.
+        let mut client_cfg = yamux_config(&TcpMuxConfig::default());
+        client_cfg.set_max_num_streams(1025);
+        let (mut control, session) = client_mux_with_config(client_io, client_cfg)
             .await
-            .expect("client_mux");
+            .expect("client_mux_with_config");
 
-        // Open up to the cap. Each open is followed by a one-byte write; the
-        // NEXT open's driver pass flushes the previous write onto the wire
-        // (the driver's I/O poll drains the connection's stream commands),
-        // and the server's reply ACKs it.
-        let mut streams = Vec::with_capacity(1024);
+        // The control stream's SYN rides its FIRST frame, exactly like
+        // production (frpc writes the Login message right after the open):
+        // write one byte so the server admits the control stream and its
+        // stream map holds control + work streams — the 1024-stream cap
+        // must include it, or the server's cap is effectively 1024 work
+        // streams and the refused SYN below lands 1024 when expected to
+        // reset.
+        control
+            .write_all(b"x")
+            .await
+            .expect("write on the control stream");
+
+        // Open up to the server's cap. Each open is followed by a one-byte
+        // write AND an echo read: the write pushes the stream's SYN+data onto
+        // the wire, and the read only returns once the server's handler has
+        // echoed — i.e. once the server has ACCEPTED the stream. Reading the
+        // echo per stream makes the server's acceptance synchronous with the
+        // test loop (an open resolves client-side as soon as the driver
+        // serves it; the server accepts each SYN one poll at a time and lags
+        // otherwise), so the server is provably at its cap before the refused
+        // SYN goes out — no acceptance-lag race. The reply's ACK flag also
+        // clears the client's ack backlog for the stream.
+        let mut streams = Vec::with_capacity(1023);
         for i in 0..1023 {
             let stream = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
                 .await
@@ -1050,65 +1237,133 @@ mod tests {
                 .write_all(b"x")
                 .await
                 .expect("write must succeed below the cap");
+            let mut echo = [0u8; 1];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut echo))
+                .await
+                .expect("echo must not hang below the cap")
+                .expect("read");
+            assert_eq!(&echo[..n], b"x", "server must accept and echo open #{i}");
             streams.push(stream);
         }
 
-        // The 1024th open (1 control + 1023 held) must fail fast with
-        // TooManyStreams, not queue forever or grow past the cap.
-        let refused = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
+        // The 1024th work open (1 control + 1023 held = the server's cap)
+        // SUCCEEDS client-side (client cap 1025) but the server answers the
+        // SYN with a per-stream RST: the stream reads EOF instead of hanging.
+        let mut refused = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
             .await
-            .expect("cap refusal must be prompt");
-        assert!(
-            refused.is_none(),
-            "expected the open past the 1024-stream cap to be refused"
-        );
-
-        // crates.io yamux 0.14 turns a TooManyStreams open into a full
-        // connection cleanup (ConnectionState::Cleanup + drop_all_streams):
-        // EVERY stream moves to State::Closed and no further stream can ever
-        // open on this session. Pin that semantic — it is what makes the
-        // refusal fail FAST for both the opener and the holders of open
-        // streams, instead of queueing (Go frp's yamux fork keeps the
-        // session alive on a cap refusal; frp-rs reconnects the mux session
-        // through the control layer instead).
-        //
-        // The last stream is the clean probe: its SYN was not yet flushed
-        // when the cap hit discarded it, so its reply can never arrive and
-        // the read must return an immediate EOF — the Closed state, not a
-        // hang, is the "fails fast" guarantee for holders of open streams.
-        let mut last = streams.pop().expect("1023 streams held");
+            .expect("open past the server cap must still resolve client-side")
+            .expect("client cap 1025 must admit the 1024th work open");
+        // yamux-rs carries the SYN flag on the stream's FIRST frame, which
+        // is only queued when the stream's writer is polled — write one byte
+        // so the SYN reaches the server (the cap check fires on the SYN; the
+        // body is dropped with the frame — the stream never exists
+        // server-side).
+        refused
+            .write_all(b"x")
+            .await
+            .expect("write on the refused stream");
         let mut probe = [0u8; 1];
-        let eof = tokio::time::timeout(Duration::from_secs(2), last.read(&mut probe))
+        let eof = tokio::time::timeout(Duration::from_secs(2), refused.read(&mut probe))
             .await
-            .expect("Closed stream must read EOF, not hang");
+            .expect("the server RST must arrive promptly, not hang")
+            .expect("read");
         assert_eq!(
-            eof.expect("read"),
-            0,
-            "stream must be Closed after the cap hit"
+            eof, 0,
+            "the server RST must close the offending stream, not the session"
         );
 
-        // Every further open is refused promptly: the connection is in
-        // cleanup / closed, never queued behind the first refusal.
-        let again = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
+        // Existing streams keep working: the echo loop answers a fresh write
+        // — proof the session was not GoAway'd.
+        let mut live = streams.remove(0);
+        live.write_all(b"z")
             .await
-            .expect("post-cap refusal must be prompt");
-        assert!(again.is_none(), "opens after the cap hit must be refused");
+            .expect("write after the RST must succeed");
+        let mut probe = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), live.read(&mut probe))
+            .await
+            .expect("read must not hang after the RST")
+            .expect("read");
+        assert_eq!(
+            &probe[..n],
+            b"z",
+            "echo loop must still answer after the RST"
+        );
 
-        // Let the peer finish. How many SYNs the server drained before the
-        // cap hit depends on whether the last stream's SYN flushed in an
-        // intermediate driver pass (both 1022 and 1023 observed), so pin
-        // only the teardown: the drain loop ends once the session drops and
-        // virtually every opened stream was carried.
+        // Closing one held stream frees a server slot (map entry removed via
+        // on_drop_stream) — a NEW stream opens on the same session and
+        // carries data: the RST refused only that one stream.
+        let closed_stream = streams.pop().expect("1022 streams held");
+        drop(closed_stream);
+        tokio::time::timeout(Duration::from_secs(5), closed_rx.recv())
+            .await
+            .expect("server must close the dropped stream, not hang")
+            .expect("closed signal must arrive");
+        let mut again = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
+            .await
+            .expect("open after a slot frees must not hang")
+            .expect("a freed slot must admit a new stream");
+        again
+            .write_all(b"y")
+            .await
+            .expect("write on the reopened stream");
+        let mut probe = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), again.read(&mut probe))
+            .await
+            .expect("reopened stream read must not hang")
+            .expect("read");
+        assert_eq!(&probe[..n], b"y", "reopened stream must carry data");
+
+        // The client is now at ITS cap (control + 1022 held + the refused
+        // stream + the reopened one = 1025). The next open hits the client's
+        // OWN cap: outbound TooManyStreams, refused fast. yamux 0.14 turns
+        // that into a full session cleanup (ConnectionState::Cleanup +
+        // drop_all_streams) — pin it: a held stream reads EOF.
+        let cap_refused = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
+            .await
+            .expect("client-cap refusal must be prompt");
+        assert!(
+            cap_refused.is_none(),
+            "open past the client's own cap must be refused"
+        );
+        let mut probe = [0u8; 1];
+        let eof = tokio::time::timeout(Duration::from_secs(2), live.read(&mut probe))
+            .await
+            .expect("Closed stream must read EOF, not hang")
+            .expect("read");
+        assert_eq!(eof, 0, "session cleanup must close every held stream");
+
+        // Teardown: the session drops, the peer EOFs every stream, and each
+        // handler exits. The server must have accepted exactly control +
+        // 1023 work + the reopened stream — the RST'd stream was never
+        // accepted — and every accepted stream's handler must drain.
+        //
+        // Drain closed_rx BEFORE awaiting the server task: both channels are
+        // capped at 64, and a handler only exits after BOTH its sends
+        // succeed. The server task drains accepted_rx while this loop drains
+        // closed_rx (they wake each other); awaiting the server task first
+        // would park the test, stranding the closed senders and with them
+        // their accepted clones — the accepted channel would never close.
+        drop(again);
+        drop(refused);
+        drop(live);
         drop(streams);
-        drop(last);
+        drop(control);
         drop(session);
+        let mut closed_count = 1; // the mid-test drop signal
+        while closed_rx.recv().await.is_some() {
+            closed_count += 1;
+        }
         let accepted = tokio::time::timeout(Duration::from_secs(5), server_task)
             .await
             .expect("server task must finish")
             .expect("server task must not panic");
-        assert!(
-            (1022..=1023).contains(&accepted),
-            "server drained {accepted} streams, expected 1022 or 1023"
+        assert_eq!(
+            accepted, 1025,
+            "server must accept control + 1023 work + reopened (the RST'd stream never lands)"
+        );
+        assert_eq!(
+            closed_count, accepted,
+            "every accepted stream's handler must drain"
         );
     }
 }
