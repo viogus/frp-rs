@@ -995,7 +995,17 @@ async fn register_https_vhost(
                             hhr,
                             http_user,
                             http_pwd,
-                            rubu,
+                            // Go parity: HTTPSProxyConfig is ProxyBaseConfig +
+                            // DomainConfig ONLY (pkg/config/v1/proxy.go) — Go's
+                            // HTTPSProxy never sets RouteByHTTPUser (https.go
+                            // listenForDomain builds an empty RouteConfig), so
+                            // the SNI route is always keyed by "" and the SNI
+                            // lookup (http_user "") can find it. Registering
+                            // under rubu instead would make the proxy silently
+                            // unreachable and let two HTTPS proxies on the same
+                            // domain with different rubu pass the conflict
+                            // check where Go rejects the second.
+                            "",
                             &headers,
                             group_name,
                         )
@@ -1055,7 +1065,15 @@ async fn register_https_vhost(
             hhr,
             http_user,
             http_pwd,
-            rubu,
+            // Go parity: HTTPSProxyConfig is ProxyBaseConfig + DomainConfig
+            // ONLY (pkg/config/v1/proxy.go) — Go's HTTPSProxy never sets
+            // RouteByHTTPUser (https.go listenForDomain builds an empty
+            // RouteConfig), so the SNI route is always keyed by "" and the
+            // SNI lookup (http_user "") can find it. Registering under rubu
+            // instead would make the proxy silently unreachable and let two
+            // HTTPS proxies on the same domain with different rubu pass the
+            // conflict check where Go rejects the second.
+            "",
             &headers,
             "",
         )
@@ -3771,7 +3789,7 @@ pub(crate) mod unregister_generation_tests {
         assert!(
             state
                 .vhost_manager
-                .lookup("a.example.net", "/", "")
+                .lookup("a.example.net", "/", "", "http")
                 .await
                 .is_none(),
             "no vhost route may be left behind by the rejected registration"
@@ -3824,11 +3842,129 @@ pub(crate) mod unregister_generation_tests {
         assert!(
             state
                 .vhost_manager
-                .lookup("a.example.net", "", "")
+                .lookup("a.example.net", "", "", "https")
                 .await
                 .is_none(),
             "no SNI route may be left behind by the rejected registration"
         );
+    }
+
+    /// Regression (round-12 MEDIUM): Go's HTTPSProxyConfig is ProxyBaseConfig
+    /// + DomainConfig ONLY (pkg/config/v1/proxy.go) — HTTPS proxies never
+    /// carry route_by_http_user, so the SNI route must be registered under
+    /// the "" (empty httpUser) key, which is exactly what the SNI lookup
+    /// (http_user "") probes. Pre-fix the register call passed the proxy's
+    /// route_by_http_user through, storing the route under the rubu key and
+    /// making the proxy silently unreachable via SNI.
+    #[tokio::test]
+    async fn https_rubu_proxy_registered_under_empty_key() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("https-rubu", "https");
+        np.custom_domains = Some(vec!["rubu.example.net".to_string()]);
+        np.route_by_http_user = Some("app".to_string());
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "https proxy with route_by_http_user must register");
+        // The SNI lookup (http_user "") must find the route — pre-fix it
+        // was stored under "app" and this lookup missed.
+        let route = state
+            .vhost_manager
+            .lookup("rubu.example.net", "", "", "https")
+            .await
+            .unwrap_or_else(|| panic!("SNI lookup must find the https proxy"));
+        assert_eq!(route.proxy_name.as_ref(), "https-rubu");
+    }
+
+    /// Regression (round-12 MEDIUM): with route_by_http_user no longer
+    /// affecting HTTPS registration, two HTTPS proxies on the same domain
+    /// with DIFFERENT rubu values now collide on the shared (domain, "")
+    /// SNI triple and the second is rejected — matching Go, where
+    /// HTTPSProxyConfig has no RouteByHTTPUser and the HTTPS Muxer's
+    /// Routers.Add rejects the duplicate domain outright. Pre-fix the
+    /// different rubu keys let both through, with the first silently winning.
+    #[tokio::test]
+    async fn https_same_domain_different_rubu_second_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np1 = new_proxy("https-a", "https");
+        np1.custom_domains = Some(vec!["dup-rubu.example.net".to_string()]);
+        np1.route_by_http_user = Some("a".to_string());
+        let mut writer1 = Vec::new();
+        let ok = handle_new_proxy(
+            np1,
+            "run-1",
+            1,
+            &state,
+            &mut writer1,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "first https proxy must register");
+        assert!(state.proxy_manager.get("https-a").await.is_some());
+
+        let mut np2 = new_proxy("https-b", "https");
+        np2.custom_domains = Some(vec!["dup-rubu.example.net".to_string()]);
+        np2.route_by_http_user = Some("b".to_string());
+        let mut writer2 = Vec::new();
+        let ok = handle_new_proxy(
+            np2,
+            "run-1",
+            1,
+            &state,
+            &mut writer2,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(
+            !ok,
+            "second https proxy on the same domain (different rubu) must be rejected"
+        );
+        assert!(state.proxy_manager.get("https-b").await.is_none());
+        assert!(
+            String::from_utf8_lossy(&writer2).contains("conflict"),
+            "rejection response must surface the router config conflict"
+        );
+        // The first proxy's SNI route survives.
+        let route = state
+            .vhost_manager
+            .lookup("dup-rubu.example.net", "", "", "https")
+            .await
+            .unwrap_or_else(|| panic!("first https proxy's SNI route must survive"));
+        assert_eq!(route.proxy_name.as_ref(), "https-a");
     }
 
     /// Go validateDomainConfigForServer rejects a subdomain when

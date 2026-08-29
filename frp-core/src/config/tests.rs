@@ -67,6 +67,40 @@ fn test_xtcp_visitor_defaults_to_quic() {
 }
 
 #[test]
+fn test_xtcp_visitor_empty_protocol_normalizes_to_quic() {
+    // Go util.EmptyOr(Protocol, "quic") applied in Complete() BEFORE
+    // validation (pkg/config/v1/visitor.go:160 + pkg/config/load.go): an
+    // explicitly-empty `protocol = ""` must normalize to "quic" the same
+    // way a missing field does, not stay "" (which would then be rejected
+    // by the kcp/quic validation as a third, unknown protocol).
+    let toml = r#"
+[common]
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "t"
+
+[[visitors]]
+name = "v"
+type = "xtcp"
+server_name = "s"
+bind_port = 7000
+protocol = ""
+"#;
+    let cfg = load_client_config_from_str(toml).expect("config loads");
+    let visitor = cfg
+        .visitors
+        .iter()
+        .find(|v| v.name == "v")
+        .expect("visitor");
+    assert_eq!(
+        visitor.protocol, "quic",
+        "empty protocol must normalize to quic"
+    );
+    // And it passes validation (a literal "" would be rejected).
+    super::loader::validate_client_config(&cfg).expect("empty protocol validates as quic");
+}
+
+#[test]
 fn test_visitor_config_validation_matches_go() {
     // Round 10 (MEDIUM): Go validation/visitor.go:42-63 — name/serverName
     // required, bindPort==0 rejected (negative = no-bind passes), XTCP

@@ -75,6 +75,12 @@ pub(crate) struct VisitorListenerConfig {
     /// so the visitor segment matches the provider segment's packet codec
     /// when wire protocol v2 is negotiated; empty means JSON framing.
     pub udp_packet_codec: String,
+    #[cfg(feature = "quic")]
+    /// Client-configured QUIC transport params for the XTCP tunnel session
+    /// (Go `clientCfg.Transport.QUIC` — both the visitor's
+    /// `NewQUICTunnelSession(sv.clientCfg)` and the provider's
+    /// `listenByQUIC` read `clientCfg.Transport.QUIC`).
+    pub quic_params: frp_core::quic::QuicTransportParams,
 }
 
 /// Configuration for a no-bind `virtual_net` visitor tunnel.
@@ -262,6 +268,26 @@ impl TunnelSession {
         }
     }
 
+    /// Whether opening a throwaway probe stream is safe for this session.
+    ///
+    /// The no-tcp-mux raw-KCP session is ONE-SHOT: `open_stream` hands out
+    /// the session's only stream and flips `alive=false` — a keepalive probe
+    /// would SPEND a freshly punched session and force a re-punch churn on
+    /// the next user connection. Go has no such mode (its KCP tunnel is
+    /// always yamux-wrapped), so there is no parity constraint; user
+    /// connections re-punch on demand. QUIC and yamux sessions multiplex
+    /// streams, so probing them is harmless.
+    pub(crate) fn probe_safe(&self) -> bool {
+        match self {
+            #[cfg(not(feature = "tcp-mux"))]
+            TunnelSession::Kcp(_) => false,
+            #[cfg(feature = "tcp-mux")]
+            TunnelSession::Kcp(_) => true,
+            #[cfg(all(feature = "quic", feature = "kcp"))]
+            TunnelSession::Quic(_) => true,
+        }
+    }
+
     /// Close the session (releases the UDP socket / KCP / yamux / QUIC).
     pub(crate) async fn close(&self) {
         match self {
@@ -289,6 +315,16 @@ struct XtcpPunchConfig {
     daa: bool,
     /// Control-channel sender for NatHoleVisitor.
     vtx: mpsc::Sender<crate::service::VisitorRequest>,
+    /// Listener-teardown token. `do_hole_punch` races its awaits (pre_check,
+    /// NatHoleResp, MakeHole) against this so a cancelled listener exits in
+    /// milliseconds instead of lingering through the full punch sequence
+    /// (pre_check 5s + NatHoleResp 15s + punch up to ~35s ≈ 50s).
+    cancel: CancellationToken,
+    #[cfg(feature = "quic")]
+    /// Client-configured QUIC transport params for the tunnel session (Go
+    /// `clientCfg.Transport.QUIC` — both the visitor and provider tunnel
+    /// sessions read it).
+    quic_params: frp_core::quic::QuicTransportParams,
 }
 
 /// Full XTCP hole punch (Go `makeNatHole`): PreCheck → STUN → NatHoleVisitor
@@ -334,7 +370,15 @@ async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
                 "failed to send pre_check to control loop (backlogged, not draining)".into()
             });
         }
-        match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+        match tokio::select! {
+            _ = cfg.cancel.cancelled() => {
+                return Err(format!(
+                    "Visitor '{}': pre_check cancelled (listener shutting down)",
+                    cfg.visitor_name
+                ));
+            }
+            r = tokio::time::timeout(Duration::from_secs(5), reply_rx) => r,
+        } {
             Ok(Ok(Ok(resp))) => {
                 if let Some(err) = resp.error {
                     return Err(format!("pre_check failed: {err}"));
@@ -440,7 +484,15 @@ async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
             "failed to send NatHoleVisitor to control loop (backlogged, not draining)".into()
         });
     }
-    let resp = match tokio::time::timeout(Duration::from_secs(15), reply_rx).await {
+    let resp = match tokio::select! {
+        _ = cfg.cancel.cancelled() => {
+            return Err(format!(
+                "Visitor '{}': NatHoleResp wait cancelled (listener shutting down)",
+                cfg.visitor_name
+            ));
+        }
+        r = tokio::time::timeout(Duration::from_secs(15), reply_rx) => r,
+    } {
         Ok(Ok(Ok(resp))) => resp,
         Ok(Ok(Err(e))) => return Err(format!("NatHoleResp error from server: {e}")),
         Ok(Err(_)) => return Err("NatHoleResp channel closed (control loop dropped)".into()),
@@ -469,53 +521,79 @@ async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
     // Use read_timeout_ms from the server's detect_behavior as the
     // hole-punch timeout (Go parity); default to Go's MakeHole 5s. The
     // punch no longer shares a budget with the per-connection wait — it runs
-    // in the background.
+    // in the background. Go MakeHole floors the guard at 5s too:
+    // `timeout := 5*time.Second; if m.DetectBehavior.ReadTimeoutMs > 0 {...}`
+    // (pkg/nathole/nathole.go:248-250) — a hostile/misbehaving server
+    // sending 0 must not make the punch fail instantly.
     let hp_timeout = resp
         .detect_behavior
         .as_ref()
-        .map(|db| db.read_timeout_ms.max(0) as u64)
+        .map(|db| {
+            (db.read_timeout_ms.max(0) as u64)
+                .max(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS)
+        })
         .unwrap_or(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS);
     let assisted = resp.assisted_addrs.clone().unwrap_or_default();
     let behavior = resp.detect_behavior.clone();
-    if cfg.pp.as_str() == "quic" {
-        #[cfg(all(feature = "quic", feature = "kcp"))]
-        {
-            let s = frp_core::xtcp_p2p::xtcp_p2p_connect_quic_session(
+    // Data-plane protocol dispatch (Go parity, client/visitor/xtcp.go:57-60):
+    // ONLY "kcp" selects the KCP+yamux data plane; anything else — "quic",
+    // "", or an unknown value — selects QUIC. The config layer already
+    // normalizes an explicitly empty protocol to "quic" (Go EmptyOr), so ""
+    // here means a non-Rust peer or a hostile server echo.
+    let session_fut = async {
+        if cfg.pp.as_str() == "kcp" {
+            let s = frp_core::xtcp_p2p::xtcp_p2p_connect_yamux_session(
                 socket,
                 &candidates,
                 &assisted,
                 behavior.as_ref(),
+                conv,
+                kcp_cfg,
                 hp_timeout,
+                true, // yamux_client = visitor
                 p2p_sid,
                 p2p_key.as_ref(),
-                false, // is_server = false (visitor is QUIC client)
             )
             .await?;
-            Ok(TunnelSession::Quic(s))
+            Ok(TunnelSession::Kcp(s))
+        } else {
+            #[cfg(all(feature = "quic", feature = "kcp"))]
+            {
+                let s = frp_core::xtcp_session::xtcp_p2p_connect_quic_session_with_params(
+                    socket,
+                    &candidates,
+                    &assisted,
+                    behavior.as_ref(),
+                    hp_timeout,
+                    p2p_sid,
+                    p2p_key.as_ref(),
+                    false, // is_server = false (visitor is QUIC client)
+                    cfg.quic_params.clone(),
+                )
+                .await?;
+                Ok(TunnelSession::Quic(s))
+            }
+            #[cfg(not(all(feature = "quic", feature = "kcp")))]
+            {
+                warn!(visitor_name = %cfg.visitor_name, "Visitor '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)", cfg.visitor_name);
+                Err(format!(
+                    "Visitor '{}': protocol 'quic' requires both the quic and kcp features",
+                    cfg.visitor_name
+                ))
+            }
         }
-        #[cfg(not(all(feature = "quic", feature = "kcp")))]
-        {
-            warn!(visitor_name = %cfg.visitor_name, "Visitor '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)", cfg.visitor_name);
+    };
+    // Race the punch (up to hp_timeout ≈ 35s) against listener teardown so
+    // the background task exits promptly instead of lingering.
+    tokio::pin!(session_fut);
+    tokio::select! {
+        _ = cfg.cancel.cancelled() => {
             Err(format!(
-                "Visitor '{}': protocol 'quic' requires both the quic and kcp features",
+                "Visitor '{}': hole punch cancelled (listener shutting down)",
                 cfg.visitor_name
             ))
         }
-    } else {
-        let s = frp_core::xtcp_p2p::xtcp_p2p_connect_yamux_session(
-            socket,
-            &candidates,
-            &assisted,
-            behavior.as_ref(),
-            conv,
-            kcp_cfg,
-            hp_timeout,
-            true, // yamux_client = visitor
-            p2p_sid,
-            p2p_key.as_ref(),
-        )
-        .await?;
-        Ok(TunnelSession::Kcp(s))
+        r = &mut session_fut => r,
     }
 }
 
@@ -535,11 +613,16 @@ async fn process_tunnel_start_events(
         // signal arrives the gate drops — the receiver is busy punching and
         // sleeping, and further signals are dropped, exactly like a send to
         // Go's unbuffered channel while the receiver is not in select.
-        armed.store(true, Ordering::Relaxed);
+        // Release/Acquire (not Relaxed): the store must be visible to a
+        // sender's load BEFORE the sender's channel send, and the load on
+        // the send side must not observe a stale "not parked" — a lost
+        // signal on weak-memory CPUs would strand the session until the
+        // next user connection. Zero cost on x86.
+        armed.store(true, Ordering::Release);
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = start_rx.recv() => {
-                armed.store(false, Ordering::Relaxed);
+                armed.store(false, Ordering::Release);
                 let start = std::time::Instant::now();
                 match do_hole_punch(&cfg).await {
                     Ok(new_session) => {
@@ -569,19 +652,45 @@ async fn process_tunnel_start_events(
     }
 }
 
-/// Go frp v0.71 `getTunnelConn`: open a stream on the persistent session; on
-/// any error, close + clear the session and signal `startTunnelCh`
-/// (non-blocking) so `process_tunnel_start_events` re-punches. The signal
-/// fires on EVERY error path — empty slot included (Go: getTunnelConn sends
-/// the non-blocking startTunnelCh after any OpenConn failure) — gated on the
-/// receiver being parked (`armed`): Go's unbuffered channel drops the signal
-/// when the receiver is busy punching/sleeping, so the gate keeps the
-/// cap-1 channel empty and drops those signals too.
+/// Go frp v0.71 `getTunnelConn`: open a stream on the persistent session.
+///
+/// Error taxonomy (the session's own `open_stream` wording, see
+/// frp-core/src/xtcp_session.rs):
+/// - "timeout opening tunnel stream (...)" — the session's driver is STILL
+///   ALIVE but could not serve the open within `timeout` (peer ACK backlog /
+///   stream-cap congestion). This is BUSY, not dead: closing the session
+///   would kill every in-flight bridge. Go never hits this — its KCP
+///   `session.Open()` blocks until a stream opens (fatedier yamux fork has
+///   no cap) and QUIC `OpenStreamSync(ctx)` waits on the caller's deadline —
+///   so a slow open is never treated as a dead session there. The 500ms
+///   user-connection probe can time out on a healthy session under a
+///   >64-open burst (the driver's 64-request queue cap) — see `open_tunnel`.
+/// - "tunnel session open queue full (peer stalled?)" — same family: the
+///   driver is alive but its 64-slot request queue is congested.
+/// - every other error (is_alive false, driver exited, connection error) is
+///   a DEAD session.
+///
+/// On a dead session: close it, clear the slot (only if it still holds THIS
+/// session — a re-punch may have swapped in a fresh one while we were
+/// failing) and signal `startTunnelCh` (non-blocking) so the re-punch task
+/// runs. The signal fires on EVERY error path — empty slot included (Go:
+/// getTunnelConn sends the non-blocking startTunnelCh after any OpenConn
+/// failure) — gated on the receiver being parked (`armed`): Go's unbuffered
+/// channel drops the signal when the receiver is busy punching/sleeping, so
+/// the gate keeps the cap-1 channel empty and drops those signals too.
+///
+/// `close_on_timeout`: the caller's verdict on the BUSY case. `open_tunnel`
+/// (500ms user probes) passes false — the session is healthy, just busy,
+/// and the probe is retried. `keep_tunnel_open_worker` (30s liveness probe)
+/// passes true — 30s without service means the session is effectively dead
+/// and must be re-punched (Go's worker closes + re-punches on any probe
+/// failure too).
 async fn get_tunnel_conn(
     slot: &Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>>,
     start_tx: &mpsc::Sender<()>,
     armed: &AtomicBool,
     timeout: Duration,
+    close_on_timeout: bool,
 ) -> Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> {
     let session = {
         let guard = slot.lock().await;
@@ -591,7 +700,7 @@ async fn get_tunnel_conn(
                 // Go parity: getTunnelConn signals startTunnelCh (non-blocking)
                 // on every error path — with keep_tunnel_open=false the first
                 // user connection's failure is what triggers the initial punch.
-                if armed.load(Ordering::Relaxed) {
+                if armed.load(Ordering::Acquire) {
                     let _ = start_tx.try_send(());
                 }
                 return Err("no tunnel session".into());
@@ -600,28 +709,78 @@ async fn get_tunnel_conn(
     };
     match session.open_stream(timeout).await {
         Ok(stream) => Ok(stream),
-        Err(e) => {
-            // The session is dead: close it, and clear the slot only if it
-            // still holds THIS session (a re-punch may have swapped in a
-            // fresh one while we were failing). Then signal a re-punch —
-            // only when we cleared the slot, so a fresh session is not
-            // churned by a stale failure; gated on the receiver parked.
-            session.close().await;
-            let mut guard = slot.lock().await;
-            let cleared = guard
-                .as_ref()
-                .map(|cur| Arc::ptr_eq(cur, &session))
-                .unwrap_or(false);
-            if cleared {
-                guard.take();
+        // Capacity errors PROVE the session is alive (its driver served the
+        // refusal) — never close for these, even when the caller
+        // (keepalive probe) treats probe timeouts as death: closing would
+        // kill every in-flight bridge on a healthy session.
+        Err(e) if is_session_capacity_error(&e) => Err(format!("tunnel session busy: {e}")),
+        Err(e) if is_busy_open_error(&e) => {
+            if close_on_timeout {
+                // The caller (keepalive probe) judged this a dead session.
+                close_and_signal(session, slot, start_tx, armed, &e).await
+            } else {
+                // Session alive but busy: do NOT close it (that would kill
+                // every in-flight bridge and force a 10s+ re-punch cascade);
+                // let the caller retry the probe.
+                Err(format!("tunnel session busy: {e}"))
             }
-            drop(guard);
-            if cleared && armed.load(Ordering::Relaxed) {
-                let _ = start_tx.try_send(());
-            }
-            Err(e)
         }
+        Err(e) => close_and_signal(session, slot, start_tx, armed, &e).await,
     }
+}
+
+/// Whether an `open_stream` error means "session alive but busy" rather
+/// than "session dead". See the taxonomy comment on `get_tunnel_conn`.
+fn is_busy_open_error(e: &str) -> bool {
+    is_session_capacity_error(e)
+        // Both session variants (yamux-over-KCP and QUIC) format open
+        // timeouts identically in frp-core/src/xtcp_session.rs. The timeout
+        // class is AMBIGUOUS (alive-but-stalled vs dead-but-undetected —
+        // KCP dead-link detection lags); the caller's `close_on_timeout`
+        // flag decides whether a probe timeout means death.
+        || e.starts_with("timeout opening tunnel stream")
+}
+
+/// Errors that prove the session driver is alive and serving requests — the
+/// open failed on CAPACITY, not health:
+/// - `yamux tunnel stream cap reached (256)`: the driver's own outbound-cap
+///   mirror refused the open (frp-core/src/xtcp_session.rs — per-open
+///   refusal so the session survives; Go's fatedier fork has no cap at all).
+/// - `tunnel session open queue full (peer stalled?)`: the driver's bounded
+///   64-slot request queue (open_stream fails fast instead of accumulating).
+///
+/// A 500ms probe hitting either on a busy-but-healthy session must NOT close
+/// the session (that was the round-10 HIGH: probe killed every in-flight
+/// bridge + forced a 10s+ re-punch cascade).
+fn is_session_capacity_error(e: &str) -> bool {
+    e.starts_with("yamux tunnel stream cap reached") || e.contains("tunnel session open queue full")
+}
+
+/// Close + clear the session and signal a re-punch (Go getTunnelConn error
+/// path). The slot is cleared only if it still holds THIS session, so a
+/// fresh session swapped in by a re-punch is not churned by a stale failure;
+/// the signal is gated on the receiver being parked (`armed`).
+async fn close_and_signal(
+    session: Arc<TunnelSession>,
+    slot: &Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>>,
+    start_tx: &mpsc::Sender<()>,
+    armed: &AtomicBool,
+    e: &str,
+) -> Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> {
+    session.close().await;
+    let mut guard = slot.lock().await;
+    let cleared = guard
+        .as_ref()
+        .map(|cur| Arc::ptr_eq(cur, &session))
+        .unwrap_or(false);
+    if cleared {
+        guard.take();
+    }
+    drop(guard);
+    if cleared && armed.load(Ordering::Acquire) {
+        let _ = start_tx.try_send(());
+    }
+    Err(e.to_string())
 }
 
 /// Go frp v0.71 `openTunnel`: poll `get_tunnel_conn` until a tunnel stream is
@@ -632,6 +791,14 @@ async fn get_tunnel_conn(
 /// is bounded by 500ms so a dead session cannot eat the whole budget on one
 /// attempt (Go: OpenConn carries the full deadline, timer.Reset(500ms) paces
 /// retries).
+///
+/// `get_tunnel_conn` is called with close_on_timeout=false: a probe TIMEOUT
+/// means the session is alive but busy (peer ACK backlog / request-queue
+/// congestion — e.g. a >64-concurrent-open burst), NOT dead — closing it
+/// would kill every in-flight bridge on that session. The busy error is
+/// retried like any other; the session stays in the slot. (Capacity errors
+/// — stream-cap reached / request queue full — never close the session
+/// regardless of the flag: they prove the driver is alive.)
 async fn open_tunnel(
     visitor_name: &str,
     slot: &Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>>,
@@ -645,7 +812,15 @@ async fn open_tunnel(
         if conn_cancel.is_cancelled() {
             return Err("visitor shutting down".into());
         }
-        match get_tunnel_conn(slot, start_tx, armed, Duration::from_millis(500)).await {
+        match get_tunnel_conn(
+            slot,
+            start_tx,
+            armed,
+            Duration::from_millis(500),
+            false, // probe timeout = busy session, not dead
+        )
+        .await
+        {
             Ok(stream) => return Ok(stream),
             Err(e) => {
                 debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}': open tunnel attempt failed: {}", visitor_name, e);
@@ -702,12 +877,33 @@ async fn keep_tunnel_open_worker(
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = ticker.tick() => {
+                // No-tcp-mux raw-KCP sessions are ONE-SHOT: `open_stream`
+                // spends the session's only stream, so every probe would
+                // force a re-punch churn on the next user connection. Go
+                // has no such mode (KCP tunnel is always yamux-wrapped);
+                // skip the probe — user connections re-punch on demand.
+                let probe_skipped = {
+                    let guard = slot.lock().await;
+                    guard
+                        .as_ref()
+                        .map(|s| !s.probe_safe())
+                        .unwrap_or(false)
+                };
+                if probe_skipped {
+                    continue;
+                }
                 // Probe the session: open a stream (bounded — a healthy
                 // session answers in milliseconds; 30s covers a
                 // dead-but-undetected peer until KCP dead-link trips).
                 // On success close the probe stream; on failure rate-limit
                 // and continue (Go: retryLimiter.Wait + continue).
-                match get_tunnel_conn(&slot, &start_tx, armed, Duration::from_secs(30)).await
+                // close_on_timeout=true: this is a liveness check, not a
+                // user open — 30s without service is a dead session, and
+                // Go's worker closes + re-punches on any probe failure.
+                // (Capacity errors — stream cap / request queue — still
+                // never close the session: the driver provably lives.)
+                match get_tunnel_conn(&slot, &start_tx, armed, Duration::from_secs(30), true)
+                    .await
                 {
                     Ok(stream) => drop(stream),
                     Err(e) => {
@@ -898,6 +1094,10 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         // SUDP-only: the STCP TCP accept path ignores the negotiated
         // UDPPacket codec.
         udp_packet_codec: _,
+        // Client QUIC transport params for the XTCP tunnel session (Go
+        // clientCfg.Transport.QUIC).
+        #[cfg(feature = "quic")]
+        quic_params,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -946,6 +1146,9 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
             pp: p2p_protocol.clone(),
             daa: disable_assisted_addrs,
             vtx: visitor_tx.clone(),
+            cancel: listener_cancel.clone(),
+            #[cfg(feature = "quic")]
+            quic_params,
         };
         // processTunnelStartEvents (Go parity): re-punch on demand, ≥10s
         // apart. Runs for the listener lifetime. It owns the receiver side of
@@ -1504,6 +1707,9 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         tls_key_file,
         v2,
         udp_packet_codec,
+        // SUDP: no NAT traversal / tunnel session.
+        #[cfg(feature = "quic")]
+            quic_params: _,
     } = config;
 
     // Go frp v0.70.1 three-stage model: the visitor segment is encrypted
@@ -2779,7 +2985,8 @@ mod tunnel_session_tests {
             Arc::new(tokio::sync::Mutex::new(None));
         let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
         let armed = AtomicBool::new(true);
-        let err = get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100)).await;
+        let err =
+            get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100), false).await;
         match err {
             Err(e) => assert!(
                 e.contains("no tunnel session"),
@@ -2802,7 +3009,8 @@ mod tunnel_session_tests {
             Arc::new(tokio::sync::Mutex::new(None));
         let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
         let armed = AtomicBool::new(false);
-        let err = get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100)).await;
+        let err =
+            get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100), false).await;
         match err {
             Err(e) => assert!(
                 e.contains("no tunnel session"),
@@ -2837,7 +3045,8 @@ mod tunnel_session_tests {
 
         // Close the session → open_stream fails (alive=false).
         client.close().await;
-        let err = get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100)).await;
+        let err =
+            get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100), false).await;
         assert!(err.is_err(), "closed session must fail open_stream");
         assert!(slot.lock().await.is_none(), "dead session must be cleared");
         assert!(
@@ -2847,7 +3056,8 @@ mod tunnel_session_tests {
         // Second call: slot is empty → error, but STILL signals (Go: every
         // error path sends the non-blocking signal; the armed gate only drops
         // it when the receiver is not parked).
-        let err = get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100)).await;
+        let err =
+            get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100), false).await;
         assert!(err.is_err());
         assert!(
             start_rx.try_recv().is_ok(),
@@ -2877,9 +3087,15 @@ mod tunnel_session_tests {
                     .expect("provider accept_stream")
             }
         });
-        let stream = get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_secs(3))
-            .await
-            .expect("live session must open a stream");
+        let stream = get_tunnel_conn(
+            &slot,
+            &start_tx,
+            &armed,
+            Duration::from_secs(3),
+            false, // probe timeout = busy session, not dead
+        )
+        .await
+        .expect("live session must open a stream");
         let _accepted = accept_task.await.expect("accept task");
 
         assert!(
@@ -2892,6 +3108,124 @@ mod tunnel_session_tests {
         );
         drop(stream); // closes the probe stream
         assert!(client.is_alive(), "session survives a stream close");
+    }
+
+    /// The driver refuses an open at the 256-stream cap with a PER-OPEN
+    /// error while the session stays healthy — `get_tunnel_conn` must treat
+    /// that as "session busy", never "session dead": with
+    /// close_on_timeout=true (keepalive probe) the round-10 HIGH behavior
+    /// would close the session and kill every in-flight bridge on a healthy
+    /// session. The same session must serve the next open once capacity
+    /// frees.
+    #[tokio::test]
+    async fn get_tunnel_conn_cap_reached_is_busy_not_dead() {
+        let (_server, client) = loopback_session_pair().await;
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        *slot.lock().await = Some(client.clone());
+        let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
+        let armed = AtomicBool::new(true);
+        let _ = start_rx.try_recv(); // drain any initial signal
+
+        // Fill the session to the driver's outbound cap (MAX_TUNNEL_STREAMS
+        // = 256). Opens complete client-side (the driver emits the SYN
+        // eagerly), so no accept loop is needed.
+        let mut held: Vec<Box<dyn frp_core::xtcp_p2p::P2pStream>> = Vec::new();
+        for i in 0..256 {
+            match client.open_stream(Duration::from_secs(2)).await {
+                Ok(s) => held.push(s),
+                Err(e) => panic!("open {i} within the cap must succeed, got: {e}"),
+            }
+        }
+        let cap_err = match client.open_stream(Duration::from_secs(2)).await {
+            Ok(_) => panic!("open beyond the cap must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            cap_err.contains("yamux tunnel stream cap reached"),
+            "got: {cap_err}"
+        );
+
+        // close_on_timeout=true (keepalive-probe semantics): a capacity
+        // error is busy, NOT dead — the session survives and nothing is
+        // signalled.
+        let err = match get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(200), true)
+            .await
+        {
+            Ok(_) => panic!("cap-reached probe must be busy"),
+            Err(e) => e,
+        };
+        assert!(err.contains("tunnel session busy"), "got: {err}");
+        assert!(
+            slot.lock()
+                .await
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &client)),
+            "session must survive a cap-reached probe"
+        );
+        assert!(
+            start_rx.try_recv().is_err(),
+            "no re-punch signal for a live session"
+        );
+        assert!(client.is_alive(), "session alive");
+
+        // close_on_timeout=false (open_tunnel semantics): same.
+        let err = match get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(200), false)
+            .await
+        {
+            Ok(_) => panic!("cap-reached probe must be busy"),
+            Err(e) => e,
+        };
+        assert!(err.contains("tunnel session busy"), "got: {err}");
+        assert!(
+            slot.lock()
+                .await
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &client)),
+            "session must survive a cap-reached probe"
+        );
+        assert!(start_rx.try_recv().is_err());
+
+        // Capacity frees (handles dropped) → the SAME session serves the
+        // next open: it was never dead.
+        drop(held);
+        let stream = client
+            .open_stream(Duration::from_secs(2))
+            .await
+            .expect("session recovers once capacity frees");
+        drop(stream);
+        assert!(client.is_alive(), "session alive after recovery");
+    }
+
+    /// Error-string taxonomy: what counts as "session alive but busy" vs
+    /// "session dead", and the provably-alive capacity subclass that never
+    /// closes a session regardless of the caller's flag.
+    #[test]
+    fn busy_error_classification() {
+        // Capacity errors: the driver served the refusal — session alive.
+        assert!(is_busy_open_error("yamux tunnel stream cap reached (256)"));
+        assert!(is_busy_open_error(
+            "tunnel session open queue full (peer stalled?)"
+        ));
+        assert!(is_session_capacity_error(
+            "yamux tunnel stream cap reached (256)"
+        ));
+        assert!(is_session_capacity_error(
+            "tunnel session open queue full (peer stalled?)"
+        ));
+        // Open timeout: ambiguous (alive-but-stalled vs dead-but-undetected).
+        assert!(is_busy_open_error("timeout opening tunnel stream (500ms)"));
+        assert!(!is_session_capacity_error(
+            "timeout opening tunnel stream (500ms)"
+        ));
+        // Genuine errors: the session is dead — close + re-punch.
+        assert!(!is_busy_open_error("no tunnel session"));
+        assert!(!is_busy_open_error(
+            "tunnel session closed while opening stream"
+        ));
+        assert!(!is_busy_open_error("quic open stream: connection closed"));
+        assert!(!is_busy_open_error("yamux open stream: connection reset"));
+        assert!(!is_busy_open_error(""));
     }
 
     /// open_tunnel polls (every 500ms) until a session appears in the slot;
@@ -3022,6 +3356,9 @@ mod tunnel_session_tests {
             pp: "kcp".into(),
             daa: true,
             vtx,
+            cancel: CancellationToken::new(),
+            #[cfg(feature = "quic")]
+            quic_params: frp_core::quic::QuicTransportParams::default(),
         };
         let cancel = CancellationToken::new();
         let armed = AtomicBool::new(true);
@@ -3062,6 +3399,9 @@ mod tunnel_session_tests {
             pp: "kcp".into(),
             daa: true,
             vtx,
+            cancel: CancellationToken::new(),
+            #[cfg(feature = "quic")]
+            quic_params: frp_core::quic::QuicTransportParams::default(),
         };
         let cancel = CancellationToken::new();
         let armed = AtomicBool::new(true);

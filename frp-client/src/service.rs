@@ -2269,6 +2269,26 @@ impl Service {
             // Clone the negotiated UDPPacket codec before `ctx` moves into
             // the spawn (Go frp v0.71.0 sessionCtx.UDPPacketCodec).
             let ctx_udp_packet_codec = ctx.wc_udp_packet_codec.clone();
+            // Client QUIC transport params for the XTCP tunnel session (Go
+            // `clientCfg.Transport.QUIC`).
+            #[cfg(feature = "quic")]
+            let visitor_quic_params = frp_core::quic::quic_params_from_option_values(
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.keepalive_period)
+                    .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.max_idle_timeout)
+                    .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.max_incoming_streams)
+                    .unwrap_or(0),
+            );
             let handle = tokio::spawn(async move {
                 crate::visitor::run_visitor_listener(crate::visitor::VisitorListenerConfig {
                     server_addr: sa,
@@ -2314,6 +2334,8 @@ impl Service {
                     // byte-stream bridge; mismatches fall back to the
                     // message-level transcoding bridge.
                     udp_packet_codec: ctx_udp_packet_codec.clone(),
+                    #[cfg(feature = "quic")]
+                    quic_params: visitor_quic_params,
                 })
                 .await;
             });

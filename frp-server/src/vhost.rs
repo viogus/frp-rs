@@ -28,9 +28,14 @@ pub struct VhostRoute {
     /// `httpVhostRouter` (server/service.go:179) while HTTPS proxies
     /// register in their own Muxer's `registryRouter` (vhost/vhost.go:56-70)
     /// — so an HTTP proxy and an HTTPS proxy for the same domain never
-    /// conflict in Go. frp-rs stores both schemes in one VhostTables, so the
-    /// scheme partitions the cross-call conflict check. Lookup ignores it
-    /// (cross-scheme lookup ambiguity is pre-existing, not a regression).
+    /// conflict in Go, and lookups never cross schemes: http.go routes by
+    /// Host inside httpVhostRouter only, https.go by SNI inside the HTTPS
+    /// Muxer's registryRouter only. frp-rs stores both schemes in one
+    /// VhostTables, so the scheme partitions BOTH the conflict check and
+    /// every lookup — find_matching_route only matches routes whose scheme
+    /// equals the lookup's (HTTP call sites pass "http", SNI call sites
+    /// "https"), so a plain HTTP request can never land on an HTTPS
+    /// proxy's backend nor an SNI connection on an HTTP proxy's backend.
     pub scheme: String,
     /// Non-empty when this route belongs to an HTTP/HTTPS group (Go frp
     /// v0.71.0 HTTPGroup): requests are dispatched round-robin across the
@@ -109,10 +114,18 @@ impl std::fmt::Display for RouterConfigConflict {
 
 impl std::error::Error for RouterConfigConflict {}
 
-/// Find the first route in a sorted Vec whose location prefix-matches the path.
+/// Find the first route in a sorted Vec whose scheme matches and whose
+/// location prefix-matches the path.
 /// If the route has no locations (e.g. HTTPS SNI routes), it matches any path.
-fn find_matching_route(vrs: &[VhostRoute], path: &str) -> Option<VhostRouteMatch> {
+/// The scheme filter mirrors Go's separate router sets (httpVhostRouter vs
+/// the HTTPS Muxer's registryRouter): an HTTP lookup must never match an
+/// HTTPS route and vice versa. Same-scheme first-match order is preserved —
+/// within a scheme, the first route in the Go-sorted order wins.
+fn find_matching_route(vrs: &[VhostRoute], path: &str, scheme: &str) -> Option<VhostRouteMatch> {
     for route in vrs {
+        if route.scheme != scheme {
+            continue;
+        }
         if route.locations.is_empty() {
             return Some(VhostRouteMatch::from_route(route));
         }
@@ -125,14 +138,16 @@ fn find_matching_route(vrs: &[VhostRoute], path: &str) -> Option<VhostRouteMatch
     None
 }
 
-/// Find best matching route for a given host, path, and httpUser.
+/// Find best matching route for a given host, path, httpUser, and scheme.
 /// Corresponds to Go frp's `getLocked` + calls through `getExactOrAllUsersLocked`:
 /// tries httpUser-specific routes first, then falls back to empty-string httpUser.
+/// `scheme` is the route-scheme key ("http"/"https") — see find_matching_route.
 fn get_locked(
     routes: &HashMap<String, HashMap<String, Vec<VhostRoute>>>,
     host: &str,
     path: &str,
     http_user: &str,
+    scheme: &str,
 ) -> Option<VhostRouteMatch> {
     // Go frp compat (pkg/util/vhost/router.go): `Get` does
     // `strings.ToLower(host)` before lookup — domains are stored lowercased
@@ -151,13 +166,13 @@ fn get_locked(
     let user_map = routes.get(host_key)?;
     // Try httpUser-specific first
     if let Some(vrs) = user_map.get(http_user) {
-        if let Some(route) = find_matching_route(vrs, path) {
+        if let Some(route) = find_matching_route(vrs, path, scheme) {
             return Some(route);
         }
     }
     // Fall back to empty-string httpUser (matching Go frp's all-users fallback)
     if let Some(vrs) = user_map.get("") {
-        if let Some(route) = find_matching_route(vrs, path) {
+        if let Some(route) = find_matching_route(vrs, path, scheme) {
             return Some(route);
         }
     }
@@ -399,14 +414,17 @@ impl VhostManager {
     /// Look up by domain (exact match) with path prefix matching.
     /// Tries httpUser-specific routes first, then falls back to empty-string httpUser
     /// (matching Go frp's `getLocked` → `getExactOrAllUsersLocked`).
+    /// `scheme` partitions the lookup like Go's separate router sets: pass
+    /// "http" from HTTP request paths and "https" from SNI paths.
     pub async fn lookup(
         &self,
         domain: &str,
         path: &str,
         http_user: &str,
+        scheme: &str,
     ) -> Option<VhostRouteMatch> {
         let tables = self.inner.read().await;
-        get_locked(&tables.routes, domain, path, http_user)
+        get_locked(&tables.routes, domain, path, http_user, scheme)
     }
 
     /// Look up by domain with wildcard and path prefix support (Go frp dev compat).
@@ -419,16 +437,19 @@ impl VhostManager {
     ///
     /// Only checks wildcards for domains with >=3 labels (matching Go frp's
     /// `for len(hostSplit) >= 3` — prevents matching `*.com` for `example.com`).
+    /// `scheme` partitions the lookup like Go's separate router sets: pass
+    /// "http" from HTTP request paths and "https" from SNI paths.
     pub async fn lookup_wildcard(
         &self,
         domain: &str,
         path: &str,
         http_user: &str,
+        scheme: &str,
     ) -> Option<VhostRouteMatch> {
         let tables = self.inner.read().await;
 
         // 1. Exact match
-        if let Some(route) = get_locked(&tables.routes, domain, path, http_user) {
+        if let Some(route) = get_locked(&tables.routes, domain, path, http_user, scheme) {
             return Some(route);
         }
         // 2. Replace leftmost label with "*" progressively.
@@ -437,13 +458,14 @@ impl VhostManager {
         while parts.len() > 2 {
             parts[0] = "*";
             let wildcard_host = parts.join(".");
-            if let Some(route) = get_locked(&tables.routes, &wildcard_host, path, http_user) {
+            if let Some(route) = get_locked(&tables.routes, &wildcard_host, path, http_user, scheme)
+            {
                 return Some(route);
             }
             parts.remove(0);
         }
         // 3. Catch-all "*"
-        get_locked(&tables.routes, "*", path, http_user)
+        get_locked(&tables.routes, "*", path, http_user, scheme)
     }
 
     /// Combined lookup: domain match with wildcard expansion and location
@@ -459,16 +481,19 @@ impl VhostManager {
     /// fallthrough request on the vhost port (the round-6 catch-all hijack
     /// recreated via the path table). Domain-scoped locations still work
     /// through `lookup_wildcard`'s get_locked path-matching.
+    /// `scheme` partitions the lookup like Go's separate router sets: pass
+    /// "http" from HTTP request paths and "https" from SNI paths.
     pub async fn lookup_combined(
         &self,
         domain: &str,
         path: &str,
         http_user: &str,
+        scheme: &str,
     ) -> Option<VhostRouteMatch> {
         // Host-based routing with wildcard support and path matching.
         // lookup_wildcard internally calls get_locked which finds the first
         // route whose location prefix-matches the path.
-        self.lookup_wildcard(domain, path, http_user).await
+        self.lookup_wildcard(domain, path, http_user, scheme).await
     }
 }
 /// Write an HTTP error response, optionally with a custom body.
@@ -809,9 +834,20 @@ pub(crate) async fn resolve_vhost_request(
         .map(|(u, _)| u.as_str())
         .unwrap_or_default();
 
+    // Route-scheme key for the lookup. Routes are registered with lowercase
+    // "http"/"https"; callers of resolve_vhost_request pass the scheme as a
+    // log label ("HTTP"). The lookup must be scheme-partitioned — Go routes
+    // plain-HTTP requests exclusively through httpVhostRouter, so they must
+    // never match an HTTPS proxy's SNI route (which would bypass the HTTP
+    // proxy's http_user/auth gate and land on the HTTPS backend).
+    let scheme_key = if scheme.eq_ignore_ascii_case("http") {
+        "http"
+    } else {
+        "https"
+    };
     let Some(route) = state
         .vhost_manager
-        .lookup_combined(host, path, http_user)
+        .lookup_combined(host, path, http_user, scheme_key)
         .await
     else {
         warn!(host = %host, path = %path, peer = %peer, "No {} VHost route for '{}' path '{}' from {}", scheme, host, path, peer);
@@ -1060,9 +1096,11 @@ pub async fn run_vhost_https_listener(
                     // resolve case-insensitively. get_locked is the sole
                     // routing lowercaser, so pass the raw SNI here — the
                     // debug/warn lines below log it case-preserved.
+                    // Scheme "https": the HTTPS Muxer's registryRouter only
+                    // (Go parity) — SNI must never match an HTTP route.
                     if let Some(route) = state
                         .vhost_manager
-                        .lookup_combined(&sni, "/", "")
+                        .lookup_combined(&sni, "/", "", "https")
                         .await
                     {
                         let internal_tx = state
@@ -1981,7 +2019,7 @@ mod tests {
             "MixedCase.Example.com",
         ] {
             let route = mgr
-                .lookup(host, "/", "")
+                .lookup(host, "/", "", "http")
                 .await
                 .unwrap_or_else(|| panic!("lookup for '{host}' must resolve"));
             assert_eq!(route.proxy_name.as_ref(), "p1");
@@ -2013,7 +2051,10 @@ mod tests {
         // Unregister removes the route regardless of the original casing
         // (by_proxy bookkeeping holds the same lowered keys).
         mgr.unregister("p1").await;
-        assert!(mgr.lookup("mixedcase.example.com", "/", "").await.is_none());
+        assert!(mgr
+            .lookup("mixedcase.example.com", "/", "", "http")
+            .await
+            .is_none());
     }
 
     /// Go frp parity (round 8): buildDomains does no dedup, so a duplicate
@@ -2046,7 +2087,7 @@ mod tests {
             "conflict must name the duplicated domain: {err}"
         );
         // Nothing was inserted — no half-registered route.
-        assert!(mgr.lookup("a.example.com", "/", "").await.is_none());
+        assert!(mgr.lookup("a.example.com", "/", "", "http").await.is_none());
     }
 
     /// Go parity: Routers.Add lowercases before exist(), so a case-only
@@ -2122,9 +2163,15 @@ mod tests {
         )
         .await
         .expect("one domain with distinct locations must register");
-        let r = mgr.lookup("example.com", "/api/users", "").await.unwrap();
+        let r = mgr
+            .lookup("example.com", "/api/users", "", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p1");
-        let r = mgr.lookup("example.com", "/other", "").await.unwrap();
+        let r = mgr
+            .lookup("example.com", "/other", "", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p1");
     }
 
@@ -2196,8 +2243,11 @@ mod tests {
             err.to_string().contains("p1"),
             "conflict must name the existing proxy: {err}"
         );
-        // The first route survives.
-        let r = mgr.lookup("tls.example.com", "", "").await.unwrap();
+        // The first route survives (scheme "https" — SNI lookup).
+        let r = mgr
+            .lookup("tls.example.com", "", "", "https")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p1");
     }
 
@@ -2339,6 +2389,84 @@ mod tests {
         .expect("HTTPS registration must not conflict with the HTTP catch-all");
     }
 
+    /// Regression (round-12 MEDIUM): the conflict check is scheme-partitioned
+    /// (HTTP and HTTPS proxies for the same domain both register), and the
+    /// LOOKUPS must be too — Go routes HTTP requests through httpVhostRouter
+    /// and SNI through the HTTPS Muxer's registryRouter, so the two routes
+    /// are independently reachable and never cross. Pre-fix the lookups were
+    /// scheme-blind: find_matching_route returned whichever route came first,
+    /// so a plain HTTP request could be routed to the HTTPS proxy's backend
+    /// (bypassing the HTTP proxy's http_user/401 gate) and an SNI lookup
+    /// could pick the HTTP route.
+    #[tokio::test]
+    async fn test_vhost_http_https_same_domain_scheme_partitioned_lookup() {
+        let mgr = VhostManager::new();
+        // HTTP proxy on the shared domain with a Basic Auth gate...
+        mgr.register(
+            "http-p",
+            &["example.com".into()],
+            "http",
+            &["/".into()],
+            "run-1",
+            "",
+            "alice",
+            "secret",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTP registration must succeed");
+        // ...and an HTTPS (SNI) proxy for the SAME domain.
+        mgr.register(
+            "https-p",
+            &["example.com".into()],
+            "https",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTPS registration for the same domain must succeed");
+
+        // HTTP lookup (scheme "http") must land on the HTTP backend only —
+        // never on the HTTPS route.
+        let r = mgr.lookup("example.com", "/", "", "http").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "http-p");
+        // The HTTP route carries the auth gate (http_user), so a request
+        // routed to it can still be 401'd — the cross-scheme bug would have
+        // handed the same request to the HTTPS backend with no gate.
+        assert_eq!(r.http_user.as_ref(), "alice");
+        // SNI lookup (scheme "https") must land on the HTTPS backend only.
+        let r = mgr.lookup("example.com", "/", "", "https").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "https-p");
+        // The wildcard/combined paths partition identically.
+        let r = mgr
+            .lookup_wildcard("example.com", "/", "", "https")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "https-p");
+        let r = mgr
+            .lookup_combined("example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "http-p");
+
+        // Unregistering one scheme's route leaves the other reachable.
+        mgr.unregister("http-p").await;
+        assert!(
+            mgr.lookup("example.com", "/", "", "http").await.is_none(),
+            "HTTP route must be gone"
+        );
+        let r = mgr.lookup("example.com", "/", "", "https").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "https-p");
+    }
+
     /// Within one scheme, the (domain, route_by_http_user, location) triple
     /// stays unique: a second HTTP proxy with the same domain and same
     /// location is rejected (Go httpVhostRouter Routers.Add exist()).
@@ -2424,11 +2552,11 @@ mod tests {
             "HTTPS custom_domains=[\"\",\"\"] must be accepted (Go buildDomains skips empties)",
         );
         // Zero domains registered — nothing resolves for "".
-        assert!(mgr.lookup("", "/", "").await.is_none());
-        assert!(mgr.lookup_combined("", "/", "").await.is_none());
+        assert!(mgr.lookup("", "/", "", "http").await.is_none());
+        assert!(mgr.lookup_combined("", "/", "", "http").await.is_none());
         // A real domain must not resolve to either proxy either (zero
         // routes were inserted, not just ""-keyed ones).
-        assert!(mgr.lookup("example.com", "/", "").await.is_none());
+        assert!(mgr.lookup("example.com", "/", "", "http").await.is_none());
     }
 
     /// Minimal AppState for routing-only tests (mirrors state.rs test_state).
@@ -2510,20 +2638,26 @@ mod tests {
         // A 4-label host walks "*.b.example.com" (miss) then "*.example.com"
         // (hit) — the progressive leftmost-label replacement.
         let r = mgr
-            .lookup_wildcard("a.b.example.com", "/", "")
+            .lookup_wildcard("a.b.example.com", "/", "", "http")
             .await
             .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p1");
         // A 3-label host walks straight to "*.example.com".
-        let r = mgr.lookup_wildcard("b.example.com", "/", "").await.unwrap();
+        let r = mgr
+            .lookup_wildcard("b.example.com", "/", "", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p1");
         // Two-label hosts never match the wildcard (Go's >=3-label guard
         // keeps `*.com` from matching `example.com`) — and no catch-all is
         // registered, so the lookup misses entirely.
-        assert!(mgr.lookup_wildcard("example.com", "/", "").await.is_none());
+        assert!(mgr
+            .lookup_wildcard("example.com", "/", "", "http")
+            .await
+            .is_none());
         // Unrelated suffixes stay misses.
         assert!(mgr
-            .lookup_wildcard("a.example.net", "/", "")
+            .lookup_wildcard("a.example.net", "/", "", "http")
             .await
             .is_none());
     }
@@ -2566,12 +2700,15 @@ mod tests {
 
         // "a.b.example.com": the walk hits "*.b.example.com" first.
         let r = mgr
-            .lookup_wildcard("a.b.example.com", "/", "")
+            .lookup_wildcard("a.b.example.com", "/", "", "http")
             .await
             .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "specific");
         // "c.example.com": "*.b.example.com" misses, "*.example.com" hits.
-        let r = mgr.lookup_wildcard("c.example.com", "/", "").await.unwrap();
+        let r = mgr
+            .lookup_wildcard("c.example.com", "/", "", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "broad");
     }
 
@@ -2596,7 +2733,7 @@ mod tests {
 
         for host in ["anything.example.com", "example.com", "localhost"] {
             let r = mgr
-                .lookup_wildcard(host, "/", "")
+                .lookup_wildcard(host, "/", "", "http")
                 .await
                 .unwrap_or_else(|| panic!("catch-all must match '{host}'"));
             assert_eq!(r.proxy_name.as_ref(), "p1");
@@ -2639,9 +2776,15 @@ mod tests {
 
         // Exact match wins; the wildcard catches everything else under the
         // domain.
-        let r = mgr.lookup_wildcard("a.example.com", "/", "").await.unwrap();
+        let r = mgr
+            .lookup_wildcard("a.example.com", "/", "", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p1");
-        let r = mgr.lookup_wildcard("b.example.com", "/", "").await.unwrap();
+        let r = mgr
+            .lookup_wildcard("b.example.com", "/", "", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p2");
     }
 
@@ -2670,11 +2813,14 @@ mod tests {
         .await
         .expect("expanded subdomain registration must succeed");
 
-        let r = mgr.lookup_wildcard(&expanded, "/", "").await.unwrap();
+        let r = mgr
+            .lookup_wildcard(&expanded, "/", "", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p1");
         // The bare host has no route — the subdomain supplies the first label.
         assert!(mgr
-            .lookup_wildcard(sub_domain_host, "/", "")
+            .lookup_wildcard(sub_domain_host, "/", "", "http")
             .await
             .is_none());
     }
@@ -2698,22 +2844,26 @@ mod tests {
         assert_eq!(routes[2].proxy_name.as_ref(), "c");
 
         // Path under the longest location → b.
-        let m = find_matching_route(&routes, "/aa/bb/cc/d").unwrap();
+        let m = find_matching_route(&routes, "/aa/bb/cc/d", "http").unwrap();
         assert_eq!(m.proxy_name.as_ref(), "b");
         // "/aa/bb" misses b's "/aa/bb/cc" and hits a's "/aa".
-        let m = find_matching_route(&routes, "/aa/bb").unwrap();
+        let m = find_matching_route(&routes, "/aa/bb", "http").unwrap();
         assert_eq!(m.proxy_name.as_ref(), "a");
         // No prefix matches → falls through to the no-location route.
-        let m = find_matching_route(&routes, "/zz").unwrap();
+        let m = find_matching_route(&routes, "/zz", "http").unwrap();
         assert_eq!(m.proxy_name.as_ref(), "c");
         // A no-location route matches ANY path (even an empty one).
         assert_eq!(
-            find_matching_route(&routes, "")
+            find_matching_route(&routes, "", "http")
                 .unwrap()
                 .proxy_name
                 .as_ref(),
             "c"
         );
+        // The scheme filter keeps other-scheme routes out: with only an
+        // "http" route in the list, an "https" lookup misses entirely.
+        let m = find_matching_route(&routes, "/aa/bb/cc/d", "https");
+        assert!(m.is_none(), "cross-scheme lookup must not match");
     }
 
     /// Re-registration must restore the sorted order, and the httpUser-
@@ -2752,9 +2902,15 @@ mod tests {
         .await
         .unwrap();
         // Longest location prefix wins.
-        let r = mgr.lookup("example.com", "/api/users", "").await.unwrap();
+        let r = mgr
+            .lookup("example.com", "/api/users", "", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p2");
-        let r = mgr.lookup("example.com", "/other", "").await.unwrap();
+        let r = mgr
+            .lookup("example.com", "/other", "", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p1");
 
         // Unregister + re-register p2: the sort must be restored so the
@@ -2775,7 +2931,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = mgr.lookup("example.com", "/api/users", "").await.unwrap();
+        let r = mgr
+            .lookup("example.com", "/api/users", "", "http")
+            .await
+            .unwrap();
         assert_eq!(
             r.proxy_name.as_ref(),
             "p2",
@@ -2801,9 +2960,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = mgr.lookup("example.com", "/x", "alice").await.unwrap();
+        let r = mgr
+            .lookup("example.com", "/x", "alice", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "auth-p");
-        let r = mgr.lookup("example.com", "/x", "bob").await.unwrap();
+        let r = mgr
+            .lookup("example.com", "/x", "bob", "http")
+            .await
+            .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p1");
     }
 
@@ -2831,7 +2996,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            mgr.lookup_combined("example.com", "/static/img/logo.png", "")
+            mgr.lookup_combined("example.com", "/static/img/logo.png", "", "http")
                 .await
                 .is_none(),
             "locations without custom_domains must register zero routes (Go parity)"
@@ -2853,7 +3018,7 @@ mod tests {
         .await
         .unwrap();
         let r = mgr
-            .lookup_combined("example.com", "/static/css/site.css", "")
+            .lookup_combined("example.com", "/static/css/site.css", "", "http")
             .await
             .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p2");

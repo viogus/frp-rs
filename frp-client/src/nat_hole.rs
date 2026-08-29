@@ -482,12 +482,19 @@ impl Service {
         // NatHoleResp.detect_behavior as the hole-punch timeout, not a
         // hardcoded 5000ms. The server computes this as max(SendDelayMs) + 5000
         // (+30000 if listen_random_ports) minus the side's own send_delay.
-        // Default to 5000ms if detect_behavior is not available.
+        // Default to 5000ms if detect_behavior is not available. Go MakeHole
+        // floors the guard at 5s too: `timeout := 5*time.Second; if
+        // m.DetectBehavior.ReadTimeoutMs > 0 {...}` (pkg/nathole/nathole.go:
+        // 248-250) — a hostile/misbehaving server sending 0 (or a negative)
+        // must not make the punch fail instantly.
         let hole_punch_timeout = resp
             .detect_behavior
             .as_ref()
-            .map(|db| db.read_timeout_ms.max(0) as u64)
-            .unwrap_or(5000);
+            .map(|db| {
+                (db.read_timeout_ms.max(0) as u64)
+                    .max(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS)
+            })
+            .unwrap_or(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS);
 
         // Spawn hole punch task (don't block control loop)
         let proxy_info = self.proxy_info_map.read().await.get(&proxy_name).map(|p| {
@@ -508,6 +515,26 @@ impl Service {
         let hp_timeout = hole_punch_timeout;
         let resp_writer = writer.clone();
         let resp_v2 = self.cfg.read().await.v2;
+        // Client QUIC transport params for the provider-side tunnel session
+        // (Go `listenByQUIC` reads `pxy.clientCfg.Transport.QUIC`).
+        #[cfg(feature = "quic")]
+        let quic_params = {
+            let cfg = self.cfg.read().await;
+            frp_core::quic::quic_params_from_option_values(
+                cfg.quic_options
+                    .as_ref()
+                    .map(|q| q.keepalive_period)
+                    .unwrap_or(0),
+                cfg.quic_options
+                    .as_ref()
+                    .map(|q| q.max_idle_timeout)
+                    .unwrap_or(0),
+                cfg.quic_options
+                    .as_ref()
+                    .map(|q| q.max_incoming_streams)
+                    .unwrap_or(0),
+            )
+        };
         tokio::spawn(async move {
             // Session-bound task: `session_alive` is cleared at session
             // teardown, which aborts both the hole punch and the P2P bridge
@@ -568,9 +595,10 @@ impl Service {
             // session per punch); user connections are accepted from it.
             // Data-plane protocol dispatch: the server echoes the visitor's
             // `protocol` (NatHoleVisitor → NatHoleResp) back to both peers.
-            // Go v0.70.1 visitors default to "quic"; a Rust visitor's
-            // `protocol` config field selects it. Anything else (incl. "" or
-            // "tcp") falls through to the KCP+yamux data plane.
+            // Go provider dispatch (client/proxy/xtcp.go:124): ONLY "kcp"
+            // selects listenByKCP; anything else — "quic", "" or an unknown
+            // value — falls through to listenByQUIC. (Round-8 read "" as
+            // KCP — a divergence for explicitly-empty protocol echoes.)
             //
             // Provider roles: yamux server (accepts the visitor's yamux
             // streams) or QUIC server (accepts the QUIC connection + streams).
@@ -593,38 +621,8 @@ impl Service {
             };
             let session_result: Result<crate::visitor::TunnelSession, String> = {
                 let p2p_fut = async {
-                    match p2p_protocol.as_str() {
-                        "quic" => {
-                            #[cfg(all(feature = "quic", feature = "kcp"))]
-                            {
-                                match frp_core::xtcp_p2p::xtcp_p2p_connect_quic_session(
-                                    socket,
-                                    &candidate_addrs,
-                                    &assisted_addrs,
-                                    detect_behavior.as_ref(),
-                                    hp_timeout,
-                                    p2p_sid,
-                                    p2p_key.as_ref(),
-                                    true, // is_server = true (provider is QUIC server)
-                                )
-                                .await
-                                {
-                                    Ok(s) => Ok(crate::visitor::TunnelSession::Quic(s)),
-                                    Err(e) => Err(e),
-                                }
-                            }
-                            #[cfg(not(all(feature = "quic", feature = "kcp")))]
-                            {
-                                warn!(proxy_name = %proxy_name_clone,
-                                "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
-                                proxy_name_clone);
-                                Err(format!(
-                                    "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features",
-                                    proxy_name_clone
-                                ))
-                            }
-                        }
-                        _ => match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux_session(
+                    if p2p_protocol == "kcp" {
+                        match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux_session(
                             socket,
                             &candidate_addrs,
                             &assisted_addrs,
@@ -640,7 +638,38 @@ impl Service {
                         {
                             Ok(s) => Ok(crate::visitor::TunnelSession::Kcp(s)),
                             Err(e) => Err(e),
-                        },
+                        }
+                    } else {
+                        // default is quic (Go parity: anything not "kcp")
+                        #[cfg(all(feature = "quic", feature = "kcp"))]
+                        {
+                            match frp_core::xtcp_session::xtcp_p2p_connect_quic_session_with_params(
+                                socket,
+                                &candidate_addrs,
+                                &assisted_addrs,
+                                detect_behavior.as_ref(),
+                                hp_timeout,
+                                p2p_sid,
+                                p2p_key.as_ref(),
+                                true, // is_server = true (provider is QUIC server)
+                                quic_params,
+                            )
+                            .await
+                            {
+                                Ok(s) => Ok(crate::visitor::TunnelSession::Quic(s)),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        #[cfg(not(all(feature = "quic", feature = "kcp")))]
+                        {
+                            warn!(proxy_name = %proxy_name_clone,
+                            "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
+                            proxy_name_clone);
+                            Err(format!(
+                                "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features",
+                                proxy_name_clone
+                            ))
+                        }
                     }
                 };
                 tokio::pin!(p2p_fut);

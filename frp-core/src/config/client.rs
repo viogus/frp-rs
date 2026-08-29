@@ -631,8 +631,15 @@ pub struct VisitorConfig {
     /// Protocol for XTCP P2P connections: "quic" (default, matching Go frp
     /// v0.70.1) or "kcp". Both data planes are implemented; "quic" requires
     /// BOTH the `quic` and `kcp` features (the QUIC data plane reuses the
-    /// KCP hole-punch machinery).
-    #[serde(default = "default_xtcp_protocol", alias = "protocol")]
+    /// KCP hole-punch machinery). An EXPLICIT empty value normalizes to
+    /// "quic" (Go frp: `Protocol = util.EmptyOr(Protocol, "quic")` at
+    /// pkg/config/v1/visitor.go:160 — a missing field is covered by the
+    /// serde default; the deserializer covers `protocol = ""`).
+    #[serde(
+        default = "default_xtcp_protocol",
+        alias = "protocol",
+        deserialize_with = "deserialize_xtcp_protocol"
+    )]
     pub protocol: String,
     /// Optional server user for auth matching.
     #[serde(default, alias = "serverUser")]
@@ -744,6 +751,22 @@ fn default_min_retry_interval() -> i64 {
 fn default_xtcp_protocol() -> String {
     // Go frp v0.70.1 XTCP visitors default to "quic".
     "quic".into()
+}
+
+/// Serde helper for `VisitorConfig.protocol`: Go frp normalizes an EXPLICIT
+/// empty value to "quic" (`util.EmptyOr(Protocol, "quic")` in
+/// pkg/config/v1/visitor.go:160, applied during config Complete()). The
+/// `default = "default_xtcp_protocol"` serde attribute only covers a MISSING
+/// field; this covers `protocol = ""` — which would otherwise dispatch to
+/// the KCP data plane ("" is not "quic"), diverging from Go where "" is
+/// impossible after Complete(). "kcp" and other values pass through
+/// unchanged (validation later rejects anything outside kcp/quic).
+fn deserialize_xtcp_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(if s.is_empty() { "quic".into() } else { s })
 }
 fn default_vnet_netmask() -> String {
     "255.255.255.0".to_string()

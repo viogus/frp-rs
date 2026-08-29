@@ -487,6 +487,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                                 // path's reset in `on_drop_stream`). The
                                 // receiving yamux-rs side closes just that
                                 // stream; the session survives.
+                                //
+                                // Wire-shape note: Go's fatedier fork sends
+                                // this RST as a WindowUpdate-typed frame
+                                // (stream.go closeTimeout:
+                                // `hdr.encode(typeWindowUpdate, flagRST, ...)`),
+                                // while this patch uses a Data-typed frame.
+                                // Both peers key off the RST flag, not the
+                                // frame type, so this is a deliberate
+                                // wire-shape choice, not a bug.
                                 log::trace!("{}/{}: sending stream reset", self.id, id);
                                 let mut header = Header::data(id, 0);
                                 header.rst();

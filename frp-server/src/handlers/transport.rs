@@ -132,7 +132,13 @@ pub(crate) async fn handle_tls_connection(
                 // SNI routing: no HTTP auth, so http_user is empty string.
                 // SNI routing: no HTTP path, so pass empty string.
                 // Routes with empty locations (HTTPS SNI) match any path.
-                if let Some(route) = state.vhost_manager.lookup_wildcard(&sni_host, "", "").await {
+                // Scheme "https": the HTTPS Muxer's registryRouter only
+                // (Go parity) — SNI must never match an HTTP route.
+                if let Some(route) = state
+                    .vhost_manager
+                    .lookup_wildcard(&sni_host, "", "", "https")
+                    .await
+                {
                     let ctl_tx = state
                         .run_id_to_ctl_tx
                         .get(route.run_id.as_ref())
