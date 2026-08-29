@@ -118,6 +118,11 @@ pub struct Login {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// Deliberately `i32`, not Go's int64 (round-8 note): a poolCount above
+    /// 2^31-1 fails deserialization (fail-closed) instead of silently
+    /// wrapping — Go frp accepts any non-negative int64, but values that
+    /// large are nonsensical and the login path rejects negatives anyway
+    /// ("invalid pool count, must be non-negative"). Keep this tightening.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_count: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1855,6 +1860,17 @@ mod tests {
             r#"{"proxy_name":"p1","remote_addr":"0.0.0.0:7001","featureFlags":["quic-ack"]}"#,
         );
         accepts::<CloseProxy>(r#"{"proxy_name":"p1","featureFlags":["quic-ack"]}"#);
+        accepts::<CloseProxyResp>(r#"{"proxy_name":"p1","featureFlags":["quic-ack"]}"#);
+        #[cfg(feature = "vnet")]
+        accepts::<VnetRouteAdvertise>(
+            r#"{"proxy_name":"p1","subnet":"10.0.0.0/8","virtual_net":"vn1","featureFlags":["quic-ack"]}"#,
+        );
+        #[cfg(feature = "vnet")]
+        accepts::<VnetPacket>(r#"{"proxy_name":"p1","data":"AQID","featureFlags":["quic-ack"]}"#);
+        #[cfg(feature = "vnet")]
+        accepts::<VnetRouteRemove>(
+            r#"{"proxy_name":"p1","virtual_net":"vn1","featureFlags":["quic-ack"]}"#,
+        );
         accepts::<StartWorkConn>(
             r#"{"proxy_name":"p1","src_addr":"1.2.3.4","src_port":12345,"dst_addr":"5.6.7.8","dst_port":80,"featureFlags":["quic-ack"]}"#,
         );

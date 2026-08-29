@@ -229,14 +229,37 @@ pub(crate) async fn run_http_check(
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("TCP connect: {e}"))?;
 
-    // Extract host from addr (strip port for Host header).
-    let default_host = addr.split(':').next().unwrap_or(addr);
+    // Extract host from addr for the Host header. Go URL.Hostname():
+    // port stripped, IPv6 brackets removed — a plain split(':') would
+    // mangle "[::1]:8080" into "[" and unbracketed "::1:8080" into "".
+    let default_host = addr
+        .parse::<std::net::SocketAddr>()
+        .map(|sa| sa.ip().to_string())
+        .unwrap_or_else(|_| {
+            // Bracketed IPv6 with port: "[::1]:8080" → "::1".
+            if let Some(rest) = addr.strip_prefix('[') {
+                if let Some((host, _)) = rest.split_once(']') {
+                    return host.to_string();
+                }
+            }
+            // Last-colon split only when the port part is numeric (Go
+            // splitHostPort's validOptionalPort gate; a hostname or an
+            // unbracketed IPv6 keeps its colons as-is).
+            match addr.rsplit_once(':') {
+                Some((host, port))
+                    if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    host.to_string()
+                }
+                _ => addr.to_string(),
+            }
+        });
     // Support custom Host header override from user-configured headers (Go frp compat).
     let host = headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case("host"))
         .map(|h| h.value.as_str())
-        .unwrap_or(default_host);
+        .unwrap_or(default_host.as_str());
     // Use HTTP/1.1 (Go frp compat: http.NewRequestWithContext defaults to HTTP/1.1).
     let mut req = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close",

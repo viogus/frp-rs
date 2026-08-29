@@ -486,6 +486,21 @@ async fn test_tcpmux_passthrough() {
         Ok(Err(e)) => panic!("client read error: {}", e),
     }
 
+    // Negative window is not enough: a slow (but wrong) server could have
+    // sent the 200 just after the 500ms cut. Give the server one more
+    // second to prove no late HTTP bytes arrive — a read timeout (or EOF)
+    // is the only pass.
+    let mut late = [0u8; 256];
+    match tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut late)).await {
+        Err(_) => {} // still silent: no late 200, passthrough confirmed
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!(
+            "late HTTP bytes after negative window, got: {}",
+            String::from_utf8_lossy(&late[..n])
+        ),
+        Ok(Err(e)) => panic!("client read error: {}", e),
+    }
+
     // Backend side: StartWorkConn first, then the raw CONNECT request bytes.
     match read_msg_v1(&mut work_conn)
         .await

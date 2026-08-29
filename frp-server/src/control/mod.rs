@@ -369,10 +369,11 @@ async fn handle_control_inner<S>(
             // the sleep target on every iteration, so last_ping updates are
             // picked up automatically.
             _ = async {
-                // checked_add (finding 5): the config-side clamp (≤3600s)
-                // makes overflow unreachable, but a hostile/legacy value
-                // must never panic the process — degrade to never firing
-                // this arm instead (the loop-top check above still applies).
+                // checked_add (round-8): config no longer clamps heartbeat
+                // values (Go has none — Go frpc uses 7200), so any positive
+                // i64 can reach here. checked_add must never panic the
+                // process — an overflowing value degrades to never firing
+                // this arm (the loop-top check above still applies).
                 match ctl.last_ping.checked_add(hb_timeout) {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending::<()>().await,

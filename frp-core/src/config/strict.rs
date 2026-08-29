@@ -439,17 +439,24 @@ pub(super) fn check_strict(
                 "unknown field \"{}\" in config file {}",
                 full_key, config_path
             );
-            // Suggest closest known key if within edit distance 3
+            // Suggest closest known key if within edit distance 3. Skip
+            // absurdly long unknown keys (>256 chars): levenshtein() is
+            // O(n·m) per known key, so a 10 MB unknown key would cost
+            // ~100 × O(400M) char ops on every strict-config load — and no
+            // known key (all short) can be within edit distance 3 of a
+            // >30-char key anyway, so the suggestion would never match.
             let mut best: Option<(&str, usize)> = None;
-            for known_key in known.iter() {
-                let d = levenshtein(key, known_key);
-                if d <= 3
-                    && (best.is_none()
-                        || d < best
-                            .expect("best set by an earlier iteration of this loop")
-                            .1)
-                {
-                    best = Some((known_key, d));
+            if key.len() <= 256 {
+                for known_key in known.iter() {
+                    let d = levenshtein(key, known_key);
+                    if d <= 3
+                        && (best.is_none()
+                            || d < best
+                                .expect("best set by an earlier iteration of this loop")
+                                .1)
+                    {
+                        best = Some((known_key, d));
+                    }
                 }
             }
             if let Some((suggestion, _)) = best {

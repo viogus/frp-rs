@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
 
 use super::config::KcpConfig;
-use super::protocol::{Error as KcpError, Kcp};
+use super::protocol::{Error as KcpError, Kcp, KCP_WND_RCV};
 use super::socket::KCP_SND_BACKLOG_THRESHOLD;
 use crate::kcp_compat::Fec;
 
@@ -234,6 +234,15 @@ impl KcpSession {
         self.conv
     }
 
+    /// Segments still waiting to be sent (`snd_buf + snd_queue`). The dial
+    /// driver's self-exit check uses this: a dropped stream must not kill the
+    /// driver while unacked data is still in flight (write_all → shutdown →
+    /// drop completes in milliseconds, long before the peer ACKs a full
+    /// window's worth of segments).
+    pub fn wait_snd(&self) -> usize {
+        self.kcp.wait_snd()
+    }
+
     /// Common FEC encode logic for both update() and force_flush().
     /// Processes output packets through FEC encoding (if enabled), or returns
     /// them directly if FEC is disabled.
@@ -335,6 +344,30 @@ impl KcpSession {
         // poll_write blocked on it can re-evaluate.
         self.reconcile_snd_backlog();
         Ok(n)
+    }
+
+    /// Send a buffer that may exceed the single-send window limit.
+    ///
+    /// `kcp.send` rejects one buffer larger than the send window
+    /// (`KCP_WND_RCV` = 128 segments); callers with big buffers must split.
+    /// This splits by the exact window bound (`(KCP_WND_RCV - 1) * mss`
+    /// bytes per piece), so every piece passes the gate. Two callers:
+    /// the socket driver's write path (`socket.rs` — a single
+    /// `WriteRequest::Data` chunk may exceed one window, and `send` would
+    /// drop it AFTER poll_write already claimed the bytes), and the
+    /// XtcpP2pStream HWM drain (a high-water-parked writer can accumulate
+    /// up to PENDING_SEND_HIGH_WATER + one write chunk while the drain is
+    /// stalled — the pre-fix code handed the whole buffer to `send`, a
+    /// burst bigger than ~176 KiB that killed the link with
+    /// `UserBufTooBig` instead of recovering).
+    pub fn send_chunked(&mut self, data: &[u8]) -> io::Result<usize> {
+        let mss = self.kcp.mss();
+        let window = ((KCP_WND_RCV as usize).saturating_sub(1)) * mss.max(1);
+        let mut sent = 0;
+        for chunk in data.chunks(window) {
+            sent += self.send(chunk)?;
+        }
+        Ok(sent)
     }
 
     /// Force KCP to flush pending data and produce output packets immediately.
@@ -1268,7 +1301,13 @@ mod tests {
         // An empty segment in the MIDDLE of a fragment chain (frg=1 empty,
         // frg=0 carries data) must not corrupt reassembly: the chain's total
         // peek size is non-zero, so the normal path merges it into one frame.
-        let config = test_config();
+        // Non-stream mode: stream-mode sessions reject frg>0 PUSH segments
+        // outright (see `stream_mode_rejects_frg_positive_push_without_killing_session`),
+        // so the fragment-chain path is only reachable with `stream: false`.
+        let config = KcpConfig {
+            stream: false,
+            ..test_config()
+        };
         let (tx2, mut rx2) = tokio::sync::mpsc::channel(16);
         let mut s2 = KcpSession::new(10, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 

@@ -1786,34 +1786,36 @@ mod v2 {
         }
     }
 
-    /// Percent-decode a URL-encoded path segment (Go `decodeV2PathParam`).
+    /// Percent-decode a URL-encoded path segment (Go `url.PathUnescape`
+    /// parity). Go's PathUnescape: only `%XX` escapes are decoded, `+` is a
+    /// literal plus (no space translation — that is QueryUnescape), and the
+    /// decoded bytes must form valid UTF-8 (Go `utf8.Valid` check inside
+    /// unescape → ErrInvalidEncoding; the old frp-rs decoder translated `+`
+    /// to space and cast each byte to a Latin-1 char, mojibaking non-ASCII).
     fn percent_decode_path(s: &str) -> Result<String, (StatusCode, Json<V2Error>)> {
-        let mut out = String::with_capacity(s.len());
         let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(s.len());
         let mut i = 0;
         while i < bytes.len() {
-            match bytes[i] {
-                b'%' if i + 2 < bytes.len() => {
-                    let hi = hex_nibble(bytes[i + 1]);
-                    let lo = hex_nibble(bytes[i + 2]);
-                    if let (Some(h), Some(l)) = (hi, lo) {
-                        out.push((h << 4 | l) as char);
+            if bytes[i] == b'%' {
+                // Go: a trailing '%' without two hex digits → ErrInvalidEncoding.
+                if i + 2 >= bytes.len() {
+                    return Err(err(StatusCode::BAD_REQUEST, "invalid percent-encoding"));
+                }
+                match (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push(hi << 4 | lo);
                         i += 3;
-                    } else {
-                        return Err(err(StatusCode::BAD_REQUEST, "invalid percent-encoding"));
                     }
+                    _ => return Err(err(StatusCode::BAD_REQUEST, "invalid percent-encoding")),
                 }
-                b'+' => {
-                    out.push(' ');
-                    i += 1;
-                }
-                b => {
-                    out.push(b as char);
-                    i += 1;
-                }
+            } else {
+                // Includes '+': literal (Go PathUnescape parity).
+                out.push(bytes[i]);
+                i += 1;
             }
         }
-        Ok(out)
+        String::from_utf8(out).map_err(|_| err(StatusCode::BAD_REQUEST, "invalid percent-encoding"))
     }
 
     fn hex_nibble(b: u8) -> Option<u8> {
@@ -2966,6 +2968,39 @@ mod v2 {
             );
             assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
             assert_eq!(json.0.error, "invalid JSON body");
+        }
+
+        #[test]
+        fn percent_decode_path_go_parity() {
+            // Go url.PathUnescape parity: '+' stays a literal plus, %XX decodes
+            // to its byte (assembled into UTF-8), invalid escapes and invalid
+            // UTF-8 are rejected.
+            // Plus is literal (PathUnescape, NOT QueryUnescape).
+            assert_eq!(percent_decode_path("a+b").unwrap(), "a+b");
+            // ASCII escape.
+            assert_eq!(percent_decode_path("a%20b").unwrap(), "a b");
+            // Non-ASCII: %C3%A9 = é (UTF-8) — the old Latin-1 cast mojibaked
+            // this into two chars.
+            assert_eq!(percent_decode_path("caf%C3%A9").unwrap(), "café");
+            // Raw non-ASCII bytes pass through.
+            assert_eq!(percent_decode_path("café").unwrap(), "café");
+            // Empty is fine.
+            assert_eq!(percent_decode_path("").unwrap(), "");
+            // Missing hex digits → invalid (Go EscapeError).
+            let e = expect_err(percent_decode_path("%zz"), "bad escape must fail");
+            assert_eq!(e.0, StatusCode::BAD_REQUEST);
+            assert!(e.1 .0.error.contains("invalid percent-encoding"));
+            // Trailing lone '%' → invalid (Go: i+2 >= len → EscapeError).
+            let e = expect_err(percent_decode_path("abc%"), "lone % must fail");
+            assert_eq!(e.0, StatusCode::BAD_REQUEST);
+            let e = expect_err(percent_decode_path("100%"), "lone % must fail");
+            assert_eq!(e.0, StatusCode::BAD_REQUEST);
+            // %XX bytes that are not valid UTF-8 → invalid (Go ErrInvalidEncoding).
+            let e = expect_err(percent_decode_path("%FF%FE"), "invalid UTF-8 must fail");
+            assert_eq!(e.0, StatusCode::BAD_REQUEST);
+            assert!(e.1 .0.error.contains("invalid percent-encoding"));
+            // Lowercase hex accepted.
+            assert_eq!(percent_decode_path("%e2%82%ac").unwrap(), "€");
         }
     }
 }

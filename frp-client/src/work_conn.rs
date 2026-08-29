@@ -794,8 +794,15 @@ async fn run_udp_work_conn(
                             };
                             // PROXY header on the first packet of each remote
                             // session (Go: first packet of each remote conn).
+                            // Go parity: a source port of 0 (UDP packets may
+                            // legally carry one) skips the header, and an
+                            // unparsable source address is logged + skipped
+                            // by the builder's callers below.
                             let mut final_payload = payload;
-                            if first_packet && !proxy_protocol_version.is_empty() {
+                            if first_packet
+                                && !proxy_protocol_version.is_empty()
+                                && remote.port() != 0
+                            {
                                 if let Ok(header) =
                                     frp_core::proxy_protocol::build_proxy_protocol_header(
                                         &remote.ip().to_string(),
@@ -1672,25 +1679,44 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                         .await
                     {
                         Ok(mut local) => {
-                            // Write PROXY protocol header if configured
-                            if !info.proxy_protocol_version.is_empty() {
+                            // Write PROXY protocol header if configured. Go
+                            // parity (client/proxy/proxy.go:183-197,210):
+                            // the header is only emitted when the source
+                            // address is non-empty AND the source port is
+                            // non-zero; both addresses are resolved as
+                            // IpAddr, and a resolution failure logs and
+                            // skips the header (Go closes the conn — the
+                            // header is informational, dropping it keeps the
+                            // data plane alive).
+                            let src_port = swc.src_port.unwrap_or(0);
+                            if !info.proxy_protocol_version.is_empty()
+                                && swc.src_addr.is_some()
+                                && src_port != 0
+                            {
                                 if let Some(ref src) = swc.src_addr {
                                     if info.proxy_protocol_version == "v1" {
-                                        let header =
-                                            frp_core::proxy_protocol::build_proxy_protocol_v1(
-                                                src,
-                                                swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
-                                                swc.src_port.unwrap_or(0),
-                                                swc.dst_port.unwrap_or(0),
-                                            );
-                                        if let Err(e) = local.write_all(header.as_bytes()).await {
-                                            warn!(error = %e, "Failed to write PROXY v1 header: {}", e);
+                                        match frp_core::proxy_protocol::build_proxy_protocol_v1(
+                                            src,
+                                            swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
+                                            src_port,
+                                            swc.dst_port.unwrap_or(0),
+                                        ) {
+                                            Ok(header) => {
+                                                if let Err(e) =
+                                                    local.write_all(header.as_bytes()).await
+                                                {
+                                                    warn!(error = %e, "Failed to write PROXY v1 header: {}", e);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, "Failed to build PROXY v1 header (skipping): {}", e);
+                                            }
                                         }
                                     } else if info.proxy_protocol_version == "v2" {
                                         match frp_core::proxy_protocol::build_proxy_protocol_v2(
                                             src,
                                             swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
-                                            swc.src_port.unwrap_or(0),
+                                            src_port,
                                             swc.dst_port.unwrap_or(0),
                                         ) {
                                             Ok(header) => {

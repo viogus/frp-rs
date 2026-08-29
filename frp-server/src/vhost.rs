@@ -581,10 +581,19 @@ async fn serve_vhost_request<S>(
             // preface before committing to the h2 path. A truncated HTTP/1.1
             // request (e.g. "POST …" cut to "P") falls back to the HTTP/1.1
             // parser (Go's bufio-based h2 server matches the exact line).
+            // Single absolute deadline for the whole preface completion
+            // (same idiom as the HTTP/1.1 head at handle_http1_request): a
+            // slow-drip client sending one byte per read window would
+            // otherwise stretch the completion loop to 23 × timeout (a
+            // sub-1s-per-byte drip would never trip a per-read timeout and
+            // would park the task + fd + permit for minutes). The full
+            // preface must arrive within vhost_http_timeout.
+            let preface_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
             let mut prefix_len = n;
             while prefix_len < vhost_h2c::H2_PREFACE.len() {
-                let m = match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
+                let m = match tokio::time::timeout_at(
+                    preface_deadline,
                     stream.read(&mut buf[prefix_len..vhost_h2c::H2_PREFACE.len()]),
                 )
                 .await
@@ -688,13 +697,17 @@ async fn handle_http1_request<S>(
     // Round 6 (A3/A4/A7): Go net/http request-line semantics — version
     // gates (malformed shape → 400, non-1.x → 505), absolute-form routing
     // (req.Host = req.URL.Host — Host header ignored), path minus query.
-    let (host, path) = match parse_vhost_request_line(request_text) {
-        RequestLine::Ok { host, path } => {
+    let (host, path, is_absolute_form) = match parse_vhost_request_line(request_text) {
+        RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } => {
             let Some(host) = host else {
                 let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                 return;
             };
-            (host.to_string(), path.to_string())
+            (host.to_string(), path.to_string(), absolute_form)
         }
         RequestLine::BadRequest => {
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
@@ -720,7 +733,15 @@ async fn handle_http1_request<S>(
 
     // Parse Basic Auth once — reused for route matching, auth check,
     // and per-user routing (Go frp compat: getByRoute(host, path, username)).
-    let http_auth = extract_basic_auth(request_text);
+    // Go `checkRouteAuthByRequest`: an absolute-form request target
+    // (req.URL.Host != "") authenticates against `Proxy-Authorization`
+    // only; origin-form against `Authorization` (and answers 407 vs 401
+    // below accordingly).
+    let http_auth = if is_absolute_form {
+        extract_basic_auth_named(request_text, "proxy-authorization:")
+    } else {
+        extract_basic_auth(request_text)
+    };
 
     debug!(host = %host, path = %path, peer = %peer, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
 
@@ -732,6 +753,7 @@ async fn handle_http1_request<S>(
         pre_read,
         peer,
         scheme,
+        is_absolute_form,
     )
     .await
     {
@@ -776,7 +798,16 @@ async fn handle_http1_request<S>(
                 write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
             }
         }
-        Err(VhostResolveError::Unauthorized) => {
+        Err(VhostResolveError::Unauthorized { proxy_form: true }) => {
+            // Absolute-form request → Go checkRouteAuthByRequest 407 +
+            // Proxy-Authenticate.
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"frp\"\r\n\r\n",
+                )
+                .await;
+        }
+        Err(VhostResolveError::Unauthorized { proxy_form: false }) => {
             let _ = stream
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n",
@@ -808,8 +839,11 @@ pub(crate) struct VhostForward {
 pub(crate) enum VhostResolveError {
     /// No route matched → 404.
     NotFound,
-    /// HTTP Basic Auth failed → 401.
-    Unauthorized,
+    /// HTTP Basic Auth failed. `proxy_form` mirrors Go
+    /// `checkRouteAuthByRequest` (`req.URL.Host != ""`): absolute-form
+    /// requests (h2c always; HTTP/1.1 absolute-form request lines) answer
+    /// 407 + Proxy-Authenticate, origin-form 401 + WWW-Authenticate.
+    Unauthorized { proxy_form: bool },
 }
 
 /// Shared routing + header rewriting for HTTP/1.1 and h2c vhost requests.
@@ -820,6 +854,7 @@ pub(crate) enum VhostResolveError {
 /// X-Forwarded-For / requestHeaders into the forwarded head. The caller
 /// renders rejection (404/401) or success (ProxyUserConn dispatch) in its own
 /// protocol (HTTP/1.1 text vs HTTP/2 frames).
+#[allow(clippy::too_many_arguments)] // mirrors tcpmux::route (same request-context tuple)
 pub(crate) async fn resolve_vhost_request(
     state: &AppState,
     host: &str,
@@ -828,6 +863,7 @@ pub(crate) async fn resolve_vhost_request(
     request_head: Vec<u8>,
     peer: std::net::SocketAddr,
     scheme: &str,
+    is_absolute_form: bool,
 ) -> Result<VhostForward, VhostResolveError> {
     let http_user = http_auth
         .as_ref()
@@ -843,6 +879,9 @@ pub(crate) async fn resolve_vhost_request(
     let scheme_key = if scheme.eq_ignore_ascii_case("http") {
         "http"
     } else {
+        // Current callers pass only "HTTP"/"HTTPS" (log labels), so this
+        // fallback covers "https"/"HTTPS" only — a future caller passing a
+        // third scheme would silently key as "https".
         "https"
     };
     let Some(route) = state
@@ -863,7 +902,12 @@ pub(crate) async fn resolve_vhost_request(
             })
             .unwrap_or(false);
         if !auth_ok {
-            return Err(VhostResolveError::Unauthorized);
+            // Go checkRouteAuthByRequest: the response shape depends on the
+            // request form — absolute-form → 407 + Proxy-Authenticate,
+            // origin-form → 401 + WWW-Authenticate (the caller renders it).
+            return Err(VhostResolveError::Unauthorized {
+                proxy_form: is_absolute_form,
+            });
         }
     }
 
@@ -1142,6 +1186,16 @@ pub async fn run_vhost_https_listener(
                         }
                     } else {
                         warn!(sni = %sni, peer = %peer, "No HTTPS VHost route for '{}' from {}", sni, peer);
+                        // Best-effort TLS alert before the drop: fatal
+                        // unrecognized_name — record type 0x15 (alert),
+                        // TLS 1.2 record, 2-byte payload 0x02 0x70
+                        // (fatal, alertUnrecognizedName=112) — so a TLS
+                        // client fails fast instead of hanging on a
+                        // handshake timeout. Write failure is ignored;
+                        // the connection is dropped either way.
+                        let _ = stream
+                            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70])
+                            .await;
                     }
                 });
             }
@@ -1206,9 +1260,13 @@ pub async fn run_vhost_https_listener(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestLine<'a> {
     /// host: None when no Host header is present (caller replies 400).
+    /// `absolute_form` mirrors Go `req.URL.Host != ""` — an absolute-form
+    /// request target ("GET http://host/…") — and drives the auth shape
+    /// (Proxy-Authorization + 407, Go `checkRouteAuthByRequest`).
     Ok {
         host: Option<&'a str>,
         path: &'a str,
+        absolute_form: bool,
     },
     /// Malformed version shape or malformed absolute URL (Go 400).
     BadRequest,
@@ -1281,6 +1339,7 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
         return RequestLine::Ok {
             host: Some(canonicalize_authority(authority)),
             path,
+            absolute_form: true,
         };
     }
 
@@ -1295,6 +1354,7 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
                 path
             }
         },
+        absolute_form: false,
     }
 }
 
@@ -1474,10 +1534,18 @@ fn inject_vhost_request_headers(
 /// Extract HTTP Basic Auth credentials from the Authorization header.
 /// Returns Some((username, password)) or None if no/invalid auth header.
 fn extract_basic_auth(request: &str) -> Option<(String, String)> {
-    let auth_line = request
-        .lines()
-        .find(|line| line.len() >= 14 && line[..14].eq_ignore_ascii_case("authorization:"))?;
-    let value = auth_line[14..].trim();
+    extract_basic_auth_named(request, "authorization:")
+}
+
+/// Same parser with a configurable header name — absolute-form requests
+/// (Go `req.URL.Host != ""`) carry credentials in `Proxy-Authorization`
+/// instead (Go `checkRouteAuthByRequest` reads ONLY that header there).
+/// `header` must include the trailing colon (e.g. "proxy-authorization:").
+fn extract_basic_auth_named(request: &str, header: &str) -> Option<(String, String)> {
+    let auth_line = request.lines().find(|line| {
+        line.len() >= header.len() && line[..header.len()].eq_ignore_ascii_case(header)
+    })?;
+    let value = auth_line[header.len()..].trim();
     let encoded = value.strip_prefix("Basic ")?.trim();
     let decoded = frp_core::base64::decode(encoded).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
@@ -1893,27 +1961,37 @@ mod tests {
             RequestLine::VersionNotSupported
         );
         // HTTP/1.x routes.
-        let RequestLine::Ok { host, path } =
-            parse_vhost_request_line("GET /abc HTTP/1.1\r\nHost: x.example.com\r\n\r\n")
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line("GET /abc HTTP/1.1\r\nHost: x.example.com\r\n\r\n")
         else {
             panic!("expected Ok");
         };
         assert_eq!(host, Some("x.example.com"));
         assert_eq!(path, "/abc");
+        assert!(!absolute_form, "origin-form must not be marked absolute");
     }
 
     #[test]
     fn test_parse_vhost_request_line_absolute_form() {
         // A3/A4: absolute-form routes on the URL authority; ANY Host
         // header is ignored (RFC 7230 §5.3, req.Host = req.URL.Host).
-        let RequestLine::Ok { host, path } = parse_vhost_request_line(
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line(
             "GET http://a.example.com:8080/api?x=1 HTTP/1.1\r\nHost: ignored.example.com\r\n\r\n",
-        ) else {
+        )
+        else {
             panic!("expected Ok");
         };
         assert_eq!(host, Some("a.example.com")); // port stripped
         assert_eq!(path, "/api"); // query stripped, Go req.URL.Path
-                                  // Absolute-form with no path → "/".
+        assert!(absolute_form, "absolute-form must be marked");
+        // Absolute-form with no path → "/".
         let RequestLine::Ok { path, .. } =
             parse_vhost_request_line("GET http://a.example.com HTTP/1.1\r\nHost: x\r\n\r\n")
         else {
@@ -1949,13 +2027,19 @@ mod tests {
     fn test_parse_vhost_request_line_origin_form_query() {
         // A4: origin-form path minus query (Go req.URL.Path) — query
         // strings must not influence location matching.
-        let RequestLine::Ok { host, path } = parse_vhost_request_line(
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line(
             "GET /api/v1?user=admin#frag HTTP/1.1\r\nHost: a.example.com:8080\r\n\r\n",
-        ) else {
+        )
+        else {
             panic!("expected Ok");
         };
         assert_eq!(host, Some("a.example.com"));
         assert_eq!(path, "/api/v1");
+        assert!(!absolute_form, "origin-form must not be marked absolute");
         // Missing Host header → Ok with host None (caller 400s).
         let RequestLine::Ok { host, .. } = parse_vhost_request_line("GET / HTTP/1.1\r\n\r\n")
         else {
@@ -3122,9 +3206,12 @@ mod tests {
         let head = b"GET / HTTP/1.1\r\nHost: auth.example.com\r\n\r\n".to_vec();
         let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 1234));
 
-        let resolve = |auth: Option<(&str, &str)>| {
+        // `head` is passed in per call (a clone) so the closure never
+        // borrows the fn-local `head` — the `abs_bad` block below MOVES
+        // `head` into its future, which would otherwise collide with the
+        // closure's capture borrow.
+        let resolve = |auth: Option<(&str, &str)>, head: Vec<u8>| {
             let auth = auth.map(|(u, p)| (u.to_string(), p.to_string()));
-            let head = head.clone();
             // Shadow `state` with a Copy reference: the move future copies
             // the reference instead of consuming the fn-local AppState, so
             // the outer closure stays Fn and can be called repeatedly.
@@ -3138,28 +3225,77 @@ mod tests {
                     head,
                     peer,
                     "HTTP",
+                    false, // origin-form request
                 )
                 .await
             }
         };
 
-        // No credentials → 401.
+        // No credentials → origin-form 401 shape.
         assert!(matches!(
-            resolve(None).await,
-            Err(VhostResolveError::Unauthorized)
+            resolve(None, head.clone()).await,
+            Err(VhostResolveError::Unauthorized { proxy_form: false })
         ));
-        // Wrong password → 401.
+        // Wrong password → 401 shape.
         assert!(matches!(
-            resolve(Some(("user1", "wrong"))).await,
-            Err(VhostResolveError::Unauthorized)
+            resolve(Some(("user1", "wrong")), head.clone()).await,
+            Err(VhostResolveError::Unauthorized { proxy_form: false })
         ));
-        // Wrong username → 401.
+        // Wrong username → 401 shape.
         assert!(matches!(
-            resolve(Some(("other", "pass1"))).await,
-            Err(VhostResolveError::Unauthorized)
+            resolve(Some(("other", "pass1")), head.clone()).await,
+            Err(VhostResolveError::Unauthorized { proxy_form: false })
         ));
-        // Correct credentials → forward to the route's proxy.
-        let fwd = resolve(Some(("user1", "pass1")))
+        // Absolute-form shape: the SAME auth failure must be flagged
+        // `proxy_form: true` so the caller answers 407 + Proxy-Authenticate.
+        let abs = {
+            let auth = Some(("user1".to_string(), "pass1".to_string()));
+            let state = &state;
+            let head = head.clone(); // the async move below captures it by value
+            async move {
+                resolve_vhost_request(
+                    state,
+                    "auth.example.com",
+                    "/",
+                    auth.as_ref(),
+                    head,
+                    peer,
+                    "HTTP",
+                    true, // absolute-form request
+                )
+                .await
+            }
+        };
+        // Correct credentials pass on the absolute-form path too — the flag
+        // must not change the credential check itself.
+        assert!(
+            abs.await.is_ok(),
+            "valid credentials must forward on both forms"
+        );
+        let abs_bad = {
+            let auth = Some(("user1".to_string(), "wrong".to_string()));
+            let state = &state;
+            let head = head.clone(); // `head` is still needed by the final resolve() below
+            async move {
+                resolve_vhost_request(
+                    state,
+                    "auth.example.com",
+                    "/",
+                    auth.as_ref(),
+                    head,
+                    peer,
+                    "HTTP",
+                    true,
+                )
+                .await
+            }
+        };
+        assert!(matches!(
+            abs_bad.await,
+            Err(VhostResolveError::Unauthorized { proxy_form: true })
+        ));
+        // Correct credentials → forward to the route's proxy (moves `head`).
+        let fwd = resolve(Some(("user1", "pass1")), head)
             .await
             .expect("valid credentials must forward");
         assert_eq!(fwd.proxy_name, "auth-p");
@@ -3206,6 +3342,7 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: g.example.com\r\n\r\n".to_vec(),
             std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
             "HTTP",
+            false,
         )
         .await
         .expect("member-gone fallback must forward");
@@ -3248,6 +3385,7 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: g2.example.com\r\n\r\n".to_vec(),
             std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
             "HTTP",
+            false,
         )
         .await
         .expect("no-member fallback must forward");

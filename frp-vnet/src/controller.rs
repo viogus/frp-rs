@@ -27,6 +27,25 @@ fn tun_read_buf_len(mtu: u16) -> usize {
     mtu as usize + 4
 }
 
+/// Whether a TUN write error means the device itself is gone (closed or
+/// destroyed) — the only errors that should terminate the TUN pump. Any
+/// other error (e.g. EMSGSIZE for an oversized datagram) is a per-packet
+/// failure: drop the packet and keep pumping, so a transient device error
+/// cannot strand the proxy registration.
+fn is_tun_write_fatal(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        return true; // EPIPE
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        e.raw_os_error() == Some(libc::EBADF)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
 /// Manages a TUN device ↔ frp work connection packet loop.
 pub struct VnetController {
     /// Shared client-side controller: routing table plus server-conn registry.
@@ -88,6 +107,11 @@ impl VnetController {
         mut tun_packet_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let mut tun_buf = vec![0u8; tun_read_buf_len(tun.mtu())];
+        // Rate-limits "dropping packet" warnings (oversized TUN writes, full
+        // control queue) to at most one per second: a misbehaving peer or a
+        // slow control writer must not be able to flood the log at TUN read
+        // rate. Initialized in the past so the first drop warns immediately.
+        let mut last_drop_warn = std::time::Instant::now() - std::time::Duration::from_secs(2);
 
         loop {
             tokio::select! {
@@ -158,11 +182,17 @@ impl VnetController {
                                     tracing::error!(%self.proxy_name, %e, "control write error");
                                     break;
                                 }
-                                tracing::warn!(
-                                    %self.proxy_name,
-                                    %e,
-                                    "vnet control queue full; dropping packet"
-                                );
+                                let now = std::time::Instant::now();
+                                if now.duration_since(last_drop_warn)
+                                    >= std::time::Duration::from_secs(1)
+                                {
+                                    last_drop_warn = now;
+                                    tracing::warn!(
+                                        %self.proxy_name,
+                                        %e,
+                                        "vnet control queue full; dropping packet"
+                                    );
+                                }
                             }
                         }
                         // If no route match, packet dropped (not destined for this vnet).
@@ -177,9 +207,52 @@ impl VnetController {
                 packet = tun_packet_rx.recv() => {
                     match packet {
                         Some(pkt) => {
+                            // Reject packets that cannot fit the device MTU
+                            // before writing: Linux TUN rejects datagrams
+                            // longer than the MTU with EMSGSIZE, and macOS
+                            // utun does likewise for payloads over the MTU
+                            // (its 4-byte AF family header sits on top of
+                            // that budget). A remote peer with a larger MTU
+                            // — or a malformed oversized packet — must not
+                            // be able to take the whole TUN pump down.
+                            if pkt.len() > tun.mtu() as usize {
+                                let now = std::time::Instant::now();
+                                if now.duration_since(last_drop_warn)
+                                    >= std::time::Duration::from_secs(1)
+                                {
+                                    last_drop_warn = now;
+                                    tracing::warn!(
+                                        %self.proxy_name,
+                                        pkt_len = pkt.len(),
+                                        mtu = tun.mtu(),
+                                        "vnet TUN write: oversized packet dropped"
+                                    );
+                                }
+                                continue;
+                            }
                             if let Err(e) = tun.write_all(&pkt).await {
-                                tracing::error!(%self.proxy_name, %e, "TUN write error");
-                                return Err(anyhow::anyhow!("TUN write error: {e}"));
+                                // Only a device-close-class error (EBADF,
+                                // EPIPE; read-side EOF is handled by the
+                                // TUN read arm) terminates the pump. Any
+                                // other write error is per-packet: drop the
+                                // packet and keep pumping so a transient
+                                // device error cannot strand the proxy
+                                // registration.
+                                if is_tun_write_fatal(&e) {
+                                    tracing::error!(%self.proxy_name, %e, "TUN write error");
+                                    return Err(anyhow::anyhow!("TUN write error: {e}"));
+                                }
+                                let now = std::time::Instant::now();
+                                if now.duration_since(last_drop_warn)
+                                    >= std::time::Duration::from_secs(1)
+                                {
+                                    last_drop_warn = now;
+                                    tracing::warn!(
+                                        %self.proxy_name,
+                                        %e,
+                                        "vnet TUN write failed; dropping packet"
+                                    );
+                                }
                             }
                         }
                         None => {
@@ -367,17 +440,36 @@ mod tests {
     #[derive(Default)]
     struct TestSink {
         msgs: std::sync::Mutex<Vec<(frp_core::msg::FrpMessage, bool)>>,
+        /// When set, `send_msg` returns Err — simulating a full channel.
+        full: std::sync::atomic::AtomicBool,
+        /// When set, `is_failed()` reports a dead writer (control conn gone).
+        failed: std::sync::atomic::AtomicBool,
     }
 
     impl frp_core::ControlSink for TestSink {
         fn send_msg(&self, msg: frp_core::msg::FrpMessage, v2: bool) -> Result<(), String> {
+            if self.full.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("queue full".to_string());
+            }
             self.msgs.lock().unwrap().push((msg, v2));
             Ok(())
+        }
+
+        fn is_failed(&self) -> bool {
+            self.failed.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
     fn test_sink() -> Arc<TestSink> {
         Arc::new(TestSink::default())
+    }
+
+    fn test_sink_with(full: bool, failed: bool) -> Arc<TestSink> {
+        let sink = test_sink();
+        sink.full.store(full, std::sync::atomic::Ordering::Relaxed);
+        sink.failed
+            .store(failed, std::sync::atomic::Ordering::Relaxed);
+        sink
     }
 
     use super::*;
@@ -725,6 +817,116 @@ mod tests {
         tun_peer.write_all(&packet).await.unwrap();
         assert_eq!(rx2.recv().await, Some(packet.clone()));
         assert!(client.server_conn_sender(&remote_ip).is_some());
+
+        drop(tun_packet_tx);
+        drop(tun_peer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+    }
+
+    #[tokio::test]
+    async fn failed_writer_terminates_tun_pump() {
+        // A writer whose control connection is gone (is_failed == true)
+        // terminates the TUN pump instead of dropping packets forever.
+        let client = Arc::new(ClientVnetController::new());
+        client
+            .route_table()
+            .write()
+            .await
+            .insert("", "target", "10.0.0.0/24")
+            .unwrap();
+
+        let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
+        let tun = Box::new(FakeTun { inner: tun_stream });
+        let writer = test_sink_with(true, true); // send fails AND writer failed
+        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let ctrl = VnetController::new(
+            "plugin-proxy".to_string(),
+            client.clone(),
+            false,
+            String::new(),
+        );
+        let handle = tokio::spawn(async move {
+            ctrl.run(tun, writer, tun_packet_rx).await.unwrap();
+        });
+
+        // A routable TUN packet hits the failed writer: the pump must exit.
+        let packet = vec![
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 2,
+            10, 0, 0, 5,
+        ];
+        tun_peer.write_all(&packet).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("failed writer must terminate the TUN pump")
+            .expect("pump task must not panic");
+        drop(tun_packet_tx);
+    }
+
+    #[tokio::test]
+    async fn full_but_alive_writer_drops_packet_and_keeps_pumping() {
+        // A full-but-alive writer (send_msg Err, is_failed == false) must
+        // not kill the pump: the packet is dropped, and the pump keeps
+        // forwarding once the writer accepts again.
+        let client = Arc::new(ClientVnetController::new());
+        client
+            .route_table()
+            .write()
+            .await
+            .insert("", "target", "10.0.0.0/24")
+            .unwrap();
+
+        let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
+        let tun = Box::new(FakeTun { inner: tun_stream });
+        let writer = test_sink_with(true, false); // send fails, writer alive
+        let writer_for_task = writer.clone();
+        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let ctrl = VnetController::new(
+            "plugin-proxy".to_string(),
+            client.clone(),
+            false,
+            String::new(),
+        );
+        let handle = tokio::spawn(async move {
+            ctrl.run(tun, writer_for_task, tun_packet_rx).await.unwrap();
+        });
+
+        let packet = vec![
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 2,
+            10, 0, 0, 5,
+        ];
+        tun_peer.write_all(&packet).await.unwrap();
+
+        // Give the pump a moment: the dropped packet must not terminate it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_finished(),
+            "full-but-alive writer must not terminate the TUN pump"
+        );
+
+        // Once the writer accepts again, the pump still forwards packets.
+        writer
+            .full
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        tun_peer.write_all(&packet).await.unwrap();
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let pending = { writer.msgs.lock().unwrap().last().cloned() };
+                if let Some((msg, _)) = pending {
+                    return msg;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sink never received VnetPacket");
+        match msg {
+            frp_core::msg::FrpMessage::VnetPacket(vpkt) => {
+                assert_eq!(vpkt.proxy_name, "target");
+                assert_eq!(frp_core::base64::decode(&vpkt.data).unwrap(), packet);
+            }
+            other => panic!("expected VnetPacket, got type {}", other.v1_type_byte()),
+        }
 
         drop(tun_packet_tx);
         drop(tun_peer);

@@ -72,6 +72,12 @@ fn io_err(msg: String) -> io::Error {
 /// Wrap *outside* a [`crate::cipher_stream::CipherReader`] for the
 /// encrypted+compressed visitor segment (snappy inner, CFB outer — see the
 /// module docs).
+/// Max metadata-drain feed calls per `poll_read`. Each feed processes at
+/// most 1024 frames, so one poll is bounded to ~4096 metadata frames even
+/// when a peer floods pure metadata (see `meta_budget`).
+#[cfg(feature = "compression")]
+const MAX_META_FEEDS_PER_POLL: usize = 4;
+
 #[cfg(feature = "compression")]
 pub struct SnappyStreamReader<R: AsyncRead + Unpin> {
     inner: R,
@@ -83,6 +89,15 @@ pub struct SnappyStreamReader<R: AsyncRead + Unpin> {
     /// can be drained without reading more input (e.g. a metadata-only
     /// batch from the last feed).
     has_more_complete: bool,
+    /// Remaining metadata-drain budget for the current `poll_read` call,
+    /// in feed calls (each ≤1024 frames). Reset at poll entry. When a peer
+    /// floods metadata-only frames (padding / skippable chunks), the
+    /// pre-fix loop drained every buffered frame in a single poll — one
+    /// `poll_read` could process megabytes of metadata and starve other
+    /// tasks on the worker. Exhausting the budget pauses with a self-wake,
+    /// so the drain resumes on the next poll with a fresh budget (bounded
+    /// CPU per poll; total work is still O(metadata the peer sent)).
+    meta_budget: usize,
     /// Set once the inner reader returned EOF; no further inner reads.
     eof: bool,
     /// Reusable 32 KiB input scratch for the inner read.
@@ -98,6 +113,7 @@ impl<R: AsyncRead + Unpin> SnappyStreamReader<R> {
             out_buf: Vec::new(),
             out_pos: 0,
             has_more_complete: false,
+            meta_budget: MAX_META_FEEDS_PER_POLL,
             eof: false,
             read_buf: [0u8; READ_CHUNK_SIZE],
         }
@@ -115,6 +131,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for SnappyStreamReader<R> {
             return Poll::Ready(Ok(()));
         }
         let this = &mut *self;
+        // Fresh budget per poll_read call: a metadata flood must not let a
+        // single poll drain unboundedly (see `meta_budget`).
+        this.meta_budget = MAX_META_FEEDS_PER_POLL;
         loop {
             // 1. Serve buffered decoded output first — one poll may satisfy
             //    the caller from a previously decoded batch without touching
@@ -130,8 +149,18 @@ impl<R: AsyncRead + Unpin> AsyncRead for SnappyStreamReader<R> {
             //    the previous feed (extra data frames, or a metadata-only
             //    batch whose output landed after step 1). `feed_into_*` is
             //    budgeted (≤1024 metadata frames per call) so this loop makes
-            //    bounded forward progress without reading more input.
+            //    bounded forward progress without reading more input. When
+            //    the per-poll budget runs out, pause: the self-wake
+            //    guarantees a re-poll, where the drain continues with a
+            //    fresh budget. (Returning Pending without a registered waker
+            //    would park the reader forever; wake_by_ref registers this
+            //    task for immediate re-poll.)
             if this.has_more_complete {
+                if this.meta_budget == 0 {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                this.meta_budget -= 1;
                 this.out_buf.clear();
                 this.out_pos = 0;
                 let status = this
@@ -171,6 +200,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for SnappyStreamReader<R> {
             }
             this.out_buf.clear();
             this.out_pos = 0;
+            // The fresh-chunk feed also consumes budget; if it drains the
+            // budget and leaves more complete frames, the next loop
+            // iteration's step 2 pauses instead of feeding again.
+            this.meta_budget = this.meta_budget.saturating_sub(1);
             let status = this
                 .decompressor
                 .feed_into_append_progress(&this.read_buf[..filled], &mut this.out_buf)

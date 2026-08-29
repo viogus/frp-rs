@@ -2023,7 +2023,7 @@ pub async fn connect_ws_raw<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     let mut stream = stream;
 
@@ -2050,35 +2050,72 @@ where
     // Read HTTP 101 response with timeout.
     // BufReader may buffer WebSocket frame bytes past \r\n\r\n — capture
     // them before into_inner() to avoid permanent stream desync.
+    //
+    // Bounded byte-oriented parsing (mirroring accept_websocket): read_line
+    // grows the String unboundedly until a newline arrives — a hostile peer
+    // could stream endless header bytes into RAM. Every line is capped at
+    // 16 KiB and the whole response at 64 KiB. BufReader's internal buffer
+    // amortises the per-byte reads, so this is not one syscall per byte.
     let (stream, leftover) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        use tokio::io::AsyncReadExt;
+
+        const MAX_LINE_LEN: usize = 16 * 1024; // 16 KiB per header line
+        const MAX_TOTAL_HEADERS: usize = 64 * 1024; // 64 KiB total headers
+
         let mut reader = BufReader::new(stream);
-        let mut status_line = String::new();
-        reader.read_line(&mut status_line).await.map_err(|e| {
-            crate::Error::Transport(format!("WS raw connect read status: {e}").into())
-        })?;
-
-        if !status_line.starts_with("HTTP/1.1 101") {
-            return Err(crate::Error::Transport(
-                format!("WS upgrade rejected: {}", status_line.trim()).into(),
-            ));
-        }
-
-        // Parse response headers until \r\n\r\n, capturing the
-        // Sec-WebSocket-Accept value.
+        let mut buf = Vec::with_capacity(4096);
+        let mut total_bytes = 0usize;
+        let mut status_line: Option<String> = None;
         let mut accept_header: Option<String> = None;
         loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).await.map_err(|e| {
-                crate::Error::Transport(format!("WS raw connect read headers: {e}").into())
-            })?;
-            if line == "\r\n" || line.is_empty() {
+            let mut byte = [0u8; 1];
+            reader
+                .read_exact(&mut byte)
+                .await
+                .map_err(|e| crate::Error::Transport(format!("WS raw connect read: {e}").into()))?;
+            buf.push(byte[0]);
+            total_bytes += 1;
+
+            // Total limit BEFORE allowing more reads.
+            if total_bytes > MAX_TOTAL_HEADERS {
+                return Err(crate::Error::Transport(
+                    "WS upgrade rejected: response headers too large".into(),
+                ));
+            }
+
+            // Only parse when a complete line has arrived.
+            if byte[0] != b'\n' {
+                continue;
+            }
+            if buf.len() > MAX_LINE_LEN {
+                return Err(crate::Error::Transport(
+                    format!(
+                        "WS upgrade rejected: response header line too long ({} bytes, max {})",
+                        buf.len(),
+                        MAX_LINE_LEN
+                    )
+                    .into(),
+                ));
+            }
+
+            let line = String::from_utf8_lossy(&buf);
+            let line_str = line.as_ref();
+            if line_str == "\r\n" || line_str == "\n" || line_str.is_empty() {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':') {
+            if status_line.is_none() {
+                status_line = Some(line_str.to_string());
+                if !line_str.starts_with("HTTP/1.1 101") {
+                    return Err(crate::Error::Transport(
+                        format!("WS upgrade rejected: {}", line_str.trim()).into(),
+                    ));
+                }
+            } else if let Some((name, value)) = line_str.split_once(':') {
                 if name.trim().eq_ignore_ascii_case("sec-websocket-accept") {
                     accept_header = Some(value.trim().to_string());
                 }
             }
+            buf.clear();
         }
 
         // Verify Sec-WebSocket-Accept == base64(SHA1(key + RFC 6455 magic

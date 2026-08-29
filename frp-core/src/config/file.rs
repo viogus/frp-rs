@@ -213,7 +213,16 @@ pub fn collect_config_files(
     dir: &Path,
 ) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
-    collect_config_files_inner(dir, &mut files)?;
+    // Canonicalized directories seen so far. `--config-dir` trees may
+    // contain symlinked subdirectories (e.g. a deploy dir that symlinks a
+    // shared config subdir); a cycle (dir → ancestor → dir) would otherwise
+    // recurse forever and blow the stack (SIGSEGV under panic=abort,
+    // uncatchable). Canonicalize-then-track terminates the walk: the first
+    // visit descends, any repeat visit returns immediately. Same-directory
+    // symlink aliases are visited once (their files are collected under the
+    // first path), matching the "walk the tree once" contract.
+    let mut visited = std::collections::HashSet::new();
+    collect_config_files_inner(dir, &mut files, &mut visited)?;
     files.sort();
     Ok(files)
 }
@@ -221,15 +230,20 @@ pub fn collect_config_files(
 fn collect_config_files_inner(
     dir: &Path,
     files: &mut Vec<std::path::PathBuf>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !dir.is_dir() {
-        return Err(format!("not a directory: {}", dir.display()).into());
+    // `path.is_dir()` follows symlinks — that is exactly the cycle vector.
+    // Track the canonicalized directory: a symlink pointing at an ancestor
+    // resolves to an already-visited canonical path and stops the walk.
+    let canonical = std::fs::canonicalize(dir)?;
+    if !visited.insert(canonical) {
+        return Ok(());
     }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_config_files_inner(&path, files)?;
+            collect_config_files_inner(&path, files, visited)?;
         } else if path
             .extension()
             .and_then(|ext| ext.to_str())

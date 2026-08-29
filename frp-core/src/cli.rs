@@ -1431,6 +1431,13 @@ mod tests {
         }
     }
 
+    fn parse_frpc_verify(args: &[&str]) -> Result<VerifyArgs, bpaf::ParseFailure> {
+        match frpc_parser().to_options().run_inner(args)? {
+            FrpcCmd::Verify(a) => Ok(a),
+            other => panic!("expected verify command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn strict_config_defaults_to_true() {
         assert!(parse_frps(&[]).unwrap().strict_config);
@@ -1534,6 +1541,41 @@ mod tests {
         );
         assert!(
             parse_frpc_reload(&["reload", "--strict_config", "true"])
+                .unwrap()
+                .strict_config
+        );
+    }
+
+    #[test]
+    fn verify_strict_config_parses_like_run_mode() {
+        // Go frp v0.70.1: --strict_config is a persistent rootCmd flag
+        // (default true), so the `verify` subcommand inherits run-mode
+        // semantics — absent → true, bare → true, `=false` / ` false` →
+        // false (cmd/frpc/sub/verify.go passes strictConfigMode to
+        // config.LoadClientConfig). Round-8 fix 7e.
+        let args = parse_frpc_verify(&["verify", "-c", "x.toml"]).unwrap();
+        assert_eq!(args.config, "x.toml");
+        assert!(
+            args.strict_config,
+            "verify defaults to strict config (Go rootCmd persistent flag)"
+        );
+        assert!(
+            parse_frpc_verify(&["verify", "-c", "x.toml", "--strict-config"])
+                .unwrap()
+                .strict_config
+        );
+        assert!(
+            !parse_frpc_verify(&["verify", "-c", "x.toml", "--strict-config=false"])
+                .unwrap()
+                .strict_config
+        );
+        assert!(
+            !parse_frpc_verify(&["verify", "-c", "x.toml", "--strict-config", "false"])
+                .unwrap()
+                .strict_config
+        );
+        assert!(
+            parse_frpc_verify(&["verify", "-c", "x.toml", "--strict_config=true"])
                 .unwrap()
                 .strict_config
         );

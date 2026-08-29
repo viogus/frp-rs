@@ -5,9 +5,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crossbeam_queue::ArrayQueue;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Notify};
 
@@ -65,7 +66,7 @@ pub struct KcpStream {
     /// KcpSocketHandle::chunk_pool). poll_write pops a chunk here instead
     /// of allocating a fresh Vec per bridge write; the driver returns
     /// chunks once the session has segmented them. Bounded by CHUNK_POOL_CAP.
-    chunk_pool: Arc<Mutex<Vec<Vec<u8>>>>,
+    chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
 }
 
 impl KcpStream {
@@ -77,7 +78,7 @@ impl KcpStream {
         read_rx: mpsc::Receiver<Vec<u8>>,
         write_backlog: Arc<AtomicUsize>,
         write_notify: Arc<Notify>,
-        chunk_pool: Arc<Mutex<Vec<Vec<u8>>>>,
+        chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
         snd_backlog: Arc<AtomicUsize>,
         snd_notify: Arc<Notify>,
         session_alive: Arc<AtomicBool>,

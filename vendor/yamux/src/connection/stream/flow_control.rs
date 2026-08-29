@@ -103,6 +103,21 @@ impl FlowController {
                 cmp::min(new_max, connection_limit.try_into().unwrap_or(u32::MAX))
             };
 
+            // frp-rs patch: per-stream receive-window cap
+            // (`Config::max_stream_receive_window`, Go frp `MaxStreamWindowSize=6MiB`
+            // on the XTCP data plane). The cap only limits GROWTH: it is applied
+            // when it is above the current max (a window that already exceeds the
+            // cap — only possible if the cap is configured after traffic — is left
+            // unchanged, which also keeps `new_max - self.max_receive_window`
+            // non-negative for the accumulated-credit accounting below). The
+            // connection-window invariants are preserved: the min only shrinks
+            // `new_max`, and `connection_limit >= self.max_receive_window` (by the
+            // accumulated invariant) so `new_max >= self.max_receive_window` holds.
+            let new_max = match self.config.max_stream_receive_window {
+                Some(cap) if cap > self.max_receive_window => cmp::min(new_max, cap),
+                _ => new_max,
+            };
+
             // Account for the additional credit on the accumulated connection counter.
             *accumulated_max_stream_windows += (new_max - self.max_receive_window) as usize;
             drop(accumulated_max_stream_windows);

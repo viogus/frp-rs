@@ -60,6 +60,11 @@ pub(crate) async fn serve_h2_connection<S>(
         // Bound concurrent streams like Go's http.Server (default 250) to
         // cap per-connection memory (same as the vhost h2c path).
         .max_concurrent_streams(100)
+        // Cap the per-connection header-list size (h2 default 16 MiB × 100
+        // streams ≈ 1.6 GiB ceiling): server symmetry with the vhost h2c
+        // path, which uses 4096 — a hostile client's oversized head is
+        // rejected at the connection layer instead of being parsed.
+        .max_header_list_size(4096)
         .handshake(stream)
         .await
     {
@@ -239,12 +244,21 @@ fn cap_chunk(len: usize, remaining: Option<usize>) -> (Option<usize>, usize) {
 }
 
 /// Hop-by-hop headers dropped when converting between HTTP/1.1 and HTTP/2
-/// (RFC 7540 §8.1.2.2 forbids them; Go's net/http drops them too).
+/// (RFC 7540 §8.1.2.2 forbids them; Go's net/http drops them too). This is
+/// Go httputil.hopHeaders' full list — proxy-authenticate, proxy-
+/// authorization, te, and trailer were missing, so a backend's
+/// Proxy-Authenticate challenge would have been forwarded to the h2 client
+/// as a connection-scoped header, and a client's Proxy-Authorization would
+/// have leaked to the backend.
 fn is_hop_by_hop(name: &str) -> bool {
-    const HOP: [&str; 5] = [
+    const HOP: [&str; 9] = [
         "connection",
         "keep-alive",
         "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
         "transfer-encoding",
         "upgrade",
     ];

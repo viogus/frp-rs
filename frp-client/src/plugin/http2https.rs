@@ -73,9 +73,15 @@ async fn handle_conn(
     request_headers: &std::collections::HashMap<String, String>,
     tls_connector: &tokio_rustls::TlsConnector,
 ) -> Result<(), String> {
-    let fwd =
-        crate::plugin::read_request_and_build_forward(&mut client, host_rewrite, request_headers)
-            .await?;
+    // No X-Forwarded-For append: Go http2https.go does not call
+    // SetXForwarded (only the https2http/https2https variants do).
+    let fwd = crate::plugin::read_request_and_build_forward(
+        &mut client,
+        host_rewrite,
+        request_headers,
+        None,
+    )
+    .await?;
 
     // Extract hostname from target for SNI
     let (host, port) = split_host_port(target);

@@ -1005,10 +1005,21 @@ mod tests {
                 .expect("serialize")
                 .len()
         };
-        let mut n = 0usize;
-        while payload_len(n + 1) <= V2_MAX_FRAME_PAYLOAD as usize {
-            n += 1;
+        // payload_len(n) is monotonic in n (content grows one byte per n), so
+        // binary-search the largest n that still fits. The old linear scan
+        // re-serialized the growing payload every iteration — O(n²) JSON work,
+        // 112s in a debug build.  ~16 probes instead of ~49k.
+        let mut lo = 0usize;
+        let mut hi = (V2_MAX_FRAME_PAYLOAD as usize) * 2;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if payload_len(mid) <= V2_MAX_FRAME_PAYLOAD as usize {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
         }
+        let n = lo;
         assert!(payload_len(n) <= V2_MAX_FRAME_PAYLOAD as usize);
         assert!(payload_len(n + 1) > V2_MAX_FRAME_PAYLOAD as usize);
 
@@ -1160,6 +1171,26 @@ mod tests {
             }),
             FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
         ];
+        #[cfg(feature = "vnet")]
+        let messages = {
+            let mut all = messages;
+            all.extend_from_slice(&[
+                FrpMessage::VnetRouteAdvertise(msg::VnetRouteAdvertise {
+                    proxy_name: "v1".into(),
+                    subnet: "10.0.0.0/8".into(),
+                    virtual_net: Some("vn1".into()),
+                }),
+                FrpMessage::VnetPacket(msg::VnetPacket {
+                    proxy_name: "v1".into(),
+                    data: "AQID".into(),
+                }),
+                FrpMessage::VnetRouteRemove(msg::VnetRouteRemove {
+                    proxy_name: "v1".into(),
+                    virtual_net: Some("vn1".into()),
+                }),
+            ]);
+            all
+        };
 
         for msg in &messages {
             write_msg_v2(&mut client, msg).await.expect("write V2");

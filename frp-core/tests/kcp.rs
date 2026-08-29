@@ -163,3 +163,49 @@ async fn test_kcp_tls_round_trip() {
 
     server_handle.await.expect("server task");
 }
+
+/// 512 KiB of patterned data over real UDP loopback — many KCP windows
+/// worth (the receive window is ~256 packets), exercising window
+/// advances, retransmission pacing and the multi-packet reassembly path
+/// under genuine socket backpressure. Byte-exactness proves no
+/// reorder/drop corruption survives the journey.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_kcp_512kib_volume_byte_exact() {
+    let config = no_fec_config();
+    let mut listener = KcpListener::bind("127.0.0.1:0", config.clone())
+        .await
+        .expect("bind");
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+
+    // Allow driver event loops to start.
+    sleep(Duration::from_millis(50)).await;
+
+    const N: usize = 512 * 1024;
+    let payload: Vec<u8> = (0..N).map(|i| ((i * 13 + 5) % 251) as u8).collect();
+    let write_data = payload.clone();
+
+    // Spawn the dialer: connect, write the full volume (write_all may park
+    // on KCP write backpressure while the listener drains), flush.
+    let dial_handle = tokio::spawn(async move {
+        let mut stream = timeout(Duration::from_secs(10), dial_kcp(&addr, config))
+            .await
+            .expect("dial timeout")
+            .expect("dial_kcp");
+        stream.write_all(&write_data).await.expect("write_all");
+        stream.flush().await.expect("flush");
+        stream.shutdown().await.expect("shutdown");
+    });
+
+    let mut stream = timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("accept timeout")
+        .expect("accept");
+
+    let mut got = vec![0u8; N];
+    timeout(Duration::from_secs(30), stream.read_exact(&mut got))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(got, payload, "512 KiB payload must be byte-exact");
+    dial_handle.await.expect("dial task");
+}

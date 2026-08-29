@@ -75,12 +75,19 @@ const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
 /// - max. number of streams = 512
 /// - read after close = true
 /// - split send size = 16 KiB
+/// - per-stream receive window cap = none (crates.io auto-tuning)
 #[derive(Debug, Clone)]
 pub struct Config {
     max_connection_receive_window: Option<usize>,
     max_num_streams: usize,
     read_after_close: bool,
     split_send_size: usize,
+    /// frp-rs patch: optional per-stream receive-window cap. `None` keeps the
+    /// crates.io auto-tuning behavior (a stream's window doubles toward the
+    /// connection limit); `Some(cap)` bounds a single stream's window
+    /// independently of the connection-wide limit (Go frp pins
+    /// `MaxStreamWindowSize=6MiB` on its XTCP data plane).
+    max_stream_receive_window: Option<u32>,
 }
 
 impl Default for Config {
@@ -90,6 +97,7 @@ impl Default for Config {
             max_num_streams: 512,
             read_after_close: true,
             split_send_size: DEFAULT_SPLIT_SEND_SIZE,
+            max_stream_receive_window: None,
         }
     }
 }
@@ -133,6 +141,34 @@ impl Config {
             stream at least the Yamux default window size"
         );
 
+        self
+    }
+
+    /// Set the upper limit for a single stream's receive window
+    /// (frp-rs patch).
+    ///
+    /// yamux auto-tunes a stream's receive window up to the connection limit
+    /// (`set_max_connection_receive_window`), so with a large connection
+    /// window a single stream can claim hundreds of MiB (e.g. ~320 MiB at a
+    /// 384 MiB connection window with 256 streams). This cap bounds one
+    /// stream's window independently of the connection-wide limit.
+    ///
+    /// Must be `>= 256 KiB (DEFAULT_CREDIT)`, the window every stream starts
+    /// at. The cap only limits window GROWTH: a stream whose window already
+    /// exceeds the cap (only possible if the cap is set after traffic) is
+    /// left unchanged.
+    ///
+    /// Go frp pins `MaxStreamWindowSize=6MiB` on the XTCP data plane; the
+    /// XTCP tunnel session sets this to the same value. `None` (the default)
+    /// keeps the crates.io auto-tuning behavior.
+    pub fn set_max_stream_receive_window(&mut self, n: Option<u32>) -> &mut Self {
+        if let Some(cap) = n {
+            assert!(
+                cap >= DEFAULT_CREDIT,
+                "`max_stream_receive_window` must be `>= 256 KiB (DEFAULT_CREDIT)`"
+            );
+        }
+        self.max_stream_receive_window = n;
         self
     }
 
@@ -191,6 +227,11 @@ impl quickcheck::Arbitrary for Config {
             max_num_streams,
             read_after_close: bool::arbitrary(g),
             split_send_size: g.gen_range(DEFAULT_SPLIT_SEND_SIZE..usize::MAX),
+            max_stream_receive_window: if bool::arbitrary(g) {
+                Some(g.gen_range(DEFAULT_CREDIT..=u32::MAX))
+            } else {
+                None
+            },
         }
     }
 }

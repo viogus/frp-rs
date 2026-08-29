@@ -74,6 +74,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use futures_util::FutureExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
@@ -94,6 +95,31 @@ pub(crate) const KCP_TICK_MS: u32 = 10;
 
 /// Default timeout for hole-punch response.
 pub const DEFAULT_HOLE_PUNCH_TIMEOUT_MS: u64 = 5000;
+
+/// Upper bound on the server-supplied hole-punch detect-wait timeout (ms).
+/// Go's NAT analyzer emits `ReadTimeoutMs` = max(SendDelayMs)+5000
+/// [+30000 when listen_random_ports] — at most ~45s — so 60s is far above
+/// any legitimate value. Without the cap a hostile server could stretch a
+/// punch to ~24.8 days (`read_timeout_ms` is i32).
+pub const MAX_HOLE_PUNCH_TIMEOUT_MS: u64 = 60_000;
+
+/// Upper bound on the sender's pre-probe sleep (ms). Go's analyzer emits
+/// `SendDelayMs` ≤ 10s (nathole/analysis.go), so 15s is far above any
+/// legitimate value; a hostile server must not be able to delay the whole
+/// punch for weeks via `send_delay_ms` (also i32).
+pub const MAX_SEND_DELAY_MS: u64 = 15_000;
+
+/// Go `nathole.go` `MakeHole` role resolution: only the exact string
+/// `"sender"` takes the sender arm (sleep + probe assisted/candidates);
+/// EVERYTHING else — including a missing role from a hostile or legacy
+/// server — is the receiver (Go `else` branch, verified against v0.71.0
+/// nathole.go:201-208).
+fn resolve_punch_role(role: Option<&str>) -> &'static str {
+    match role {
+        Some("sender") => "sender",
+        _ => "receiver",
+    }
+}
 
 // Persistent tunnel-session API (Go frp v0.71 keepTunnelOpenWorker): the
 // one hole-punched session per XTCP proxy, reused across user connections.
@@ -441,7 +467,27 @@ pub struct XtcpP2pStream {
     pending_send: Vec<u8>,
     /// Waker to signal when pending_send is drained (write backpressure).
     write_notify: Arc<Notify>,
+    /// Stored HWM-park wait future (round 13 fix). The round-10 fix built
+    /// `select(notified, sleep)` inside poll_write and returned Pending with
+    /// the select dropped — tokio unregisters BOTH wakers when a future is
+    /// dropped (Sleep cancel in the timer wheel + OwnedNotified waiter
+    /// removal from notify.rs), so the 10ms timer never fired and the
+    /// raw-KCP path (tcp-mux off, no background driver) deadlocked at the
+    /// high-water mark forever. Storing the select across polls (the
+    /// KcpStream `backpressure_fut` pattern) keeps both wakers registered
+    /// until the wait resolves. Select is Unpin when both halves are Unpin
+    /// (they are boxed), so the struct stays Unpin.
+    hwm_wait_fut: Option<HwmWaitFut>,
 }
+
+/// Parked HWM wait: race the drain notify against a KCP_TICK_MS timer so a
+/// parked writer re-polls even when no peer traffic ever drains (raw-KCP
+/// path has no background driver). Type alias keeps the struct field
+/// readable (clippy::type_complexity).
+type HwmWaitFut = futures_util::future::Select<
+    Pin<Box<tokio::sync::futures::OwnedNotified>>,
+    Pin<Box<tokio::time::Sleep>>,
+>;
 
 /// High-water mark for pending_send in bytes. When pending_send exceeds
 /// this, poll_write returns Pending to signal backpressure to the caller.
@@ -480,6 +526,7 @@ impl XtcpP2pStream {
             shutdown: false,
             pending_send: Vec::new(),
             write_notify: Arc::new(Notify::new()),
+            hwm_wait_fut: None,
         })
     }
 
@@ -501,7 +548,11 @@ impl XtcpP2pStream {
         let was_full = self.pending_send.len() >= PENDING_SEND_HIGH_WATER;
         if !self.pending_send.is_empty() {
             let data = std::mem::take(&mut self.pending_send);
-            self.session.send(data)?;
+            // send_chunked: kcp.send rejects one buffer >= the send window
+            // (128 segments); a HWM-parked drain can hold up to
+            // PENDING_SEND_HIGH_WATER + one write chunk, so the whole
+            // buffer must be split (see KcpSession::send_chunked).
+            self.session.send_chunked(&data)?;
             // Wake write pollers that were blocked on the high-water mark.
             // notify_one() stores a permit if no waiters exist, preventing
             // the lost-wake race between poll_write's notified_owned() and
@@ -669,22 +720,37 @@ impl AsyncWrite for XtcpP2pStream {
         // grow pending_send without bound if UDP sends are slower than
         // data arrival.
         //
-        // Round 10 (MEDIUM): the raw-KCP path (tcp-mux off, micro builds)
-        // has no background yamux driver re-polling this stream, so a
-        // silent peer deadlocks: the write half parks here, the read half
-        // parks on the empty read channel, and drive_kcp — the only drain
-        // site — never runs again. A timer wake alongside the notify
-        // guarantees a re-poll, and the drain below forces one KCP tick
-        // so parked writers make progress even without peer traffic.
+        // Round 10 (MEDIUM, found RED): the raw-KCP path (tcp-mux off,
+        // micro builds) has no background yamux driver re-polling this
+        // stream, so a silent peer deadlocks: the write half parks here,
+        // the read half parks on the empty read channel, and drive_kcp —
+        // the only drain site — never runs again. A timer wake alongside
+        // the notify guarantees a re-poll, and the drain below forces one
+        // KCP tick so parked writers make progress even without peer
+        // traffic.
+        //
+        // Round 13: the round-10 fix built `select(notified, sleep)`
+        // locally and returned Pending with the select dropped — tokio
+        // unregisters both wakers when a future is dropped, so the timer
+        // never fired and the HWM-parked write deadlocked forever. The
+        // select is now stored in `hwm_wait_fut` across polls (KcpStream's
+        // `backpressure_fut` pattern) so both wakers stay registered until
+        // the wait resolves; it is cleared on Ready and whenever the HWM
+        // condition clears without this poll_write draining it.
         if self.pending_send.len() >= PENDING_SEND_HIGH_WATER {
             // Both futures are !Unpin (tokio Notify waiter / Sleep), so
             // box-pin them to satisfy futures_util select's Unpin bounds.
-            // Two box allocs on the rare HWM-parked path only.
-            let notified = self.write_notify.clone().notified_owned();
-            let wake = tokio::time::sleep(std::time::Duration::from_millis(KCP_TICK_MS as u64));
-            let mut select = futures_util::future::select(Box::pin(notified), Box::pin(wake));
-            match futures_util::FutureExt::poll_unpin(&mut select, cx) {
+            // Two box allocs on the rare HWM-parked path only. get_or_insert
+            // keeps an existing parked wait alive across polls.
+            let write_notify = self.write_notify.clone();
+            let fut = self.hwm_wait_fut.get_or_insert_with(|| {
+                let notified = write_notify.notified_owned();
+                let wake = tokio::time::sleep(std::time::Duration::from_millis(KCP_TICK_MS as u64));
+                futures_util::future::select(Box::pin(notified), Box::pin(wake))
+            });
+            match futures_util::FutureExt::poll_unpin(fut, cx) {
                 Poll::Ready(_) => {
+                    self.hwm_wait_fut = None;
                     // Drain pending_send immediately: bypass the 10ms tick
                     // gate, which the yamux driver path does not need but
                     // the raw path cannot afford (see above).
@@ -693,6 +759,11 @@ impl AsyncWrite for XtcpP2pStream {
                 }
                 Poll::Pending => return Poll::Pending,
             }
+        } else if self.hwm_wait_fut.is_some() {
+            // HWM cleared without this poll_write draining (drive_kcp ran
+            // from poll_read/poll_flush): drop the stale parked future so
+            // its timer entry and Notify waiter are released.
+            self.hwm_wait_fut = None;
         }
 
         // Accumulate send data — flush happens in drive_kcp.
@@ -737,7 +808,7 @@ impl AsyncWrite for XtcpP2pStream {
         let pending_drain_len = self.pending_send.len();
         if !self.pending_send.is_empty() {
             let data = std::mem::take(&mut self.pending_send);
-            let _ = self.session.send(data);
+            let _ = self.session.send_chunked(&data);
             // Round 10 (LOW): symmetric with drive_kcp's was_full notify —
             // a flush-drain landing between a writer's gate check and the
             // next drive_kcp must still wake parked writers.
@@ -1379,6 +1450,12 @@ async fn send_sid_probe(
 /// replies to is specific to the socket that received the probe, so the data
 /// plane must run on that exact socket (`result.lConn`), not on the original
 /// STUN socket.
+///
+/// All sockets are polled concurrently under ONE shared deadline (Go spawns
+/// one goroutine per socket and selects on the result channel, nathole.go
+/// 264-287). The old sequential 50 ms-per-socket scan took 257×50 ms ≈ 12.8s
+/// per pass with `listen_random_ports` at its cap — longer than the whole 5s
+/// detect budget — so a reply on the last socket was never seen in time.
 async fn wait_detect_on_any(
     sockets: &[&UdpSocket],
     peers: &[SocketAddr],
@@ -1387,51 +1464,76 @@ async fn wait_detect_on_any(
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
 ) -> Result<(usize, SocketAddr), String> {
-    let mut buf = [0u8; 1024];
     let start = std::time::Instant::now();
     loop {
-        if start.elapsed().as_millis() as u64 >= timeout_ms {
+        let remaining_ms = timeout_ms.saturating_sub(start.elapsed().as_millis() as u64);
+        if remaining_ms == 0 {
             return Err(format!(
                 "wait detect message timeout after {}ms",
                 timeout_ms
             ));
         }
-        for (idx, s) in sockets.iter().enumerate() {
-            let r =
-                tokio::time::timeout(std::time::Duration::from_millis(50), s.recv_from(&mut buf))
-                    .await;
-            match r {
-                Ok(Ok((n, peer))) => {
-                    let data = &buf[..n];
-                    if data == HOLE_PUNCH_MAGIC {
-                        // Rust magic: only accept from a known candidate
-                        // (a receiver's extra listener socket is not one).
-                        if peers.contains(&peer) {
+        // One future per socket, each owning its receive buffer (a shared
+        // buffer cannot be mutably borrowed by concurrent recv futures).
+        // Boxed so select_all can poll them (async blocks are !Unpin).
+        let futures: Vec<_> = sockets
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let s = *s;
+                async move {
+                    let mut buf = [0u8; 1024];
+                    let r = s.recv_from(&mut buf).await;
+                    (idx, r, buf)
+                }
+                .boxed()
+            })
+            .collect();
+        let (idx, r, buf) = match tokio::time::timeout(
+            std::time::Duration::from_millis(remaining_ms),
+            futures_util::future::select_all(futures),
+        )
+        .await
+        {
+            Ok((winner, _, _)) => winner,
+            Err(_elapsed) => {
+                return Err(format!(
+                    "wait detect message timeout after {}ms",
+                    timeout_ms
+                ));
+            }
+        };
+        let s = sockets[idx];
+        match r {
+            Ok((n, peer)) => {
+                let data = &buf[..n];
+                if data == HOLE_PUNCH_MAGIC {
+                    // Rust magic: only accept from a known candidate
+                    // (a receiver's extra listener socket is not one).
+                    if peers.contains(&peer) {
+                        return Ok((idx, peer));
+                    }
+                    continue;
+                }
+                if let (Some(sid_str), Some(enc_key)) = (sid, key) {
+                    if let Ok(msg) = decode_detect_msg(data, enc_key) {
+                        if msg.sid == sid_str && (msg.response || role == "receiver") {
+                            // Receiver echoes the probe as a response
+                            // (Go waitDetectMessage), then returns.
+                            if role == "receiver" && !msg.response {
+                                let mut echo = msg;
+                                echo.response = true;
+                                if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
+                                    let _ = s.send_to(&encoded, peer).await;
+                                }
+                            }
                             return Ok((idx, peer));
                         }
-                        continue;
-                    }
-                    if let (Some(sid_str), Some(enc_key)) = (sid, key) {
-                        if let Ok(msg) = decode_detect_msg(data, enc_key) {
-                            if msg.sid == sid_str && (msg.response || role == "receiver") {
-                                // Receiver echoes the probe as a response
-                                // (Go waitDetectMessage), then returns.
-                                if role == "receiver" && !msg.response {
-                                    let mut echo = msg;
-                                    echo.response = true;
-                                    if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
-                                        let _ = s.send_to(&encoded, peer).await;
-                                    }
-                                }
-                                return Ok((idx, peer));
-                            }
-                            // Sender got a plain probe — keep waiting.
-                        }
+                        // Sender got a plain probe — keep waiting.
                     }
                 }
-                Ok(Err(_)) => return Err("recv error during MakeHole detect".into()),
-                Err(_) => {}
             }
+            Err(_) => return Err("recv error during MakeHole detect".into()),
         }
     }
 }
@@ -1465,25 +1567,40 @@ pub async fn punch_udp_hole_makehole_owned(
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
 ) -> Result<(UdpSocket, SocketAddr), String> {
-    let role = behavior.role.as_deref().unwrap_or("sender");
+    // Go nathole.go MakeHole: only `Role == DetectRoleSender` takes the
+    // sender arm (sleep + probe assisted+candidates); EVERYTHING else —
+    // including an unknown/empty role from a hostile or legacy server — is
+    // the receiver (see `resolve_punch_role`).
+    let role = resolve_punch_role(behavior.role.as_deref());
     let ttl = behavior.ttl;
     // Go MakeHole: `timeout := 5 * time.Second; if ReadTimeoutMs > 0 {
     // timeout = ReadTimeoutMs * ms }`. The server computes ReadTimeoutMs as
     // (max(SendDelayMs)+5000 [+30000 if listen_random_ports]) minus the
     // side's own send_delay, so it is normally positive; fall back to 5s
-    // when the server sent 0 or negative (Go keeps 5s in that case).
+    // when the server sent 0 or negative (Go keeps 5s in that case). Also
+    // capped at MAX_HOLE_PUNCH_TIMEOUT_MS — a hostile server must not be
+    // able to stretch the detect wait to ~24.8 days (the caller caps too;
+    // this is the punch's own invariant).
     let timeout_ms = if timeout_ms > 0 {
-        timeout_ms
+        timeout_ms.min(MAX_HOLE_PUNCH_TIMEOUT_MS)
     } else {
         DEFAULT_HOLE_PUNCH_TIMEOUT_MS
     };
 
-    // Sender waits SendDelayMs before probing (Go MakeHole).
+    // Sender waits SendDelayMs before probing (Go MakeHole). Capped: Go's
+    // analyzer emits ≤ 10s, so anything above MAX_SEND_DELAY_MS is a hostile
+    // server trying to stall the punch (send_delay_ms is i32 — uncapped it
+    // would sleep ~24.8 days).
     if role == "sender" && behavior.send_delay_ms > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(
-            behavior.send_delay_ms as u64,
-        ))
-        .await;
+        let delay_ms = (behavior.send_delay_ms as u64).min(MAX_SEND_DELAY_MS);
+        if behavior.send_delay_ms as u64 > MAX_SEND_DELAY_MS {
+            tracing::warn!(
+                configured = behavior.send_delay_ms,
+                capped = MAX_SEND_DELAY_MS,
+                "XTCP MakeHole: send_delay_ms capped"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
 
     // Detect address set: assisted + candidates (sender), or candidates when
@@ -1683,4 +1800,20 @@ fn get_unused_random_port(used: &mut std::collections::HashSet<u16>) -> u16 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_punch_role;
+
+    #[test]
+    fn punch_role_defaults_to_receiver() {
+        // Go nathole.go MakeHole (v0.71.0): `if role == DetectRoleSender`
+        // takes the sender arm; any other value — empty, unknown, or
+        // missing — falls into the `else` (receiver) branch.
+        assert_eq!(resolve_punch_role(None), "receiver");
+        assert_eq!(resolve_punch_role(Some("")), "receiver");
+        assert_eq!(resolve_punch_role(Some("spoofer")), "receiver");
+        assert_eq!(resolve_punch_role(Some("sender")), "sender");
+    }
 }

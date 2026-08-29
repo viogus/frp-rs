@@ -241,6 +241,12 @@ struct AeadWriteState {
     max_frame_count: Option<u64>,
     pending: Vec<u8>,
     pending_pos: usize,
+    /// Bytes claimed from the caller's buf by the frame currently being
+    /// flushed. Set at frame build (== the chunk size); returned by the next
+    /// `poll_write` once the flush completes, instead of re-encrypting the
+    /// same buf into a duplicate frame. Cleared when the claim is delivered.
+    /// Mirrors `CipherWriterState`'s `first_write_data_len` accounting.
+    claimed: Option<usize>,
     err: Option<io::Error>,
     /// Reusable AAD buffer: stream_nonce || frame_header (4 bytes).
     /// Allocated once, reused per frame.
@@ -318,6 +324,7 @@ impl AeadStream {
                 max_frame_count: algorithm.max_frame_count(),
                 pending: Vec::new(),
                 pending_pos: 0,
+                claimed: None,
                 err: None,
                 aad_buf: Vec::with_capacity(nonce_size + AEAD_FRAME_HEADER_SIZE),
             },
@@ -621,6 +628,17 @@ impl AsyncWrite for AeadStream {
             }
         }
 
+        // A frame built by a previous poll_write just finished flushing (its
+        // flush was Pending on that poll, or a poll_flush/poll_shutdown
+        // drained it in between). Deliver the claim — the number of bytes
+        // accepted from that buf — WITHOUT building a new frame: the caller
+        // re-polls with the same buf per the AsyncWrite contract, and
+        // re-encrypting it with the next nonce would emit a duplicate frame
+        // (both decrypt at the peer). Mirrors CipherWriterState.
+        if let Some(claimed) = this.write.claimed.take() {
+            return Poll::Ready(Ok(claimed));
+        }
+
         // Build a new frame
         if let Some(ref max) = this.write.max_frame_count {
             if this.write.frame_count >= *max {
@@ -721,9 +739,19 @@ impl AsyncWrite for AeadStream {
             this.write.pending_pos = 0;
         }
 
+        // Claim this chunk: the flush below may park (Pending) mid-frame; on
+        // the re-poll the claim is returned in place of a duplicate frame.
+        this.write.claimed = Some(chunk_size);
+
         // Flush the pending data
         match this.poll_flush_pending(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(chunk_size)),
+            Poll::Ready(Ok(())) => {
+                // Flush completed on this poll — the claim is delivered as
+                // this return value; clear it so the NEXT poll_write builds a
+                // fresh frame instead of re-reporting the old chunk.
+                this.write.claimed = None;
+                Poll::Ready(Ok(chunk_size))
+            }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
@@ -1115,5 +1143,140 @@ mod tests {
             got, plaintext,
             "content mismatch: AEAD frame corruption from lost partial reads"
         );
+    }
+
+    /// Inner transport whose `poll_write` stalls once per frame flush: the
+    /// first call makes partial progress (1 byte), the second parks with
+    /// `Pending`, then the remaining calls drain normally. Every frame built
+    /// by the AEAD writer therefore crosses a mid-frame `Pending` boundary.
+    struct StallEveryFlush<T> {
+        inner: T,
+        calls: usize,
+    }
+
+    impl<T: AsyncReadWriteUnpin> AsyncRead for StallEveryFlush<T> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncReadWriteUnpin> AsyncWrite for StallEveryFlush<T> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.calls += 1;
+            match this.calls % 3 {
+                // Partial progress: per the AsyncWrite contract, Ok(1) means
+                // the first byte HAS reached the stream — write it for real,
+                // then the drain (call 3) sends the rest.
+                1 => Pin::new(&mut this.inner).poll_write(cx, &buf[..1]),
+                2 => {
+                    // Park mid-frame; self-wake so a runtime re-polls and the
+                    // drain (call 3) completes the flush.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                _ => Pin::new(&mut this.inner).poll_write(cx, buf),
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// BLOCKER B1 regression: a flush that parks mid-frame (`Pending` after
+    /// partial progress) and completes on the re-poll must NOT re-encrypt the
+    /// same buf into a duplicate frame. The old code fell through to "Build a
+    /// new frame" once the pending bytes drained, re-encrypting `buf[..chunk]`
+    /// with the next nonce — the peer then decrypted the chunk TWICE (and
+    /// with a multi-chunk write_all, poll_write never returned Ok at all: the
+    /// payload was re-sent as fresh frames in an infinite duplicate loop).
+    ///
+    /// Drives `poll_write` manually (same-buf re-poll after `Pending`, as
+    /// AsyncWrite mandates) over a stalling inner transport and asserts the
+    /// peer decrypts EXACTLY one frame per chunk: 2 chunks in, 2 chunks out,
+    /// with no further plaintext on the wire.
+    #[tokio::test]
+    async fn test_aead_stalling_inner_encrypts_exactly_one_frame_per_chunk() {
+        use futures_util::task::noop_waker;
+        use tokio::io::AsyncReadExt;
+        use tokio::time::Duration;
+
+        let key = generate_random(32).unwrap();
+        let (write_half, read_half) = tokio::io::duplex(1 << 20);
+
+        let mut writer = AeadStream::new(
+            Box::new(StallEveryFlush {
+                inner: write_half,
+                calls: 0,
+            }),
+            AeadAlgorithm::Aes256Gcm,
+            &key,
+            &key,
+        )
+        .unwrap();
+        let mut peer =
+            AeadStream::new(Box::new(read_half), AeadAlgorithm::Aes256Gcm, &key, &key).unwrap();
+
+        let chunk_len = DEFAULT_MAX_PAYLOAD_SIZE;
+        let expected: Vec<u8> = (0..2 * chunk_len).map(|i| (i % 251) as u8).collect();
+        let expect_len = expected.len();
+        let reader_task = tokio::spawn(async move {
+            let mut got = vec![0u8; expect_len];
+            peer.read_exact(&mut got)
+                .await
+                .expect("peer must decrypt both chunks");
+            // No duplicate may follow: any further plaintext is a
+            // re-encrypted copy of a chunk already delivered.
+            let extra =
+                tokio::time::timeout(Duration::from_millis(500), peer.read(&mut [0u8; 16])).await;
+            (got, extra)
+        });
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for chunk_idx in 0..2 {
+            let chunk = &expected[chunk_idx * chunk_len..(chunk_idx + 1) * chunk_len];
+            // Poll 1: frame built, flush parks mid-frame → Pending.
+            match Pin::new(&mut writer).poll_write(&mut cx, chunk) {
+                Poll::Pending => {}
+                other => panic!(
+                    "chunk {chunk_idx}: expected Pending from the stalled flush, got {other:?}"
+                ),
+            }
+            // Poll 2: flush completes — the claim must be returned WITHOUT
+            // building a duplicate frame from the same buf.
+            match Pin::new(&mut writer).poll_write(&mut cx, chunk) {
+                Poll::Ready(Ok(n)) => assert_eq!(n, chunk_len, "chunk {chunk_idx} claim"),
+                other => panic!("chunk {chunk_idx}: expected Ok(chunk_len), got {other:?}"),
+            }
+        }
+
+        let (got, extra) = tokio::time::timeout(Duration::from_secs(10), reader_task)
+            .await
+            .expect("peer read must complete within 10s")
+            .expect("peer task must not panic");
+        assert_eq!(
+            got, expected,
+            "peer must decrypt exactly the original chunks"
+        );
+        match extra {
+            Err(_) => {}    // no duplicate arrived (timeout)
+            Ok(Ok(0)) => {} // writer dropped: clean EOF
+            Ok(Ok(n)) => panic!("duplicate frame: peer decrypted {n} extra bytes"),
+            Ok(Err(e)) => panic!("peer read error: {e}"),
+        }
     }
 }

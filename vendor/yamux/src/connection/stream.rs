@@ -96,6 +96,19 @@ pub struct Stream {
     conn: connection::Id,
     config: Arc<Config>,
     sender: mpsc::Sender<StreamCommand>,
+    /// Separate handle to the same channel, reserved for window updates sent
+    /// from the read side.
+    ///
+    /// `futures::channel::mpsc` assumes a single task polls a `Sender` for
+    /// readiness: while parked, `poll_ready` stores the caller's waker and
+    /// the receiver wakes that one task when capacity frees up. A
+    /// `tokio::io::split` read/write pair polls the *same* `Sender` from two
+    /// tasks — a `poll_read` window update can overwrite a parked writer's
+    /// waker, and the notify then wakes the wrong task while the writer
+    /// stays parked forever (lost wakeup). Keeping a dedicated clone for the
+    /// read path restores one-poller-per-`Sender`; the channel's
+    /// guaranteed-slot accounting (capacity = buffer + senders) covers both.
+    sender_wu: mpsc::Sender<StreamCommand>,
     flag: Flag,
     shared: Arc<Mutex<Shared>>,
 }
@@ -125,11 +138,13 @@ impl Stream {
         rtt: rtt::Rtt,
         accumulated_max_stream_windows: Arc<Mutex<usize>>,
     ) -> Self {
+        let sender_wu = sender.clone();
         Self {
             id,
             conn,
             config: config.clone(),
             sender,
+            sender_wu,
             flag: Flag::Ack,
             shared: Arc::new(Mutex::new(Shared::new(
                 DEFAULT_CREDIT,
@@ -149,11 +164,13 @@ impl Stream {
         rtt: rtt::Rtt,
         accumulated_max_stream_windows: Arc<Mutex<usize>>,
     ) -> Self {
+        let sender_wu = sender.clone();
         Self {
             id,
             conn,
             config: config.clone(),
             sender,
+            sender_wu,
             flag: Flag::Syn,
             shared: Arc::new(Mutex::new(Shared::new(
                 DEFAULT_CREDIT,
@@ -219,7 +236,7 @@ impl Stream {
         }
 
         ready!(self
-            .sender
+            .sender_wu
             .poll_ready(cx)
             .map_err(|_| self.write_zero_err())?);
 
@@ -230,7 +247,7 @@ impl Stream {
         let mut frame = Frame::window_update(self.id, credit).right();
         self.add_flag(frame.header_mut());
         let cmd = StreamCommand::SendFrame(frame);
-        self.sender
+        self.sender_wu
             .start_send(cmd)
             .map_err(|_| self.write_zero_err())?;
 
@@ -358,10 +375,11 @@ impl AsyncWrite for Stream {
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        ready!(self
-            .sender
-            .poll_ready(cx)
-            .map_err(|_| self.write_zero_err())?);
+        match self.sender.poll_ready(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(_)) => return Poll::Ready(Err(self.write_zero_err())),
+            Poll::Pending => return Poll::Pending,
+        }
         let body = {
             let mut shared = self.shared();
             if !shared.state().can_write() {
@@ -402,9 +420,10 @@ impl AsyncWrite for Stream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        self.sender
-            .poll_flush_unpin(cx)
-            .map_err(|_| self.write_zero_err())
+        match self.sender.poll_flush_unpin(cx) {
+            Poll::Ready(r) => Poll::Ready(r.map_err(|_| self.write_zero_err())),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {

@@ -271,6 +271,12 @@ where
         match tokio::time::timeout_at(attempt_deadline, connector(socket_addr)).await {
             Ok(Ok(stream)) => {
                 frp_core::transport::set_nodelay(&stream);
+                // Local-service dial keepalive: Go net.Dialer default is 15s
+                // (this was the only dial side without one — server dials
+                // already use 7200s). Idle tunnels to the local service are
+                // detected by the peer's kernel after ~30s instead of
+                // hanging until a read error surfaces.
+                frp_core::transport::set_keepalive(&stream, 15);
                 return Ok(stream);
             }
             Ok(Err(error)) => last_error = Some(error.to_string()),

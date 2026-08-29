@@ -1305,6 +1305,10 @@ impl Service {
         let wc_tls_cert_file = opt_if_empty!(cfg_local.tls_cert_file);
         let wc_tls_key_file = opt_if_empty!(cfg_local.tls_key_file);
         let wc_dns_server = opt_if_empty!(cfg_local.dns_server);
+        // Upper bound (65507, max UDP payload) is enforced at config load
+        // (frp-core config/client.rs — every load path, reload included);
+        // `.max(0)` guards programmatically-built configs with a negative
+        // value so the buffer size stays sane.
         let wc_udp_packet_size = cfg_local.udp_packet_size.max(0) as usize;
         let wc_disable_custom_tls_first_byte = cfg_local.disable_custom_tls_first_byte;
         let wc_keepalive_secs = cfg_local.dial_server_keepalive.max(0) as u64;
@@ -3927,6 +3931,16 @@ impl Service {
         for name in delta.added.iter().chain(delta.changed.iter()) {
             if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
                 if let Some(ref plugin_cfg) = p.plugin {
+                    // virtual_net is not a local-listener plugin (startup
+                    // skip at plugin/mod.rs start_plugin): start_plugin
+                    // returns None for it, which the changed-arm below would
+                    // misread as a restart FAILURE and abort the ENTIRE
+                    // reload (dropping every other changed proxy). Skip it
+                    // here — vnet proxies are handled by the TUN
+                    // open/register section below.
+                    if plugin_cfg.plugin_type == "virtual_net" {
+                        continue;
+                    }
                     if let Some(handle) = self
                         .start_plugin(name, plugin_cfg, p.use_encryption, p.use_compression)
                         .await

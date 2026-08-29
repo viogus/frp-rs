@@ -67,7 +67,7 @@ while [[ $# -gt 0 ]]; do
         --xtcp-only) XTCP_ONLY=true; shift ;;
         --shard) XTCP_SHARD="$2"; shift 2 ;;
         --list)
-            awk '/^[[:space:]]*run_test test_[a-z]/ {print $2}' "$0" | sort
+            awk '/^[[:space:]]*run_test[[:space:]]test_[a-z]/ {print $2}' "$0" | sort
             exit 0
             ;;
         --help|-h)

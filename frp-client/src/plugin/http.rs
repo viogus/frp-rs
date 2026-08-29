@@ -79,24 +79,32 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     // anywhere in the buffer (not only at its end): with a request body the
     // head terminator is followed by body bytes, and reading past it would
     // swallow the body into the "headers" until the 64 KiB cap.
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 512];
-    loop {
-        let n = client
-            .read(&mut chunk)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Err("connection closed".into());
+    // Go parity: http.Server ReadHeaderTimeout (60s) — one absolute deadline
+    // over the whole header read, so a slowloris "trickle" cannot park the
+    // task + fd + plugin listener slot indefinitely.
+    let buf = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = client
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                return Err("connection closed".into());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if buf.len() > 65536 {
+                return Err("request headers too large".into());
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if buf.len() > 65536 {
-            return Err("request headers too large".into());
-        }
-    }
+        Ok::<Vec<u8>, String>(buf)
+    })
+    .await
+    .map_err(|_| "read headers timed out".to_string())??;
 
     let headers_str = String::from_utf8_lossy(&buf);
     let mut lines = headers_str.lines();
@@ -133,6 +141,9 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
         return Err("auth failed".into());
     }
 
+    // Case-insensitive CONNECT match: Go frp http_proxy.go uses
+    // strings.EqualFold(string(firstBytes), http.MethodConnect) — a
+    // lowercase "connect" is accepted.
     if method.eq_ignore_ascii_case("CONNECT") {
         handle_connect(client, url).await
     } else {
@@ -148,9 +159,20 @@ async fn handle_connect(mut client: TcpStream, target: &str) -> Result<(), Strin
         format!("{target}:443")
     };
 
-    let mut remote = TcpStream::connect(&target)
-        .await
-        .map_err(|e| format!("connect to {target}: {e}"))?;
+    let mut remote = match TcpStream::connect(&target).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Go frp http_proxy.go CONNECT arm: dial failure answers the
+            // client with HTTP/1.1 400 + Connection: close (the proxy is
+            // about to drop the connection), instead of closing silently.
+            let resp =
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            if let Err(we) = client.write_all(resp).await {
+                tracing::debug!(error = %we, "plugin relay error: {}", we);
+            }
+            return Err(format!("connect to {target}: {e}"));
+        }
+    };
     frp_core::transport::set_nodelay(&remote);
 
     // Tell client connection established

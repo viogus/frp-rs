@@ -512,6 +512,17 @@ pub(super) fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
         if v.bind_port == 0 {
             return Err(format!("visitor '{}': bind port is required", v.name));
         }
+        // Round-8 blocker: Go v0.71.0 dispatches visitors by a type switch
+        // over stcp/sudp/xtcp (validation/visitor.go ValidateVisitorConfigurer)
+        // — any other type, including empty, fails with "unknown visitor
+        // config type". A `type = "typo"` visitor used to load silently and
+        // never connect. Mirrors frp-client/src/store.rs VALID_VISITOR_TYPES.
+        if !matches!(v.visitor_type.as_str(), "stcp" | "sudp" | "xtcp") {
+            return Err(format!(
+                "visitor '{}': unknown visitor type '{}'",
+                v.name, v.visitor_type
+            ));
+        }
         if v.visitor_type == "xtcp" && v.protocol != "kcp" && v.protocol != "quic" {
             return Err(format!(
                 "visitor '{}': protocol should be kcp or quic",

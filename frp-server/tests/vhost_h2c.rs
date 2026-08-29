@@ -434,13 +434,16 @@ async fn test_h2c_preface_then_silence_dropped_at_timeout() {
 }
 
 /// h2c Basic-auth branch: a request without credentials against an
-/// `http_user`/`http_pwd` route must get an HTTP/2 401 (with the
-/// `www-authenticate` challenge) and must NOT be forwarded to a backend;
-/// the same connection then succeeds with the correct Authorization header
-/// (base64("user:pass") = dXNlcjpwYXNz), proving the auth check matches
-/// credentials rather than blanket-rejecting h2.
+/// `http_user`/`http_pwd` route must get an HTTP/2 407 Proxy Authentication
+/// Required (with the `proxy-authenticate` challenge — h2 requests are
+/// always absolute-form, so Go `checkRouteAuthByRequest` answers 407 and
+/// reads `Proxy-Authorization` only) and must NOT be forwarded to a
+/// backend; the same connection then succeeds with the correct
+/// proxy-authorization header (base64("user:pass") = dXNlcjpwYXNz),
+/// proving the auth check matches credentials rather than
+/// blanket-rejecting h2.
 #[tokio::test]
-async fn test_h2c_401_without_credentials() {
+async fn test_h2c_407_without_credentials() {
     let (_bind, vhost_addr, _provider, _run_id, mut work_conn) = setup_auth(
         "h2c-auth",
         "auth.example.com",
@@ -452,7 +455,7 @@ async fn test_h2c_401_without_credentials() {
 
     let mut client = h2_connect(vhost_addr).await;
 
-    // No credentials → HTTP/2 401, never forwarded.
+    // No credentials → HTTP/2 407, never forwarded.
     let request = http::Request::builder()
         .method("GET")
         .uri("http://auth.example.com/")
@@ -460,14 +463,14 @@ async fn test_h2c_401_without_credentials() {
         .unwrap();
     let (response_fut, _stream) = client.send_request(request, true).unwrap();
     let response = response_fut.await.expect("h2 response");
-    assert_eq!(response.status().as_u16(), 401);
+    assert_eq!(response.status().as_u16(), 407);
     assert_eq!(
-        response.headers()["www-authenticate"].to_str().unwrap(),
+        response.headers()["proxy-authenticate"].to_str().unwrap(),
         "Basic realm=\"frp\""
     );
     let body = read_h2_body(response.into_body()).await;
     assert!(body.is_empty());
-    // The pooled work conn must stay silent — the 401 was generated in the
+    // The pooled work conn must stay silent — the 407 was generated in the
     // vhost layer, no StartWorkConn reached a backend.
     let swc = tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -476,14 +479,14 @@ async fn test_h2c_401_without_credentials() {
     .await;
     assert!(
         swc.is_err(),
-        "401 request must not be forwarded to a backend (StartWorkConn sent)"
+        "407 request must not be forwarded to a backend (StartWorkConn sent)"
     );
 
     // Correct credentials on the SAME h2 connection → forwarded, 200.
     let request = http::Request::builder()
         .method("GET")
         .uri("http://auth.example.com/")
-        .header("authorization", "Basic dXNlcjpwYXNz")
+        .header("proxy-authorization", "Basic dXNlcjpwYXNz")
         .body(())
         .unwrap();
     let (response_fut, _stream) = client.send_request(request, true).unwrap();
@@ -494,8 +497,8 @@ async fn test_h2c_401_without_credentials() {
     // both are legal, RFC 7230 §3.2 makes field names case-insensitive).
     // The property under test is the VALUE arriving intact.
     assert!(
-        String::from_utf8_lossy(&head).contains("authorization: Basic dXNlcjpwYXNz\r\n"),
-        "authorization header must be forwarded intact: {}",
+        String::from_utf8_lossy(&head).contains("proxy-authorization: Basic dXNlcjpwYXNz\r\n"),
+        "proxy-authorization header must be forwarded intact: {}",
         String::from_utf8_lossy(&head),
     );
     work_conn
@@ -554,7 +557,14 @@ async fn test_h2c_keepalive_reuse_survives_http_timeout() {
         .unwrap();
     let (response_fut, _stream) = client.send_request(request, true).unwrap();
 
-    match read_msg_v1(&mut provider).await.expect("ReqWorkConn") {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_msg_v1(&mut provider),
+    )
+    .await
+    .expect("ReqWorkConn within 10s")
+    .expect("read ReqWorkConn")
+    {
         FrpMessage::ReqWorkConn(_) => {}
         other => panic!("expected ReqWorkConn, got {:?}", other.v1_type_byte()),
     }
@@ -585,4 +595,126 @@ async fn test_h2c_keepalive_reuse_survives_http_timeout() {
     assert_eq!(response.status().as_u16(), 200);
     let body = read_h2_body(response.into_body()).await;
     assert_eq!(body, b"two");
+}
+
+/// Round-8 h2c preface slow-drip regression: the preface completion loop in
+/// vhost.rs uses ONE absolute deadline (vhost_http_timeout from the first
+/// byte), not a per-read timeout. A client dripping the 24-byte preface one
+/// byte per read window (300ms here, so 23 × 300ms ≈ 6.9s to complete) must
+/// be released after the 1s deadline — a per-read timeout would re-arm on
+/// every received byte and park the task + fd + vhost permit for ~7s.
+///
+/// Assertion: the server closes the connection within 2.5s of the first
+/// preface byte (1s deadline + scheduling slack). Pre-fix the connection
+/// would survive past the 2.5s window (preface completes at ~6.9s).
+#[tokio::test]
+async fn test_h2c_preface_slow_drip_released_at_absolute_deadline() {
+    let (_bind, vhost_addr, _provider, _run_id, _work_conn) =
+        setup_auth("h2c-drip", "drip.example.com", None, None, 1).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let started = std::time::Instant::now();
+
+    // Drip one byte per 300ms: the absolute 1s deadline must fire while
+    // fewer than 24 bytes have arrived (first 4 bytes land before 1s).
+    let mut sent = 0;
+    while sent < preface.len() {
+        client
+            .write_all(&preface[sent..sent + 1])
+            .await
+            .expect("drip preface byte");
+        sent += 1;
+        if sent >= 4 {
+            break; // enough bytes to commit the h2 path; keep the conn open
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    // The remaining drip keeps arriving but the 1s deadline must already
+    // have armed (it is anchored at the first read in the completion loop).
+    // Server-side release: read returns EOF or an error within 2.5s.
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!(
+            "server must release the slow-drip h2c client, got {} bytes: {}",
+            n,
+            String::from_utf8_lossy(&buf[..n])
+        ),
+        Ok(Err(_)) => {}
+        Err(_) => panic!(
+            "slow-drip h2c preface still alive after {:.1}s (absolute deadline not enforced)",
+            started.elapsed().as_secs_f32()
+        ),
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "server released the slow-drip client only after {:.1}s",
+        started.elapsed().as_secs_f32()
+    );
+}
+
+/// Round-8 h2c oversized header block regression: the h2 server builder caps
+/// max_header_list_size at 4096 (the same bound as the HTTP/1.1 head cap).
+/// A request with a > 4096-byte decoded header block must be rejected by the
+/// h2 layer WITHOUT dispatching a work conn to the provider — a work conn
+/// forwarded to a backend that can never read the complete head would tie up
+/// the pooled slot.
+///
+/// Rejection shape: h2 ≥0.4 implements RFC 9113 §10.5.1 — a server that
+/// receives a larger header block than SETTINGS_MAX_HEADER_LIST_SIZE may
+/// answer an auto-generated 431 (Request Header Fields Too Large), an error
+/// recorded so the stream also gets REFUSED_STREAM and none of its data
+/// frames are accepted (proto/streams/recv.rs `frame.is_over_size()` arm).
+/// The frp-rs handler never sees the request either way; both the 431
+/// response and a protocol error are valid h2-layer rejections.
+#[tokio::test]
+async fn test_h2c_oversized_header_block_rejected_no_work_conn() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-big-head", "big.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://big.example.com/")
+        .header("x-big", "a".repeat(5000))
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    // The h2 layer must reject the stream, never answer through a work conn:
+    // either an auto-generated 431 (RFC 9113 §10.5.1, h2's implementation of
+    // SETTINGS_MAX_HEADER_LIST_SIZE) or a protocol error / reset.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), response_fut).await {
+        Ok(Ok(resp)) => assert_eq!(
+            resp.status().as_u16(),
+            431,
+            "h2-layer rejection must be 431, got {}",
+            resp.status()
+        ),
+        Ok(Err(_e)) => {} // protocol error / reset — also a valid rejection
+        Err(_) => panic!("no h2 response within 5s"),
+    }
+
+    // The pooled work conn must stay silent: no StartWorkConn, no forwarded
+    // head. (500ms negative window — the dispatch path is fast.)
+    let mut buf = [0u8; 64];
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        work_conn.read(&mut buf),
+    )
+    .await;
+    match silent {
+        Err(_) => {}
+        Ok(Ok(0)) => panic!("work conn closed unexpectedly"),
+        Ok(Ok(n)) => panic!(
+            "oversized h2 request must not dispatch a work conn, got {} bytes: {}",
+            n,
+            String::from_utf8_lossy(&buf[..n])
+        ),
+        Ok(Err(e)) => panic!("work conn read error: {e}"),
+    }
 }

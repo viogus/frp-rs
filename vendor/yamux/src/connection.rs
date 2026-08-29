@@ -650,11 +650,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 log::error!("{}/{}: stream already exists", self.id, stream_id);
                 return Action::Terminate(Frame::protocol_error());
             }
-            if self.streams.len() == self.config.max_num_streams {
+            if self.streams.len() >= self.config.max_num_streams {
                 // frp-rs patch: per-stream reset instead of a
                 // session-killing GoAway (Go's fatedier/yamux fork
                 // semantics). The rejected SYN's body (if any) is dropped
                 // with the frame; the stream is never created.
+                // `>=` (not `==`): `len` can only be checked here, but every
+                // admission site must defend the cap against itself — a
+                // future admission path that forgets to check would otherwise
+                // overflow the map by one (see on_window_update below).
                 return Action::Reset(stream_id);
             }
             if frame.body().len() > DEFAULT_CREDIT as usize {
@@ -756,11 +760,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 log::error!("{}/{}: stream already exists", self.id, stream_id);
                 return Action::Terminate(Frame::protocol_error());
             }
-            if self.streams.len() == self.config.max_num_streams {
+            if self.streams.len() >= self.config.max_num_streams {
                 log::debug!("{}: maximum number of streams reached", self.id);
                 // frp-rs patch: per-stream reset instead of a
                 // session-killing GoAway (Go's fatedier/yamux fork
-                // semantics).
+                // semantics). `>=` (not `==`): same admission-defense as the
+                // SYN path above.
                 return Action::Reset(stream_id);
             }
 

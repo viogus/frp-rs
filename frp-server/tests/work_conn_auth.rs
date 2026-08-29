@@ -16,7 +16,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
-use common::{allocate_port, start_test_server_tcpmux_on, test_auth_cfg, TEST_TOKEN};
+use common::{
+    allocate_port, login_with_test_token, start_test_server, start_test_server_tcpmux_on,
+    test_auth_cfg, TEST_TOKEN,
+};
 use frp_core::auth;
 use frp_core::config::ServerConfig;
 use frp_core::encryption;
@@ -223,4 +226,125 @@ async fn test_yamux_work_conn_validation_drops_bad_streams() {
         kept.is_err(),
         "valid NewWorkConn must be pooled (stream stays open), not closed"
     );
+}
+
+/// Raw-TCP work-connection validation chain (dispatch.rs
+/// handle_work_conn_inner). With tcp_mux OFF, work connections are
+/// standalone TCP connections to the main port carrying one V1 NewWorkConn
+/// frame — the same validation chain as the yamux streams above must hold:
+/// a wrong run_id or a bad privilege_key gets the connection dropped, no
+/// StartWorkConn is ever written, and the control stream stays silent.
+/// A subsequent VALID NewWorkConn is pooled (connection kept open), proving
+/// the rejections were validation, not a broken work-conn accept path.
+///
+/// NOTE: the yamux chain's case (c) — a Login frame on a work stream — has
+/// NO raw-TCP analogue: on raw TCP a Login frame on a NEW connection is a
+/// legitimate control login (the main-port accept loop dispatches by
+/// message type), not a work-conn rejection. Raw work conns are validated
+/// by run_id + privilege_key only.
+#[tokio::test]
+async fn test_raw_tcp_work_conn_validation_drops_bad_connections() {
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    // Raw control login (tcp_mux OFF). login_with_test_token drains the
+    // post-login pre-warm ReqWorkConn, so the control stream is silent
+    // afterwards and the server has an empty pool.
+    let (mut control, resp) = login_with_test_token(addr).await.expect("control login");
+    let run_id = resp.run_id.expect("run_id in LoginResp");
+
+    // (a) wrong run_id → connection dropped (EOF or RST within 2s).
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("dial work conn");
+    let (mut rd, mut wr) = stream.into_split();
+    write_msg_v1(
+        &mut wr,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some("wrong-run-id".into()),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("write wrong-run_id NewWorkConn");
+    assert_raw_conn_closed(&mut rd, "wrong run_id").await;
+
+    // (b) correct run_id but bad privilege_key → dropped by auth validation.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("dial work conn");
+    let (mut rd, mut wr) = stream.into_split();
+    write_msg_v1(
+        &mut wr,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: Some(ts),
+            privilege_key: Some("bogus-key".into()),
+        }),
+    )
+    .await
+    .expect("write bad-key NewWorkConn");
+    assert_raw_conn_closed(&mut rd, "bad privilege_key").await;
+
+    // No StartWorkConn / ReqWorkConn leaked onto the control stream from the
+    // rejections: it must stay silent (the login pre-warm ReqWorkConn was
+    // already drained in login_with_test_token).
+    let silent = tokio::time::timeout(Duration::from_millis(300), read_msg_v1(&mut control)).await;
+    match silent {
+        Ok(Ok(msg)) => panic!(
+            "control stream must stay silent after rejected work conns, got type {}",
+            msg.v1_type_byte(),
+        ),
+        Ok(Err(e)) => panic!("control stream read errored after rejected work conns: {e}"),
+        Err(_) => {}
+    }
+
+    // (c) a VALID NewWorkConn (fresh timestamp + correct privilege_key) is
+    // still accepted: the server pools it, so the connection stays OPEN
+    // (the read must time out, not return EOF).
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("dial work conn");
+    let (mut rd, mut wr) = stream.into_split();
+    write_msg_v1(
+        &mut wr,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id),
+            timestamp: Some(ts),
+            privilege_key: Some(auth::generate_token(TEST_TOKEN, ts)),
+        }),
+    )
+    .await
+    .expect("write valid NewWorkConn");
+    let mut buf = [0u8; 64];
+    let kept = tokio::time::timeout(Duration::from_millis(300), rd.read(&mut buf)).await;
+    assert!(
+        kept.is_err(),
+        "valid NewWorkConn must be pooled (connection stays open), not closed"
+    );
+}
+
+/// Assert the server DROPS a raw work connection: the read must return EOF
+/// (Ok(0), clean FIN) or an error (RST) within 2s. A timeout — the conn
+/// still open — means the server pooled/accepted it instead of rejecting.
+async fn assert_raw_conn_closed(rd: &mut tokio::net::tcp::OwnedReadHalf, what: &str) {
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(2), rd.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!("{what}: expected EOF, got {n} bytes"),
+        Ok(Err(_)) => {} // RST is also a valid close
+        Err(_) => panic!("{what}: connection was NOT dropped by the server (still open / pooled)"),
+    }
 }

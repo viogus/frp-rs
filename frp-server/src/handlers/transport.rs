@@ -30,8 +30,6 @@ use crate::control;
 #[cfg(feature = "tls")]
 use crate::lock::RwLockExt;
 use crate::state::AppState;
-#[cfg(feature = "tls")]
-use crate::state::InternalMsg;
 
 // ---------------------------------------------------------------
 // Accepted-connection handlers (extracted from the accept-loop
@@ -69,7 +67,7 @@ pub(crate) async fn handle_tls_connection(
     // Extract inner transport and pre-read bytes.
     // detect_and_strip_magic consumed 7 bytes; replay them
     // (minus the Go frp 0x17 prefix) for TLS.
-    let (mut pre_read_bytes, mut inner_stream) = match stream_io.into_parts() {
+    let (mut pre_read_bytes, inner_stream) = match stream_io.into_parts() {
         Some(parts) => parts,
         None => {
             warn!(addr = %addr, "Expected PreRead for TLS connection from {}", addr);
@@ -83,110 +81,14 @@ pub(crate) async fn handle_tls_connection(
         pre_read_bytes.remove(0); // discard 0x17
     }
 
-    // --- SNI peek for HTTPS proxy routing ---
-    // Only pay the cost (2x4KiB heap allocs + a
-    // 4KiB blocking pre-read + ClientHello parse +
-    // vhost lookup) when at least one HTTPS proxy
-    // is registered; otherwise the sniff could
-    // never match a route, so skip straight to the
-    // normal TLS accept. The count is maintained
-    // by https registration/unregistration.
-    let mut sni_data = if state
-        .https_proxy_count
-        .load(std::sync::atomic::Ordering::Relaxed)
-        > 0
-    {
-        // Read ClientHello bytes (up to 4KB) from inner stream.
-        // The inner stream is positioned at byte 7 of the original
-        // connection. Combine with pre_read_bytes for full ClientHello.
-        // 10s timeout matches Go frp's connReadTimeout, which
-        // CheckAndEnableTLSServerConnWithTimeout applies during
-        // TLS detection (server/service.go constant, 10s).
-        let mut sni_buf = [0u8; 4096];
-        let sni_peek_n =
-            match tokio::time::timeout_at(accept_deadline, inner_stream.read(&mut sni_buf)).await {
-                // Every byte read is replayed below — dropping a short read
-                // (1-42 bytes, e.g. a fragmented ClientHello) corrupted the
-                // TLS handshake (audit fix). The SNI lookup itself is
-                // naturally skipped for short data: extract_sni_from_client_hello
-                // requires a full record (≥44 bytes).
-                Ok(Ok(n)) => n,
-                _ => {
-                    warn!(addr = %addr, "TLS read timeout from {} during SNI check", addr);
-                    return;
-                }
-            };
-
-        // Build full ClientHello data (pre-read magic bytes + SNI peek)
-        // in a single allocation instead of clone-then-extend.
-        let mut sni_data = Vec::with_capacity(pre_read_bytes.len() + sni_peek_n);
-        sni_data.extend_from_slice(&pre_read_bytes);
-        if sni_peek_n > 0 {
-            sni_data.extend_from_slice(&sni_buf[..sni_peek_n]);
-        }
-
-        // Try SNI-based routing for HTTPS proxies
-        if !sni_data.is_empty() {
-            if let Some(sni_host) = crate::vhost::extract_sni_from_client_hello(&sni_data) {
-                debug!(addr = %addr, sni_host = %sni_host, "SNI from {}: {}", addr, sni_host);
-                // SNI routing: no HTTP auth, so http_user is empty string.
-                // SNI routing: no HTTP path, so pass empty string.
-                // Routes with empty locations (HTTPS SNI) match any path.
-                // Scheme "https": the HTTPS Muxer's registryRouter only
-                // (Go parity) — SNI must never match an HTTP route.
-                if let Some(route) = state
-                    .vhost_manager
-                    .lookup_wildcard(&sni_host, "", "", "https")
-                    .await
-                {
-                    let ctl_tx = state
-                        .run_id_to_ctl_tx
-                        .get(route.run_id.as_ref())
-                        .map(|v| v.clone());
-                    if let Some(ctl) = ctl_tx {
-                        info!(sni_host = %sni_host, proxy_name = %route.proxy_name, addr = %addr,
-                                                        "SNI route '{}' → HTTPS proxy '{}' from {}",
-                                                        sni_host, route.proxy_name, addr);
-                        // send().await: backpressure is correct —
-                        // silently dropping the connection after
-                        // consuming TLS ClientHello bytes would
-                        // confuse the client. Bounded (audit H3): a
-                        // control handler that stops draining must not
-                        // pin this task + fd + permit forever; after
-                        // CTL_SEND_TIMEOUT the connection drops.
-                        match tokio::time::timeout(
-                            crate::state::CTL_SEND_TIMEOUT,
-                            ctl.tx.send(InternalMsg::ProxyUserConn {
-                                proxy_name: route.proxy_name.to_string(),
-                                user_conn: IoStream::from(inner_stream),
-                                pre_read: sni_data,
-                                user_conn_permit: None,
-                                // Local sender — no group selection was done.
-                                group_selected: false,
-                            }),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => {
-                                debug!(sni_host = %sni_host, proxy_name = %route.proxy_name, "SNI route '{}' → '{}': control handler gone, dropping conn", sni_host, route.proxy_name);
-                            }
-                            Err(_elapsed) => {
-                                warn!(sni_host = %sni_host, proxy_name = %route.proxy_name, "SNI route '{}' → '{}': control channel send timed out, dropping conn", sni_host, route.proxy_name);
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-        sni_data
-    } else {
-        // No HTTPS proxies — replay just the pre-read
-        // bytes; the TLS handshake reads the rest from
-        // the socket.
-        pre_read_bytes
-    };
+    // Go frp parity: the main port NEVER parses the TLS ClientHello. Go's
+    // CheckAndEnableTLSServerConnWithTimeout (pkg/util/net/tls.go) reads a
+    // single byte (0x17/0x16) for TLS detection; HTTPS proxies are served
+    // exclusively on vhost_https_port (service.rs vhost_https accept path,
+    // which reads the SNI itself). The pre-read magic bytes (0x17 already
+    // stripped above) are replayed into the TLS acceptor — a frpc TLS
+    // control connection must never be diverted to an HTTPS route by its
+    // SNI (route collision previously hijacked TLS control logins).
 
     // No SNI match — check acceptor before creating stream.
     let acceptor = match acceptor {
@@ -216,10 +118,12 @@ pub(crate) async fn handle_tls_connection(
                 // 0x17 is already stripped from pre_read_bytes above,
                 // but 0x16 is not (kept for TLS handshake path).
                 // Strip it here so V1 dispatch sees valid data.
-                if first_byte == frp_core::transport::FRP_TLS_DIRECT_BYTE && !sni_data.is_empty() {
-                    sni_data.remove(0);
+                if first_byte == frp_core::transport::FRP_TLS_DIRECT_BYTE
+                    && !pre_read_bytes.is_empty()
+                {
+                    pre_read_bytes.remove(0);
                 }
-                let stream = IoStream::PreRead(sni_data, inner_stream);
+                let stream = IoStream::PreRead(pre_read_bytes, inner_stream);
                 crate::handlers::dispatch_v1_message(
                     stream,
                     state,
@@ -243,14 +147,12 @@ pub(crate) async fn handle_tls_connection(
 
     // TLS acceptor exists — wrap stream to replay consumed bytes
     // for the TLS handshake.
-    let stream = PreReadStream::new(sni_data, inner_stream);
-    // Bound the TLS handshake: when https_proxy_count == 0 the
-    // SNI-sniff peek is skipped and its timeout was the only
-    // bound on this accept. A client that sends only the TLS
-    // marker byte (0x17/0x16) then goes silent would otherwise
-    // park here forever, holding a task, fd, and a
-    // conn_semaphore permit (slowloris / permit exhaustion).
-    // Same deadline and shape as the WS+TLS accept above.
+    let stream = PreReadStream::new(pre_read_bytes, inner_stream);
+    // Bound the TLS handshake by the accept deadline: a client that sends
+    // only the TLS marker byte (0x17/0x16) then goes silent would otherwise
+    // park here forever, holding a task, fd, and a conn_semaphore permit
+    // (slowloris / permit exhaustion). Same deadline and shape as the
+    // WS+TLS accept above.
     let tls_stream = match tokio::time::timeout_at(accept_deadline, acceptor.accept(stream)).await {
         Ok(r) => match r {
             Ok(s) => s,

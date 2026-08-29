@@ -78,6 +78,14 @@ pub struct WsByteStream {
     /// Reused payload buffer for the Raw read path (capacity kept across
     /// frames — avoids a fresh `vec![0u8; n]` allocation per frame).
     raw_payload_buf: Vec<u8>,
+    /// Control frame bytes (close/pong reply, and the shutdown close frame)
+    /// not yet fully written to the inner stream. A control frame is tiny
+    /// (<= 10 bytes) but the inner may still return Pending mid-write; the
+    /// tail is stashed here and drained before any further frame parse or
+    /// the inner shutdown. Also carries the shutdown close frame across
+    /// polls.
+    pending_control_write: Vec<u8>,
+    pending_control_pos: usize,
 }
 
 /// The post-upgrade stream. Manual WebSocket frame handling (RFC 6455),
@@ -107,10 +115,24 @@ impl WsByteStream {
             }
             let mask: [u8; 4] = rand::random();
             frame.extend_from_slice(&mask);
-            // XOR the payload with the mask key (RFC 6455 §5.3).
-            let start = frame.len();
-            frame.extend_from_slice(buf);
-            xor_mask(&mut frame[start..], mask);
+            // Single-pass copy + XOR (RFC 6455 §5.3): each payload byte is
+            // written exactly once, already masked — no separate
+            // copy-then-XOR pass over the payload. Word-aligned like
+            // `xor_mask` (same ~4x gain over a byte loop with a per-byte
+            // modulo), but the payload never sits unmasked in the buffer.
+            let mask_u32 = u32::from_ne_bytes(mask);
+            let mut i = 0;
+            while i + 4 <= len {
+                let mut word = [0u8; 4];
+                word.copy_from_slice(&buf[i..i + 4]);
+                let word = u32::from_ne_bytes(word) ^ mask_u32;
+                frame.extend_from_slice(&word.to_ne_bytes());
+                i += 4;
+            }
+            while i < len {
+                frame.push(buf[i] ^ mask[i & 3]);
+                i += 1;
+            }
         } else {
             // Server MUST NOT mask frames per RFC 6455 §5.1
             if len < 126 {
@@ -187,6 +209,61 @@ fn xor_mask(payload: &mut [u8], mask: [u8; 4]) {
     }
 }
 
+/// Build an RFC 6455 control frame (FIN + control opcode, payload <= 125
+/// bytes) into `out`. Masked when `client_mode` per RFC 6455 §5.3; a server
+/// MUST NOT mask its frames.
+fn build_control_frame(out: &mut Vec<u8>, opcode: u8, payload: &[u8], client_mode: bool) {
+    out.clear();
+    out.push(0x80 | opcode); // FIN + control opcode
+    if client_mode {
+        let mask: [u8; 4] = rand::random();
+        out.push(0x80 | payload.len() as u8);
+        out.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            out.push(b ^ mask[i & 3]);
+        }
+    } else {
+        out.push(payload.len() as u8);
+        out.extend_from_slice(payload);
+    }
+}
+
+/// Attempt to write a control frame (close/pong reply) to the raw inner.
+/// Returns `Poll::Ready(Ok(true))` when the frame was fully written,
+/// `Ready(Ok(false))` when the inner is busy — the unwritten tail is stashed
+/// in `stash` (drained at the top of the next `poll_read`) and the caller's
+/// waker is registered — and `Ready(Err)` on write failure. Never returns
+/// `Poll::Pending` itself: control frames are tiny and stashing lets the
+/// caller's loop continue without blocking the read path on a write.
+fn poll_write_control(
+    raw: &mut Box<dyn AsyncReadWrite>,
+    cx: &mut Context<'_>,
+    stash: &mut Vec<u8>,
+    pos: &mut usize,
+    frame: &[u8],
+) -> Poll<io::Result<bool>> {
+    match Pin::new(raw.as_mut()).poll_write(cx, frame) {
+        Poll::Ready(Ok(n)) if n >= frame.len() => Poll::Ready(Ok(true)),
+        Poll::Ready(Ok(0)) => {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
+        }
+        Poll::Ready(Ok(n)) => {
+            stash.clear();
+            stash.extend_from_slice(&frame[n..]);
+            *pos = 0;
+            cx.waker().wake_by_ref();
+            Poll::Ready(Ok(false))
+        }
+        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        Poll::Pending => {
+            stash.clear();
+            stash.extend_from_slice(frame);
+            *pos = 0;
+            Poll::Ready(Ok(false))
+        }
+    }
+}
+
 /// State machine for incremental WebSocket frame reads on Raw streams.
 /// Resumes partial reads across async yield points so frame header/mask/payload
 /// parsing does not lose progress when the underlying stream returns Pending.
@@ -212,6 +289,9 @@ fn dispatch_raw_frame(
     cx: &mut Context<'_>,
     buf: &mut ReadBuf<'_>,
     payload: &[u8],
+    client_mode: bool,
+    pending_control_write: &mut Vec<u8>,
+    pending_control_pos: &mut usize,
 ) -> Poll<io::Result<()>> {
     *raw_read_state = RawReadState::Idle;
     match opcode {
@@ -236,8 +316,20 @@ fn dispatch_raw_frame(
             Poll::Ready(Ok(()))
         }
         0x08 => {
-            let _ = Pin::new(raw.as_mut()).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
-            Poll::Ready(Ok(()))
+            // RFC 6455 §5.5.1: reply with a close frame before surfacing
+            // EOF. Masked in client mode (§5.3); if the inner is busy the
+            // reply is stashed and the next poll finishes it — a single
+            // ignored poll_write could drop the reply entirely.
+            let mut frame = Vec::with_capacity(10);
+            build_control_frame(&mut frame, 0x08, &[0x03, 0xe8], client_mode);
+            match poll_write_control(raw, cx, pending_control_write, pending_control_pos, &frame) {
+                Poll::Ready(Ok(true)) => Poll::Ready(Ok(())),
+                Poll::Ready(Ok(false)) => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    unreachable!("poll_write_control never returns Pending")
+                }
+            }
         }
         0x09 => {
             // RFC 6455 §5.5: control frame payload MUST be ≤125 bytes.
@@ -251,15 +343,16 @@ fn dispatch_raw_frame(
             } else {
                 payload
             };
-            let mut pong = [0u8; 128];
-            // RFC 6455 caps control-frame payloads at 125 bytes, so the
-            // stack buffer always fits: 2-byte header + payload.
-            pong[0] = 0x8a;
-            pong[1] = pong_payload.len() as u8;
-            pong[2..2 + pong_payload.len()].copy_from_slice(pong_payload);
-            let pong_len = 2 + pong_payload.len();
-            if let Poll::Ready(Err(e)) = Pin::new(raw.as_mut()).poll_write(cx, &pong[..pong_len]) {
-                tracing::debug!(error = %e, "WS pong write failed");
+            // Masked in client mode (§5.3); a busy inner stashes the reply
+            // and the next poll drains it before reading further frames.
+            let mut frame = Vec::with_capacity(2 + 4 + pong_payload.len());
+            build_control_frame(&mut frame, 0x0a, pong_payload, client_mode);
+            match poll_write_control(raw, cx, pending_control_write, pending_control_pos, &frame) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => {
+                    tracing::debug!(error = %e, "WS pong write failed");
+                }
+                Poll::Pending => unreachable!("poll_write_control never returns Pending"),
             }
             cx.waker().wake_by_ref();
             Poll::Pending
@@ -296,6 +389,8 @@ impl WsByteStream {
             raw_frame_mask_key: [0u8; 4],
             raw_frame_payload_len: 0,
             raw_payload_buf: Vec::new(),
+            pending_control_write: Vec::new(),
+            pending_control_pos: 0,
         }
     }
 }
@@ -333,16 +428,45 @@ impl AsyncRead for WsByteStream {
             needs_flush: _,
             pending_frame_payload_len: _,
             drain_completed: _,
-            client_mode: _,
+            client_mode,
             raw_read_state,
             raw_frame_opcode,
             raw_frame_masked,
             raw_frame_mask_key,
             raw_frame_payload_len,
             raw_payload_buf,
+            pending_control_write,
+            pending_control_pos,
         } = this;
 
         let raw = inner;
+
+        // Flush any stashed control frame (close/pong reply, or the shutdown
+        // close frame) before parsing the next frame — the write parks on
+        // Pending with the waker registered, never silently dropped.
+        if !pending_control_write.is_empty() {
+            let remaining = &pending_control_write[*pending_control_pos..];
+            match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    *pending_control_pos += n;
+                    if *pending_control_pos >= pending_control_write.len() {
+                        pending_control_write.clear();
+                        *pending_control_pos = 0;
+                    } else {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
         // No-progress frames (zero-length data / ping / pong) consumed in
         // this poll call — capped so a peer flooding empty frames cannot pin
         // the poll loop CPU-bound within a single call (see the constant).
@@ -394,6 +518,32 @@ impl AsyncRead for WsByteStream {
                             let raw_len = (head[1] & 0x7f) as u64;
                             *raw_frame_opcode = opcode;
                             *raw_frame_masked = masked;
+                            // RFC 6455 §5.2: RSV1-3 MUST be 0 unless an
+                            // extension that defines them is negotiated —
+                            // none is here, so any set bit is protocol
+                            // corruption (or a masking bypass attempt).
+                            if head[0] & 0x70 != 0 {
+                                *raw_read_state = RawReadState::Idle;
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "WS frame has RSV bits set",
+                                )));
+                            }
+                            // RFC 6455 §5.1/§5.3 mask direction: client→server
+                            // frames MUST be masked, server→client MUST NOT.
+                            // We are the server when !client_mode, the client
+                            // when client_mode.
+                            if masked == *client_mode {
+                                *raw_read_state = RawReadState::Idle;
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    if *client_mode {
+                                        "WS frame from server must not be masked"
+                                    } else {
+                                        "WS frame from client must be masked"
+                                    },
+                                )));
+                            }
                             if raw_len == 126 {
                                 *raw_read_state = RawReadState::ReadingExtendedLen2 {
                                     ext: [0u8; 2],
@@ -433,6 +583,9 @@ impl AsyncRead for WsByteStream {
                                         cx,
                                         buf,
                                         &[],
+                                        *client_mode,
+                                        pending_control_write,
+                                        pending_control_pos,
                                     );
                                     if disp.is_pending() {
                                         continue;
@@ -493,6 +646,9 @@ impl AsyncRead for WsByteStream {
                                     cx,
                                     buf,
                                     &[],
+                                    *client_mode,
+                                    pending_control_write,
+                                    pending_control_pos,
                                 );
                                 if disp.is_pending() {
                                     continue;
@@ -552,6 +708,9 @@ impl AsyncRead for WsByteStream {
                                     cx,
                                     buf,
                                     &[],
+                                    *client_mode,
+                                    pending_control_write,
+                                    pending_control_pos,
                                 );
                                 if disp.is_pending() {
                                     continue;
@@ -599,6 +758,9 @@ impl AsyncRead for WsByteStream {
                                     cx,
                                     buf,
                                     &[],
+                                    *client_mode,
+                                    pending_control_write,
+                                    pending_control_pos,
                                 );
                                 if disp.is_pending() {
                                     continue;
@@ -654,6 +816,9 @@ impl AsyncRead for WsByteStream {
                                 cx,
                                 buf,
                                 &owned_payload,
+                                *client_mode,
+                                pending_control_write,
+                                pending_control_pos,
                             );
                             // Return the payload Vec (with its capacity) to
                             // raw_payload_buf for reuse by the next frame —
@@ -705,11 +870,13 @@ impl AsyncWrite for WsByteStream {
             // was the duplicate-frame bug).
             if *drain_completed {
                 *drain_completed = false;
-                // Invariant: the re-polled buf is the payload of the drained
-                // frame (every in-tree caller honors the same-buf-until-Ok
-                // AsyncWrite contract). Self-check in debug builds.
-                debug_assert_eq!(buf.len(), *pending_frame_payload_len);
-                return Poll::Ready(Ok(*pending_frame_payload_len));
+                // The re-polled buf is normally the drained frame's payload
+                // (every in-tree caller honors the same-buf-until-Ok
+                // AsyncWrite contract); clamp to the actual buf length so a
+                // contract-violating caller can never be over-credited —
+                // over-crediting would make it skip bytes never written.
+                let claimed = (*pending_frame_payload_len).min(buf.len());
+                return Poll::Ready(Ok(claimed));
             }
             if !*needs_flush && !buf.is_empty() {
                 // Server-mode zero-copy fast path: no masking, so the payload
@@ -895,9 +1062,78 @@ impl AsyncWrite for WsByteStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let raw = &mut *self.inner;
-        let _ = Pin::new(&mut *raw).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
-        Pin::new(&mut *raw).poll_shutdown(cx)
+        let this = &mut *self;
+        let WsByteStream {
+            inner,
+            write_buf,
+            write_pos,
+            needs_flush,
+            pending_control_write,
+            pending_control_pos,
+            client_mode,
+            ..
+        } = this;
+
+        let raw = inner;
+
+        // Shutdown must not drop a partially-flushed frame: drain write_buf
+        // first (its payload was already accepted from the caller's buf).
+        if *needs_flush {
+            let remaining = &write_buf[*write_pos..];
+            match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    *write_pos += n;
+                    if *write_pos >= write_buf.len() {
+                        *write_pos = 0;
+                        *needs_flush = false;
+                    } else {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // Send the RFC 6455 close frame (masked in client mode, §5.3),
+        // retrying on Pending instead of a single ignored poll_write. The
+        // frame rides the same stash as the read-path close/pong replies.
+        if pending_control_write.is_empty() {
+            build_control_frame(pending_control_write, 0x08, &[0x03, 0xe8], *client_mode);
+            *pending_control_pos = 0;
+        }
+        if !pending_control_write.is_empty() {
+            let remaining = &pending_control_write[*pending_control_pos..];
+            match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    *pending_control_pos += n;
+                    if *pending_control_pos >= pending_control_write.len() {
+                        pending_control_write.clear();
+                        *pending_control_pos = 0;
+                    } else {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        Pin::new(raw.as_mut()).poll_shutdown(cx)
     }
 }
 impl Transport for WsByteStream {
@@ -1134,6 +1370,38 @@ mod tests {
         frame
     }
 
+    /// Like [`ws_binary_frame`] but masked — what a compliant client sends
+    /// to the server (RFC 6455 §5.3). Server-mode `WsByteStream`s enforce
+    /// the mask direction, so tests feeding frames INTO a server-mode
+    /// stream must mask them.
+    fn ws_masked_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x82];
+        let mask: [u8; 4] = rand::random();
+        if payload.len() <= 125 {
+            frame.push(0x80 | payload.len() as u8);
+        } else if payload.len() <= u16::MAX as usize {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i & 3]);
+        }
+        frame
+    }
+
+    /// Zero-length BINARY frame with the mask bit set (client-mode wire
+    /// shape), for server-mode streams.
+    fn ws_masked_zero_frame() -> Vec<u8> {
+        let mask: [u8; 4] = rand::random();
+        let mut frame = vec![0x82, 0x80];
+        frame.extend_from_slice(&mask);
+        frame
+    }
+
     /// Zero-length data frames must be consumed without surfacing a 0-byte
     /// read (which tokio treats as EOF and would tear the tunnel down).
     /// A zero-length frame followed by a real frame must deliver the real
@@ -1145,11 +1413,12 @@ mod tests {
         let (mut server_io, client_io) = tokio::io::duplex(8192);
         let mut ws = WsByteStream::from_raw(Box::new(client_io), false);
 
-        // Zero-length BINARY frame, then a real frame.
-        server_io.write_all(&[0x82, 0x00]).await.unwrap();
+        // Zero-length BINARY frame, then a real frame. Masked: the stream
+        // is server-mode and enforces RFC 6455 mask direction (L16).
+        server_io.write_all(&ws_masked_zero_frame()).await.unwrap();
         let payload = b"after-zero-frame";
         server_io
-            .write_all(&ws_binary_frame(payload))
+            .write_all(&ws_masked_frame(payload))
             .await
             .unwrap();
 
@@ -1163,11 +1432,15 @@ mod tests {
         assert_eq!(&out[..n], payload);
 
         // A second zero-length frame (through the extended-length path too:
-        // 0x82 with extended length 0) must behave the same.
-        server_io.write_all(&[0x82, 126, 0, 0]).await.unwrap();
+        // masked 0x82 with extended length 0) must behave the same. Wire
+        // order for a masked frame is header, extended length, THEN mask key
+        // (RFC 6455 §5.2): [0x82, 0xFE, 0x00, 0x00, mask..4].
+        let mut ext_zero = vec![0x82, 0x80 | 126, 0, 0];
+        ext_zero.extend_from_slice(&ws_masked_zero_frame()[2..6]);
+        server_io.write_all(&ext_zero).await.unwrap();
         let payload2 = b"second-payload";
         server_io
-            .write_all(&ws_binary_frame(payload2))
+            .write_all(&ws_masked_frame(payload2))
             .await
             .unwrap();
         let n2 = ws.read(&mut out).await.unwrap();
@@ -1184,9 +1457,11 @@ mod tests {
 
         // Between the old 14 KiB clamp and the V2 64 KiB cap: the WS
         // transport must accept it; V1 enforcement happens in protocol.rs.
+        // Masked: the stream is server-mode and enforces RFC 6455 mask
+        // direction (L16).
         let payload = vec![0x5a; 20 * 1024];
         server_io
-            .write_all(&ws_binary_frame(&payload))
+            .write_all(&ws_masked_frame(&payload))
             .await
             .unwrap();
         let mut out = vec![0u8; payload.len()];
@@ -1196,7 +1471,7 @@ mod tests {
 
         // Exactly 64 KiB is the V2 limit and must pass the WS decoder.
         let big = vec![0x6b; 64 * 1024];
-        server_io.write_all(&ws_binary_frame(&big)).await.unwrap();
+        server_io.write_all(&ws_masked_frame(&big)).await.unwrap();
         let mut big_out = vec![0u8; big.len()];
         let n2 = ws.read(&mut big_out).await.unwrap();
         assert_eq!(n2, big.len());
@@ -1206,7 +1481,7 @@ mod tests {
         // the transport must not clamp encrypted V2 frames below the cap.
         let aead_padded = vec![0x6c; 64 * 1024 + 128];
         server_io
-            .write_all(&ws_binary_frame(&aead_padded))
+            .write_all(&ws_masked_frame(&aead_padded))
             .await
             .unwrap();
         let mut padded_out = vec![0u8; aead_padded.len()];
@@ -1216,7 +1491,7 @@ mod tests {
 
         // One byte over the cap + AEAD overhead is rejected at the transport.
         let huge = vec![0x6c; 64 * 1024 + 129];
-        server_io.write_all(&ws_binary_frame(&huge)).await.unwrap();
+        server_io.write_all(&ws_masked_frame(&huge)).await.unwrap();
         let err = ws.read(&mut big_out).await.unwrap_err();
         assert!(
             err.to_string().contains("WS frame too large"),
@@ -1481,6 +1756,205 @@ mod tests {
             sent.load(std::sync::atomic::Ordering::Relaxed),
             34,
             "exactly one frame must be sent; the re-polled buf must not be re-sent"
+        );
+    }
+
+    /// L16: RSV1-3 bits must be zero (no extensions negotiated) and the
+    /// mask direction must match the role — server-mode streams reject
+    /// unmasked frames (a client MUST mask, §5.3), client-mode streams
+    /// reject masked frames (a server MUST NOT mask, §5.1).
+    #[tokio::test]
+    async fn ws_frame_rsv_and_mask_direction_enforced() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Server mode: an unmasked frame from a client is a protocol error.
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), false);
+        raw.write_all(&[0x82, 0x02, b'a', b'b']).await.unwrap();
+        let mut out = [0u8; 4];
+        let err = ws.read(&mut out).await.unwrap_err();
+        assert!(
+            err.to_string().contains("must be masked"),
+            "unexpected error: {err}"
+        );
+
+        // Server mode: RSV bits set → rejected regardless of masking.
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), false);
+        // Masked frame with RSV1 (0x40) + RSV2 (0x20) set.
+        let mut frame = ws_masked_zero_frame();
+        frame[0] = 0x82 | 0x40 | 0x20;
+        raw.write_all(&frame).await.unwrap();
+        let err = ws.read(&mut out).await.unwrap_err();
+        assert!(err.to_string().contains("RSV"), "unexpected error: {err}");
+
+        // Client mode: a masked frame from a server is a protocol error.
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), true);
+        raw.write_all(&[0x82, 0x80 | 0x02, 0, 0, 0, 0, b'a', b'b'])
+            .await
+            .unwrap();
+        let err = ws.read(&mut out).await.unwrap_err();
+        assert!(
+            err.to_string().contains("must not be masked"),
+            "unexpected error: {err}"
+        );
+
+        // And the legitimate shapes still decode: masked frame into a
+        // server-mode stream, unmasked frame into a client-mode stream.
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), false);
+        raw.write_all(&ws_masked_frame(b"ok-server")).await.unwrap();
+        let mut out = [0u8; 16];
+        let n = ws.read(&mut out).await.unwrap();
+        assert_eq!(&out[..n], b"ok-server");
+
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), true);
+        raw.write_all(&ws_binary_frame(b"ok-client")).await.unwrap();
+        let n = ws.read(&mut out).await.unwrap();
+        assert_eq!(&out[..n], b"ok-client");
+    }
+
+    /// M3: client-mode control frames (pong reply, shutdown close) are
+    /// masked per RFC 6455 §5.3 — a strict server peer must be able to
+    /// unmask them. The pong is a reply to an inbound (unmasked) ping; the
+    /// close frame must carry the masked 1000 code.
+    #[tokio::test]
+    async fn ws_client_mode_control_frames_are_masked() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        // Pong reply to an inbound ping must be a masked pong on the wire.
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), true);
+        raw.write_all(&[0x89, 0x00]).await.unwrap(); // unmasked ping (server → client)
+                                                     // Drive the read path so the ping is dispatched and the pong sent.
+        let read_task = tokio::spawn(async move {
+            let mut out = [0u8; 4];
+            let _ = timeout(Duration::from_millis(200), ws.read(&mut out)).await;
+        });
+        let mut pong = [0u8; 6];
+        let n = timeout(Duration::from_secs(5), raw.read(&mut pong))
+            .await
+            .expect("pong must arrive")
+            .expect("read pong");
+        read_task.await.expect("read task");
+        assert_eq!(n, 6, "masked pong: 2 header + 4 mask bytes");
+        assert_eq!(pong[0], 0x8a, "FIN + PONG opcode");
+        assert_eq!(pong[1], 0x80, "MASK bit must be set on client-mode pong");
+        // pong[2..6] is the 4-byte mask key: RFC 6455 §5.3 requires a fresh
+        // random key per frame, so its value is asserted only where payload
+        // exists to unmask (the close frame below). Empty payload → nothing
+        // masked; the key bytes are arbitrary.
+
+        // Shutdown close frame must be masked, with the 1000 code XORed
+        // against the 4-byte mask key.
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), true);
+        ws.shutdown().await.expect("shutdown");
+        let mut close = [0u8; 8];
+        let n = timeout(Duration::from_secs(5), raw.read(&mut close))
+            .await
+            .expect("close frame must arrive")
+            .expect("read close");
+        assert_eq!(n, 8, "masked close: 2 header + 4 mask + 2 payload");
+        assert_eq!(close[0], 0x88, "FIN + CLOSE opcode");
+        assert_eq!(close[1], 0x80 | 0x02, "MASK bit + 2-byte payload");
+        assert_eq!(
+            close[6] ^ close[2],
+            0x03,
+            "close code 1000 masked (high byte)"
+        );
+        assert_eq!(
+            close[7] ^ close[3],
+            0xe8,
+            "close code 1000 masked (low byte)"
+        );
+    }
+
+    /// L18: poll_shutdown must not drop a partially-flushed frame — it
+    /// drains write_buf (and the close frame) to completion before
+    /// delegating to the inner shutdown.
+    #[test]
+    fn ws_shutdown_drains_partially_flushed_frame() {
+        struct ShutdownTrackingSink {
+            limit: usize,
+            sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            shutdown_called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl AsyncRead for ShutdownTrackingSink {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for ShutdownTrackingSink {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let n = buf.len().min(self.limit);
+                self.sent.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                Poll::Ready(Ok(n))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.shutdown_called
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut ws = WsByteStream::from_raw(
+            Box::new(ShutdownTrackingSink {
+                limit: 7,
+                sent: sent.clone(),
+                shutdown_called: shutdown_called.clone(),
+            }),
+            false,
+        );
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let buf = vec![0x5au8; 32];
+
+        // Fresh frame write: 34 frame bytes, but the sink accepts only 7 per
+        // poll → partial, needs_flush (the frame is NOT fully on the wire).
+        assert!(matches!(
+            Pin::new(&mut ws).poll_write(&mut cx, &buf),
+            Poll::Pending
+        ));
+
+        // Shutdown must drain the retained frame (34 bytes) AND the close
+        // frame (4 bytes unmasked server-mode) before calling inner
+        // shutdown — 38 bytes total on the wire.
+        loop {
+            match Pin::new(&mut ws).poll_shutdown(&mut cx) {
+                Poll::Ready(Ok(())) => break,
+                Poll::Ready(Err(e)) => panic!("shutdown failed: {e}"),
+                Poll::Pending => {}
+            }
+        }
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::Relaxed),
+            38,
+            "shutdown must drain the partially-flushed frame (34) plus the close frame (4)"
+        );
+        assert!(
+            shutdown_called.load(std::sync::atomic::Ordering::Relaxed),
+            "inner shutdown must be delegated after the drain"
         );
     }
 }

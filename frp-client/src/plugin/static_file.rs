@@ -1,4 +1,3 @@
-use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
@@ -50,25 +49,37 @@ async fn handle_static_file_conn(
     local_path: &str,
     strip_prefix: Option<&str>,
 ) -> Result<(), String> {
-    // Read HTTP request headers in chunks until \r\n\r\n
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 512];
-    loop {
-        let n = client
-            .read(&mut chunk)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Err("connection closed".into());
+    // Read HTTP request headers in chunks until \r\n\r\n. Stop at the FIRST
+    // \r\n\r\n anywhere in the buffer (not only at its end): a pipelined or
+    // body-carrying request may follow the head terminator with more bytes,
+    // and the tail-only check would read past it into the next request until
+    // the 64 KiB cap.
+    // Go parity: http.Server ReadHeaderTimeout (60s) — one absolute deadline
+    // over the whole header read, so a slowloris "trickle" cannot park the
+    // task + fd + plugin listener slot indefinitely.
+    let buf = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = client
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                return Err("connection closed".into());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if buf.len() > 65536 {
+                return Err("request too large".into());
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
-            break;
-        }
-        if buf.len() > 65536 {
-            return Err("request too large".into());
-        }
-    }
+        Ok::<Vec<u8>, String>(buf)
+    })
+    .await
+    .map_err(|_| "read headers timed out".to_string())??;
 
     let headers_str = String::from_utf8_lossy(&buf);
     let mut lines = headers_str.lines();
@@ -181,25 +192,41 @@ async fn handle_static_file_conn(
         return Err("path traversal rejected".into());
     }
 
-    // Read file content from the already-open handle
-    let mut content = Vec::new();
-    file.take(64 * 1024 * 1024) // 64MB max file size
-        .read_to_end(&mut content)
-        .map_err(|e| format!("failed to read file: {e}"))?;
+    // Stream the file body in bounded chunks instead of buffering it whole:
+    // the old path blocked the async task on std::fs::read_to_end and
+    // truncated at 64 MiB (Content-Length then lied). Go's http.FileServer
+    // streams the file — so do we, from the already-open, inode-verified
+    // handle (tokio::fs::File wraps the same fd; position is still 0).
+    let mut file = tokio::fs::File::from_std(file);
+    let size = file
+        .metadata()
+        .await
+        .map_err(|e| format!("failed to stat file: {e}"))?
+        .len();
 
     let mime = mime_from_path(&full_path);
     let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        content.len()
+        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
     );
     client
         .write_all(resp.as_bytes())
         .await
         .map_err(|e| format!("write headers: {e}"))?;
-    client
-        .write_all(&content)
-        .await
-        .map_err(|e| format!("write body: {e}"))?;
+
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("failed to read file: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        client
+            .write_all(&chunk[..n])
+            .await
+            .map_err(|e| format!("write body: {e}"))?;
+    }
 
     Ok(())
 }

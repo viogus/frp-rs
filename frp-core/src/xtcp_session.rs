@@ -12,10 +12,16 @@
 //! - [`XtcpTunnelSession`] — yamux-over-KCP when the `tcp-mux` feature is on
 //!   (Go parity: `fmux.Client`/`fmux.Server` with `KeepAliveInterval=10s` —
 //!   Go sends real keepalive pings; yamux-rs has no keepalive machinery, so
-//!   the tunnel sends none and dead-peer detection relies on KCP dead-link
-//!   detection — and `MaxStreamWindowSize=6MB`); without `tcp-mux`, a
-//!   one-shot raw KCP stream (the pre-existing Rust↔Rust fallback capability
-//!   — one connection per punch, no multiplexing).
+//!   the tunnel sends none. Idle half-open tunnels are reclaimed by a
+//!   driver-side idle watchdog instead: the transport is wrapped in
+//!   [`ReadActivity`], which stamps a timestamp on every inbound read, and
+//!   the driver closes the session after [`TUNNEL_IDLE_CLOSE_MS`] (90s) of
+//!   total inbound silence — an alive idle peer still delivers yamux
+//!   ping/pong frames every ~10s. Outbound-only traffic with a dead peer
+//!   still dies via KCP send-side dead-link detection — and
+//!   `MaxStreamWindowSize=6MB`); without `tcp-mux`, a one-shot raw KCP
+//!   stream (the pre-existing Rust↔Rust fallback capability — one
+//!   connection per punch, no multiplexing).
 //! - [`QuicTunnelSession`] — QUIC over the punched UDP socket (NO yamux;
 //!   QUIC multiplexes streams itself, matching Go's `quic.Dial`/`quic.Listen`
 //!   on `result.lConn`).
@@ -31,13 +37,13 @@
 //! Wire-visible behavior is identical to the per-stream path: KCP over the
 //! winning hole-punch socket, yamux framing, `conv` from the session id.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
 #[cfg(feature = "tcp-mux")]
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 use crate::kcp::KcpConfig;
 use crate::msg::NatHoleDetectBehavior;
@@ -65,6 +71,59 @@ const MAX_INBOUND_QUEUE: usize = 256;
 /// [`spawn_tunnel_driver`]). Go's fatedier yamux fork has no stream cap.
 #[cfg(feature = "tcp-mux")]
 const MAX_TUNNEL_STREAMS: usize = 256;
+
+/// M10 idle-watchdog window (ms): the driver closes the tunnel session after
+/// this long with no inbound KCP input, reclaiming an idle half-open tunnel
+/// (peer vanished without RST — UDP — and nothing to send, so KCP dead-link
+/// detection never trips).
+///
+/// Implementation choice (documented per the round-13 plan): a DRIVER-SIDE
+/// IDLE WATCHDOG over a yamux keepalive ping. The vendored yamux 0.14
+/// exposes no ping/keepalive API (its RTT pings are internal and never
+/// time out), so a Go-style "3 missed 10s keepalives → close" countdown is
+/// not reachable from the driver. Instead the driver observes inbound KCP
+/// input directly: an ALIVE idle tunnel carries a yamux ping (or pong)
+/// roughly every 5-10s — both sides' connections send a ping every 10s and
+/// answer the peer's — so 90s of total silence proves the peer is gone.
+/// (Go's fmux keepalive interval is 10s; 90s is 9x that, a conservative
+/// bound.) Outbound-only traffic with a dead peer still dies via KCP
+/// send-side dead-link, so the watchdog only fires in the true idle case.
+#[cfg(feature = "tcp-mux")]
+const TUNNEL_IDLE_CLOSE_MS: u64 = 90_000;
+
+/// Round-13 adaptive idle tick (ms): when a driver pass produces no activity
+/// (no open served, no request drained, no inbound stream), the driver's next
+/// wake stretches from `KCP_TICK_MS` (10ms — 100 wakes/s of UDP try_recv
+/// syscalls on an idle tunnel) to this value. Any activity snaps back to the
+/// fast tick. The idle tick does not delay dead-link detection past the 90s
+/// idle watchdog, and inbound data/ACKs still wake the driver immediately via
+/// the poll wakers; the idle tick only paces the nothing-at-all case.
+#[cfg(feature = "tcp-mux")]
+const TUNNEL_IDLE_TICK_MS: u64 = 1000;
+
+/// Wall-clock millis (same clock for writer and reader; a clock jump would
+/// have to exceed [`TUNNEL_IDLE_CLOSE_MS`] to matter).
+#[cfg(feature = "tcp-mux")]
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// L24: flips the driver's `bg_alive` flag when dropped, so ANY task exit —
+/// the normal loop break AND a panic-unwind in the loop body — marks the
+/// session dead instead of leaving `is_alive()` stuck true on a task that no
+/// longer runs (which would strand callers waiting on a driver that is gone).
+#[cfg(feature = "tcp-mux")]
+struct BgAliveGuard(Arc<AtomicBool>);
+
+#[cfg(feature = "tcp-mux")]
+impl Drop for BgAliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Yamux-over-KCP session (tcp-mux feature on)
@@ -94,6 +153,14 @@ pub struct XtcpTunnelSession {
     /// Driver exit signal: `close()` sends; dropping the last handle closes
     /// the channel, which also wakes the driver.
     driver_drop_tx: watch::Sender<()>,
+    /// Wake channel for queued open requests (round-13 fix): the driver's
+    /// open-serving drain only runs when the driver is polled, and the idle
+    /// tick can be as long as 1s (adaptive idle loop) — without this wake an
+    /// open would wait up to 1s to be served. `open_stream` notify_one()s
+    /// after a successful try_send; the stored permit makes the wake
+    /// loss-proof (a notify arriving while the driver is inside its select
+    /// completes the next `notified()` immediately).
+    open_wake: Arc<Notify>,
 }
 
 #[cfg(feature = "tcp-mux")]
@@ -101,20 +168,39 @@ impl XtcpTunnelSession {
     /// Open a new stream on the session (visitor / yamux client role).
     ///
     /// Bounded by `timeout`: a healthy session answers in milliseconds; a
-    /// dead-but-undetected session (peer vanished without RST — UDP) times
-    /// out once KCP dead-link detection trips or `timeout` expires. The
-    /// caller (`getTunnelConn` semantics) then closes the session and
-    /// triggers a re-punch.
+    /// dead-but-undetected session (peer vanished without RST — UDP) is
+    /// closed by the driver's idle watchdog after ~90s of no inbound KCP
+    /// input (see [`TUNNEL_IDLE_CLOSE_MS`]), or times out here once
+    /// `timeout` expires. The caller (`getTunnelConn` semantics) then closes
+    /// the session and triggers a re-punch.
     pub async fn open_stream(&self, timeout: Duration) -> Result<Box<dyn P2pStream>, String> {
         if !self.is_alive() {
             return Err("no tunnel session".into());
         }
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.open_tx
-            .try_send(reply_tx)
-            .map_err(|_| "tunnel session open queue full (peer stalled?)".to_string())?;
-        // The driver's I/O branch re-arms every KCP_TICK_MS, so the request
-        // is served within one tick without an extra wake-up channel.
+        match self.open_tx.try_send(reply_tx) {
+            Ok(()) => {
+                // Wake the driver to serve the request promptly: with the
+                // adaptive idle tick the driver may be parked on a 1s
+                // timeout, and the notify (stored permit — loss-proof)
+                // completes the select's `open_wake.notified()` arm so the
+                // request is drained immediately.
+                self.open_wake.notify_one();
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err("tunnel session open queue full (peer stalled?)".to_string());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Driver exited (close, connection error, idle watchdog):
+                // the session is DEAD, not busy — classify the channel
+                // Disconnected as dead so the caller re-punches instead of
+                // misreading it as congestion.
+                return Err("tunnel session closed".to_string());
+            }
+        }
+        // The driver's open-serving drain runs within one tick (fast KCP
+        // tick with activity; up to ~1s on the idle path) — the notify above
+        // shortens that to the next driver poll.
         tokio::time::timeout(timeout, reply_rx)
             .await
             .map_err(|_| format!("timeout opening tunnel stream ({timeout:?})"))?
@@ -310,18 +396,41 @@ pub async fn xtcp_p2p_connect_yamux_session(
     )
     .await?;
 
-    // 2. Compat KCP stream to futures traits for yamux.
+    // 2. Wrap the KCP stream in ReadActivity so the driver's idle watchdog
+    //    (TUNNEL_IDLE_CLOSE_MS) can observe inbound KCP input: yamux-rs
+    //    exposes no activity signal, so the timestamp is stamped here on
+    //    every read the connection makes. (Tokio side — futures-util has no
+    //    `io` feature in this crate — then compat'd to futures traits below.)
+    let last_read_ms = Arc::new(AtomicU64::new(now_epoch_ms()));
+    let kcp_stream = ReadActivity {
+        inner: kcp_stream,
+        last_read_ms: last_read_ms.clone(),
+    };
     let compat_stream = kcp_stream.compat();
 
     // 3. Create the yamux Connection. Go frp v0.71 sets
     //    KeepAliveInterval=10s and MaxStreamWindowSize=6MB in the XTCP path
     //    (fmux.Config; the fatedier fork sends real ping frames). yamux-rs
     //    0.14 has NO keepalive field — its Config has no ping machinery — so
-    //    the tunnel data plane sends no keepalive pings at all; dead-peer
-    //    detection relies on KCP dead-link detection instead. Only the
-    //    receive window needs setting (same values as the per-stream path).
+    //    the tunnel data plane sends no keepalive pings at all. Idle
+    //    half-open tunnels are reclaimed by the driver-side idle watchdog
+    //    instead (ReadActivity timestamp vs TUNNEL_IDLE_CLOSE_MS — an alive
+    //    idle peer still delivers yamux ping/pong frames every ~10s, so 90s
+    //    of silence proves the peer is gone); outbound-only traffic with a
+    //    dead peer still dies via KCP send-side dead-link. Only the receive
+    //    window needs setting (same values as the per-stream path).
     let mut yamux_cfg = Config::default();
     yamux_cfg.set_max_connection_receive_window(Some(6 * 1024 * 1024 * 64));
+    // Round-13 per-stream window cap: Go frp pins MaxStreamWindowSize=6MiB
+    // on the XTCP data plane (client/connector.go `MaxStreamWindowSize`,
+    // client/visitor/xtcp.go + server/service.go — 6<<20). yamux-rs
+    // auto-tunes a single stream's receive window up to the connection
+    // limit (~320MiB at this 384MiB connection window, see
+    // `ConnectionWindowUpdate`), so one stream could claim the entire
+    // window — the vendored `max_stream_receive_window` cap (vendor
+    // fork, default None = crates.io behavior) restores Go's per-stream
+    // bound; the connection window keeps bounding the sum.
+    yamux_cfg.set_max_stream_receive_window(Some(6 * 1024 * 1024));
     yamux_cfg.set_max_num_streams(MAX_TUNNEL_STREAMS);
     let mode = if yamux_client {
         Mode::Client
@@ -351,17 +460,19 @@ pub async fn xtcp_p2p_connect_yamux_session(
         !yamux_client,
         MAX_TUNNEL_STREAMS,
         tick_ms,
+        last_read_ms,
     ))
 }
 
 /// A tunnel stream handed out by the driver, tracking it in the driver's
-/// outbound-stream counter until the caller drops it.
+/// live-stream mirror until the caller drops it.
 ///
 /// yamux 0.14 exposes no stream-count API, so the driver mirrors its own
-/// outbound accounting with a counter: incremented when the open is handed
-/// out, decremented here when the caller drops the stream (yamux removes the
-/// stream from its own map on the next driver poll — the driver polls
-/// inbound before serving opens, so the mirror is consistent with yamux's
+/// accounting with a counter: incremented when an outbound open is handed
+/// out OR an inbound stream is admitted, decremented here when the caller
+/// (or the driver, client-mode) drops the stream (yamux removes the stream
+/// from its own map on the next driver poll — the driver polls inbound
+/// before serving opens, so the mirror is consistent with yamux's
 /// `streams.len()`).
 #[cfg(feature = "tcp-mux")]
 struct LiveP2pStream {
@@ -412,6 +523,65 @@ impl tokio::io::AsyncWrite for LiveP2pStream {
     }
 }
 
+/// Wraps the tunnel transport to record the wall-clock time of the last
+/// successful read into a shared [`AtomicU64`], for the driver's idle
+/// watchdog ([`TUNNEL_IDLE_CLOSE_MS`]). yamux exposes no inbound-activity
+/// signal, so the driver observes KCP input at the transport level: when a
+/// datagram arrives, the KcpStream read returns data and the timestamp
+/// updates; an idle-but-alive peer still delivers yamux ping/pong frames
+/// every ~10s, so a 90s gap in reads means the peer is gone.
+#[cfg(feature = "tcp-mux")]
+struct ReadActivity<S> {
+    inner: S,
+    last_read_ms: Arc<AtomicU64>,
+}
+
+// NOTE: implemented on the TOKIO side (before `.compat()` into futures
+// traits for yamux) because frp-core's futures-util has no `io` feature —
+// `futures_util::io::ReadBuf` is unavailable there. The wrapper is applied
+// to the raw `KcpStream` in `xtcp_p2p_connect_yamux_session`, then
+// `TokioAsyncReadCompatExt` converts the whole thing for the yamux
+// connection.
+#[cfg(feature = "tcp-mux")]
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ReadActivity<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if r.is_ready() {
+            self.last_read_ms.store(now_epoch_ms(), Ordering::Release);
+        }
+        r
+    }
+}
+
+#[cfg(feature = "tcp-mux")]
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ReadActivity<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Spawn the background driver for a yamux tunnel connection and return the
 /// session handle.
 ///
@@ -420,21 +590,24 @@ impl tokio::io::AsyncWrite for LiveP2pStream {
 /// session handle drop.
 ///
 /// `max_streams` MUST match the `Config::max_num_streams` the connection was
-/// built with: the driver mirrors yamux's own outbound-cap accounting
-/// (`Active::poll_new_outbound` refuses once `streams.len() >=
-/// max_num_streams`) with a caller-side counter, so a cap hit fails the
-/// INDIVIDUAL open request instead of yamux 0.14 converting
-/// `Err(TooManyStreams)` into a session-wide `ConnectionState::Cleanup`
-/// (`drop_all_streams` — every live stream dies and the tunnel must be
-/// re-punched). Go's fatedier fork has no stream cap and fails per-open; the
-/// vendored inbound path already RSTs per-stream at the cap, and this mirror
-/// gives the outbound direction the same survival.
+/// built with: the driver mirrors yamux's own cap accounting (`poll_new_outbound`
+/// / `poll_next_inbound` refuse once `streams.len() >= max_num_streams`) with
+/// a caller-side counter that counts BOTH outbound opens and admitted inbound
+/// streams (round-13 fix: an outbound-only mirror passes while the inbound
+/// poll already filled the map — the cap check would then miss the window and
+/// `poll_new_outbound`'s `Err(TooManyStreams)` would convert into a
+/// session-wide `ConnectionState::Cleanup` (`drop_all_streams` — every live
+/// stream dies and the tunnel must be re-punched)). A cap hit fails the
+/// INDIVIDUAL open request instead. Go's fatedier fork has no stream cap and
+/// fails per-open; the vendored inbound path already RSTs per-stream at the
+/// cap, and this mirror gives the outbound direction the same survival.
 #[cfg(feature = "tcp-mux")]
 fn spawn_tunnel_driver<T>(
     mut conn: yamux::Connection<T>,
     server_mode: bool,
     max_streams: usize,
     tick_ms: u64,
+    idle_watch: Arc<AtomicU64>,
 ) -> XtcpTunnelSession
 where
     T: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin + Send + 'static,
@@ -450,10 +623,21 @@ where
     let (driver_drop_tx, mut driver_drop_rx) = watch::channel(());
     let alive = Arc::new(AtomicBool::new(true));
     let bg_alive = alive.clone();
-    // Mirror of the connection's outbound stream count (see `max_streams`
-    // above). Incremented when an open is handed to its caller; decremented
-    // by the per-stream drop guard when the caller closes the stream.
-    let live_outbound = Arc::new(AtomicUsize::new(0));
+    // Mirror of the connection's live stream-map count (see `max_streams`
+    // above): outbound opens AND admitted inbound streams (round-13 fix —
+    // the inbound poll below runs BEFORE the open-serving loop, so an
+    // inbound stream admitted this pass occupies a map slot the mirror must
+    // already reflect when the loop checks the cap). Incremented when an
+    // open is handed to its caller or an inbound stream is admitted;
+    // decremented by the per-stream drop guard when the stream is dropped.
+    let live_streams = Arc::new(AtomicUsize::new(0));
+    // Round-13 wake channel for queued open requests (see the struct field
+    // `open_wake`): the driver parks on `open_wake.notified()` in its select,
+    // so an open queued between polls is served at the next driver wake, not
+    // at the next (possibly 1s-idle) tick. A notify during the select stores
+    // a permit — the next `notified()` completes immediately.
+    let open_wake = Arc::new(Notify::new());
+    let driver_open_wake = open_wake.clone();
     // Teardown-signal clone for the nested select inside the inbound-delivery
     // path (the outer loop's receiver cannot be borrowed twice). Both
     // receivers observe sends after their creation, so `close()` /
@@ -464,13 +648,66 @@ where
         let mut pending_opens: std::collections::VecDeque<
             oneshot::Sender<Result<Box<dyn P2pStream>, String>>,
         > = std::collections::VecDeque::new();
+        // L24: the guard flips `bg_alive` false on ANY task exit, including
+        // a panic in the loop body — the explicit store below covers the
+        // normal break paths, the guard covers the rest (with panic=abort
+        // the process dies anyway; under unwind the task must not leave a
+        // stale "alive" behind for callers to wait on).
+        let _alive_guard = BgAliveGuard(bg_alive.clone());
+        // M8 cap-mirror retry guard: set when an open request is requeued
+        // after a TooManyStreams from poll_new_outbound (the mirror said
+        // "room" but yamux's stream map was still at the cap — the caller's
+        // drop decrements the mirror immediately, yamux frees the slot on
+        // the driver's next inbound poll). The requeue + break lets that
+        // inbound poll run before the retry; the flag keeps the retry to ONE
+        // per request — a second TooManyStreams for the same request means
+        // the cap is genuinely reached and must fail the open rather than
+        // requeue forever. Reset when the retried request resolves.
+        let mut too_many_retried = false;
+        // Round-13 adaptive idle tick: with steady traffic the driver wakes
+        // every KCP_TICK_MS (fast tick — drives KCP, serves opens). When a
+        // pass produced NO activity (no open served, no request drained, no
+        // inbound stream), the next timeout stretches to TUNNEL_IDLE_TICK_MS
+        // — a completely idle session must not wake 100 times per second
+        // (each wake is a UDP try_recv syscall through poll_read). Any
+        // activity snaps the tick back to the fast value. The idle tick does
+        // not delay KCP dead-link detection past the 90s idle watchdog
+        // (TUNNEL_IDLE_CLOSE_MS), and inbound data/ACKs still wake the
+        // driver immediately via the poll wakers — the idle tick only paces
+        // the nothing-at-all case.
+        let mut tick_ms = tick_ms;
         loop {
+            // M10 idle watchdog: close the session after ~90s of no inbound
+            // KCP input (see TUNNEL_IDLE_CLOSE_MS). Checked per iteration —
+            // each pass is ≤ one tick (+ bounded delivery waits), so the
+            // granularity is ~90s ± 0.5s. The timestamp is written by the
+            // ReadActivity wrapper around the transport on every successful
+            // read (any inbound datagram carrying a yamux frame — including
+            // the ~10s ping/pong keepalive traffic of an alive idle peer).
+            if now_epoch_ms().saturating_sub(idle_watch.load(Ordering::Acquire))
+                > TUNNEL_IDLE_CLOSE_MS
+            {
+                tracing::warn!(
+                    idle_ms = TUNNEL_IDLE_CLOSE_MS,
+                    "XTCP P2P: tunnel session idle (no inbound KCP input for {}s), closing",
+                    TUNNEL_IDLE_CLOSE_MS / 1000,
+                );
+                break;
+            }
             // Timeout-driven I/O poll: the timeout both keeps KCP ticking
             // (via poll_read → maybe_tick → drive_kcp inside
             // poll_next_inbound) and bounds every iteration, so open
-            // requests queued outside the poll are served within one tick.
+            // requests queued outside the poll are served within one tick
+            // (or immediately — the `open_wake` arm below).
+            let mut had_activity = false;
             let result = tokio::select! {
                 _ = driver_drop_rx.changed() => break,
+                // Open-request wake (round-13): an open_stream queued between
+                // polls must be served now, not at the next (possibly 1s)
+                // idle tick. The stored permit makes the wake loss-proof; the
+                // drain happens on the next loop pass (this arm breaks out of
+                // the select, the loop body then re-enters with a fast tick).
+                _ = driver_open_wake.notified() => None,
                 r = tokio::time::timeout(Duration::from_millis(tick_ms), poll_fn(|cx| {
                     // (1) Drain enqueued open requests (visitor role). Stop at
                     // the cap: a stalled peer must make open_stream fail fast
@@ -480,7 +717,10 @@ where
                             break;
                         }
                         match bg_open_rx.try_recv() {
-                            Ok(req) => pending_opens.push_back(req),
+                            Ok(req) => {
+                                had_activity = true;
+                                pending_opens.push_back(req);
+                            }
                             Err(mpsc::error::TryRecvError::Empty)
                             | Err(mpsc::error::TryRecvError::Disconnected) => break,
                         }
@@ -491,31 +731,60 @@ where
                     // with yamux's own accounting (a stream dropped by its
                     // caller still occupies a map slot until this poll).
                     let first = conn.poll_next_inbound(cx);
+                    // Round-13 cap-mirror fix: an inbound stream admitted by
+                    // the poll above now occupies a stream-map slot — count
+                    // it BEFORE the open-serving loop so the mirror reflects
+                    // the map when the loop checks the cap. (Without this,
+                    // the mirror passes while the map is full, poll_new_outbound
+                    // returns TooManyStreams, and yamux 0.14 converts that into
+                    // a session-wide cleanup — drop_all_streams kills every
+                    // live bridge.) The double-poll below counts its own
+                    // admission for the NEXT iteration.
+                    if matches!(&first, Poll::Ready(Some(Ok(_)))) {
+                        live_streams.fetch_add(1, Ordering::Release);
+                        had_activity = true;
+                    }
                     // (3) Serve as many opens as the ACK backlog admits.
                     // pop-first so a full backlog stops the loop; the request
                     // stays queued and is served on a later pass after the
                     // inbound poll below reads the ACKs that free backlog.
+                    // `too_many_retried` (declared at task scope, above the
+                    // driver loop) guards the M8 cap-mirror retry — see the
+                    // Err(TooManyStreams) arm below — to one extra pass per
+                    // request.
                     loop {
                         let Some(req) = pending_opens.pop_front() else {
                             break;
                         };
                         // Caller cancelled (dropped its receiver) — never
-                        // open a phantom stream for it.
+                        // open a phantom stream for it. Also settles any
+                        // in-flight M8 retry: its request is gone, so the
+                        // next TooManyStreams gets a fresh retry.
                         if req.is_closed() {
+                            too_many_retried = false;
                             continue;
                         }
-                        // Mirror yamux's own outbound-cap check
+                        // Mirror yamux's own stream-cap check
                         // (vendor/yamux `Active::poll_new_outbound`:
                         // `streams.len() >= max_num_streams`): refuse the
                         // INDIVIDUAL open here. Calling poll_new_outbound at
                         // the cap would make it return Err(TooManyStreams),
                         // which yamux 0.14 turns into a session-wide cleanup
                         // (drop_all_streams — all live streams die, tunnel
-                        // re-punch). Go's fatedier fork has no cap and fails
+                        // re-punch). The mirror counts live outbound AND
+                        // admitted inbound streams (round-13 fix — the
+                        // inbound poll in (2) admitted a stream into the map
+                        // that the mirror must already reflect; with an
+                        // outbound-only mirror the cap check misses that
+                        // window and the TooManyStreams cleanup kills the
+                        // tunnel). Go's fatedier fork has no cap and fails
                         // per-open; this gives the outbound direction the
                         // same survival as the vendored inbound per-stream
                         // RST.
-                        if live_outbound.load(Ordering::Acquire) >= max_streams {
+                        if live_streams.load(Ordering::Acquire) >= max_streams {
+                            // Mirror refusal settles any in-flight M8 retry
+                            // (the request resolves here, failing properly).
+                            too_many_retried = false;
                             let _ = req.send(Err(format!(
                                 "yamux tunnel stream cap reached ({max_streams})"
                             )));
@@ -544,15 +813,19 @@ where
                                     Poll::Ready(Ok(_)) | Poll::Pending => {
                                         // Count BEFORE handing out: the guard
                                         // below decrements when the caller
-                                        // drops the stream.
-                                        live_outbound.fetch_add(1, Ordering::Release);
+                                        // drops the stream. The open resolved,
+                                        // settling any in-flight M8 retry.
+                                        too_many_retried = false;
+                                        live_streams.fetch_add(1, Ordering::Release);
+                                        had_activity = true;
                                         let _ = req.send(Ok(Box::new(LiveP2pStream {
                                             inner: Box::new(stream.compat())
                                                 as Box<dyn P2pStream>,
-                                            live: live_outbound.clone(),
+                                            live: live_streams.clone(),
                                         }) as Box<dyn P2pStream>));
                                     }
                                     Poll::Ready(Err(e)) => {
+                                        too_many_retried = false;
                                         let _ = req.send(Err(format!(
                                             "yamux open stream: {e}"
                                         )));
@@ -560,6 +833,40 @@ where
                                 }
                             }
                             Poll::Ready(Err(e)) => {
+                                if !too_many_retried
+                                    && matches!(
+                                        e,
+                                        yamux::ConnectionError::TooManyStreams
+                                    )
+                                {
+                                    // M8 cap-mirror TOCTOU: the caller's drop
+                                    // guard decrements `live_streams`
+                                    // immediately, but yamux frees the
+                                    // stream-map slot only when the driver
+                                    // polls inbound. If a caller dropped a
+                                    // stream between the mirror check above
+                                    // and this poll, the mirror says "room"
+                                    // while yamux's map is still at the cap —
+                                    // poll_new_outbound returns
+                                    // TooManyStreams, and propagating it
+                                    // would make yamux 0.14 clean up the
+                                    // WHOLE session (drop_all_streams — all
+                                    // live streams die, tunnel re-punch).
+                                    // Requeue the request and let the NEXT
+                                    // iteration's inbound poll (2) process
+                                    // the drop; the re-check then either
+                                    // opens or refuses via the mirror. One
+                                    // retry per request (guarded by
+                                    // `too_many_retried`, reset when the
+                                    // request resolves in any of the arms
+                                    // above) — a second TooManyStreams for
+                                    // the same request means the cap is
+                                    // genuinely reached.
+                                    too_many_retried = true;
+                                    pending_opens.push_front(req);
+                                    break;
+                                }
+                                too_many_retried = false;
                                 let _ = req.send(Err(format!("yamux open stream: {e}")));
                             }
                             Poll::Pending => {
@@ -570,21 +877,44 @@ where
                     }
                     // (4) Double-poll inbound (ACK + flush; drives the KCP
                     // tick on the read path; the flush pushes the SYN frames
-                    // written by (3) onto the wire this tick).
-                    match first {
+                    // written by (3) onto the wire this tick). A stream
+                    // admitted here is counted for the NEXT iteration's cap
+                    // check (the serve loop already ran — its mirror check
+                    // cannot collide with this admission).
+                    let inbound = match first {
                         Poll::Ready(r) => Poll::Ready(r),
                         Poll::Pending => conn.poll_next_inbound(cx),
+                    };
+                    if matches!(&inbound, Poll::Ready(Some(Ok(_)))) {
+                        live_streams.fetch_add(1, Ordering::Release);
+                        had_activity = true;
                     }
-                })) => r,
+                    inbound
+                })) => Some(r),
+            };
+            // Open-request wake: the queued request is served next pass —
+            // snap back to the fast tick so a burst of opens is not paced by
+            // the idle tick, then loop (the drain runs in the next select).
+            let Some(result) = result else {
+                tick_ms = KCP_TICK_MS as u64;
+                continue;
             };
             match result {
                 Ok(Some(Ok(stream))) => {
+                    // Activity (inbound stream admitted): keep the fast tick.
+                    tick_ms = KCP_TICK_MS as u64;
                     if server_mode {
                         // Provider: deliver to the accept queue. On a full
                         // queue, a bounded wait for a permit gives the accept
                         // loop time to drain before the stream is dropped
-                        // (server_mux pattern).
-                        let stream = Box::new(stream.compat()) as Box<dyn P2pStream>;
+                        // (server_mux pattern). Wrapped in the drop-guard
+                        // (round-13): the stream was counted in the mirror at
+                        // admission, and the guard decrements when the accept
+                        // loop drops it.
+                        let stream = Box::new(LiveP2pStream {
+                            inner: Box::new(stream.compat()) as Box<dyn P2pStream>,
+                            live: live_streams.clone(),
+                        }) as Box<dyn P2pStream>;
                         if let Err(e) = inbound_tx.try_send(stream) {
                             match e {
                                 mpsc::error::TrySendError::Full(s) => {
@@ -615,11 +945,20 @@ where
                         }
                     } else {
                         // Client mode: the provider never opens streams to
-                        // the visitor — drop unexpected inbound.
+                        // the visitor — drop unexpected inbound. Wrapped in
+                        // the drop-guard (round-13) so the mirror decrements
+                        // with the drop (the map slot frees on the driver's
+                        // next inbound poll) — an unwrapped drop would leak
+                        // the admission count and permanently shrink the
+                        // mirror's headroom.
                         tracing::debug!(
                             stream_id = stream.id().val(),
                             "XTCP P2P: unexpected inbound stream on client session, dropping"
                         );
+                        drop(Box::new(LiveP2pStream {
+                            inner: Box::new(stream.compat()) as Box<dyn P2pStream>,
+                            live: live_streams.clone(),
+                        }) as Box<dyn P2pStream>);
                     }
                 }
                 Ok(Some(Err(e))) => {
@@ -631,7 +970,17 @@ where
                     break;
                 }
                 Err(_elapsed) => {
-                    // KCP tick — no I/O event this pass; loop and re-poll.
+                    // KCP tick — no I/O event this pass. Adaptive idle tick
+                    // (round-13): any activity (open served, request drained,
+                    // inbound stream) keeps the fast KCP tick; a completely
+                    // quiet pass stretches the next wake to
+                    // TUNNEL_IDLE_TICK_MS so an idle session stops waking
+                    // 100×/s.
+                    if had_activity {
+                        tick_ms = KCP_TICK_MS as u64;
+                    } else {
+                        tick_ms = TUNNEL_IDLE_TICK_MS;
+                    }
                 }
             }
         }
@@ -644,6 +993,7 @@ where
         inbound_rx: tokio::sync::Mutex::new(inbound_rx),
         alive,
         driver_drop_tx,
+        open_wake,
     }
 }
 
@@ -833,7 +1183,13 @@ mod tests {
         let mut cfg = yamux::Config::default();
         cfg.set_max_num_streams(CAP);
         let conn = yamux::Connection::new(driver_io.compat(), cfg, yamux::Mode::Client);
-        let session = spawn_tunnel_driver(conn, false, CAP, 10);
+        let session = spawn_tunnel_driver(
+            conn,
+            false,
+            CAP,
+            10,
+            Arc::new(AtomicU64::new(now_epoch_ms())),
+        );
 
         let mut streams: Vec<Box<dyn P2pStream>> = Vec::new();
         for _ in 0..CAP {

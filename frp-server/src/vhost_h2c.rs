@@ -224,9 +224,12 @@ async fn handle_stream(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    // HTTP/2 carries Basic Auth in the regular `authorization` header (no
-    // pseudo-header). Reused for route matching, auth check, and per-user
-    // routing — same as the HTTP/1.1 path.
+    // HTTP/2 has no pseudo-header for auth. Every h2 request is
+    // absolute-form (`:authority` is the URL authority), so Go
+    // `checkRouteAuthByRequest` reads `Proxy-Authorization` ONLY (never
+    // `authorization`) and answers 407 + Proxy-Authenticate on failure.
+    // The same credentials are reused for route matching and per-user
+    // routing (Go `getRequestRouteUser`).
     let http_auth = extract_basic_auth_headers(request.headers());
     tracing::debug!(host = %host, path = %path, peer = %peer, "HTTP VHost (h2c) request for '{}' path '{}' from {}", host, path, peer);
 
@@ -243,15 +246,17 @@ async fn handle_stream(
         request_head,
         peer,
         "HTTP",
+        true, // h2c is always absolute-form (Go req.URL.Host != "")
     )
     .await
     {
         Ok(f) => f,
-        Err(VhostResolveError::Unauthorized) => {
+        Err(VhostResolveError::Unauthorized { .. }) => {
+            // h2c is always absolute-form → 407 + Proxy-Authenticate.
             return send_h2_error(
                 respond,
-                401,
-                &[("www-authenticate", "Basic realm=\"frp\"")],
+                407,
+                &[("proxy-authenticate", "Basic realm=\"frp\"")],
                 Bytes::new(),
             )
             .await;
@@ -287,23 +292,33 @@ async fn handle_stream(
     let (client, control) = tokio::io::duplex(128 * 1024);
     // send().await: backpressure is correct — a full control channel must
     // not silently drop a user connection (the HTTP/1.1 path uses the same
-    // pattern). This runs in a per-connection task, so the await is free.
-    // A closed channel means the control handler is gone — answer 502,
-    // matching the HTTP/1.1 path.
-    if ctl_tx
-        .tx
-        .send(InternalMsg::ProxyUserConn {
+    // pattern). Bounded (vhost.rs:748-764 parity): a control handler that
+    // stops draining must not pin this task + fd + permit forever; after
+    // CTL_SEND_TIMEOUT the send is abandoned and the h2 stream answers 502.
+    match tokio::time::timeout(
+        crate::state::CTL_SEND_TIMEOUT,
+        ctl_tx.tx.send(InternalMsg::ProxyUserConn {
             proxy_name: forward.proxy_name,
             user_conn: frp_core::transport::IoStream::SshChannel(Box::new(control)),
             pre_read: forward.request_head,
             user_conn_permit: None,
             // Local sender — no group selection was done.
             group_selected: false,
-        })
-        .await
-        .is_err()
+        }),
+    )
+    .await
     {
-        return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            // Channel closed: control handler died between lookup and
+            // dispatch — answer 502.
+            tracing::warn!(host = %host, path = %path, "h2c route for '{}' path '{}' found but control channel closed", host, path);
+            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(host = %host, path = %path, "h2c route for '{}' path '{}' found but control channel send timed out; answering 502", host, path);
+            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        }
     }
 
     let (mut client_r, client_w) = tokio::io::split(client);
@@ -356,12 +371,16 @@ async fn handle_stream(
 
 /// Strip the port from an h2 `:authority` (Host equivalent), handling IPv6
 /// literals like `[::1]:8080` the same way `extract_host_header` does for
-/// HTTP/1.1.
+/// HTTP/1.1, and trim exactly one trailing dot (Go `CanonicalHost`
+/// `TrimSuffix(host, ".")` — same as `canonicalize_authority` in vhost.rs,
+/// so "example.com." routes like "example.com" on both paths).
 fn host_from_authority(authority: &str) -> &str {
-    if let Some(rest) = authority.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(authority);
-    }
-    authority.split(':').next().unwrap_or(authority)
+    let hostname = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(authority)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    hostname.strip_suffix('.').unwrap_or(hostname)
 }
 
 /// Re-encode an h2 request as an HTTP/1.1 request head. `:authority` becomes
@@ -415,10 +434,12 @@ fn build_http1_request_head(request: &http::Request<RecvStream>) -> Vec<u8> {
     head
 }
 
-/// Extract Basic Auth credentials from the `authorization` header of an h2
-/// request (HTTP/2 has no pseudo-header for auth).
+/// Extract Basic Auth credentials from the `proxy-authorization` header of
+/// an h2 request (HTTP/2 has no pseudo-header for auth). h2 requests are
+/// always absolute-form, so Go `checkRouteAuthByRequest` reads ONLY
+/// `Proxy-Authorization` here — never `authorization`.
 fn extract_basic_auth_headers(headers: &http::HeaderMap) -> Option<(String, String)> {
-    let value = headers.get("authorization")?.to_str().ok()?;
+    let value = headers.get("proxy-authorization")?.to_str().ok()?;
     let encoded = value.strip_prefix("Basic ")?.trim();
     let decoded = frp_core::base64::decode(encoded).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
@@ -861,9 +882,17 @@ mod tests {
         assert_eq!(host_from_authority("example.com"), "example.com");
         // Port is stripped (host:port).
         assert_eq!(host_from_authority("example.com:8080"), "example.com");
+        // Exactly one trailing dot is trimmed (Go CanonicalHost
+        // TrimSuffix strips ONE dot — "example.com.." becomes
+        // "example.com.", which STAYS unroutable because the trailing
+        // dot survives; matching canonicalize_authority in vhost.rs).
+        assert_eq!(host_from_authority("example.com."), "example.com");
+        assert_eq!(host_from_authority("example.com.:8080"), "example.com");
+        assert_eq!(host_from_authority("example.com.."), "example.com.");
         // Bracketed IPv6 keeps the bare address, with or without a port.
         assert_eq!(host_from_authority("[::1]:8080"), "::1");
         assert_eq!(host_from_authority("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(host_from_authority("[2001:db8::1]."), "2001:db8::1");
         // Empty authority.
         assert_eq!(host_from_authority(""), "");
         // An UNBRACKETED IPv6 literal splits at the first colon — garbage-in
@@ -932,10 +961,12 @@ mod tests {
 
     #[test]
     fn test_extract_basic_auth_headers() {
-        // base64("user:pass") = "dXNlcjpwYXNz".
+        // base64("user:pass") = "dXNlcjpwYXNz". h2 requests are always
+        // absolute-form → the credentials live in `proxy-authorization`
+        // (Go checkRouteAuthByRequest), never `authorization`.
         let mut h = http::HeaderMap::new();
         h.insert(
-            "authorization",
+            "proxy-authorization",
             http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
         );
         assert_eq!(
@@ -945,30 +976,45 @@ mod tests {
 
         // Missing header → None.
         assert_eq!(extract_basic_auth_headers(&http::HeaderMap::new()), None);
-        // Wrong scheme → None.
+        // A plain `authorization` header must NOT authenticate an
+        // absolute-form request (Go reads only Proxy-Authorization there).
         let mut h = http::HeaderMap::new();
         h.insert(
             "authorization",
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(
+            extract_basic_auth_headers(&h),
+            None,
+            "authorization must not authenticate an absolute-form request"
+        );
+        // Wrong scheme → None.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "proxy-authorization",
             http::HeaderValue::from_static("Bearer abc"),
         );
         assert_eq!(extract_basic_auth_headers(&h), None);
         // Decodes but has no colon separator (base64("use") = "dXNl") → None.
         let mut h = http::HeaderMap::new();
         h.insert(
-            "authorization",
+            "proxy-authorization",
             http::HeaderValue::from_static("Basic dXNl"),
         );
         assert_eq!(extract_basic_auth_headers(&h), None);
         // Decodes to non-UTF-8 bytes (base64(0xff) = "/w==") → None.
         let mut h = http::HeaderMap::new();
         h.insert(
-            "authorization",
+            "proxy-authorization",
             http::HeaderValue::from_static("Basic /w=="),
         );
         assert_eq!(extract_basic_auth_headers(&h), None);
         // Not valid base64 → None.
         let mut h = http::HeaderMap::new();
-        h.insert("authorization", http::HeaderValue::from_static("Basic !!!"));
+        h.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_static("Basic !!!"),
+        );
         assert_eq!(extract_basic_auth_headers(&h), None);
     }
 

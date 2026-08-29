@@ -1939,11 +1939,32 @@ fn resolve_dynamic_token_inner(
         // context of a multi-thread runtime). The synchronous spawn remains
         // as a fallback for callers outside any runtime (unit tests) and for
         // current-thread runtimes, where `block_in_place` would panic.
+        //
+        // Both arms are bounded by EXEC_TIMEOUT (mirroring
+        // `ValueSource::resolve`): a hung token command must fail startup
+        // after 10 s instead of parking the process forever. The async arm
+        // kills the child on drop (kill_on_drop); the sync arm SIGKILLs it
+        // (Unix) after `recv_timeout` expires.
+        const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let output = match tokio::runtime::Handle::try_current() {
             Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| handle.block_on(exec_token_command_async(&parts)))
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        tokio::time::timeout(EXEC_TIMEOUT, exec_token_command_async(&parts))
+                            .await
+                            .map_err(|_elapsed| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!(
+                                        "dynamic token exec command timed out after {}s",
+                                        EXEC_TIMEOUT.as_secs()
+                                    ),
+                                )
+                            })?
+                    })
+                })
             }
-            _ => exec_token_command_sync(&parts),
+            _ => exec_token_command_sync_timeout(&parts, EXEC_TIMEOUT),
         };
         match output {
             // Redact the command line and the script's captured stderr (both
@@ -1962,20 +1983,59 @@ fn resolve_dynamic_token_inner(
 }
 
 /// Run the exec:// token command via `tokio::process`, so `wait_with_output`
-/// parks the runtime's process driver instead of a worker thread. Returns a
-/// `std::process::Output` so both paths share `finish_exec_output`.
+/// parks the runtime's process driver instead of a worker thread. The child
+/// is killed on drop, so the caller's `tokio::time::timeout` (10 s) bounds
+/// the total runtime. Returns a `std::process::Output` so both paths share
+/// `finish_exec_output`.
 async fn exec_token_command_async(parts: &[&str]) -> std::io::Result<std::process::Output> {
     tokio::process::Command::new(parts[0])
         .args(&parts[1..])
+        .kill_on_drop(true)
         .output()
         .await
 }
 
 /// Synchronous fallback used when no multi-thread tokio runtime is available.
-fn exec_token_command_sync(parts: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(parts[0])
+/// Bounds the child's runtime to `timeout`; on expiry the child is SIGKILLed
+/// (Unix) — the `ValueSource::resolve` sync-arm pattern — so a hung token
+/// command cannot park the caller forever.
+fn exec_token_command_sync_timeout(
+    parts: &[&str],
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    let child = std::process::Command::new(parts[0])
         .args(&parts[1..])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let output = child.wait_with_output();
+        let _ = tx.send(output);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(output) => {
+            let _ = waiter.join();
+            output
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+            let _ = waiter.join();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "dynamic token exec command timed out after {}s",
+                    timeout.as_secs()
+                ),
+            ))
+        }
+    }
 }
 
 /// Shared post-processing for both exec paths: check exit status, take the

@@ -402,6 +402,16 @@ impl CipherWriterState {
             }
         }
 
+        // A first-write (IV+data) buffer fully drained inside poll_flush:
+        // first_write_data_len keeps the pending claim (see poll_flush). The
+        // caller re-polls with the same buf — return the claim without
+        // re-encrypting (the CFB keystream already advanced past it).
+        if this.first_write_data_len > 0 {
+            let data_len = this.first_write_data_len;
+            this.first_write_data_len = 0;
+            return Poll::Ready(Ok(data_len));
+        }
+
         // On first write, emit the random IV generated in new().
         if !this.iv_sent {
             this.iv_sent = true;
@@ -524,9 +534,18 @@ impl CipherWriterState {
                 Poll::Ready(Ok(n)) => {
                     this.first_write_pos += n;
                     if this.first_write_pos >= pending.len() {
+                        // Stash the write claim instead of discarding it:
+                        // this buffer may carry IV+data whose poll_write is
+                        // still pending, and poll_flush has no buf argument
+                        // to consume. The next poll_write sees the stashed
+                        // first_write_data_len and returns it WITHOUT
+                        // re-encrypting (re-encrypting with the already
+                        // advanced CFB keystream would double-encrypt the
+                        // payload). IV-only writes (data_len == 0, parked by
+                        // poll_flush itself) fall through to the eager-IV
+                        // arm below as before.
                         this.first_write_buf = None;
                         this.first_write_pos = 0;
-                        this.first_write_data_len = 0;
                     } else {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;

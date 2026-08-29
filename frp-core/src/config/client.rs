@@ -3,11 +3,25 @@ use serde::{Deserialize, Serialize};
 use super::server::{
     default_authentication_timeout, default_heartbeat_timeout, default_token_auth_timeout,
     default_true, FeatureConfig, LogConfig, ObservabilityConfig, PluginConfig, QuicOptions,
-    StoreConfig, ValueSource, WebServerConfig, MAX_HEARTBEAT_TIMEOUT_SECS,
+    StoreConfig, ValueSource, WebServerConfig,
 };
 
 fn default_udp_packet_size_i64() -> i64 {
     1500
+}
+
+/// Maximum UDP payload size (IPv4: 65535 - 8 UDP - 20 IP = 65507). Clamps
+/// `udp_packet_size` at config load — a hostile config value (e.g. 2^31)
+/// would otherwise allocate a multi-GiB receive buffer per UDP proxy at
+/// runtime (work_conn.rs `vec![0u8; udp_packet_size.max(1)]`).
+const MAX_UDP_PACKET_SIZE: i64 = 65507;
+
+fn clamp_udp_packet_size<'de, D>(d: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = i64::deserialize(d)?;
+    Ok(v.clamp(0, MAX_UDP_PACKET_SIZE))
 }
 
 fn default_visitor_bind_addr() -> String {
@@ -302,9 +316,16 @@ pub struct ClientConfig {
     #[serde(default, alias = "featureGates")]
     pub feature: FeatureConfig,
     /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
-    /// proxy datagrams. Default: 1500 (Go frp compat).
+    /// proxy datagrams. Default: 1500 (Go frp compat). Clamped to
+    /// [0, 65507] at load — the max UDP payload — so a hostile config value
+    /// cannot force a multi-GiB per-proxy allocation at runtime (the
+    /// use-sites in work_conn.rs size their buffers from this value).
     /// Go frp compat: udpPacketSize / UDPPacketSize.
-    #[serde(default = "default_udp_packet_size_i64", alias = "udpPacketSize")]
+    #[serde(
+        default = "default_udp_packet_size_i64",
+        alias = "udpPacketSize",
+        deserialize_with = "clamp_udp_packet_size"
+    )]
     pub udp_packet_size: i64,
     /// OpenTelemetry / observability settings.
     #[serde(default)]
@@ -386,15 +407,18 @@ impl ClientConfig {
             }
         }
 
-        // Go v0.70.1: with tcpMux enabled, application-layer heartbeats are
-        // disabled by default (-1) and yamux keepalive covers liveness. An
-        // explicit value is preserved (Option-style set tracking). This
-        // branch keeps its exact current behavior.
+        // Go v0.71.0: with tcpMux enabled, application-layer heartbeats are
+        // disabled by default (-1) and yamux keepalive covers liveness.
+        // util.EmptyOr(v, -1): a zero value — explicit or default — means
+        // "use the default" = -1; only positive explicit values survive
+        // (round-8 fix 5: the old code preserved an explicit 0, diverging
+        // from Go's value-level semantics; runtime-equivalent, but Go frpc
+        // shows -1 in status output).
         if self.tcp_mux {
-            if !heartbeat_interval_set {
+            if !heartbeat_interval_set || self.heartbeat_interval == 0 {
                 self.heartbeat_interval = -1;
             }
-            if !heartbeat_timeout_set {
+            if !heartbeat_timeout_set || self.heartbeat_timeout == 0 {
                 self.heartbeat_timeout = -1;
             }
         } else {
@@ -425,23 +449,16 @@ impl ClientConfig {
             self.dial_server_timeout = default_dial_server_timeout();
         }
 
-        // Clamp huge explicit heartbeat values — parity with the server-side
-        // clamp in ServerTransportConfig::complete_with_heartbeat_timeout_set
-        // (round-7 finding 5). The client control watchdog sleeps
-        // `hb_timeout.saturating_sub(last_pong.elapsed())`
-        // (frp-client/src/service.rs), and tokio's internal sleep-deadline
-        // math (Instant + duration, i64-scale) overflows only at values far
-        // beyond 3600s — but Go frp has no clamp at all and accepts e.g.
-        // 7200, so this deliberately rewrites pathological values instead of
-        // honoring them (documented divergence, not parity). 3600s is far
-        // beyond any sane heartbeat interval. Values <= 0 (explicit disable)
-        // keep their semantics.
-        if self.heartbeat_interval > MAX_HEARTBEAT_TIMEOUT_SECS {
-            self.heartbeat_interval = MAX_HEARTBEAT_TIMEOUT_SECS;
-        }
-        if self.heartbeat_timeout > MAX_HEARTBEAT_TIMEOUT_SECS {
-            self.heartbeat_timeout = MAX_HEARTBEAT_TIMEOUT_SECS;
-        }
+        // No clamp here — Go frp has none (Go frpc uses 7200; round-8
+        // blocker: the old 3600 cap disconnected a Go frpc ↔ Rust frps
+        // pair in a reconnect loop). Any positive i64 is honored; the
+        // client watchdog arithmetic is overflow-safe by construction:
+        // `Duration::from_secs(u64)` never panics, the watchdog sleeps
+        // `hb_timeout_dur.saturating_sub(last_pong.elapsed())`
+        // (frp-client/src/service.rs), and tokio's sleep/interval saturate
+        // to tokio's far-future deadline via `Instant::checked_add` rather
+        // than panicking. Values <= 0 (explicit disable) keep their
+        // semantics.
     }
 
     /// Merge file-stored proxies/visitors over this config.
@@ -773,4 +790,37 @@ fn default_vnet_netmask() -> String {
 }
 fn default_vnet_mtu() -> u16 {
     1420
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_udp_packet_size;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(deserialize_with = "clamp_udp_packet_size")]
+        v: i64,
+    }
+
+    fn parse(s: &str) -> i64 {
+        serde_json::from_str::<Wrapper>(s).unwrap().v
+    }
+
+    #[test]
+    fn udp_packet_size_clamped_at_load() {
+        // Above the IPv4 UDP max → clamped down (a hostile 2^31 would
+        // allocate a multi-GiB receive buffer per UDP proxy).
+        assert_eq!(parse(r#"{"v": 2147483647}"#), 65507);
+        assert_eq!(parse(r#"{"v": 999999999}"#), 65507);
+        assert_eq!(parse(r#"{"v": 65507}"#), 65507);
+        // In-range values pass through untouched.
+        assert_eq!(parse(r#"{"v": 2048}"#), 2048);
+        assert_eq!(parse(r#"{"v": 1500}"#), 1500);
+        // Negative / zero → clamped to 0 (runtime use-sites floor at 1).
+        assert_eq!(parse(r#"{"v": -5}"#), 0);
+        assert_eq!(parse(r#"{"v": 0}"#), 0);
+        // Non-integer still fails deserialization.
+        assert!(serde_json::from_str::<Wrapper>(r#"{"v": "big"}"#).is_err());
+    }
 }

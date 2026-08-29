@@ -502,4 +502,48 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn test_large_table_scale_ordering_and_fallback() {
+        let mut rt = RouteTable::new();
+        // 64 distinct /24 routes in one vnet, plus a /32 host route on top
+        // of one of them: 65 routes total.
+        for i in 0..64u32 {
+            rt.insert("net", &format!("proxy-{i}"), &format!("10.0.{i}.0/24"))
+                .unwrap();
+        }
+        rt.insert("net", "host", "10.0.7.7/32").unwrap();
+        assert_eq!(rt.len(), 65);
+
+        // Longest prefix match: the /32 shadows its /24.
+        let host_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 7, 7));
+        assert_eq!(rt.lookup("net", &host_ip), Some("host"));
+        // Other addresses in the same /24 fall back to the /24 route.
+        assert_eq!(
+            rt.lookup("net", &IpAddr::V4(Ipv4Addr::new(10, 0, 7, 1))),
+            Some("proxy-7")
+        );
+        // Addresses outside the covered space match nothing.
+        assert_eq!(
+            rt.lookup("net", &IpAddr::V4(Ipv4Addr::new(10, 0, 64, 1))),
+            None
+        );
+
+        // Routes stay sorted by prefix length descending after 65 inserts.
+        let routes = rt.routes.get("net").expect("vnet routes exist");
+        assert!(routes
+            .windows(2)
+            .all(|w| w[0].0.prefix_len() >= w[1].0.prefix_len()));
+        assert_eq!(routes[0].0.prefix_len(), 32, "the /32 must sort first");
+
+        // A same-prefix /24 owned by a different proxy still conflicts at
+        // scale, and the rejected insert leaves the table untouched.
+        assert!(rt.insert("net", "intruder", "10.0.7.0/24").is_err());
+        assert_eq!(rt.len(), 65);
+
+        // Deleting the /32 makes lookups fall back to the /24.
+        rt.remove("net", "host");
+        assert_eq!(rt.len(), 64);
+        assert_eq!(rt.lookup("net", &host_ip), Some("proxy-7"));
+    }
 }

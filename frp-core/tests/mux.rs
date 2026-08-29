@@ -573,3 +573,139 @@ async fn concurrent_open_stream_burst_does_not_wedge_driver() {
         open_errors.join("; ")
     );
 }
+
+/// 2 MiB of patterned data flowing in BOTH directions over one yamux
+/// session at once. Each side writes and reads concurrently (a
+/// write-then-read ordering would deadlock once both sides fill the
+/// window), and every byte must arrive intact — a byte-reordering or
+/// drop in the frame path would surface as an exact-length mismatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mux_2mib_bidirectional_byte_exact() {
+    let interval = Duration::from_secs(60);
+    // 1 MiB duplex (vs the 64 KiB default): yamux auto-tunes the per-stream
+    // receive window past the 64 KiB duplex capacity on a 2 MiB transfer,
+    // and full-window DATA frames over a smaller shared duplex deadlock
+    // (real TCP has per-direction buffers; a shared duplex does not).
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let (_server_control, mut incoming, _client_control, session) = connected_mux_pair_over(
+        client_io,
+        server_io,
+        mux_config(interval),
+        mux_config(interval),
+    )
+    .await;
+
+    let mut client_stream = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
+        .await
+        .expect("client open_stream must complete")
+        .expect("client session must stay open");
+    client_stream.write_all(b"p").await.expect("probe write");
+    client_stream.flush().await.expect("probe flush");
+    let mut server_stream = tokio::time::timeout(Duration::from_secs(5), incoming.recv())
+        .await
+        .expect("server must accept the stream")
+        .expect("server session must stay open");
+    let mut probe = [0u8; 1];
+    server_stream
+        .read_exact(&mut probe)
+        .await
+        .expect("server must read the probe byte");
+
+    const N: usize = 2 * 1024 * 1024;
+    let c2s: Vec<u8> = (0..N).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+    let s2c: Vec<u8> = (0..N).map(|i| ((i * 17 + 3) % 251) as u8).collect();
+
+    let (mut c_r, mut c_w) = tokio::io::split(client_stream);
+    let (mut s_r, mut s_w) = tokio::io::split(server_stream);
+
+    // Writes and reads run concurrently per side — the 2 MiB each way far
+    // exceeds the ~256 KiB yamux window, so a side that only writes would
+    // park forever waiting for the peer's reads.
+    let c2s_data = c2s.clone();
+    let s2c_data = s2c.clone();
+    let client_write = tokio::spawn(async move {
+        c_w.write_all(&c2s_data).await.expect("c2s write");
+        c_w.flush().await.expect("c2s flush");
+    });
+    let client_read = tokio::spawn(async move {
+        let mut got = vec![0u8; N];
+        c_r.read_exact(&mut got).await.expect("s2c read");
+        got
+    });
+    let server_write = tokio::spawn(async move {
+        s_w.write_all(&s2c_data).await.expect("s2c write");
+        s_w.flush().await.expect("s2c flush");
+    });
+    let server_read = tokio::spawn(async move {
+        let mut got = vec![0u8; N];
+        s_r.read_exact(&mut got).await.expect("c2s read");
+        got
+    });
+
+    let (cw, cr, sw, sr) = tokio::join!(client_write, client_read, server_write, server_read);
+    cw.expect("client write task");
+    sw.expect("server write task");
+    let got_s2c = cr.expect("client read task");
+    let got_c2s = sr.expect("server read task");
+    assert_eq!(got_s2c, s2c, "server→client data must be byte-exact");
+    assert_eq!(got_c2s, c2s, "client→server data must be byte-exact");
+}
+
+/// Flow-control backpressure: a 2 MiB write_all through a 64 KiB duplex
+/// (plus the ~256 KiB yamux initial window) cannot complete until the peer
+/// reads. The writer must stall — not spin, not finish early — and then
+/// drain to completion once the peer drains, with every byte intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mux_writer_stalls_on_window_exhaustion_and_drains_on_peer_read() {
+    let interval = Duration::from_secs(60);
+    let (_server_control, mut incoming, _client_control, session) =
+        connected_mux_pair(mux_config(interval), mux_config(interval)).await;
+
+    let mut client_stream = tokio::time::timeout(Duration::from_secs(5), session.open_stream())
+        .await
+        .expect("client open_stream must complete")
+        .expect("client session must stay open");
+    client_stream.write_all(b"p").await.expect("probe write");
+    client_stream.flush().await.expect("probe flush");
+    let mut server_stream = tokio::time::timeout(Duration::from_secs(5), incoming.recv())
+        .await
+        .expect("server must accept the stream")
+        .expect("server session must stay open");
+    let mut probe = [0u8; 1];
+    server_stream
+        .read_exact(&mut probe)
+        .await
+        .expect("server must read the probe byte");
+
+    const N: usize = 2 * 1024 * 1024;
+    let payload: Vec<u8> = (0..N).map(|i| ((i * 7 + 11) % 251) as u8).collect();
+    let write_data = payload.clone();
+    let write_task = tokio::spawn(async move {
+        client_stream
+            .write_all(&write_data)
+            .await
+            .expect("write_all must complete once the peer drains");
+        client_stream.flush().await.expect("flush");
+    });
+
+    // 2 MiB cannot fit in the 64 KiB duplex + ~256 KiB window: the writer
+    // must be parked on credit within 100 ms.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !write_task.is_finished(),
+        "writer must stall on window exhaustion until the peer reads"
+    );
+
+    // Draining the peer side releases window updates; the stalled writer
+    // then completes and the payload arrives byte-exact.
+    let mut got = vec![0u8; N];
+    tokio::time::timeout(Duration::from_secs(30), server_stream.read_exact(&mut got))
+        .await
+        .expect("peer read must complete within 30s")
+        .expect("read_exact");
+    assert_eq!(got, payload, "payload must be byte-exact after the stall");
+    tokio::time::timeout(Duration::from_secs(30), write_task)
+        .await
+        .expect("writer must finish after the peer drains")
+        .expect("write task");
+}

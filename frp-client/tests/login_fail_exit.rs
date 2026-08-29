@@ -166,3 +166,54 @@ async fn login_fail_exit_false_retries_login() {
 
     std::mem::drop(mock);
 }
+
+/// `login_fail_exit = false` + stop during the initial-login backoff:
+/// request_stop() must end run() promptly (round-8 fix — the backoff sleep
+/// select!s stop_rx; a bare sleep would hold the run loop until the ~2.0-
+/// 2.2s backoff elapsed, ignoring the stop request).
+#[tokio::test]
+async fn login_fail_exit_false_stop_during_initial_login_backoff() {
+    common::init_tracing();
+    let token = "login-fail-exit-backoff-token";
+    let server_port = allocate_port();
+    let (mock, login_count) = spawn_rejecting_server(server_port);
+
+    let client = Arc::new(
+        ClientService::new(client_cfg(server_port, token, false), None)
+            .await
+            .unwrap(),
+    );
+    let runner = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = client.run().await;
+        })
+    };
+
+    // Wait for the first Login — the client has just entered the ~2.0-2.2s
+    // initial backoff (1s base ×2 + ≤10% jitter). Stop right there.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while login_count.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("client never sent the first Login");
+
+    client.request_stop();
+    tokio::time::timeout(Duration::from_millis(800), runner)
+        .await
+        .expect(
+            "run() did not return within 800ms of request_stop during the initial login backoff",
+        )
+        .expect("client run() panicked");
+
+    // No runaway redial: at most one retry could have raced in before the
+    // stop landed (the backoff is ~2.2s, so normally exactly 1).
+    assert!(
+        login_count.load(Ordering::SeqCst) <= 2,
+        "client kept re-dialing after request_stop"
+    );
+
+    std::mem::drop(mock);
+}

@@ -97,6 +97,11 @@ where
         // Throttle accept-error warnings: under persistent EMFILE the loop
         // fails ~10/s (100ms pause below), which would flood the logs.
         let mut last_accept_warn: Option<std::time::Instant> = None;
+        // In-flight connection handlers, so shutdown can abort them — Go's
+        // http.Server.Close() closes active connections; a dropped
+        // PluginHandle previously left handler tasks running until the
+        // client disconnected.
+        let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -105,7 +110,7 @@ where
                             // Forwarded interactive data path — disable Nagle.
                             frp_core::transport::set_nodelay(&stream);
                             let s = state.clone();
-                            tokio::spawn(handler(stream, peer, s));
+                            handlers.spawn(handler(stream, peer, s));
                         }
                         Err(e) => {
                             // Warn at most once per second while the accept
@@ -133,6 +138,11 @@ where
                 }
             }
         }
+        // Abort in-flight handlers (Go http.Server.Close() semantics) and
+        // wait until every task has actually stopped, so the plugin's local
+        // port is never left half-served after the handle is dropped.
+        handlers.abort_all();
+        while handlers.join_next().await.is_some() {}
     });
 
     Ok(PluginHandle {
@@ -471,6 +481,12 @@ pub(super) fn resolve_content_length<'a>(
 /// an existing header with the same name is replaced), matching Go
 /// `pkg/plugin/client/http_common.go rewriteHTTPPluginRequest`.
 ///
+/// `x_forwarded_for` is the peer address to append as `X-Forwarded-For`
+/// (Go `httputil.ReverseProxy`'s `SetXForwarded`: the inbound chain is
+/// preserved and the peer appended — `https2http`/`https2https` pass the
+/// connection peer; `http2http`/`http2https` pass `None`, matching Go,
+/// which does not set X-Forwarded-For there).
+///
 /// Only the head is read here. Body bytes that happen to arrive in the same
 /// TCP read as the head are returned in [`ForwardedRequest::body_prefix`] so
 /// nothing is lost — Go's http.Server streams request bodies, and discarding
@@ -479,6 +495,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     stream: &mut S,
     host_rewrite: &str,
     request_headers: &std::collections::HashMap<String, String>,
+    x_forwarded_for: Option<std::net::IpAddr>,
 ) -> Result<ForwardedRequest, String> {
     // Read HTTP headers in chunks until \r\n\r\n. Stop at the FIRST
     // \r\n\r\n anywhere in the buffer (not only at its end): with a request
@@ -553,12 +570,27 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         "keep-alive:",
         "expect:",
     ];
+    // Inbound X-Forwarded-For chain, preserved by the https plugins (Go
+    // SetXForwarded appends the peer to the existing chain).
+    let mut prior_xff: Vec<String> = Vec::new();
     let mut fwd = format!("{method} {path} HTTP/1.0\r\n");
     for line in lines {
         if line.is_empty() {
             continue;
         }
         let lower = line.to_lowercase();
+        // When appending the peer IP (https plugins), the inbound
+        // X-Forwarded-For line is collected here and re-emitted canonically
+        // after the loop — the original line must not pass through as well,
+        // or the backend sees two X-Forwarded-For headers.
+        if x_forwarded_for.is_some() && lower.starts_with("x-forwarded-for:") {
+            if let Some(v) = line.split_once(':').map(|(_, v)| v.trim().to_string()) {
+                if !v.is_empty() {
+                    prior_xff.push(v);
+                }
+            }
+            continue;
+        }
         if hop_by_hop.iter().any(|h| lower.starts_with(h)) {
             continue;
         }
@@ -602,8 +634,19 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // "host" is skipped: Go's req.Header.Set cannot set Host — it is
     // controlled by hostHeaderRewrite (or the original request).
     // Names/values are sanitized against CR/LF like every other header.
+    // X-Forwarded-For is skipped here when the https plugins append the
+    // peer: it is emitted canonically below — Go's Header.Set runs AFTER
+    // SetXForwarded, so a configured value replaces the appended chain
+    // (emitting both would give the backend two X-Forwarded-For lines).
+    let configured_xff = request_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+        .map(|(_, v)| v.clone());
     for (k, v) in request_headers {
         if k.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if x_forwarded_for.is_some() && k.eq_ignore_ascii_case("x-forwarded-for") {
             continue;
         }
         let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
@@ -612,6 +655,18 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
             continue;
         }
         fwd.push_str(&format!("{safe_k}: {safe_v}\r\n"));
+    }
+    if let Some(cfg_xff) = configured_xff {
+        fwd.push_str(&format!("X-Forwarded-For: {cfg_xff}\r\n"));
+    } else if let Some(ip) = x_forwarded_for {
+        if prior_xff.is_empty() {
+            fwd.push_str(&format!("X-Forwarded-For: {ip}\r\n"));
+        } else {
+            fwd.push_str(&format!(
+                "X-Forwarded-For: {}, {ip}\r\n",
+                prior_xff.join(", ")
+            ));
+        }
     }
     if framing == Some(BodyFraming::Chunked) {
         fwd.push_str("Transfer-Encoding: chunked\r\n");

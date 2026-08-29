@@ -48,9 +48,15 @@ async fn handle_conn(
     host_rewrite: &str,
     request_headers: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    let fwd =
-        crate::plugin::read_request_and_build_forward(&mut client, host_rewrite, request_headers)
-            .await?;
+    // No X-Forwarded-For append: Go http2http.go does not call
+    // SetXForwarded (only the https2http/https2https variants do).
+    let fwd = crate::plugin::read_request_and_build_forward(
+        &mut client,
+        host_rewrite,
+        request_headers,
+        None,
+    )
+    .await?;
 
     // Connect to backend
     let mut remote = TcpStream::connect(target)

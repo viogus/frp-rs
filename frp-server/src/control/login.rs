@@ -325,33 +325,6 @@ async fn verify_login_auth(
         // AFTER the plugin hook and auth — Go NewControl parity, validated
         // against the MUTATED login (control.go:437).
 
-        // --- Validate run_id (Go frp v0.71.0 ValidateRunID) ---
-        // Go 0.71.0 server/service.go rejects a client-supplied run id that is
-        // empty, longer than 64 bytes, or contains non-printable characters
-        // before it enters routing tables / logs / dashboards. frp-rs
-        // normalizes a missing run_id to a generated UUID below, but a
-        // client-supplied oversized or control-character run_id must be
-        // rejected to match Go behavior (and to keep log lines and map keys
-        // well-formed). Rust Strings are always valid UTF-8, so only the
-        // length and printable-character checks apply.
-        if let Some(rid) = login.run_id.as_deref() {
-            // Round 10 (LOW): an empty client-supplied run_id must also be
-            // rejected (Go ValidateRunID "run id cannot be empty") — the
-            // old `!rid.is_empty()` exception let `Some("")` flow into
-            // routing tables and logs as the key "". None (absent) still
-            // normalizes to a generated UUID below.
-            if rid.len() > 64 || rid.chars().any(|c| c.is_control()) {
-                warn!(peer = ?peer, run_id_len = %rid.len(), "Login rejected: invalid run_id (max 64 printable bytes)");
-                send_login_error(
-                    stream,
-                    "invalid run id: must be at most 64 printable bytes".into(),
-                    v2,
-                )
-                .await;
-                return Err(());
-            }
-        }
-
         // --- Replay protection: timestamp freshness + duplicate detection ---
         if auth_cfg.token_auth_timeout && auth_cfg.authentication_timeout > 0 {
             if let Some(ts) = login.timestamp {
@@ -451,6 +424,41 @@ async fn verify_login_auth(
     Ok((oidc_subject, stream))
 }
 
+/// Go `unicode.IsPrint` parity for run_id validation (Go name.go
+/// validateIdentifier → IsPrint). Printable = graphic runes
+/// (categories L/M/N/P/S plus Zs). Go's Latin-1 fast path: any rune
+/// ≤ 0xFF that is not a space (U+0020) is NOT spacing (Zs), so U+00A0
+/// (non-breaking space) is rejected; the space U+0020 stays printable.
+/// U+00AD (soft hyphen, Cf), U+2028/U+2029 (Zl/Zp) are not graphic and
+/// not printable. Rust `is_whitespace()` includes Zl/Zp — excluded
+/// explicitly below. `is_control()` covers Cc (Go IsControl) but not
+/// Cf, which is why U+00AD gets its own case.
+///
+/// The >Latin-1 fallback uses std-only category probes (Rust has no
+/// punctuation/symbol/mark methods): alphanumeric (L+N) and spacing
+/// whitespace (Zs) are printable, everything else is REJECTED. This
+/// diverges from Go only in the fail-closed direction — combining marks
+/// and non-ASCII punctuation/symbols that Go accepts are rejected here —
+/// and never accepts a rune Go rejects (Cf, Co, Cn, Zl/Zp are all
+/// refused). Run ids are UUIDs in practice, so the gap is unreachable
+/// for real clients.
+fn is_printable_run_id_char(c: char) -> bool {
+    match c {
+        // U+0020 is the only printable Latin-1 spacing rune.
+        ' ' => true,
+        // Latin-1 fast path: every other rune ≤ 0xFF that is not a
+        // graphic category (e.g. U+00A0 Zs, U+00AD Cf) is unprintable.
+        '\u{00A0}' | '\u{00AD}' => false,
+        // Go IsControl covers Cc; also covers the C0 range already.
+        c if c.is_control() => false,
+        // Latin-1 graphic runes are printable (Go's isPrintLatin1).
+        c if (c as u32) <= 0xFF => true,
+        // Above Latin-1: L/N print; Zs prints (incl. U+3000); Zl/Zp
+        // (U+2028/2029) do NOT (Go IsGraphic). See the fail-closed note.
+        c => c.is_alphanumeric() || (c.is_whitespace() && !matches!(c, '\u{2028}' | '\u{2029}')),
+    }
+}
+
 /// Authenticate a new control connection and set up per-client state.
 /// On success returns all state needed by the main select! loop.
 /// On failure sends LoginResp with an error and returns `Err(())`.
@@ -536,9 +544,14 @@ pub(crate) async fn authenticate(
     // plugins preserve run_id, so the split is invisible in practice;
     // pathological plugins get the pre-plugin value in the bookkeeping
     // maps and the mutated value in the replay table.
+    // An empty client-supplied run_id normalizes to a generated UUID just
+    // like an absent one (Go server/service.go:789-791: `RunID == ""` →
+    // util.RandID(), BEFORE ValidateRunID). `Some("")` must never flow into
+    // routing tables / logs / the LoginResp as the key "".
     let run_id = login
         .run_id
         .clone()
+        .filter(|id| !id.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // --- Server plugin: login hook (Go parity: BEFORE auth verify) ---
@@ -632,6 +645,44 @@ pub(crate) async fn authenticate(
                 }
             }
             Ok(None) => {}
+        }
+    }
+
+    // --- Validate run_id (Go frp v0.71.0 RegisterControl + ValidateRunID) ---
+    // Go server/service.go:789-791 FIRST normalizes an empty run id to a
+    // generated UUID (util.RandID), THEN validates — on ALL auth paths
+    // (token AND OIDC), before VerifyLogin — so only a NON-EMPTY,
+    // oversized (>64 BYTES, Go len()), or non-printable run id is rejected,
+    // before any auth work or before it enters routing tables / logs /
+    // dashboards (an OIDC-path control-char run_id would otherwise reach
+    // `info!(run_id = %run_id)` log lines). Go plugin order: login hook →
+    // RegisterControl (normalize + validate) → VerifyLogin, so the check
+    // runs on the MUTATED login (a plugin mutation can repair an invalid
+    // run_id). Rust Strings are always valid UTF-8, so the UTF-8 check is
+    // automatic; length and printable-rune checks apply (Go name.go:
+    // validateIdentifier). None (absent) still normalizes to a generated
+    // UUID below (as does Some("")).
+    if let Some(rid) = login.run_id.as_deref() {
+        if rid.is_empty() {
+            // Go server/service.go:789-791 parity: an empty run id means a
+            // NEW client — normalize it to a generated UUID BEFORE
+            // validation (Go does this in RegisterControl, after the plugin
+            // hook, on the mutated login). ValidateRunID rejects "", so Go
+            // never lets an empty run id reach routing tables / logs; the
+            // pre-plugin `run_id` above already keyed bookkeeping on a UUID
+            // for the same reason, and this keeps the MUTATED login in
+            // sync with the bookkeeping value (the replay table in
+            // verify_login_auth derives from this field).
+            login.run_id = Some(uuid::Uuid::new_v4().to_string());
+        } else if rid.len() > 64 || !rid.chars().all(is_printable_run_id_char) {
+            warn!(peer = ?peer, run_id_len = %rid.len(), "Login rejected: invalid run_id (max 64 printable bytes)");
+            send_login_error(
+                stream,
+                "invalid run id: must be at most 64 printable bytes".into(),
+                v2,
+            )
+            .await;
+            return Err(());
         }
     }
 
@@ -1605,5 +1656,153 @@ mod oidc_throttle_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn oidc_path_rejects_invalid_run_id() {
+        // L4 regression: run_id validation must run BEFORE the auth branch
+        // (Go service.go:795 ValidateRunID before VerifyLogin), so the OIDC
+        // path rejects oversized / non-printable run ids too — previously
+        // the validation only ran in the token branch and an OIDC login
+        // with a 65-byte run_id sailed through into routing tables and
+        // logs. EMPTY run ids are NOT rejected: Go service.go:789-790
+        // normalizes an empty run id to util.RandID() before validating.
+        // A VALID OIDC JWT is used everywhere so the rejection is provably
+        // run_id-driven, and a control case with a valid run_id proves the
+        // JWT itself authenticates.
+        let (issuer, _stop) = oidc_mock_server();
+        let issuer_url = issuer.clone();
+        let verifier = frp_core::auth::OidcVerifier::new(
+            issuer,
+            "test-audience".into(),
+            false, // skip_expiry
+            false, // skip_issuer
+            false, // skip_nbf
+            false, // skip_audience
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("OidcVerifier against mock");
+        let state = state_with_oidc(verifier);
+
+        let valid_jwt = jsonwebtoken::encode(
+            &jsonwebtoken::Header {
+                alg: jsonwebtoken::Algorithm::HS256,
+                kid: Some("k1".into()),
+                ..jsonwebtoken::Header::default()
+            },
+            &serde_json::json!({
+                "sub": "l4-oidc-user",
+                "exp": 4_102_444_800_u64,
+                "iss": issuer_url,
+                "aud": "test-audience",
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(b"mock-jwks-secret"),
+        )
+        .expect("encode valid OIDC JWT");
+
+        let peer: std::net::SocketAddr = "127.0.0.2:12345".parse().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login_with = |run_id: Option<String>| frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id,
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(valid_jwt.clone()),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+
+        // (a) 65 bytes > Go's 64-byte cap.
+        let (server, mut client) = tokio::io::duplex(4096);
+        let result = authenticate(
+            Box::new(server),
+            &login_with(Some("a".repeat(65))),
+            state.clone(),
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "oversized run_id must be rejected");
+        let error = read_login_resp_error(&mut client).await;
+        assert!(
+            error.contains("invalid run id"),
+            "oversized run_id must be rejected on the OIDC path, got: {error}"
+        );
+
+        // (b) U+00A0 (non-breaking space) is not printable (Go IsPrint).
+        let (server, mut client) = tokio::io::duplex(4096);
+        let result = authenticate(
+            Box::new(server),
+            &login_with(Some("\u{00A0}run".into())),
+            state.clone(),
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "U+00A0 run_id must be rejected");
+        let error = read_login_resp_error(&mut client).await;
+        assert!(
+            error.contains("invalid run id"),
+            "U+00A0 run_id must be rejected on the OIDC path, got: {error}"
+        );
+
+        // (c) Empty client-supplied run_id (Some("")) is normalized to a
+        // generated UUID, NOT rejected (Go service.go:789-790 runs
+        // util.RandID() before ValidateRunID — ValidateRunID never sees
+        // the empty string, so "run id cannot be empty" is unreachable).
+        let (server, _client) = tokio::io::duplex(4096);
+        let result = authenticate(
+            Box::new(server),
+            &login_with(Some(String::new())),
+            state.clone(),
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "empty run_id must normalize to a generated id, not be rejected (Go service.go:789-790)"
+        );
+
+        // (d) Control: valid printable run_id + the same valid JWT must
+        // authenticate — proves (a)-(b) rejections are run_id-driven.
+        let (server, _client) = tokio::io::duplex(4096);
+        let result = authenticate(
+            Box::new(server),
+            &login_with(Some("l4-ok-run-id".into())),
+            state.clone(),
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "valid run_id + valid JWT must authenticate");
     }
 }

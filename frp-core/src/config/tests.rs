@@ -147,6 +147,42 @@ fn test_visitor_config_validation_matches_go() {
 }
 
 #[test]
+fn test_unknown_visitor_type_rejected() {
+    // Round-8 blocker (fix 4): Go v0.71.0 dispatches visitors by a type
+    // switch over stcp/sudp/xtcp — anything else, including empty, fails
+    // ("unknown visitor config type"). A `type = "typo"` visitor used to
+    // load silently and never connect.
+    let mk = |visitor_type: &str| VisitorConfig {
+        name: "v".into(),
+        server_name: "s".into(),
+        bind_port: 7000,
+        visitor_type: visitor_type.into(),
+        ..Default::default()
+    };
+    let err = |v: VisitorConfig| {
+        super::loader::validate_client_config(&ClientConfig {
+            visitors: vec![v],
+            ..Default::default()
+        })
+        .unwrap_err()
+    };
+    assert_eq!(err(mk("typo")), "visitor 'v': unknown visitor type 'typo'");
+    // Empty type is rejected too (serde default "").
+    assert_eq!(err(mk("")), "visitor 'v': unknown visitor type ''");
+    // All three valid types pass.
+    for t in ["stcp", "sudp", "xtcp"] {
+        assert!(
+            super::loader::validate_client_config(&ClientConfig {
+                visitors: vec![mk(t)],
+                ..Default::default()
+            })
+            .is_ok(),
+            "visitor type {t} must be accepted"
+        );
+    }
+}
+
+#[test]
 fn test_merge_store_items_overlays_by_name() {
     let base = ClientConfig {
         server_addr: "127.0.0.1".into(),
@@ -1365,10 +1401,12 @@ dialServerKeepalive = 0
 }
 
 #[test]
-fn test_explicit_zero_client_heartbeats_preserved_with_tcp_mux() {
-    // The tcpMux-on branch is unchanged by the 0→default rules (which apply
-    // only when tcpMux is off, matching Go's per-branch EmptyOr): an
-    // explicit value is preserved — only an absent heartbeat is forced -1.
+fn test_explicit_zero_client_heartbeats_map_to_minus_one_with_tcp_mux() {
+    // Go v0.71.0 util.EmptyOr(v, -1) is value-level, not presence-level:
+    // with tcpMux on, an explicit 0 — like an absent heartbeat — means
+    // "use the default" = -1 (disabled, yamux keepalive covers liveness).
+    // The old code preserved an explicit 0 (round-8 fix 5: runtime-
+    // equivalent, but Go frpc shows -1, e.g. in status output).
     let cfg = load_client_config_from_str(
         r#"
 serverAddr = "127.0.0.1"
@@ -1380,8 +1418,8 @@ heartbeatTimeout = 0
     .unwrap();
 
     assert!(cfg.tcp_mux);
-    assert_eq!(cfg.heartbeat_interval, 0);
-    assert_eq!(cfg.heartbeat_timeout, 0);
+    assert_eq!(cfg.heartbeat_interval, -1);
+    assert_eq!(cfg.heartbeat_timeout, -1);
 }
 
 #[test]
@@ -1440,6 +1478,50 @@ heartbeatTimeout = 90
     .unwrap();
 
     assert_eq!(cfg.transport.heartbeat_timeout, 90);
+}
+
+#[test]
+fn test_explicit_client_heartbeat_timeout_90_is_preserved_with_tcp_mux() {
+    // Round-8 fix 7a: pins the presence mechanism — an explicit
+    // heartbeatTimeout = 90 with tcpMux on (default) must survive
+    // complete() as 90, not be zeroed or mapped to -1 (only 0 and the
+    // absent default map to -1; fix 5).
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+heartbeatTimeout = 90
+"#,
+    )
+    .unwrap();
+
+    assert!(cfg.tcp_mux);
+    assert_eq!(cfg.heartbeat_timeout, 90);
+}
+
+#[test]
+fn test_explicit_server_heartbeat_timeout_7200_is_preserved() {
+    // Round-8 fix 7d: no clamp — a Go-frpc-scale value (7200) must pass
+    // through the server loader untouched (Go frp has no clamp).
+    let cfg = load_server_config_from_str(
+        r#"
+bindPort = 7000
+[transport]
+heartbeatTimeout = 7200
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(cfg.transport.heartbeat_timeout, 7200);
+}
+
+#[test]
+fn test_client_server_addr_defaults_to_go_zero_value() {
+    // Round-8 fix 7b: Go client.go:86 ClientCommonConfig.Complete() —
+    // ServerAddr = util.EmptyOr(ServerAddr, "0.0.0.0"). A config without
+    // serverAddr must normalize to "0.0.0.0", not error or empty-string.
+    let cfg = load_client_config_from_str("serverPort = 7000").unwrap();
+    assert_eq!(cfg.server_addr, "0.0.0.0");
 }
 
 #[test]
@@ -2886,6 +2968,37 @@ fn test_collect_config_files_includes_yaml_and_yml() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_collect_config_files_symlink_cycle_terminates() {
+    // M13 regression: a symlink cycle inside a `--config-dir` tree (dir →
+    // ancestor → dir) used to recurse forever, blowing the stack (SIGSEGV
+    // under panic=abort — uncatchable). The walk must terminate, still
+    // collecting the real config files.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("root.toml"), "").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("nested.yaml"), "").unwrap();
+    // sub/up → .. (a direct cycle back to the root dir).
+    std::os::unix::fs::symlink("..", dir.path().join("sub").join("up")).unwrap();
+    // root/self → . (self-referential cycle).
+    std::os::unix::fs::symlink(".", dir.path().join("self")).unwrap();
+    // root/loop → sub (a deeper cycle through the same subtree).
+    std::os::unix::fs::symlink("sub", dir.path().join("loop")).unwrap();
+
+    let files = super::collect_config_files(dir.path()).unwrap();
+    let names: Vec<String> = files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    for expected in ["root.toml", "nested.yaml"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing {expected}: {names:?}"
+        );
+    }
+}
+
 // ─── JSON config support (Go frp Viper parity) ───────────────────────
 
 /// Parse a JSON client config through the full pipeline (JSON → toml::Value
@@ -3317,6 +3430,43 @@ fn test_parse_number_range_out_of_port_range_kept_verbatim() {
         negative,
         "negative port kept verbatim"
     );
+}
+
+#[test]
+fn test_parse_number_range_huge_expansion_capped() {
+    // L12: an unbounded range expression (0-65535 → 65536 numbers, or an
+    // arbitrarily long comma list) must not balloon the produced string
+    // (~450 KB for the full port space) — or, via the legacy [range:...]
+    // INI path, 65536 per-port proxies. The expansion is capped and the
+    // expression is treated as invalid (kept verbatim, like other invalid
+    // segments). Real configs stay far below the cap.
+    let full_space = r#"{{ parseNumberRange "0-65535" }}"#;
+    assert_eq!(
+        expand_template_in_str(full_space),
+        full_space,
+        "full-port-space expansion exceeds the cap → kept verbatim"
+    );
+    // A many-single-number list also hits the cap.
+    let huge_list = format!(
+        r#"{{{{ parseNumberRange "{}" }}}}"#,
+        (0..=7000)
+            .collect::<Vec<_>>()
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert_eq!(
+        expand_template_in_str(&huge_list),
+        huge_list,
+        "7001 single numbers exceed the cap → kept verbatim"
+    );
+    // A large-but-legal expansion still works (cap is 4096).
+    let ok = expand_template_in_str(r#"{{ parseNumberRange "1000-5000" }}"#);
+    let nums: Vec<&str> = ok.split(',').collect();
+    assert_eq!(nums.len(), 4001, "4001 numbers are within the cap");
+    assert_eq!(nums[0], "1000");
+    assert_eq!(nums[4000], "5000");
 }
 
 #[test]
@@ -4141,6 +4291,31 @@ remote_port = "16000"
     assert_eq!(names, vec!["good"]);
 }
 
+/// Legacy INI range template whose port expression would expand beyond the
+/// per-call cap (L12: "0-65535" → 65536 numbers) is skipped, not fatal —
+/// same as any other invalid local_port.
+#[test]
+fn test_legacy_ini_range_huge_expansion_skipped() {
+    let cfg: ClientConfig = load_client_ini(
+        r#"server_addr = "127.0.0.1"
+server_port = 7000
+
+[good]
+type = "tcp"
+local_port = 8080
+remote_port = 8081
+
+[range:huge]
+type = "tcp"
+local_port = "0-65535"
+remote_port = "0-65535"
+"#,
+    )
+    .unwrap();
+    let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["good"]);
+}
+
 /// A known top-level section carrying a `type` key is NOT collected as a
 /// legacy INI proxy (KNOWN_SECTIONS guard).
 #[test]
@@ -4516,8 +4691,9 @@ fn test_ini_lone_quote_token_through_pipeline() {
 // full-sample + minimal-defaults tests for every proxy type, plus the other
 // verified gaps: malformed formats, negative poolCount/maxPoolCount,
 // strict-mode section recursion, include variants, exec token-source
-// validation, the client heartbeat clamp, full Client/Server config samples,
-// and a proxy/visitor sub-table proptest (in mod proptest_tests).
+// validation, client heartbeat preservation (no clamp — Go parity), full
+// Client/Server config samples, and a proxy/visitor sub-table proptest (in
+// mod proptest_tests).
 
 #[test]
 fn test_proxy_minimal_defaults_for_every_type() {
@@ -4525,10 +4701,13 @@ fn test_proxy_minimal_defaults_for_every_type() {
     // bandwidth_limit_mode "client", health_check_interval_seconds 10,
     // health_check_timeout_seconds 3, health_check_max_failed 1, enabled
     // true, proxy_protocol_version "".
-    for proxy_type in ["tcp", "udp", "sudp", "stcp", "xtcp", "https"] {
-        // https requires a domain (Go validateDomainConfigForClient); the
-        // other five types have no required fields.
-        let extra = if proxy_type == "https" {
+    for proxy_type in [
+        "tcp", "udp", "http", "sudp", "stcp", "xtcp", "https", "tcpmux",
+    ] {
+        // http/https/tcpmux require a domain (Go validateDomainConfigForClient:
+        // "subdomain and custom domains should not be both empty"); the other
+        // five types have no required fields.
+        let extra = if matches!(proxy_type, "http" | "https" | "tcpmux") {
             "\ncustom_domains = [\"example.com\"]"
         } else {
             ""
@@ -5244,15 +5423,16 @@ exec.env = [{ name = "TOKEN", value = "abc" }]
     assert_eq!(exec.env[0].value, "abc");
 }
 
-// ─── Client heartbeat clamp (round-8 parity with the server) ──────────
+// ─── Client heartbeat: no clamp (round-8: Go has none) ────────────────
 
 #[test]
-fn test_client_heartbeat_huge_values_clamped_to_3600() {
-    // Parity with the server-side clamp
-    // (ServerTransportConfig::complete_with_heartbeat_timeout_set): huge
-    // explicit heartbeat values are clamped to MAX_HEARTBEAT_TIMEOUT_SECS
-    // (3600s). The server clamp has tests; the client had none and did not
-    // clamp (round-8 addition in client.rs complete_with_heartbeat_set).
+fn test_client_heartbeat_huge_values_preserved() {
+    // Round-8 blocker: the old 3600 clamp disconnected Go frpc
+    // (interval=7200) ↔ Rust frps in a reconnect loop. Go has no clamp, so
+    // huge explicit heartbeat values must pass through untouched —
+    // overflow protection lives in the watchdog arithmetic
+    // (`Duration::from_secs` never panics; tokio sleep/interval saturate),
+    // not in config.
     let cfg = load_client_config_from_str(
         r#"
 serverAddr = "127.0.0.1"
@@ -5262,20 +5442,14 @@ heartbeatTimeout = 9999999999
 "#,
     )
     .unwrap();
-    assert_eq!(
-        cfg.heartbeat_interval,
-        super::server::MAX_HEARTBEAT_TIMEOUT_SECS
-    );
-    assert_eq!(
-        cfg.heartbeat_timeout,
-        super::server::MAX_HEARTBEAT_TIMEOUT_SECS
-    );
+    assert_eq!(cfg.heartbeat_interval, 9999999999);
+    assert_eq!(cfg.heartbeat_timeout, 9999999999);
 }
 
 #[test]
-fn test_client_heartbeat_clamp_preserves_disable_boundary_and_normal_values() {
-    // -1 (explicit disable), the 3600 boundary, and normal values are
-    // untouched by the clamp.
+fn test_client_heartbeat_preserves_disable_and_go_style_values() {
+    // -1 (explicit disable) and normal / Go-default-scale values (90, 3600,
+    // 7200) are untouched: no clamp rewrites them.
     let cfg = load_client_config_from_str(
         r#"
 serverAddr = "127.0.0.1"
@@ -5292,13 +5466,13 @@ heartbeatTimeout = 90
         r#"
 serverAddr = "127.0.0.1"
 [transport]
-heartbeatInterval = 3600
-heartbeatTimeout = 3600
+heartbeatInterval = 7200
+heartbeatTimeout = 7200
 "#,
     )
     .unwrap();
-    assert_eq!(cfg.heartbeat_interval, 3600);
-    assert_eq!(cfg.heartbeat_timeout, 3600);
+    assert_eq!(cfg.heartbeat_interval, 7200);
+    assert_eq!(cfg.heartbeat_timeout, 7200);
 }
 
 // ─── include / includes variants (file.rs) ────────────────────────────

@@ -330,6 +330,24 @@ struct XtcpPunchConfig {
 /// Full XTCP hole punch (Go `makeNatHole`): PreCheck → STUN → NatHoleVisitor
 /// exchange → MakeHole → session creation. Returns the persistent session —
 /// NO stream is opened here (streams are opened per user connection).
+/// Server-supplied `read_timeout_ms` → punch timeout (ms). Go MakeHole
+/// floors the guard at 5s (`timeout := 5*time.Second; if
+/// m.DetectBehavior.ReadTimeoutMs > 0`, nathole.go:248-250) — a
+/// hostile/misbehaving server sending 0 or negative must not make the punch
+/// fail instantly. Capped at
+/// [`frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS`] (60s): Go's analyzer
+/// emits ReadTimeoutMs ≤ ~45s, so anything above is a hostile server
+/// stretching the punch (`read_timeout_ms` is i32 — uncapped it would wait
+/// ~24.8 days before the visitor could re-punch).
+fn clamp_hp_timeout(read_timeout_ms: i32) -> u64 {
+    // DEFAULT_HOLE_PUNCH_TIMEOUT_MS <= MAX_HOLE_PUNCH_TIMEOUT_MS (constant
+    // invariant), so `clamp` cannot panic.
+    (read_timeout_ms.max(0) as u64).clamp(
+        frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS,
+        frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS,
+    )
+}
+
 async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
     // 1. PreCheck: validate proxy existence/permissions before STUN (Go
     //    nathole.PreCheck, 5s timeout). A timeout proceeds with the full
@@ -395,45 +413,65 @@ async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
     // 2. STUN discovery: first STUN gives the mapped address + optional
     //    OTHER-ADDRESS (RFC 5780); use it (or the same server) for the
     //    second request so the NAT classifier gets ≥2 addresses. The socket
-    //    is reused for the punch + data plane.
-    let (stun_socket, mapped_addrs, assisted_addrs) =
-        match frp_core::stun::stun_binding_with_details(&cfg.stun_server).await {
-            Ok((sock, result1)) => {
-                let addr1 = result1.mapped_addr;
-                debug!(visitor_name = %cfg.visitor_name, addr = %addr1, "Visitor '{}': STUN #1: {}", cfg.visitor_name, addr1);
-                let mut addrs = vec![addr1];
-                let second_target = result1.other_addr.as_deref().unwrap_or(&cfg.stun_server);
-                match frp_core::stun::stun_binding_on_socket(&sock, second_target).await {
-                    Ok(addr2) => {
-                        debug!(visitor_name = %cfg.visitor_name, addr = %addr2, "Visitor '{}': STUN #2 from '{}': {}", cfg.visitor_name, second_target, addr2);
-                        addrs.push(addr2);
-                    }
-                    Err(e) => {
-                        warn!(visitor_name = %cfg.visitor_name, error = %e, "Visitor '{}': STUN #2 failed: {}", cfg.visitor_name, e);
-                    }
+    //    is reused for the punch + data plane. Both STUN awaits are raced
+    //    against cfg.cancel so listener teardown aborts the STUN phase too
+    //    (the socket is dropped with the future — the shutdown exits in
+    //    milliseconds instead of lingering through the STUN timeouts).
+    let stun_first = tokio::select! {
+        _ = cfg.cancel.cancelled() => {
+            return Err(format!(
+                "Visitor '{}': STUN cancelled (listener shutting down)",
+                cfg.visitor_name
+            ));
+        }
+        r = frp_core::stun::stun_binding_with_details(&cfg.stun_server) => r,
+    };
+    let (stun_socket, mapped_addrs, assisted_addrs) = match stun_first {
+        Ok((sock, result1)) => {
+            let addr1 = result1.mapped_addr;
+            debug!(visitor_name = %cfg.visitor_name, addr = %addr1, "Visitor '{}': STUN #1: {}", cfg.visitor_name, addr1);
+            let mut addrs = vec![addr1];
+            let second_target = result1.other_addr.as_deref().unwrap_or(&cfg.stun_server);
+            let stun_second = tokio::select! {
+                _ = cfg.cancel.cancelled() => {
+                    return Err(format!(
+                        "Visitor '{}': STUN #2 cancelled (listener shutting down)",
+                        cfg.visitor_name
+                    ));
                 }
-                let assisted = if cfg.daa {
-                    vec![]
-                } else {
-                    let stun_port = sock.local_addr().ok().map(|a| a.port()).unwrap_or(0);
-                    let local_ips = list_local_ips();
-                    debug!(
-                        visitor_name = %cfg.visitor_name, local_ips = ?local_ips, port = %stun_port,
-                        "Visitor '{}': building assisted_addrs from {} local IPs port {}",
-                        cfg.visitor_name, local_ips.len(), stun_port
-                    );
-                    local_ips
-                        .into_iter()
-                        .map(|ip| format!("{}:{}", ip, stun_port))
-                        .collect()
-                };
-                (Some(sock), addrs, assisted)
+                r = frp_core::stun::stun_binding_on_socket(&sock, second_target) => r,
+            };
+            match stun_second {
+                Ok(addr2) => {
+                    debug!(visitor_name = %cfg.visitor_name, addr = %addr2, "Visitor '{}': STUN #2 from '{}': {}", cfg.visitor_name, second_target, addr2);
+                    addrs.push(addr2);
+                }
+                Err(e) => {
+                    warn!(visitor_name = %cfg.visitor_name, error = %e, "Visitor '{}': STUN #2 failed: {}", cfg.visitor_name, e);
+                }
             }
-            Err(e) => {
-                warn!(visitor_name = %cfg.visitor_name, error = %e, "Visitor '{}': STUN failed: {}", cfg.visitor_name, e);
-                (None, vec![], vec![])
-            }
-        };
+            let assisted = if cfg.daa {
+                vec![]
+            } else {
+                let stun_port = sock.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+                let local_ips = list_local_ips();
+                debug!(
+                    visitor_name = %cfg.visitor_name, local_ips = ?local_ips, port = %stun_port,
+                    "Visitor '{}': building assisted_addrs from {} local IPs port {}",
+                    cfg.visitor_name, local_ips.len(), stun_port
+                );
+                local_ips
+                    .into_iter()
+                    .map(|ip| format!("{}:{}", ip, stun_port))
+                    .collect()
+            };
+            (Some(sock), addrs, assisted)
+        }
+        Err(e) => {
+            warn!(visitor_name = %cfg.visitor_name, error = %e, "Visitor '{}': STUN failed: {}", cfg.visitor_name, e);
+            (None, vec![], vec![])
+        }
+    };
     let Some(socket) = stun_socket else {
         return Err(format!(
             "Visitor '{}': STUN failed, no socket for XTCP P2P",
@@ -442,7 +480,8 @@ async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
     };
 
     // 3. Send NatHoleVisitor on the control connection and wait for
-    //    NatHoleResp (15s — server NAT_HOLE_TIMEOUT is 10s).
+    //    NatHoleResp (5s — Go frp client/xtcp.go waits 5s for the server's
+    //    NatHoleResp; the server's own NAT_HOLE_TIMEOUT is 10s).
     let txn_id = uuid::Uuid::new_v4().to_string();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -491,12 +530,12 @@ async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
                 cfg.visitor_name
             ));
         }
-        r = tokio::time::timeout(Duration::from_secs(15), reply_rx) => r,
+        r = tokio::time::timeout(Duration::from_secs(5), reply_rx) => r,
     } {
         Ok(Ok(Ok(resp))) => resp,
         Ok(Ok(Err(e))) => return Err(format!("NatHoleResp error from server: {e}")),
         Ok(Err(_)) => return Err("NatHoleResp channel closed (control loop dropped)".into()),
-        Err(_elapsed) => return Err("NatHoleResp timed out after 15s".into()),
+        Err(_elapsed) => return Err("NatHoleResp timed out after 5s".into()),
     };
     debug!(visitor_name = %cfg.visitor_name, "Visitor '{}': received NatHoleResp from server", cfg.visitor_name);
 
@@ -519,19 +558,12 @@ async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
         Some(sid.as_str())
     };
     // Use read_timeout_ms from the server's detect_behavior as the
-    // hole-punch timeout (Go parity); default to Go's MakeHole 5s. The
-    // punch no longer shares a budget with the per-connection wait — it runs
-    // in the background. Go MakeHole floors the guard at 5s too:
-    // `timeout := 5*time.Second; if m.DetectBehavior.ReadTimeoutMs > 0 {...}`
-    // (pkg/nathole/nathole.go:248-250) — a hostile/misbehaving server
-    // sending 0 must not make the punch fail instantly.
+    // hole-punch timeout (Go parity); default to Go's MakeHole 5s (see
+    // `clamp_hp_timeout` for the floor/cap semantics).
     let hp_timeout = resp
         .detect_behavior
         .as_ref()
-        .map(|db| {
-            (db.read_timeout_ms.max(0) as u64)
-                .max(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS)
-        })
+        .map(|db| clamp_hp_timeout(db.read_timeout_ms))
         .unwrap_or(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS);
     let assisted = resp.assisted_addrs.clone().unwrap_or_default();
     let behavior = resp.detect_behavior.clone();
@@ -618,6 +650,16 @@ async fn process_tunnel_start_events(
         // the send side must not observe a stale "not parked" — a lost
         // signal on weak-memory CPUs would strand the session until the
         // next user connection. Zero cost on x86.
+        //
+        // L22: the sender's check-then-send is not atomic — a sender can
+        // load `armed==true` just before our dequeue flips it false and
+        // deliver a signal the busy receiver never asked for. That stale
+        // signal would be consumed immediately on re-parking, triggering a
+        // redundant punch (during which genuine signals are dropped — Go's
+        // unbuffered channel drops them too, but only because the receiver
+        // is NOT in select). Draining before re-parking removes stale
+        // signals, restoring Go's drop-while-busy semantics exactly.
+        while start_rx.try_recv().is_ok() {}
         armed.store(true, Ordering::Release);
         tokio::select! {
             _ = cancel.cancelled() => return,
@@ -2650,6 +2692,21 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn hp_timeout_floor_and_cap() {
+        // Go MakeHole floors at the 5s default: 0 / negative must not make
+        // the punch fail instantly.
+        assert_eq!(clamp_hp_timeout(0), 5000);
+        assert_eq!(clamp_hp_timeout(-5), 5000);
+        // Legitimate analyzer emissions (~5-45s) pass through.
+        assert_eq!(clamp_hp_timeout(5000), 5000);
+        assert_eq!(clamp_hp_timeout(35000), 35000);
+        // Hostile server values are capped at 60s (i32 uncapped would wait
+        // ~24.8 days before the visitor could re-punch).
+        assert_eq!(clamp_hp_timeout(70_000), 60_000);
+        assert_eq!(clamp_hp_timeout(i32::MAX), 60_000);
+    }
 
     #[tokio::test]
     async fn tunnel_ingress_delivers_to_local_tun_channels() {

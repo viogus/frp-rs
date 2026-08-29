@@ -1018,10 +1018,19 @@ async fn bridge_ssh_side(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Consume the StartWorkConn V1 frame (type byte + 8-byte BE length + payload).
+    // Both reads are bounded by POST_HANDSHAKE_READ_TIMEOUT (30s): the peer
+    // (an SSH virtual client bridging via a user connection) is not
+    // authenticated on this pipe, so an unbounded read would park this task,
+    // the channel, and the session's resources forever on a silent peer.
     let mut header = [0u8; frp_core::protocol::V1_HEADER_LEN];
-    if ssh_side.read_exact(&mut header).await.is_err() {
+    let Ok(Ok(_)) = tokio::time::timeout(
+        crate::handlers::POST_HANDSHAKE_READ_TIMEOUT,
+        ssh_side.read_exact(&mut header),
+    )
+    .await
+    else {
         return;
-    }
+    };
     let len = u64::from_be_bytes(
         header[1..9]
             .try_into()
@@ -1029,9 +1038,14 @@ async fn bridge_ssh_side(
     );
     if len <= frp_core::protocol::V1_MAX_MSG_LENGTH as u64 {
         let mut payload = vec![0u8; len as usize];
-        if ssh_side.read_exact(&mut payload).await.is_err() {
+        let Ok(Ok(_)) = tokio::time::timeout(
+            crate::handlers::POST_HANDSHAKE_READ_TIMEOUT,
+            ssh_side.read_exact(&mut payload),
+        )
+        .await
+        else {
             return;
-        }
+        };
     }
 
     let (mut ssh_read, mut ssh_write) = tokio::io::split(ssh_side);
