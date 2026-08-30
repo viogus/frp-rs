@@ -5,12 +5,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub async fn run(cli: &Cli) -> Result<()> {
+    run_with_mode(cli, &cli.mode).await
+}
+
+pub async fn run_with_mode(cli: &Cli, mode: &str) -> Result<()> {
     let target = format!(
         "{}:{}",
         cli.frps_addr.split(':').next().unwrap_or("127.0.0.1"),
         cli.port
     );
-    match cli.mode.as_str() {
+    match mode {
         "idle_hold" => idle_hold(cli, &target).await,
         "churn" => churn(cli, &target).await,
         other => anyhow::bail!("unknown memory mode: {other} (expected idle_hold|churn)"),
