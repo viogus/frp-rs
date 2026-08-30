@@ -582,7 +582,10 @@ pub struct ProxyConfig {
     pub multiplexer: String,
     #[serde(default)]
     pub group: String,
-    #[serde(default)]
+    // Go frp v1 proxy config carries `groupKey` as a TOP-LEVEL proxy field
+    // (ProxyBaseConf.GroupKey) — without this alias the key is silently
+    // dropped by the lenient unknown-key tolerance.
+    #[serde(default, alias = "groupKey")]
     pub group_key: String,
     #[serde(default)]
     pub health_check_type: String,

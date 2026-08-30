@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -96,6 +96,24 @@ impl TcpMuxManager {
         // the conflict check, the insert, and the by_proxy bookkeeping,
         // keeping register/unregister symmetric.
         let domains: Vec<String> = domains.iter().map(|d| d.to_lowercase()).collect();
+
+        // Same-call duplicate detection (Go parity): Go's registration loop
+        // calls `Routers.Add` once per domain, and the SECOND Add of a
+        // duplicate (domain, location, httpUser) triple hits `exist()` →
+        // conflict → the whole registration fails. A duplicate inside one
+        // call must therefore reject the registration, not silently register
+        // the domain once (which would leave unregister's by_proxy list
+        // containing the duplicate). Mirrors the vhost manager's same-call
+        // dedup check.
+        let mut seen: HashSet<&str> = HashSet::with_capacity(domains.len());
+        for domain in &domains {
+            if !seen.insert(domain.as_str()) {
+                return Err(format!(
+                    "tcpmux duplicate domain '{}' in registration for proxy '{}'",
+                    domain, proxy_name
+                ));
+            }
+        }
 
         // Validate every domain before inserting anything (no partial state).
         // Re-registration by the same proxy name is allowed (idempotent).
@@ -926,6 +944,55 @@ mod tests {
         // Unregister
         mgr.unregister("p1").await;
         assert!(mgr.lookup("a.example.com", "").await.is_none());
+    }
+
+    /// Go parity: the registration loop calls `Routers.Add` once per domain,
+    /// and the second Add of a duplicate (domain, location, httpUser) triple
+    /// hits `exist()` → conflict → the WHOLE registration fails. A duplicate
+    /// inside a single call (including case variants, which collapse via
+    /// lowercase) must reject the registration with no partial state.
+    #[tokio::test]
+    async fn test_tcpmux_register_same_call_duplicate_domain_rejected() {
+        let mgr = TcpMuxManager::new();
+
+        let err = mgr
+            .register(
+                "p1",
+                &["a.example.com".into(), "A.EXAMPLE.COM".into()],
+                "run-1",
+                "",
+                "",
+                "",
+                &[],
+            )
+            .await
+            .expect_err("same-call duplicate domain must be rejected");
+        assert!(
+            err.contains("duplicate domain"),
+            "error must name the duplicate: {err}"
+        );
+
+        // No partial state: nothing was registered, and the proxy is free to
+        // re-register with a clean domain list.
+        assert!(mgr.lookup("a.example.com", "").await.is_none());
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
+            .await
+            .expect("clean re-registration must succeed");
+        let r = mgr.lookup("a.example.com", "").await.unwrap();
+        assert_eq!(r.proxy_name, "p1");
+
+        // Distinct domains in one call stay legal.
+        mgr.register(
+            "p2",
+            &["x.example.com".into(), "y.example.com".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            &[],
+        )
+        .await
+        .expect("distinct domains in one call must succeed");
     }
 
     /// Go frp compat (pkg/util/vhost/router.go): tcpmux domains are stored

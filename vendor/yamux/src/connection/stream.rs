@@ -20,6 +20,7 @@ use crate::{
     },
     Config, DEFAULT_CREDIT,
 };
+use crossbeam_queue::ArrayQueue;
 use flow_control::FlowController;
 use futures::{
     channel::mpsc,
@@ -111,6 +112,10 @@ pub struct Stream {
     sender_wu: mpsc::Sender<StreamCommand>,
     flag: Flag,
     shared: Arc<Mutex<Shared>>,
+    /// frp-rs patch: connection-scoped send-side body-buffer pool. Data-frame
+    /// bodies are drawn from here in `poll_write` (instead of a fresh `Vec`
+    /// per chunk) and returned once `frame::Io` has fully written the frame.
+    body_pool: Arc<ArrayQueue<Vec<u8>>>,
 }
 
 impl fmt::Debug for Stream {
@@ -137,6 +142,7 @@ impl Stream {
         sender: mpsc::Sender<StreamCommand>,
         rtt: rtt::Rtt,
         accumulated_max_stream_windows: Arc<Mutex<usize>>,
+        body_pool: Arc<ArrayQueue<Vec<u8>>>,
     ) -> Self {
         let sender_wu = sender.clone();
         Self {
@@ -153,6 +159,7 @@ impl Stream {
                 rtt,
                 config,
             ))),
+            body_pool,
         }
     }
 
@@ -163,6 +170,7 @@ impl Stream {
         sender: mpsc::Sender<StreamCommand>,
         rtt: rtt::Rtt,
         accumulated_max_stream_windows: Arc<Mutex<usize>>,
+        body_pool: Arc<ArrayQueue<Vec<u8>>>,
     ) -> Self {
         let sender_wu = sender.clone();
         Self {
@@ -179,6 +187,7 @@ impl Stream {
                 rtt,
                 config,
             ))),
+            body_pool,
         }
     }
 
@@ -396,7 +405,17 @@ impl AsyncWrite for Stream {
             shared
                 .consume_send_window(k as u32)
                 .expect("not exceed receive window");
-            Vec::from(&buf[..k])
+            // frp-rs patch: reuse a body buffer from the connection-scoped
+            // pool instead of allocating a fresh `Vec` per chunk (the last
+            // per-chunk allocation on the default tcp-mux data plane; Go's
+            // fatedier fork writes the user slice zero-copy). The driver
+            // returns the buffer to the pool once the frame is fully written
+            // (`frame::Io` WriteState::Body completion). A full pool just
+            // allocates fresh — this is a cache, not a guarantee.
+            let mut body = self.body_pool.pop().unwrap_or_default();
+            body.clear();
+            body.extend_from_slice(&buf[..k]);
+            body
         };
         let n = body.len();
         let mut frame = Frame::data(self.id, body).expect("body <= u32::MAX").left();

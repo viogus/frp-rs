@@ -19,7 +19,9 @@ pub(crate) mod proxy_ops;
 pub(crate) use proxy_ops::release_udp_port_with_owner_check;
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -50,13 +52,14 @@ async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
 const CTL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Deadline for yamux-stream reads in the control select loop (round 10
-/// HIGH). Unlike the main `read_ctl_msg(&mut reader, v2)` select branch —
-/// which yields back to the select when the peer trickles, so the heartbeat
-/// and shutdown arms stay live — the yamux arm's reads run inside the arm
-/// body, where no other arm can fire. A post-auth client trickling partial
-/// frame bytes on a yamux stream would pin the task + fd + semaphore permit
-/// + run_id registration forever (Go bounds this via its independent
-///   heartbeatWorker goroutine calling `ctl.Close()`).
+/// HIGH). Unlike the main control-read branch (the persisted
+/// `pending_read` future — which yields back to the select when the peer
+/// trickles, so the heartbeat and shutdown arms stay live), the yamux
+/// arm's reads run inside the arm body, where no other arm can fire. A
+/// post-auth client trickling partial frame bytes on a yamux stream would
+/// pin the task + fd + semaphore permit + run_id registration forever (Go
+/// bounds this via its independent heartbeatWorker goroutine calling
+/// `ctl.Close()`).
 ///
 /// A read timeout behaves like the Err branch: drop the stream, keep the
 /// control loop alive.
@@ -232,7 +235,7 @@ async fn handle_control_inner<S>(
     // monomorphization (saves ~30KB per copy in release binary).
     let stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin> = Box::new(stream);
     // 1. Authenticate and set up per-client state (login.rs)
-    let (mut ctx, mut ctl, _internal_tx, mut internal_rx, mut reader, mut writer, mut incoming) =
+    let (mut ctx, mut ctl, _internal_tx, mut internal_rx, reader, mut writer, mut incoming) =
         match login::authenticate(
             stream,
             &login,
@@ -249,6 +252,11 @@ async fn handle_control_inner<S>(
             Ok(tuple) => tuple,
             Err(()) => return,
         };
+
+    // The control read half is shared with the persisted read future via an
+    // async Mutex: the future holds the guard only while a frame is being
+    // read (control-plane rate), and no other loop arm touches `reader`.
+    let reader = std::sync::Arc::new(tokio::sync::Mutex::new(reader));
 
     // Convenience bindings for the main loop
     let state = ctx.state.clone();
@@ -271,6 +279,31 @@ async fn handle_control_inner<S>(
     } else {
         Duration::ZERO
     };
+
+    // Persist a partial control-frame read across select iterations (audit
+    // finding 4 — MEDIUM): the select drops every branch future when
+    // another arm wins, and `read_exact`-based framing keeps its partial
+    // state only in the branch future's locals. A client that splits a
+    // frame across two writes and forces an internal/accept arm to win
+    // mid-frame would lose the consumed bytes; the next iteration would
+    // parse the frame tail as a fresh header — a garbage type/length →
+    // protocol error → control drop + reconnect. The boxed future
+    // survives the select, so consumed bytes are retained until the frame
+    // completes. The loop shape stays fair (no biased branch ordering —
+    // the fairness regression test below asserts this): the read still
+    // progresses only at loop top, exactly like a fresh future would, and
+    // a completed read always wins its own round (tokio's select returns
+    // at the first Ready branch), so the arm body's reset below can never
+    // strand a completed future.
+    //
+    // The future owns an Arc<tokio::sync::Mutex<ReadHalf>> clone and locks
+    // inside its own poll, so it borrows nothing from the loop — a
+    // loop-local borrow could not be stored across select iterations (the
+    // Option's type region would keep the borrow alive for the whole loop,
+    // conflicting with the loop-top recreation below).
+    type PendingRead = Pin<Box<dyn Future<Output = Result<FrpMessage, frp_core::Error>> + Send>>;
+    let mut pending_read: Option<PendingRead> = None;
+
     loop {
         // Superseded by a newer login (same run_id) whose Shutdown message
         // could not be delivered through a full channel (round-7 review
@@ -325,6 +358,18 @@ async fn handle_control_inner<S>(
         if state.heartbeat_timeout > 0 && ctl.last_ping.elapsed() > hb_timeout {
             warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
             break;
+        }
+
+        // Recreate the control-read future when the previous frame
+        // completed (the arm body detached it). Starts a fresh read at the
+        // next frame boundary. The async block owns an Arc clone and takes
+        // the lock only while the frame is in flight.
+        if pending_read.is_none() {
+            let reader = reader.clone();
+            pending_read = Some(Box::pin(async move {
+                let mut guard = reader.lock().await;
+                read_ctl_msg(&mut *guard, v2).await
+            }));
         }
 
         // Earliest pending-request expiry deadline. Loop-top expiry is
@@ -497,7 +542,12 @@ async fn handle_control_inner<S>(
                 }
             }
 
-            msg = read_ctl_msg(&mut reader, v2) => {
+            msg = pending_read.as_mut().unwrap() => {
+                // Detach the completed future before handling the message:
+                // the select has dropped the branch future, and the
+                // loop-top `if pending_read.is_none()` recreates a fresh
+                // one for the next frame.
+                pending_read = None;
                 match msg {
                     Ok(msg) => {
                         if dispatch::dispatch_frp_message(&mut ctx, &mut ctl, &mut writer, msg, &authenticated_user).await.is_err() {
@@ -717,5 +767,214 @@ mod ctl_write_timeout_tests {
             Ok(Err(frp_core::Error::Protocol(_))) => {}
             other => panic!("expected Protocol error on V2 write, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod partial_read_tests {
+    use super::*;
+
+    /// Read one V1 LoginResp frame from the client side of the duplex and
+    /// return its error field (empty when the login succeeded).
+    async fn read_login_resp_error(client: &mut tokio::io::DuplexStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut header = [0u8; 9];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("read frame header");
+        let len = u64::from_be_bytes(header[1..9].try_into().unwrap()) as usize;
+        assert!(len < 4096, "implausible frame length {len}");
+        let mut payload = vec![0u8; len];
+        client
+            .read_exact(&mut payload)
+            .await
+            .expect("read frame payload");
+        let resp: frp_core::msg::LoginResp =
+            serde_json::from_slice(&payload).expect("parse LoginResp");
+        resp.error.unwrap_or_default()
+    }
+
+    /// Audit finding 4 (MEDIUM) regression: a control frame delivered in
+    /// two chunks with an internal message landing mid-frame must not lose
+    /// the consumed bytes. The old select arm created a fresh
+    /// `read_ctl_msg` future every iteration, so a competing arm winning
+    /// mid-frame dropped the partial read — the next iteration parsed the
+    /// frame tail as a fresh header (garbage type/length → protocol error
+    /// → control drop + reconnect). The persisted boxed future retains the
+    /// consumed bytes and completes the frame.
+    ///
+    /// Determinism: the duplex (1024) capacity makes chunk 1's write_all
+    /// block until the loop's read branch has consumed it (the only
+    /// consumer), so the read is provably mid-frame when the injected
+    /// `NewWorkConn` internal message wins the select — the test observes
+    /// the win via `pool_stats.pool_size >= 1` (the pooled work conn).
+    /// Registration of the frame's stcp proxy is the observable end state:
+    /// old code breaks on a garbage header before registering anything;
+    /// new code completes the frame and registers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_frame_survives_competing_internal_message() {
+        let state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        let (server, mut client) = tokio::io::duplex(1024);
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("test-run-id".into()),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("test-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        let control_task = tokio::spawn(handle_control(
+            server,
+            login,
+            state.clone(),
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+        ));
+
+        // Login handshake. The server's prewarm ReqWorkConn stays in the
+        // client buffer — never read, small enough to fit.
+        let error = read_login_resp_error(&mut client).await;
+        assert!(error.is_empty(), "login failed: {error}");
+
+        // The V1 control channel is ALWAYS AES-128-CFB wrapped after
+        // LoginResp (Go parity — no config flag gates it), so the frame
+        // must go out encrypted: wrap the client half and write through it.
+        let client_key = frp_core::encryption::derive_key("test-token");
+        let mut client = frp_core::cipher_stream::CipherStream::new(client, client_key);
+
+        // NewProxy frame with a large headers map so the frame exceeds the
+        // duplex capacity. stcp needs no listener — registration alone is
+        // the observable end state.
+        let np = msg::NewProxy {
+            proxy_name: "t".into(),
+            proxy_type: "stcp".into(),
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: None,
+            local_str: None,
+            remote_port: Some(0),
+            sk: Some("sk".into()),
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: Some(std::collections::HashMap::from([(
+                "x-pad".into(),
+                "x".repeat(5000),
+            )])),
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        };
+        let new_proxy_msg = FrpMessage::NewProxy(Box::new(np));
+        let type_byte = new_proxy_msg.v1_type_byte();
+        let payload = serde_json::to_vec(&new_proxy_msg).expect("encode NewProxy");
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.push(type_byte);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        assert!(
+            frame.len() > 1024,
+            "frame must exceed the duplex capacity: {} bytes",
+            frame.len()
+        );
+        let chunk1 = 1500.min(frame.len());
+
+        // Chunk 1 write: blocks until the loop's read branch has consumed
+        // the first 1024 bytes (it is the only consumer), so the read is
+        // provably mid-frame afterwards. (The CipherStream adds a 16-byte
+        // IV on the first write; the blocking math still holds.)
+        client
+            .write_all(&frame[..chunk1])
+            .await
+            .expect("write chunk 1");
+
+        // Inject an internal NewWorkConn: it must win the select while the
+        // read is mid-frame, dropping the branch future (the bug).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let accept = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.expect("accept");
+            s
+        });
+        let client_keepalive = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let work_conn = accept.await.expect("accepted socket");
+        // Keep the peer end alive so the server-side socket stays open.
+        let _client_keepalive = client_keepalive;
+
+        let ctl_tx = state
+            .run_id_to_ctl_tx
+            .get("test-run-id")
+            .expect("control registered at login");
+        ctl_tx
+            .tx
+            .send(InternalMsg::NewWorkConn(IoStream::Tcp(work_conn)))
+            .await
+            .expect("internal send");
+        // The message being processed proves the select returned with the
+        // read mid-frame (pooling sets pool_size >= 1).
+        let pool_stats = ctl_tx.pool_stats.clone();
+        drop(ctl_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pool_stats.pool_size.load(Ordering::Relaxed) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("internal NewWorkConn must be processed");
+
+        // Chunk 2: the rest of the frame.
+        client
+            .write_all(&frame[chunk1..])
+            .await
+            .expect("write chunk 2");
+
+        // The stcp proxy must register. Old code: the frame tail parsed as
+        // a fresh header → garbage length → protocol error → control drop,
+        // nothing registered.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.proxy_manager.get("t").await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stcp proxy 't' must register after the interrupted frame");
+
+        // Teardown: closing the client side ends the control (read EOF).
+        drop(client);
+        control_task.await.expect("control task must exit");
     }
 }

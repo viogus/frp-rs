@@ -13,10 +13,12 @@ use super::{
     Frame,
 };
 use crate::connection::Id;
+use crossbeam_queue::ArrayQueue;
 use futures::{prelude::*, ready};
 use std::{
     fmt, io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -34,15 +36,23 @@ pub(crate) struct Io<T> {
     io: T,
     read_state: ReadState,
     write_state: WriteState,
+    /// frp-rs patch: connection-scoped send-side body-buffer pool. A fully
+    /// written data-frame body is returned here instead of dropped
+    /// (WriteState::Body completion); `Stream::poll_write` draws from it,
+    /// removing the per-chunk `Vec` allocation on the send path. Send-side
+    /// only — read bodies move into `Shared::buffer` and are consumed
+    /// lazily, so they must never be pooled.
+    body_pool: Arc<ArrayQueue<Vec<u8>>>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
-    pub(crate) fn new(id: Id, io: T) -> Self {
+    pub(crate) fn new(id: Id, io: T, body_pool: Arc<ArrayQueue<Vec<u8>>>) -> Self {
         Io {
             id,
             io,
             read_state: ReadState::Init,
             write_state: WriteState::Init,
+            body_pool,
         }
     }
 }
@@ -149,7 +159,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
                         }
 
                         if *offset == buffer.len() {
+                            let buffer = std::mem::take(buffer);
                             this.write_state = WriteState::Init;
+                            // frp-rs patch: the body is fully on the wire and
+                            // exclusively owned here — return it to the
+                            // connection-scoped pool for reuse by the next
+                            // `Stream::poll_write`. Best-effort: a full pool
+                            // or a buffer above the default split-send size
+                            // (custom `split_send_size`) is simply dropped.
+                            // Buffers lost to WriteZero / Poisoned / teardown
+                            // are fine — the pool dies with the connection.
+                            if !buffer.is_empty()
+                                && buffer.capacity() <= crate::DEFAULT_SPLIT_SEND_SIZE
+                            {
+                                let _ = this.body_pool.push(buffer);
+                            }
                         }
                     }
                 },
@@ -385,7 +409,11 @@ mod tests {
         fn property(f: Frame<()>) -> bool {
             futures::executor::block_on(async move {
                 let id = crate::connection::Id::next();
-                let mut io = Io::new(id, futures::io::Cursor::new(Vec::new()));
+                let mut io = Io::new(
+                    id,
+                    futures::io::Cursor::new(Vec::new()),
+                    Arc::new(ArrayQueue::new(1)),
+                );
                 if io.send(f.clone()).await.is_err() {
                     return false;
                 }

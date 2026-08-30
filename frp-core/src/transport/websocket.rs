@@ -295,7 +295,11 @@ fn dispatch_raw_frame(
 ) -> Poll<io::Result<()>> {
     *raw_read_state = RawReadState::Idle;
     match opcode {
-        0x00..=0x02 => {
+        0x00 => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WS continuation frame without a fragmented message",
+        ))),
+        0x01..=0x02 => {
             if payload.is_empty() {
                 // Zero-length data frame: consume it without forwarding.
                 // Returning `Ready(Ok(()))` with zero bytes filled reads as
@@ -308,6 +312,18 @@ fn dispatch_raw_frame(
                 return Poll::Pending;
             }
             let n = payload.len().min(buf.remaining());
+            if n == 0 {
+                // The caller's ReadBuf has no remaining capacity: a
+                // Ready(Ok(())) with zero bytes filled reads as EOF to
+                // tokio (AsyncRead contract), tearing the tunnel down —
+                // same hazard the zero-length-frame arm above guards.
+                // Stash the whole payload for the next poll and return
+                // wake + Pending so it is delivered then.
+                *read_buf = payload.to_vec();
+                *read_pos = 0;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             buf.put_slice(&payload[..n]);
             if n < payload.len() {
                 *read_buf = payload[n..].to_vec();
@@ -332,21 +348,23 @@ fn dispatch_raw_frame(
             }
         }
         0x09 => {
-            // RFC 6455 §5.5: control frame payload MUST be ≤125 bytes.
-            // Extended length encoding is disallowed for control frames.
-            let pong_payload = if payload.len() > 125 {
-                tracing::warn!(
-                    "WS pong payload {} bytes exceeds 125-byte limit, truncating",
-                    payload.len()
-                );
-                &payload[..125]
-            } else {
-                payload
-            };
+            // RFC 6455 §5.5: control frame payload MUST be ≤125 bytes. The
+            // header arm already rejects raw length fields 126/127 before
+            // the extended length is parsed, so this guard is unreachable
+            // in practice — kept as defense in depth mirroring gorilla's
+            // advanceFrame decoded-length rule: a peer ping payload >125
+            // bytes is a protocol error that closes the connection, never
+            // a truncatable pong.
+            if payload.len() > 125 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WS control frame length > 125",
+                )));
+            }
             // Masked in client mode (§5.3); a busy inner stashes the reply
             // and the next poll drains it before reading further frames.
-            let mut frame = Vec::with_capacity(2 + 4 + pong_payload.len());
-            build_control_frame(&mut frame, 0x0a, pong_payload, client_mode);
+            let mut frame = Vec::with_capacity(2 + 4 + payload.len());
+            build_control_frame(&mut frame, 0x0a, payload, client_mode);
             match poll_write_control(raw, cx, pending_control_write, pending_control_pos, &frame) {
                 Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(e)) => {
@@ -543,6 +561,32 @@ impl AsyncRead for WsByteStream {
                                         "WS frame from client must be masked"
                                     },
                                 )));
+                            }
+                            // RFC 6455 §5.5: control frames (close/ping/pong)
+                            // MUST have FIN set and a payload of at most 125
+                            // bytes, and MUST NOT use the extended length
+                            // encodings. gorilla/websocket checks the RAW
+                            // 7-bit length field against 125 before parsing
+                            // any extended length ("len > 125 for control"
+                            // in advanceFrame), so a 16/64-bit-encoded
+                            // control frame is a protocol error here — not a
+                            // truncatable pong — and "FIN not set on
+                            // control" likewise closes the connection.
+                            if matches!(opcode, 0x08..=0x0a) {
+                                if head[0] & 0x80 == 0 {
+                                    *raw_read_state = RawReadState::Idle;
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "WS control frame has FIN not set",
+                                    )));
+                                }
+                                if raw_len > 125 {
+                                    *raw_read_state = RawReadState::Idle;
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "WS control frame length > 125",
+                                    )));
+                                }
                             }
                             if raw_len == 126 {
                                 *raw_read_state = RawReadState::ReadingExtendedLen2 {
@@ -1956,5 +2000,74 @@ mod tests {
             shutdown_called.load(std::sync::atomic::Ordering::Relaxed),
             "inner shutdown must be delegated after the drain"
         );
+    }
+
+    /// Masked frame with an arbitrary opcode and an EXPLICIT raw length
+    /// field (126/127 allowed even for payloads that would not need the
+    /// extended encoding) — lets a test pin the raw-length-field and FIN
+    /// checks on control frames independently of the payload-size-driven
+    /// encoding of [`ws_masked_frame`]. Server-mode streams enforce
+    /// RFC 6455 mask direction, so protocol-violation frames fed into them
+    /// are masked.
+    fn ws_masked_frame_raw(opcode: u8, raw_len: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![opcode | if fin { 0x80 } else { 0 }];
+        frame.push(0x80 | raw_len);
+        match raw_len {
+            126 => frame.extend_from_slice(&(payload.len() as u16).to_be_bytes()),
+            127 => frame.extend_from_slice(&(payload.len() as u64).to_be_bytes()),
+            _ => {}
+        }
+        let mask: [u8; 4] = rand::random();
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i & 3]);
+        }
+        frame
+    }
+
+    /// RFC 6455 §5.5 control-frame validation (gorilla advanceFrame parity):
+    /// a control frame whose decoded payload exceeds 125 bytes, whose RAW
+    /// length field is 126/127 (extended-length encoding), or whose FIN bit
+    /// is clear is a protocol error that closes the connection — a >125-byte
+    /// ping is NOT truncatable to a pong. A continuation frame (opcode 0x00)
+    /// with no fragmented message in progress is likewise a protocol error
+    /// (gorilla: "continuation after FIN"), not a data frame.
+    #[tokio::test]
+    async fn ws_control_frame_and_continuation_validation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn expect_protocol_error(frame: Vec<u8>, needle: &str) {
+            let (mut raw, client_io) = tokio::io::duplex(8192);
+            let mut ws = WsByteStream::from_raw(Box::new(client_io), false);
+            raw.write_all(&frame).await.unwrap();
+            let mut out = [0u8; 8];
+            let err = ws.read(&mut out).await.unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "expected error containing {needle:?}, got: {err}"
+            );
+        }
+
+        // Oversized ping: a 126-byte payload requires the 16-bit extended
+        // length encoding, which control frames must not use (previously
+        // truncated to a 125-byte pong with a warning).
+        expect_protocol_error(
+            ws_masked_frame_raw(0x09, 126, true, &[0x55; 126]),
+            "control",
+        )
+        .await;
+
+        // Extended-length ping: the RAW length field is 127 (64-bit
+        // encoding) even though the decoded payload is only 2 bytes —
+        // gorilla checks the raw field before parsing the extended length.
+        expect_protocol_error(ws_masked_frame_raw(0x09, 127, true, b"hi"), "control").await;
+
+        // FIN=0 ping: control frames must have FIN set (RFC 6455 §5.5).
+        expect_protocol_error(ws_masked_frame_raw(0x09, 1, false, b"x"), "FIN not set").await;
+
+        // Stray continuation: opcode 0x00 with no fragmented message in
+        // progress (the reader never starts one — every data frame is
+        // treated as complete) is a protocol error, not a data frame.
+        expect_protocol_error(ws_masked_frame_raw(0x00, 3, true, b"abc"), "continuation").await;
     }
 }

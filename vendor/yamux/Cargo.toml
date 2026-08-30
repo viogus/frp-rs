@@ -60,6 +60,12 @@ version = "1"
 [dependencies.web-time]
 version = "1"
 
+# frp-rs patch (send-side body-buffer pool): lock-free bounded queue for
+# reusing data-frame body buffers. Already in the workspace dependency tree
+# (frp-core's KCP chunk pool), so no new crates are added to the build.
+[dependencies.crossbeam-queue]
+version = "0.3"
+
 [dev-dependencies.futures]
 version = "0.3"
 features = ["executor"]

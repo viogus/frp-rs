@@ -1057,7 +1057,13 @@ pub(crate) async fn connect_via_proxy(
             }
 
             let status_line = String::from_utf8_lossy(&status_buf);
-            if !status_line.contains("200") {
+            // Go parity (golib httpProxyAfterHook → http.ReadResponse reads
+            // the FIRST status line only — no 1xx hopping — and requires
+            // StatusCode == 200). The code is the second
+            // whitespace-delimited token and must be exactly "200":
+            // `contains("200")` accepted a non-200 whose reason phrase
+            // embeds "200" (or a 4-digit code like "1200").
+            if status_line.split_whitespace().nth(1) != Some("200") {
                 return Err(crate::Error::Transport(
                     format!("proxy CONNECT rejected: {}", status_line.trim()).into(),
                 ));
@@ -2316,6 +2322,48 @@ mod tests {
         }
 
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_http_connect_requires_exact_200_status() {
+        // Regression: `status_line.contains("200")` accepted a non-200
+        // response whose reason phrase embeds "200" (or a 4-digit code like
+        // "1200"). Go golib httpProxyAfterHook reads the FIRST status line
+        // only — no 1xx hopping — and requires StatusCode == 200.
+        async fn proxy_reply(status: &'static str) -> Result<(), String> {
+            use tokio::io::AsyncBufReadExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let (sock, _) = listener.accept().await.unwrap();
+                let mut sock = tokio::io::BufReader::new(sock);
+                let mut req = Vec::new();
+                sock.read_until(b'\n', &mut req).await.unwrap();
+                assert!(
+                    req.starts_with(b"CONNECT "),
+                    "expected a CONNECT request, got: {:?}",
+                    req
+                );
+                let resp = format!("{status}\r\n\r\n");
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                // Dropping the socket after the response closes the tunnel.
+            });
+            let res = connect_via_proxy(&format!("http://{addr}"), "127.0.0.1", 80, 5, 0).await;
+            srv.await.unwrap();
+            res.map(|_| ()).map_err(|e| e.to_string())
+        }
+
+        assert!(
+            proxy_reply("HTTP/1.1 407 Proxy Auth 200 OK").await.is_err(),
+            "a 407 whose reason phrase embeds 200 must be rejected"
+        );
+        assert!(
+            proxy_reply("HTTP/1.1 1200 OK").await.is_err(),
+            "a 4-digit status code must be rejected"
+        );
+        proxy_reply("HTTP/1.1 200 OK")
+            .await
+            .expect("a genuine 200 must be accepted");
     }
 
     #[tokio::test]

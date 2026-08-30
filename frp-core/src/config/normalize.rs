@@ -1574,6 +1574,28 @@ fn normalize_proxies(table: &mut toml::Table) {
                 }
             }
         }
+
+        // Go frp compat (client/health/health.go:57-64): the health check
+        // interval/timeout/maxFailed fields are Go `int` fields where `<= 0`
+        // falls back to the defaults. The ProxyConfig fields are u64/u32, so
+        // a bare `-1` (accepted by Go) would fail serde and kill the whole
+        // config load on every path — file, --config-dir, reload, and the
+        // admin API all funnel through normalize_client_config, and the
+        // `[proxies.healthCheck]`/legacy-INI keys were flattened to these
+        // names just above. Clamp `<= 0` to the Go defaults pre-
+        // deserialization; the runtime `== 0` fallback (frp-client
+        // service.rs spawn_health_checks) remains for programmatic configs.
+        for (key, default) in [
+            ("health_check_interval_seconds", 10i64),
+            ("health_check_timeout_seconds", 3i64),
+            ("health_check_max_failed", 1i64),
+        ] {
+            if let Some(Value::Integer(n)) = proxy_table.get(key) {
+                if *n <= 0 {
+                    proxy_table.insert(key.to_string(), Value::Integer(default));
+                }
+            }
+        }
     }
 }
 

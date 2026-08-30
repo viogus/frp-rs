@@ -2556,6 +2556,61 @@ fn proxy_healthcheck_subtable_normalized() {
 }
 
 #[test]
+fn proxy_healthcheck_negative_values_default_go_parity() {
+    // Go frp accepts negative health check ints and falls back to the
+    // defaults (client/health/health.go:57-64). The u64/u32 ProxyConfig
+    // fields would fail serde on -1 and kill the whole config load; the
+    // normalize step clamps <= 0 to the Go defaults pre-deserialization.
+    let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            remote_port = 7001
+            health_check_type = "tcp"
+            health_check_interval_seconds = -1
+            health_check_timeout_seconds = -5
+            health_check_max_failed = -2
+        "#;
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    let p = &cfg.proxies[0];
+    assert_eq!(p.health_check_interval_seconds, 10);
+    assert_eq!(p.health_check_timeout_seconds, 3);
+    assert_eq!(p.health_check_max_failed, 1);
+}
+
+#[test]
+fn proxy_healthcheck_nested_negative_and_zero_default() {
+    // Same clamp through the Go-style [proxies.healthCheck] sub-table
+    // flattening (negative and explicit-zero both land on the Go default,
+    // matching Go's `<= 0` rule), while positive explicit values are
+    // preserved.
+    let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            remote_port = 7001
+            [proxies.healthCheck]
+            type = "tcp"
+            intervalSeconds = -1
+            timeoutSeconds = 0
+            maxFailed = 3
+        "#;
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    let p = &cfg.proxies[0];
+    assert_eq!(p.health_check_interval_seconds, 10);
+    assert_eq!(p.health_check_timeout_seconds, 3);
+    assert_eq!(p.health_check_max_failed, 3);
+}
+
+#[test]
 fn proxy_loadbalancer_subtable_normalized() {
     let toml = r#"
             server_addr = "127.0.0.1"

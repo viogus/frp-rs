@@ -113,7 +113,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
 ///
 /// The handshake and the first accept are bounded by a single absolute
 /// `vhost_http_timeout` deadline — the exact parallel of the HTTP/1.1 head
-/// read at vhost.rs:635-640 (same `.max(1)` floor, same
+/// read at vhost.rs:635-640 (same `<= 0 → 60s` Go floor, same
 /// `Instant::now() + from_secs` idiom). An unauthenticated client that sends
 /// the 24-byte preface and then goes silent must not park a task, an fd, and
 /// — when `max_connections` is configured — a `conn_semaphore` permit (held
@@ -133,7 +133,13 @@ pub(crate) async fn serve_h2c_request<S>(
     // Same absolute-deadline idiom as the HTTP/1.1 head read (vhost.rs:635-
     // 640): the whole handshake must complete within vhost_http_timeout, not
     // a per-read timeout a drip-feeding client could stretch indefinitely.
-    let timeout_secs = state.vhost_http_timeout.max(1);
+    // Go parity (pkg/util/vhost/http.go NewHTTPReverseProxy): `<= 0` floors
+    // at 60s; positive values pass through unchanged.
+    let timeout_secs = if state.vhost_http_timeout > 0 {
+        state.vhost_http_timeout
+    } else {
+        60
+    };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let io = PreReadStream {
         pre_read,
@@ -210,39 +216,58 @@ pub(crate) async fn serve_h2c_request<S>(
 /// backend's HTTP/1.1 response (with chunked decoding) as HTTP/2 frames.
 async fn handle_stream(
     request: http::Request<RecvStream>,
-    respond: SendResponse<Bytes>,
+    mut respond: SendResponse<Bytes>,
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
 ) -> Result<(), h2::Error> {
     // Route key from the HTTP/2 request (RFC 7540 §8.1.2.3): `:authority` is
-    // the Host equivalent, `:path` carries the request-target.
+    // the Host equivalent, `:path` carries the request-target. Routing uses
+    // the path WITHOUT the query — Go routes on `req.URL.Path` (the h2 layer
+    // is Go's http.Request, same URL.Path semantics as HTTP/1.1); the query
+    // is still forwarded to the provider (build_http1_request_head keeps the
+    // full path_and_query).
     let authority = request.uri().authority().map(|a| a.as_str()).unwrap_or("");
     let host = host_from_authority(authority);
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let path = request.uri().path().to_string();
 
     // HTTP/2 has no pseudo-header for auth. Every h2 request is
     // absolute-form (`:authority` is the URL authority), so Go
     // `checkRouteAuthByRequest` reads `Proxy-Authorization` ONLY (never
     // `authorization`) and answers 407 + Proxy-Authenticate on failure.
-    // The same credentials are reused for route matching and per-user
-    // routing (Go `getRequestRouteUser`).
     let http_auth = extract_basic_auth_headers(request.headers());
+    // Go getRequestRouteUser: ROUTING ONLY — when Proxy-Authorization is
+    // absent, fall back to the Authorization header's Basic Auth username so
+    // the request still hits the matched per-user route and returns 407
+    // instead of 404. Auth validation does not share the fallback
+    // (checkRouteAuthByRequest reads Proxy-Authorization only).
+    let route_user: Option<String> = if http_auth.is_none() {
+        extract_basic_auth_header(request.headers(), "authorization").map(|(u, _)| u)
+    } else {
+        None
+    };
     tracing::debug!(host = %host, path = %path, peer = %peer, "HTTP VHost (h2c) request for '{}' path '{}' from {}", host, path, peer);
 
     // Re-encode as an HTTP/1.1 request head. Go's reverse proxy forwards to
     // the provider as plain HTTP/1.1 even when the inbound request is h2c.
+    // `content_length` is the DECLARED body length (RFC 7540 §8.1.2.6
+    // enforcement — see the body task below); an unparseable header value
+    // degrades to "unknown" (the h2 library has already rejected invalid CL
+    // frames at receipt, so this is unreachable in practice). The chunked
+    // framing decision follows header PRESENCE, as before.
+    let content_length: Option<u64> = request
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
     let has_content_length = request.headers().contains_key("content-length");
     let request_head = build_http1_request_head(&request);
 
     let forward = match resolve_vhost_request(
         &state,
         host,
-        path,
+        path.as_str(),
         http_auth.as_ref(),
+        route_user.as_deref(),
         request_head,
         peer,
         "HTTP",
@@ -254,7 +279,7 @@ async fn handle_stream(
         Err(VhostResolveError::Unauthorized { .. }) => {
             // h2c is always absolute-form → 407 + Proxy-Authenticate.
             return send_h2_error(
-                respond,
+                &mut respond,
                 407,
                 &[("proxy-authenticate", "Basic realm=\"frp\"")],
                 Bytes::new(),
@@ -263,7 +288,7 @@ async fn handle_stream(
         }
         Err(VhostResolveError::NotFound) => {
             return send_h2_error(
-                respond,
+                &mut respond,
                 404,
                 &[],
                 Bytes::from(state.custom_404_page.clone()),
@@ -280,7 +305,7 @@ async fn handle_stream(
         .map(|v| v.clone());
     let Some(ctl_tx) = internal_tx else {
         tracing::warn!(host = %host, path = %path, "HTTP VHost (h2c) route for '{}' path '{}' found but control handler gone", host, path);
-        return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        return send_h2_error(&mut respond, 502, &[], Bytes::new()).await;
     };
 
     // Bridge the h2 stream to the byte-level work-conn machinery through an
@@ -313,16 +338,36 @@ async fn handle_stream(
             // Channel closed: control handler died between lookup and
             // dispatch — answer 502.
             tracing::warn!(host = %host, path = %path, "h2c route for '{}' path '{}' found but control channel closed", host, path);
-            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+            return send_h2_error(&mut respond, 502, &[], Bytes::new()).await;
         }
         Err(_elapsed) => {
             tracing::warn!(host = %host, path = %path, "h2c route for '{}' path '{}' found but control channel send timed out; answering 502", host, path);
-            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+            return send_h2_error(&mut respond, 502, &[], Bytes::new()).await;
         }
     }
 
     let (mut client_r, client_w) = tokio::io::split(client);
     let mut body = request.into_body();
+
+    // RFC 7540 §8.1.2.6: the request body must not extend beyond the
+    // declared Content-Length. The h2 library already enforces this at frame
+    // receipt (excess DATA → PROTOCOL_ERROR before it reaches us), but this
+    // app-level gate is defense in depth against that guarantee changing:
+    // forwarding excess bytes raw would let them reach the provider as a
+    // pipelined request (request smuggling). The body task counts against
+    // the declared length and signals `excess` on a violation; the main task
+    // answers RST_STREAM PROTOCOL_ERROR (Go's h2 server resets with
+    // PROTOCOL_ERROR on the same violation).
+    //
+    // `Notify` is deliberate over `oneshot`: the signal must fire ONLY on an
+    // actual violation. A oneshot's sender is dropped when the body task
+    // finishes NORMALLY (every legitimate request), which closes the channel
+    // and resolves the receiver with `Err(Closed)` — a `biased` select would
+    // then take the reset arm on every forwarded request. `notified()` stays
+    // pending until `notify_one()` is called, no matter how the body task
+    // ends; the permit is retained if the notification beats the first poll.
+    let excess = Arc::new(tokio::sync::Notify::new());
+    let excess_body = excess.clone();
 
     // Forward the h2 request body to the provider. When the head carried no
     // Content-Length it was emitted with `Transfer-Encoding: chunked` (Go
@@ -332,8 +377,19 @@ async fn handle_stream(
     let body_task = tokio::spawn(async move {
         let mut client_w = client_w;
         let end_stream = body.is_end_stream();
+        let mut remaining = content_length;
         while let Some(Ok(data)) = body.data().await {
             if !data.is_empty() {
+                if let Some(rem) = remaining {
+                    if data.len() as u64 > rem {
+                        // Excess body bytes beyond the declared Content-Length
+                        // (RFC 7540 §8.1.2.6). Never forward them — they would
+                        // arrive at the provider as a pipelined request.
+                        excess_body.notify_one();
+                        return;
+                    }
+                    remaining = Some(rem - data.len() as u64);
+                }
                 if has_content_length {
                     let _ = client_w.write_all(&data).await;
                 } else {
@@ -355,12 +411,29 @@ async fn handle_stream(
     });
 
     // Read the backend's HTTP/1.1 response and re-encode it as HTTP/2. The
-    // response-head read is bounded by vhost_http_timeout when configured
-    // (Go ResponseHeaderTimeout → 504 Gateway Timeout; 0 disables it, the
-    // same semantics as the byte-level bridge).
-    let head_timeout = (state.vhost_http_timeout > 0)
-        .then(|| std::time::Duration::from_secs(state.vhost_http_timeout));
-    let response_result = stream_h2_response(&mut client_r, respond, head_timeout).await;
+    // response-head read is bounded by vhost_http_timeout — Go parity
+    // (pkg/util/vhost/http.go): `<= 0` floors at 60s (ResponseHeaderTimeout
+    // → 504 Gateway Timeout), positive values pass through unchanged.
+    let head_timeout = Some(std::time::Duration::from_secs(
+        if state.vhost_http_timeout > 0 {
+            state.vhost_http_timeout
+        } else {
+            60
+        },
+    ));
+    // `biased;`: if the backend completes AND the body exceeds simultaneously,
+    // the protocol error wins — a declared Content-Length is a hard contract.
+    let response_result = tokio::select! {
+        biased;
+        _ = excess.notified() => {
+            body_task.abort();
+            // Go's h2 server answers RST_STREAM PROTOCOL_ERROR when a DATA
+            // frame exceeds the declared Content-Length.
+            respond.send_reset(h2::Reason::PROTOCOL_ERROR);
+            return Ok(());
+        }
+        r = stream_h2_response(&mut client_r, &mut respond, head_timeout) => r,
+    };
 
     // Once the response is fully relayed the bridge has served its purpose —
     // stop the body forwarder so the h2 stream (and work conn) can wind down
@@ -369,18 +442,16 @@ async fn handle_stream(
     response_result
 }
 
-/// Strip the port from an h2 `:authority` (Host equivalent), handling IPv6
-/// literals like `[::1]:8080` the same way `extract_host_header` does for
-/// HTTP/1.1, and trim exactly one trailing dot (Go `CanonicalHost`
-/// `TrimSuffix(host, ".")` — same as `canonicalize_authority` in vhost.rs,
-/// so "example.com." routes like "example.com" on both paths).
+/// Canonicalize an h2 `:authority` (Host equivalent) for routing — the same
+/// Go `CanonicalHost` semantics as the HTTP/1.1 path, delegated to
+/// `canonicalize_authority` in vhost.rs so both paths share ONE
+/// implementation. The Go `hasPort` gate matters here: the port is stripped
+/// only when the value has exactly one colon (or a bracketed form with `]:`).
+/// "example.com:8080:90" has two colons and is NOT a bracketed form — Go
+/// leaves it untouched (unroutable → 404), while a naive first-colon split
+/// would route it to "example.com" and shadow a legitimate route.
 fn host_from_authority(authority: &str) -> &str {
-    let hostname = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(authority)
-    } else {
-        authority.split(':').next().unwrap_or(authority)
-    };
-    hostname.strip_suffix('.').unwrap_or(hostname)
+    super::canonicalize_authority(authority)
 }
 
 /// Re-encode an h2 request as an HTTP/1.1 request head. `:authority` becomes
@@ -434,12 +505,17 @@ fn build_http1_request_head(request: &http::Request<RecvStream>) -> Vec<u8> {
     head
 }
 
-/// Extract Basic Auth credentials from the `proxy-authorization` header of
-/// an h2 request (HTTP/2 has no pseudo-header for auth). h2 requests are
-/// always absolute-form, so Go `checkRouteAuthByRequest` reads ONLY
-/// `Proxy-Authorization` here — never `authorization`.
-fn extract_basic_auth_headers(headers: &http::HeaderMap) -> Option<(String, String)> {
-    let value = headers.get("proxy-authorization")?.to_str().ok()?;
+/// Extract Basic Auth credentials from a named header of an h2 request
+/// (HTTP/2 has no pseudo-header for auth). h2 requests are always
+/// absolute-form, so Go `checkRouteAuthByRequest` reads ONLY
+/// `Proxy-Authorization` for auth validation — while Go `getRequestRouteUser`
+/// falls back to `Authorization` for ROUTING when Proxy-Authorization is
+/// absent. Both readers share this one parser.
+fn extract_basic_auth_header(
+    headers: &http::HeaderMap,
+    name: &'static str,
+) -> Option<(String, String)> {
+    let value = headers.get(name)?.to_str().ok()?;
     let encoded = value.strip_prefix("Basic ")?.trim();
     let decoded = frp_core::base64::decode(encoded).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
@@ -447,9 +523,14 @@ fn extract_basic_auth_headers(headers: &http::HeaderMap) -> Option<(String, Stri
     Some((user.to_string(), pwd.to_string()))
 }
 
+/// Extract Basic Auth credentials from the `proxy-authorization` header.
+fn extract_basic_auth_headers(headers: &http::HeaderMap) -> Option<(String, String)> {
+    extract_basic_auth_header(headers, "proxy-authorization")
+}
+
 /// Send a body-less (or single-chunk) HTTP/2 error response.
 async fn send_h2_error(
-    mut respond: SendResponse<Bytes>,
+    respond: &mut SendResponse<Bytes>,
     status: u16,
     extra: &[(&str, &str)],
     body: Bytes,
@@ -654,9 +735,18 @@ impl<'a, R: AsyncRead + Unpin> BodyReader<'a, R> {
     }
 
     /// Read one CRLF (or LF) terminated line including its terminator.
+    /// A line longer than 64 KiB is invalid (chunk-size lines and trailing
+    /// headers are tiny in practice) — the growth is bounded instead of
+    /// letting a misbehaving backend accumulate 8 KiB per read_more forever.
     async fn read_line(&mut self) -> std::io::Result<Vec<u8>> {
         loop {
             let avail = self.available();
+            if avail.len() > MAX_CHUNK_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "chunk line exceeds 64 KiB",
+                ));
+            }
             if let Some(rel) = avail.windows(2).position(|w| w == b"\r\n") {
                 let line = avail[..rel + 2].to_vec();
                 self.consume(rel + 2);
@@ -734,8 +824,14 @@ async fn stream_chunked_body(
             send.send_data(Bytes::from(data), false)?;
             remaining -= n;
         }
-        if reader.read_exact(2).await.is_err() {
-            return Ok(()); // missing trailing CRLF
+        // Each chunk ends with CRLF (RFC 7230 §4.1); Go's chunkedReader
+        // errors with "malformed chunked encoding" when the two bytes after
+        // the chunk data are not CRLF. Verify instead of silently discarding
+        // whatever two bytes arrived — mis-parsing the framing could let
+        // garbage past as a chunk line.
+        match reader.read_exact(2).await {
+            Ok(terminator) if terminator == *b"\r\n" => {}
+            _ => return Ok(()), // missing or malformed trailing CRLF
         }
     }
 }
@@ -747,7 +843,7 @@ async fn stream_chunked_body(
 /// backend that closes before the head produces `502 Bad Gateway`.
 async fn stream_h2_response<R: AsyncRead + Unpin>(
     r: &mut R,
-    mut respond: SendResponse<Bytes>,
+    respond: &mut SendResponse<Bytes>,
     head_timeout: Option<std::time::Duration>,
 ) -> Result<(), h2::Error> {
     let head = if let Some(timeout) = head_timeout {
@@ -798,7 +894,10 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         if is_hop_by_hop(n.as_str()) {
             continue;
         }
-        resp.headers_mut().insert(n.clone(), v.clone());
+        // `append`, not `insert`: a backend emitting duplicate response
+        // headers (e.g. multiple Set-Cookie) must preserve ALL values —
+        // `insert` collapses duplicates and the last one wins.
+        resp.headers_mut().append(n.clone(), v.clone());
     }
 
     let content_length = header_value(&headers, "content-length")
@@ -889,16 +988,28 @@ mod tests {
         assert_eq!(host_from_authority("example.com."), "example.com");
         assert_eq!(host_from_authority("example.com.:8080"), "example.com");
         assert_eq!(host_from_authority("example.com.."), "example.com.");
-        // Bracketed IPv6 keeps the bare address, with or without a port.
+        // Bracketed IPv6: with a port the address is stripped of brackets
+        // and port; WITHOUT "]:", the whole bracketed value stays — Go
+        // `hasPort` returns false, CanonicalHost leaves it untouched, and it
+        // is unroutable (nothing registers brackets).
         assert_eq!(host_from_authority("[::1]:8080"), "::1");
-        assert_eq!(host_from_authority("[2001:db8::1]"), "2001:db8::1");
-        assert_eq!(host_from_authority("[2001:db8::1]."), "2001:db8::1");
+        assert_eq!(host_from_authority("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(host_from_authority("[2001:db8::1]."), "[2001:db8::1]");
         // Empty authority.
         assert_eq!(host_from_authority(""), "");
-        // An UNBRACKETED IPv6 literal splits at the first colon — garbage-in
-        // (RFC 9110 requires brackets for IPv6 authorities), but the
-        // behavior must not panic.
-        assert_eq!(host_from_authority("::1"), "");
+        // Two colons without brackets: Go `hasPort` is false → the value is
+        // left untouched (unroutable → 404). A naive first-colon split would
+        // wrongly route this to "example.com".
+        assert_eq!(
+            host_from_authority("example.com:8080:90"),
+            "example.com:8080:90"
+        );
+        // A non-numeric port still splits (Go never validates the port
+        // digits on this path — the numeric gate is CONNECT-only).
+        assert_eq!(host_from_authority("example.com:abc"), "example.com");
+        // An UNBRACKETED IPv6 literal has two+ colons and is not a bracketed
+        // form — it stays untouched (unroutable), no panic.
+        assert_eq!(host_from_authority("::1"), "::1");
     }
 
     #[test]

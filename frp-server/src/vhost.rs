@@ -114,28 +114,47 @@ impl std::fmt::Display for RouterConfigConflict {
 
 impl std::error::Error for RouterConfigConflict {}
 
-/// Find the first route in a sorted Vec whose scheme matches and whose
-/// location prefix-matches the path.
-/// If the route has no locations (e.g. HTTPS SNI routes), it matches any path.
+/// Find the route whose location prefix-matches the path, preferring the
+/// LONGEST matching location (Go frp flattened-Router semantics).
+///
+/// Go registers one `Routers` entry per (domain, location, httpUser) triple
+/// and sorts ALL of them by location lexicographically descending before
+/// first-match probing (router.go `slices.SortFunc` + `getLocked`). A
+/// route-level scan that probes each route's locations in registration order
+/// diverges when routes carry interleaved multi-location sets: route A at
+/// ["/zz", "/a"] and route B at ["/aa"] — Go flattens to "/zz"(A),
+/// "/aa"(B), "/a"(A) and routes path "/aa" to B, while route-first probing
+/// would check A's "/a" and wrongly pick A. Scanning every (route, location)
+/// pair and keeping the largest matching location reproduces the flattened
+/// order exactly (a tie in the flattened order can only be the same
+/// location — same route — so any tie-break is equivalent).
+///
+/// Routes with no locations (e.g. HTTPS SNI routes) match any path with the
+/// empty-string key — Go's "" location sorts LAST, so they only win when
+/// nothing else matches.
 /// The scheme filter mirrors Go's separate router sets (httpVhostRouter vs
 /// the HTTPS Muxer's registryRouter): an HTTP lookup must never match an
-/// HTTPS route and vice versa. Same-scheme first-match order is preserved —
-/// within a scheme, the first route in the Go-sorted order wins.
+/// HTTPS route and vice versa.
 fn find_matching_route(vrs: &[VhostRoute], path: &str, scheme: &str) -> Option<VhostRouteMatch> {
+    let mut best: Option<(&VhostRoute, &str)> = None;
     for route in vrs {
         if route.scheme != scheme {
             continue;
         }
         if route.locations.is_empty() {
-            return Some(VhostRouteMatch::from_route(route));
+            // Go's "" location sorts last; record only as a fallback.
+            if best.is_none() {
+                best = Some((route, ""));
+            }
+            continue;
         }
         for loc in &route.locations {
-            if path.starts_with(loc.as_str()) {
-                return Some(VhostRouteMatch::from_route(route));
+            if path.starts_with(loc.as_str()) && best.is_none_or(|(_, bl)| loc.as_str() > bl) {
+                best = Some((route, loc.as_str()));
             }
         }
     }
-    None
+    best.map(|(route, _)| VhostRouteMatch::from_route(route))
 }
 
 /// Find best matching route for a given host, path, httpUser, and scheme.
@@ -550,7 +569,13 @@ async fn serve_vhost_request<S>(
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     // Read the first 4096 bytes to extract Host header (with configured timeout)
-    let timeout_secs = state.vhost_http_timeout.max(1);
+    // Go parity (pkg/util/vhost/http.go NewHTTPReverseProxy): `<= 0` floors
+    // at 60s; positive values pass through unchanged.
+    let timeout_secs = if state.vhost_http_timeout > 0 {
+        state.vhost_http_timeout
+    } else {
+        60
+    };
     let mut buf = [0u8; 4096];
     let n = match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
@@ -641,7 +666,12 @@ async fn handle_http1_request<S>(
 {
     // The vhost listener's single read may be short (e.g. an h2c-misdetected
     // HTTP/1.1 request): keep reading until the head terminator or the cap.
-    let timeout_secs = state.vhost_http_timeout.max(1);
+    // Go parity (pkg/util/vhost/http.go): `<= 0` floors at 60s.
+    let timeout_secs = if state.vhost_http_timeout > 0 {
+        state.vhost_http_timeout
+    } else {
+        60
+    };
     // Single absolute deadline for the whole head (audit fix): a slow-drip
     // client sending one byte per read window would otherwise stretch the
     // head read to 4096 × timeout. The whole head must arrive within
@@ -742,6 +772,18 @@ async fn handle_http1_request<S>(
     } else {
         extract_basic_auth(request_text)
     };
+    // Go getRequestRouteUser (pkg/util/vhost/http.go): ROUTING ONLY — when
+    // an absolute-form request carries no Proxy-Authorization, fall back to
+    // the Authorization header's Basic Auth username so the request still
+    // hits the matched per-user route and returns 407 instead of 404. Auth
+    // validation deliberately does not share this fallback (checkRouteAuthByRequest
+    // reads Proxy-Authorization only on absolute-form); http_auth above stays
+    // the single source of truth for the credential check.
+    let route_user: Option<String> = if http_auth.is_none() && is_absolute_form {
+        extract_basic_auth(request_text).map(|(u, _)| u)
+    } else {
+        None
+    };
 
     debug!(host = %host, path = %path, peer = %peer, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
 
@@ -750,6 +792,7 @@ async fn handle_http1_request<S>(
         &host,
         &path,
         http_auth.as_ref(),
+        route_user.as_deref(),
         pre_read,
         peer,
         scheme,
@@ -860,14 +903,18 @@ pub(crate) async fn resolve_vhost_request(
     host: &str,
     path: &str,
     http_auth: Option<&(String, String)>,
+    route_user: Option<&str>,
     request_head: Vec<u8>,
     peer: std::net::SocketAddr,
     scheme: &str,
     is_absolute_form: bool,
 ) -> Result<VhostForward, VhostResolveError> {
-    let http_user = http_auth
-        .as_ref()
-        .map(|(u, _)| u.as_str())
+    // Routing username: the caller's routing-only BasicAuth fallback
+    // (Go getRequestRouteUser) takes precedence when present; otherwise the
+    // authenticated header's username. Auth validation below still checks
+    // only `http_auth` — the fallback never weakens the credential gate.
+    let http_user = route_user
+        .or_else(|| http_auth.map(|(u, _)| u.as_str()))
         .unwrap_or_default();
 
     // Route-scheme key for the lookup. Routes are registered with lowercase
@@ -1113,7 +1160,12 @@ pub async fn run_vhost_https_listener(
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let timeout_secs = state.vhost_http_timeout.max(1);
+                    // Go parity (pkg/util/vhost/http.go): `<= 0` floors at 60s.
+                    let timeout_secs = if state.vhost_http_timeout > 0 {
+                        state.vhost_http_timeout
+                    } else {
+                        60
+                    };
                     // Read the TLS ClientHello (SNI lives in the first
                     // record; 4096 bytes comfortably covers it).
                     let mut buf = [0u8; 4096];
@@ -1296,6 +1348,13 @@ enum RequestLine<'a> {
 /// not influence location matching).
 fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
     let first_line = request.lines().next().unwrap_or("");
+    // Go readRequest parity: a request that opens with a blank line is
+    // "malformed HTTP request" → 400. (Go's HTTP/0.9 default only applies
+    // once a non-empty request line parses with <3 space-separated tokens;
+    // an empty first line fails readRequest's shape check before that.)
+    if first_line.is_empty() {
+        return RequestLine::BadRequest;
+    }
     let mut parts = first_line.splitn(3, ' ');
     let _method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -1427,16 +1486,14 @@ fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
 /// Inject `X-Forwarded-For` (append semantics, Go httputil.ReverseProxy) and
 /// configured requestHeaders (Set semantics, Go `req.Header.Set`) into the
 /// request head bytes. Only the header block up to `\r\n\r\n` is touched.
-/// When no request headers are configured, the input is returned unchanged
-/// (ownership transferred, no copy).
+/// The X-Forwarded-For append runs even when no requestHeaders are
+/// configured — Go's Rewrite hook (pkg/util/vhost/http.go) unconditionally
+/// calls `r.SetXForwarded()`; a configured header list is not a gate.
 fn inject_vhost_request_headers(
     data: Vec<u8>,
     peer: std::net::SocketAddr,
     request_headers: &[(String, String)],
 ) -> Vec<u8> {
-    if request_headers.is_empty() {
-        return data;
-    }
     let header_end = data
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -1598,7 +1655,7 @@ pub(crate) fn count_host_headers(request: &str) -> usize {
 /// to the LAST ']' ("[::1]x]:8080" → host "::1]x" — unroutable); accepting
 /// the first ']' would route a malformed value as "::1" when that literal
 /// is registered.
-fn canonicalize_authority(value: &str) -> &str {
+pub(crate) fn canonicalize_authority(value: &str) -> &str {
     let colons = value.bytes().filter(|b| *b == b':').count();
     let hostname = if colons == 1 {
         // host:port — SplitHostPort never validates the port digits
@@ -2950,6 +3007,47 @@ mod tests {
         assert!(m.is_none(), "cross-scheme lookup must not match");
     }
 
+    /// Go registers one Router per (domain, location, httpUser) triple and
+    /// sorts ALL of them flat before first-match probing. A route-first scan
+    /// over interleaved multi-location sets diverges: with A at
+    /// ["/zz", "/a"] and B at ["/aa"], Go's flattened order "/zz"(A),
+    /// "/aa"(B), "/a"(A) routes "/aa" to B — a route-first probe would check
+    /// A's "/a" first and wrongly pick A. The best-match scan reproduces the
+    /// flattened order exactly.
+    #[test]
+    fn test_find_matching_route_interleaved_multi_location() {
+        let mut routes = vec![
+            route("a", &["/zz".into(), "/a".into()]),
+            route("b", &["/aa".into()]),
+        ];
+        sort_by_longest_location(&mut routes);
+        // A sorts first (its "/zz" key is largest), so a route-first
+        // first-match scan would probe A first.
+        assert_eq!(routes[0].proxy_name.as_ref(), "a");
+
+        // "/aa" → B (flattened order: "/aa" before "/a").
+        let m = find_matching_route(&routes, "/aa", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "b");
+        // "/a" → A (B's "/aa" does not prefix-match "/a").
+        let m = find_matching_route(&routes, "/a", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "a");
+        // "/zzzz" → A (A's "/zz").
+        let m = find_matching_route(&routes, "/zzzz", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "a");
+        // "/aab" → B ("/aa" is longer than "/a").
+        let m = find_matching_route(&routes, "/aab", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "b");
+        // A no-location route only wins when nothing else matches.
+        let mut with_catchall = vec![
+            route("a", &["/zz".into(), "/a".into()]),
+            route("b", &["/aa".into()]),
+            route("c", &[]),
+        ];
+        sort_by_longest_location(&mut with_catchall);
+        let m = find_matching_route(&with_catchall, "/none", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "c");
+    }
+
     /// Re-registration must restore the sorted order, and the httpUser-
     /// specific bucket must win over the "" (all-users) fallback bucket.
     #[tokio::test]
@@ -3222,6 +3320,7 @@ mod tests {
                     "auth.example.com",
                     "/",
                     auth.as_ref(),
+                    None, // no routing-only fallback user
                     head,
                     peer,
                     "HTTP",
@@ -3258,6 +3357,7 @@ mod tests {
                     "auth.example.com",
                     "/",
                     auth.as_ref(),
+                    None, // no routing-only fallback user
                     head,
                     peer,
                     "HTTP",
@@ -3282,6 +3382,7 @@ mod tests {
                     "auth.example.com",
                     "/",
                     auth.as_ref(),
+                    None, // no routing-only fallback user
                     head,
                     peer,
                     "HTTP",
@@ -3339,6 +3440,7 @@ mod tests {
             "g.example.com",
             "/",
             None,
+            None, // no routing-only fallback user
             b"GET / HTTP/1.1\r\nHost: g.example.com\r\n\r\n".to_vec(),
             std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
             "HTTP",
@@ -3382,6 +3484,7 @@ mod tests {
             "g2.example.com",
             "/",
             None,
+            None, // no routing-only fallback user
             b"GET / HTTP/1.1\r\nHost: g2.example.com\r\n\r\n".to_vec(),
             std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
             "HTTP",

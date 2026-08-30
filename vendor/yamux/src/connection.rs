@@ -27,6 +27,7 @@ use crate::{
     Config, DEFAULT_CREDIT,
 };
 use crate::{Result, MAX_ACK_BACKLOG};
+use crossbeam_queue::ArrayQueue;
 use cleanup::Cleanup;
 use closing::Closing;
 use futures::stream::SelectAll;
@@ -41,6 +42,12 @@ pub use stream::{Packet, State, Stream};
 
 /// Next connection identifier, used for debug logging.
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Capacity of the connection-scoped send-side body-buffer pool (frp-rs
+/// patch). At most one `Vec` per in-flight data frame is retained; with the
+/// 16 KiB split-send default that bounds the pool at ~256 KiB per connection.
+/// The pool is a cache only — a full pool just allocates fresh.
+const BODY_POOL_CAP: usize = 16;
 
 /// How the connection is used.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
@@ -89,7 +96,12 @@ pub struct Connection<T> {
 impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     pub fn new(socket: T, cfg: Config, mode: Mode) -> Self {
         Self {
-            inner: ConnectionState::Active(Active::new(socket, cfg, mode)),
+            inner: ConnectionState::Active(Active::new(
+                socket,
+                cfg,
+                mode,
+                Arc::new(ArrayQueue::new(BODY_POOL_CAP)),
+            )),
         }
     }
 
@@ -297,8 +309,25 @@ struct Active<T> {
     no_streams_waker: Option<Waker>,
 
     pending_read_frame: Option<Frame<()>>,
+    /// frp-rs patch: single queued per-stream RST (cap-hit replies).
+    ///
+    /// Kept separate from `pending_read_frame` because RSTs are idempotent
+    /// (same 12-byte header each time): a second cap-hit SYN while one RST is
+    /// queued just replaces it (coalescing), so this slot never gates the
+    /// read branch — inbound frames keep being processed while the socket
+    /// write is backpressured. Pongs/GoAways keep the read gate (they must
+    /// answer per-ping, see `poll`).
+    pending_reset_frame: Option<Frame<()>>,
     pending_write_frame: Option<Frame<()>>,
     new_outbound_stream_waker: Option<Waker>,
+
+    /// frp-rs patch: connection-scoped send-side body-buffer pool. Data-frame
+    /// bodies are drawn from here in `Stream::poll_write` and returned by
+    /// `frame::Io` once the frame is fully written (WriteState::Body
+    /// completion), removing the per-chunk `Vec` allocation on the send path.
+    /// Send-side only: read bodies move into `Shared::buffer` and are
+    /// consumed lazily, so they must never be pooled.
+    body_pool: Arc<ArrayQueue<Vec<u8>>>,
 
     rtt: rtt::Rtt,
 
@@ -361,10 +390,10 @@ impl<T> fmt::Display for Active<T> {
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     /// Create a new `Connection` from the given I/O resource.
-    fn new(socket: T, cfg: Config, mode: Mode) -> Self {
+    fn new(socket: T, cfg: Config, mode: Mode, body_pool: Arc<ArrayQueue<Vec<u8>>>) -> Self {
         let id = Id::next();
         log::debug!("new connection: {id} ({mode:?})");
-        let socket = frame::Io::new(id, socket).fuse();
+        let socket = frame::Io::new(id, socket, body_pool.clone()).fuse();
         Active {
             id,
             mode,
@@ -378,10 +407,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 Mode::Server => 2,
             },
             pending_read_frame: None,
+            pending_reset_frame: None,
             pending_write_frame: None,
             new_outbound_stream_waker: None,
             rtt: rtt::Rtt::new(),
             accumulated_max_stream_windows: Default::default(),
+            body_pool,
         }
     }
 
@@ -390,6 +421,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         let pending_frames = self
             .pending_read_frame
             .into_iter()
+            .chain(self.pending_reset_frame)
             .chain(self.pending_write_frame)
             .collect::<VecDeque<Frame<()>>>();
         Closing::new(self.stream_receivers, pending_frames, self.socket)
@@ -420,6 +452,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 if let Some(frame) = self
                     .pending_read_frame
                     .take()
+                    .or_else(|| self.pending_reset_frame.take())
                     .or_else(|| self.pending_write_frame.take())
                 {
                     self.socket.start_send_unpin(frame)?;
@@ -464,6 +497,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 }
             }
 
+            // The read gate only guards `pending_read_frame` (pongs/GoAways):
+            // a queued pong while the socket write is backpressured stops
+            // inbound processing rather than pile up more answerable frames
+            // (pings must be answered per-ping). frp-rs patch: queued RSTs in
+            // `pending_reset_frame` deliberately do NOT gate reads — they are
+            // idempotent 12-byte headers coalesced into a single slot, and a
+            // session-wide stall while a cap-hit RST waits for the socket
+            // would let one hostile SYN freeze the whole connection (all
+            // streams, the control channel included) for up to the keepalive
+            // timeout.
             if self.pending_read_frame.is_none() {
                 match self.socket.poll_next_unpin(cx) {
                     Poll::Ready(Some(frame)) => {
@@ -496,10 +539,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                                 // Both peers key off the RST flag, not the
                                 // frame type, so this is a deliberate
                                 // wire-shape choice, not a bug.
+                                //
+                                // Queued into `pending_reset_frame` (NOT
+                                // `pending_read_frame`): RSTs are idempotent —
+                                // the same 12-byte header regardless of how
+                                // many cap-hit SYNs arrive — so a second one
+                                // while the socket write is backpressured just
+                                // replaces the first (coalescing, no per-SYN
+                                // fidelity needed; a coalesced-away RST costs
+                                // the remote at most a briefly-open stream we
+                                // no-op as unknown). This keeps the read
+                                // branch running during backpressure instead
+                                // of stalling the whole session behind one
+                                // un-sendable RST.
                                 log::trace!("{}/{}: sending stream reset", self.id, id);
                                 let mut header = Header::data(id, 0);
                                 header.rst();
-                                self.pending_read_frame.replace(Frame::new(header).into());
+                                self.pending_reset_frame.replace(Frame::new(header).into());
                             }
                         }
                         continue;
@@ -866,6 +922,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             sender,
             self.rtt.clone(),
             self.accumulated_max_stream_windows.clone(),
+            self.body_pool.clone(),
         )
     }
 
@@ -885,6 +942,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             sender,
             self.rtt.clone(),
             self.accumulated_max_stream_windows.clone(),
+            self.body_pool.clone(),
         )
     }
 

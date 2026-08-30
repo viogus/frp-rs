@@ -4193,8 +4193,16 @@ impl Service {
                     let snapshot = crate::reload::config_snapshot(p);
                     let mut err = String::new();
                     // If this proxy has a plugin but plugin_addrs doesn't have it,
-                    // the plugin failed to start — record the error
-                    if p.plugin.is_some() && !plugin_addrs.contains_key(name) {
+                    // the plugin failed to start — record the error. virtual_net
+                    // is not a local-listener plugin (start_plugin skips it, see
+                    // the plugin-restart loop above), so its name never lands in
+                    // plugin_addrs — stamping the err here would report a false
+                    // "failed to start" after every vnet-touching reload
+                    // (transient until NewProxyResp clears it).
+                    if p.plugin.is_some()
+                        && plugin_type != "virtual_net"
+                        && !plugin_addrs.contains_key(name)
+                    {
                         err = format!("plugin '{}' failed to start", plugin_type);
                     }
                     map.insert(

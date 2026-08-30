@@ -599,45 +599,50 @@ async fn test_h2c_keepalive_reuse_survives_http_timeout() {
 
 /// Round-8 h2c preface slow-drip regression: the preface completion loop in
 /// vhost.rs uses ONE absolute deadline (vhost_http_timeout from the first
-/// byte), not a per-read timeout. A client dripping the 24-byte preface one
-/// byte per read window (300ms here, so 23 × 300ms ≈ 6.9s to complete) must
-/// be released after the 1s deadline — a per-read timeout would re-arm on
-/// every received byte and park the task + fd + vhost permit for ~7s.
+/// byte), not a per-read timeout. A client dripping the FULL 24-byte preface
+/// one byte per 300ms (23 × 300ms ≈ 6.9s to complete) must be released after
+/// the 1s deadline — a per-read timeout would re-arm on every received byte
+/// and park the task + fd + vhost permit for ~7s.
 ///
-/// Assertion: the server closes the connection within 2.5s of the first
-/// preface byte (1s deadline + scheduling slack). Pre-fix the connection
-/// would survive past the 2.5s window (preface completes at ~6.9s).
+/// The drip runs on the split write half so the read half can observe the
+/// server-side release while bytes keep arriving — a drip that stops writing
+/// cannot tell "server closed" from "server stopped reading". The drip task
+/// breaks on the first write error (the server's close surfaces as one).
+///
+/// Assertion: the server closes the connection within 3s of the first
+/// preface byte (1s deadline + scheduling slack), well before the 24th byte
+/// lands at ~6.9s. Pre-fix (per-read timeout) code re-arms on every 300ms
+/// byte and the connection survives past the window.
 #[tokio::test]
 async fn test_h2c_preface_slow_drip_released_at_absolute_deadline() {
     let (_bind, vhost_addr, _provider, _run_id, _work_conn) =
         setup_auth("h2c-drip", "drip.example.com", None, None, 1).await;
 
-    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+    let client = tokio::net::TcpStream::connect(vhost_addr)
         .await
         .expect("vhost connect");
     let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     let started = std::time::Instant::now();
+    let (mut client_rd, mut client_wr) = tokio::io::split(client);
 
-    // Drip one byte per 300ms: the absolute 1s deadline must fire while
-    // fewer than 24 bytes have arrived (first 4 bytes land before 1s).
-    let mut sent = 0;
-    while sent < preface.len() {
-        client
-            .write_all(&preface[sent..sent + 1])
-            .await
-            .expect("drip preface byte");
-        sent += 1;
-        if sent >= 4 {
-            break; // enough bytes to commit the h2 path; keep the conn open
+    // Drip ALL 24 preface bytes at 300ms each (23 × 300ms ≈ 6.9s total):
+    // the absolute 1s deadline must fire mid-drip, while the h2 path is
+    // already committed (the first byte "P" is a preface prefix). Breaking
+    // on write error is the normal end once the server closes.
+    let drip = tokio::spawn(async move {
+        for &b in preface {
+            if client_wr.write_all(&[b]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
+    });
 
-    // The remaining drip keeps arriving but the 1s deadline must already
-    // have armed (it is anchored at the first read in the completion loop).
-    // Server-side release: read returns EOF or an error within 2.5s.
+    // Server-side release: the read half observes EOF or an error within
+    // 3s — while the drip is STILL sending bytes, proving the server (not a
+    // quiet client) closed the connection.
     let mut buf = [0u8; 64];
-    match tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf)).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(3), client_rd.read(&mut buf)).await {
         Ok(Ok(0)) => {}
         Ok(Ok(n)) => panic!(
             "server must release the slow-drip h2c client, got {} bytes: {}",
@@ -651,10 +656,11 @@ async fn test_h2c_preface_slow_drip_released_at_absolute_deadline() {
         ),
     }
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(3),
+        started.elapsed() < std::time::Duration::from_millis(3500),
         "server released the slow-drip client only after {:.1}s",
         started.elapsed().as_secs_f32()
     );
+    drip.abort();
 }
 
 /// Round-8 h2c oversized header block regression: the h2 server builder caps

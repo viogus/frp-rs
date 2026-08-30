@@ -503,19 +503,19 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
     // Do NOT use remove_client() — it removes ALL proxies for this run_id,
     // which in supersession would delete the new handler's proxies.
     for name in &proxy_names {
-        // Skip proxies registered by a newer control generation: when the
-        // 10s handoff barrier times out, the superseding control may have
-        // registered proxies before this cleanup captured its snapshot, and
-        // the snapshot-then-remove loop must not tear them down (audit
-        // finding 3 — same generation filter as unregister_control).
-        if ctx
+        // Generation-guarded removal: `remove_if_control_id` removes only
+        // when the entry still belongs to this control generation (or has
+        // no owner), closing the get-then-remove window where a same-name
+        // newer-generation re-registration landing between the pre-check
+        // and the removal would be torn down (audit finding 3 — same
+        // generation filter as unregister_control and the round-7 reaper).
+        if let Some(removed) = ctx
             .state
             .proxy_manager
-            .get(name)
+            .remove_if_control_id(name, ctx.control_id)
             .await
-            .is_some_and(|i| i.control_id != 0 && i.control_id > ctx.control_id)
         {
-            // Port-mark ownership on supersession: the skipped proxy's
+            // Port-mark ownership on supersession: a skipped proxy's
             // ORIGINAL port mark was freed exactly once by the superseding
             // login's registration — register_or_replace returned the
             // replaced entry and free_replaced_port (proxy_ops.rs) released
@@ -523,20 +523,16 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
             // leaks here (audit-fix: residual port-mark leak on
             // barrier-timeout supersession; same note in proxy_ops.rs
             // unregister_control).
-            continue;
-        }
-        // Decrement the SNI-sniff gate count only when the proxy was
-        // actually removed here — a racing dashboard delete may have removed
-        // it first, and a double decrement would leave https_proxy_count at 0
-        // while https proxies still exist, silently disabling SNI sniff.
-        let is_https = ctx
-            .state
-            .proxy_manager
-            .get(name)
-            .await
-            .is_some_and(|i| i.proxy_type == "https");
-        if ctx.state.proxy_manager.remove(name).await && is_https {
-            ctx.state.dec_https_proxy_count();
+            //
+            // Decrement the SNI-sniff gate count only when the removed
+            // entry is an https proxy — the removed entry is the source of
+            // truth (a racing dashboard delete may have removed it first,
+            // and a double decrement would leave https_proxy_count at 0
+            // while https proxies still exist, silently disabling SNI
+            // sniff).
+            if removed.proxy_type == "https" {
+                ctx.state.dec_https_proxy_count();
+            }
         }
     }
     info!(run_id = %ctx.run_id, "Control connection {} removed", ctx.run_id);
@@ -689,6 +685,180 @@ mod tests {
         assert!(
             bridge_token.is_cancelled(),
             "cleanup must cancel the work-conn bridge token"
+        );
+    }
+
+    /// Round-8 finding: cleanup's per-proxy removal must be generation-
+    /// guarded (`remove_if_control_id`). A proxy that a NEWER control
+    /// generation re-registered between the name snapshot and the removal
+    /// loop must survive the old handler's cleanup — the old get-then-remove
+    /// window could tear down the fresh registration. Mirrors the round-7
+    /// reaper pattern (service.rs).
+    #[tokio::test]
+    async fn cleanup_removes_own_generation_proxy_and_decrements_https() {
+        let state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        state
+            .proxy_manager
+            .register(
+                "run-1".into(),
+                crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+                    "p1",
+                    "https",
+                    "run-1",
+                    Some(24001),
+                    1,
+                ),
+            )
+            .await
+            .expect("register https proxy");
+        state
+            .https_proxy_count
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let (_, run_mu_guard) = state.get_run_mu("run-1");
+        let (internal_tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut ctx = ControlContext {
+            state: Arc::clone(&state),
+            pool_stats: Arc::new(crate::state::PoolStats::default()),
+            reloadable: state
+                .reloadable
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            v2: false,
+            run_id: "run-1".to_string(),
+            control_id: 1,
+            pool_cap: 10,
+            internal_tx,
+            peer: None,
+            authenticated_user: String::new(),
+            udp_packet_codec: String::new(),
+            _run_mu_guard: run_mu_guard,
+        };
+        let mut ctl = ControlState {
+            shutting_down: false,
+            shutdown_done: None,
+            udp_cancel: tokio_util::sync::CancellationToken::new(),
+            udp_cancels: HashMap::new(),
+            bridge_cancel: tokio_util::sync::CancellationToken::new(),
+            work_pool: std::collections::VecDeque::new(),
+            pending_requests: std::collections::VecDeque::new(),
+            pending_udp: std::collections::VecDeque::new(),
+            pending_nat_hole_sids: std::collections::VecDeque::new(),
+            listener_handles: HashMap::new(),
+            udp_sockets: HashMap::new(),
+            last_ping: tokio::time::Instant::now(),
+            superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let mut writer = Vec::new();
+        cleanup(&mut ctx, &mut ctl, &mut writer).await;
+
+        assert!(
+            state.proxy_manager.get("p1").await.is_none(),
+            "own-generation https proxy must be removed by cleanup"
+        );
+        assert_eq!(
+            state
+                .https_proxy_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "removing an https proxy must decrement the SNI-sniff gate count"
+        );
+    }
+
+    /// Round-8 finding (supersession arm): the same-name proxy re-registered
+    /// by a NEWER generation (control_id 2, via register_or_replace) must
+    /// survive the OLD generation's cleanup, and the https count must NOT
+    /// be decremented for the surviving entry.
+    #[tokio::test]
+    async fn cleanup_skips_newer_generation_proxy_without_https_decrement() {
+        let state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        state
+            .proxy_manager
+            .register(
+                "run-1".into(),
+                crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+                    "p1",
+                    "https",
+                    "run-1",
+                    Some(24001),
+                    1,
+                ),
+            )
+            .await
+            .expect("register old-generation https proxy");
+        // The superseding login's registration replaces the old entry.
+        state
+            .proxy_manager
+            .register_or_replace(
+                "run-1".into(),
+                crate::control::proxy_ops::unregister_generation_tests::proxy_info(
+                    "p1",
+                    "https",
+                    "run-1",
+                    Some(24002),
+                    2,
+                ),
+            )
+            .await
+            .expect("register_or_replace newer-generation proxy");
+        // Both generations' registrations are https (proxy_ops increments
+        // once per registration in production).
+        state
+            .https_proxy_count
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let (_, run_mu_guard) = state.get_run_mu("run-1");
+        let (internal_tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut ctx = ControlContext {
+            state: Arc::clone(&state),
+            pool_stats: Arc::new(crate::state::PoolStats::default()),
+            reloadable: state
+                .reloadable
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            v2: false,
+            run_id: "run-1".to_string(),
+            control_id: 1,
+            pool_cap: 10,
+            internal_tx,
+            peer: None,
+            authenticated_user: String::new(),
+            udp_packet_codec: String::new(),
+            _run_mu_guard: run_mu_guard,
+        };
+        let mut ctl = ControlState {
+            shutting_down: false,
+            shutdown_done: None,
+            udp_cancel: tokio_util::sync::CancellationToken::new(),
+            udp_cancels: HashMap::new(),
+            bridge_cancel: tokio_util::sync::CancellationToken::new(),
+            work_pool: std::collections::VecDeque::new(),
+            pending_requests: std::collections::VecDeque::new(),
+            pending_udp: std::collections::VecDeque::new(),
+            pending_nat_hole_sids: std::collections::VecDeque::new(),
+            listener_handles: HashMap::new(),
+            udp_sockets: HashMap::new(),
+            last_ping: tokio::time::Instant::now(),
+            superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let mut writer = Vec::new();
+        cleanup(&mut ctx, &mut ctl, &mut writer).await;
+
+        let survivor = state.proxy_manager.get("p1").await;
+        assert!(
+            survivor.is_some_and(|i| i.control_id == 2),
+            "newer-generation proxy must survive the old generation's cleanup"
+        );
+        assert_eq!(
+            state
+                .https_proxy_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the surviving newer-generation https proxy must not decrement the count"
         );
     }
 }

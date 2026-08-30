@@ -435,13 +435,13 @@ async fn verify_login_auth(
 /// Cf, which is why U+00AD gets its own case.
 ///
 /// The >Latin-1 fallback uses std-only category probes (Rust has no
-/// punctuation/symbol/mark methods): alphanumeric (L+N) and spacing
-/// whitespace (Zs) are printable, everything else is REJECTED. This
-/// diverges from Go only in the fail-closed direction — combining marks
-/// and non-ASCII punctuation/symbols that Go accepts are rejected here —
-/// and never accepts a rune Go rejects (Cf, Co, Cn, Zl/Zp are all
-/// refused). Run ids are UUIDs in practice, so the gap is unreachable
-/// for real clients.
+/// punctuation/symbol/mark methods): alphanumeric (L+N) is printable,
+/// everything else is REJECTED. This diverges from Go only in the
+/// fail-closed direction — combining marks and non-ASCII
+/// punctuation/symbols that Go accepts are rejected here — and never
+/// accepts a rune Go rejects (Go unicode.IsPrint admits Zs only as
+/// U+0020; Cf, Co, Cn, Zl/Zp are refused). Run ids are UUIDs in
+/// practice, so the gap is unreachable for real clients.
 fn is_printable_run_id_char(c: char) -> bool {
     match c {
         // U+0020 is the only printable Latin-1 spacing rune.
@@ -453,9 +453,12 @@ fn is_printable_run_id_char(c: char) -> bool {
         c if c.is_control() => false,
         // Latin-1 graphic runes are printable (Go's isPrintLatin1).
         c if (c as u32) <= 0xFF => true,
-        // Above Latin-1: L/N print; Zs prints (incl. U+3000); Zl/Zp
-        // (U+2028/2029) do NOT (Go IsGraphic). See the fail-closed note.
-        c => c.is_alphanumeric() || (c.is_whitespace() && !matches!(c, '\u{2028}' | '\u{2029}')),
+        // Above Latin-1: L/N print only — Go unicode.IsPrint admits
+        // U+0020 as the sole spacing rune, so Zs above Latin-1 (U+1680,
+        // U+2000-U+200A, U+202F, U+205F, U+3000) is rejected like Zl/Zp
+        // (round-8 finding — the old Zs clause failed open for U+3000
+        // and friends). See the fail-closed note.
+        c => c.is_alphanumeric(),
     }
 }
 
@@ -676,6 +679,16 @@ pub(crate) async fn authenticate(
             login.run_id = Some(uuid::Uuid::new_v4().to_string());
         } else if rid.len() > 64 || !rid.chars().all(is_printable_run_id_char) {
             warn!(peer = ?peer, run_id_len = %rid.len(), "Login rejected: invalid run_id (max 64 printable bytes)");
+            // Consume a throttle slot: like every other pre-auth failure
+            // path, an IP flooding invalid run_ids must advance the per-IP
+            // counter toward the 60s throttle window instead of an
+            // unbounded failure rate (round-8 finding — the old path
+            // returned before `throttled_login_error`, so the pre-auth
+            // gate never armed).
+            if let Some(msg) = throttled_login_error(&state, peer).await {
+                send_login_error(stream, msg, v2).await;
+                return Err(());
+            }
             send_login_error(
                 stream,
                 "invalid run id: must be at most 64 printable bytes".into(),
@@ -1352,6 +1365,120 @@ mod auth_signal_tests {
         assert!(result.is_err());
         assert!(rx.await.is_err(), "bad token must drop the unsent signal");
         drain.abort();
+    }
+
+    /// Read one V1 LoginResp frame from the client side of the duplex and
+    /// return its error field (empty when the login succeeded). Local copy
+    /// of the helper in oidc_throttle_tests (sibling test modules cannot
+    /// share private items).
+    async fn read_login_resp_error(client: &mut tokio::io::DuplexStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut header = [0u8; 9];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("read frame header");
+        let len = u64::from_be_bytes(header[1..9].try_into().unwrap()) as usize;
+        assert!(len < 4096, "implausible frame length {len}");
+        let mut payload = vec![0u8; len];
+        client
+            .read_exact(&mut payload)
+            .await
+            .expect("read frame payload");
+        let resp: frp_core::msg::LoginResp =
+            serde_json::from_slice(&payload).expect("parse LoginResp");
+        resp.error.unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn invalid_run_ids_consume_login_throttle_slots() {
+        // Round-8 finding: the invalid-run_id rejection (oversized /
+        // non-printable) must consume a per-IP throttle slot like every
+        // other pre-auth failure path. An attacker flooding invalid run_ids
+        // must hit the 60s throttle window instead of an unbounded failure
+        // rate — the old path returned before `throttled_login_error`, so
+        // the pre-auth gate never armed. Mirrors the replay×throttle and
+        // OIDC slot-consumption patterns: attempts 1..=5 reject the run id,
+        // attempt 6 is pre-auth-throttled.
+        let state = test_state();
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = || frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            // 65 bytes > the 64-byte Go len() cap — rejected before auth.
+            run_id: Some("x".repeat(65)),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("expected-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        for attempt in 1..=6u32 {
+            let (server, mut client) = tokio::io::duplex(4096);
+            let result = super::authenticate(
+                Box::new(server),
+                &login(),
+                state.clone(),
+                Some(peer),
+                None,
+                false,
+                None,
+                false,
+                None,
+            )
+            .await;
+            assert!(result.is_err(), "attempt {attempt} must be rejected");
+            let error = read_login_resp_error(&mut client).await;
+            if attempt <= 5 {
+                assert!(
+                    error.contains("invalid run id"),
+                    "attempt {attempt} must reject the run id, got: {error}"
+                );
+            } else {
+                assert!(
+                    error.contains("throttled"),
+                    "6th attempt must be throttled, got: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_id_printable_chars_match_go_unicode_is_print() {
+        // Round-8 finding: Go unicode.IsPrint admits U+0020 as the only
+        // spacing rune, so Zs above Latin-1 must be rejected (the old
+        // whitespace clause failed open for these).
+        for c in [
+            '\u{1680}', '\u{2000}', '\u{200A}', '\u{202F}', '\u{205F}', '\u{3000}',
+        ] {
+            assert!(
+                !super::is_printable_run_id_char(c),
+                "Zs rune U+{:04X} must be rejected (Go IsPrint admits only U+0020)",
+                c as u32
+            );
+        }
+        // U+0020 and Latin-1 fast path stay printable; control runes stay
+        // rejected.
+        assert!(super::is_printable_run_id_char(' '));
+        assert!(super::is_printable_run_id_char('a'));
+        assert!(super::is_printable_run_id_char('Z'));
+        assert!(super::is_printable_run_id_char('0'));
+        assert!(super::is_printable_run_id_char('-'));
+        assert!(super::is_printable_run_id_char('\u{4E2D}'));
+        assert!(!super::is_printable_run_id_char('\u{00A0}'));
+        assert!(!super::is_printable_run_id_char('\u{00AD}'));
+        assert!(!super::is_printable_run_id_char('\u{0000}'));
+        assert!(!super::is_printable_run_id_char('\u{2028}'));
+        assert!(!super::is_printable_run_id_char('\u{2029}'));
     }
 }
 
