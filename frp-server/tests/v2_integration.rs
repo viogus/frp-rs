@@ -169,7 +169,10 @@ async fn test_v2_tcp_proxy() {
         proxy_name: "v2-tcp-test".into(),
         proxy_type: "tcp".into(),
         local_str: Some(format!("127.0.0.1:{echo_port}")),
-        remote_port: Some(0), // auto-assign
+        // Explicit allocated port: remote_port=0 would trigger the server's
+        // 1..65535 probe-bind scan, racing parallel test servers for the
+        // same low port (cross-test EADDRINUSE flake).
+        remote_port: Some(allocate_port() as i32),
         use_encryption: None,
         use_compression: None,
         group: None,

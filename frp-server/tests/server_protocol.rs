@@ -328,7 +328,11 @@ async fn test_new_proxy_duplicate_name_fails() {
             proxy_name: "dup-tcp".into(),
             proxy_type: "tcp".into(),
             local_str: Some("127.0.0.1:9876".into()),
-            remote_port: Some(0),
+            // Explicit allocated port: remote_port=0 would make the server
+            // scan the whole 1..65535 range with probe-binds, racing
+            // parallel test servers for the same low port (EADDRINUSE flake
+            // observed in this test at server_protocol.rs:370).
+            remote_port: Some(allocate_port() as i32),
             use_encryption: None,
             use_compression: None,
             group: None,
@@ -949,7 +953,10 @@ async fn test_duplicate_run_id_supersedes_under_proxy_burst() {
             proxy_name: format!("burst-{i}"),
             proxy_type: "tcp".into(),
             local_str: Some("127.0.0.1:9876".into()),
-            remote_port: Some(0), // auto-assign
+            // Explicit port per proxy: 200 auto-assign scans (remote_port=0)
+            // would each probe the low port range, racing parallel test
+            // servers for the same port (EADDRINUSE flake).
+            remote_port: Some(allocate_port() as i32),
             use_encryption: None,
             use_compression: None,
             group: None,
