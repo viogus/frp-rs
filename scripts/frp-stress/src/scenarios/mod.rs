@@ -15,7 +15,7 @@ use std::future::Future;
 /// Run all scenarios sequentially. Each exits non-zero on failure.
 pub async fn run_all(cli: &Cli) -> Result<()> {
     let scenarios: &[(&str, fn(&Cli) -> Pin<Box<dyn Future<Output = Result<()>> + '_>>)] = &[
-        ("memory", |c| Box::pin(memory::run(c))),
+        ("memory", |c| Box::pin(memory::run_with_mode(c, "idle_hold"))),
         ("connections", |c| Box::pin(connections::run(c))),
         ("throughput", |c| Box::pin(throughput::run(c))),
         ("longevity", |c| Box::pin(longevity::run(c))),

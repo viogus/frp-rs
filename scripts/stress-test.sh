@@ -24,12 +24,14 @@ CONCURRENCY="${3:-50}"
 
 FRPS_PORT=17000
 FRPC_ADMIN_PORT=17400
+ECHO_PORT=22000
 TOKEN="stress-test-token-$(date +%s)"
 
 cleanup() {
     echo "=== Cleanup ==="
     kill "$FRPS_PID" 2>/dev/null || true
     kill "$FRPC_PID" 2>/dev/null || true
+    kill "$ECHO_PID" 2>/dev/null || true
     rm -f /tmp/stress-frps.toml /tmp/stress-frpc.toml
 }
 trap cleanup EXIT
@@ -61,7 +63,8 @@ port = $FRPC_ADMIN_PORT
 name = "stress-tcp"
 type = "tcp"
 local_ip = "127.0.0.1"
-local_port = 22
+# Echo backend started below listens here (nothing serves the old ssh port 22)
+local_port = $ECHO_PORT
 remote_port = 17001
 EOF
 
@@ -101,6 +104,18 @@ sleep 3
 # Verify frpc
 if ! kill -0 "$FRPC_PID" 2>/dev/null; then
     echo "FATAL: frpc failed to start"
+    exit 1
+fi
+
+# Start echo backend (frpc proxy local_port points here; echo loops forever)
+echo "=== Starting echo backend ==="
+./scripts/frp-stress/target/release/frp-stress --scenario echo --port "$ECHO_PORT" &
+ECHO_PID=$!
+sleep 1
+
+# Verify echo backend
+if ! kill -0 "$ECHO_PID" 2>/dev/null; then
+    echo "FATAL: echo backend failed to start"
     exit 1
 fi
 
