@@ -225,35 +225,22 @@ async fn handle_stream(
     let host = host_from_authority(authority);
     let path = request.uri().path().to_string();
 
-    // HTTP/2 has no pseudo-header for auth. Every h2 request is
-    // absolute-form (`:authority` is the URL authority), so Go
-    // `checkRouteAuthByRequest` reads `Proxy-Authorization` ONLY (never
-    // `authorization`) and answers 407 + Proxy-Authenticate on failure.
-    let http_auth = extract_basic_auth_headers(request.headers());
-    // Go getRequestRouteUser (pkg/util/vhost/http.go:231-243): ROUTING
-    // ONLY — when Proxy-Authorization is ABSENT (or empty-valued —
-    // Go `Header.Get` returns "" for both), fall back to the Authorization
-    // header's Basic Auth username so the request still hits the matched
-    // per-user route and returns 407 instead of 404. A PRESENT but
-    // malformed Proxy-Authorization makes `ParseBasicAuth` fail and Go
-    // routes to the EMPTY user bucket ("") — never to the Authorization
-    // header's username. Auth validation does not share the fallback
-    // (checkRouteAuthByRequest reads Proxy-Authorization only).
-    let proxy_auth_present = request
-        .headers()
-        .get("proxy-authorization")
-        .is_some_and(|v| !v.is_empty());
-    let route_user: Option<String> = if http_auth.is_none() {
-        if proxy_auth_present {
-            // Header present but unparseable — Go ParseBasicAuth fails →
-            // empty user bucket (Some("") ≡ "", no Authorization fallback).
-            Some(String::new())
-        } else {
-            extract_basic_auth_header(request.headers(), "authorization").map(|(u, _)| u)
-        }
-    } else {
-        None
-    };
+    // HTTP/2 has no pseudo-header for auth; Go reads the request FORM
+    // exactly like HTTP/1.1. Go's h2 server builds req.URL per
+    // h2_bundle.go:6362-6430: CONNECT gets URL{Host: :authority}
+    // (absolute-form); every other request gets url.ParseRequestURI(":path")
+    // — URL.Host == "" for path-form targets (the normal h2 case; the
+    // :scheme/:authority pseudo-headers do NOT feed the URL) and a real
+    // host only when ":path" itself begins with "scheme://authority". Go
+    // frp gates on `req.URL.Host != ""` (pkg/util/vhost/http.go:195, 232):
+    // absolute-form reads `Proxy-Authorization` (answers 407), origin-form
+    // reads `Authorization` (answers 401) — exactly like HTTP/1.1
+    // origin-form. NOTE: `request.uri().scheme()` is NOT the signal — h2
+    // 0.4.18's server keeps :scheme in the Uri whenever :authority is
+    // present (server.rs convert_poll_message), so every normal request
+    // would look absolute-form.
+    let is_absolute_form = h2_request_is_absolute_form(&request);
+    let (http_auth, route_user) = h2_select_auth(request.headers(), is_absolute_form);
     tracing::debug!(host = %host, path = %path, peer = %peer, "HTTP VHost (h2c) request for '{}' path '{}' from {}", host, path, peer);
 
     // Re-encode as an HTTP/1.1 request head. Go's reverse proxy forwards to
@@ -280,17 +267,31 @@ async fn handle_stream(
         request_head,
         peer,
         "HTTP",
-        true, // h2c is always absolute-form (Go req.URL.Host != "")
+        // Go checkRouteAuthByRequest's `req.URL.Host != ""` gate — decides
+        // the 407-vs-401 response shape on auth failure below.
+        is_absolute_form,
     )
     .await
     {
         Ok(f) => f,
-        Err(VhostResolveError::Unauthorized { .. }) => {
-            // h2c is always absolute-form → 407 + Proxy-Authenticate.
+        Err(VhostResolveError::Unauthorized { proxy_form: true }) => {
+            // Absolute-form → Go checkRouteAuthByRequest answers 407 +
+            // Proxy-Authenticate (http.go:272-274).
             return send_h2_error(
                 &mut respond,
                 407,
                 &[("proxy-authenticate", "Basic realm=\"frp\"")],
+                Bytes::new(),
+            )
+            .await;
+        }
+        Err(VhostResolveError::Unauthorized { proxy_form: false }) => {
+            // Origin-form → Go answers 401 + WWW-Authenticate
+            // (http.go:275-277).
+            return send_h2_error(
+                &mut respond,
+                401,
+                &[("www-authenticate", "Basic realm=\"frp\"")],
                 Bytes::new(),
             )
             .await;
@@ -449,16 +450,60 @@ async fn handle_stream(
     response_result
 }
 
-/// Canonicalize an h2 `:authority` (Host equivalent) for routing — the same
-/// Go `CanonicalHost` semantics as the HTTP/1.1 path, delegated to
-/// `canonicalize_authority` in vhost.rs so both paths share ONE
-/// implementation. The Go `hasPort` gate matters here: the port is stripped
-/// only when the value has exactly one colon (or a bracketed form with `]:`).
-/// "example.com:8080:90" has two colons and is NOT a bracketed form — Go
-/// leaves it untouched (unroutable → 404), while a naive first-colon split
+/// Canonicalize an h2 `:authority` (Host equivalent) for routing — Go
+/// `CanonicalHost` semantics (pkg/util/http/http.go:54-66), the same
+/// `host[:port]` → host split the HTTP/1.1 Host-header path performs in
+/// vhost.rs (`canonicalize_authority`). Implemented here directly (not
+/// delegated) so the h2c side is self-contained on the SplitHostPort
+/// parity details; both implementations follow the same Go spec and agree
+/// on every input.
+///
+/// The Go `hasPort` gate: the port is split only when the value has exactly
+/// one colon or is a bracketed form with `]:`. The port itself is never
+/// digit-validated ("example.com:abc" → "example.com" — the numeric gate
+/// exists only on the CONNECT request line via url.ParseRequestURI's
+/// validOptionalPort). An EMPTY port is legal (net/ipsock.go:216
+/// `port = hostport[i+1:]` unconditional) — "example.com:" → "example.com".
+/// "example.com:8080:90" has two colons and is NOT a bracketed form, so Go
+/// leaves it untouched (unroutable → 404) while a naive first-colon split
 /// would route it to "example.com" and shadow a legitimate route.
 fn host_from_authority(authority: &str) -> &str {
-    super::canonicalize_authority(authority)
+    let colons = authority.bytes().filter(|b| *b == b':').count();
+    let hostname = if authority.starts_with('[') && authority.contains("]:") {
+        // Go SplitHostPort bracket branch (net/ipsock.go:190-209): the
+        // FIRST ']' must sit immediately before the LAST ':' — otherwise
+        // the address errors ("too many colons", "missing port") and
+        // CanonicalHost returns "" (unroutable), NOT the bare literal
+        // ("[::1]:80:90" must not route as "::1"). The post-split guards
+        // (ipsock.go:210-213) also reject a '[' inside the bracket host or
+        // a stray ']' after the closing bracket.
+        let end = authority.find(']').unwrap_or(0);
+        let inner = &authority[1..end];
+        let clean = !inner.contains('[') && !authority[end + 1..].contains(']');
+        match authority.rfind(':') {
+            Some(i) if end + 1 == i && clean => inner,
+            _ => "",
+        }
+    } else if colons == 1 {
+        // SplitHostPort host:port — the port may be empty (ipsock.go:216).
+        // A '[' or ']' anywhere in a non-bracketed value is Go's
+        // "unexpected '['/']' in address" error → "".
+        if authority.contains(['[', ']']) {
+            ""
+        } else {
+            let (h, _port) = authority.rsplit_once(':').unwrap_or((authority, ""));
+            h
+        }
+    } else {
+        // Portless hostname, bracketed IPv6 without "]:", or unbracketed
+        // multi-colon — Go hasPort is false, the value is used as-is.
+        authority
+    };
+    // Strip exactly one trailing dot (Go TrimSuffix — "example.com.."
+    // stays unroutable). Lowercase is NOT applied here: the route lookup is
+    // case-insensitive (vhost.rs get_locked), matching Go's CanonicalHost
+    // while keeping the borrowed `&str`.
+    hostname.strip_suffix('.').unwrap_or(hostname)
 }
 
 /// Re-encode an h2 request as an HTTP/1.1 request head. `:authority` becomes
@@ -513,17 +558,39 @@ fn build_http1_request_head(request: &http::Request<RecvStream>) -> Vec<u8> {
 }
 
 /// Extract Basic Auth credentials from a named header of an h2 request
-/// (HTTP/2 has no pseudo-header for auth). h2 requests are always
-/// absolute-form, so Go `checkRouteAuthByRequest` reads ONLY
-/// `Proxy-Authorization` for auth validation — while Go `getRequestRouteUser`
+/// (HTTP/2 has no pseudo-header for auth). Go `checkRouteAuthByRequest`
+/// reads `Proxy-Authorization` for absolute-form requests and
+/// `Authorization` for origin-form; Go `getRequestRouteUser` additionally
 /// falls back to `Authorization` for ROUTING when Proxy-Authorization is
-/// absent. Both readers share this one parser.
+/// absent. Both readers share this one parser, which mirrors Go
+/// `httppkg.ParseBasicAuth` (pkg/util/http/http.go:81-97): the "Basic "
+/// prefix is matched case-insensitively (`strings.EqualFold`) and the
+/// base64 payload is NOT trimmed — Go's StdEncoding rejects any whitespace
+/// in the payload (a trailing space is a decode error, not padding).
 fn extract_basic_auth_header(
     headers: &http::HeaderMap,
     name: &'static str,
 ) -> Option<(String, String)> {
     let value = headers.get(name)?.to_str().ok()?;
-    let encoded = value.strip_prefix("Basic ")?.trim();
+    // Case-insensitive "Basic " prefix — strip_prefix is case-sensitive,
+    // so "basic dXNl…" was wrongly rejected (Go EqualFold accepts it).
+    // `get(..n)` not `value[..n]`: h2 field values may legally carry
+    // obs-text bytes (RFC 7230 §3.2 — 0x80-0xFF), so to_str() can yield a
+    // multibyte char straddling the fixed 6-byte cut → the slice would
+    // panic (process abort under panic=abort) on ANY request carrying such
+    // a header. get() returns None at a non-boundary cut (no match).
+    const PREFIX: &str = "Basic ";
+    if !value
+        .get(..PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+    {
+        return None;
+    }
+    // Safe: the get(..6) match above guarantees byte 6 is a char boundary.
+    let encoded = &value[PREFIX.len()..];
+    // Deliberately NO trim: Go decodes the payload verbatim and its
+    // StdEncoding rejects whitespace ("Basic  dXNl…" and "…c3Nz " fail in
+    // Go; the old trim accepted both).
     let decoded = frp_core::base64::decode(encoded).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;
@@ -533,6 +600,107 @@ fn extract_basic_auth_header(
 /// Extract Basic Auth credentials from the `proxy-authorization` header.
 fn extract_basic_auth_headers(headers: &http::HeaderMap) -> Option<(String, String)> {
     extract_basic_auth_header(headers, "proxy-authorization")
+}
+
+/// Go `checkRouteAuthByRequest` + `getRequestRouteUser`
+/// (pkg/util/vhost/http.go:187-246) for h2 streams. Returns (credentials
+/// for validation, routing-only username).
+///
+/// Absolute-form (`req.URL.Host != ""`): credentials come from
+/// `Proxy-Authorization` ONLY (never `authorization`). Origin-form:
+/// credentials come from `Authorization` (Basic) — exactly like HTTP/1.1
+/// origin-form; `Proxy-Authorization` is entirely ignored.
+///
+/// Routing (Go getRequestRouteUser): on origin-form the Authorization
+/// Basic username routes the request; on absolute-form a NON-EMPTY
+/// Proxy-Authorization is parsed (malformed → "" empty user bucket, never
+/// the Authorization username), while an ABSENT/empty one
+/// (`Header.Get` == "" for both) falls back to the Authorization username
+/// so the request still hits the matched per-user route and returns
+/// 407 instead of 404. Auth validation deliberately does not share the
+/// fallback — the returned credentials are the single validation source.
+fn h2_select_auth(
+    headers: &http::HeaderMap,
+    is_absolute_form: bool,
+) -> (Option<(String, String)>, Option<String>) {
+    let http_auth = if is_absolute_form {
+        extract_basic_auth_headers(headers)
+    } else {
+        extract_basic_auth_header(headers, "authorization")
+    };
+    let proxy_auth_present = headers
+        .get("proxy-authorization")
+        .is_some_and(|v| !v.is_empty());
+    let route_user: Option<String> = if http_auth.is_none() {
+        if is_absolute_form && proxy_auth_present {
+            // Header present but unparseable — Go ParseBasicAuth fails →
+            // empty user bucket (Some("") ≡ "", no Authorization fallback).
+            Some(String::new())
+        } else {
+            // Go `req.BasicAuth()` user: origin-form always; absolute-form
+            // only when Proxy-Authorization is absent/empty. A failed or
+            // absent Authorization parse yields None ≡ Go's "" bucket.
+            extract_basic_auth_header(headers, "authorization").map(|(u, _)| u)
+        }
+    } else {
+        None
+    };
+    (http_auth, route_user)
+}
+
+/// Go-parity request-form gate for h2 streams: absolute-form ⟺
+/// `req.URL.Host != ""` (pkg/util/vhost/http.go:195, 232), where Go's h2
+/// server built the URL per h2_bundle.go:6362-6430 — CONNECT gets
+/// URL{Host: :authority}, everything else gets url.ParseRequestURI(":path").
+fn h2_request_is_absolute_form<B>(request: &http::Request<B>) -> bool {
+    if request.method() == http::Method::CONNECT {
+        // Go: URL{Host: :authority} — always absolute-form.
+        return true;
+    }
+    // Non-CONNECT: the :scheme/:authority pseudo-headers do NOT feed the
+    // URL (it is built from ":path" alone), so absolute-form requires
+    // ":path" itself to parse as an absolute URI with a non-empty host.
+    match request.uri().path_and_query() {
+        Some(pq) => is_absolute_form_target(pq.as_str()),
+        None => false,
+    }
+}
+
+/// Go `url.ParseRequestURI(":path").Host != ""` — the non-CONNECT half of
+/// the form gate. Host is set only when the target starts with
+/// "scheme://authority" (a scheme parsed by getScheme — first char a
+/// letter — then "://" before any path "/", then a NON-EMPTY authority;
+/// "http:///x" has Host == ""). A "//host/path" network-path reference has
+/// NO scheme and ParseRequestURI (viaRequest) leaves Host empty — it is
+/// origin-form (go1.22 net/url/url.go: the authority branch requires a
+/// scheme when viaRequest). Only the AUTH gate uses this — the routing
+/// host always comes from `:authority`.
+fn is_absolute_form_target(path_and_query: &str) -> bool {
+    let Some(first) = path_and_query.as_bytes().first() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        // getScheme needs a letter first ("1a://x", "/foo:bar"). Go 400s
+        // "1a://x" at ParseRequestURI; treating it as origin-form here
+        // still routes on :authority with Authorization auth enforced, so
+        // the outcome is a 401/404, never an auth bypass.
+        return false;
+    }
+    let Some(colon) = path_and_query.find(':') else {
+        return false;
+    };
+    let scheme = &path_and_query[..colon];
+    if scheme.contains('/') || scheme.contains('?') {
+        // The ':' sits after the first '/' or inside the query — a path.
+        return false;
+    }
+    let after = &path_and_query[colon + 1..];
+    if !after.starts_with("//") {
+        // "http:opaque" → Go URL.Opaque, Host == "".
+        return false;
+    }
+    // The authority must be non-empty ("http:///x" → Host == "").
+    after[2..].split('/').next().is_some_and(|a| !a.is_empty())
 }
 
 /// Send a body-less (or single-chunk) HTTP/2 error response.
@@ -677,7 +845,18 @@ fn header_value<'a>(
 fn parse_hex(b: &[u8]) -> std::io::Result<usize> {
     let s = std::str::from_utf8(b)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
-    usize::from_str_radix(s.trim(), 16)
+    let s = s.trim();
+    // Go parseHexUint (net/http/transfer.go) accepts ONLY 0-9a-fA-F — a
+    // leading '+' is "invalid byte in chunk length". Rust's from_str_radix
+    // accepts "+5" for any radix; reject the '+' explicitly ('-' already
+    // fails from_str_radix for radix 16).
+    if s.starts_with('+') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad chunk size",
+        ));
+    }
+    usize::from_str_radix(s, 16)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))
 }
 
@@ -1025,9 +1204,14 @@ mod tests {
         assert_eq!(host_from_authority("example.com"), "example.com");
         // Port is stripped (host:port).
         assert_eq!(host_from_authority("example.com:8080"), "example.com");
-        // Round-15: an EMPTY port part is a Go SplitHostPort error →
-        // CanonicalHost returns "" (unroutable), NOT the bare hostname.
-        assert_eq!(host_from_authority("example.com:"), "");
+        // Round-15 correction: an EMPTY port part is LEGAL — Go
+        // net.SplitHostPort slices `port = hostport[i+1:]` unconditionally
+        // (ipsock.go:216) → CanonicalHost routes the bare hostname
+        // (trailing dot still trimmed after the strip).
+        assert_eq!(host_from_authority("example.com:"), "example.com");
+        assert_eq!(host_from_authority("example.com.:"), "example.com");
+        // Bracketed IPv6 with an empty port — likewise legal.
+        assert_eq!(host_from_authority("[::1]:"), "::1");
         // Exactly one trailing dot is trimmed (Go CanonicalHost
         // TrimSuffix strips ONE dot — "example.com.." becomes
         // "example.com.", which STAYS unroutable because the trailing
@@ -1051,6 +1235,13 @@ mod tests {
             host_from_authority("example.com:8080:90"),
             "example.com:8080:90"
         );
+        // Bracket form with extra colons after the "]:" — Go SplitHostPort
+        // tooManyColons (ipsock.go:196-197) → host "" (unroutable), NOT the
+        // bare "::1" (a naive ']'-split would route it).
+        assert_eq!(host_from_authority("[::1]:80:90"), "");
+        // ']' not immediately followed by the LAST colon — Go
+        // missingPort (ipsock.go:206-209) → "" (unroutable).
+        assert_eq!(host_from_authority("[::1]x]:8080"), "");
         // A non-numeric port still splits (Go never validates the port
         // digits on this path — the numeric gate is CONNECT-only).
         assert_eq!(host_from_authority("example.com:abc"), "example.com");
@@ -1069,6 +1260,10 @@ mod tests {
         assert!(parse_hex(b"zz").is_err());
         assert!(parse_hex(b"-1").is_err());
         assert!(parse_hex(b"1g").is_err());
+        // Go parseHexUint accepts ONLY 0-9a-fA-F — "+5" is an invalid byte
+        // in a chunk length even though Rust's from_str_radix would accept
+        // the leading '+' for radix 16.
+        assert!(parse_hex(b"+5").is_err());
         // Not valid UTF-8 → InvalidData.
         assert!(parse_hex(&[0xff, 0xfe]).is_err());
     }
@@ -1119,9 +1314,9 @@ mod tests {
 
     #[test]
     fn test_extract_basic_auth_headers() {
-        // base64("user:pass") = "dXNlcjpwYXNz". h2 requests are always
-        // absolute-form → the credentials live in `proxy-authorization`
-        // (Go checkRouteAuthByRequest), never `authorization`.
+        // base64("user:pass") = "dXNlcjpwYXNz". An absolute-form h2 request
+        // carries its credentials in `proxy-authorization` (Go
+        // checkRouteAuthByRequest reads only that header there).
         let mut h = http::HeaderMap::new();
         h.insert(
             "proxy-authorization",
@@ -1145,6 +1340,53 @@ mod tests {
             extract_basic_auth_headers(&h),
             None,
             "authorization must not authenticate an absolute-form request"
+        );
+        // Go ParseBasicAuth parity: the "Basic " prefix matches
+        // case-insensitively (strings.EqualFold), the payload is NOT
+        // trimmed (StdEncoding rejects whitespace), and a len-4-multiple
+        // payload needs exact padding.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_static("basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(
+            extract_basic_auth_headers(&h),
+            Some(("user".into(), "pass".into())),
+            "lowercase 'basic ' must match (Go EqualFold)"
+        );
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_static("Basic  dXNlcjpwYXNz"),
+        );
+        assert_eq!(
+            extract_basic_auth_headers(&h),
+            None,
+            "payload must not be trimmed (double space fails Go too)"
+        );
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz "),
+        );
+        assert_eq!(
+            extract_basic_auth_headers(&h),
+            None,
+            "trailing space in the payload fails Go StdEncoding too"
+        );
+        // A multibyte char straddling the 6-byte "Basic " cut must be
+        // skipped (get(..6) → None), not panic — h2 allows obs-text bytes
+        // in field values, so to_str() can succeed with "abcdeé…".
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_bytes(&b"abcde\xc3\xa9Basic dXNlcjpwYXNz"[..]).unwrap(),
+        );
+        assert_eq!(
+            extract_basic_auth_headers(&h),
+            None,
+            "straddling multibyte char must be a non-match, not a panic"
         );
         // Wrong scheme → None.
         let mut h = http::HeaderMap::new();
@@ -1313,5 +1555,170 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[test]
+    fn test_is_absolute_form_target() {
+        // Path-form targets (the normal h2 case — the :scheme/:authority
+        // pseudo-headers are irrelevant) → origin-form.
+        assert!(!is_absolute_form_target("/"));
+        assert!(!is_absolute_form_target("/secret?q=1"));
+        assert!(!is_absolute_form_target("/pa:th"));
+        // Absolute-form: ":path" itself starts with "scheme://authority".
+        assert!(is_absolute_form_target("http://h2c.example.com/secret"));
+        assert!(is_absolute_form_target("https://example.com/"));
+        // A network-path reference has no scheme and stays origin-form
+        // under ParseRequestURI's viaRequest gate (go1.22 net/url/url.go).
+        assert!(!is_absolute_form_target("//example.com/secret"));
+        // Scheme rules: must start with a letter; the authority must be
+        // non-empty ("http:///x" → URL.Host == "").
+        assert!(!is_absolute_form_target("1a://x/y"));
+        assert!(!is_absolute_form_target("http:///x"));
+        assert!(!is_absolute_form_target("http:opaque"));
+        assert!(!is_absolute_form_target(""));
+    }
+
+    #[test]
+    fn test_h2_select_auth_fallbacks() {
+        // Absolute-form: valid Proxy-Authorization authenticates.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(
+            h2_select_auth(&h, true),
+            (Some(("user".into(), "pass".into())), None)
+        );
+        // Absolute-form: malformed Proxy-Authorization → empty user bucket,
+        // NO Authorization fallback (Go getRequestRouteUser ParseBasicAuth
+        // failure branch).
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_static("Basic !!!"),
+        );
+        h.insert(
+            "authorization",
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(h2_select_auth(&h, true), (None, Some(String::new())));
+        // Absolute-form: Proxy-Authorization ABSENT → routing falls back to
+        // the Authorization username (Go `proxyAuth == ""` branch).
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "authorization",
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(h2_select_auth(&h, true), (None, Some("user".into())));
+        // Absolute-form with nothing → (None, None) ≡ Go's "" bucket.
+        assert_eq!(h2_select_auth(&http::HeaderMap::new(), true), (None, None));
+        // Origin-form: credentials come from Authorization; Proxy-
+        // Authorization is entirely ignored (Go checkRouteAuthByRequest
+        // req.BasicAuth() branch).
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "authorization",
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        h.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(
+            h2_select_auth(&h, false),
+            (Some(("user".into(), "pass".into())), None)
+        );
+        // Origin-form with no Authorization → (None, None) → "" bucket.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(h2_select_auth(&h, false), (None, None));
+        // Origin-form with malformed Authorization → (None, None): the
+        // failed parse yields "" for both auth and routing (Go BasicAuth
+        // returns "" on failure).
+        let mut h = http::HeaderMap::new();
+        h.insert("authorization", http::HeaderValue::from_static("Basic !!!"));
+        assert_eq!(h2_select_auth(&h, false), (None, None));
+    }
+
+    #[tokio::test]
+    async fn test_h2_select_auth_origin_form_authorization() {
+        // A real h2 GET always carries :scheme/:authority pseudo-headers,
+        // but the :path is path-form "/secret" — Go builds the URL from
+        // :path alone → req.URL.Host == "" → origin-form → the
+        // `authorization` header authenticates (and a failure would answer
+        // 401 + WWW-Authenticate, not 407). This pins the round-8 MEDIUM
+        // fix: the old code read Proxy-Authorization on EVERY h2 request
+        // and 407'd origin-form requests.
+        with_h2_request(
+            "GET",
+            "http://h2c.example.com/secret",
+            &[("authorization", "Basic dXNlcjpwYXNz")],
+            true,
+            |req| {
+                assert!(
+                    !h2_request_is_absolute_form(req),
+                    "path-form :path must be origin-form"
+                );
+                let (auth, route_user) =
+                    h2_select_auth(req.headers(), h2_request_is_absolute_form(req));
+                assert_eq!(auth, Some(("user".to_string(), "pass".to_string())));
+                assert_eq!(route_user, None);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_h2_select_auth_connect_proxy_authorization() {
+        // CONNECT builds URL{Host: :authority} in Go's h2 server →
+        // absolute-form → Proxy-Authorization authenticates. The h2 client
+        // sends no :path/:scheme for CONNECT and the server-side Uri is
+        // authority-form (h2 0.4.18 Pseudo::request / convert_poll_message).
+        with_h2_request(
+            "CONNECT",
+            "example.com:443",
+            &[("proxy-authorization", "Basic dXNlcjpwYXNz")],
+            true,
+            |req| {
+                assert!(
+                    h2_request_is_absolute_form(req),
+                    "CONNECT must be absolute-form"
+                );
+                let (auth, route_user) = h2_select_auth(req.headers(), true);
+                assert_eq!(auth, Some(("user".to_string(), "pass".to_string())));
+                assert_eq!(route_user, None);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_chunked_body_eof_mid_chunk() {
+        // A backend chunk stream that ends mid-chunk (declared size larger
+        // than the remaining bytes) must fail with UnexpectedEof — never
+        // hang, loop, or panic (round-15 review flagged missing coverage;
+        // stream_chunked_body truncates the body on this error, Go treats
+        // an aborted backend body as EOF).
+        let data: &[u8] = b"5\r\nabc";
+        let mut src = data;
+        let mut reader = BodyReader::new(&mut src, Vec::new());
+        assert_eq!(reader.read_line().await.expect("chunk size line"), b"5\r\n");
+        let mut scratch = Vec::new();
+        let err = reader
+            .read_exact_into(&mut scratch, 5)
+            .await
+            .expect_err("declared 5 bytes, only 3 arrive");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        // The post-chunk terminator read sees the same clean EOF.
+        let mut term = [0u8; 2];
+        let err = reader
+            .fill_exact(&mut term)
+            .await
+            .expect_err("no terminator bytes after the truncation");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

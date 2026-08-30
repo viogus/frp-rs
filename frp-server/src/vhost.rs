@@ -1608,11 +1608,31 @@ fn extract_basic_auth(request: &str) -> Option<(String, String)> {
 /// instead (Go `checkRouteAuthByRequest` reads ONLY that header there).
 /// `header` must include the trailing colon (e.g. "proxy-authorization:").
 fn extract_basic_auth_named(request: &str, header: &str) -> Option<(String, String)> {
+    // `get(..header.len())`, not `line[..header.len()]`: a hostile header
+    // line with a multibyte UTF-8 char straddling the fixed-offset cut
+    // would panic the slice (process abort under panic=abort) on EVERY
+    // vhost request. get() returns None at any length/boundary violation
+    // and behaves identically when the cut is on a char boundary.
     let auth_line = request.lines().find(|line| {
-        line.len() >= header.len() && line[..header.len()].eq_ignore_ascii_case(header)
+        line.get(..header.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(header))
     })?;
+    // Go parity (pkg/util/http/http.go ParseBasicAuth, net/textproto
+    // readMIMEHeader): the MIME reader trims the value's outer whitespace
+    // (leading AND trailing — `trim` in readContinuedLineSlice), the
+    // "Basic " scheme prefix matches CASE-INSENSITIVELY (Go Issue 22736),
+    // and the base64 payload is taken verbatim — NO interior trim, so
+    // "Basic  xyz" (double space) fails the decode exactly like Go's
+    // base64.StdEncoding.
     let value = auth_line[header.len()..].trim();
-    let encoded = value.strip_prefix("Basic ")?.trim();
+    let encoded = if value
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("Basic "))
+    {
+        &value[6..]
+    } else {
+        return None;
+    };
     let decoded = frp_core::base64::decode(encoded).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;
@@ -1625,12 +1645,22 @@ fn extract_basic_auth_named(request: &str, header: &str) -> Option<(String, Stri
 /// PRESENT non-empty value forces the `ParseBasicAuth` path in
 /// `getRequestRouteUser` (a malformed value then routes to the "" user
 /// bucket instead of falling back to Authorization).
+///
+/// FIRST-VALUE semantics: Go readMIMEHeader stores duplicate headers as a
+/// slice and `Header.Get` returns `v[0]` only — a first empty-valued line
+/// shadows a later non-empty one (keeping the "" → Authorization
+/// fallback). `.any()` would see the later line and force the "" bucket;
+/// `.find()` by header name + value check on THAT line matches Go. The
+/// `get(..header.len())` scan (not `line[..header.len()]`) also keeps a
+/// multibyte char straddling the cut from panicking (panic=abort).
 fn has_nonempty_header(request: &str, header: &str) -> bool {
-    request.lines().any(|line| {
-        line.len() >= header.len()
-            && line[..header.len()].eq_ignore_ascii_case(header)
-            && !line[header.len()..].trim().is_empty()
-    })
+    request
+        .lines()
+        .find(|line| {
+            line.get(..header.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(header))
+        })
+        .is_some_and(|line| !line[header.len()..].trim().is_empty())
 }
 
 /// Count Host header lines (RFC 7230 §5.4 allows at most one). Must only be
@@ -1657,28 +1687,30 @@ pub(crate) fn count_host_headers(request: &str) -> usize {
         .count()
 }
 
-/// Extract the Host header value from an HTTP request (hostname only,
-/// exactly one trailing dot trimmed — Go frp `CanonicalHost`,
-/// pkg/util/http/http.go). Port handling follows Go's `hasPort` gate: the
-/// port is split only when the value has exactly one colon (host:port /
-/// IPv4:port) or is a bracket-start with `]:` (bracketed IPv6), and the
-/// port itself is never validated — `net.SplitHostPort` accepts any
-/// suffix, so Go routes "Host: example.com:abc" to example.com (the
-/// numeric gate exists only on the CONNECT request line via
-/// url.ParseRequestURI's validOptionalPort). An EMPTY port ("Host:
-/// example.com:") is a SplitHostPort error → "" (unroutable). Portless
-/// values are used as-is — "example.com", or "[::1]" which stays
-/// bracketed (unroutable, nothing registers brackets).
 /// Canonicalize an authority value (host[:port] or [v6]:port) for vhost
 /// routing — port strip, bracket handling, exactly one trailing dot.
-/// Go frp `CanonicalHost` semantics (pkg/util/http/http.go), shared by
-/// the Host-header path and the absolute-form URL authority path (A3).
+/// Go frp `CanonicalHost` semantics (pkg/util/http/http.go:54-67), shared
+/// by the Host-header path, the absolute-form URL authority path (A3), and
+/// the h2c path (vhost_h2c.rs): `hasPort` gate (colons==1, or
+/// bracket-start with `]:`), then `net.SplitHostPort`, then exactly one
+/// trailing dot trimmed. (CanonicalHost also lowercases — `strings.ToLower`
+/// before the gate; here the lowercase lives at the ROUTE LOOKUP instead —
+/// router.go `Get` parity, see `get_locked` — with identical
+/// case-insensitive routing and the same accepted Unicode-case divergence.
+/// The function stays borrowed `&str` because vhost_h2c.rs shares it.)
 ///
-/// Round 6 (A5): the bracket branch now requires the ']' to be
-/// immediately followed by ':'. Go `SplitHostPort` brackets the FIRST '['
-/// to the LAST ']' ("[::1]x]:8080" → host "::1]x" — unroutable); accepting
-/// the first ']' would route a malformed value as "::1" when that literal
-/// is registered.
+/// SplitHostPort ACCEPTS an empty port — it slices `port = hostport[i+1:]`
+/// unconditionally (net/ipsock.go; the official test pins {"golang.org:",
+/// "golang.org", ""}) — so "example.com:" routes to "example.com" — and
+/// never validates the port digits ("example.com:abc" → "example.com"; the
+/// digit gate exists only on the CONNECT request line via
+/// url.ParseRequestURI's validOptionalPort). Bracket errors are
+/// fail-closed: a ']' not immediately followed by the last colon
+/// ("[::1]x]:8080" → "missing port in address") and a second colon after
+/// the bracket's port ("[::1]:80:90" → "too many colons in address") are
+/// SplitHostPort ERRORS → "" (unroutable), never the bare "::1". Portless
+/// values are used as-is — "example.com", or "[::1]" which stays bracketed
+/// (unroutable, nothing registers brackets).
 pub(crate) fn canonicalize_authority(value: &str) -> &str {
     let colons = value.bytes().filter(|b| *b == b':').count();
     let hostname = if colons == 1 {
@@ -1686,22 +1718,27 @@ pub(crate) fn canonicalize_authority(value: &str) -> &str {
         // (Go frp routes "Host: example.com:abc" to example.com); the
         // digit gate exists only on the CONNECT request line, where
         // url.ParseRequestURI enforces it (validOptionalPort). An EMPTY
-        // port part ("example.com:") is a `net.SplitHostPort` ERROR in Go
-        // ("missing port in address") → CanonicalHost returns "" →
-        // unroutable (404), NOT the bare hostname.
-        let (h, port) = value.rsplit_once(':').unwrap_or((value, ""));
-        if port.is_empty() {
-            return "";
-        }
-        h
+        // port part ("example.com:") is legal — Go slices `port =
+        // hostport[i+1:]` unconditionally and its own test suite pins
+        // {"golang.org:", "golang.org", ""} — CanonicalHost routes the
+        // bare hostname (lowercased, trailing dot trimmed).
+        value.rsplit_once(':').unwrap_or((value, "")).0
     } else if colons >= 2 && value.starts_with('[') && value.contains("]:") {
         let end = value.find(']').unwrap_or(0);
         if !value[end + 1..].starts_with(':') {
-            // ']' not immediately followed by ':' — not a bracket form.
-            // Go routes the raw value (unroutable → 404); mirror that
-            // rather than 400ing (the header path has no 400 trigger).
-            value
+            // ']' not immediately followed by ':' — Go SplitHostPort
+            // errors ("missing port in address": the bracket's port must
+            // run to the LAST colon) → CanonicalHost "" (unroutable).
+            ""
+        } else if value[end + 2..].contains(':') {
+            // Too many colons ("[::1]:80:90") — Go ipsock.go errors when
+            // the colon behind the ']' is not the last one ("too many
+            // colons in address") → CanonicalHost "" (unroutable).
+            ""
         } else {
+            // Bracket form with a port (possibly empty: "[::1]:" → "::1")
+            // — Go's bracket branch strips the brackets
+            // (`host = hostport[1:end]`).
             &value[1..end]
         }
     } else {
@@ -1721,9 +1758,18 @@ fn extract_host_header(request: &str) -> Option<&str> {
         if line.len() < 6 {
             continue;
         }
-        if !line[..5].eq_ignore_ascii_case("host:") {
+        // `get(..5)`, not `line[..5]`: len ≥ 6 does NOT imply byte 5 is a
+        // char boundary — "abcéé…" has é (2 bytes) straddling the cut, and
+        // the fixed-offset slice panicked (process abort under panic=abort)
+        // on every origin-form vhost request. get() returns None on any
+        // boundary violation; identical match when byte 5 is a boundary.
+        if !line
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("host:"))
+        {
             continue;
         }
+        // Safe: the get(..5) match above guarantees byte 5 is a boundary.
         let value = line[5..].trim();
         return Some(canonicalize_authority(value));
     }
@@ -1976,24 +2022,117 @@ mod tests {
         );
     }
 
-    /// Round-15: a trailing colon with an EMPTY port part is a
-    /// `net.SplitHostPort` error in Go ("missing port in address") →
-    /// `CanonicalHost` returns "" (unroutable), NOT the bare hostname.
+    /// Round-15 correction: a trailing colon with an EMPTY port part is
+    /// LEGAL — Go `net.SplitHostPort` slices `port = hostport[i+1:]`
+    /// unconditionally (net/ipsock.go; the official test pins
+    /// {"golang.org:", "golang.org", ""}) → `CanonicalHost` routes the
+    /// bare hostname (lowercased, trailing dot trimmed).
     #[test]
     fn test_canonicalize_authority_empty_port() {
-        // "example.com:" must NOT route to "example.com".
-        assert_eq!(canonicalize_authority("example.com:"), "");
+        // "example.com:" routes to "example.com".
+        assert_eq!(canonicalize_authority("example.com:"), "example.com");
+        // Lowercase is applied at the route lookup (Go router.go `Get` —
+        // see `get_locked`), not here — identical case-insensitive routing
+        // to Go's CanonicalHost while keeping the borrowed `&str` that
+        // vhost_h2c.rs shares.
+        assert_eq!(canonicalize_authority("GOLANG.ORG:"), "GOLANG.ORG");
+        // The trailing-dot trim still applies after the port strip.
+        assert_eq!(canonicalize_authority("example.com.:"), "example.com");
         // A normal port still strips (and is never digit-validated —
         // SplitHostPort accepts any suffix).
         assert_eq!(canonicalize_authority("example.com:8080"), "example.com");
         assert_eq!(canonicalize_authority("example.com:abc"), "example.com");
-        // The trailing-dot trim still applies after the port strip.
-        assert_eq!(canonicalize_authority("example.com.:"), "");
+        // Bracketed IPv6 with a port — possibly empty — strips the
+        // brackets (Go bracket branch `host = hostport[1:end]`).
+        assert_eq!(canonicalize_authority("[::1]:8080"), "::1");
+        assert_eq!(canonicalize_authority("[::1]:"), "::1");
+        // Too many colons after the bracket: Go errors ("too many colons
+        // in address") → "" (unroutable), NOT the bare "::1".
+        assert_eq!(canonicalize_authority("[::1]:80:90"), "");
+        // ']' not immediately followed by the last colon: Go errors
+        // ("missing port in address") → "" (unroutable).
+        assert_eq!(canonicalize_authority("[::1]x]:8080"), "");
         // Portless values and other shapes are untouched.
         assert_eq!(canonicalize_authority("example.com"), "example.com");
+        assert_eq!(canonicalize_authority("[::1]"), "[::1]");
         assert_eq!(
             canonicalize_authority("example.com:8080:90"),
             "example.com:8080:90"
+        );
+    }
+
+    /// The header-scan helpers must never panic on hostile multi-byte
+    /// input: they used to slice `&str` at fixed byte offsets
+    /// (`line[..header.len()]` / `line[..5]`), and a UTF-8 char straddling
+    /// the cut aborted the process (panic=abort) on ANY vhost request.
+    /// Now `line.get(..n)` returns None at a non-boundary cut, so the line
+    /// is skipped like any non-matching one.
+    #[test]
+    fn test_header_scans_panic_proof_multibyte() {
+        // é (U+00E9) = 0xC3 0xA9. "x-pad: abcdefé": byte 13 is the FIRST
+        // byte of é → the 14-byte "authorization:" scan cuts mid-char.
+        let req = "GET / HTTP/1.1\r\nx-pad: abcdefé\r\n\r\n";
+        assert_eq!(extract_basic_auth(req), None);
+        assert!(!has_nonempty_header(req, "authorization:"));
+        // Same shape for the 20-byte "proxy-authorization:" scan: é spans
+        // bytes 19-20 of "proxy-authorizationé".
+        let req = "GET / HTTP/1.1\r\nproxy-authorizationé\r\n\r\n";
+        assert_eq!(extract_basic_auth_named(req, "proxy-authorization:"), None);
+        assert!(!has_nonempty_header(req, "proxy-authorization:"));
+        // "abcéé": byte 4 is the CONTINUATION byte of the first é → the
+        // 5-byte "host:" scan cuts mid-char. The scan skips the line and
+        // still finds the real Host header...
+        let req = "GET / HTTP/1.1\r\nabcéé\r\nHost: example.com\r\n\r\n";
+        assert_eq!(extract_host_header(req), Some("example.com"));
+        // ...and a head with no Host at all yields None, not a panic.
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nabcéé\r\nx-pad: abcdefé\r\n\r\n"),
+            None
+        );
+    }
+
+    /// Go frp ParseBasicAuth parity (pkg/util/http/http.go:81-97): the
+    /// "Basic " scheme prefix matches CASE-INSENSITIVELY (Go Issue 22736)
+    /// and the base64 payload is taken verbatim — an interior space after
+    /// the scheme ("Basic  xyz") fails the decode exactly like Go's
+    /// base64.StdEncoding, while line-end whitespace is stripped by the
+    /// MIME reader in both (textproto `trim` handles both ends). An
+    /// unpadded payload is rejected: Go StdEncoding requires padding and
+    /// the inline codec requires `len % 4 == 0`.
+    #[test]
+    fn test_extract_basic_auth_case_insensitive_no_trim() {
+        // Case-insensitive scheme prefix.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: bAsIc dXNlcjpwYXNz\r\n\r\n"),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+        // "user:pass" (9 bytes) encodes without '=' padding — decodes fine.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n"),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+        // Interior whitespace after the scheme is NOT trimmed (Go takes
+        // auth[6:] verbatim) → base64 decode fails → None.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic  dXNlcjpwYXNz\r\n\r\n"),
+            None
+        );
+        // An unpadded payload (this one needs "==") is rejected — Go
+        // StdEncoding and the inline codec agree.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNzIQ\r\n\r\n"),
+            None
+        );
+        // Trailing line whitespace: Go's textproto trims both ends of the
+        // value, so this decodes — unlike the interior-space case above.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz  \r\n\r\n"),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+        // Wrong scheme still fails.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Bearer dXNlcjpwYXNz\r\n\r\n"),
+            None
         );
     }
 
@@ -2160,13 +2299,16 @@ mod tests {
             panic!("expected Ok");
         };
         assert_eq!(host, Some("::1"));
-        // A5: mis-bracketed authority stays unroutable, never "::1".
+        // A5: mis-bracketed authority — Go SplitHostPort errors ("missing
+        // port in address": the ']' is not immediately before the last
+        // colon, net/ipsock.go) → CanonicalHost "" (unroutable), never the
+        // bare "::1" nor the raw literal.
         let RequestLine::Ok { host, .. } =
             parse_vhost_request_line("GET http://[::1]x]:8080/ HTTP/1.1\r\nHost: x\r\n\r\n")
         else {
             panic!("expected Ok");
         };
-        assert_eq!(host, Some("[::1]x]:8080"));
+        assert_eq!(host, Some(""));
     }
 
     #[test]
@@ -3309,12 +3451,12 @@ mod tests {
             extract_basic_auth(req),
             Some(("user".into(), "pass".into()))
         );
-        // Whitespace between "Basic" and the payload is trimmed.
+        // Whitespace between "Basic" and the payload is NOT trimmed (Go
+        // takes auth[6:] verbatim — a space is an invalid base64 char, so
+        // StdEncoding fails → None, exactly like the round-16 fix's
+        // test_extract_basic_auth_case_insensitive_no_trim).
         let req = "GET / HTTP/1.1\r\nAuthorization: Basic   dXNlcjpwYXNz\r\n\r\n";
-        assert_eq!(
-            extract_basic_auth(req),
-            Some(("user".into(), "pass".into()))
-        );
+        assert_eq!(extract_basic_auth(req), None);
         // Empty password after the colon.
         let req = "GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjo=\r\n\r\n";
         assert_eq!(extract_basic_auth(req), Some(("user".into(), "".into())));

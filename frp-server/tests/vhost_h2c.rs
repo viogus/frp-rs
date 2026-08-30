@@ -482,17 +482,18 @@ async fn test_h2c_preface_then_silence_dropped_at_timeout() {
     );
 }
 
-/// h2c Basic-auth branch: a request without credentials against an
-/// `http_user`/`http_pwd` route must get an HTTP/2 407 Proxy Authentication
-/// Required (with the `proxy-authenticate` challenge — h2 requests are
-/// always absolute-form, so Go `checkRouteAuthByRequest` answers 407 and
-/// reads `Proxy-Authorization` only) and must NOT be forwarded to a
-/// backend; the same connection then succeeds with the correct
-/// proxy-authorization header (base64("user:pass") = dXNlcjpwYXNz),
-/// proving the auth check matches credentials rather than
+/// h2c Basic-auth branch (round-16 origin-form correction): a path-form h2
+/// request is ORIGIN-form — Go's h2 server builds req.URL from ":path"
+/// alone (h2_bundle.go:6362-6430, url.ParseRequestURI) so URL.Host == "",
+/// and `checkRouteAuthByRequest` reads `Authorization` (req.BasicAuth) and
+/// answers 401 + WWW-Authenticate (http.go:275-277), NOT the 407 the
+/// round-15 absolute-form-only model predicted. A request without
+/// credentials must get 401 and NOT be forwarded; the same connection then
+/// succeeds with the correct authorization header (base64("user:pass") =
+/// dXNlcjpwYXNz), proving the auth check matches credentials rather than
 /// blanket-rejecting h2.
 #[tokio::test]
-async fn test_h2c_407_without_credentials() {
+async fn test_h2c_401_without_credentials_origin_form() {
     let (_bind, vhost_addr, _provider, _run_id, mut work_conn) = setup_auth(
         "h2c-auth",
         "auth.example.com",
@@ -504,7 +505,7 @@ async fn test_h2c_407_without_credentials() {
 
     let mut client = h2_connect(vhost_addr).await;
 
-    // No credentials → HTTP/2 407, never forwarded.
+    // No credentials → HTTP/2 401, never forwarded.
     let request = http::Request::builder()
         .method("GET")
         .uri("http://auth.example.com/")
@@ -512,14 +513,14 @@ async fn test_h2c_407_without_credentials() {
         .unwrap();
     let (response_fut, _stream) = client.send_request(request, true).unwrap();
     let response = response_fut.await.expect("h2 response");
-    assert_eq!(response.status().as_u16(), 407);
+    assert_eq!(response.status().as_u16(), 401);
     assert_eq!(
-        response.headers()["proxy-authenticate"].to_str().unwrap(),
+        response.headers()["www-authenticate"].to_str().unwrap(),
         "Basic realm=\"frp\""
     );
     let body = read_h2_body(response.into_body()).await;
     assert!(body.is_empty());
-    // The pooled work conn must stay silent — the 407 was generated in the
+    // The pooled work conn must stay silent — the 401 was generated in the
     // vhost layer, no StartWorkConn reached a backend.
     let swc = tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -528,14 +529,16 @@ async fn test_h2c_407_without_credentials() {
     .await;
     assert!(
         swc.is_err(),
-        "407 request must not be forwarded to a backend (StartWorkConn sent)"
+        "401 request must not be forwarded to a backend (StartWorkConn sent)"
     );
 
     // Correct credentials on the SAME h2 connection → forwarded, 200.
+    // (Origin-form: the credential header is `authorization`; Go's
+    // req.BasicAuth reads only that.)
     let request = http::Request::builder()
         .method("GET")
         .uri("http://auth.example.com/")
-        .header("proxy-authorization", "Basic dXNlcjpwYXNz")
+        .header("authorization", "Basic dXNlcjpwYXNz")
         .body(())
         .unwrap();
     let (response_fut, _stream) = client.send_request(request, true).unwrap();
@@ -546,8 +549,8 @@ async fn test_h2c_407_without_credentials() {
     // both are legal, RFC 7230 §3.2 makes field names case-insensitive).
     // The property under test is the VALUE arriving intact.
     assert!(
-        String::from_utf8_lossy(&head).contains("proxy-authorization: Basic dXNlcjpwYXNz\r\n"),
-        "proxy-authorization header must be forwarded intact: {}",
+        String::from_utf8_lossy(&head).contains("authorization: Basic dXNlcjpwYXNz\r\n"),
+        "authorization header must be forwarded intact: {}",
         String::from_utf8_lossy(&head),
     );
     work_conn
@@ -837,15 +840,17 @@ async fn test_h2c_content_length_excess_resets_protocol_error() {
     }
 }
 
-/// Round-15 route_user fallback (h2c): the route is registered ONLY in the
-/// "user" bucket (`route_by_http_user = "user"`). A request with a VALID
-/// `authorization` Basic header and NO proxy-authorization must route on the
-/// Authorization username (Go `getRequestRouteUser`: Proxy-Authorization
-/// absent → `req.BasicAuth()` fallback) and then fail the auth gate with 407
-/// — NOT the 404 an empty-bucket routing would produce (the pre-fix
-/// behavior). base64("user:pass") = dXNlcjpwYXNz.
+/// Round-16 route_user origin-form (h2c): the route is registered ONLY in
+/// the "user" bucket (`route_by_http_user = "user"`). A path-form request
+/// with a VALID `authorization` Basic header is ORIGIN-form (Go h2 server:
+/// URL built from ":path" alone, URL.Host == ""), so Go `getRequestRouteUser`
+/// routes on `req.BasicAuth()` — the request hits the "user"-bucket route
+/// and `checkRouteAuthByRequest` PASSES (authorization matches the route's
+/// http_user/http_pwd) → forwarded. The round-15 oracle (407) encoded the
+/// absolute-form-only misread this round corrects. base64("user:pass") =
+/// dXNlcjpwYXNz.
 #[tokio::test]
-async fn test_h2c_route_user_authorization_fallback_407_not_404() {
+async fn test_h2c_route_user_authorization_authenticates_origin_form() {
     let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
         setup_rubu("h2c-rubu", "rubu.example.com", Some("user"), Some("pass")).await;
 
@@ -858,36 +863,39 @@ async fn test_h2c_route_user_authorization_fallback_407_not_404() {
         .unwrap();
     let (response_fut, _stream) = client.send_request(request, true).unwrap();
 
+    // Routed on the Authorization username and AUTHENTICATED by it — the
+    // request is forwarded, not rejected (a rejection would be 401, and a
+    // missed "user" bucket would be 404).
+    read_start_work_conn(&mut work_conn).await;
+    let head = read_request_bytes(&mut work_conn).await;
+    assert!(
+        String::from_utf8_lossy(&head).contains("authorization: Basic dXNlcjpwYXNz\r\n"),
+        "authorization header must be forwarded intact: {}",
+        String::from_utf8_lossy(&head),
+    );
+    work_conn
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        .await
+        .expect("write backend response");
     let response = response_fut.await.expect("h2 response");
     assert_eq!(
         response.status().as_u16(),
-        407,
-        "route found via Authorization fallback must fail auth with 407, not 404"
-    );
-    assert_eq!(
-        response.headers()["proxy-authenticate"].to_str().unwrap(),
-        "Basic realm=\"frp\""
+        200,
+        "valid origin-form authorization must authenticate and forward"
     );
     let body = read_h2_body(response.into_body()).await;
-    assert!(body.is_empty());
-    // Never forwarded: auth failed in the vhost layer.
-    let swc = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        read_msg_v1(&mut work_conn),
-    )
-    .await;
-    assert!(
-        swc.is_err(),
-        "auth-failed route_user request must not be forwarded (StartWorkConn sent)"
-    );
+    assert_eq!(body, b"ok");
 }
 
-/// Round-15 malformed Proxy-Authorization (h2c): a PRESENT but unparseable
-/// proxy-authorization must route to the EMPTY user bucket (Go
-/// `getRequestRouteUser`: `ParseBasicAuth` fails → `""`), NOT fall back to
-/// the valid `authorization` username. The request misses the "user"-only
-/// route and answers 404 — the pre-fix code would have routed on the
-/// authorization username to the "user" route and answered 407 instead.
+/// Round-16 malformed Proxy-Authorization (h2c, ABSOLUTE-form): only a
+/// CONNECT (Go h2 server: URL{Host: :authority} — h2_bundle.go:6362-6430)
+/// is absolute-form, and there a PRESENT but unparseable
+/// proxy-authorization routes to the EMPTY user bucket (Go
+/// `getRequestRouteUser`: `ParseBasicAuth` fails → `""`), NOT the valid
+/// `authorization` username. The request misses the "user"-only route and
+/// answers 404. (A path-form GET with the same headers is origin-form:
+/// proxy-authorization is ignored and the authorization authenticates —
+/// covered by test_h2c_route_user_authorization_authenticates_origin_form.)
 #[tokio::test]
 async fn test_h2c_malformed_proxy_auth_empty_bucket_404() {
     let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
@@ -895,8 +903,8 @@ async fn test_h2c_malformed_proxy_auth_empty_bucket_404() {
 
     let mut client = h2_connect(vhost_addr).await;
     let request = http::Request::builder()
-        .method("GET")
-        .uri("http://rubu2.example.com/")
+        .method("CONNECT")
+        .uri("rubu2.example.com:443")
         .header("proxy-authorization", "Basic !!!")
         .header("authorization", "Basic dXNlcjpwYXNz")
         .body(())

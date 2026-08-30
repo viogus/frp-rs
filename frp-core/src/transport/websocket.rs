@@ -565,18 +565,16 @@ impl AsyncRead for WsByteStream {
                             // RFC 6455 §5.5: control frames (close/ping/pong)
                             // MUST have FIN set and a payload of at most 125
                             // bytes, and MUST NOT use the extended length
-                            // encodings. gorilla/websocket v1.5.x
-                            // advanceFrame checks the DECODED payload length
-                            // against maxControlFramePayloadSize=125
-                            // (readRemaining, after any 16/64-bit extended
-                            // length has been parsed), so gorilla would
-                            // admit e.g. a 126-encoded ping with a 100-byte
-                            // payload. frp-rs is stricter: the RAW length
-                            // field 126/127 is rejected outright, so a
-                            // 16/64-bit-encoded control frame is a protocol
-                            // error here — not a truncatable pong — and
-                            // "FIN not set on control" likewise closes the
-                            // connection.
+                            // encodings. gorilla/websocket v1.5.x enforces
+                            // this at the same point we do: advanceFrame
+                            // compares the RAW 7-bit length field
+                            // (readRemaining) against
+                            // maxControlFramePayloadSize=125 for control
+                            // frames (conn.go:841) BEFORE any extended
+                            // length is decoded, so gorilla likewise rejects
+                            // a 126/127-encoded control frame outright — not
+                            // a truncatable pong — and "FIN not set on
+                            // control" likewise closes the connection.
                             if matches!(opcode, 0x08..=0x0a) {
                                 if head[0] & 0x80 == 0 {
                                     *raw_read_state = RawReadState::Idle;
@@ -2089,16 +2087,16 @@ mod tests {
         frame
     }
 
-    /// RFC 6455 §5.5 control-frame validation: a control frame whose decoded
-    /// payload exceeds 125 bytes (gorilla advanceFrame parity — gorilla
-    /// checks the DECODED length via readRemaining after parsing any
-    /// extended length), whose RAW length field is 126/127 (extended-length
-    /// encoding — stricter than gorilla, which decodes the extended length
-    /// before comparing), or whose FIN bit is clear is a protocol error
-    /// that closes the connection — a >125-byte ping is NOT truncatable to
-    /// a pong. A continuation frame (opcode 0x00) with no fragmented message
-    /// in progress is likewise a protocol error (gorilla: "continuation
-    /// after FIN"), not a data frame.
+    /// RFC 6455 §5.5 control-frame validation: a control frame whose raw
+    /// 7-bit length field is 126/127 (extended-length encoding), whose
+    /// decoded payload exceeds 125 bytes, or whose FIN bit is clear is a
+    /// protocol error that closes the connection — a >125-byte ping is NOT
+    /// truncatable to a pong. The raw-field rejection matches gorilla:
+    /// advanceFrame checks the raw length field against 125 for control
+    /// frames (conn.go:841) before decoding any extended length. A
+    /// continuation frame (opcode 0x00) with no fragmented message in
+    /// progress is likewise a protocol error (gorilla: "continuation after
+    /// FIN"), not a data frame.
     #[tokio::test]
     async fn ws_control_frame_and_continuation_validation() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

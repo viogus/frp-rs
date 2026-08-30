@@ -1059,17 +1059,17 @@ pub(crate) async fn connect_via_proxy(
             let status_line = String::from_utf8_lossy(&status_buf);
             // Go parity (golib httpProxyAfterHook → http.ReadResponse reads
             // the FIRST status line only — no 1xx hopping — and requires
-            // StatusCode == 200). The code is the second space-delimited
-            // token and must be exactly "200": `contains("200")` accepted a
-            // non-200 whose reason phrase embeds "200" (or a 4-digit code
-            // like "1200"). Split on ' ' ONLY (round-15): Go parses the
-            // status line with strings.IndexByte(line, ' '), so a
-            // tab-separated line ("HTTP/1.1\t200 OK") leaves the tab in
-            // Proto and makes the code token the reason phrase (Atoi fails),
-            // and "HTTP/1.1\t200" has no space at all ("malformed HTTP
-            // response") — split_whitespace treated the tab as a delimiter
-            // and accepted both.
-            if status_line.split(' ').nth(1) != Some("200") {
+            // StatusCode == 200). `parse_connect_status_line` below mirrors
+            // ReadResponse's line semantics exactly (response.go:168-184:
+            // terminator strip, first-space Cut, TrimLeft, 3-char numeric
+            // code, ParseHTTPVersion). The code is NOT the second
+            // space-delimited token: `contains("200")` accepted a non-200
+            // whose reason phrase embeds "200" (or a 4-digit code like
+            // "1200"), plain split(' ') mis-reads CRLF-less and multi-space
+            // lines, and a tab-separated line ("HTTP/1.1\t200 OK") leaves
+            // the tab in Proto so ParseHTTPVersion rejects it — Go
+            // strings.Cut splits on ' ' only (round-15 parity).
+            if !parse_connect_status_line(&status_line) {
                 return Err(crate::Error::Transport(
                     format!("proxy CONNECT rejected: {}", status_line.trim()).into(),
                 ));
@@ -1302,6 +1302,80 @@ pub(crate) async fn connect_via_proxy(
     }
 
     Ok(IoStream::Tcp(stream))
+}
+
+/// Decide whether an HTTP CONNECT proxy accepted the tunnel, from its
+/// status line as read by `read_until(b'\n')` (i.e. including the trailing
+/// "\r\n"). Mirrors Go golib `httpProxyAfterHook` (net/dial_option.go,
+/// `http.ReadResponse` + `StatusCode != 200`) status-line parsing exactly
+/// (net/http/response.go:168-184):
+///
+/// - the line terminator is stripped first (textproto.ReadLine elides
+///   "\r\n" / "\n");
+/// - `strings.Cut(line, " ")` splits on the FIRST space into proto + status
+///   — no space at all is "malformed HTTP response", so a tab-separated
+///   line leaves the tab in Proto and fails ParseHTTPVersion below;
+/// - `strings.TrimLeft(status, " ")` — extra spaces between the version and
+///   the code are legal ("HTTP/1.1  200 OK");
+/// - the status code is the first space-delimited token of status, and
+///   `len(statusCode) != 3` is "malformed HTTP status code" — checked
+///   BEFORE Atoi, so "0200" (4 chars) is rejected like "2000";
+/// - `strconv.Atoi(statusCode)` must succeed (a non-numeric code like
+///   "20O" is rejected);
+/// - `ParseHTTPVersion(proto)` must pass (a non-HTTP proto like "FOO" is
+///   rejected);
+/// - golib then requires `StatusCode == 200` ("201" and friends fail).
+///
+/// `code.parse::<u16>() == Ok(200)` is outcome-identical to Go's
+/// Atoi + `== 200` for a 3-char token (Atoi's "+"/"-" prefixes never
+/// produce 200 within 3 characters).
+fn parse_connect_status_line(line: &str) -> bool {
+    // textproto.ReadLine strips the trailing "\r\n" (bare "\n" too).
+    let line = line
+        .strip_suffix("\r\n")
+        .or_else(|| line.strip_suffix('\n'))
+        .unwrap_or(line);
+
+    // Go: proto, status, ok := strings.Cut(line, " ")
+    let (proto, status) = match line.split_once(' ') {
+        Some(pair) => pair,
+        None => return false, // "malformed HTTP response"
+    };
+    // Go: resp.Status = strings.TrimLeft(status, " ")
+    let status = status.trim_start_matches(' ');
+    // Go: statusCode, _, _ := strings.Cut(resp.Status, " ") — no space in
+    // the status means the whole status is the code.
+    let code = match status.split_once(' ') {
+        Some((code, _)) => code,
+        None => status,
+    };
+    if code.len() != 3 {
+        return false; // "malformed HTTP status code" (checked before Atoi)
+    }
+    if code.parse::<u16>() != Ok(200) {
+        // Go: Atoi must succeed and golib requires StatusCode == 200.
+        return false;
+    }
+    parse_http_version(proto)
+}
+
+/// Mirror Go net/http `ParseHTTPVersion` (request.go:817-842): the proto
+/// must be "HTTP/" followed by exactly major "." minor — one ASCII digit
+/// each, nothing else. "HTTP/1.1", "HTTP/1.0", "HTTP/2.0" pass; "FOO",
+/// "HTTP/1", "HTTP/1.1.1", "HTTP/1x" fail.
+fn parse_http_version(vers: &str) -> bool {
+    let rest = match vers.strip_prefix("HTTP/") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    let (major, minor) = match rest.split_once('.') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    major.len() == 1
+        && minor.len() == 1
+        && major.as_bytes()[0].is_ascii_digit()
+        && minor.as_bytes()[0].is_ascii_digit()
 }
 
 /// Parse a proxy URL into (scheme, auth, host, port).
@@ -2370,6 +2444,41 @@ mod tests {
         proxy_reply("HTTP/1.1 200 OK")
             .await
             .expect("a genuine 200 must be accepted");
+    }
+
+    /// Go parity matrix for [`parse_connect_status_line`] — the exact
+    /// status-line semantics of golib `httpProxyAfterHook` →
+    /// `http.ReadResponse` (net/http/response.go:168-184): textproto.ReadLine
+    /// terminator strip, first-space Cut, TrimLeft on the status, 3-char
+    /// numeric status code (length checked before Atoi), and
+    /// ParseHTTPVersion on the proto.
+    #[test]
+    fn test_parse_connect_status_line_go_parity_matrix() {
+        let accept: &[&str] = &[
+            "HTTP/1.1 200 OK\r\n",  // standard
+            "HTTP/1.1 200\r\n",     // no reason phrase — ReadLine strips the CRLF
+            "HTTP/1.1  200 OK\r\n", // double space — TrimLeft(status, " ")
+        ];
+        let reject: &[&str] = &[
+            "HTTP/1.1 201 OK\r\n",  // StatusCode != 200 (golib hook check)
+            "HTTP/1.1 0200 OK\r\n", // len(statusCode) != 3 → "malformed HTTP status code" (response.go:180) — the length check runs BEFORE Atoi, so 4-char "0200" is rejected even though Atoi would parse it to 200
+            "HTTP/1.1 2000 OK\r\n", // len(statusCode) != 3 → malformed
+            "FOO 200 OK\r\n",       // ParseHTTPVersion("FOO") fails
+            "HTTP/1.1\t200 OK\r\n", // tab in Proto → ParseHTTPVersion fails (Cut splits on ' ' only)
+            "HTTP/1.1 20O OK\r\n",  // Atoi("20O") fails
+        ];
+        for line in accept {
+            assert!(
+                parse_connect_status_line(line),
+                "a genuine 200 status line must be accepted: {line:?}"
+            );
+        }
+        for line in reject {
+            assert!(
+                !parse_connect_status_line(line),
+                "a non-200/malformed status line must be rejected: {line:?}"
+            );
+        }
     }
 
     #[tokio::test]
