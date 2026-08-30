@@ -43,7 +43,10 @@ jobs:
   tests:
     name: Tests (lib + integration + dashboard)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 1505 tests with `-j 1` serial integration suites runs ~24.5 min on a
+    # cold runner (measured 2026-08-30: 24m39s green run) — 25 left no
+    # headroom and cancelled the job at the limit twice in one day.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
