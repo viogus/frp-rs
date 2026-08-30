@@ -565,13 +565,18 @@ impl AsyncRead for WsByteStream {
                             // RFC 6455 §5.5: control frames (close/ping/pong)
                             // MUST have FIN set and a payload of at most 125
                             // bytes, and MUST NOT use the extended length
-                            // encodings. gorilla/websocket checks the RAW
-                            // 7-bit length field against 125 before parsing
-                            // any extended length ("len > 125 for control"
-                            // in advanceFrame), so a 16/64-bit-encoded
-                            // control frame is a protocol error here — not a
-                            // truncatable pong — and "FIN not set on
-                            // control" likewise closes the connection.
+                            // encodings. gorilla/websocket v1.5.x
+                            // advanceFrame checks the DECODED payload length
+                            // against maxControlFramePayloadSize=125
+                            // (readRemaining, after any 16/64-bit extended
+                            // length has been parsed), so gorilla would
+                            // admit e.g. a 126-encoded ping with a 100-byte
+                            // payload. frp-rs is stricter: the RAW length
+                            // field 126/127 is rejected outright, so a
+                            // 16/64-bit-encoded control frame is a protocol
+                            // error here — not a truncatable pong — and
+                            // "FIN not set on control" likewise closes the
+                            // connection.
                             if matches!(opcode, 0x08..=0x0a) {
                                 if head[0] & 0x80 == 0 {
                                     *raw_read_state = RawReadState::Idle;
@@ -1492,6 +1497,65 @@ mod tests {
         assert_eq!(&out[..n2], payload2);
     }
 
+    /// Round-15 finding: the `n == 0` stash arm of dispatch_raw_frame (caller
+    /// ReadBuf exactly full) had no coverage — a regression there (lost wake,
+    /// dropped stash) would silently stall the tunnel: poll_read returns
+    /// Pending after stashing the payload, and the next poll must deliver it
+    /// from read_buf. Drive poll_read directly with a zero-capacity ReadBuf
+    /// to hit the arm, then drain a ≥16 KiB payload through 32-byte buffers,
+    /// bounded by a timeout so a hang fails the test instead of parking it.
+    #[tokio::test]
+    async fn ws_readbuf_full_stash_delivers_payload_across_polls() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+
+        let (mut server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), false);
+
+        // Byte-distinct ≥16 KiB payload so truncation/duplication is caught.
+        let payload: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+        server_io
+            .write_all(&ws_masked_frame(&payload))
+            .await
+            .unwrap();
+
+        // Poll 1 with a zero-capacity ReadBuf: the frame parses fully and
+        // dispatch_raw_frame hits n == 0 → payload stashed, task woken,
+        // Pending returned. Poll 2 (self-wake): stash present → Ready.
+        // A lost wake parks this poll_fn forever — caught by the timeout.
+        let mut empty = [0u8; 0];
+        let mut zero_buf = ReadBuf::new(&mut empty);
+        timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| Pin::new(&mut ws).poll_read(cx, &mut zero_buf)),
+        )
+        .await
+        .expect("stash poll hung: wake lost in n == 0 arm")
+        .expect("stash poll errored");
+        assert_eq!(
+            zero_buf.filled().len(),
+            0,
+            "zero-capacity ReadBuf must not be filled"
+        );
+
+        // Drain the stashed payload through 32-byte reads; all bytes must
+        // arrive, nothing may hang or be dropped.
+        let mut out = vec![0u8; payload.len()];
+        let mut got = 0usize;
+        while got < payload.len() {
+            let mut chunk = [0u8; 32];
+            let n = timeout(Duration::from_secs(5), ws.read(&mut chunk))
+                .await
+                .expect("read hung: stashed payload never delivered")
+                .expect("read errored");
+            assert!(n > 0, "stalled mid-payload after {got} bytes");
+            out[got..got + n].copy_from_slice(&chunk[..n]);
+            got += n;
+        }
+        assert_eq!(&out, &payload, "stashed payload must be byte-exact");
+    }
+
     #[tokio::test]
     async fn ws_raw_accepts_v2_sized_frames_and_rejects_oversized() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2025,13 +2089,16 @@ mod tests {
         frame
     }
 
-    /// RFC 6455 §5.5 control-frame validation (gorilla advanceFrame parity):
-    /// a control frame whose decoded payload exceeds 125 bytes, whose RAW
-    /// length field is 126/127 (extended-length encoding), or whose FIN bit
-    /// is clear is a protocol error that closes the connection — a >125-byte
-    /// ping is NOT truncatable to a pong. A continuation frame (opcode 0x00)
-    /// with no fragmented message in progress is likewise a protocol error
-    /// (gorilla: "continuation after FIN"), not a data frame.
+    /// RFC 6455 §5.5 control-frame validation: a control frame whose decoded
+    /// payload exceeds 125 bytes (gorilla advanceFrame parity — gorilla
+    /// checks the DECODED length via readRemaining after parsing any
+    /// extended length), whose RAW length field is 126/127 (extended-length
+    /// encoding — stricter than gorilla, which decodes the extended length
+    /// before comparing), or whose FIN bit is clear is a protocol error
+    /// that closes the connection — a >125-byte ping is NOT truncatable to
+    /// a pong. A continuation frame (opcode 0x00) with no fragmented message
+    /// in progress is likewise a protocol error (gorilla: "continuation
+    /// after FIN"), not a data frame.
     #[tokio::test]
     async fn ws_control_frame_and_continuation_validation() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2058,8 +2125,9 @@ mod tests {
         .await;
 
         // Extended-length ping: the RAW length field is 127 (64-bit
-        // encoding) even though the decoded payload is only 2 bytes —
-        // gorilla checks the raw field before parsing the extended length.
+        // encoding) even though the decoded payload is only 2 bytes — a
+        // protocol error here although gorilla's decoded-length check
+        // (2 ≤ 125) would admit it: frp-rs is stricter on the encoding.
         expect_protocol_error(ws_masked_frame_raw(0x09, 127, true, b"hi"), "control").await;
 
         // FIN=0 ping: control frames must have FIN set (RFC 6455 §5.5).

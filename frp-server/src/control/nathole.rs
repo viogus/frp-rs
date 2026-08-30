@@ -994,6 +994,16 @@ pub(crate) async fn handle_vnet_route_advertise(
     // default-net routes). Wide-subnet default-net ads still require a
     // default-net vnet proxy; the per-client 64-route cap bounds the
     // round-10 fork/exec blast radius in every net.
+    //
+    // DESIGN PREMISE (tighten in sync): the proxy-less host-route
+    // admission above is justified ONLY by the server's inability to
+    // observe visitors — NewVisitorConn carries no plugin-type field, so
+    // a visitor-only client is indistinguishable from a bare control.
+    // Future code that adds a per-control visitor registry MUST tighten
+    // this logic in the same change: host-route admission must then also
+    // require the advertiser to hold an actual visitor (or vnet proxy) in
+    // the default net, or the round-14 HIGH guard relaxes back into an
+    // injection hole.
     let (owns_vnet_proxy, owns_named_net_proxy) = {
         let proxies = ctx.state.proxy_manager.list_client(&ctx.run_id).await;
         (

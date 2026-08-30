@@ -559,6 +559,19 @@ pub(crate) async fn write_http_error(
 /// stream via InternalMsg::ProxyUserConn. `scheme` labels log lines
 /// ("HTTP"/"HTTPS"). `wrap` converts the (readable+writable) stream into the
 /// IoStream variant carried to the control handler.
+///
+/// Go parity (pkg/util/vhost/http.go `NewHTTPReverseProxy`): a
+/// `vhost_http_timeout <= 0` value floors at 60s; positive values pass
+/// through unchanged. Shared by every vhost accept path (HTTP/1.1 head,
+/// h2c handshake, HTTPS SNI, h2c response-head).
+pub(crate) fn clamp_vhost_timeout(t: u64) -> u64 {
+    if t > 0 {
+        t
+    } else {
+        60
+    }
+}
+
 async fn serve_vhost_request<S>(
     mut stream: S,
     peer: std::net::SocketAddr,
@@ -568,14 +581,8 @@ async fn serve_vhost_request<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    // Read the first 4096 bytes to extract Host header (with configured timeout)
-    // Go parity (pkg/util/vhost/http.go NewHTTPReverseProxy): `<= 0` floors
-    // at 60s; positive values pass through unchanged.
-    let timeout_secs = if state.vhost_http_timeout > 0 {
-        state.vhost_http_timeout
-    } else {
-        60
-    };
+    // Read the first 4096 bytes to extract Host header (with configured timeout).
+    let timeout_secs = clamp_vhost_timeout(state.vhost_http_timeout);
     let mut buf = [0u8; 4096];
     let n = match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
@@ -666,12 +673,7 @@ async fn handle_http1_request<S>(
 {
     // The vhost listener's single read may be short (e.g. an h2c-misdetected
     // HTTP/1.1 request): keep reading until the head terminator or the cap.
-    // Go parity (pkg/util/vhost/http.go): `<= 0` floors at 60s.
-    let timeout_secs = if state.vhost_http_timeout > 0 {
-        state.vhost_http_timeout
-    } else {
-        60
-    };
+    let timeout_secs = clamp_vhost_timeout(state.vhost_http_timeout);
     // Single absolute deadline for the whole head (audit fix): a slow-drip
     // client sending one byte per read window would otherwise stretch the
     // head read to 4096 × timeout. The whole head must arrive within
@@ -772,15 +774,27 @@ async fn handle_http1_request<S>(
     } else {
         extract_basic_auth(request_text)
     };
-    // Go getRequestRouteUser (pkg/util/vhost/http.go): ROUTING ONLY — when
-    // an absolute-form request carries no Proxy-Authorization, fall back to
-    // the Authorization header's Basic Auth username so the request still
-    // hits the matched per-user route and returns 407 instead of 404. Auth
-    // validation deliberately does not share this fallback (checkRouteAuthByRequest
-    // reads Proxy-Authorization only on absolute-form); http_auth above stays
+    // Go getRequestRouteUser (pkg/util/vhost/http.go:231-243): ROUTING
+    // ONLY — an absolute-form request without Proxy-Authorization falls
+    // back to the Authorization header's Basic Auth username so the request
+    // still hits the matched per-user route and returns 407 instead of 404.
+    // Go falls back ONLY when `proxyAuth == ""` (absent or empty-valued);
+    // a PRESENT but malformed Proxy-Authorization makes `ParseBasicAuth`
+    // fail and Go routes to the EMPTY user bucket ("") — never to the
+    // Authorization header's username. Auth validation deliberately does
+    // not share the fallback (checkRouteAuthByRequest reads
+    // Proxy-Authorization only on absolute-form); http_auth above stays
     // the single source of truth for the credential check.
-    let route_user: Option<String> = if http_auth.is_none() && is_absolute_form {
-        extract_basic_auth(request_text).map(|(u, _)| u)
+    let route_user: Option<String> = if is_absolute_form && http_auth.is_none() {
+        if has_nonempty_header(request_text, "proxy-authorization:") {
+            // Header present but unparseable — Go ParseBasicAuth fails →
+            // empty user bucket (Some("") ≡ "", no Authorization fallback).
+            Some(String::new())
+        } else {
+            // Header absent or empty-valued — Go's `proxyAuth == ""`
+            // fallback to the Authorization header's Basic username.
+            extract_basic_auth(request_text).map(|(u, _)| u)
+        }
     } else {
         None
     };
@@ -1160,12 +1174,7 @@ pub async fn run_vhost_https_listener(
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    // Go parity (pkg/util/vhost/http.go): `<= 0` floors at 60s.
-                    let timeout_secs = if state.vhost_http_timeout > 0 {
-                        state.vhost_http_timeout
-                    } else {
-                        60
-                    };
+                    let timeout_secs = clamp_vhost_timeout(state.vhost_http_timeout);
                     // Read the TLS ClientHello (SNI lives in the first
                     // record; 4096 bytes comfortably covers it).
                     let mut buf = [0u8; 4096];
@@ -1610,6 +1619,20 @@ fn extract_basic_auth_named(request: &str, header: &str) -> Option<(String, Stri
     Some((user.to_string(), pwd.to_string()))
 }
 
+/// Does the head carry a `header:` line with a non-empty value? Go
+/// `http.Header.Get` returns "" both for an absent header and an
+/// empty-valued one, so the two are indistinguishable there — only a
+/// PRESENT non-empty value forces the `ParseBasicAuth` path in
+/// `getRequestRouteUser` (a malformed value then routes to the "" user
+/// bucket instead of falling back to Authorization).
+fn has_nonempty_header(request: &str, header: &str) -> bool {
+    request.lines().any(|line| {
+        line.len() >= header.len()
+            && line[..header.len()].eq_ignore_ascii_case(header)
+            && !line[header.len()..].trim().is_empty()
+    })
+}
+
 /// Count Host header lines (RFC 7230 §5.4 allows at most one). Must only be
 /// called on the head (up to the first `\r\n\r\n`) — see `handle_http1_request`.
 pub(crate) fn count_host_headers(request: &str) -> usize {
@@ -1642,9 +1665,10 @@ pub(crate) fn count_host_headers(request: &str) -> usize {
 /// port itself is never validated — `net.SplitHostPort` accepts any
 /// suffix, so Go routes "Host: example.com:abc" to example.com (the
 /// numeric gate exists only on the CONNECT request line via
-/// url.ParseRequestURI's validOptionalPort). Portless values are used
-/// as-is — "example.com", or "[::1]" which stays bracketed (unroutable,
-/// nothing registers brackets).
+/// url.ParseRequestURI's validOptionalPort). An EMPTY port ("Host:
+/// example.com:") is a SplitHostPort error → "" (unroutable). Portless
+/// values are used as-is — "example.com", or "[::1]" which stays
+/// bracketed (unroutable, nothing registers brackets).
 /// Canonicalize an authority value (host[:port] or [v6]:port) for vhost
 /// routing — port strip, bracket handling, exactly one trailing dot.
 /// Go frp `CanonicalHost` semantics (pkg/util/http/http.go), shared by
@@ -1661,8 +1685,14 @@ pub(crate) fn canonicalize_authority(value: &str) -> &str {
         // host:port — SplitHostPort never validates the port digits
         // (Go frp routes "Host: example.com:abc" to example.com); the
         // digit gate exists only on the CONNECT request line, where
-        // url.ParseRequestURI enforces it (validOptionalPort).
-        let (h, _port) = value.rsplit_once(':').unwrap_or((value, ""));
+        // url.ParseRequestURI enforces it (validOptionalPort). An EMPTY
+        // port part ("example.com:") is a `net.SplitHostPort` ERROR in Go
+        // ("missing port in address") → CanonicalHost returns "" →
+        // unroutable (404), NOT the bare hostname.
+        let (h, port) = value.rsplit_once(':').unwrap_or((value, ""));
+        if port.is_empty() {
+            return "";
+        }
         h
     } else if colons >= 2 && value.starts_with('[') && value.contains("]:") {
         let end = value.find(']').unwrap_or(0);
@@ -1944,6 +1974,65 @@ mod tests {
             extract_host_header("GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n"),
             Some("::1")
         );
+    }
+
+    /// Round-15: a trailing colon with an EMPTY port part is a
+    /// `net.SplitHostPort` error in Go ("missing port in address") →
+    /// `CanonicalHost` returns "" (unroutable), NOT the bare hostname.
+    #[test]
+    fn test_canonicalize_authority_empty_port() {
+        // "example.com:" must NOT route to "example.com".
+        assert_eq!(canonicalize_authority("example.com:"), "");
+        // A normal port still strips (and is never digit-validated —
+        // SplitHostPort accepts any suffix).
+        assert_eq!(canonicalize_authority("example.com:8080"), "example.com");
+        assert_eq!(canonicalize_authority("example.com:abc"), "example.com");
+        // The trailing-dot trim still applies after the port strip.
+        assert_eq!(canonicalize_authority("example.com.:"), "");
+        // Portless values and other shapes are untouched.
+        assert_eq!(canonicalize_authority("example.com"), "example.com");
+        assert_eq!(
+            canonicalize_authority("example.com:8080:90"),
+            "example.com:8080:90"
+        );
+    }
+
+    #[test]
+    fn test_clamp_vhost_timeout() {
+        // Go parity: `<= 0` floors at 60s; positive values pass through.
+        assert_eq!(clamp_vhost_timeout(0), 60);
+        assert_eq!(clamp_vhost_timeout(1), 1);
+        assert_eq!(clamp_vhost_timeout(30), 30);
+        assert_eq!(clamp_vhost_timeout(60), 60);
+        assert_eq!(clamp_vhost_timeout(120), 120);
+    }
+
+    #[test]
+    fn test_has_nonempty_header() {
+        // Absent → false (Go Header.Get returns "" for absent too).
+        assert!(!has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n",
+            "proxy-authorization:"
+        ));
+        // Present with a value → true (forces the ParseBasicAuth path).
+        assert!(has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nProxy-Authorization: Basic !!!\r\n\r\n",
+            "proxy-authorization:"
+        ));
+        // Empty-valued / whitespace-only → false (Go Get returns "").
+        assert!(!has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nProxy-Authorization:\r\n\r\n",
+            "proxy-authorization:"
+        ));
+        assert!(!has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nProxy-Authorization:   \r\n\r\n",
+            "proxy-authorization:"
+        ));
+        // Case-insensitive header name match.
+        assert!(has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nproxy-authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+            "proxy-authorization:"
+        ));
     }
 
     #[test]

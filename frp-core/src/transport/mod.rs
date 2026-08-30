@@ -1059,11 +1059,17 @@ pub(crate) async fn connect_via_proxy(
             let status_line = String::from_utf8_lossy(&status_buf);
             // Go parity (golib httpProxyAfterHook → http.ReadResponse reads
             // the FIRST status line only — no 1xx hopping — and requires
-            // StatusCode == 200). The code is the second
-            // whitespace-delimited token and must be exactly "200":
-            // `contains("200")` accepted a non-200 whose reason phrase
-            // embeds "200" (or a 4-digit code like "1200").
-            if status_line.split_whitespace().nth(1) != Some("200") {
+            // StatusCode == 200). The code is the second space-delimited
+            // token and must be exactly "200": `contains("200")` accepted a
+            // non-200 whose reason phrase embeds "200" (or a 4-digit code
+            // like "1200"). Split on ' ' ONLY (round-15): Go parses the
+            // status line with strings.IndexByte(line, ' '), so a
+            // tab-separated line ("HTTP/1.1\t200 OK") leaves the tab in
+            // Proto and makes the code token the reason phrase (Atoi fails),
+            // and "HTTP/1.1\t200" has no space at all ("malformed HTTP
+            // response") — split_whitespace treated the tab as a delimiter
+            // and accepted both.
+            if status_line.split(' ').nth(1) != Some("200") {
                 return Err(crate::Error::Transport(
                     format!("proxy CONNECT rejected: {}", status_line.trim()).into(),
                 ));

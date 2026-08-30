@@ -26,6 +26,7 @@ fn http_proxy(
     domains: Vec<String>,
     http_user: Option<&str>,
     http_pwd: Option<&str>,
+    route_by_http_user: Option<&str>,
 ) -> NewProxy {
     NewProxy {
         proxy_name: name.into(),
@@ -45,7 +46,7 @@ fn http_proxy(
         host_header_rewrite: None,
         headers: None,
         response_headers: None,
-        route_by_http_user: None,
+        route_by_http_user: route_by_http_user.map(String::from),
         allow_users: None,
         bandwidth_limit: None,
         bandwidth_limit_mode: None,
@@ -62,13 +63,17 @@ fn http_proxy(
 }
 
 /// Start a test frps + a provider registered with an HTTP proxy for `domain`
-/// (optionally Basic-auth protected) with one work conn already pooled.
+/// (optionally Basic-auth protected, optionally with `route_by_http_user`
+/// set so the route lands in the named user bucket) with one work conn
+/// already pooled.
 /// Returns `(bind_addr, vhost_addr, provider_control, run_id, work_conn)`.
-async fn setup_auth(
+#[allow(clippy::too_many_arguments)]
+async fn setup_auth_impl(
     proxy_name: &str,
     domain: &str,
     http_user: Option<&str>,
     http_pwd: Option<&str>,
+    route_by_http_user: Option<&str>,
     vhost_http_timeout: u64,
 ) -> (
     SocketAddr,
@@ -100,6 +105,7 @@ async fn setup_auth(
         vec![domain.into()],
         http_user,
         http_pwd,
+        route_by_http_user,
     )));
     write_msg_v1(&mut provider, &np)
         .await
@@ -127,6 +133,49 @@ async fn setup_auth(
     .expect("send NewWorkConn");
 
     (addr, vhost_addr, provider, run_id, work_conn)
+}
+
+/// Wrapper without `route_by_http_user`.
+async fn setup_auth(
+    proxy_name: &str,
+    domain: &str,
+    http_user: Option<&str>,
+    http_pwd: Option<&str>,
+    vhost_http_timeout: u64,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    IoStream,
+    String,
+    tokio::net::TcpStream,
+) {
+    setup_auth_impl(
+        proxy_name,
+        domain,
+        http_user,
+        http_pwd,
+        None,
+        vhost_http_timeout,
+    )
+    .await
+}
+
+/// Like `setup_auth` but with `route_by_http_user = "user"` — the route is
+/// registered in the "user" bucket only, so routing exercises the
+/// getRequestRouteUser username fallback.
+async fn setup_rubu(
+    proxy_name: &str,
+    domain: &str,
+    http_user: Option<&str>,
+    http_pwd: Option<&str>,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    IoStream,
+    String,
+    tokio::net::TcpStream,
+) {
+    setup_auth_impl(proxy_name, domain, http_user, http_pwd, Some("user"), 30).await
 }
 
 /// Convenience wrapper: default vhost_http_timeout (30s), no Basic auth.
@@ -723,4 +772,215 @@ async fn test_h2c_oversized_header_block_rejected_no_work_conn() {
         ),
         Ok(Err(e)) => panic!("work conn read error: {e}"),
     }
+}
+
+/// Round-15 Content-Length enforcement: a request body longer than the
+/// declared `content-length` must be reset with RST_STREAM PROTOCOL_ERROR
+/// (RFC 7540 §8.1.2.6 — Go's h2 server resets on the same violation) and the
+/// excess bytes must NEVER reach the provider: forwarded raw, they would
+/// arrive at the backend as a pipelined request (request smuggling). The
+/// backend sees the head with the DECLARED length and then silence — the
+/// body task checks the length BEFORE writing, so even the first 3 bytes of
+/// a 5-byte body are withheld once the violation is known.
+#[tokio::test]
+async fn test_h2c_content_length_excess_resets_protocol_error() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-cl-excess", "clx.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://clx.example.com/")
+        .header("content-length", "3")
+        .body(())
+        .unwrap();
+    let (response_fut, mut send_stream) = client.send_request(request, false).unwrap();
+    // Declared 3 bytes, send 5 with END_STREAM.
+    send_stream
+        .send_data(Bytes::from_static(b"hello"), true)
+        .unwrap();
+
+    // The stream must be reset with PROTOCOL_ERROR, never answered.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), response_fut).await {
+        Ok(Err(e)) => assert_eq!(
+            e.reason(),
+            Some(h2::Reason::PROTOCOL_ERROR),
+            "CL-excess must reset with PROTOCOL_ERROR, got: {e}"
+        ),
+        Ok(Ok(resp)) => panic!("CL-excess request was answered with {}", resp.status()),
+        Err(_) => panic!("no reset within 5s"),
+    }
+
+    // The backend received the head (with the DECLARED length) but must not
+    // receive any body bytes.
+    read_start_work_conn(&mut work_conn).await;
+    let head = read_request_bytes(&mut work_conn).await;
+    let head_text = String::from_utf8_lossy(&head);
+    assert!(
+        head_text.contains("content-length: 3\r\n"),
+        "head must carry the declared length: {head_text}"
+    );
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        work_conn.read(&mut buf),
+    )
+    .await
+    {
+        Err(_) => {}
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!(
+            "excess body bytes reached the backend: {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        ),
+        Ok(Err(e)) => panic!("work conn read error: {e}"),
+    }
+}
+
+/// Round-15 route_user fallback (h2c): the route is registered ONLY in the
+/// "user" bucket (`route_by_http_user = "user"`). A request with a VALID
+/// `authorization` Basic header and NO proxy-authorization must route on the
+/// Authorization username (Go `getRequestRouteUser`: Proxy-Authorization
+/// absent → `req.BasicAuth()` fallback) and then fail the auth gate with 407
+/// — NOT the 404 an empty-bucket routing would produce (the pre-fix
+/// behavior). base64("user:pass") = dXNlcjpwYXNz.
+#[tokio::test]
+async fn test_h2c_route_user_authorization_fallback_407_not_404() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup_rubu("h2c-rubu", "rubu.example.com", Some("user"), Some("pass")).await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://rubu.example.com/")
+        .header("authorization", "Basic dXNlcjpwYXNz")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    let response = response_fut.await.expect("h2 response");
+    assert_eq!(
+        response.status().as_u16(),
+        407,
+        "route found via Authorization fallback must fail auth with 407, not 404"
+    );
+    assert_eq!(
+        response.headers()["proxy-authenticate"].to_str().unwrap(),
+        "Basic realm=\"frp\""
+    );
+    let body = read_h2_body(response.into_body()).await;
+    assert!(body.is_empty());
+    // Never forwarded: auth failed in the vhost layer.
+    let swc = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        read_msg_v1(&mut work_conn),
+    )
+    .await;
+    assert!(
+        swc.is_err(),
+        "auth-failed route_user request must not be forwarded (StartWorkConn sent)"
+    );
+}
+
+/// Round-15 malformed Proxy-Authorization (h2c): a PRESENT but unparseable
+/// proxy-authorization must route to the EMPTY user bucket (Go
+/// `getRequestRouteUser`: `ParseBasicAuth` fails → `""`), NOT fall back to
+/// the valid `authorization` username. The request misses the "user"-only
+/// route and answers 404 — the pre-fix code would have routed on the
+/// authorization username to the "user" route and answered 407 instead.
+#[tokio::test]
+async fn test_h2c_malformed_proxy_auth_empty_bucket_404() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup_rubu("h2c-rubu2", "rubu2.example.com", Some("user"), Some("pass")).await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://rubu2.example.com/")
+        .header("proxy-authorization", "Basic !!!")
+        .header("authorization", "Basic dXNlcjpwYXNz")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    let response = response_fut.await.expect("h2 response");
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "malformed proxy-authorization must route to the empty bucket (404), not the Authorization username"
+    );
+    let body = read_h2_body(response.into_body()).await;
+    assert!(body.is_empty());
+    // Never forwarded.
+    let swc = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        read_msg_v1(&mut work_conn),
+    )
+    .await;
+    assert!(
+        swc.is_err(),
+        "empty-bucket 404 must not be forwarded (StartWorkConn sent)"
+    );
+}
+
+/// Round-15 malformed chunk tail: the backend's chunked response ends a
+/// chunk with garbage ("XX") instead of the required CRLF (Go
+/// `chunkedReader`: "malformed chunked encoding"). The server must drop the
+/// stream — the client receives the decoded "hello" and then a reset
+/// (CANCEL), never a clean truncated 200. Pre-fix the two bytes were
+/// discarded silently and the response ended as if complete.
+#[tokio::test]
+async fn test_h2c_malformed_chunk_tail_resets_stream() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-chunk-tail", "ct.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://ct.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    read_request_bytes(&mut work_conn).await;
+    // Chunk-size 5, data "hello", then "XX" DIRECTLY — the two bytes after
+    // the chunk data must be CRLF (RFC 7230 §4.1); "hello\r\nXX" would be a
+    // VALID chunk tail followed by a garbage chunk-size line, which the
+    // reader treats as an aborted backend (clean end).
+    work_conn
+        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX")
+        .await
+        .expect("write chunked backend response");
+
+    let response = response_fut.await.expect("h2 response");
+    assert_eq!(response.status().as_u16(), 200);
+    let mut body = response.into_body();
+    let mut got = Vec::new();
+    let mut reset = false;
+    // Bounded: if the stream is neither reset nor ended (server regression)
+    // the data loop must fail the test, not hang it.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match body.data().await {
+                Some(Ok(chunk)) => got.extend_from_slice(&chunk),
+                Some(Err(_e)) => {
+                    reset = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+    })
+    .await
+    .expect("stream neither reset nor ended within 5s");
+    // The stream must end in an ERROR, never a clean truncation. Whether the
+    // already-queued "hello" DATA frame is delivered before the RST is a wire
+    // race (h2 discards queued DATA of a reset stream) — either way the
+    // client must NOT see a clean end.
+    assert!(
+        reset,
+        "malformed chunk tail must reset the stream, not deliver a clean truncated 200; body so far: {:?}",
+        String::from_utf8_lossy(&got)
+    );
 }

@@ -291,10 +291,17 @@ async fn handle_control_inner<S>(
     // survives the select, so consumed bytes are retained until the frame
     // completes. The loop shape stays fair (no biased branch ordering —
     // the fairness regression test below asserts this): the read still
-    // progresses only at loop top, exactly like a fresh future would, and
-    // a completed read always wins its own round (tokio's select returns
-    // at the first Ready branch), so the arm body's reset below can never
-    // strand a completed future.
+    // progresses only at loop top, exactly like a fresh future would. Note
+    // the read does NOT "always win its own round": tokio::select! returns
+    // the FIRST Ready branch in declaration order, and internal_rx is
+    // declared above the read arm, so an internal message can win a round
+    // in which the read is also complete. Correctness never relies on the
+    // read winning — the future lives in the loop-outer Option, so a lost
+    // round drops the branch's reference, not the future: a completed read
+    // stays Ready and wins the first round in which no earlier arm is also
+    // Ready (a Ready future needs no waker to make progress), and a
+    // partial read keeps its consumed bytes until completion. The arm
+    // body's reset below therefore can never strand a completed future.
     //
     // The future owns an Arc<tokio::sync::Mutex<ReadHalf>> clone and locks
     // inside its own poll, so it borrows nothing from the loop — a

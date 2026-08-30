@@ -133,13 +133,8 @@ pub(crate) async fn serve_h2c_request<S>(
     // Same absolute-deadline idiom as the HTTP/1.1 head read (vhost.rs:635-
     // 640): the whole handshake must complete within vhost_http_timeout, not
     // a per-read timeout a drip-feeding client could stretch indefinitely.
-    // Go parity (pkg/util/vhost/http.go NewHTTPReverseProxy): `<= 0` floors
-    // at 60s; positive values pass through unchanged.
-    let timeout_secs = if state.vhost_http_timeout > 0 {
-        state.vhost_http_timeout
-    } else {
-        60
-    };
+    // `<= 0` floors at 60s (Go parity, shared clamp in vhost.rs).
+    let timeout_secs = super::clamp_vhost_timeout(state.vhost_http_timeout);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let io = PreReadStream {
         pre_read,
@@ -235,13 +230,27 @@ async fn handle_stream(
     // `checkRouteAuthByRequest` reads `Proxy-Authorization` ONLY (never
     // `authorization`) and answers 407 + Proxy-Authenticate on failure.
     let http_auth = extract_basic_auth_headers(request.headers());
-    // Go getRequestRouteUser: ROUTING ONLY — when Proxy-Authorization is
-    // absent, fall back to the Authorization header's Basic Auth username so
-    // the request still hits the matched per-user route and returns 407
-    // instead of 404. Auth validation does not share the fallback
+    // Go getRequestRouteUser (pkg/util/vhost/http.go:231-243): ROUTING
+    // ONLY — when Proxy-Authorization is ABSENT (or empty-valued —
+    // Go `Header.Get` returns "" for both), fall back to the Authorization
+    // header's Basic Auth username so the request still hits the matched
+    // per-user route and returns 407 instead of 404. A PRESENT but
+    // malformed Proxy-Authorization makes `ParseBasicAuth` fail and Go
+    // routes to the EMPTY user bucket ("") — never to the Authorization
+    // header's username. Auth validation does not share the fallback
     // (checkRouteAuthByRequest reads Proxy-Authorization only).
+    let proxy_auth_present = request
+        .headers()
+        .get("proxy-authorization")
+        .is_some_and(|v| !v.is_empty());
     let route_user: Option<String> = if http_auth.is_none() {
-        extract_basic_auth_header(request.headers(), "authorization").map(|(u, _)| u)
+        if proxy_auth_present {
+            // Header present but unparseable — Go ParseBasicAuth fails →
+            // empty user bucket (Some("") ≡ "", no Authorization fallback).
+            Some(String::new())
+        } else {
+            extract_basic_auth_header(request.headers(), "authorization").map(|(u, _)| u)
+        }
     } else {
         None
     };
@@ -350,14 +359,16 @@ async fn handle_stream(
     let mut body = request.into_body();
 
     // RFC 7540 §8.1.2.6: the request body must not extend beyond the
-    // declared Content-Length. The h2 library already enforces this at frame
-    // receipt (excess DATA → PROTOCOL_ERROR before it reaches us), but this
-    // app-level gate is defense in depth against that guarantee changing:
-    // forwarding excess bytes raw would let them reach the provider as a
-    // pipelined request (request smuggling). The body task counts against
-    // the declared length and signals `excess` on a violation; the main task
-    // answers RST_STREAM PROTOCOL_ERROR (Go's h2 server resets with
-    // PROTOCOL_ERROR on the same violation).
+    // declared Content-Length. The h2 crate does FRAME-level work only —
+    // it has no notion of Content-Length (that header is opaque app data
+    // to the h2 codec), so nothing below this gate rejects a body longer
+    // than the declared value. This app-level gate is therefore the
+    // PRIMARY defense, not defense in depth: the body task counts against
+    // the declared length and signals `excess` on a violation; the main
+    // task answers RST_STREAM PROTOCOL_ERROR (Go's h2 server resets with
+    // PROTOCOL_ERROR on the same violation). Forwarding excess bytes raw
+    // would let them reach the provider as a pipelined request (request
+    // smuggling).
     //
     // `Notify` is deliberate over `oneshot`: the signal must fire ONLY on an
     // actual violation. A oneshot's sender is dropped when the body task
@@ -412,15 +423,11 @@ async fn handle_stream(
 
     // Read the backend's HTTP/1.1 response and re-encode it as HTTP/2. The
     // response-head read is bounded by vhost_http_timeout — Go parity
-    // (pkg/util/vhost/http.go): `<= 0` floors at 60s (ResponseHeaderTimeout
-    // → 504 Gateway Timeout), positive values pass through unchanged.
-    let head_timeout = Some(std::time::Duration::from_secs(
-        if state.vhost_http_timeout > 0 {
-            state.vhost_http_timeout
-        } else {
-            60
-        },
-    ));
+    // (pkg/util/vhost/http.go ResponseHeaderTimeout → 504 Gateway Timeout),
+    // `<= 0` floors at 60s (shared clamp in vhost.rs).
+    let head_timeout = Some(std::time::Duration::from_secs(super::clamp_vhost_timeout(
+        state.vhost_http_timeout,
+    )));
     // `biased;`: if the backend completes AND the body exceeds simultaneously,
     // the protocol error wins — a declared Content-Length is a hard contract.
     let response_result = tokio::select! {
@@ -718,20 +725,38 @@ impl<'a, R: AsyncRead + Unpin> BodyReader<'a, R> {
         Ok(true)
     }
 
-    async fn read_exact(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(n.min(8192));
-        while out.len() < n {
+    /// Fill `buf` completely from the buffered reader, failing with
+    /// UnexpectedEof when the stream ends early.
+    async fn fill_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut filled = 0;
+        while filled < buf.len() {
             if self.available().is_empty() && !self.read_more().await? {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "eof in response body",
                 ));
             }
-            let take = (n - out.len()).min(self.available().len());
-            out.extend_from_slice(&self.available()[..take]);
+            let take = (buf.len() - filled).min(self.available().len());
+            buf[filled..filled + take].copy_from_slice(&self.available()[..take]);
             self.consume(take);
+            filled += take;
         }
-        Ok(out)
+        Ok(())
+    }
+
+    /// Read exactly `n` bytes, appending to `out` after clearing it. The
+    /// caller owns the buffer, so its allocation is REUSED across calls —
+    /// chunked streaming no longer allocates (and re-grows) a fresh Vec per
+    /// chunk (a 64 KiB chunk used to cost ~8 reallocations via
+    /// `with_capacity(n.min(8192))` growth). The capacity grows to exactly
+    /// `n` on the first call and is kept for subsequent calls.
+    async fn read_exact_into(&mut self, out: &mut Vec<u8>, n: usize) -> std::io::Result<()> {
+        out.clear();
+        out.try_reserve_exact(n).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "response body too large")
+        })?;
+        out.resize(n, 0); // no realloc: capacity already >= n
+        self.fill_exact(out).await
     }
 
     /// Read one CRLF (or LF) terminated line including its terminator.
@@ -772,10 +797,15 @@ fn is_blank_line(b: &[u8]) -> bool {
 }
 
 /// Decode a chunked response body and stream it as HTTP/2 DATA frames.
-/// Read errors truncate the body (Go treats an aborted backend body as EOF).
+/// Read errors truncate the body (Go treats an aborted backend body as EOF);
+/// a MALFORMED chunk terminator is an explicit framing error (Go
+/// chunkedReader: "malformed chunked encoding") that drops the stream
+/// instead of delivering a truncated 200. `scratch` is the caller-owned
+/// buffer reused for every chunk (see `BodyReader::read_exact_into`).
 async fn stream_chunked_body(
     reader: &mut BodyReader<'_, impl AsyncRead + Unpin>,
     send: &mut SendStream<Bytes>,
+    scratch: &mut Vec<u8>,
 ) -> Result<(), h2::Error> {
     loop {
         let line = match reader.read_line().await {
@@ -813,25 +843,35 @@ async fn stream_chunked_body(
         // attacker-influenced memory (a misbehaving backend or proxied
         // origin can emit an arbitrarily large chunk). Stream the chunk
         // in bounded slices instead; the frame stays chunked
-        // (end_stream=false on every slice).
+        // (end_stream=false on every slice). Round 15: each slice reads
+        // into the reused `scratch` (no per-chunk Vec growth); the data is
+        // copied out because h2's `SendStream` consumes `Bytes`.
         let mut remaining = size;
         while remaining > 0 {
             let n = remaining.min(MAX_CHUNK_SIZE);
-            let data = match reader.read_exact(n).await {
-                Ok(d) => d,
+            match reader.read_exact_into(scratch, n).await {
+                Ok(()) => {}
                 Err(_) => return Ok(()),
-            };
-            send.send_data(Bytes::from(data), false)?;
+            }
+            send.send_data(Bytes::copy_from_slice(scratch), false)?;
             remaining -= n;
         }
         // Each chunk ends with CRLF (RFC 7230 §4.1); Go's chunkedReader
         // errors with "malformed chunked encoding" when the two bytes after
         // the chunk data are not CRLF. Verify instead of silently discarding
         // whatever two bytes arrived — mis-parsing the framing could let
-        // garbage past as a chunk line.
-        match reader.read_exact(2).await {
-            Ok(terminator) if terminator == *b"\r\n" => {}
-            _ => return Ok(()), // missing or malformed trailing CRLF
+        // garbage past as a chunk line, and a missing/malformed terminator
+        // must not deliver a truncated 200. Returning Err drops the stream
+        // (the h2 layer resets it with CANCEL); the caller logs the error.
+        let mut terminator = [0u8; 2];
+        match reader.fill_exact(&mut terminator).await {
+            Ok(()) if terminator == *b"\r\n" => {}
+            _ => {
+                // Explicit reset with CANCEL — the same reason the h2 layer
+                // would use if the SendResponse were dropped. PROTOCOL_ERROR
+                // would blame the client; the violation is the backend's.
+                return Err(h2::Reason::CANCEL.into());
+            }
         }
     }
 }
@@ -914,18 +954,22 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
 
     let mut send = respond.send_response(resp, false)?;
     let mut reader = BodyReader::new(r, head[body_offset..].to_vec());
+    // One scratch buffer for every body path — chunk slices and
+    // content-length slices read into it and are copied out (h2
+    // `SendStream` consumes `Bytes`), so no per-slice Vec growth.
+    let mut scratch: Vec<u8> = Vec::new();
 
     if chunked {
-        stream_chunked_body(&mut reader, &mut send).await?;
+        stream_chunked_body(&mut reader, &mut send, &mut scratch).await?;
     } else if let Some(mut remaining) = content_length {
         while remaining > 0 {
             let n = remaining.min(8192);
-            let data = match reader.read_exact(n).await {
-                Ok(d) => d,
+            match reader.read_exact_into(&mut scratch, n).await {
+                Ok(()) => {}
                 Err(_) => break, // truncated body
-            };
-            remaining -= data.len();
-            send.send_data(Bytes::from(data), false)?;
+            }
+            remaining -= scratch.len();
+            send.send_data(Bytes::copy_from_slice(&scratch), false)?;
         }
     } else {
         // No length framing: read to EOF (the work conn is closed by frpc
@@ -981,6 +1025,9 @@ mod tests {
         assert_eq!(host_from_authority("example.com"), "example.com");
         // Port is stripped (host:port).
         assert_eq!(host_from_authority("example.com:8080"), "example.com");
+        // Round-15: an EMPTY port part is a Go SplitHostPort error →
+        // CanonicalHost returns "" (unroutable), NOT the bare hostname.
+        assert_eq!(host_from_authority("example.com:"), "");
         // Exactly one trailing dot is trimmed (Go CanonicalHost
         // TrimSuffix strips ONE dot — "example.com.." becomes
         // "example.com.", which STAYS unroutable because the trailing

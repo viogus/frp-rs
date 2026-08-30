@@ -434,14 +434,12 @@ async fn verify_login_auth(
 /// explicitly below. `is_control()` covers Cc (Go IsControl) but not
 /// Cf, which is why U+00AD gets its own case.
 ///
-/// The >Latin-1 fallback uses std-only category probes (Rust has no
-/// punctuation/symbol/mark methods): alphanumeric (L+N) is printable,
-/// everything else is REJECTED. This diverges from Go only in the
-/// fail-closed direction — combining marks and non-ASCII
-/// punctuation/symbols that Go accepts are rejected here — and never
-/// accepts a rune Go rejects (Go unicode.IsPrint admits Zs only as
-/// U+0020; Cf, Co, Cn, Zl/Zp are refused). Run ids are UUIDs in
-/// practice, so the gap is unreachable for real clients.
+/// The >Latin-1 fallback accepts everything that is neither Cc nor
+/// White_Space (Rust std has no IsPrint/IsGraphic methods): the graphic
+/// categories L/M/N/P/S that Go admits — plus, as a known negligible
+/// fail-open edge, Cf format characters (e.g. ZWJ U+200D), unassigned
+/// (Cn) and private-use (Co) runes that Go IsPrint rejects. Run ids are
+/// UUIDs in practice, so the gap is unreachable for real clients.
 fn is_printable_run_id_char(c: char) -> bool {
     match c {
         // U+0020 is the only printable Latin-1 spacing rune.
@@ -453,12 +451,19 @@ fn is_printable_run_id_char(c: char) -> bool {
         c if c.is_control() => false,
         // Latin-1 graphic runes are printable (Go's isPrintLatin1).
         c if (c as u32) <= 0xFF => true,
-        // Above Latin-1: L/N print only — Go unicode.IsPrint admits
-        // U+0020 as the sole spacing rune, so Zs above Latin-1 (U+1680,
-        // U+2000-U+200A, U+202F, U+205F, U+3000) is rejected like Zl/Zp
-        // (round-8 finding — the old Zs clause failed open for U+3000
-        // and friends). See the fail-closed note.
-        c => c.is_alphanumeric(),
+        // Above Latin-1: Go unicode.IsPrint admits every graphic rune —
+        // L/M/N/P/S (IsGraphic) minus Cc, Cf and White_Space, with
+        // U+0020 the sole spacing rune (IsPrint is IsGraphic minus
+        // IsControl/IsSpace/IsFormat). `!is_control() && !is_whitespace()`
+        // matches that for every graphic category and keeps Zs above
+        // Latin-1 (U+1680, U+2000-U+200A, U+202F, U+205F, U+3000) and
+        // Zl/Zp rejected via White_Space (round-8 finding — the old Zs
+        // clause failed open for U+3000 and friends). The only
+        // divergences vs Go are the fail-open Cf/Cn/Co edge noted in the
+        // doc comment. Round-15 finding: the previous is_alphanumeric
+        // fallback fail-closed on P/S/M, rejecting Go-accepted runes
+        // like U+2010 (Pd) and U+2192 (Sm).
+        c => !c.is_control() && !c.is_whitespace(),
     }
 }
 
@@ -1479,6 +1484,28 @@ mod auth_signal_tests {
         assert!(!super::is_printable_run_id_char('\u{0000}'));
         assert!(!super::is_printable_run_id_char('\u{2028}'));
         assert!(!super::is_printable_run_id_char('\u{2029}'));
+        // Round-15 finding: the old is_alphanumeric fallback fail-closed on
+        // Go-admitted graphic categories — punctuation (Pd), symbols (Sm)
+        // and combining marks (Mn) above Latin-1 must be printable.
+        assert!(
+            super::is_printable_run_id_char('\u{2010}'),
+            "Pd U+2010 must be printable (Go IsPrint admits P)"
+        );
+        assert!(
+            super::is_printable_run_id_char('\u{2192}'),
+            "Sm U+2192 must be printable (Go IsPrint admits S)"
+        );
+        assert!(
+            super::is_printable_run_id_char('\u{0301}'),
+            "Mn U+0301 must be printable (Go IsPrint admits M)"
+        );
+        // Documented fail-open edge: Cf format chars (ZWJ) pass the
+        // std-only probe but Go IsPrint rejects them — pinned here so a
+        // future Cf exclusion is a deliberate change.
+        assert!(
+            super::is_printable_run_id_char('\u{200D}'),
+            "Cf U+200D accepted (documented divergence from Go IsPrint)"
+        );
     }
 }
 

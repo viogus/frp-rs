@@ -620,3 +620,94 @@ async fn test_tls_sni_peek_short_read_replays_bytes() {
     drop(sock);
     drop(_provider);
 }
+
+// ---------------------------------------------------------------
+// Round-15: X-Forwarded-For is appended even when the proxy configures
+// response headers
+// ---------------------------------------------------------------
+
+/// The X-Forwarded-For append must run UNCONDITIONALLY (Go's Rewrite hook
+/// always calls SetXForwarded — a configured header list is not a gate).
+/// Round-14 regression shape: the old combined request/response header
+/// injection skipped the XFF append whenever response-header config was
+/// present; this test pins the current behavior with `response_headers`
+/// set on the proxy.
+#[tokio::test]
+async fn test_vhost_xff_appended_with_response_headers_configured() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let mut np = http_proxy("xff-resp", vec!["xff.example.com".into()], None, None);
+    let mut response_headers = std::collections::HashMap::new();
+    response_headers.insert("X-Backend-Resp".into(), "yes".into());
+    np.response_headers = Some(response_headers);
+    let (_provider, run_id) = register_proxy(addr, FrpMessage::NewProxy(Box::new(np))).await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    // No X-Forwarded-For in the request.
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: xff.example.com\r\n\r\n")
+        .await
+        .expect("send request");
+
+    match read_msg_v1(&mut work_conn).await.expect("StartWorkConn") {
+        FrpMessage::StartWorkConn(swc) => {
+            assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+    let head = read_forwarded_head(&mut work_conn).await;
+    let text = String::from_utf8_lossy(&head);
+    assert!(
+        text.contains("X-Forwarded-For: 127.0.0.1\r\n"),
+        "XFF must be appended despite response_headers config, head: {text}"
+    );
+    drop(client);
+    drop(_provider);
+}
+
+// ---------------------------------------------------------------
+// Round-15: a request that opens with a blank line is malformed → 400
+// ---------------------------------------------------------------
+
+/// Go readRequest parity: a head whose FIRST line is empty (the request
+/// opens with `\r\n`) is "malformed HTTP request" → 400 — the request must
+/// not be routed or forwarded to any backend.
+#[tokio::test]
+async fn test_vhost_blank_first_line_400() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "blank-line",
+            vec!["blank.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    // The request line is empty — the head starts with a bare CRLF.
+    client
+        .write_all(
+            b"\r\n\
+              GET / HTTP/1.1\r\n\
+              Host: blank.example.com\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send request");
+
+    assert_rejected_and_not_forwarded(&mut client, &mut work_conn, "HTTP/1.1 400").await;
+    drop(client);
+    drop(_provider);
+}

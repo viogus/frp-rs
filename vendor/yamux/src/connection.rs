@@ -27,9 +27,9 @@ use crate::{
     Config, DEFAULT_CREDIT,
 };
 use crate::{Result, MAX_ACK_BACKLOG};
-use crossbeam_queue::ArrayQueue;
 use cleanup::Cleanup;
 use closing::Closing;
+use crossbeam_queue::ArrayQueue;
 use futures::stream::SelectAll;
 use futures::{channel::mpsc, future::Either, prelude::*, sink::SinkExt, stream::Fuse};
 use nohash_hasher::IntMap;
@@ -48,6 +48,14 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 /// 16 KiB split-send default that bounds the pool at ~256 KiB per connection.
 /// The pool is a cache only — a full pool just allocates fresh.
 const BODY_POOL_CAP: usize = 16;
+
+/// frp-rs patch: cap of the per-stream RST queue (bounded FIFO). A cap-hit
+/// SYN queues a 12-byte RST; at cap the OLDEST pending RST is dropped — a
+/// reset that can't be sent promptly still ends the stream locally, and the
+/// peer's lingering entry is bounded by its own session timeout. 32 covers
+/// any realistic burst of inbound SYNs at the stream cap while the socket
+/// write is backpressured, keeping the worst-case backlog at 384 bytes.
+const RESET_QUEUE_CAP: usize = 32;
 
 /// How the connection is used.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
@@ -309,15 +317,18 @@ struct Active<T> {
     no_streams_waker: Option<Waker>,
 
     pending_read_frame: Option<Frame<()>>,
-    /// frp-rs patch: single queued per-stream RST (cap-hit replies).
+    /// frp-rs patch: bounded FIFO of queued per-stream RSTs (cap-hit
+    /// replies), cap `RESET_QUEUE_CAP` (32).
     ///
-    /// Kept separate from `pending_read_frame` because RSTs are idempotent
-    /// (same 12-byte header each time): a second cap-hit SYN while one RST is
-    /// queued just replaces it (coalescing), so this slot never gates the
-    /// read branch — inbound frames keep being processed while the socket
-    /// write is backpressured. Pongs/GoAways keep the read gate (they must
-    /// answer per-ping, see `poll`).
-    pending_reset_frame: Option<Frame<()>>,
+    /// Kept separate from `pending_read_frame`: a burst of cap-hit SYNs while
+    /// the socket write is backpressured queues one RST per stream in FIFO
+    /// order, and at cap the oldest is dropped (a reset that can't be sent
+    /// promptly still ends the stream locally; the peer's lingering entry is
+    /// bounded by its own timeout). The queue never gates the read branch —
+    /// inbound frames keep being processed while the socket write is
+    /// backpressured. Pongs/GoAways keep the read gate (they must answer
+    /// per-ping, see `poll`).
+    pending_reset_frames: VecDeque<Frame<()>>,
     pending_write_frame: Option<Frame<()>>,
     new_outbound_stream_waker: Option<Waker>,
 
@@ -407,7 +418,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 Mode::Server => 2,
             },
             pending_read_frame: None,
-            pending_reset_frame: None,
+            pending_reset_frames: VecDeque::new(),
             pending_write_frame: None,
             new_outbound_stream_waker: None,
             rtt: rtt::Rtt::new(),
@@ -421,7 +432,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         let pending_frames = self
             .pending_read_frame
             .into_iter()
-            .chain(self.pending_reset_frame)
+            .chain(self.pending_reset_frames)
             .chain(self.pending_write_frame)
             .collect::<VecDeque<Frame<()>>>();
         Closing::new(self.stream_receivers, pending_frames, self.socket)
@@ -448,11 +459,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 }
 
                 // Privilege pending `Pong` and `GoAway` `Frame`s
-                // over `Frame`s from the receivers.
+                // over `Frame`s from the receivers. frp-rs patch: queued
+                // per-stream RSTs drain one per loop iteration (FIFO via
+                // `pop_front`); the `continue` re-enters the writable check,
+                // so the whole queue goes out within one poll round when the
+                // socket stays writable — no extra wake mechanism.
                 if let Some(frame) = self
                     .pending_read_frame
                     .take()
-                    .or_else(|| self.pending_reset_frame.take())
+                    .or_else(|| self.pending_reset_frames.pop_front())
                     .or_else(|| self.pending_write_frame.take())
                 {
                     self.socket.start_send_unpin(frame)?;
@@ -501,10 +516,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             // a queued pong while the socket write is backpressured stops
             // inbound processing rather than pile up more answerable frames
             // (pings must be answered per-ping). frp-rs patch: queued RSTs in
-            // `pending_reset_frame` deliberately do NOT gate reads — they are
-            // idempotent 12-byte headers coalesced into a single slot, and a
-            // session-wide stall while a cap-hit RST waits for the socket
-            // would let one hostile SYN freeze the whole connection (all
+            // `pending_reset_frames` deliberately do NOT gate reads — they are
+            // idempotent 12-byte headers held in a bounded FIFO queue, and a
+            // session-wide stall while cap-hit RSTs wait for the socket would
+            // let one hostile SYN burst freeze the whole connection (all
             // streams, the control channel included) for up to the keepalive
             // timeout.
             if self.pending_read_frame.is_none() {
@@ -540,22 +555,31 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                                 // frame type, so this is a deliberate
                                 // wire-shape choice, not a bug.
                                 //
-                                // Queued into `pending_reset_frame` (NOT
-                                // `pending_read_frame`): RSTs are idempotent —
-                                // the same 12-byte header regardless of how
-                                // many cap-hit SYNs arrive — so a second one
-                                // while the socket write is backpressured just
-                                // replaces the first (coalescing, no per-SYN
-                                // fidelity needed; a coalesced-away RST costs
-                                // the remote at most a briefly-open stream we
-                                // no-op as unknown). This keeps the read
-                                // branch running during backpressure instead
-                                // of stalling the whole session behind one
+                                // Queued into `pending_reset_frames` (NOT
+                                // `pending_read_frame`): RSTs are idempotent
+                                // 12-byte headers, so a burst of cap-hit SYNs
+                                // while the socket write is backpressured
+                                // queues one RST per stream in FIFO order. The
+                                // queue is bounded (`RESET_QUEUE_CAP` = 32):
+                                // at cap the OLDEST pending RST is dropped — a
+                                // reset that can't be sent promptly still ends
+                                // the stream locally, and the peer's lingering
+                                // entry is bounded by its own timeout. Reads
+                                // keep running during backpressure instead of
+                                // stalling the whole session behind an
                                 // un-sendable RST.
                                 log::trace!("{}/{}: sending stream reset", self.id, id);
                                 let mut header = Header::data(id, 0);
                                 header.rst();
-                                self.pending_reset_frame.replace(Frame::new(header).into());
+                                if self.pending_reset_frames.len() >= RESET_QUEUE_CAP {
+                                    // Drop the oldest so the queue stays
+                                    // bounded (a dropped RST costs the remote
+                                    // at most a briefly-open stream we no-op
+                                    // as unknown).
+                                    self.pending_reset_frames.pop_front();
+                                }
+                                self.pending_reset_frames
+                                    .push_back(Frame::new(header).into());
                             }
                         }
                         continue;

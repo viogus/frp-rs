@@ -43,21 +43,27 @@ matches Go's per-stream reset semantics.
   bad credit / body) are untouched.
 - The `Action` dispatch in `poll` handles `Reset(id)` by queueing a
   Data-typed frame with the `RST` flag for `id` into the dedicated
-  `pending_reset_frame` slot — the same frame shape the crate already
+  `pending_reset_frames` queue — the same frame shape the crate already
   sends when a stream handle is dropped without `poll_close`
   (`on_drop_stream`, `State::Open` arm).
-- `pending_reset_frame` is a single slot distinct from
-  `pending_read_frame`: while the socket write is backpressured, a
-  second cap-hit SYN just replaces the queued RST (coalescing), and —
-  unlike a queued pong/GoAway — a queued RST does NOT gate the read
-  branch of `poll`. This is deliberate: RSTs are idempotent 12-byte
-  headers that need no per-SYN fidelity (a coalesced-away RST costs the
-  remote at most a briefly-open stream we no-op as unknown), while
-  gating reads behind an un-sendable RST would let one hostile SYN
-  freeze the whole session — every stream, the control channel included
-  — until the socket drains or the keepalive fires. The send loop
-  privileges the RST slot after pongs/GoAways and before stream frames,
-  and `close()` flushes it with the other pending frames.
+- `pending_reset_frames` is a bounded FIFO `VecDeque` (cap 32,
+  `RESET_QUEUE_CAP`) distinct from `pending_read_frame`. A burst of
+  cap-hit SYNs while the socket write is backpressured queues one RST
+  per stream in FIFO order; at cap the OLDEST pending RST is dropped
+  (a reset that can't be sent promptly still ends the stream locally,
+  and the peer's lingering entry is bounded by its own session
+  timeout). RSTs are idempotent 12-byte headers, so a dropped one costs
+  the remote at most a briefly-open stream we no-op as unknown.
+- Unlike a queued pong/GoAway, queued RSTs do NOT gate the read branch
+  of `poll`. This is deliberate: gating reads behind an un-sendable RST
+  would let a hostile SYN burst freeze the whole session — every
+  stream, the control channel included — until the socket drains or
+  the keepalive fires. The send loop drains the queue one frame per
+  iteration (FIFO `pop_front`) at the same site the original single
+  slot drained: after pongs/GoAways and before stream frames, with no
+  extra wake mechanism — while the socket is writable the whole queue
+  goes out within one poll round. `close()` flushes the whole queue
+  with the other pending frames.
 
 ### Wire semantics
 
@@ -75,10 +81,10 @@ matches Go's per-stream reset semantics.
 
 When bumping yamux upstream: re-apply the `Action::Reset` machinery
 above to the new `src/connection.rs` (the `Action` enum variant, the two
-cap sites, the `pending_reset_frame` field + send-loop + `close()`
-wiring, and the read-gate exception), or — better — carry the patch
-upstream. The other deviations from crates.io yamux 0.14.0 are listed
-below.
+cap sites, the `pending_reset_frames` bounded queue + send-loop +
+`close()` wiring, and the read-gate exception), or — better — carry the
+patch upstream. The other deviations from crates.io yamux 0.14.0 are
+listed below.
 
 ## Patch: separate mpsc `Sender` for window updates (read-side lost-wakeup deadlock)
 
