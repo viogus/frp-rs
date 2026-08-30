@@ -69,7 +69,13 @@ EOF
 echo "=== Building ==="
 cd "$PROJECT_DIR"
 mkdir -p .cargo
-printf '[profile.release]\nlto = false\nopt-level = 2\n' >> .cargo/config.toml
+# Idempotent: the stress-test.yml workflow's Build step appends this same
+# block before invoking this script (two unconditional appends = duplicate
+# [profile.release] key = TOML parse error = every cargo command fails;
+# weekly CI red since 2026-07-05). Skip the append when the block already
+# exists, so the script works both standalone and after the workflow's write.
+grep -q '^\[profile\.release\]' .cargo/config.toml 2>/dev/null \
+    || printf '[profile.release]\nlto = false\nopt-level = 2\n' >> .cargo/config.toml
 cargo build --release --bin frps --bin frpc 2>&1
 cd "$PROJECT_DIR/scripts/frp-stress" && cargo build --release 2>&1
 cd "$PROJECT_DIR"
