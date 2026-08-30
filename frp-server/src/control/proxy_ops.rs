@@ -47,6 +47,21 @@ async fn reject_new_proxy(
     write_resp(writer, &resp, v2).await;
 }
 
+/// First duplicated domain in a list, compared case-insensitively (Go's
+/// `Routers.Add` lowercases the domain before `exist()`, so a case-only
+/// variant of an earlier entry is a duplicate). Returns the lowercased
+/// duplicate, or None when every entry is distinct.
+fn duplicate_domain(domains: &[String]) -> Option<String> {
+    let mut seen = std::collections::HashSet::with_capacity(domains.len());
+    for d in domains {
+        let lowered = d.to_lowercase();
+        if !seen.insert(lowered.clone()) {
+            return Some(lowered);
+        }
+    }
+    None
+}
+
 /// Check whether a UDP port is available at the OS level by attempting a bind.
 /// Immediately drops the socket if successful (just a probe).
 /// Matches Go frp's `Manager.isPortAvailable` for UDP netType.
@@ -589,6 +604,110 @@ async fn rollback_tcp_bind_failure(
     state.proxy_manager.remove(proxy_name).await;
 }
 
+/// Register `np` under `run_id` and attach the per-client port bookkeeping
+/// for `port` (sk_index, registry entry with `remote_port`, replaced-entry
+/// cleanup, per-client port count).
+///
+/// Shared by `handle_new_proxy` and the TCP auto-assign bind retry
+/// (`bind_tcp_proxy_with_retry`), which re-registers a proxy on a fresh
+/// port after the first bind lost the auto-assigned port to another
+/// process — re-entering this same path keeps every structure that holds
+/// the port (ProxyInfo `remote_port`, `used_ports`, `client_ports_used`)
+/// consistent.
+///
+/// Returns `Err(message)` when registration failed (the port mark and
+/// sk_index entry were already rolled back); the caller writes the
+/// rejection response.
+#[inline(never)]
+async fn register_proxy_entry(
+    state: &Arc<AppState>,
+    np: &msg::NewProxy,
+    run_id: &str,
+    control_id: u64,
+    port: u16,
+    is_udp_type: bool,
+) -> Result<(), String> {
+    let info = build_proxy_info(state, np, run_id, control_id, port).await;
+
+    // Go frp compat: proxy.Run() calls startVisitorListener() BEFORE
+    // proxyManager.Add(). Insert sk_index before proxy_manager.register()
+    // so that STCP/XTCP visitors that arrive during the registration
+    // window can find the proxy via sk_index fallback.
+    let needs_sk_index = register_sk_index(state, np);
+
+    // Supersession takeover: when the 10s handoff-barrier timeout
+    // fires, the superseding control may re-register a name the old
+    // control still holds. Port-consuming types (tcp/udp/sudp/
+    // stcp/xtcp/vnet) take over via register_or_replace — the
+    // replaced entry's port mark is freed below, exactly once
+    // (audit-fix: residual port-mark leak on barrier-timeout
+    // supersession). http/https/tcpmux keep the conflict-reject
+    // behavior: their vhost/tcpmux routes are owned by the old
+    // control's registration and cannot be taken over mid-flight
+    // (a replace-then-rollback would orphan the old routes).
+    let replaced = {
+        let replaceable = matches!(
+            np.proxy_type.as_str(),
+            "tcp" | "udp" | "sudp" | "stcp" | "xtcp" | "vnet"
+        );
+        let register_result = if replaceable {
+            state
+                .proxy_manager
+                .register_or_replace(run_id.to_string(), info.clone())
+                .await
+        } else {
+            state
+                .proxy_manager
+                .register(run_id.to_string(), info.clone())
+                .await
+                .map(|_| None)
+        };
+        match register_result {
+            Ok(r) => r,
+            Err(e) => {
+                // Cleanup sk_index on registration failure
+                rollback_port_allocation(state, &np.proxy_name, port, is_udp_type, needs_sk_index)
+                    .await;
+                return Err(e);
+            }
+        }
+    };
+
+    // A replaced entry's per-client port count and port mark are
+    // released here: the old control's sweep will skip the name
+    // (newer control_id) and never decrement either.
+    if let Some(old) = replaced {
+        if (old.proxy_type == "tcp" || old.proxy_type == "udp" || old.proxy_type == "sudp")
+            && old.remote_port.is_some_and(|p| p > 0)
+        {
+            let mut port_counts = state.client_ports_used.write().await;
+            if let Some(count) = port_counts.get_mut(run_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    port_counts.remove(run_id);
+                }
+            }
+        }
+        free_replaced_port(state, &old, port).await;
+    }
+
+    // Track port usage per client (matching Go frp's portsUsedNum).
+    // Only proxies that actually consume a port are counted:
+    // stcp/xtcp/http/https/tcpmux register with remote port 0 and
+    // would otherwise inflate the count the max_ports_per_client
+    // gate checks (audit finding 1).
+    if matches!(np.proxy_type.as_str(), "tcp" | "udp" | "sudp") && port > 0 {
+        state
+            .client_ports_used
+            .write()
+            .await
+            .entry(run_id.to_string())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
+    Ok(())
+}
+
 /// Pure validation of NewProxy fields. Returns Ok(()) or an error message.
 /// Checks port range, proxy_name length/control chars, custom_domains length,
 /// and subdomain length. Extracted from the async state machine to reduce
@@ -707,9 +826,13 @@ async fn register_http_vhost(
             }
             let full_domain = format!("{}.{}", subdomain, sub_host);
             info!(full_domain = %full_domain, proxy_name = %np.proxy_name, "Subdomain route: {} → {}", full_domain, np.proxy_name);
-            if !domains.contains(&full_domain) {
-                domains.push(full_domain);
-            }
+            // Go frp v0.71.0 parity: buildDomains (proxy.go:218-229) does NO
+            // dedup — a subdomain expansion colliding with a custom_domains
+            // entry produces a duplicate domain, and the registration loop's
+            // repeated (domain, location, routeByHTTPUser) triple is then
+            // rejected as a router config conflict by VhostManager::register
+            // (Go: ErrRouterConfigConflict on the second Routers.Add).
+            domains.push(full_domain);
         }
     }
 
@@ -780,6 +903,7 @@ async fn register_http_vhost(
                         .register(
                             &np.proxy_name,
                             &domains,
+                            "http",
                             &locations,
                             run_id,
                             hhr,
@@ -839,6 +963,7 @@ async fn register_http_vhost(
         .register(
             &np.proxy_name,
             &domains,
+            "http",
             &locations,
             run_id,
             hhr,
@@ -910,9 +1035,11 @@ async fn register_https_vhost(
                 return false;
             }
             let full_domain = format!("{}.{}", subdomain, sub_host);
-            if !domains.contains(&full_domain) {
-                domains.push(full_domain);
-            }
+            // No dedup (Go buildDomains parity): a subdomain expansion
+            // colliding with a custom_domains entry is a duplicate domain,
+            // and VhostManager::register rejects the repeated
+            // (domain, "", routeByHTTPUser) SNI triple as a config conflict.
+            domains.push(full_domain);
         }
     }
 
@@ -966,12 +1093,23 @@ async fn register_https_vhost(
                         .register(
                             &np.proxy_name,
                             &domains,
+                            "https",
                             &[], // no locations for HTTPS SNI routing
                             run_id,
                             hhr,
                             http_user,
                             http_pwd,
-                            rubu,
+                            // Go parity: HTTPSProxyConfig is ProxyBaseConfig +
+                            // DomainConfig ONLY (pkg/config/v1/proxy.go) — Go's
+                            // HTTPSProxy never sets RouteByHTTPUser (https.go
+                            // listenForDomain builds an empty RouteConfig), so
+                            // the SNI route is always keyed by "" and the SNI
+                            // lookup (http_user "") can find it. Registering
+                            // under rubu instead would make the proxy silently
+                            // unreachable and let two HTTPS proxies on the same
+                            // domain with different rubu pass the conflict
+                            // check where Go rejects the second.
+                            "",
                             &headers,
                             group_name,
                         )
@@ -1025,12 +1163,21 @@ async fn register_https_vhost(
         .register(
             &np.proxy_name,
             &domains,
+            "https",
             &[], // no locations for HTTPS SNI routing
             run_id,
             hhr,
             http_user,
             http_pwd,
-            rubu,
+            // Go parity: HTTPSProxyConfig is ProxyBaseConfig + DomainConfig
+            // ONLY (pkg/config/v1/proxy.go) — Go's HTTPSProxy never sets
+            // RouteByHTTPUser (https.go listenForDomain builds an empty
+            // RouteConfig), so the SNI route is always keyed by "" and the
+            // SNI lookup (http_user "") can find it. Registering under rubu
+            // instead would make the proxy silently unreachable and let two
+            // HTTPS proxies on the same domain with different rubu pass the
+            // conflict check where Go rejects the second.
+            "",
             &headers,
             "",
         )
@@ -1069,9 +1216,14 @@ async fn register_https_vhost(
 /// Set up the per-proxy listener for a newly registered proxy: UDP/SuDP
 /// socket bind with work-conn requesters, TCP group shared listener, or
 /// per-proxy TCP listener. Returns the oneshot senders that must be fired
-/// after NewProxyResp is written (they gate ReqWorkConn on the response),
-/// or `Err(())` if the proxy was already rejected (bind failure) and the
-/// caller must abort. Extracted from `handle_new_proxy`'s state machine.
+/// after NewProxyResp is written (they gate ReqWorkConn on the response)
+/// plus the FINAL port, or `Err(())` if the proxy was already rejected
+/// (bind failure) and the caller must abort. The final port can differ
+/// from the requested `port` for TCP proxies: an auto-assigned port stolen
+/// by another process between the allocation probe and the bind triggers
+/// an internal re-allocation retry (`bind_tcp_proxy_with_retry`) — the
+/// caller's NewProxyResp / dashboard event must use the returned port.
+/// Extracted from `handle_new_proxy`'s state machine.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 async fn setup_proxy_listeners(
@@ -1087,12 +1239,15 @@ async fn setup_proxy_listeners(
     writer: &mut (impl AsyncWriteExt + Unpin),
     v2: bool,
     tcp_group_created: bool,
-) -> Result<Vec<oneshot::Sender<()>>, ()> {
+) -> Result<(Vec<oneshot::Sender<()>>, u16), ()> {
     let is_nat_hole =
         np.proxy_type == "stcp" || np.proxy_type == "xtcp" || np.proxy_type == "tcpmux";
     let pn = np.proxy_name.clone();
     let itx = itx.clone();
     let bind_addr = bind_addr.to_string();
+    // Mutable: the per-proxy TCP branch may re-allocate on an auto-assign
+    // bind race, moving the proxy to a fresh port.
+    let mut port = port;
 
     // Collect oneshot senders for UDP work-conn tasks so we can signal
     // them after NewProxyResp has been written (avoiding the race where
@@ -1324,26 +1479,15 @@ async fn setup_proxy_listeners(
         // failure (TOCTOU race with the allocation-time probe) must reject
         // the proxy instead of leaving a registered-but-dead proxy holding
         // the port (audit finding 4; mirrors the UDP bind rollback path).
-        let addr = format_socket_addr(&bind_addr, port);
-        let listener = match bind_proxy_listener(&bind_addr, port, &np.proxy_name).await {
+        let listener = match bind_tcp_proxy_with_retry(
+            state, np, run_id, control_id, &mut port, &bind_addr, writer, v2,
+        )
+        .await
+        {
             Ok(l) => l,
-            Err(e) => {
-                tracing::error!(port = %port, error = %e, "Failed to bind proxy port {}: {}", port, e);
-                rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
-                reject_new_proxy(
-                    writer,
-                    &np.proxy_name,
-                    err_msg(
-                        state.detailed_errors_to_client,
-                        format!("TCP bind failed: {e}"),
-                        "TCP bind failed",
-                    ),
-                    v2,
-                )
-                .await;
-                return Err(());
-            }
+            Err(()) => return Err(()),
         };
+        let addr = format_socket_addr(&bind_addr, port);
         info!(addr = %addr, proxy_name = %np.proxy_name, "Proxy listener started on {} for '{}'", addr, np.proxy_name);
         let tcp_keepalive = state.tcp_keepalive;
         let handle = tokio::spawn(async move {
@@ -1361,7 +1505,7 @@ async fn setup_proxy_listeners(
             port
         );
     }
-    Ok(udp_resp_signals)
+    Ok((udp_resp_signals, port))
 }
 
 /// Register a new proxy and start listening on its assigned port.
@@ -1564,101 +1708,27 @@ pub(crate) async fn handle_new_proxy(
         allocate_proxy_port(state, &np, consumes_port, is_udp_type, is_sudp, remote_port).await;
 
     match allocated_port {
-        Some(port) => {
-            let info = build_proxy_info(state, &np, run_id, control_id, port).await;
-
-            // Go frp compat: proxy.Run() calls startVisitorListener() BEFORE
-            // proxyManager.Add(). Insert sk_index before proxy_manager.register()
-            // so that STCP/XTCP visitors that arrive during the registration
-            // window can find the proxy via sk_index fallback.
-            let needs_sk_index = register_sk_index(state, &np);
-
-            // Supersession takeover: when the 10s handoff-barrier timeout
-            // fires, the superseding control may re-register a name the old
-            // control still holds. Port-consuming types (tcp/udp/sudp/
-            // stcp/xtcp/vnet) take over via register_or_replace — the
-            // replaced entry's port mark is freed below, exactly once
-            // (audit-fix: residual port-mark leak on barrier-timeout
-            // supersession). http/https/tcpmux keep the conflict-reject
-            // behavior: their vhost/tcpmux routes are owned by the old
-            // control's registration and cannot be taken over mid-flight
-            // (a replace-then-rollback would orphan the old routes).
-            let replaced = {
-                let replaceable = matches!(
-                    np.proxy_type.as_str(),
-                    "tcp" | "udp" | "sudp" | "stcp" | "xtcp" | "vnet"
-                );
-                let register_result = if replaceable {
-                    state
-                        .proxy_manager
-                        .register_or_replace(run_id.to_string(), info.clone())
-                        .await
-                } else {
-                    state
-                        .proxy_manager
-                        .register(run_id.to_string(), info.clone())
-                        .await
-                        .map(|_| None)
-                };
-                match register_result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // Cleanup sk_index on registration failure
-                        rollback_port_allocation(
-                            state,
-                            &np.proxy_name,
-                            port,
-                            is_udp_type,
-                            needs_sk_index,
-                        )
-                        .await;
-                        reject_new_proxy(
-                            writer,
-                            &np.proxy_name,
-                            err_msg(
-                                state.detailed_errors_to_client,
-                                e,
-                                "proxy registration conflict",
-                            ),
-                            v2,
-                        )
-                        .await;
-                        return false;
-                    }
-                }
-            };
-
-            // A replaced entry's per-client port count and port mark are
-            // released here: the old control's sweep will skip the name
-            // (newer control_id) and never decrement either.
-            if let Some(old) = replaced {
-                if (old.proxy_type == "tcp" || old.proxy_type == "udp" || old.proxy_type == "sudp")
-                    && old.remote_port.is_some_and(|p| p > 0)
-                {
-                    let mut port_counts = state.client_ports_used.write().await;
-                    if let Some(count) = port_counts.get_mut(run_id) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            port_counts.remove(run_id);
-                        }
-                    }
-                }
-                free_replaced_port(state, &old, port).await;
-            }
-
-            // Track port usage per client (matching Go frp's portsUsedNum).
-            // Only proxies that actually consume a port are counted:
-            // stcp/xtcp/http/https/tcpmux register with remote port 0 and
-            // would otherwise inflate the count the max_ports_per_client
-            // gate checks (audit finding 1).
-            if consumes_port && port > 0 {
-                state
-                    .client_ports_used
-                    .write()
-                    .await
-                    .entry(run_id.to_string())
-                    .and_modify(|c| *c += 1)
-                    .or_insert(1);
+        Some(mut port) => {
+            // Registration via the shared helper: the TCP auto-assign bind
+            // retry (`bind_tcp_proxy_with_retry`) re-enters it on a fresh
+            // port when the first bind lost the auto-assigned port to
+            // another process, so the ProxyInfo remote_port, used_ports
+            // mark and per-client count all move together.
+            if let Err(e) =
+                register_proxy_entry(state, &np, run_id, control_id, port, is_udp_type).await
+            {
+                reject_new_proxy(
+                    writer,
+                    &np.proxy_name,
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        e,
+                        "proxy registration conflict",
+                    ),
+                    v2,
+                )
+                .await;
+                return false;
             }
 
             #[cfg(feature = "vnet")]
@@ -1727,9 +1797,12 @@ pub(crate) async fn handle_new_proxy(
                         }
                         let full_domain = format!("{}.{}", subdomain, sub_host);
                         info!(full_domain = %full_domain, proxy_name = %np.proxy_name, "Subdomain route: {} → {}", full_domain, np.proxy_name);
-                        if !domains.contains(&full_domain) {
-                            domains.push(full_domain);
-                        }
+                        // No dedup (Go buildDomains parity): a subdomain
+                        // expansion colliding with a custom_domains entry is
+                        // a duplicate domain — rejected below by the
+                        // duplicate-domain gate (Go: the second Muxer.Listen
+                        // → Routers.Add hits exist() and rejects).
+                        domains.push(full_domain);
                     }
                 }
 
@@ -1744,6 +1817,44 @@ pub(crate) async fn handle_new_proxy(
                     )
                     .await;
                     state.proxy_manager.remove(&np.proxy_name).await;
+                    return false;
+                }
+                // Go buildDomains parity (server/proxy/proxy.go:218-229):
+                // empty custom_domains entries are SKIPPED (`if d != ""`),
+                // so custom_domains=["",""] yields zero domains and the
+                // proxy is ACCEPTED (Muxer.Listen never runs, listens
+                // nothing). Filter before the duplicate gate so ["",""]
+                // can't trip it; the register below with an empty list is a
+                // no-op. The len(customDomains)==0 gate above stays on the
+                // raw list (Go checks it before buildDomains).
+                let domains: Vec<String> = domains.into_iter().filter(|d| !d.is_empty()).collect();
+                // Go frp v0.71.0 parity (tcpmux.go httpConnectRun →
+                // httpConnectListen → Muxer.Listen → Routers.Add): buildDomains
+                // does no dedup, so a duplicate domain within one proxy's own
+                // list (duplicate custom_domains entry, subdomain expansion
+                // colliding with a custom_domains entry, or a case-only
+                // variant — Add lowercases before exist()) repeats the
+                // (domain, "", routeByHTTPUser) triple and the second Add
+                // REJECTS the whole registration. The tcpmux manager's
+                // per-(domain, routeByHTTPUser) HashMap insert is idempotent
+                // for same-proxy re-registration, so the reject happens here.
+                if let Some(dup) = duplicate_domain(&domains) {
+                    rollback_vhost_conflict(state, run_id, port, false).await;
+                    state.proxy_manager.remove(&np.proxy_name).await;
+                    reject_new_proxy(
+                        writer,
+                        &np.proxy_name,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            format!(
+                                "tcpmux proxy custom_domains contains duplicate domain '{}'",
+                                dup
+                            ),
+                            "tcpmux route config conflict",
+                        ),
+                        v2,
+                    )
+                    .await;
                     return false;
                 }
                 let http_user = np.http_user.as_deref().unwrap_or("");
@@ -1808,7 +1919,13 @@ pub(crate) async fn handle_new_proxy(
             )
             .await
             {
-                Ok(signals) => signals,
+                // The TCP auto-assign bind retry may have moved the proxy
+                // to a fresh port — everything below (log, dashboard event,
+                // NewProxyResp remote_addr) must use the final port.
+                Ok((signals, final_port)) => {
+                    port = final_port;
+                    signals
+                }
                 Err(()) => return false,
             };
 
@@ -1886,6 +2003,123 @@ async fn bind_proxy_listener(
     Err(std::io::Error::other(
         "proxy listener bind failed after retries",
     ))
+}
+
+/// Total bind attempts for a TCP proxy with an AUTO-ASSIGNED remote port
+/// (remote_port == 0) before the retry gives up: 1 initial + 7 re-allocations.
+/// The cross-instance port-steal race is rare; 8 fresh ports is far beyond
+/// any realistic collision window, and each attempt carries a bounded cost
+/// (`bind_proxy_listener` retries 3×100ms on EADDRINUSE).
+const TCP_AUTO_BIND_MAX_ATTEMPTS: u32 = 8;
+
+/// Bind the per-proxy TCP listener for `np` at `*port`, retrying with a
+/// freshly allocated port when the bind fails with EADDRINUSE on an
+/// AUTO-ASSIGNED port (remote_port == 0). On success `*port` holds the
+/// final (possibly re-allocated) port.
+///
+/// Why this exists: three-phase TCP allocation probes the OS OUTSIDE
+/// `used_ports`, so a second frps instance (or any other process) can bind
+/// the same candidate in the window between the probe and our own bind —
+/// the bind then fails with EADDRINUSE even though the port was
+/// "allocated". Two parallel frps instances on one host collide this way
+/// on every proxy they auto-assign. The retry rolls the failed
+/// registration back (`rollback_tcp_bind_failure`), clears the 24h
+/// reservation keyed by the proxy name (it would hand back the SAME stolen
+/// port on re-allocation), re-runs `allocate_proxy_port` with
+/// remote_port == 0, and re-registers via `register_proxy_entry` so the
+/// ProxyInfo `remote_port`, `used_ports` mark and per-client count all
+/// move to the fresh port together.
+///
+/// Explicit ports (remote_port > 0) keep the immediate reject-on-AddrInUse
+/// behavior (Go parity: Go's port manager is per-process and never faces
+/// this cross-instance race, and a requested-port conflict is a client
+/// config error — Go rejects it at registration). On exhaustion or a
+/// non-retryable error the failed registration is rolled back and the
+/// rejection response written; the caller aborts (`Err(())`).
+#[allow(clippy::too_many_arguments)]
+async fn bind_tcp_proxy_with_retry(
+    state: &Arc<AppState>,
+    np: &msg::NewProxy,
+    run_id: &str,
+    control_id: u64,
+    port: &mut u16,
+    bind_addr: &str,
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    v2: bool,
+) -> Result<TcpListener, ()> {
+    let auto_assign = np.remote_port.unwrap_or(0) == 0;
+    let mut attempts: u32 = 0;
+    loop {
+        match bind_proxy_listener(bind_addr, *port, &np.proxy_name).await {
+            Ok(l) => return Ok(l),
+            Err(e) => {
+                let retryable = auto_assign
+                    && e.kind() == std::io::ErrorKind::AddrInUse
+                    && attempts + 1 < TCP_AUTO_BIND_MAX_ATTEMPTS;
+                if !retryable {
+                    // Plain reject path (explicit-port conflicts, and
+                    // auto-assign exhaustion): roll the registration back
+                    // (port mark, per-client count, registry entry) and
+                    // reject — unchanged behavior.
+                    tracing::error!(port = %*port, error = %e, "Failed to bind proxy port {}: {}", *port, e);
+                    rollback_tcp_bind_failure(state, run_id, *port, &np.proxy_name).await;
+                    reject_new_proxy(
+                        writer,
+                        &np.proxy_name,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            format!("TCP bind failed: {e}"),
+                            "TCP bind failed",
+                        ),
+                        v2,
+                    )
+                    .await;
+                    return Err(());
+                }
+                attempts += 1;
+                // The port was stolen between the allocation probe and this
+                // bind (cross-instance collision). Roll the failed
+                // registration back, clear the 24h reservation (it would
+                // otherwise hand back the SAME stolen port), re-allocate,
+                // and re-register on the fresh port.
+                tracing::warn!(
+                    port = %*port,
+                    proxy_name = %np.proxy_name,
+                    attempt = attempts,
+                    error = %e,
+                    "Auto-assigned proxy port {} for '{}' was stolen between allocation and bind — re-allocating (attempt {}/{})",
+                    *port, np.proxy_name, attempts, TCP_AUTO_BIND_MAX_ATTEMPTS,
+                );
+                rollback_tcp_bind_failure(state, run_id, *port, &np.proxy_name).await;
+                state.port_reservations.write().await.remove(&np.proxy_name);
+                let Some(p) = allocate_proxy_port(state, np, true, false, false, 0).await else {
+                    tracing::warn!(
+                        proxy_name = %np.proxy_name,
+                        "No available port for proxy '{}' after auto-assign bind retry",
+                        np.proxy_name,
+                    );
+                    reject_new_proxy(writer, &np.proxy_name, "no available port".into(), v2).await;
+                    return Err(());
+                };
+                if let Err(e) = register_proxy_entry(state, np, run_id, control_id, p, false).await
+                {
+                    reject_new_proxy(
+                        writer,
+                        &np.proxy_name,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            e,
+                            "proxy registration conflict",
+                        ),
+                        v2,
+                    )
+                    .await;
+                    return Err(());
+                }
+                *port = p;
+            }
+        }
+    }
 }
 
 /// Accept loop for an already-bound proxy listener: forward incoming
@@ -3556,6 +3790,333 @@ pub(crate) mod unregister_generation_tests {
         );
     }
 
+    /// Go frp v0.71.0 parity (round 8): buildDomains does no dedup, so a
+    /// duplicate custom_domains entry repeats the (domain, "", rubu) triple
+    /// and Go's second Muxer.Listen → Routers.Add rejects the whole
+    /// registration. The tcpmux manager's HashMap insert is idempotent for
+    /// same-proxy re-registration, so proxy_ops must reject the duplicate
+    /// itself.
+    #[tokio::test]
+    async fn tcpmux_duplicate_domain_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("mux-dup", "tcpmux");
+        np.custom_domains = Some(vec![
+            "a.example.com".to_string(),
+            "a.example.com".to_string(),
+        ]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(!ok, "tcpmux proxy with a duplicate domain must be rejected");
+        assert!(
+            state.proxy_manager.get("mux-dup").await.is_none(),
+            "rejected tcpmux proxy must be rolled back"
+        );
+        assert!(
+            String::from_utf8_lossy(&writer).contains("duplicate domain"),
+            "rejection response must surface the duplicate domain"
+        );
+        assert!(
+            state
+                .tcpmux_manager
+                .lookup("a.example.com", "")
+                .await
+                .is_none(),
+            "no route may be left behind by the rejected registration"
+        );
+    }
+
+    /// Go parity: the same duplicate-domain rejection on the tcpmux path
+    /// for CASE-ONLY duplicates (Routers.Add lowercases before exist()).
+    /// (A subdomain-expansion collision with a custom_domains entry is
+    /// pre-empted by validateDomainConfigForServer — a custom domain under
+    /// subDomainHost is rejected before buildDomains runs — so the
+    /// reachable duplicate is a repeated custom_domains entry.)
+    #[tokio::test]
+    async fn tcpmux_case_variant_duplicate_domain_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("mux-case", "tcpmux");
+        np.custom_domains = Some(vec![
+            "a.example.net".to_string(),
+            "A.EXAMPLE.NET".to_string(),
+        ]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(!ok, "case-variant duplicate tcpmux domain must be rejected");
+        assert!(state.proxy_manager.get("mux-case").await.is_none());
+        assert!(
+            String::from_utf8_lossy(&writer).contains("duplicate domain"),
+            "rejection must name the duplicated domain: {}",
+            String::from_utf8_lossy(&writer)
+        );
+    }
+
+    /// Go parity (round 8): duplicate custom_domains entries flow through
+    /// to VhostManager::register, whose same-call duplicate detection
+    /// rejects the repeated (domain, location, routeByHTTPUser) triple —
+    /// previously the duplicate silently double-registered the vhost route.
+    /// (subdomain-expansion collisions are pre-empted by
+    /// validateDomainConfigForServer, Go validation/proxy.go:81-99.)
+    #[tokio::test]
+    async fn http_duplicate_custom_domains_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("http-dup", "http");
+        np.custom_domains = Some(vec![
+            "a.example.net".to_string(),
+            "a.example.net".to_string(),
+        ]);
+        np.locations = Some(vec!["/".to_string()]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(
+            !ok,
+            "http proxy with duplicate custom_domains must be rejected"
+        );
+        assert!(state.proxy_manager.get("http-dup").await.is_none());
+        assert!(
+            String::from_utf8_lossy(&writer).contains("conflict"),
+            "rejection response must surface the router config conflict"
+        );
+        assert!(
+            state
+                .vhost_manager
+                .lookup("a.example.net", "/", "", "http")
+                .await
+                .is_none(),
+            "no vhost route may be left behind by the rejected registration"
+        );
+    }
+
+    /// Go parity: the same duplicate-custom_domains rejection on the HTTPS
+    /// (SNI, empty locations) path — VhostManager::register treats an empty
+    /// location list as the single location "" (Go https.go listenForDomain
+    /// → Add(domain, "")).
+    #[tokio::test]
+    async fn https_duplicate_custom_domains_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("https-dup", "https");
+        np.custom_domains = Some(vec![
+            "a.example.net".to_string(),
+            "a.example.net".to_string(),
+        ]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(
+            !ok,
+            "https proxy with duplicate custom_domains must be rejected"
+        );
+        assert!(state.proxy_manager.get("https-dup").await.is_none());
+        assert!(
+            String::from_utf8_lossy(&writer).contains("conflict"),
+            "rejection response must surface the router config conflict"
+        );
+        assert!(
+            state
+                .vhost_manager
+                .lookup("a.example.net", "", "", "https")
+                .await
+                .is_none(),
+            "no SNI route may be left behind by the rejected registration"
+        );
+    }
+
+    /// Regression (round-12 MEDIUM): Go's HTTPSProxyConfig is ProxyBaseConfig
+    /// + DomainConfig ONLY (pkg/config/v1/proxy.go) — HTTPS proxies never
+    /// carry route_by_http_user, so the SNI route must be registered under
+    /// the "" (empty httpUser) key, which is exactly what the SNI lookup
+    /// (http_user "") probes. Pre-fix the register call passed the proxy's
+    /// route_by_http_user through, storing the route under the rubu key and
+    /// making the proxy silently unreachable via SNI.
+    #[tokio::test]
+    async fn https_rubu_proxy_registered_under_empty_key() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("https-rubu", "https");
+        np.custom_domains = Some(vec!["rubu.example.net".to_string()]);
+        np.route_by_http_user = Some("app".to_string());
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "https proxy with route_by_http_user must register");
+        // The SNI lookup (http_user "") must find the route — pre-fix it
+        // was stored under "app" and this lookup missed.
+        let route = state
+            .vhost_manager
+            .lookup("rubu.example.net", "", "", "https")
+            .await
+            .unwrap_or_else(|| panic!("SNI lookup must find the https proxy"));
+        assert_eq!(route.proxy_name.as_ref(), "https-rubu");
+    }
+
+    /// Regression (round-12 MEDIUM): with route_by_http_user no longer
+    /// affecting HTTPS registration, two HTTPS proxies on the same domain
+    /// with DIFFERENT rubu values now collide on the shared (domain, "")
+    /// SNI triple and the second is rejected — matching Go, where
+    /// HTTPSProxyConfig has no RouteByHTTPUser and the HTTPS Muxer's
+    /// Routers.Add rejects the duplicate domain outright. Pre-fix the
+    /// different rubu keys let both through, with the first silently winning.
+    #[tokio::test]
+    async fn https_same_domain_different_rubu_second_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np1 = new_proxy("https-a", "https");
+        np1.custom_domains = Some(vec!["dup-rubu.example.net".to_string()]);
+        np1.route_by_http_user = Some("a".to_string());
+        let mut writer1 = Vec::new();
+        let ok = handle_new_proxy(
+            np1,
+            "run-1",
+            1,
+            &state,
+            &mut writer1,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "first https proxy must register");
+        assert!(state.proxy_manager.get("https-a").await.is_some());
+
+        let mut np2 = new_proxy("https-b", "https");
+        np2.custom_domains = Some(vec!["dup-rubu.example.net".to_string()]);
+        np2.route_by_http_user = Some("b".to_string());
+        let mut writer2 = Vec::new();
+        let ok = handle_new_proxy(
+            np2,
+            "run-1",
+            1,
+            &state,
+            &mut writer2,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(
+            !ok,
+            "second https proxy on the same domain (different rubu) must be rejected"
+        );
+        assert!(state.proxy_manager.get("https-b").await.is_none());
+        assert!(
+            String::from_utf8_lossy(&writer2).contains("conflict"),
+            "rejection response must surface the router config conflict"
+        );
+        // The first proxy's SNI route survives.
+        let route = state
+            .vhost_manager
+            .lookup("dup-rubu.example.net", "", "", "https")
+            .await
+            .unwrap_or_else(|| panic!("first https proxy's SNI route must survive"));
+        assert_eq!(route.proxy_name.as_ref(), "https-a");
+    }
+
     /// Go validateDomainConfigForServer rejects a subdomain when
     /// SubDomainHost is unset ("subdomain is not supported because this
     /// feature is not enabled in server") — unlike the HTTP path (which
@@ -4767,5 +5328,274 @@ mod subdomain_conflict_tests {
     fn wildcard_unrelated_host_allowed() {
         let np = np_with_domains(vec!["*.other.net"], None);
         assert!(validate_new_proxy(&np, "example.com").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tcp_auto_bind_retry_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Minimal AsyncWrite capture for tests: every written byte lands in a
+    /// shared buffer for post-hoc assertions on the NewProxyResp payload.
+    #[derive(Default)]
+    struct CaptureWriter {
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl tokio::io::AsyncWrite for CaptureWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.buf.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn auto_assign_tcp_np(proxy_name: &str) -> msg::NewProxy {
+        msg::NewProxy {
+            proxy_name: proxy_name.to_string(),
+            proxy_type: "tcp".to_string(),
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: None,
+            local_str: None,
+            remote_port: None,
+            sk: None,
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: None,
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        }
+    }
+
+    /// The auto-assign bind race, proven end-to-end with real sockets:
+    ///
+    /// 1. Hold `used_ports` READ — the allocator's OS probe runs OUTSIDE
+    ///    any lock, so the registration task probes the first candidate
+    ///    (port `stolen`, free at that moment) and then parks on the
+    ///    commit WRITE lock.
+    /// 2. Bind `stolen` ourselves — the thief — exactly in the window
+    ///    between probe and bind that a second frps instance would hit.
+    /// 3. Drop the READ guard: allocation commits the probed port,
+    ///    registration runs, and the bind fails EADDRINUSE.
+    /// 4. The retry must roll the registration back, clear the 24h
+    ///    reservation, re-allocate a FRESH port, re-register, and accept —
+    ///    with the NewProxyResp carrying the fresh port.
+    #[tokio::test]
+    async fn auto_assign_bind_steal_retries_with_fresh_port() {
+        let state = super::unregister_generation_tests::test_state();
+        // A controlled range makes the first candidate deterministic.
+        {
+            let mut reloadable = state.reloadable.write().unwrap();
+            reloadable.allow_ports = Arc::new(vec![frp_core::config::PortsRange {
+                start: 61000,
+                end: 61099,
+                single: 0,
+            }]);
+        }
+        // First candidate = first bindable port in the range.
+        let stolen = (61000u16..61100)
+            .find(|p| crate::proxy::is_tcp_port_bindable("127.0.0.1", *p))
+            .expect("test range 61000-61099 must contain a free port");
+        // Seed the 24h reservation: a re-registration within 24h of a close
+        // would otherwise hand the SAME stolen port back on re-allocation.
+        state
+            .port_reservations
+            .write()
+            .await
+            .insert("p1".to_string(), (stolen, false, Instant::now()));
+
+        let np = auto_assign_tcp_np("p1");
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut writer = CaptureWriter { buf: buf.clone() };
+        let (itx, _irx) = tokio::sync::mpsc::channel(8);
+        let mut listener_handles = std::collections::HashMap::new();
+        let mut udp_sockets = std::collections::HashMap::new();
+
+        // The seam: hold the used_ports READ lock. The allocator's commit
+        // needs the WRITE lock, so the registration task parks there AFTER
+        // probing `stolen` (free) — the thief then binds it in the
+        // probe→bind window.
+        let guard = state.used_ports.read().await;
+        let st = state.clone();
+        let np2 = np.clone();
+        let task = tokio::spawn(async move {
+            handle_new_proxy(
+                np2,
+                "run1",
+                1,
+                &st,
+                &mut writer,
+                &itx,
+                &mut listener_handles,
+                &mut udp_sockets,
+                false,
+            )
+            .await
+        });
+        // Run the registration task to its first suspension (the commit
+        // WRITE lock — it cannot proceed while the READ guard is held, and
+        // nothing before the commit is contended).
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let thief = std::net::TcpListener::bind(("127.0.0.1", stolen)).expect("thief bind");
+        drop(guard);
+
+        let accepted = task.await.expect("registration task must not panic");
+        assert!(
+            accepted,
+            "auto-assign TCP proxy must be accepted after the steal retry"
+        );
+        drop(thief);
+
+        // NewProxyResp must carry the FRESH port, never the stolen one.
+        let resp = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            !resp.contains(&format!(":{stolen}")),
+            "resp must not carry the stolen port {stolen}: {resp}"
+        );
+        // Registry entry holds the final port; every structure agrees.
+        let info = state
+            .proxy_manager
+            .get("p1")
+            .await
+            .expect("proxy must be registered after the retry");
+        let final_port = info
+            .remote_port
+            .expect("TCP proxy must hold a port after the retry");
+        assert_ne!(
+            final_port, stolen,
+            "the fresh port must differ from the stolen one"
+        );
+        assert!(
+            resp.contains(&format!(":{final_port}")),
+            "resp must carry the re-allocated port {final_port}: {resp}"
+        );
+        let used = state.used_ports.read().await;
+        assert!(
+            used.contains(&final_port),
+            "used_ports must hold the fresh port"
+        );
+        assert!(
+            !used.contains(&stolen),
+            "used_ports must release the stolen port"
+        );
+        drop(used);
+        assert!(
+            !state.port_reservations.read().await.contains_key("p1"),
+            "the 24h reservation for 'p1' must be cleared by the retry"
+        );
+        assert_eq!(info.remote_port, Some(final_port));
+    }
+
+    /// The Go-parity guard: an EXPLICIT remote_port bind conflict must keep
+    /// the immediate reject — no re-allocation, no "silently different
+    /// port" response to a client that asked for a specific port. Uses the
+    /// same probe→bind seam as the auto-assign test so the conflict lands
+    /// on the bind itself (a thief binding BEFORE allocation is caught by
+    /// the OS probe, which is also a reject — the stronger case is the
+    /// bind-time steal, which must NOT trigger the retry for explicit
+    /// ports).
+    #[tokio::test]
+    async fn explicit_port_bind_steal_rejects_immediately() {
+        let state = super::unregister_generation_tests::test_state();
+        {
+            let mut reloadable = state.reloadable.write().unwrap();
+            reloadable.allow_ports = Arc::new(vec![frp_core::config::PortsRange {
+                start: 61100,
+                end: 61199,
+                single: 0,
+            }]);
+        }
+        let requested = (61100u16..61200)
+            .find(|p| crate::proxy::is_tcp_port_bindable("127.0.0.1", *p))
+            .expect("test range 61100-61199 must contain a free port");
+
+        let mut np = auto_assign_tcp_np("p2");
+        np.remote_port = Some(requested as i32);
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut writer = CaptureWriter { buf: buf.clone() };
+        let (itx, _irx) = tokio::sync::mpsc::channel(8);
+        let mut listener_handles = std::collections::HashMap::new();
+        let mut udp_sockets = std::collections::HashMap::new();
+
+        let guard = state.used_ports.read().await;
+        let st = state.clone();
+        let np2 = np.clone();
+        let task = tokio::spawn(async move {
+            handle_new_proxy(
+                np2,
+                "run1",
+                1,
+                &st,
+                &mut writer,
+                &itx,
+                &mut listener_handles,
+                &mut udp_sockets,
+                false,
+            )
+            .await
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let thief = std::net::TcpListener::bind(("127.0.0.1", requested)).expect("thief bind");
+        drop(guard);
+
+        let accepted = task.await.expect("registration task must not panic");
+        drop(thief);
+
+        assert!(
+            !accepted,
+            "explicit-port bind conflict must reject immediately (Go parity)"
+        );
+        let resp = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            resp.contains("TCP bind failed"),
+            "rejection must carry the TCP bind failure: {resp}"
+        );
+        assert!(
+            state.proxy_manager.get("p2").await.is_none(),
+            "a rejected explicit-port proxy must not be registered"
+        );
+        let used = state.used_ports.read().await;
+        assert!(
+            !used.contains(&requested),
+            "the conflicted port must be released"
+        );
     }
 }

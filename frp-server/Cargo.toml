@@ -60,6 +60,14 @@ mem-profile = ["frp-core/mem-profile"]
 profiling = ["frp-core/profiling"]
 
 [dev-dependencies]
+# 跨 crate in-process e2e（KCP/mux/QUIC 传输组合本地回归）: transport_e2e_kcp.rs /
+# transport_e2e_quic.rs spawn an in-process frpc (frp_client::service::Service)
+# against the in-process frps (frp_server::service::Service). Test-only, never
+# compiled into frps. frp-client already dev-depends on frp-server for its own
+# harness; cargo permits the mutual dev-dependency cycle because dev-deps
+# never participate in the normal build graph. (No workspace entry exists for
+# frp-client — path form required.)
+frp-client = { path = "../frp-client" }
 # test-util enables `#[tokio::test(start_paused = true)]` + time::pause for
 # the audit deadline tests (write_ctl_msg / send_login_error timeouts) —
 # same pattern as frp-core's dev-dependencies; never compiled into

@@ -110,3 +110,104 @@ pub(crate) fn fast_backoff_delay(
     let ms = (duration.as_millis() as f64 * jitter) as u64;
     Duration::from_millis(ms.min(20_000))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 60s sliding window: entries older than the cutoff are dropped, the
+    /// boundary entry (age just under 60s) is retained. The `>= cutoff`
+    /// comparison is inclusive, so an entry exactly 60s old would survive;
+    /// 59.9s is used here because Instant::now() advances between vec
+    /// construction and prune — a literal "exactly 60s" entry would be
+    /// marginally OLDER than the cutoff by the time prune runs and would
+    /// spuriously fail.
+    #[test]
+    fn prune_fast_retry_count_keeps_only_60s_window() {
+        let now = Instant::now();
+        let mut ts = vec![
+            now - Duration::from_secs(59),
+            now - Duration::from_millis(59_900), // boundary: age < 60s → retained
+            now - Duration::from_secs(61),
+            now - Duration::from_secs(300),
+        ];
+        assert_eq!(prune_fast_retry_count(&mut ts), 2);
+        assert_eq!(ts.len(), 2);
+    }
+
+    /// All-expired window: returns 0 and empties the vec.
+    #[test]
+    fn prune_fast_retry_count_all_expired_empties_vec() {
+        let now = Instant::now();
+        let mut ts = vec![
+            now - Duration::from_secs(60) - Duration::from_millis(10),
+            now - Duration::from_secs(120),
+        ];
+        assert_eq!(prune_fast_retry_count(&mut ts), 0);
+        assert!(ts.is_empty());
+    }
+
+    /// Phase 1 (window count <= 3): 200ms base × full jitter (0.5..=1.5)
+    /// → 100-300ms. The 4th retry flips to phase 2: anchored to the previous
+    /// ACTUAL (jittered) delay ×2 with ±10% jitter (Go wait.FastBackoffImpl
+    /// Backoff()). All timestamps are pushed "now", so all 4 land inside the
+    /// 60s window with no sleeps.
+    #[test]
+    fn reconnect_delay_phase1_to_phase2_transition() {
+        let mut err_count: u32 = 0;
+        let mut timestamps = Vec::new();
+        let mut prev = Duration::ZERO;
+
+        for _ in 0..3 {
+            let d = reconnect_delay_after_session(&mut err_count, &mut timestamps, prev);
+            assert!(
+                (100..=300).contains(&d.as_millis()),
+                "phase-1 delay {}ms outside 100-300ms",
+                d.as_millis()
+            );
+            prev = d;
+        }
+        assert_eq!(err_count, 3);
+        assert_eq!(timestamps.len(), 3);
+
+        let d = reconnect_delay_after_session(&mut err_count, &mut timestamps, prev);
+        // prev ×2 × jitter(0.9..=1.1); ±1ms slack absorbs u64 truncation
+        // and f64 rounding of the jitter product (prev <= 300ms, so the
+        // slack is far wider than any float error — never flaky).
+        let prev_ms = prev.as_millis() as f64;
+        let lo = prev_ms * 2.0 * 0.9 - 1.0;
+        let hi = prev_ms * 2.0 * 1.1 + 1.0;
+        let ms = d.as_millis() as f64;
+        assert!(
+            ms >= lo && ms <= hi,
+            "phase-2 delay {}ms outside [{},{}] (previous {}ms)",
+            ms,
+            lo,
+            hi,
+            prev_ms
+        );
+        assert_eq!(err_count, 4);
+        assert_eq!(timestamps.len(), 4);
+    }
+
+    /// Phase-2 anchoring: consecutive_err_count == 1 (or a zero previous
+    /// delay) takes the 1s InitDurationIfFail base → 2s ±10% jitter.
+    #[test]
+    fn fast_backoff_delay_phase2_anchors_to_one_second() {
+        let d = fast_backoff_delay(1, 4, Duration::ZERO);
+        assert!(
+            (1800..=2200).contains(&d.as_millis()),
+            "delay {}ms outside 1800-2200ms",
+            d.as_millis()
+        );
+    }
+
+    /// Phase-2 20s cap: a previous delay already at the cap doubles to 40s
+    /// and, jittered (0.9-1.1), can never drop below 36s — min(…, 20_000)
+    /// pins every sample to exactly 20s.
+    #[test]
+    fn fast_backoff_delay_phase2_caps_at_20s() {
+        let d = fast_backoff_delay(5, 4, Duration::from_secs(20));
+        assert_eq!(d, Duration::from_secs(20));
+    }
+}

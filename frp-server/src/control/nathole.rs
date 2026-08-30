@@ -952,6 +952,15 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
 /// re-advertising (clients carry run_id over reconnects, Go frp `previousRunID`)
 /// is a normal update and always proceeds.
 #[cfg(feature = "vnet")]
+/// Per-run_id cap on accepted vnet route advertisements (round 10 HIGH).
+/// Without a cap, an authenticated client can grow `vnet_routes` unboundedly
+/// and each advertisement is broadcast to every peer in the net — every peer
+/// with a local TUN then runs an `ip route add` subprocess for the fake
+/// subnet (K advertisements × M peers = K×M fork/execs and attacker-chosen
+/// subnets injected into peers' kernel routing tables).
+const MAX_VNET_ROUTES_PER_CLIENT: usize = 64;
+
+#[cfg(feature = "vnet")]
 pub(crate) async fn handle_vnet_route_advertise(
     ctx: &ControlContext,
     _ctl: &mut ControlState,
@@ -959,9 +968,87 @@ pub(crate) async fn handle_vnet_route_advertise(
     adv: msg::VnetRouteAdvertise,
 ) {
     let vn = adv.virtual_net.clone().unwrap_or_default();
+    // Membership guard (round 10 HIGH): the advertiser must hold a vnet
+    // proxy registered in `vn`. `control_txs_in_vnet` derives broadcast
+    // membership from `vnet_routes`, so without this check any
+    // authenticated control can advertise subnets for a virtual net it
+    // does not belong to, reaching that net's real peers.
+    //
+    // Empty-net normalization (HIGH fix): the server stores an empty
+    // virtual_net as None (proxy_ops.rs NewProxy), while the wire default
+    // is "" — compare through `unwrap_or("")` so default-net proxies match
+    // default-net advertisements. The old `as_deref() == Some(vn.as_str())`
+    // made None == Some("") always false and refused every default-net
+    // advertise.
+    //
+    // Default-net visitor path: a client whose only membership is a
+    // `virtual_net` visitor registers no proxy of its own (its tunnel
+    // targets a peer's provider proxy), and frpc sends every virtual_net
+    // visitor's host-route advertisement with virtual_net: None
+    // (frp-client vnet.rs). The server cannot observe visitors —
+    // NewVisitorConn carries no plugin-type field and there is no
+    // per-control visitor registry — so a default-net advertisement of a
+    // HOST ROUTE (/32 or /128, the visitor's destinationIP shape) is
+    // admitted without a proxy, as long as the advertiser holds no
+    // named-net vnet proxy (a named-net member must not inject
+    // default-net routes). Wide-subnet default-net ads still require a
+    // default-net vnet proxy; the per-client 64-route cap bounds the
+    // round-10 fork/exec blast radius in every net.
+    //
+    // DESIGN PREMISE (tighten in sync): the proxy-less host-route
+    // admission above is justified ONLY by the server's inability to
+    // observe visitors — NewVisitorConn carries no plugin-type field, so
+    // a visitor-only client is indistinguishable from a bare control.
+    // Future code that adds a per-control visitor registry MUST tighten
+    // this logic in the same change: host-route admission must then also
+    // require the advertiser to hold an actual visitor (or vnet proxy) in
+    // the default net, or the round-14 HIGH guard relaxes back into an
+    // injection hole.
+    let (owns_vnet_proxy, owns_named_net_proxy) = {
+        let proxies = ctx.state.proxy_manager.list_client(&ctx.run_id).await;
+        (
+            proxies
+                .iter()
+                .any(|p| p.proxy_type == "vnet" && p.virtual_net.as_deref().unwrap_or("") == vn),
+            proxies.iter().any(|p| {
+                p.proxy_type == "vnet" && !p.virtual_net.as_deref().unwrap_or("").is_empty()
+            }),
+        )
+    };
+    let is_host_route = adv.subnet.ends_with("/32") || adv.subnet.ends_with("/128");
+    let membership_ok =
+        owns_vnet_proxy || (vn.is_empty() && !owns_named_net_proxy && is_host_route);
+    if !membership_ok {
+        warn!(
+            run_id = %ctx.run_id,
+            virtual_net = %vn,
+            subnet = %adv.subnet,
+            proxy_name = %adv.proxy_name,
+            "vnet route advertise refused: run_id holds no membership in virtual_net '{vn}'"
+        );
+        return;
+    }
     let key = (vn.clone(), adv.subnet.clone());
     {
         let mut routes = ctx.state.vnet_routes.write().await;
+        // Route-count cap: reject new keys once this client owns the cap.
+        // Re-advertising an already-owned key stays allowed (normal update).
+        if !routes.contains_key(&key) {
+            let owned = routes
+                .iter()
+                .filter(|(_, (rid, _))| rid == &ctx.run_id)
+                .count();
+            if owned >= MAX_VNET_ROUTES_PER_CLIENT {
+                warn!(
+                    run_id = %ctx.run_id,
+                    virtual_net = %vn,
+                    subnet = %adv.subnet,
+                    owned,
+                    "vnet route advertise refused: per-client route cap ({MAX_VNET_ROUTES_PER_CLIENT}) reached"
+                );
+                return;
+            }
+        }
         if let Some((owner_run_id, owner_proxy)) = routes.get(&key) {
             if owner_run_id != &ctx.run_id {
                 // Liveness check: a route is only "owned" while its owner's
@@ -1399,6 +1486,48 @@ mod vnet_route_tests {
         (ctx, ctl)
     }
 
+    /// Register a vnet proxy for `run_id` in `vnet` (`None` = the default
+    /// net — the server stores an empty virtual_net as None, proxy_ops.rs
+    /// NewProxy normalization). The round-10 membership guard requires the
+    /// advertiser to hold one before any route advertise.
+    async fn register_vnet_proxy(
+        state: &Arc<AppState>,
+        run_id: &str,
+        name: &str,
+        vnet: Option<&str>,
+    ) {
+        let info = crate::proxy::ProxyInfo {
+            name: name.to_string(),
+            proxy_type: "vnet".into(),
+            run_id: run_id.to_string(),
+            control_id: 1,
+            remote_port: None,
+            sk: None,
+            group: None,
+            group_key: None,
+            local_addr: None,
+            use_encryption: false,
+            use_compression: false,
+            virtual_net: vnet.map(|v| v.to_string()),
+            allow_users: Vec::new(),
+            proxy_protocol_version: String::new(),
+            udp_packet_codec: String::new(),
+            response_headers: std::collections::HashMap::new(),
+            custom_domains: Vec::new(),
+            route_by_http_user: String::new(),
+            multiplexer: String::new(),
+            bandwidth_limit: String::new(),
+            bandwidth_limit_mode: String::new(),
+            user: String::new(),
+            user_conn_sem: None,
+        };
+        state
+            .proxy_manager
+            .register(run_id.to_string(), info)
+            .await
+            .unwrap();
+    }
+
     fn assert_advertise_eq(actual: &msg::VnetRouteAdvertise, expected: &msg::VnetRouteAdvertise) {
         assert_eq!(actual.proxy_name, expected.proxy_name);
         assert_eq!(actual.subnet, expected.subnet);
@@ -1415,6 +1544,7 @@ mod vnet_route_tests {
         let state = test_state();
         let mut sender_rx = insert_control(&state, "run-a").await;
         let mut peer_rx = insert_control(&state, "run-b").await;
+        register_vnet_proxy(&state, "run-a", "vnet-visitor", Some("vnet-a")).await;
         let (ctx, mut ctl) = test_context(&state, "run-a");
         let adv = msg::VnetRouteAdvertise {
             proxy_name: "vnet-visitor".to_string(),
@@ -1465,6 +1595,7 @@ mod vnet_route_tests {
                 ("run-a".to_string(), "owner-proxy".to_string()),
             );
         }
+        register_vnet_proxy(&state, "run-b", "hijack-proxy", Some("vnet-a")).await;
         let (ctx, mut ctl) = test_context(&state, "run-b");
         let adv = msg::VnetRouteAdvertise {
             proxy_name: "hijack-proxy".to_string(),
@@ -1507,6 +1638,7 @@ mod vnet_route_tests {
                 ("run-c".to_string(), "peer-c".to_string()),
             );
         }
+        register_vnet_proxy(&state, "run-b", "new-owner", Some("vnet-a")).await;
         let (ctx, mut ctl) = test_context(&state, "run-b");
         let adv = msg::VnetRouteAdvertise {
             proxy_name: "new-owner".to_string(),
@@ -1537,6 +1669,7 @@ mod vnet_route_tests {
     #[tokio::test]
     async fn advertise_from_same_run_id_updates_route() {
         let state = test_state();
+        register_vnet_proxy(&state, "run-a", "vnet-visitor", Some("vnet-a")).await;
         let (ctx, mut ctl) = test_context(&state, "run-a");
         let adv1 = msg::VnetRouteAdvertise {
             proxy_name: "vnet-visitor".to_string(),
@@ -1558,6 +1691,257 @@ mod vnet_route_tests {
             routes.get(&("vnet-a".to_string(), "10.0.0.0/24".to_string())),
             Some(&("run-a".to_string(), "vnet-visitor-v2".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn advertise_without_vnet_proxy_is_refused() {
+        // Round 10 (HIGH): the membership guard — a control that holds no
+        // vnet proxy in the advertised virtual net cannot inject routes.
+        let state = test_state();
+        let mut peer_rx = insert_control(&state, "run-b").await;
+        // run-b holds a vnet-a route (so it would receive any broadcast).
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-b".to_string(), "peer-b".to_string()),
+            );
+        }
+        // run-a registers a vnet proxy in a DIFFERENT virtual net.
+        register_vnet_proxy(&state, "run-a", "other-net-proxy", Some("vnet-b")).await;
+        let (ctx, mut ctl) = test_context(&state, "run-a");
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "other-net-proxy".to_string(),
+            subnet: "2001:db8::1/128".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv).await;
+
+        let routes = state.vnet_routes.read().await;
+        assert!(
+            !routes.contains_key(&("vnet-a".to_string(), "2001:db8::1/128".to_string())),
+            "advertise from a run_id without a vnet-a proxy must not register"
+        );
+        drop(routes);
+        assert!(
+            peer_rx.try_recv().is_err(),
+            "refused advertise must not be broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn advertise_in_default_net_with_default_net_proxy_is_accepted_and_broadcast() {
+        // HIGH fix: the server stores an empty virtual_net as None
+        // (proxy_ops.rs NewProxy) while the wire default is "" — the old
+        // `as_deref() == Some("")` guard comparison refused every
+        // default-net advertisement. A default-net (virtual_net: None)
+        // proxy must satisfy the default-net membership check.
+        let state = test_state();
+        let mut peer_rx = insert_control(&state, "run-b").await;
+        register_vnet_proxy(&state, "run-a", "vnet-proxy", None).await;
+        let (ctx, mut ctl) = test_context(&state, "run-a");
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "vnet-proxy".to_string(),
+            subnet: "10.0.0.1/32".to_string(),
+            virtual_net: None,
+        };
+
+        // Pre-seed run-b with a default-net route so the broadcast filter
+        // (which only forwards to controls that have a route in the same
+        // virtual net — the empty default-net key "") considers run-b a
+        // peer; otherwise peer_rx would block forever.
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                (String::new(), "10.0.0.0/24".to_string()),
+                ("run-b".to_string(), "peer-b".to_string()),
+            );
+        }
+
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv.clone())
+            .await;
+
+        let routes = state.vnet_routes.read().await;
+        assert_eq!(
+            routes.get(&(String::new(), "10.0.0.1/32".to_string())),
+            Some(&("run-a".to_string(), "vnet-proxy".to_string()))
+        );
+        drop(routes);
+
+        match tokio::time::timeout(Duration::from_secs(5), peer_rx.recv()).await {
+            Ok(Some(InternalMsg::VnetRouteAdvertiseForward { msg })) => {
+                assert_advertise_eq(&msg, &adv);
+            }
+            other => panic!("expected forwarded advertise, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn advertise_in_default_net_with_named_net_proxy_is_refused() {
+        // Default-net membership is not implied by a vnet proxy in a
+        // NAMED net: a vnet-b holder cannot inject default-net routes
+        // (host routes included) without a default-net proxy.
+        let state = test_state();
+        let mut peer_rx = insert_control(&state, "run-b").await;
+        // run-b holds a default-net route (so it would receive any broadcast).
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                (String::new(), "10.0.0.0/24".to_string()),
+                ("run-b".to_string(), "peer-b".to_string()),
+            );
+        }
+        // run-a registers a vnet proxy in a NAMED virtual net.
+        register_vnet_proxy(&state, "run-a", "named-net-proxy", Some("vnet-b")).await;
+        let (ctx, mut ctl) = test_context(&state, "run-a");
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "named-net-proxy".to_string(),
+            subnet: "10.0.0.9/32".to_string(),
+            virtual_net: None,
+        };
+
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv).await;
+
+        let routes = state.vnet_routes.read().await;
+        assert!(
+            !routes.contains_key(&(String::new(), "10.0.0.9/32".to_string())),
+            "advertise from a run_id holding only a named-net proxy must not register in the default net"
+        );
+        drop(routes);
+        assert!(
+            peer_rx.try_recv().is_err(),
+            "refused advertise must not be broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn advertise_in_default_net_without_proxy_is_accepted_and_broadcast() {
+        // A client whose only membership is a `virtual_net` visitor
+        // registers no proxy of its own (its tunnel targets a peer's
+        // provider proxy), and frpc sends the visitor's destinationIP
+        // host-route ad with virtual_net: None (frp-client vnet.rs). The
+        // default-net host-route path admits it — the server cannot
+        // observe visitors (NewVisitorConn has no plugin-type field), so
+        // the proxy check alone would refuse every visitor advertise.
+        let state = test_state();
+        let mut peer_rx = insert_control(&state, "run-b").await;
+        // run-a registers NO proxy — visitor-only membership.
+        let (ctx, mut ctl) = test_context(&state, "run-a");
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "vnet-visitor".to_string(),
+            subnet: "100.86.0.1/32".to_string(),
+            virtual_net: None,
+        };
+        // Pre-seed run-b with a default-net route (broadcast filter peer).
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                (String::new(), "10.0.0.0/24".to_string()),
+                ("run-b".to_string(), "peer-b".to_string()),
+            );
+        }
+
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv.clone())
+            .await;
+
+        let routes = state.vnet_routes.read().await;
+        assert_eq!(
+            routes.get(&(String::new(), "100.86.0.1/32".to_string())),
+            Some(&("run-a".to_string(), "vnet-visitor".to_string()))
+        );
+        drop(routes);
+
+        match tokio::time::timeout(Duration::from_secs(5), peer_rx.recv()).await {
+            Ok(Some(InternalMsg::VnetRouteAdvertiseForward { msg })) => {
+                assert_advertise_eq(&msg, &adv);
+            }
+            other => panic!("expected forwarded advertise, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn advertise_in_default_net_without_proxy_wide_subnet_is_refused() {
+        // The default-net visitor path admits only HOST routes (/32 or
+        // /128 — the visitor's destinationIP shape). A proxy-less control
+        // cannot inject a wide subnet into the default net: wide-subnet
+        // membership still requires a default-net vnet proxy.
+        let state = test_state();
+        let mut peer_rx = insert_control(&state, "run-b").await;
+        // run-b holds a default-net route (so it would receive any broadcast).
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                (String::new(), "10.0.0.0/24".to_string()),
+                ("run-b".to_string(), "peer-b".to_string()),
+            );
+        }
+        // run-a registers NO proxy.
+        let (ctx, mut ctl) = test_context(&state, "run-a");
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "attacker".to_string(),
+            subnet: "0.0.0.0/0".to_string(),
+            virtual_net: None,
+        };
+
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv).await;
+
+        let routes = state.vnet_routes.read().await;
+        assert!(
+            !routes.contains_key(&(String::new(), "0.0.0.0/0".to_string())),
+            "wide default-net advertise from a proxy-less run_id must not register"
+        );
+        drop(routes);
+        assert!(
+            peer_rx.try_recv().is_err(),
+            "refused advertise must not be broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn advertise_respects_per_client_route_cap() {
+        // Round 10 (HIGH): 64-route per-client cap — the 65th NEW route is
+        // refused, while updating an already-owned key stays allowed.
+        let state = test_state();
+        register_vnet_proxy(&state, "run-a", "vnet-visitor", Some("vnet-a")).await;
+        let (ctx, mut ctl) = test_context(&state, "run-a");
+        {
+            let mut routes = state.vnet_routes.write().await;
+            for i in 0..super::MAX_VNET_ROUTES_PER_CLIENT {
+                routes.insert(
+                    ("vnet-a".to_string(), format!("10.{}.0.0/24", i)),
+                    ("run-a".to_string(), format!("p{i}")),
+                );
+            }
+        }
+        let overflow = msg::VnetRouteAdvertise {
+            proxy_name: "overflow".to_string(),
+            subnet: "192.168.0.0/24".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), overflow).await;
+        {
+            let routes = state.vnet_routes.read().await;
+            assert!(
+                !routes.contains_key(&("vnet-a".to_string(), "192.168.0.0/24".to_string())),
+                "65th new route must be refused at the cap"
+            );
+            // Updating an already-owned key is a normal update, not a new
+            // route: allowed at the cap.
+            let update = msg::VnetRouteAdvertise {
+                proxy_name: "p0-v2".to_string(),
+                subnet: "10.0.0.0/24".to_string(),
+                virtual_net: Some("vnet-a".to_string()),
+            };
+            drop(routes);
+            super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), update)
+                .await;
+            let routes = state.vnet_routes.read().await;
+            assert_eq!(
+                routes.get(&("vnet-a".to_string(), "10.0.0.0/24".to_string())),
+                Some(&("run-a".to_string(), "p0-v2".to_string()))
+            );
+        }
     }
 
     #[tokio::test]

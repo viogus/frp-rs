@@ -191,7 +191,7 @@ impl ServerConfigSnapshot {
             quic_bind_port: cfg.quic_bind_port,
             subdomain_host: cfg.sub_domain_host.clone(),
             max_pool_count: cfg.transport.max_pool_count,
-            max_ports_per_client: cfg.max_ports_per_client as i64,
+            max_ports_per_client: cfg.max_ports_per_client.min(1_048_576) as i64,
             max_conns_per_proxy: cfg.max_conns_per_proxy.min(1_048_576) as i64,
             heartbeat_timeout: cfg.transport.heartbeat_timeout,
             allow_ports_str: cfg.allow_ports.clone(),
@@ -899,12 +899,15 @@ pub(super) fn default_heartbeat_timeout() -> i64 {
     90
 }
 
-/// Upper bound for `heartbeat_timeout` in seconds. Larger positive values
-/// are clamped during config completion: the control loop computes
-/// `last_ping + hb_timeout` (an `Instant` add), which would
-/// overflow-panic on a huge value (finding 5). 3600s is far beyond any
-/// sane heartbeat interval.
-pub(super) const MAX_HEARTBEAT_TIMEOUT_SECS: i64 = 3600;
+// Go frp has NO clamp on `heartbeat_timeout` (Go's watchdog compares
+// `time.Since(lastPing) > timeout`), so values like Go frpc's 7200 pass
+// through untouched. frp-rs keeps only genuine overflow protection: any
+// positive i64 is honored, and the downstream arithmetic is overflow-safe
+// by construction — `Duration::from_secs(u64)` never panics, the server
+// watchdog uses `Instant::checked_add` with a never-firing fallback
+// (frp-server/src/control/mod.rs), and the client watchdog
+// (`sleep(saturating_sub(...))` + tokio `interval`) saturates to tokio's
+// far-future deadline instead of panicking.
 
 fn default_tcp_keepalive() -> i64 {
     7200
@@ -936,28 +939,29 @@ impl ServerTransportConfig {
             // value (util.EmptyOr) → the default (90), not "disabled".
             self.heartbeat_timeout = default_heartbeat_timeout();
         }
-        // Clamp the raw passthrough (finding 5): a huge positive value would
-        // overflow `last_ping + hb_timeout` in the control loop's heartbeat
-        // watchdog (Instant add panics). Values <= 0 keep their disable
-        // semantics untouched.
-        if self.heartbeat_timeout > MAX_HEARTBEAT_TIMEOUT_SECS {
-            self.heartbeat_timeout = MAX_HEARTBEAT_TIMEOUT_SECS;
-        }
+        // No clamp here (Go has none — see the note above). Any positive i64
+        // passes through; the downstream watchdog arithmetic is
+        // overflow-safe (`Duration::from_secs` + `Instant::checked_add`).
+        // Values <= 0 keep their disable semantics untouched.
     }
 }
 
 #[cfg(test)]
-mod heartbeat_timeout_clamp_tests {
+mod heartbeat_timeout_tests {
     use super::*;
 
     #[test]
-    fn huge_heartbeat_timeout_is_clamped_to_max() {
+    fn huge_heartbeat_timeout_is_preserved_not_clamped() {
+        // Round-8 blocker: Go frp has no clamp (Go frpc uses 7200) — the
+        // old 3600 cap disconnected Go frpc ↔ Rust frps in a loop. Any
+        // positive i64 must pass through; overflow protection lives in the
+        // watchdog arithmetic (checked_add), not in config.
         let mut t = ServerTransportConfig {
             heartbeat_timeout: i64::MAX,
             ..Default::default()
         };
         t.complete_with_heartbeat_timeout_set(true);
-        assert_eq!(t.heartbeat_timeout, MAX_HEARTBEAT_TIMEOUT_SECS);
+        assert_eq!(t.heartbeat_timeout, i64::MAX);
     }
 
     #[test]
@@ -981,13 +985,15 @@ mod heartbeat_timeout_clamp_tests {
     }
 
     #[test]
-    fn boundary_max_heartbeat_timeout_is_preserved() {
+    fn large_go_style_heartbeat_timeout_is_preserved() {
+        // Go frpc's 7200 (its default when tcpMux is off) must survive
+        // complete() untouched.
         let mut t = ServerTransportConfig {
-            heartbeat_timeout: MAX_HEARTBEAT_TIMEOUT_SECS,
+            heartbeat_timeout: 7200,
             ..Default::default()
         };
         t.complete_with_heartbeat_timeout_set(true);
-        assert_eq!(t.heartbeat_timeout, MAX_HEARTBEAT_TIMEOUT_SECS);
+        assert_eq!(t.heartbeat_timeout, 7200);
     }
 }
 

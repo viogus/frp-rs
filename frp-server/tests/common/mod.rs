@@ -176,6 +176,34 @@ pub async fn start_test_server(mut cfg: ServerConfig) -> (JoinHandle<()>, u16) {
     (handle, port)
 }
 
+/// Start the frp server with tcp_mux (yamux) left ENABLED, returning the
+/// join handle and bind port. Unlike `start_test_server`, this does NOT
+/// force `cfg.transport.tcp_mux = false` — the caller must configure a
+/// client that wraps its control connection in yamux to match (see
+/// work_conn_auth.rs). Ready when the port accepts connections.
+#[allow(dead_code)]
+pub async fn start_test_server_tcpmux_on(cfg: ServerConfig) -> (JoinHandle<()>, u16) {
+    let port = cfg.bind_port;
+    let service = Service::new(cfg, None).await.expect("create service");
+    let handle = tokio::spawn(async move {
+        let _ = service.run().await;
+    });
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let mut ready = false;
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        ready,
+        "test server did not start listening on {addr} in time"
+    );
+    (handle, port)
+}
+
 /// Fully parametrized login: like `raw_login` plus the client identity
 /// (`user`, `metas`) and `pool_count` Go frpc sends. Used by the plugin
 /// tests to assert the `user` object and flat Login fields in payloads.

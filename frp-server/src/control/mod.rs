@@ -19,7 +19,9 @@ pub(crate) mod proxy_ops;
 pub(crate) use proxy_ops::release_udp_port_with_owner_check;
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -48,6 +50,20 @@ async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
 /// a write, so every control write gets this bound. Longer than the 5s
 /// login reject/success deadlines — those keep their tighter budget.
 const CTL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline for yamux-stream reads in the control select loop (round 10
+/// HIGH). Unlike the main control-read branch (the persisted
+/// `pending_read` future — which yields back to the select when the peer
+/// trickles, so the heartbeat and shutdown arms stay live), the yamux
+/// arm's reads run inside the arm body, where no other arm can fire. A
+/// post-auth client trickling partial frame bytes on a yamux stream would
+/// pin the task + fd + semaphore permit + run_id registration forever (Go
+/// bounds this via its independent heartbeatWorker goroutine calling
+/// `ctl.Close()`).
+///
+/// A read timeout behaves like the Err branch: drop the stream, keep the
+/// control loop alive.
+const CTL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Protocol-aware write: dispatches to V1 or V2 framing based on the `v2`
 /// flag. Bounded by `CTL_WRITE_TIMEOUT` (30s): on timeout the write is
@@ -219,7 +235,7 @@ async fn handle_control_inner<S>(
     // monomorphization (saves ~30KB per copy in release binary).
     let stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin> = Box::new(stream);
     // 1. Authenticate and set up per-client state (login.rs)
-    let (mut ctx, mut ctl, _internal_tx, mut internal_rx, mut reader, mut writer, mut incoming) =
+    let (mut ctx, mut ctl, _internal_tx, mut internal_rx, reader, mut writer, mut incoming) =
         match login::authenticate(
             stream,
             &login,
@@ -236,6 +252,11 @@ async fn handle_control_inner<S>(
             Ok(tuple) => tuple,
             Err(()) => return,
         };
+
+    // The control read half is shared with the persisted read future via an
+    // async Mutex: the future holds the guard only while a frame is being
+    // read (control-plane rate), and no other loop arm touches `reader`.
+    let reader = std::sync::Arc::new(tokio::sync::Mutex::new(reader));
 
     // Convenience bindings for the main loop
     let state = ctx.state.clone();
@@ -258,6 +279,38 @@ async fn handle_control_inner<S>(
     } else {
         Duration::ZERO
     };
+
+    // Persist a partial control-frame read across select iterations (audit
+    // finding 4 — MEDIUM): the select drops every branch future when
+    // another arm wins, and `read_exact`-based framing keeps its partial
+    // state only in the branch future's locals. A client that splits a
+    // frame across two writes and forces an internal/accept arm to win
+    // mid-frame would lose the consumed bytes; the next iteration would
+    // parse the frame tail as a fresh header — a garbage type/length →
+    // protocol error → control drop + reconnect. The boxed future
+    // survives the select, so consumed bytes are retained until the frame
+    // completes. The loop shape stays fair (no biased branch ordering —
+    // the fairness regression test below asserts this): the read still
+    // progresses only at loop top, exactly like a fresh future would. Note
+    // the read does NOT "always win its own round": tokio::select! returns
+    // the FIRST Ready branch in declaration order, and internal_rx is
+    // declared above the read arm, so an internal message can win a round
+    // in which the read is also complete. Correctness never relies on the
+    // read winning — the future lives in the loop-outer Option, so a lost
+    // round drops the branch's reference, not the future: a completed read
+    // stays Ready and wins the first round in which no earlier arm is also
+    // Ready (a Ready future needs no waker to make progress), and a
+    // partial read keeps its consumed bytes until completion. The arm
+    // body's reset below therefore can never strand a completed future.
+    //
+    // The future owns an Arc<tokio::sync::Mutex<ReadHalf>> clone and locks
+    // inside its own poll, so it borrows nothing from the loop — a
+    // loop-local borrow could not be stored across select iterations (the
+    // Option's type region would keep the borrow alive for the whole loop,
+    // conflicting with the loop-top recreation below).
+    type PendingRead = Pin<Box<dyn Future<Output = Result<FrpMessage, frp_core::Error>> + Send>>;
+    let mut pending_read: Option<PendingRead> = None;
+
     loop {
         // Superseded by a newer login (same run_id) whose Shutdown message
         // could not be delivered through a full channel (round-7 review
@@ -314,6 +367,18 @@ async fn handle_control_inner<S>(
             break;
         }
 
+        // Recreate the control-read future when the previous frame
+        // completed (the arm body detached it). Starts a fresh read at the
+        // next frame boundary. The async block owns an Arc clone and takes
+        // the lock only while the frame is in flight.
+        if pending_read.is_none() {
+            let reader = reader.clone();
+            pending_read = Some(Box::pin(async move {
+                let mut guard = reader.lock().await;
+                read_ctl_msg(&mut *guard, v2).await
+            }));
+        }
+
         // Earliest pending-request expiry deadline. Loop-top expiry is
         // event-driven only — with tcp_mux on (the default), heartbeat is
         // disabled and this select has no timer arm, so a silent client
@@ -356,10 +421,11 @@ async fn handle_control_inner<S>(
             // the sleep target on every iteration, so last_ping updates are
             // picked up automatically.
             _ = async {
-                // checked_add (finding 5): the config-side clamp (≤3600s)
-                // makes overflow unreachable, but a hostile/legacy value
-                // must never panic the process — degrade to never firing
-                // this arm instead (the loop-top check above still applies).
+                // checked_add (round-8): config no longer clamps heartbeat
+                // values (Go has none — Go frpc uses 7200), so any positive
+                // i64 can reach here. checked_add must never panic the
+                // process — an overflowing value degrades to never firing
+                // this arm (the loop-top check above still applies).
                 match ctl.last_ping.checked_add(hb_timeout) {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending::<()>().await,
@@ -395,58 +461,86 @@ async fn handle_control_inner<S>(
                 }
             } => {
                 if let Some(stream) = incoming_msg {
-                    let mut io = IoStream::Yamux(stream);
-                    if v2 {
-                        match frp_core::protocol::read_v2_magic_or_replay(&mut io).await {
-                            Ok(None) => {} // magic consumed
-                            Ok(Some(bytes)) => {
-                                // Older V2 client without per-stream magic —
-                                // replay bytes as start of next frame.
-                                io = IoStream::BufferedRead(bytes, 0, Box::new(io));
-                            }
-                            Err(e) => {
-                                warn!(run_id = %run_id, error = %e, "Failed to read V2 magic from yamux stream for {run_id}: {e}");
-                                continue;
+                    // Bounded by CTL_READ_TIMEOUT: see the const doc — these
+                    // arm-body reads must not outlive the select's other arms.
+                    // The block owns the stream and hands back the (possibly
+                    // re-wrapped) IoStream with the message; a timeout drops
+                    // the stream.
+                    let run_id_log = run_id.clone();
+                    let stream_read = tokio::time::timeout(CTL_READ_TIMEOUT, async move {
+                        let mut io = IoStream::Yamux(stream);
+                        if v2 {
+                            match frp_core::protocol::read_v2_magic_or_replay(&mut io).await {
+                                Ok(None) => {} // magic consumed
+                                Ok(Some(bytes)) => {
+                                    // Older V2 client without per-stream magic —
+                                    // replay bytes as start of next frame.
+                                    io = IoStream::BufferedRead(bytes, 0, Box::new(io));
+                                }
+                                Err(e) => {
+                                    return Err(format!(
+                                        "Failed to read V2 magic from yamux stream for {run_id_log}: {e}"
+                                    ));
+                                }
                             }
                         }
-                    }
-                    match read_ctl_msg(&mut io, v2).await {
-                        Ok(FrpMessage::NewWorkConn(nwc)) => {
-                            let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
-                            if stream_run_id != run_id {
-                                debug!(expected_run_id = %run_id, got_run_id = %stream_run_id, "Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
-                                continue;
-                            }
-                            // Validate NewWorkConn credentials (privilege_key + timestamp).
-                            // Standalone TCP work connections go through handle_work_conn_inner
-                            // which validates auth. Yamux work connections must apply the
-                            // same validation — without it, tcp_mux (default on) creates an
-                            // auth bypass: yamux streams skip NewWorkConn verification that
-                            // standalone TCP work connections require.
-                            if let Err(e) = crate::handlers::validate_new_work_conn_auth(
-                                &nwc, &run_id, &state,
-                            )
+                        let msg = read_ctl_msg(&mut io, v2)
                             .await
-                            {
-                                warn!(run_id = %run_id, error = %e, "Yamux work conn auth failed for {run_id}: {e}");
-                                continue;
-                            }
-                            // NewWorkConn plugin hook — control-enabled plugins can reject
-                            if let Err(reason) =
-                                crate::handlers::run_new_work_conn_plugin(&run_id, &state).await
-                            {
-                                warn!(run_id = %run_id, reason = %reason, "Yamux work conn plugin hook rejected: {reason}");
-                                continue;
-                            }
-                        }
-                        Ok(other) => {
+                            .map_err(|e| e.to_string())?;
+                        Ok((msg, io))
+                    });
+                    let (nwc, io) = match stream_read.await {
+                        Ok(Ok((FrpMessage::NewWorkConn(nwc), io))) => (nwc, io),
+                        Ok(Ok((other, _io))) => {
                             debug!(run_id = %run_id, msg_type = ?other.v1_type_byte(), "Unexpected yamux stream message for {run_id}: {:?}", other.v1_type_byte());
                             continue;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(run_id = %run_id, error = %e, "Failed to read from yamux stream for {run_id}: {e}");
                             continue;
                         }
+                        Err(_elapsed) => {
+                            warn!(run_id = %run_id, "Yamux stream read timed out after {CTL_READ_TIMEOUT:?} for {run_id}");
+                            continue;
+                        }
+                    };
+                    let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
+                    if stream_run_id != run_id {
+                        debug!(expected_run_id = %run_id, got_run_id = %stream_run_id, "Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
+                        continue;
+                    }
+                    // NewWorkConn plugin hook — Go frp v0.71.0 RegisterWorkConn
+                    // ordering (server/service.go:852-888): the hook runs BEFORE
+                    // auth and may REPLACE the message (`newMsg =
+                    // &retContent.NewWorkConn`), so a plugin that rewrites
+                    // privilege_key/timestamp changes what auth validates.
+                    // Control-enabled plugins can also reject.
+                    let nwc = match crate::handlers::run_new_work_conn_plugin_with_msg(
+                        &nwc, &run_id, &state,
+                    )
+                    .await
+                    {
+                        Ok(Some(mutated)) => mutated,
+                        Ok(None) => nwc,
+                        Err(reason) => {
+                            warn!(run_id = %run_id, reason = %reason, "Yamux work conn plugin hook rejected: {reason}");
+                            continue;
+                        }
+                    };
+                    // Validate NewWorkConn credentials (privilege_key + timestamp)
+                    // on the possibly plugin-mutated message. Standalone TCP work
+                    // connections go through handle_work_conn_inner which
+                    // validates auth. Yamux work connections must apply the same
+                    // validation — without it, tcp_mux (default on) creates an
+                    // auth bypass: yamux streams skip NewWorkConn verification
+                    // that standalone TCP work connections require.
+                    if let Err(e) = crate::handlers::validate_new_work_conn_auth(
+                        &nwc, &run_id, &state,
+                    )
+                    .await
+                    {
+                        warn!(run_id = %run_id, error = %e, "Yamux work conn auth failed for {run_id}: {e}");
+                        continue;
                     }
                     // Route through pool::handle_new_work_conn for consistent
                     // priority: NatHoleSid → UDP → pending requests → pool → drop.
@@ -455,7 +549,12 @@ async fn handle_control_inner<S>(
                 }
             }
 
-            msg = read_ctl_msg(&mut reader, v2) => {
+            msg = pending_read.as_mut().unwrap() => {
+                // Detach the completed future before handling the message:
+                // the select has dropped the branch future, and the
+                // loop-top `if pending_read.is_none()` recreates a fresh
+                // one for the next frame.
+                pending_read = None;
                 match msg {
                     Ok(msg) => {
                         if dispatch::dispatch_frp_message(&mut ctx, &mut ctl, &mut writer, msg, &authenticated_user).await.is_err() {
@@ -675,5 +774,214 @@ mod ctl_write_timeout_tests {
             Ok(Err(frp_core::Error::Protocol(_))) => {}
             other => panic!("expected Protocol error on V2 write, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod partial_read_tests {
+    use super::*;
+
+    /// Read one V1 LoginResp frame from the client side of the duplex and
+    /// return its error field (empty when the login succeeded).
+    async fn read_login_resp_error(client: &mut tokio::io::DuplexStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut header = [0u8; 9];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("read frame header");
+        let len = u64::from_be_bytes(header[1..9].try_into().unwrap()) as usize;
+        assert!(len < 4096, "implausible frame length {len}");
+        let mut payload = vec![0u8; len];
+        client
+            .read_exact(&mut payload)
+            .await
+            .expect("read frame payload");
+        let resp: frp_core::msg::LoginResp =
+            serde_json::from_slice(&payload).expect("parse LoginResp");
+        resp.error.unwrap_or_default()
+    }
+
+    /// Audit finding 4 (MEDIUM) regression: a control frame delivered in
+    /// two chunks with an internal message landing mid-frame must not lose
+    /// the consumed bytes. The old select arm created a fresh
+    /// `read_ctl_msg` future every iteration, so a competing arm winning
+    /// mid-frame dropped the partial read — the next iteration parsed the
+    /// frame tail as a fresh header (garbage type/length → protocol error
+    /// → control drop + reconnect). The persisted boxed future retains the
+    /// consumed bytes and completes the frame.
+    ///
+    /// Determinism: the duplex (1024) capacity makes chunk 1's write_all
+    /// block until the loop's read branch has consumed it (the only
+    /// consumer), so the read is provably mid-frame when the injected
+    /// `NewWorkConn` internal message wins the select — the test observes
+    /// the win via `pool_stats.pool_size >= 1` (the pooled work conn).
+    /// Registration of the frame's stcp proxy is the observable end state:
+    /// old code breaks on a garbage header before registering anything;
+    /// new code completes the frame and registers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_frame_survives_competing_internal_message() {
+        let state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        let (server, mut client) = tokio::io::duplex(1024);
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("test-run-id".into()),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("test-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        let control_task = tokio::spawn(handle_control(
+            server,
+            login,
+            state.clone(),
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+        ));
+
+        // Login handshake. The server's prewarm ReqWorkConn stays in the
+        // client buffer — never read, small enough to fit.
+        let error = read_login_resp_error(&mut client).await;
+        assert!(error.is_empty(), "login failed: {error}");
+
+        // The V1 control channel is ALWAYS AES-128-CFB wrapped after
+        // LoginResp (Go parity — no config flag gates it), so the frame
+        // must go out encrypted: wrap the client half and write through it.
+        let client_key = frp_core::encryption::derive_key("test-token");
+        let mut client = frp_core::cipher_stream::CipherStream::new(client, client_key);
+
+        // NewProxy frame with a large headers map so the frame exceeds the
+        // duplex capacity. stcp needs no listener — registration alone is
+        // the observable end state.
+        let np = msg::NewProxy {
+            proxy_name: "t".into(),
+            proxy_type: "stcp".into(),
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: None,
+            local_str: None,
+            remote_port: Some(0),
+            sk: Some("sk".into()),
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: Some(std::collections::HashMap::from([(
+                "x-pad".into(),
+                "x".repeat(5000),
+            )])),
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        };
+        let new_proxy_msg = FrpMessage::NewProxy(Box::new(np));
+        let type_byte = new_proxy_msg.v1_type_byte();
+        let payload = serde_json::to_vec(&new_proxy_msg).expect("encode NewProxy");
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.push(type_byte);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        assert!(
+            frame.len() > 1024,
+            "frame must exceed the duplex capacity: {} bytes",
+            frame.len()
+        );
+        let chunk1 = 1500.min(frame.len());
+
+        // Chunk 1 write: blocks until the loop's read branch has consumed
+        // the first 1024 bytes (it is the only consumer), so the read is
+        // provably mid-frame afterwards. (The CipherStream adds a 16-byte
+        // IV on the first write; the blocking math still holds.)
+        client
+            .write_all(&frame[..chunk1])
+            .await
+            .expect("write chunk 1");
+
+        // Inject an internal NewWorkConn: it must win the select while the
+        // read is mid-frame, dropping the branch future (the bug).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let accept = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.expect("accept");
+            s
+        });
+        let client_keepalive = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let work_conn = accept.await.expect("accepted socket");
+        // Keep the peer end alive so the server-side socket stays open.
+        let _client_keepalive = client_keepalive;
+
+        let ctl_tx = state
+            .run_id_to_ctl_tx
+            .get("test-run-id")
+            .expect("control registered at login");
+        ctl_tx
+            .tx
+            .send(InternalMsg::NewWorkConn(IoStream::Tcp(work_conn)))
+            .await
+            .expect("internal send");
+        // The message being processed proves the select returned with the
+        // read mid-frame (pooling sets pool_size >= 1).
+        let pool_stats = ctl_tx.pool_stats.clone();
+        drop(ctl_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pool_stats.pool_size.load(Ordering::Relaxed) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("internal NewWorkConn must be processed");
+
+        // Chunk 2: the rest of the frame.
+        client
+            .write_all(&frame[chunk1..])
+            .await
+            .expect("write chunk 2");
+
+        // The stcp proxy must register. Old code: the frame tail parsed as
+        // a fresh header → garbage length → protocol error → control drop,
+        // nothing registered.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.proxy_manager.get("t").await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stcp proxy 't' must register after the interrupted frame");
+
+        // Teardown: closing the client side ends the control (read EOF).
+        drop(client);
+        control_task.await.expect("control task must exit");
     }
 }

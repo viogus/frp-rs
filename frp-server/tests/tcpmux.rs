@@ -176,6 +176,141 @@ async fn test_tcpmux_unknown_domain_returns_404() {
     drop(provider);
 }
 
+/// Read raw bytes until the header terminator (`\r\n\r\n`) is in the buffer
+/// (or the peer closes). Loopback reads of small responses can arrive split.
+async fn read_full_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 128];
+    loop {
+        if buf.ends_with(b"\r\n\r\n") {
+            return buf;
+        }
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("timeout waiting for the HTTP error response")
+            .expect("read HTTP error response");
+        assert!(
+            n > 0,
+            "EOF before the full response (got {:?})",
+            String::from_utf8_lossy(&buf)
+        );
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Listener-level gates: a raw socket that sends a NON-CONNECT request line
+/// must get the exact Go-parity 405 status bytes (tcpmux.rs method gate —
+/// case-sensitive like Go httpconnect.go's `req.Method != "CONNECT"`), and
+/// the connection must never reach route lookup.
+#[tokio::test]
+async fn test_tcpmux_get_request_line_rejected_405() {
+    let bind_port = allocate_port();
+    let tcpmux_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        tcpmux_httpconnect_port: tcpmux_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
+
+    // No proxy registration needed: the 405 gate fires before routing.
+    let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
+        .await
+        .expect("connect to tcpmux port");
+    client
+        .write_all(
+            b"GET / HTTP/1.1\r\n\
+              Host: machine-a.example.com\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send GET request line");
+
+    let response = read_full_response(&mut client).await;
+    assert_eq!(
+        String::from_utf8_lossy(&response),
+        "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
+    );
+    drop(client);
+}
+
+/// CONNECT without a routable host — a 2-part request line with the version
+/// in the target slot ("CONNECT HTTP/1.1") — must get the exact Go-parity
+/// 400 status bytes (extract_route_host returns None → 400).
+#[tokio::test]
+async fn test_tcpmux_connect_without_host_rejected_400() {
+    let bind_port = allocate_port();
+    let tcpmux_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        tcpmux_httpconnect_port: tcpmux_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
+
+    let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
+        .await
+        .expect("connect to tcpmux port");
+    client
+        .write_all(b"CONNECT HTTP/1.1\r\n\r\n")
+        .await
+        .expect("send CONNECT without host");
+
+    let response = read_full_response(&mut client).await;
+    assert_eq!(
+        String::from_utf8_lossy(&response),
+        "HTTP/1.1 400 Bad Request\r\n\r\n"
+    );
+    drop(client);
+}
+
+/// Duplicate Host headers must be rejected with the exact Go-parity 400
+/// status bytes (RFC 7230 §5.4 — the duplicate check runs before routing,
+/// even though the CONNECT authority is authoritative for routing).
+#[tokio::test]
+async fn test_tcpmux_duplicate_host_headers_rejected_400() {
+    let bind_port = allocate_port();
+    let tcpmux_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        tcpmux_httpconnect_port: tcpmux_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
+
+    let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
+        .await
+        .expect("connect to tcpmux port");
+    client
+        .write_all(
+            b"CONNECT machine-a.example.com:22 HTTP/1.1\r\n\
+              Host: machine-a.example.com:22\r\n\
+              Host: other.example.com:22\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send CONNECT with duplicate Host headers");
+
+    let response = read_full_response(&mut client).await;
+    assert_eq!(
+        String::from_utf8_lossy(&response),
+        "HTTP/1.1 400 Bad Request\r\n\r\n"
+    );
+    drop(client);
+}
+
 /// TCPMux: Proxy-Authorization check.
 #[tokio::test]
 async fn test_tcpmux_proxy_auth() {
@@ -347,6 +482,21 @@ async fn test_tcpmux_passthrough() {
         Ok(Ok(n)) => panic!(
             "passthrough mode must not send HTTP 200, got: {}",
             String::from_utf8_lossy(&response[..n])
+        ),
+        Ok(Err(e)) => panic!("client read error: {}", e),
+    }
+
+    // Negative window is not enough: a slow (but wrong) server could have
+    // sent the 200 just after the 500ms cut. Give the server one more
+    // second to prove no late HTTP bytes arrive — a read timeout (or EOF)
+    // is the only pass.
+    let mut late = [0u8; 256];
+    match tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut late)).await {
+        Err(_) => {} // still silent: no late 200, passthrough confirmed
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!(
+            "late HTTP bytes after negative window, got: {}",
+            String::from_utf8_lossy(&late[..n])
         ),
         Ok(Err(e)) => panic!("client read error: {}", e),
     }

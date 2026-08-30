@@ -16,7 +16,11 @@ tempfile = "3"
 frp-core = { path = "../frp-core", default-features = false }
 frp-vnet = { workspace = true, optional = true }
 futures-util.workspace = true
-tokio.workspace = true
+# "fs": static_file.rs wraps a std file handle via tokio::fs::File::from_std
+# (round-8 static_file streaming change); the workspace tokio features do not
+# include "fs" and no other crate requests it, so enable it here — client-only,
+# keeps frps/frpc-server graphs free of the fs module.
+tokio = { workspace = true, features = ["fs"] }
 tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true

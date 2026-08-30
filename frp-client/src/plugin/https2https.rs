@@ -96,15 +96,29 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                                 };
                                 serve_h2_connection(client_tls, target, rewrite, headers, backend)
                                     .await;
-                            } else if let Err(e) =
-                                handle_conn(client_tls, &target, &rewrite, &headers, &connector).await
+                            } else if let Err(e) = handle_conn(
+                                client_tls,
+                                &target,
+                                &rewrite,
+                                &headers,
+                                &connector,
+                                peer.ip(),
+                            )
+                            .await
                             {
                                 debug!(%peer, error = %e, "https2https: {peer} error: {e}");
                             }
                         }
                         #[cfg(not(feature = "http2http"))]
-                        if let Err(e) =
-                            handle_conn(client_tls, &target, &rewrite, &headers, &connector).await
+                        if let Err(e) = handle_conn(
+                            client_tls,
+                            &target,
+                            &rewrite,
+                            &headers,
+                            &connector,
+                            peer.ip(),
+                        )
+                        .await
                         {
                             debug!(%peer, error = %e, "https2https: {peer} error: {e}");
                         }
@@ -133,11 +147,15 @@ async fn handle_conn(
     host_rewrite: &str,
     request_headers: &std::collections::HashMap<String, String>,
     tls_connector: &tokio_rustls::TlsConnector,
+    peer_ip: std::net::IpAddr,
 ) -> Result<(), String> {
+    // Go https2https.go SetXForwarded: append the connection peer as
+    // X-Forwarded-For (the tunnel peer — see the L3 note in the report).
     let fwd = crate::plugin::read_request_and_build_forward(
         &mut client_tls,
         host_rewrite,
         request_headers,
+        Some(peer_ip),
     )
     .await?;
 

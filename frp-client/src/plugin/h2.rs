@@ -60,6 +60,15 @@ pub(crate) async fn serve_h2_connection<S>(
         // Bound concurrent streams like Go's http.Server (default 250) to
         // cap per-connection memory (same as the vhost h2c path).
         .max_concurrent_streams(100)
+        // Go parity: the https2http/https2https plugins serve with net/http
+        // (x/net/http2 defaultMaxHeaderListSize = 16 MiB), so legitimately
+        // large header lists — big Cookie jars, JWTs — must not be rejected.
+        // Unlike the server-side vhost h2c path (frp-server vhost_h2c.rs),
+        // which deliberately stays at 4096 because it accepts connections
+        // from ANY client on an untrusted public surface, this listener is
+        // the operator's own: the plugin binds 127.0.0.1:local_port and
+        // serves only the local user's browser, so 16 MiB is safe here.
+        .max_header_list_size(16 * 1024 * 1024)
         .handshake(stream)
         .await
     {
@@ -239,12 +248,21 @@ fn cap_chunk(len: usize, remaining: Option<usize>) -> (Option<usize>, usize) {
 }
 
 /// Hop-by-hop headers dropped when converting between HTTP/1.1 and HTTP/2
-/// (RFC 7540 §8.1.2.2 forbids them; Go's net/http drops them too).
+/// (RFC 7540 §8.1.2.2 forbids them; Go's net/http drops them too). This is
+/// Go httputil.hopHeaders' full list — proxy-authenticate, proxy-
+/// authorization, te, and trailer were missing, so a backend's
+/// Proxy-Authenticate challenge would have been forwarded to the h2 client
+/// as a connection-scoped header, and a client's Proxy-Authorization would
+/// have leaked to the backend.
 fn is_hop_by_hop(name: &str) -> bool {
-    const HOP: [&str; 5] = [
+    const HOP: [&str; 9] = [
         "connection",
         "keep-alive",
         "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
         "transfer-encoding",
         "upgrade",
     ];
@@ -462,6 +480,10 @@ fn parse_hex(b: &[u8]) -> std::io::Result<usize> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))
 }
 
+/// Per-slice cap for streaming chunked bodies (round 10 MEDIUM): a chunk is
+/// forwarded in bounded slices instead of one `read_exact(size)` allocation.
+const MAX_CHUNK_SIZE: usize = 64 * 1024;
+
 /// Incremental response-body reader that starts with the bytes that arrived
 /// together with the response head.
 struct BodyReader<'a, R: AsyncRead + Unpin> {
@@ -622,14 +644,25 @@ async fn stream_chunked_body(
             }
             return Ok(());
         }
-        let data = match reader.read_exact(size).await {
-            Ok(d) => d,
-            Err(_) => return Ok(()),
-        };
+        // Round 10 (MEDIUM): `size` comes from the backend's chunk-size
+        // line — buffering it in one `read_exact(size)` allocates
+        // attacker-influenced memory (a misbehaving backend or proxied
+        // origin can emit an arbitrarily large chunk). Stream the chunk
+        // in bounded slices instead; the frame stays chunked
+        // (end_stream=false on every slice).
+        let mut remaining = size;
+        while remaining > 0 {
+            let n = remaining.min(MAX_CHUNK_SIZE);
+            let data = match reader.read_exact(n).await {
+                Ok(d) => d,
+                Err(_) => return Ok(()),
+            };
+            send.send_data(Bytes::from(data), false)?;
+            remaining -= n;
+        }
         if reader.read_exact(2).await.is_err() {
             return Ok(()); // missing trailing CRLF
         }
-        send.send_data(Bytes::from(data), false)?;
     }
 }
 

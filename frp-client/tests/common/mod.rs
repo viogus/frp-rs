@@ -215,16 +215,24 @@ impl TestHarness {
     /// `v2` enables V2 wire protocol (defaults to V1).
     #[allow(dead_code, clippy::unnecessary_min_or_max)]
     pub async fn new(use_encryption: bool, token: &str) -> Self {
-        Self::new_inner(use_encryption, token, false).await
+        Self::new_inner(use_encryption, false, token, false).await
     }
 
     /// Build and start the full stack with V2 protocol support.
     #[allow(dead_code, clippy::unnecessary_min_or_max)]
     pub async fn new_v2(use_encryption: bool, token: &str) -> Self {
-        Self::new_inner(use_encryption, token, true).await
+        Self::new_inner(use_encryption, false, token, true).await
     }
 
-    async fn new_inner(use_encryption: bool, token: &str, v2: bool) -> Self {
+    /// Build and start the full stack with an explicit compression setting
+    /// (the other constructors hardcode `use_compression: false`). Enables
+    /// the encrypted+compressed bridge data path (AES-128-CFB + Snappy).
+    #[allow(dead_code, clippy::unnecessary_min_or_max)]
+    pub async fn new_compressed(use_encryption: bool, use_compression: bool, token: &str) -> Self {
+        Self::new_inner(use_encryption, use_compression, token, false).await
+    }
+
+    async fn new_inner(use_encryption: bool, use_compression: bool, token: &str, v2: bool) -> Self {
         init_tracing();
         let echo_port = allocate_port();
         let server_port = allocate_port();
@@ -258,7 +266,7 @@ impl TestHarness {
                 local_port: echo_port,
                 remote_port: proxy_port,
                 use_encryption,
-                use_compression: false,
+                use_compression,
                 sk: String::new(),
                 plugin: None,
                 custom_domains: vec![],

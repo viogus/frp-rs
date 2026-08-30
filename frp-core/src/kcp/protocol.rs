@@ -54,7 +54,7 @@ const KCP_ASK_TELL: u32 = 2;
 /// Default send window.
 const KCP_WND_SND: u16 = 32;
 /// Default receive window; must be >= max fragment count.
-const KCP_WND_RCV: u16 = 128;
+pub(crate) const KCP_WND_RCV: u16 = 128;
 
 /// Default MTU.
 const KCP_MTU_DEF: usize = 1400;
@@ -110,6 +110,8 @@ pub enum Error {
     RecvQueueEmpty,
     #[error("expecting fragment")]
     ExpectingFragment,
+    #[error("unexpected fragment {0} in stream mode")]
+    UnexpectedFragment(u8),
     #[error("command {0} is not supported")]
     UnsupportedCmd(u8),
     #[error("user's send buffer is too big")]
@@ -510,6 +512,17 @@ impl<Output> Kcp<Output> {
 
     /// RFC 6298-style RTT smoothing.
     fn update_ack(&mut self, rtt: u32) {
+        // Clamp hostile RTTs to the largest RTO we ever emit (KCP_RTO_MAX).
+        // The ACK `ts` field is attacker-controlled: ts=0 against a large
+        // `current` clock yields rtt ~ 2^31 ms, and the pre-fix arithmetic
+        // `(7 * rx_srtt + rtt) / 8` overflowed u32 — a debug-build panic
+        // killed the whole driver task on the second ACK (one-packet
+        // session kill). With the clamp, rx_srtt <= 60_000 and rx_rttval
+        // <= 60_000 (the smoothing's fixed point at the clamp, reachable
+        // with alternating extreme ACKs), so no intermediate
+        // (`7 * rx_srtt + rtt` <= 480_000, `4 * rx_rttval` <= 240_000) can
+        // overflow u32.
+        let rtt = rtt.min(KCP_RTO_MAX);
         if self.rx_srtt == 0 {
             self.rx_srtt = rtt;
             self.rx_rttval = rtt / 2;
@@ -719,6 +732,20 @@ impl<Output> Kcp<Output> {
                     if timediff(sn, self.rcv_nxt + self.rcv_wnd as u32) < 0 {
                         self.ack_push(sn, ts);
                         if timediff(sn, self.rcv_nxt) >= 0 {
+                            // Stream-mode sessions (the only mode frp runs —
+                            // Go frp `SetStreamMode(true)`, `KcpConfig.stream`
+                            // defaults) never carry fragment chains: every
+                            // segment has frg=0. A hostile in-window PUSH with
+                            // frg>0 would sit at the front of rcv_queue with
+                            // its chain never completing, turning every
+                            // peeksize() into ExpectingFragment and killing
+                            // the session via recv_and_push — a one-packet
+                            // session kill. Reject the whole datagram instead:
+                            // input() errors are non-fatal (the driver logs
+                            // and drops), so the session survives.
+                            if self.stream && frg != 0 {
+                                return Err(Error::UnexpectedFragment(frg));
+                            }
                             // Reject oversized segments (beyond MSS): a conforming
                             // peer always fragments at MSS. Guards the per-connection
                             // recv buffer against len up to 64 KiB × window.
@@ -1057,7 +1084,6 @@ impl<Output: Write> Kcp<Output> {
         if !self.nocwnd {
             cwnd = cmp::min(self.cwnd, cwnd);
         }
-
         // Move data from snd_queue to snd_buf.
         let mut new_segs_count: u32 = 0;
         while timediff(self.snd_nxt, self.snd_una + cwnd as u32) < 0 {
@@ -1454,6 +1480,59 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn hostile_ack_ts_does_not_overflow_srtt() {
+        // L7: an ACK's ts field is attacker-controlled; ts=0 against a large
+        // `current` clock drives rtt toward 2^31-1 ms. The pre-fix smoothing
+        // `(7 * rx_srtt + rtt) / 8` overflowed u32 on the SECOND ACK and
+        // panicked (debug builds) — killing the whole driver task with two
+        // packets. The clamp to KCP_RTO_MAX keeps every intermediate in
+        // range; the session stays usable and rx_rto stays bounded.
+        let mut kcp = Kcp::new(1, PacketWriter::default());
+        kcp.update(0).unwrap();
+        kcp.send(b"hello").unwrap();
+        kcp.update(200).unwrap();
+        // Move the session clock near the i32 positive ceiling.
+        kcp.update(2_147_000_000).unwrap();
+        // First hostile ACK: rtt = timediff(current, ts=0) ≈ 2.1e9 ms.
+        kcp.input(&make_ack(1, 0, 128, 0)).unwrap();
+        assert!(kcp.rx_srtt <= KCP_RTO_MAX, "rtt must be clamped");
+        // Second ACK drives the smoothing arithmetic — pre-fix this
+        // overflowed and panicked in debug builds.
+        kcp.input(&make_ack(1, 0, 128, 0)).unwrap();
+        assert!(kcp.rx_srtt <= KCP_RTO_MAX);
+        assert!(kcp.rx_rttval <= KCP_RTO_MAX);
+        assert!(kcp.rx_rto <= KCP_RTO_MAX);
+        // Session is still functional: a conforming PUSH is processed.
+        kcp.update(2_147_000_001).unwrap();
+        kcp.input(&make_push(1, 0, 0, 0, b"ok")).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(kcp.recv(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ok");
+    }
+
+    #[test]
+    fn stream_mode_rejects_frg_positive_push_without_killing_session() {
+        // L8: a hostile stream-mode peer sends an in-window PUSH with
+        // frg=255. Pre-fix the segment landed at the front of rcv_queue
+        // with its chain never completing → peeksize() returned
+        // ExpectingFragment → recv_and_push errored → the driver removed
+        // the session: one packet killed the session. Now the datagram is
+        // rejected at input time (non-fatal), and the session survives.
+        let mut kcp = Kcp::new_stream(1, PacketWriter::default());
+        kcp.update(0).unwrap();
+        let hostile = make_push(1, 0, 255, 0, b"x");
+        match kcp.input(&hostile) {
+            Err(Error::UnexpectedFragment(255)) => {}
+            other => panic!("expected UnexpectedFragment(255), got {:?}", other),
+        }
+        // The session survives: a conforming PUSH is still processed.
+        kcp.input(&make_push(1, 0, 0, 0, b"ok")).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(kcp.recv(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ok");
     }
 
     // ── 2. basic roundtrip ───────────────────────────────────────────────

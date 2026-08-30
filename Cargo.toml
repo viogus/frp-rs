@@ -94,6 +94,9 @@ mimalloc = "0.1.52"
 # the workspace moves past rustls 0.23.
 [patch.crates-io]
 rustls = { path = "vendor/rustls" }
+# yamux 0.14.0 with a per-stream RST on inbound stream-cap hits (instead
+# of a session-killing GoAway) — see vendor/yamux/README-FRP-RS.md.
+yamux = { path = "vendor/yamux" }
 
 [profile.release]
 opt-level = "z"

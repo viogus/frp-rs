@@ -402,6 +402,16 @@ impl CipherWriterState {
             }
         }
 
+        // A first-write (IV+data) buffer fully drained inside poll_flush:
+        // first_write_data_len keeps the pending claim (see poll_flush). The
+        // caller re-polls with the same buf — return the claim without
+        // re-encrypting (the CFB keystream already advanced past it).
+        if this.first_write_data_len > 0 {
+            let data_len = this.first_write_data_len;
+            this.first_write_data_len = 0;
+            return Poll::Ready(Ok(data_len));
+        }
+
         // On first write, emit the random IV generated in new().
         if !this.iv_sent {
             this.iv_sent = true;
@@ -524,9 +534,18 @@ impl CipherWriterState {
                 Poll::Ready(Ok(n)) => {
                     this.first_write_pos += n;
                     if this.first_write_pos >= pending.len() {
+                        // Stash the write claim instead of discarding it:
+                        // this buffer may carry IV+data whose poll_write is
+                        // still pending, and poll_flush has no buf argument
+                        // to consume. The next poll_write sees the stashed
+                        // first_write_data_len and returns it WITHOUT
+                        // re-encrypting (re-encrypting with the already
+                        // advanced CFB keystream would double-encrypt the
+                        // payload). IV-only writes (data_len == 0, parked by
+                        // poll_flush itself) fall through to the eager-IV
+                        // arm below as before.
                         this.first_write_buf = None;
                         this.first_write_pos = 0;
-                        this.first_write_data_len = 0;
                     } else {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
@@ -1342,6 +1361,42 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = reader.read(&mut buf).await.unwrap();
         assert_eq!(n, 0, "should get EOF after IV with no data");
+    }
+
+    /// Peer closes after writing only PART of the 16-byte IV: the read must
+    /// return UnexpectedEof — not hang, and not decrypt with a partial IV.
+    #[tokio::test]
+    async fn eof_mid_iv_returns_unexpected_eof() {
+        let (mut client, server) = duplex(1024);
+        // Write 5 of the 16 IV bytes, then close.
+        client.write_all(&[0xABu8; 5]).await.unwrap();
+        drop(client);
+
+        let mut reader = CipherReader::new(server, TEST_KEY);
+        let mut buf = [0u8; 64];
+        let err = reader.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("EOF while reading IV"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Same EOF-mid-IV contract for the combined CipherStream reader.
+    #[tokio::test]
+    async fn cipher_stream_eof_mid_iv_returns_unexpected_eof() {
+        let (mut client, server) = duplex(1024);
+        client.write_all(&[0xCDu8; 5]).await.unwrap();
+        drop(client);
+
+        let mut stream = CipherStream::new(server, TEST_KEY);
+        let mut buf = [0u8; 64];
+        let err = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("EOF while reading IV"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Verify that the scratch buffer is reused across multiple sequential writes,

@@ -88,12 +88,14 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
                                 port: _port,
                             };
                             serve_h2_connection(tls, target, rewrite, headers, backend).await;
-                        } else if let Err(e) = handle_conn(tls, &target, &rewrite, &headers).await {
+                        } else if let Err(e) =
+                            handle_conn(tls, &target, &rewrite, &headers, peer.ip()).await
+                        {
                             debug!(%peer, error = %e, "https2http: {peer} error: {e}");
                         }
                     }
                     #[cfg(not(feature = "http2http"))]
-                    if let Err(e) = handle_conn(tls, &target, &rewrite, &headers).await {
+                    if let Err(e) = handle_conn(tls, &target, &rewrite, &headers, peer.ip()).await {
                         debug!(%peer, error = %e, "https2http: {peer} error: {e}");
                     }
                 }
@@ -117,10 +119,17 @@ async fn handle_conn(
     target: &str,
     host_rewrite: &str,
     request_headers: &std::collections::HashMap<String, String>,
+    peer_ip: std::net::IpAddr,
 ) -> Result<(), String> {
-    let fwd =
-        crate::plugin::read_request_and_build_forward(&mut tls, host_rewrite, request_headers)
-            .await?;
+    // Go https2http.go SetXForwarded: append the connection peer as
+    // X-Forwarded-For (the tunnel peer — see the L3 note in the report).
+    let fwd = crate::plugin::read_request_and_build_forward(
+        &mut tls,
+        host_rewrite,
+        request_headers,
+        Some(peer_ip),
+    )
+    .await?;
 
     // Connect to plain HTTP backend
     let (host, port) = split_host_port(target);

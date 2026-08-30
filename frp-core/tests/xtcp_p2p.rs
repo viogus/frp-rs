@@ -639,3 +639,118 @@ async fn test_quic_roundtrip_loopback() {
         .expect("visitor read");
     assert_eq!(&buf, REPLY, "visitor should receive provider's reply");
 }
+
+/// raw-KCP (tcp-mux off) HWM write must recover via the stored tick timer.
+///
+/// Regression for the round-10 MEDIUM: that fix built
+/// `select(notified_owned, sleep(10ms))` INSIDE `poll_write` and returned
+/// `Poll::Pending` with the select dropped — tokio unregisters BOTH wakers
+/// when a future is dropped (Sleep cancel in the timer wheel + OwnedNotified
+/// waiter removal), so the timer never fired and the HWM-parked write half
+/// deadlocked forever when tcp-mux was off (no background driver re-polling
+/// the stream). The fix stores the select future as a struct field across
+/// polls (KcpStream's `backpressure_fut` pattern). This test is RED on the
+/// round-10 code (the writer parks at the HWM permanently; the 30s budget
+/// fires) and GREEN with the stored future.
+///
+/// Real time only — `tokio::time::pause()`/`advance` cannot drive KCP: the
+/// flush gate (`update()` flushes only when >= interval of the stream's own
+/// monotonic ms clock elapsed) and the peer's input/ACK processing are real-
+/// time. Both sides poll with a 10ms timeout loop, mirroring the write-half
+/// timer that keeps the bridge task polling the stream in production.
+#[tokio::test]
+async fn raw_kcp_hwm_write_recovers_via_timer() {
+    let (a, b, _addr_a, _addr_b) = bind_pair().await;
+    let candidates_a = vec![a.local_addr().unwrap().to_string()];
+    let candidates_b = vec![b.local_addr().unwrap().to_string()];
+    let conv = 4242u32;
+    let kcp_config = KcpConfig {
+        data_shards: 0,
+        parity_shards: 0,
+        ..default_kcp_config()
+    };
+    let (stream_a, stream_b) = tokio::join!(
+        xtcp_p2p::xtcp_p2p_connect(
+            a,
+            &candidates_b,
+            &[],
+            None,
+            conv,
+            kcp_config.clone(),
+            3000,
+            None,
+            None
+        ),
+        xtcp_p2p::xtcp_p2p_connect(
+            b,
+            &candidates_a,
+            &[],
+            None,
+            conv,
+            kcp_config.clone(),
+            3000,
+            None,
+            None
+        ),
+    );
+    let mut stream_a = stream_a.expect("side A connect");
+    let mut stream_b = stream_b.expect("side B connect");
+    eprintln!("C1: connected");
+
+    const TARGET: usize = 1024 * 1024 + 64 * 1024;
+    let reader_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Peer keeps reading, driving B's KCP (input + ACKs) via a 10ms poll
+    // loop — in the real bridge the write-half timer keeps the task polling.
+    let reader = {
+        let reader_done = reader_done.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total = 0usize;
+            while total < TARGET {
+                match tokio::time::timeout(Duration::from_millis(10), stream_b.read(&mut buf)).await
+                {
+                    Ok(Ok(n)) => {
+                        if n == 0 {
+                            break; // EOF — cannot happen while both halves live
+                        }
+                        total += n;
+                    }
+                    Ok(Err(_)) => break, // dead link
+                    Err(_) => {}         // idle tick — re-poll (drives B's KCP)
+                }
+            }
+            reader_done.store(true, std::sync::atomic::Ordering::Release);
+            total
+        })
+    };
+
+    // First write_all fills pending_send in one poll_write (Ok(1MiB)); the
+    // second parks at the HWM — the deadlock point this test pins.
+    let writer = tokio::spawn(async move {
+        stream_a.write_all(&vec![0u8; 1024 * 1024]).await?;
+        eprintln!("C1: 1MiB written");
+        stream_a.write_all(&vec![0u8; 64 * 1024]).await?; // parks at HWM
+        eprintln!("C1: 64KiB written (HWM park recovered)");
+        stream_a.flush().await?;
+        // Keep driving A's KCP (ACK processing, window opening) until the
+        // reader has everything: with the writer parked-or-done, nothing
+        // else polls A.
+        let mut dummy = [0u8; 1];
+        while !reader_done.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ =
+                tokio::time::timeout(Duration::from_millis(10), stream_a.read(&mut dummy)).await;
+        }
+        Ok::<(), std::io::Error>(())
+    });
+
+    // 30s real-time budget: pre-fix the writer parks at the HWM forever
+    // (timer waker dropped with the select) and this fires. Three unwrap
+    // layers: timeout budget, task panic, then the io error.
+    tokio::time::timeout(Duration::from_secs(30), writer)
+        .await
+        .expect("HWM-parked raw-KCP write must complete via the stored tick timer")
+        .expect("writer task must not panic")
+        .expect("write must succeed");
+    assert_eq!(reader.await.unwrap(), TARGET);
+}

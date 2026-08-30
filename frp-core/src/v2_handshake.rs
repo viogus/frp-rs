@@ -549,6 +549,19 @@ pub async fn v2_handshake_client_recv_hello(
                     udp_packet_codec,
                 }))
             } else {
+                // Round-8 blocker: Go has no "no crypto selected" path —
+                // ValidateServerHelloForClient (pkg/proto/wire/crypto.go)
+                // fails closed on an empty algorithm ("unknown selected
+                // crypto algorithm"). When we proposed crypto and the
+                // server answered with no selection, fail instead of
+                // silently downgrading the whole V2 session to plaintext.
+                // Only a client that never proposed crypto
+                // (with_crypto=false, Rust↔Rust plain V2) accepts None.
+                if with_crypto {
+                    return Err(crate::Error::Protocol(
+                        "server did not select crypto although client proposed it".into(),
+                    ));
+                }
                 Ok(None)
             }
         }
@@ -914,5 +927,75 @@ mod tests {
             matches!(result, Err(crate::Error::Protocol(_))),
             "server must reject the ClientHello, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn client_rejects_server_hello_without_crypto_when_crypto_was_proposed() {
+        // Round-8 blocker: a server answering a crypto-proposing ClientHello
+        // with no crypto selection used to pass `Ok(None)` — the session
+        // silently downgraded to plaintext. Go's ValidateServerHelloForClient
+        // (pkg/proto/wire/crypto.go) has no such path and fails closed.
+        // The client must Err; only a client that never proposed crypto
+        // (with_crypto=false) may accept None.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            let (frame_type, _flags, _payload) = io.read_raw_v2_frame().await.unwrap();
+            assert_eq!(frame_type, V2_FRAME_TYPE_CLIENT_HELLO);
+            // Answer with a ServerHello that selects NO crypto at all.
+            let sh_json = serde_json::to_vec(&ServerHello::default_ok()).unwrap();
+            io.write_raw_v2_frame(V2_FRAME_TYPE_SERVER_HELLO, 0, &sh_json)
+                .await
+                .unwrap();
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        let hello_json = v2_handshake_client_send_hello(&mut client_io, "tcp", false, true, true)
+            .await
+            .unwrap();
+        let result =
+            v2_handshake_client_recv_hello(&mut client_io, &hello_json, "tcp", false, true, true)
+                .await;
+        assert!(
+            matches!(result, Err(crate::Error::Protocol(_))),
+            "crypto-proposing client must reject a crypto-less ServerHello, got {result:?}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_without_crypto_offer_accepts_crypto_less_server_hello() {
+        // Rust↔Rust plain V2 (with_crypto=false): no crypto was proposed,
+        // so a ServerHello without a crypto selection is the expected
+        // handshake — Ok(None), not an error.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            let (frame_type, _flags, _payload) = io.read_raw_v2_frame().await.unwrap();
+            assert_eq!(frame_type, V2_FRAME_TYPE_CLIENT_HELLO);
+            let sh_json = serde_json::to_vec(&ServerHello::default_ok()).unwrap();
+            io.write_raw_v2_frame(V2_FRAME_TYPE_SERVER_HELLO, 0, &sh_json)
+                .await
+                .unwrap();
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        let hello_json = v2_handshake_client_send_hello(&mut client_io, "tcp", false, true, false)
+            .await
+            .unwrap();
+        let result =
+            v2_handshake_client_recv_hello(&mut client_io, &hello_json, "tcp", false, true, false)
+                .await;
+        match result {
+            Ok(None) => {}
+            other => panic!("plain-V2 client must accept a crypto-less ServerHello, got {other:?}"),
+        }
+        server.await.unwrap();
     }
 }

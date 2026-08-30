@@ -75,6 +75,12 @@ pub(crate) struct VisitorListenerConfig {
     /// so the visitor segment matches the provider segment's packet codec
     /// when wire protocol v2 is negotiated; empty means JSON framing.
     pub udp_packet_codec: String,
+    #[cfg(feature = "quic")]
+    /// Client-configured QUIC transport params for the XTCP tunnel session
+    /// (Go `clientCfg.Transport.QUIC` — both the visitor's
+    /// `NewQUICTunnelSession(sv.clientCfg)` and the provider's
+    /// `listenByQUIC` read `clientCfg.Transport.QUIC`).
+    pub quic_params: frp_core::quic::QuicTransportParams,
 }
 
 /// Configuration for a no-bind `virtual_net` visitor tunnel.
@@ -202,23 +208,769 @@ fn plan_visitor_dial(
     }
 }
 
-/// XTCP retry decision after a failed NatHoleVisitor attempt.
+// ── Persistent XTCP tunnel session (Go frp v0.71 keepTunnelOpenWorker) ──
+//
+// Go frp v0.71 keeps ONE hole-punched data-plane session per XTCP visitor
+// (`KCPTunnelSession` / `QUICTunnelSession` in client/visitor/xtcp.go) and
+// reuses it across user connections. A dead session is closed and re-punched
+// in the background (`processTunnelStartEvents`), optionally kept alive by
+// `keepTunnelOpenWorker`. User connections wait up to a budget for the
+// session to yield a stream (`openTunnel` / `getTunnelConn`); there is NO
+// per-connection punch+retry loop anymore.
+
+/// Minimum gap between hole punches (Go `processTunnelStartEvents` sleeps
+/// the remainder of 10s after each makeNatHole).
+const MIN_PUNCH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A persistent XTCP data-plane session, one per visitor listener.
 ///
-/// Returns `None` when the per-connection cancellation token is cancelled —
-/// the visitor listener is shutting down and the task must drop the user
-/// connection and return without bridging (Go frpc cancels a per-visitor
-/// context on teardown). `Some(true)` retries with the next attempt;
-/// `Some(false)` gives up (attempt budget exhausted, or one-shot mode).
-fn xtcp_retry_decision(
-    cancelled: bool,
-    keep_tunnel_open: bool,
-    attempt: usize,
-    max_retries: usize,
-) -> Option<bool> {
-    if cancelled {
-        return None;
+/// `Kcp` is the yamux-over-KCP session (raw KCP when `tcp-mux` is off; an
+/// erroring stub when `kcp` is off — tiny/micro builds fall back to STCP).
+/// `Quic` is the QUIC session (no yamux), requiring both `quic` and `kcp`
+/// features (the QUIC data plane reuses the KCP hole-punch machinery).
+pub(crate) enum TunnelSession {
+    Kcp(frp_core::xtcp_p2p::XtcpTunnelSession),
+    #[cfg(all(feature = "quic", feature = "kcp"))]
+    Quic(frp_core::xtcp_p2p::QuicTunnelSession),
+}
+
+impl TunnelSession {
+    /// Open a new stream (visitor / client role).
+    pub(crate) async fn open_stream(
+        &self,
+        timeout: Duration,
+    ) -> Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> {
+        match self {
+            TunnelSession::Kcp(s) => s.open_stream(timeout).await,
+            #[cfg(all(feature = "quic", feature = "kcp"))]
+            TunnelSession::Quic(s) => s.open_stream(timeout).await,
+        }
     }
-    Some(keep_tunnel_open && attempt < max_retries)
+
+    /// Accept the next inbound stream (provider / server role).
+    pub(crate) async fn accept_stream(
+        &self,
+        timeout: Duration,
+    ) -> Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> {
+        match self {
+            TunnelSession::Kcp(s) => s.accept_stream(timeout).await,
+            #[cfg(all(feature = "quic", feature = "kcp"))]
+            TunnelSession::Quic(s) => s.accept_stream(timeout).await,
+        }
+    }
+
+    /// Whether the session is alive.
+    pub(crate) fn is_alive(&self) -> bool {
+        match self {
+            TunnelSession::Kcp(s) => s.is_alive(),
+            #[cfg(all(feature = "quic", feature = "kcp"))]
+            TunnelSession::Quic(s) => s.is_alive(),
+        }
+    }
+
+    /// Whether opening a throwaway probe stream is safe for this session.
+    ///
+    /// The no-tcp-mux raw-KCP session is ONE-SHOT: `open_stream` hands out
+    /// the session's only stream and flips `alive=false` — a keepalive probe
+    /// would SPEND a freshly punched session and force a re-punch churn on
+    /// the next user connection. Go has no such mode (its KCP tunnel is
+    /// always yamux-wrapped), so there is no parity constraint; user
+    /// connections re-punch on demand. QUIC and yamux sessions multiplex
+    /// streams, so probing them is harmless.
+    pub(crate) fn probe_safe(&self) -> bool {
+        match self {
+            #[cfg(not(feature = "tcp-mux"))]
+            TunnelSession::Kcp(_) => false,
+            #[cfg(feature = "tcp-mux")]
+            TunnelSession::Kcp(_) => true,
+            #[cfg(all(feature = "quic", feature = "kcp"))]
+            TunnelSession::Quic(_) => true,
+        }
+    }
+
+    /// Close the session (releases the UDP socket / KCP / yamux / QUIC).
+    pub(crate) async fn close(&self) {
+        match self {
+            TunnelSession::Kcp(s) => s.close().await,
+            #[cfg(all(feature = "quic", feature = "kcp"))]
+            TunnelSession::Quic(s) => s.close().await,
+        }
+    }
+}
+
+/// Config for the background XTCP hole-punch task (Go `makeNatHole`).
+/// Cloned once per listener; drives `do_hole_punch` in
+/// `process_tunnel_start_events` / `keep_tunnel_open_worker`.
+#[derive(Clone)]
+struct XtcpPunchConfig {
+    visitor_name: String,
+    /// target server proxy name (`server_name`).
+    sn: String,
+    /// secret key for auth + detect probing.
+    sk: String,
+    stun_server: String,
+    /// XTCP P2P data plane protocol: "quic" (default, Go parity) or "kcp".
+    pp: String,
+    /// disable assisted addresses.
+    daa: bool,
+    /// Control-channel sender for NatHoleVisitor.
+    vtx: mpsc::Sender<crate::service::VisitorRequest>,
+    /// Listener-teardown token. `do_hole_punch` races its awaits (pre_check,
+    /// NatHoleResp, MakeHole) against this so a cancelled listener exits in
+    /// milliseconds instead of lingering through the full punch sequence
+    /// (pre_check 5s + NatHoleResp 15s + punch up to ~35s ≈ 50s).
+    cancel: CancellationToken,
+    #[cfg(feature = "quic")]
+    /// Client-configured QUIC transport params for the tunnel session (Go
+    /// `clientCfg.Transport.QUIC` — both the visitor and provider tunnel
+    /// sessions read it).
+    quic_params: frp_core::quic::QuicTransportParams,
+}
+
+/// Full XTCP hole punch (Go `makeNatHole`): PreCheck → STUN → NatHoleVisitor
+/// exchange → MakeHole → session creation. Returns the persistent session —
+/// NO stream is opened here (streams are opened per user connection).
+/// Server-supplied `read_timeout_ms` → punch timeout (ms). Go MakeHole
+/// floors the guard at 5s (`timeout := 5*time.Second; if
+/// m.DetectBehavior.ReadTimeoutMs > 0`, nathole.go:248-250) — a
+/// hostile/misbehaving server sending 0 or negative must not make the punch
+/// fail instantly. Capped at
+/// [`frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS`] (60s): Go's analyzer
+/// emits ReadTimeoutMs ≤ ~45s, so anything above is a hostile server
+/// stretching the punch (`read_timeout_ms` is i32 — uncapped it would wait
+/// ~24.8 days before the visitor could re-punch).
+fn clamp_hp_timeout(read_timeout_ms: i32) -> u64 {
+    // DEFAULT_HOLE_PUNCH_TIMEOUT_MS <= MAX_HOLE_PUNCH_TIMEOUT_MS (constant
+    // invariant), so `clamp` cannot panic.
+    (read_timeout_ms.max(0) as u64).clamp(
+        frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS,
+        frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS,
+    )
+}
+
+async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
+    // 1. PreCheck: validate proxy existence/permissions before STUN (Go
+    //    nathole.PreCheck, 5s timeout). A timeout proceeds with the full
+    //    request — graceful degradation against servers that ignore
+    //    pre_check. In the background-task model a 5s wait cannot stall a
+    //    user connection, so the full Go timeout is used (the old
+    //    per-connection code shortened it to 1s).
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let sign_key = if cfg.sk.is_empty() {
+            None
+        } else {
+            Some(frp_core::auth::generate_token(&cfg.sk, ts))
+        };
+        let pre_check_req = crate::service::VisitorRequest {
+            nhv: msg::NatHoleVisitor {
+                transaction_id: uuid::Uuid::new_v4().to_string(),
+                proxy_name: cfg.sn.clone(),
+                pre_check: true,
+                protocol: Some(cfg.pp.to_string()),
+                sign_key,
+                timestamp: Some(ts),
+                mapped_addrs: None,
+                assisted_addrs: None,
+            },
+            reply: reply_tx,
+        };
+        if cfg.vtx.try_send(pre_check_req).is_err() {
+            // try_send also fails on Full (backpressure) — a closed channel
+            // and a backlogged control loop are different failures.
+            return Err(if cfg.vtx.is_closed() {
+                "failed to send pre_check to control loop (channel closed)".into()
+            } else {
+                "failed to send pre_check to control loop (backlogged, not draining)".into()
+            });
+        }
+        match tokio::select! {
+            _ = cfg.cancel.cancelled() => {
+                return Err(format!(
+                    "Visitor '{}': pre_check cancelled (listener shutting down)",
+                    cfg.visitor_name
+                ));
+            }
+            r = tokio::time::timeout(Duration::from_secs(5), reply_rx) => r,
+        } {
+            Ok(Ok(Ok(resp))) => {
+                if let Some(err) = resp.error {
+                    return Err(format!("pre_check failed: {err}"));
+                }
+            }
+            Ok(Ok(Err(e))) => return Err(format!("pre_check error: {e}")),
+            Ok(Err(_)) => return Err("pre_check channel closed (control loop dropped)".into()),
+            Err(_elapsed) => {
+                warn!(visitor_name = %cfg.visitor_name, "Visitor '{}': pre_check timed out after 5s, proceeding with full request", cfg.visitor_name);
+            }
+        }
+    }
+
+    // 2. STUN discovery: first STUN gives the mapped address + optional
+    //    OTHER-ADDRESS (RFC 5780); use it (or the same server) for the
+    //    second request so the NAT classifier gets ≥2 addresses. The socket
+    //    is reused for the punch + data plane. Both STUN awaits are raced
+    //    against cfg.cancel so listener teardown aborts the STUN phase too
+    //    (the socket is dropped with the future — the shutdown exits in
+    //    milliseconds instead of lingering through the STUN timeouts).
+    let stun_first = tokio::select! {
+        _ = cfg.cancel.cancelled() => {
+            return Err(format!(
+                "Visitor '{}': STUN cancelled (listener shutting down)",
+                cfg.visitor_name
+            ));
+        }
+        r = frp_core::stun::stun_binding_with_details(&cfg.stun_server) => r,
+    };
+    let (stun_socket, mapped_addrs, assisted_addrs) = match stun_first {
+        Ok((sock, result1)) => {
+            let addr1 = result1.mapped_addr;
+            debug!(visitor_name = %cfg.visitor_name, addr = %addr1, "Visitor '{}': STUN #1: {}", cfg.visitor_name, addr1);
+            let mut addrs = vec![addr1];
+            let second_target = result1.other_addr.as_deref().unwrap_or(&cfg.stun_server);
+            let stun_second = tokio::select! {
+                _ = cfg.cancel.cancelled() => {
+                    return Err(format!(
+                        "Visitor '{}': STUN #2 cancelled (listener shutting down)",
+                        cfg.visitor_name
+                    ));
+                }
+                r = frp_core::stun::stun_binding_on_socket(&sock, second_target) => r,
+            };
+            match stun_second {
+                Ok(addr2) => {
+                    debug!(visitor_name = %cfg.visitor_name, addr = %addr2, "Visitor '{}': STUN #2 from '{}': {}", cfg.visitor_name, second_target, addr2);
+                    addrs.push(addr2);
+                }
+                Err(e) => {
+                    warn!(visitor_name = %cfg.visitor_name, error = %e, "Visitor '{}': STUN #2 failed: {}", cfg.visitor_name, e);
+                }
+            }
+            let assisted = if cfg.daa {
+                vec![]
+            } else {
+                let stun_port = sock.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+                let local_ips = list_local_ips();
+                debug!(
+                    visitor_name = %cfg.visitor_name, local_ips = ?local_ips, port = %stun_port,
+                    "Visitor '{}': building assisted_addrs from {} local IPs port {}",
+                    cfg.visitor_name, local_ips.len(), stun_port
+                );
+                local_ips
+                    .into_iter()
+                    .map(|ip| format!("{}:{}", ip, stun_port))
+                    .collect()
+            };
+            (Some(sock), addrs, assisted)
+        }
+        Err(e) => {
+            warn!(visitor_name = %cfg.visitor_name, error = %e, "Visitor '{}': STUN failed: {}", cfg.visitor_name, e);
+            (None, vec![], vec![])
+        }
+    };
+    let Some(socket) = stun_socket else {
+        return Err(format!(
+            "Visitor '{}': STUN failed, no socket for XTCP P2P",
+            cfg.visitor_name
+        ));
+    };
+
+    // 3. Send NatHoleVisitor on the control connection and wait for
+    //    NatHoleResp (5s — Go frp client/xtcp.go waits 5s for the server's
+    //    NatHoleResp; the server's own NAT_HOLE_TIMEOUT is 10s).
+    let txn_id = uuid::Uuid::new_v4().to_string();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let sign_key = if cfg.sk.is_empty() {
+        None
+    } else {
+        Some(frp_core::auth::generate_token(&cfg.sk, ts))
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let nhv = crate::service::VisitorRequest {
+        nhv: msg::NatHoleVisitor {
+            transaction_id: txn_id.clone(),
+            proxy_name: cfg.sn.clone(),
+            pre_check: false,
+            protocol: Some(cfg.pp.to_string()),
+            sign_key,
+            timestamp: Some(ts),
+            mapped_addrs: if mapped_addrs.is_empty() {
+                None
+            } else {
+                Some(mapped_addrs.clone())
+            },
+            assisted_addrs: if assisted_addrs.is_empty() {
+                None
+            } else {
+                Some(assisted_addrs)
+            },
+        },
+        reply: reply_tx,
+    };
+    if cfg.vtx.try_send(nhv).is_err() {
+        // try_send also fails on Full (backpressure) — a closed channel and a
+        // backlogged control loop are different failures.
+        return Err(if cfg.vtx.is_closed() {
+            "failed to send NatHoleVisitor to control loop (channel closed)".into()
+        } else {
+            "failed to send NatHoleVisitor to control loop (backlogged, not draining)".into()
+        });
+    }
+    let resp = match tokio::select! {
+        _ = cfg.cancel.cancelled() => {
+            return Err(format!(
+                "Visitor '{}': NatHoleResp wait cancelled (listener shutting down)",
+                cfg.visitor_name
+            ));
+        }
+        r = tokio::time::timeout(Duration::from_secs(5), reply_rx) => r,
+    } {
+        Ok(Ok(Ok(resp))) => resp,
+        Ok(Ok(Err(e))) => return Err(format!("NatHoleResp error from server: {e}")),
+        Ok(Err(_)) => return Err("NatHoleResp channel closed (control loop dropped)".into()),
+        Err(_elapsed) => return Err("NatHoleResp timed out after 5s".into()),
+    };
+    debug!(visitor_name = %cfg.visitor_name, "Visitor '{}': received NatHoleResp from server", cfg.visitor_name);
+
+    let candidates = resp.candidate_addrs.unwrap_or_default();
+    debug!(visitor_name = %cfg.visitor_name, candidate_count = %candidates.len(), "Visitor '{}': got {} candidate addresses from server", cfg.visitor_name, candidates.len());
+
+    // 4. UDP hole punch + session creation (Go v0.71 tunnel-session model —
+    //    the session, not a single stream, is the punch result).
+    let sid = resp.sid.clone().unwrap_or_default();
+    let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
+    let kcp_cfg = frp_core::kcp::default_kcp_config();
+    let p2p_key = if !cfg.sk.is_empty() {
+        Some(frp_core::xtcp_p2p::derive_detect_key(&cfg.sk))
+    } else {
+        None
+    };
+    let p2p_sid = if sid.is_empty() {
+        None
+    } else {
+        Some(sid.as_str())
+    };
+    // Use read_timeout_ms from the server's detect_behavior as the
+    // hole-punch timeout (Go parity); default to Go's MakeHole 5s (see
+    // `clamp_hp_timeout` for the floor/cap semantics).
+    let hp_timeout = resp
+        .detect_behavior
+        .as_ref()
+        .map(|db| clamp_hp_timeout(db.read_timeout_ms))
+        .unwrap_or(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS);
+    let assisted = resp.assisted_addrs.clone().unwrap_or_default();
+    let behavior = resp.detect_behavior.clone();
+    // Data-plane protocol dispatch (Go parity, client/visitor/xtcp.go:57-60):
+    // ONLY "kcp" selects the KCP+yamux data plane; anything else — "quic",
+    // "", or an unknown value — selects QUIC. The config layer already
+    // normalizes an explicitly empty protocol to "quic" (Go EmptyOr), so ""
+    // here means a non-Rust peer or a hostile server echo.
+    let session_fut = async {
+        if cfg.pp.as_str() == "kcp" {
+            let s = frp_core::xtcp_p2p::xtcp_p2p_connect_yamux_session(
+                socket,
+                &candidates,
+                &assisted,
+                behavior.as_ref(),
+                conv,
+                kcp_cfg,
+                hp_timeout,
+                true, // yamux_client = visitor
+                p2p_sid,
+                p2p_key.as_ref(),
+            )
+            .await?;
+            Ok(TunnelSession::Kcp(s))
+        } else {
+            #[cfg(all(feature = "quic", feature = "kcp"))]
+            {
+                let s = frp_core::xtcp_session::xtcp_p2p_connect_quic_session_with_params(
+                    socket,
+                    &candidates,
+                    &assisted,
+                    behavior.as_ref(),
+                    hp_timeout,
+                    p2p_sid,
+                    p2p_key.as_ref(),
+                    false, // is_server = false (visitor is QUIC client)
+                    cfg.quic_params.clone(),
+                )
+                .await?;
+                Ok(TunnelSession::Quic(s))
+            }
+            #[cfg(not(all(feature = "quic", feature = "kcp")))]
+            {
+                warn!(visitor_name = %cfg.visitor_name, "Visitor '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)", cfg.visitor_name);
+                Err(format!(
+                    "Visitor '{}': protocol 'quic' requires both the quic and kcp features",
+                    cfg.visitor_name
+                ))
+            }
+        }
+    };
+    // Race the punch (up to hp_timeout ≈ 35s) against listener teardown so
+    // the background task exits promptly instead of lingering.
+    tokio::pin!(session_fut);
+    tokio::select! {
+        _ = cfg.cancel.cancelled() => {
+            Err(format!(
+                "Visitor '{}': hole punch cancelled (listener shutting down)",
+                cfg.visitor_name
+            ))
+        }
+        r = &mut session_fut => r,
+    }
+}
+
+/// Go frp v0.71 `processTunnelStartEvents`: on each start signal, punch a
+/// new hole and swap the fresh session into the slot (closing the old one
+/// first). At least `MIN_PUNCH_INTERVAL` between punches.
+async fn process_tunnel_start_events(
+    cfg: XtcpPunchConfig,
+    slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>>,
+    mut start_rx: mpsc::Receiver<()>,
+    armed: &AtomicBool,
+    cancel: CancellationToken,
+) {
+    loop {
+        // Parked-gate (Go unbuffered startTunnelCh): while this receiver is
+        // parked in recv, non-blocking senders may deliver a signal; once a
+        // signal arrives the gate drops — the receiver is busy punching and
+        // sleeping, and further signals are dropped, exactly like a send to
+        // Go's unbuffered channel while the receiver is not in select.
+        // Release/Acquire (not Relaxed): the store must be visible to a
+        // sender's load BEFORE the sender's channel send, and the load on
+        // the send side must not observe a stale "not parked" — a lost
+        // signal on weak-memory CPUs would strand the session until the
+        // next user connection. Zero cost on x86.
+        //
+        // L22: the sender's check-then-send is not atomic — a sender can
+        // load `armed==true` just before our dequeue flips it false and
+        // deliver a signal the busy receiver never asked for. That stale
+        // signal would be consumed immediately on re-parking, triggering a
+        // redundant punch (during which genuine signals are dropped — Go's
+        // unbuffered channel drops them too, but only because the receiver
+        // is NOT in select). Draining before re-parking removes stale
+        // signals, restoring Go's drop-while-busy semantics exactly.
+        while start_rx.try_recv().is_ok() {}
+        armed.store(true, Ordering::Release);
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = start_rx.recv() => {
+                armed.store(false, Ordering::Release);
+                let start = std::time::Instant::now();
+                match do_hole_punch(&cfg).await {
+                    Ok(new_session) => {
+                        let old = {
+                            let mut guard = slot.lock().await;
+                            guard.replace(Arc::new(new_session))
+                        };
+                        if let Some(old) = old {
+                            old.close().await;
+                        }
+                        info!(visitor_name = %cfg.visitor_name, "Visitor '{}': XTCP tunnel session (re)established", cfg.visitor_name);
+                    }
+                    Err(e) => {
+                        warn!(visitor_name = %cfg.visitor_name, error = %e, "Visitor '{}': XTCP hole punch failed: {}", cfg.visitor_name, e);
+                    }
+                }
+                // avoid too frequently (Go: sleep remainder of 10s)
+                let elapsed = start.elapsed();
+                if elapsed < MIN_PUNCH_INTERVAL {
+                    tokio::select! {
+                        _ = tokio::time::sleep(MIN_PUNCH_INTERVAL - elapsed) => {}
+                        _ = cancel.cancelled() => return,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Go frp v0.71 `getTunnelConn`: open a stream on the persistent session.
+///
+/// Error taxonomy (the session's own `open_stream` wording, see
+/// frp-core/src/xtcp_session.rs):
+/// - "timeout opening tunnel stream (...)" — the session's driver is STILL
+///   ALIVE but could not serve the open within `timeout` (peer ACK backlog /
+///   stream-cap congestion). This is BUSY, not dead: closing the session
+///   would kill every in-flight bridge. Go never hits this — its KCP
+///   `session.Open()` blocks until a stream opens (fatedier yamux fork has
+///   no cap) and QUIC `OpenStreamSync(ctx)` waits on the caller's deadline —
+///   so a slow open is never treated as a dead session there. The 500ms
+///   user-connection probe can time out on a healthy session under a
+///   >64-open burst (the driver's 64-request queue cap) — see `open_tunnel`.
+/// - "tunnel session open queue full (peer stalled?)" — same family: the
+///   driver is alive but its 64-slot request queue is congested.
+/// - every other error (is_alive false, driver exited, connection error) is
+///   a DEAD session.
+///
+/// On a dead session: close it, clear the slot (only if it still holds THIS
+/// session — a re-punch may have swapped in a fresh one while we were
+/// failing) and signal `startTunnelCh` (non-blocking) so the re-punch task
+/// runs. The signal fires on EVERY error path — empty slot included (Go:
+/// getTunnelConn sends the non-blocking startTunnelCh after any OpenConn
+/// failure) — gated on the receiver being parked (`armed`): Go's unbuffered
+/// channel drops the signal when the receiver is busy punching/sleeping, so
+/// the gate keeps the cap-1 channel empty and drops those signals too.
+///
+/// `close_on_timeout`: the caller's verdict on the BUSY case. `open_tunnel`
+/// (500ms user probes) passes false — the session is healthy, just busy,
+/// and the probe is retried. `keep_tunnel_open_worker` (30s liveness probe)
+/// passes true — 30s without service means the session is effectively dead
+/// and must be re-punched (Go's worker closes + re-punches on any probe
+/// failure too).
+async fn get_tunnel_conn(
+    slot: &Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>>,
+    start_tx: &mpsc::Sender<()>,
+    armed: &AtomicBool,
+    timeout: Duration,
+    close_on_timeout: bool,
+) -> Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> {
+    let session = {
+        let guard = slot.lock().await;
+        match guard.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                // Go parity: getTunnelConn signals startTunnelCh (non-blocking)
+                // on every error path — with keep_tunnel_open=false the first
+                // user connection's failure is what triggers the initial punch.
+                if armed.load(Ordering::Acquire) {
+                    let _ = start_tx.try_send(());
+                }
+                return Err("no tunnel session".into());
+            }
+        }
+    };
+    match session.open_stream(timeout).await {
+        Ok(stream) => Ok(stream),
+        // Capacity errors PROVE the session is alive (its driver served the
+        // refusal) — never close for these, even when the caller
+        // (keepalive probe) treats probe timeouts as death: closing would
+        // kill every in-flight bridge on a healthy session.
+        Err(e) if is_session_capacity_error(&e) => Err(format!("tunnel session busy: {e}")),
+        Err(e) if is_busy_open_error(&e) => {
+            if close_on_timeout {
+                // The caller (keepalive probe) judged this a dead session.
+                close_and_signal(session, slot, start_tx, armed, &e).await
+            } else {
+                // Session alive but busy: do NOT close it (that would kill
+                // every in-flight bridge and force a 10s+ re-punch cascade);
+                // let the caller retry the probe.
+                Err(format!("tunnel session busy: {e}"))
+            }
+        }
+        Err(e) => close_and_signal(session, slot, start_tx, armed, &e).await,
+    }
+}
+
+/// Whether an `open_stream` error means "session alive but busy" rather
+/// than "session dead". See the taxonomy comment on `get_tunnel_conn`.
+fn is_busy_open_error(e: &str) -> bool {
+    is_session_capacity_error(e)
+        // Both session variants (yamux-over-KCP and QUIC) format open
+        // timeouts identically in frp-core/src/xtcp_session.rs. The timeout
+        // class is AMBIGUOUS (alive-but-stalled vs dead-but-undetected —
+        // KCP dead-link detection lags); the caller's `close_on_timeout`
+        // flag decides whether a probe timeout means death.
+        || e.starts_with("timeout opening tunnel stream")
+}
+
+/// Errors that prove the session driver is alive and serving requests — the
+/// open failed on CAPACITY, not health:
+/// - `yamux tunnel stream cap reached (256)`: the driver's own outbound-cap
+///   mirror refused the open (frp-core/src/xtcp_session.rs — per-open
+///   refusal so the session survives; Go's fatedier fork has no cap at all).
+/// - `tunnel session open queue full (peer stalled?)`: the driver's bounded
+///   64-slot request queue (open_stream fails fast instead of accumulating).
+///
+/// A 500ms probe hitting either on a busy-but-healthy session must NOT close
+/// the session (that was the round-10 HIGH: probe killed every in-flight
+/// bridge + forced a 10s+ re-punch cascade).
+fn is_session_capacity_error(e: &str) -> bool {
+    e.starts_with("yamux tunnel stream cap reached") || e.contains("tunnel session open queue full")
+}
+
+/// Close + clear the session and signal a re-punch (Go getTunnelConn error
+/// path). The slot is cleared only if it still holds THIS session, so a
+/// fresh session swapped in by a re-punch is not churned by a stale failure;
+/// the signal is gated on the receiver being parked (`armed`).
+async fn close_and_signal(
+    session: Arc<TunnelSession>,
+    slot: &Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>>,
+    start_tx: &mpsc::Sender<()>,
+    armed: &AtomicBool,
+    e: &str,
+) -> Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> {
+    session.close().await;
+    let mut guard = slot.lock().await;
+    let cleared = guard
+        .as_ref()
+        .map(|cur| Arc::ptr_eq(cur, &session))
+        .unwrap_or(false);
+    if cleared {
+        guard.take();
+    }
+    drop(guard);
+    if cleared && armed.load(Ordering::Acquire) {
+        let _ = start_tx.try_send(());
+    }
+    Err(e.to_string())
+}
+
+/// Go frp v0.71 `openTunnel`: poll `get_tunnel_conn` until a tunnel stream is
+/// available or `budget` expires. The effective budget is capped at 20s — Go
+/// ALWAYS wraps the caller's ctx in `context.WithTimeout(ctx, 20s)`
+/// (xtcp.go:202-206), so when `fallback_to` is set the budget is
+/// min(20s, fallback_timeout_ms), never the raw fallback timeout. Each probe
+/// is bounded by 500ms so a dead session cannot eat the whole budget on one
+/// attempt (Go: OpenConn carries the full deadline, timer.Reset(500ms) paces
+/// retries).
+///
+/// `get_tunnel_conn` is called with close_on_timeout=false: a probe TIMEOUT
+/// means the session is alive but busy (peer ACK backlog / request-queue
+/// congestion — e.g. a >64-concurrent-open burst), NOT dead — closing it
+/// would kill every in-flight bridge on that session. The busy error is
+/// retried like any other; the session stays in the slot. (Capacity errors
+/// — stream-cap reached / request queue full — never close the session
+/// regardless of the flag: they prove the driver is alive.)
+async fn open_tunnel(
+    visitor_name: &str,
+    slot: &Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>>,
+    start_tx: &mpsc::Sender<()>,
+    armed: &AtomicBool,
+    conn_cancel: &CancellationToken,
+    budget: Duration,
+) -> Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if conn_cancel.is_cancelled() {
+            return Err("visitor shutting down".into());
+        }
+        match get_tunnel_conn(
+            slot,
+            start_tx,
+            armed,
+            Duration::from_millis(500),
+            false, // probe timeout = busy session, not dead
+        )
+        .await
+        {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}': open tunnel attempt failed: {}", visitor_name, e);
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("open tunnel timeout after {budget:?}"));
+                }
+            }
+        }
+        // Pace attempts (Go: timer.Reset(500ms)); a healthy session answers
+        // in milliseconds so this only paces failures. Cancellation-aware: a
+        // bare sleep would park up to 500ms past shutdown.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = conn_cancel.cancelled() => return Err("visitor shutting down".into()),
+        }
+    }
+}
+
+/// Go frp v0.71 `keepTunnelOpenWorker`: keep a live session punched in the
+/// background. FIRST action is a BLOCKING startTunnelCh send (initial
+/// punch); then every `min_retry_interval` seconds probe the session via
+/// `get_tunnel_conn` — a healthy session yields a probe stream that is
+/// closed immediately; a failure waits on the retry limiter (token bucket:
+/// `max_retries_an_hour` per hour) before the next tick.
+async fn keep_tunnel_open_worker(
+    cfg: XtcpPunchConfig,
+    slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>>,
+    start_tx: mpsc::Sender<()>,
+    armed: &AtomicBool,
+    cancel: CancellationToken,
+    min_retry_interval: i64,
+    max_retries_an_hour: i32,
+) {
+    // FIRST action: blocking send (Go: `sv.startTunnelCh <- struct{}{}`).
+    // UNGATED on purpose: Go's initial send blocks until received; the
+    // cap-1 buffer absorbs it if the receiver has not parked yet (the gate
+    // covers only non-blocking sends — same net effect).
+    tokio::select! {
+        _ = start_tx.send(()) => {}
+        _ = cancel.cancelled() => return,
+    }
+    // Token bucket: burst = max_retries_an_hour, one token per
+    // (3600 / max_retries_an_hour) seconds (Go
+    // rate.NewLimiter(rate.Every(Hour/MaxRetriesAnHour), MaxRetriesAnHour)).
+    // The limiter starts full (Go rate.NewLimiter initial burst).
+    let burst = max_retries_an_hour.max(1) as usize;
+    let refill_secs = (3600.0 / max_retries_an_hour.max(1) as f64).max(1.0);
+    let mut tokens = burst;
+    let mut ticker = tokio::time::interval(Duration::from_secs(min_retry_interval.max(1) as u64));
+    // Consume the immediate first tick: the initial punch above already
+    // covers the first check (Go's ticker also fires after one interval).
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = ticker.tick() => {
+                // No-tcp-mux raw-KCP sessions are ONE-SHOT: `open_stream`
+                // spends the session's only stream, so every probe would
+                // force a re-punch churn on the next user connection. Go
+                // has no such mode (KCP tunnel is always yamux-wrapped);
+                // skip the probe — user connections re-punch on demand.
+                let probe_skipped = {
+                    let guard = slot.lock().await;
+                    guard
+                        .as_ref()
+                        .map(|s| !s.probe_safe())
+                        .unwrap_or(false)
+                };
+                if probe_skipped {
+                    continue;
+                }
+                // Probe the session: open a stream (bounded — a healthy
+                // session answers in milliseconds; 30s covers a
+                // dead-but-undetected peer until KCP dead-link trips).
+                // On success close the probe stream; on failure rate-limit
+                // and continue (Go: retryLimiter.Wait + continue).
+                // close_on_timeout=true: this is a liveness check, not a
+                // user open — 30s without service is a dead session, and
+                // Go's worker closes + re-punches on any probe failure.
+                // (Capacity errors — stream cap / request queue — still
+                // never close the session: the driver provably lives.)
+                match get_tunnel_conn(&slot, &start_tx, armed, Duration::from_secs(30), true)
+                    .await
+                {
+                    Ok(stream) => drop(stream),
+                    Err(e) => {
+                        warn!(visitor_name = %cfg.visitor_name, error = %e, "Visitor '{}': keepTunnelOpenWorker probe failed, rate-limiting retries", cfg.visitor_name);
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = wait_for_retry_token(&mut tokens, refill_secs) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Wait for the next retry token (token bucket, single consumer — the
+/// `keepTunnelOpenWorker`). Consumes one token when the burst is available;
+/// otherwise sleeps one refill interval (Go `rate.Limiter.Wait`).
+async fn wait_for_retry_token(tokens: &mut usize, refill_secs: f64) {
+    if *tokens > 0 {
+        *tokens -= 1;
+        return;
+    }
+    tokio::time::sleep(Duration::from_secs_f64(refill_secs)).await;
+    // Tokens stay at 0: the sleep IS the refill for this single consumer.
 }
 
 /// Run the packet loop over an established `virtual_net` visitor tunnel.
@@ -384,6 +1136,10 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         // SUDP-only: the STCP TCP accept path ignores the negotiated
         // UDPPacket codec.
         udp_packet_codec: _,
+        // Client QUIC transport params for the XTCP tunnel session (Go
+        // clientCfg.Transport.QUIC).
+        #[cfg(feature = "quic")]
+        quic_params,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -404,6 +1160,70 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
     // after 500ms): dropping the guard cancels the parent and every child.
     let listener_cancel = CancellationToken::new();
     let _cancel_guard = listener_cancel.clone().drop_guard();
+
+    // XTCP: persistent tunnel session state (Go frp v0.71 keepTunnelOpenWorker).
+    // One session slot + start-signal channel per listener, shared by the
+    // accept loop (open_tunnel → get_tunnel_conn), the background re-punch
+    // task (process_tunnel_start_events) and — when keep_tunnel_open is set —
+    // the keepTunnelOpenWorker. The session outlives individual user
+    // connections; only listener teardown cancels the background tasks.
+    let tunnel_slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    // Go: `startTunnelCh: make(chan struct{})` is UNBUFFERED (visitor.go:114)
+    // — a non-blocking send succeeds only while the receiver is parked in
+    // select. tokio's mpsc panics on capacity 0 ("requires buffer > 0"), so
+    // the cap-1 channel plus the `start_armed` flag emulate the Go unbuffered
+    // parked-gate: try_sends are gated on the flag (set only while the
+    // receiver is parked in recv), so a signal is never buffered mid-punch —
+    // the cap-1 slot stays empty.
+    let (start_tx, start_rx) = mpsc::channel::<()>(1);
+    let start_armed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    if visitor_type == "xtcp" {
+        let punch_cfg = XtcpPunchConfig {
+            visitor_name: name.clone(),
+            sn: server_name.clone(),
+            sk: secret_key.clone(),
+            stun_server: stun_server.clone(),
+            pp: p2p_protocol.clone(),
+            daa: disable_assisted_addrs,
+            vtx: visitor_tx.clone(),
+            cancel: listener_cancel.clone(),
+            #[cfg(feature = "quic")]
+            quic_params,
+        };
+        // processTunnelStartEvents (Go parity): re-punch on demand, ≥10s
+        // apart. Runs for the listener lifetime. It owns the receiver side of
+        // the parked-gate: armed=true only while it is parked in recv.
+        let slot_ev = tunnel_slot.clone();
+        let cancel_ev = listener_cancel.clone();
+        let punch_cfg_ev = punch_cfg.clone();
+        let armed_ev = start_armed.clone();
+        tokio::spawn(async move {
+            process_tunnel_start_events(punch_cfg_ev, slot_ev, start_rx, &armed_ev, cancel_ev).await
+        });
+        if keep_tunnel_open {
+            // keepTunnelOpenWorker (Go parity): keep the tunnel punched in
+            // the background. NO per-connection retry loop anymore — user
+            // connections wait on the session via open_tunnel.
+            let slot_w = tunnel_slot.clone();
+            let start_tx_w = start_tx.clone();
+            let cancel_w = listener_cancel.clone();
+            let armed_w = start_armed.clone();
+            tokio::spawn(async move {
+                keep_tunnel_open_worker(
+                    punch_cfg,
+                    slot_w,
+                    start_tx_w,
+                    &armed_w,
+                    cancel_w,
+                    min_retry_interval,
+                    max_retries_an_hour,
+                )
+                .await
+            });
+        }
+    }
 
     loop {
         // Check graceful shutdown signal before each accept (Go frp compat:
@@ -429,11 +1249,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let tls_sn = tls_server_name.clone();
                 let tls_ca = tls_ca_file.clone();
                 let vt = visitor_type.clone();
-                let stun_server = stun_server.clone();
-                let vtx = visitor_tx.clone();
                 let fb_to = fallback_to.clone();
-                let daa = disable_assisted_addrs;
-                let pp = p2p_protocol.clone();
                 let u = user.clone();
                 let rid = run_id.clone();
                 let transport = VisitorTransportConfig {
@@ -452,10 +1268,19 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 
                 // Per-connection shutdown token: a child of the listener
                 // token, cancelled on listener exit so this task aborts its
-                // XTCP retry loop / pending bridge instead of running out its
-                // retry budget after shutdown has been requested. The child
-                // dies with the task — no pruning needed.
+                // open-tunnel wait / pending bridge instead of running out its
+                // budget after shutdown has been requested. The child dies
+                // with the task — no pruning needed.
                 let conn_cancel = listener_cancel.child_token();
+
+                // XTCP: the listener's session slot + re-punch signal, shared
+                // with the background tasks above (Go v0.71 persistent tunnel).
+                // `start_armed` is the parked-gate: signals only reach the
+                // receiver while it is parked in recv (Go unbuffered
+                // startTunnelCh semantics).
+                let tunnel_slot = tunnel_slot.clone();
+                let start_tx = start_tx.clone();
+                let start_armed = start_armed.clone();
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
@@ -465,461 +1290,105 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                     let yamux_keepalive = plan.yamux_keepalive_secs;
 
                     if vt == "xtcp" {
-                        // --- XTCP NAT hole punch via control connection ---
-                        // Go frps v0.69.1 only handles NatHoleVisitor on the existing
-                        // control connection path, not on fresh TCP connections.
-                        // We send the message through the control loop and receive the
-                        // NatHoleResp via a oneshot channel.
-                        // When keep_tunnel_open is false, still retry once (2 total attempts).
-                        // TCP simultaneous open timing is finicky — a second attempt with fresh
-                        // STUN addresses often succeeds even when the first times out.
-                        // When keep_tunnel_open is true, use the configured retry count/delay.
-                        let max_retries = if keep_tunnel_open {
-                            max_retries_an_hour.max(0) as usize
-                        } else {
-                            1 // 2 total attempts
-                        };
-                        let retry_delay = if keep_tunnel_open {
-                            Duration::from_secs(min_retry_interval.max(1) as u64)
-                        } else {
-                            Duration::from_secs(2) // Quick retry for one-shot mode
-                        };
-                        let mut hole_punch_ok = false;
+                        // --- XTCP persistent tunnel session (Go frp v0.71) ---
+                        // The listener owns ONE hole-punched data-plane session,
+                        // reused across user connections (Go getTunnelConn /
+                        // openTunnel). A dead session is closed + re-punched in
+                        // the background by process_tunnel_start_events; there is
+                        // NO per-connection punch+retry loop anymore.
                         // Wrap in Option — P2P success arm moves it out via take().
                         let mut user_conn = Some(user_conn);
 
-                        // --- PreCheck: validate proxy existence/permissions before STUN ---
-                        // Go frp two-phase approach: first send pre_check=true to validate
-                        // auth/permissions, THEN do STUN + full request. Skipping this
-                        // wastes STUN calls on auth/proxy-not-found failures.
+                        // Go openTunnel budget: openTunnel ALWAYS wraps the
+                        // ctx in a 20s timeout (xtcp.go:202-206), so with
+                        // fallback_to set the effective budget is
+                        // min(20s, fallback_timeout_ms) — never the raw
+                        // fallback timeout. A failing open signals the
+                        // background re-punch (startTunnelCh) inside the
+                        // budget.
+                        let budget = if fb_to.is_empty() {
+                            Duration::from_secs(20)
+                        } else {
+                            Duration::from_millis(fallback_timeout_ms.clamp(1, 20_000))
+                        };
+                        match open_tunnel(
+                            &visitor_name,
+                            &tunnel_slot,
+                            &start_tx,
+                            &start_armed,
+                            &conn_cancel,
+                            budget,
+                        )
+                        .await
                         {
-                            let (reply_tx, reply_rx) = oneshot::channel();
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64;
-                            let sign_key = if sk.is_empty() {
-                                None
-                            } else {
-                                Some(frp_core::auth::generate_token(&sk, ts))
-                            };
-                            let pre_check_req = crate::service::VisitorRequest {
-                                nhv: msg::NatHoleVisitor {
-                                    transaction_id: uuid::Uuid::new_v4().to_string(),
-                                    proxy_name: sn.clone(),
-                                    pre_check: true,
-                                    protocol: Some(pp.to_string()),
-                                    sign_key,
-                                    timestamp: Some(ts),
-                                    mapped_addrs: None,
-                                    assisted_addrs: None,
-                                },
-                                reply: reply_tx,
-                            };
-                            if vtx.try_send(pre_check_req).is_err() {
-                                warn!(visitor_name = %visitor_name, "Visitor '{}': failed to send pre_check to control loop (channel closed)", visitor_name);
-                                return;
-                            }
-                            debug!(visitor_name = %visitor_name, sn = %sn, "Visitor '{}': sent NatHoleVisitor pre_check for '{}'", visitor_name, sn);
-
-                            match tokio::time::timeout(Duration::from_secs(1), reply_rx).await {
-                                Ok(Ok(Ok(resp))) => {
-                                    if let Some(err) = resp.error {
-                                        warn!(visitor_name = %visitor_name, error = %err, "Visitor '{}': pre_check failed: {}", visitor_name, err);
-                                        return;
-                                    }
-                                    debug!(visitor_name = %visitor_name, sn = %sn, "Visitor '{}': pre_check OK for '{}'", visitor_name, sn);
+                            Ok(mut p2p_stream) => {
+                                // Shutdown boundary: don't start the P2P bridge —
+                                // drop the user connection and return.
+                                if conn_cancel.is_cancelled() {
+                                    info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP P2P connection", visitor_name);
+                                    return; // drops the user connection unbridged
                                 }
-                                Ok(Ok(Err(e))) => {
-                                    warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': pre_check error: {}", visitor_name, e);
-                                    return;
-                                }
-                                Ok(Err(_)) => {
-                                    warn!(visitor_name = %visitor_name, "Visitor '{}': pre_check channel closed (control loop dropped)", visitor_name);
-                                    return;
-                                }
-                                Err(_elapsed) => {
-                                    // Timeout on pre_check: server may not support
-                                    // pre_check on control channel. Proceed with
-                                    // full request anyway (graceful degradation).
-                                    // Short timeout — 15s per connection stalled
-                                    // every XTCP connect against servers that
-                                    // ignore pre_check.
-                                    warn!(visitor_name = %visitor_name, "Visitor '{}': pre_check timed out after 1s, proceeding with full request", visitor_name);
-                                }
-                            }
-                        }
-
-                        for attempt in 0..=max_retries {
-                            // Shutdown boundary: abandon the connection
-                            // between attempts. Never checked mid-hole-punch —
-                            // an in-flight STUN/MakeHole attempt runs to its
-                            // own timeout before this boundary is reached.
-                            if conn_cancel.is_cancelled() {
-                                info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
-                                return; // drops the user connection unbridged
-                            }
-                            if attempt > 0 {
-                                debug!(
-                                    visitor_name = %visitor_name, attempt = %attempt, max_retries = %max_retries, retry_delay = ?retry_delay,
-                                    "Visitor '{}': XTCP retry {}/{} after {:?}",
-                                    visitor_name, attempt, max_retries, retry_delay
-                                );
-                                // Round 6 (LOW C4): the plain sleep was NOT
-                                // cancel-aware — a shutdown landing mid-delay
-                                // left the visitor parked for the full
-                                // retry_delay. Race the delay against the
-                                // cancellation token like every other
-                                // shutdown boundary in this loop.
-                                tokio::select! {
-                                    _ = tokio::time::sleep(retry_delay) => {}
-                                    _ = conn_cancel.cancelled() => {
-                                        info!(visitor_name = %visitor_name, "Visitor '{}': shutting down during retry delay, abandoning XTCP connection", visitor_name);
-                                        return; // drops the user connection unbridged
-                                    }
-                                }
-                            }
-
-                            // --- STUN Discovery (UDP socket for XTCP P2P) ---
-                            // Go frp v0.70 NAT classifier needs ≥2 mapped
-                            // addresses. Reuse the same UDP socket for both
-                            // STUN calls and subsequent KCP data plane.
-                            //
-                            // First STUN: get mapped address + optional OTHER-ADDRESS
-                            // (RFC 5780). If OTHER-ADDRESS is present, use it for the
-                            // second STUN request (Go frp discovery.go:137-138 dual-server
-                            // NAT probing). Otherwise fall back to the same stun_server.
-                            let (stun_socket, mapped_addrs, assisted_addrs) =
-                                match frp_core::stun::stun_binding_with_details(&stun_server).await
-                                {
-                                    Ok((sock, result1)) => {
-                                        let addr1 = result1.mapped_addr;
-                                        debug!(visitor_name = %visitor_name, addr = %addr1, "Visitor '{}': STUN #1: {}", visitor_name, addr1);
-                                        let mut addrs = vec![addr1];
-
-                                        // Use OTHER-ADDRESS as second STUN target if available
-                                        // (Go frp discovery.go:137 dual-server probing).
-                                        let second_target =
-                                            result1.other_addr.as_deref().unwrap_or(&stun_server);
-                                        match frp_core::stun::stun_binding_on_socket(
-                                            &sock,
-                                            second_target,
-                                        )
-                                        .await
-                                        {
-                                            Ok(addr2) => {
-                                                debug!(visitor_name = %visitor_name, addr = %addr2, "Visitor '{}': STUN #2 from '{}': {}", visitor_name, second_target, addr2);
-                                                // Go frp NAT classifier needs ≥2 addresses.
-                                                // Always push — Go frp doesn't dedup, and
-                                                // fewer than 2 causes "not enough addresses".
-                                                addrs.push(addr2);
-                                            }
-                                            Err(e) => {
-                                                warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN #2 failed: {}", visitor_name, e);
-                                            }
-                                        }
-
-                                        // Build assisted addresses from local IPs + STUN socket port
-                                        // (Go frp nathole.go:143-150 ListLocalIPsForNatHole).
-                                        let assisted = if daa {
-                                            vec![]
-                                        } else {
-                                            let stun_port = sock
-                                                .local_addr()
-                                                .ok()
-                                                .map(|a| a.port())
-                                                .unwrap_or(0);
-                                            let local_ips = list_local_ips();
-                                            debug!(
-                                                visitor_name = %visitor_name, local_ips = ?local_ips, port = %stun_port,
-                                                "Visitor '{}': building assisted_addrs from {} local IPs port {}",
-                                                visitor_name, local_ips.len(), stun_port
-                                            );
-                                            local_ips
-                                                .into_iter()
-                                                .map(|ip| format!("{}:{}", ip, stun_port))
-                                                .collect()
-                                        };
-                                        (Some(sock), addrs, assisted)
-                                    }
-                                    Err(e) => {
-                                        warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN failed: {}", visitor_name, e);
-                                        (None, vec![], vec![])
-                                    }
-                                };
-
-                            // --- Send NatHoleVisitor on control connection ---
-                            let txn_id = uuid::Uuid::new_v4().to_string();
-                            // Generate auth credentials (Go frps v0.69.1 requires sign_key+timestamp)
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64;
-                            let sign_key = if sk.is_empty() {
-                                None
-                            } else {
-                                Some(frp_core::auth::generate_token(&sk, ts))
-                            };
-                            let (reply_tx, reply_rx) = oneshot::channel();
-                            // Go v0.70 compat: XTCP P2P uses KCP over UDP.
-                            let nhv = crate::service::VisitorRequest {
-                                nhv: msg::NatHoleVisitor {
-                                    transaction_id: txn_id.clone(),
-                                    proxy_name: sn.clone(),
-                                    pre_check: false,
-                                    protocol: Some(pp.to_string()),
-                                    sign_key,
-                                    timestamp: Some(ts),
-                                    mapped_addrs: if mapped_addrs.is_empty() {
-                                        None
-                                    } else {
-                                        Some(mapped_addrs.clone())
-                                    },
-                                    assisted_addrs: if assisted_addrs.is_empty() {
-                                        None
-                                    } else {
-                                        Some(assisted_addrs)
-                                    },
-                                },
-                                reply: reply_tx,
-                            };
-                            if vtx.try_send(nhv).is_err() {
-                                warn!(visitor_name = %visitor_name, "Visitor '{}': failed to send NatHoleVisitor to control loop (channel closed)", visitor_name);
-                                return;
-                            }
-                            debug!(visitor_name = %visitor_name, sn = %sn, "Visitor '{}': sent NatHoleVisitor on control connection for '{}'", visitor_name, sn);
-
-                            // --- Wait for NatHoleResp from control loop ---
-                            // Timeout after 15s (server NAT_HOLE_TIMEOUT is 10s)
-                            let resp = match tokio::time::timeout(Duration::from_secs(15), reply_rx)
-                                .await
-                            {
-                                Ok(Ok(Ok(resp))) => resp,
-                                Ok(Ok(Err(e))) => {
-                                    warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': NatHoleResp error from server: {}", visitor_name, e);
-                                    match xtcp_retry_decision(
-                                        conn_cancel.is_cancelled(),
-                                        keep_tunnel_open,
-                                        attempt,
-                                        max_retries,
-                                    ) {
-                                        Some(true) => continue,
-                                        Some(false) => return,
-                                        None => {
-                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
-                                            return; // drops the user connection unbridged
-                                        }
-                                    }
-                                }
-                                Ok(Err(_)) => {
-                                    warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp channel closed (control loop dropped)", visitor_name);
-                                    match xtcp_retry_decision(
-                                        conn_cancel.is_cancelled(),
-                                        keep_tunnel_open,
-                                        attempt,
-                                        max_retries,
-                                    ) {
-                                        Some(true) => continue,
-                                        Some(false) => return,
-                                        None => {
-                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
-                                            return; // drops the user connection unbridged
-                                        }
-                                    }
-                                }
-                                Err(_elapsed) => {
-                                    warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp timed out after 15s", visitor_name);
-                                    match xtcp_retry_decision(
-                                        conn_cancel.is_cancelled(),
-                                        keep_tunnel_open,
-                                        attempt,
-                                        max_retries,
-                                    ) {
-                                        Some(true) => continue,
-                                        Some(false) => return,
-                                        None => {
-                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP connection", visitor_name);
-                                            return; // drops the user connection unbridged
-                                        }
-                                    }
-                                }
-                            };
-                            debug!(visitor_name = %visitor_name, "Visitor '{}': received NatHoleResp from server", visitor_name);
-
-                            let candidates = resp.candidate_addrs.unwrap_or_default();
-                            debug!(visitor_name = %visitor_name, candidate_count = %candidates.len(), "Visitor '{}': got {} candidate addresses from server", visitor_name, candidates.len());
-
-                            // UDP hole punch + KCP data plane (Go v0.70 compat).
-                            // Uses the STUN socket to punch a hole and create
-                            // a KCP stream over UDP.
-                            if let Some(socket) = stun_socket {
-                                // Derive shared KCP conv from the NAT session ID
-                                // (both sides get the same sid from the server).
-                                let sid = resp.sid.clone().unwrap_or_default();
-                                let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
-                                let kcp_cfg = frp_core::kcp::default_kcp_config();
-                                // Go v0.70 compat: NatHoleSid detect + yamux client.
-                                let p2p_key = if !sk.is_empty() {
-                                    Some(frp_core::xtcp_p2p::derive_detect_key(&sk))
-                                } else {
-                                    None
-                                };
-                                let p2p_sid = if sid.is_empty() {
-                                    None
-                                } else {
-                                    Some(sid.as_str())
-                                };
-                                // Use read_timeout_ms from server's detect_behavior as
-                                // the hole-punch timeout (Go frp v0.70.1 compat).
-                                // Keep fallback_timeout_ms as the outer STCP fallback
-                                // deadline (retry loop).
-                                let hp_timeout = resp
-                                    .detect_behavior
-                                    .as_ref()
-                                    .map(|db| db.read_timeout_ms.max(0) as u64)
-                                    .unwrap_or(fallback_timeout_ms);
-                                let assisted = resp.assisted_addrs.clone().unwrap_or_default();
-                                let behavior = resp.detect_behavior.clone();
-                                // Data-plane dispatch: the configured
-                                // `p2p_protocol` ("quic" default, Go v0.70.1
-                                // parity; "kcp" for the KCP data plane) selects
-                                // the transport. The visitor is the QUIC client
-                                // / yamux client (opens the stream). Both the
-                                // quic AND kcp features are required for the
-                                // QUIC data plane (it reuses the KCP
-                                // hole-punch machinery).
-                                let p2p_stream: Result<
-                                    Box<dyn frp_core::xtcp_p2p::P2pStream>,
-                                    String,
-                                > = if pp.as_str() == "quic" {
-                                    #[cfg(all(feature = "quic", feature = "kcp"))]
-                                    {
-                                        match frp_core::xtcp_p2p::xtcp_p2p_connect_quic(
-                                            socket,
-                                            &candidates,
-                                            &assisted,
-                                            behavior.as_ref(),
-                                            hp_timeout,
-                                            p2p_sid,
-                                            p2p_key.as_ref(),
-                                            false, // is_server = false (visitor is QUIC client)
-                                        )
-                                        .await
-                                        {
-                                            Ok(s) => Ok(Box::new(s) as Box<_>),
-                                            Err(e) => Err(e),
-                                        }
-                                    }
-                                    #[cfg(not(all(feature = "quic", feature = "kcp")))]
-                                    {
-                                        warn!(visitor_name = %visitor_name, "Visitor '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)", visitor_name);
-                                        Err(format!(
-                                            "Visitor '{}': protocol 'quic' requires both the quic and kcp features",
-                                            visitor_name
-                                        ))
-                                    }
-                                } else {
-                                    match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
-                                        socket,
-                                        &candidates,
-                                        &assisted,
-                                        behavior.as_ref(),
-                                        conv,
-                                        kcp_cfg,
-                                        hp_timeout,
-                                        true, // yamux_client = visitor
-                                        p2p_sid,
-                                        p2p_key.as_ref(),
+                                info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected", visitor_name);
+                                let use_enc = use_encryption && !sk.is_empty();
+                                let (user_r, user_w) = user_conn
+                                    .take()
+                                    .expect("user_conn set Some above, not yet consumed")
+                                    .into_split();
+                                let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
+                                if use_enc {
+                                    let key = frp_core::encryption::derive_key(&sk);
+                                    if !bridge_until_cancelled(
+                                        &visitor_name,
+                                        "XTCP encrypted P2P",
+                                        "shutting down, aborting XTCP encrypted P2P bridge",
+                                        &conn_cancel,
+                                        frp_core::bridge::bridge_encrypted(
+                                            user_r,
+                                            user_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            &key,
+                                            use_compression,
+                                            vec![],
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            false,
+                                        ),
                                     )
                                     .await
                                     {
-                                        Ok(s) => Ok(Box::new(s) as Box<_>),
-                                        Err(e) => Err(e),
+                                        return; // drops both bridge halves
                                     }
-                                };
-                                match p2p_stream {
-                                    Ok(mut p2p_stream) => {
-                                        // Shutdown boundary: don't start the
-                                        // P2P bridge — drop the user
-                                        // connection and return.
-                                        if conn_cancel.is_cancelled() {
-                                            info!(visitor_name = %visitor_name, "Visitor '{}': shutting down, abandoning XTCP P2P connection", visitor_name);
-                                            return; // drops the user connection unbridged
-                                        }
-                                        info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected", visitor_name);
-                                        let use_enc = use_encryption && !sk.is_empty();
-                                        let (user_r, user_w) = user_conn
-                                            .take()
-                                            .expect("user_conn set Some above, not yet consumed")
-                                            .into_split();
-                                        let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
-                                        if use_enc {
-                                            let key = frp_core::encryption::derive_key(&sk);
-                                            if !bridge_until_cancelled(
-                                                &visitor_name,
-                                                "XTCP encrypted P2P",
-                                                "shutting down, aborting XTCP encrypted P2P bridge",
-                                                &conn_cancel,
-                                                frp_core::bridge::bridge_encrypted(
-                                                    user_r,
-                                                    user_w,
-                                                    p2p_r,
-                                                    p2p_w,
-                                                    &key,
-                                                    use_compression,
-                                                    vec![],
-                                                    None,
-                                                    None,
-                                                    None,
-                                                    None,
-                                                    false,
-                                                ),
-                                            )
-                                            .await
-                                            {
-                                                return; // drops both bridge halves
-                                            }
-                                        } else {
-                                            if !bridge_until_cancelled(
-                                                &visitor_name,
-                                                "XTCP",
-                                                "shutting down, aborting XTCP P2P bridge",
-                                                &conn_cancel,
-                                                frp_core::bridge::bridge_plain(
-                                                    user_r,
-                                                    user_w,
-                                                    p2p_r,
-                                                    p2p_w,
-                                                    use_compression,
-                                                    vec![],
-                                                    None,
-                                                    None,
-                                                ),
-                                            )
-                                            .await
-                                            {
-                                                return; // drops both bridge halves
-                                            }
-                                        }
-                                        hole_punch_ok = true;
-                                    }
-                                    Err(e) => {
-                                        debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}': UDP hole punch + data plane connect failed: {}", visitor_name, e);
-                                    }
+                                } else if !bridge_until_cancelled(
+                                    &visitor_name,
+                                    "XTCP",
+                                    "shutting down, aborting XTCP P2P bridge",
+                                    &conn_cancel,
+                                    frp_core::bridge::bridge_plain(
+                                        user_r,
+                                        user_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        use_compression,
+                                        vec![],
+                                        None,
+                                        None,
+                                    ),
+                                )
+                                .await
+                                {
+                                    return; // drops both bridge halves
                                 }
-                            } else {
-                                warn!(visitor_name = %visitor_name, "Visitor '{}': no STUN socket for XTCP P2P", visitor_name);
+                                return; // XTCP P2P succeeded (bridge ended)
                             }
-                            if hole_punch_ok {
-                                break; // Exit retry loop
+                            Err(e) => {
+                                debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}': open tunnel failed, trying STCP fallback: {}", visitor_name, e);
                             }
                         }
 
-                        if hole_punch_ok {
-                            return; // XTCP P2P succeeded
-                        }
-
-                        // Unwrap user_conn for STCP fallback (hole punch failed, so not moved).
+                        // Unwrap user_conn for STCP fallback (tunnel open failed, so not moved).
                         let Some(user_conn) = user_conn else {
                             warn!(visitor_name = %visitor_name, "Visitor '{}': user_conn missing in XTCP fallback path", visitor_name);
                             return;
@@ -1280,6 +1749,9 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         tls_key_file,
         v2,
         udp_packet_codec,
+        // SUDP: no NAT traversal / tunnel session.
+        #[cfg(feature = "quic")]
+            quic_params: _,
     } = config;
 
     // Go frp v0.70.1 three-stage model: the visitor segment is encrypted
@@ -2221,6 +2693,21 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
+    #[test]
+    fn hp_timeout_floor_and_cap() {
+        // Go MakeHole floors at the 5s default: 0 / negative must not make
+        // the punch fail instantly.
+        assert_eq!(clamp_hp_timeout(0), 5000);
+        assert_eq!(clamp_hp_timeout(-5), 5000);
+        // Legitimate analyzer emissions (~5-45s) pass through.
+        assert_eq!(clamp_hp_timeout(5000), 5000);
+        assert_eq!(clamp_hp_timeout(35000), 35000);
+        // Hostile server values are capped at 60s (i32 uncapped would wait
+        // ~24.8 days before the visitor could re-punch).
+        assert_eq!(clamp_hp_timeout(70_000), 60_000);
+        assert_eq!(clamp_hp_timeout(i32::MAX), 60_000);
+    }
+
     #[tokio::test]
     async fn tunnel_ingress_delivers_to_local_tun_channels() {
         let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -2492,34 +2979,534 @@ mod transport_tests {
     }
 }
 
-#[cfg(test)]
-mod retry_decision_tests {
-    use super::xtcp_retry_decision;
+#[cfg(all(test, feature = "kcp"))]
+mod tunnel_session_tests {
+    use super::*;
 
-    #[test]
-    fn cancellation_aborts_retries_regardless_of_budget() {
-        // Cancelled token → abandon the connection (drop the user conn, no
-        // bridging), even with keep_tunnel_open and attempts left.
-        assert_eq!(xtcp_retry_decision(true, true, 0, 5), None);
-        assert_eq!(xtcp_retry_decision(true, true, 4, 5), None);
-        assert_eq!(xtcp_retry_decision(true, true, 5, 5), None);
-        // One-shot mode (keep_tunnel_open=false) too.
-        assert_eq!(xtcp_retry_decision(true, false, 0, 1), None);
+    /// Hole-punch two loopback UDP sockets into a yamux session pair
+    /// (Rust↔Rust "frp" magic, no sid/key — same pattern as
+    /// frp-core/tests/xtcp_p2p.rs). Returns (server/provider, client/visitor)
+    /// sessions; both drivers run in the background.
+    async fn loopback_session_pair() -> (Arc<TunnelSession>, Arc<TunnelSession>) {
+        let sock_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+        let cand_b = vec![addr_b.to_string()];
+        let cand_a = vec![addr_a.to_string()];
+        let kcp_cfg = frp_core::kcp::default_kcp_config();
+        let conv = 42u32;
+        let (server, client) = tokio::join!(
+            frp_core::xtcp_p2p::xtcp_p2p_connect_yamux_session(
+                sock_a,
+                &cand_b,
+                &[],
+                None,
+                conv,
+                kcp_cfg.clone(),
+                3000,
+                false, // yamux_client = false (provider)
+                None,
+                None,
+            ),
+            frp_core::xtcp_p2p::xtcp_p2p_connect_yamux_session(
+                sock_b,
+                &cand_a,
+                &[],
+                None,
+                conv,
+                kcp_cfg,
+                3000,
+                true, // yamux_client = visitor
+                None,
+                None,
+            ),
+        );
+        let server = server.expect("server-side session");
+        let client = client.expect("client-side session");
+        (
+            Arc::new(TunnelSession::Kcp(server)),
+            Arc::new(TunnelSession::Kcp(client)),
+        )
     }
 
-    #[test]
-    fn keep_tunnel_open_retries_while_budget_remains() {
-        assert_eq!(xtcp_retry_decision(false, true, 0, 5), Some(true));
-        assert_eq!(xtcp_retry_decision(false, true, 4, 5), Some(true));
-        // Attempt budget exhausted → give up.
-        assert_eq!(xtcp_retry_decision(false, true, 5, 5), Some(false));
+    /// get_tunnel_conn on an empty slot fails immediately AND signals a
+    /// re-punch (Go getTunnelConn sends the non-blocking startTunnelCh signal
+    /// on every error path, empty slot included — with keep_tunnel_open=false
+    /// the first user connection's failure is what triggers the initial
+    /// punch). armed=true + cap-1 channel: try_send always succeeds,
+    /// making the "signal is sent" assertion deterministic.
+    #[tokio::test]
+    async fn get_tunnel_conn_empty_slot_signals_repunch() {
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
+        let armed = AtomicBool::new(true);
+        let err =
+            get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100), false).await;
+        match err {
+            Err(e) => assert!(
+                e.contains("no tunnel session"),
+                "error must mention no tunnel session, got: {e}"
+            ),
+            Ok(_) => panic!("empty slot must error"),
+        }
+        assert!(
+            start_rx.try_recv().is_ok(),
+            "empty slot must signal a re-punch"
+        );
     }
 
+    /// get_tunnel_conn on an empty slot with the parked-gate DOWN (receiver
+    /// busy punching) drops the signal — Go unbuffered startTunnelCh: a send
+    /// only succeeds while the receiver is parked in select.
+    #[tokio::test]
+    async fn get_tunnel_conn_empty_slot_armed_false_drops_signal() {
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
+        let armed = AtomicBool::new(false);
+        let err =
+            get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100), false).await;
+        match err {
+            Err(e) => assert!(
+                e.contains("no tunnel session"),
+                "error must mention no tunnel session, got: {e}"
+            ),
+            Ok(_) => panic!("empty slot must error"),
+        }
+        // Parked recv: nothing may arrive (armed=false dropped the signal).
+        let recv_task = tokio::spawn(async move { start_rx.recv().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), recv_task)
+                .await
+                .is_err(),
+            "armed=false must drop the re-punch signal"
+        );
+    }
+
+    /// get_tunnel_conn on a dead session: errors, clears the slot, and
+    /// signals startTunnelCh (triggering a re-punch). Every error path
+    /// signals — a second call on the cleared slot errors AND re-signals
+    /// (Go: getTunnelConn sends the non-blocking startTunnelCh on any error;
+    /// in production the armed gate drops it unless the receiver is parked,
+    /// so there is no pile-up).
+    #[tokio::test]
+    async fn get_tunnel_conn_dead_session_clears_slot_and_signals_repunch() {
+        let (_server, client) = loopback_session_pair().await;
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        *slot.lock().await = Some(client.clone());
+        let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
+        let armed = AtomicBool::new(true);
+
+        // Close the session → open_stream fails (alive=false).
+        client.close().await;
+        let err =
+            get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100), false).await;
+        assert!(err.is_err(), "closed session must fail open_stream");
+        assert!(slot.lock().await.is_none(), "dead session must be cleared");
+        assert!(
+            start_rx.try_recv().is_ok(),
+            "clearing the slot must signal a re-punch"
+        );
+        // Second call: slot is empty → error, but STILL signals (Go: every
+        // error path sends the non-blocking signal; the armed gate only drops
+        // it when the receiver is not parked).
+        let err =
+            get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(100), false).await;
+        assert!(err.is_err());
+        assert!(
+            start_rx.try_recv().is_ok(),
+            "empty slot must still signal a re-punch"
+        );
+    }
+
+    /// get_tunnel_conn on a live session opens a stream without touching the
+    /// slot or signalling a re-punch.
+    #[tokio::test]
+    async fn get_tunnel_conn_live_session_opens_stream() {
+        let (server, client) = loopback_session_pair().await;
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        *slot.lock().await = Some(client.clone());
+        let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
+        let armed = AtomicBool::new(true);
+
+        // Provider side accepts (the driver pushes the stream into the
+        // inbound queue; accept completes the yamux open).
+        let accept_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .accept_stream(Duration::from_secs(3))
+                    .await
+                    .expect("provider accept_stream")
+            }
+        });
+        let stream = get_tunnel_conn(
+            &slot,
+            &start_tx,
+            &armed,
+            Duration::from_secs(3),
+            false, // probe timeout = busy session, not dead
+        )
+        .await
+        .expect("live session must open a stream");
+        let _accepted = accept_task.await.expect("accept task");
+
+        assert!(
+            slot.lock().await.is_some(),
+            "live session stays in the slot"
+        );
+        assert!(
+            start_rx.try_recv().is_err(),
+            "successful open must not signal a re-punch"
+        );
+        drop(stream); // closes the probe stream
+        assert!(client.is_alive(), "session survives a stream close");
+    }
+
+    /// The driver refuses an open at the 256-stream cap with a PER-OPEN
+    /// error while the session stays healthy — `get_tunnel_conn` must treat
+    /// that as "session busy", never "session dead": with
+    /// close_on_timeout=true (keepalive probe) the round-10 HIGH behavior
+    /// would close the session and kill every in-flight bridge on a healthy
+    /// session. The same session must serve the next open once capacity
+    /// frees.
+    #[tokio::test]
+    async fn get_tunnel_conn_cap_reached_is_busy_not_dead() {
+        let (_server, client) = loopback_session_pair().await;
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        *slot.lock().await = Some(client.clone());
+        let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
+        let armed = AtomicBool::new(true);
+        let _ = start_rx.try_recv(); // drain any initial signal
+
+        // Fill the session to the driver's outbound cap (MAX_TUNNEL_STREAMS
+        // = 256). Opens complete client-side (the driver emits the SYN
+        // eagerly), so no accept loop is needed.
+        let mut held: Vec<Box<dyn frp_core::xtcp_p2p::P2pStream>> = Vec::new();
+        for i in 0..256 {
+            match client.open_stream(Duration::from_secs(2)).await {
+                Ok(s) => held.push(s),
+                Err(e) => panic!("open {i} within the cap must succeed, got: {e}"),
+            }
+        }
+        let cap_err = match client.open_stream(Duration::from_secs(2)).await {
+            Ok(_) => panic!("open beyond the cap must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            cap_err.contains("yamux tunnel stream cap reached"),
+            "got: {cap_err}"
+        );
+
+        // close_on_timeout=true (keepalive-probe semantics): a capacity
+        // error is busy, NOT dead — the session survives and nothing is
+        // signalled.
+        let err = match get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(200), true)
+            .await
+        {
+            Ok(_) => panic!("cap-reached probe must be busy"),
+            Err(e) => e,
+        };
+        assert!(err.contains("tunnel session busy"), "got: {err}");
+        assert!(
+            slot.lock()
+                .await
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &client)),
+            "session must survive a cap-reached probe"
+        );
+        assert!(
+            start_rx.try_recv().is_err(),
+            "no re-punch signal for a live session"
+        );
+        assert!(client.is_alive(), "session alive");
+
+        // close_on_timeout=false (open_tunnel semantics): same.
+        let err = match get_tunnel_conn(&slot, &start_tx, &armed, Duration::from_millis(200), false)
+            .await
+        {
+            Ok(_) => panic!("cap-reached probe must be busy"),
+            Err(e) => e,
+        };
+        assert!(err.contains("tunnel session busy"), "got: {err}");
+        assert!(
+            slot.lock()
+                .await
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &client)),
+            "session must survive a cap-reached probe"
+        );
+        assert!(start_rx.try_recv().is_err());
+
+        // Capacity frees (handles dropped) → the SAME session serves the
+        // next open: it was never dead.
+        drop(held);
+        let stream = client
+            .open_stream(Duration::from_secs(2))
+            .await
+            .expect("session recovers once capacity frees");
+        drop(stream);
+        assert!(client.is_alive(), "session alive after recovery");
+    }
+
+    /// Error-string taxonomy: what counts as "session alive but busy" vs
+    /// "session dead", and the provably-alive capacity subclass that never
+    /// closes a session regardless of the caller's flag.
     #[test]
-    fn one_shot_mode_gives_up_after_first_failure() {
-        // keep_tunnel_open=false → 2 total attempts, no retry after the first.
-        assert_eq!(xtcp_retry_decision(false, false, 0, 1), Some(false));
-        assert_eq!(xtcp_retry_decision(false, false, 1, 1), Some(false));
+    fn busy_error_classification() {
+        // Capacity errors: the driver served the refusal — session alive.
+        assert!(is_busy_open_error("yamux tunnel stream cap reached (256)"));
+        assert!(is_busy_open_error(
+            "tunnel session open queue full (peer stalled?)"
+        ));
+        assert!(is_session_capacity_error(
+            "yamux tunnel stream cap reached (256)"
+        ));
+        assert!(is_session_capacity_error(
+            "tunnel session open queue full (peer stalled?)"
+        ));
+        // Open timeout: ambiguous (alive-but-stalled vs dead-but-undetected).
+        assert!(is_busy_open_error("timeout opening tunnel stream (500ms)"));
+        assert!(!is_session_capacity_error(
+            "timeout opening tunnel stream (500ms)"
+        ));
+        // Genuine errors: the session is dead — close + re-punch.
+        assert!(!is_busy_open_error("no tunnel session"));
+        assert!(!is_busy_open_error(
+            "tunnel session closed while opening stream"
+        ));
+        assert!(!is_busy_open_error("quic open stream: connection closed"));
+        assert!(!is_busy_open_error("yamux open stream: connection reset"));
+        assert!(!is_busy_open_error(""));
+    }
+
+    /// open_tunnel polls (every 500ms) until a session appears in the slot;
+    /// the budget bounds the wait.
+    #[tokio::test]
+    async fn open_tunnel_polls_until_session_appears() {
+        let (server, client) = loopback_session_pair().await;
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let (start_tx, _start_rx) = mpsc::channel::<()>(1);
+        let armed = AtomicBool::new(true);
+        let conn_cancel = CancellationToken::new();
+
+        // Populate the slot + start accepting after 300ms — the first probe
+        // fails, later ones succeed.
+        let accept_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                server
+                    .accept_stream(Duration::from_secs(3))
+                    .await
+                    .expect("provider accept_stream")
+            }
+        });
+        tokio::spawn({
+            let slot = slot.clone();
+            let client = client.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                *slot.lock().await = Some(client);
+            }
+        });
+        let stream = open_tunnel(
+            "t",
+            &slot,
+            &start_tx,
+            &armed,
+            &conn_cancel,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("open_tunnel must poll until the session appears");
+        let _accepted = accept_task.await.expect("accept task");
+        drop(stream);
+    }
+
+    /// open_tunnel gives up once the budget is exhausted.
+    #[tokio::test]
+    async fn open_tunnel_times_out_without_session() {
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let (start_tx, _start_rx) = mpsc::channel::<()>(1);
+        let armed = AtomicBool::new(true);
+        let conn_cancel = CancellationToken::new();
+        let start = std::time::Instant::now();
+        let result = open_tunnel(
+            "t",
+            &slot,
+            &start_tx,
+            &armed,
+            &conn_cancel,
+            Duration::from_millis(150),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("empty slot with a tiny budget must time out"),
+        };
+        assert!(
+            err.contains("timeout"),
+            "error must mention the timeout, got: {err}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timeout must respect the budget (elapsed {:?})",
+            start.elapsed()
+        );
+    }
+
+    /// open_tunnel aborts on cancellation even with a budget left.
+    #[tokio::test]
+    async fn open_tunnel_aborts_on_cancellation() {
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let (start_tx, _start_rx) = mpsc::channel::<()>(1);
+        let armed = AtomicBool::new(true);
+        let conn_cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let slot = slot.clone();
+            let start_tx = start_tx.clone();
+            let conn_cancel = conn_cancel.clone();
+            async move {
+                open_tunnel(
+                    "t",
+                    &slot,
+                    &start_tx,
+                    &armed,
+                    &conn_cancel,
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        conn_cancel.cancel();
+        let result = task.await.expect("open_tunnel task");
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("cancelled wait must error"),
+        };
+        assert!(err.contains("shutting down"), "got: {err}");
+    }
+
+    /// keepTunnelOpenWorker's FIRST action is a blocking startTunnelCh send
+    /// (the initial punch signal), even with an empty slot.
+    #[tokio::test]
+    async fn keep_tunnel_open_worker_sends_initial_punch_signal() {
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
+        let (vtx, _vtx_rx) = mpsc::channel::<crate::service::VisitorRequest>(1);
+        let cfg = XtcpPunchConfig {
+            visitor_name: "t".into(),
+            sn: "tunnel".into(),
+            sk: String::new(),
+            stun_server: String::new(),
+            pp: "kcp".into(),
+            daa: true,
+            vtx,
+            cancel: CancellationToken::new(),
+            #[cfg(feature = "quic")]
+            quic_params: frp_core::quic::QuicTransportParams::default(),
+        };
+        let cancel = CancellationToken::new();
+        let armed = AtomicBool::new(true);
+        let worker = tokio::spawn({
+            let cfg = cfg.clone();
+            let slot = slot.clone();
+            let start_tx = start_tx.clone();
+            let cancel = cancel.clone();
+            async move {
+                keep_tunnel_open_worker(cfg, slot, start_tx, &armed, cancel, 1, 8).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), start_rx.recv())
+            .await
+            .expect("initial punch signal must be sent")
+            .expect("channel open");
+        cancel.cancel();
+        let _ = worker.await;
+    }
+
+    /// keepTunnelOpenWorker probes the session every min_retry_interval; a
+    /// dead session fails the probe, gets cleared, and re-signals
+    /// startTunnelCh.
+    #[tokio::test]
+    async fn keep_tunnel_open_worker_probes_and_resignals_on_dead_session() {
+        let (_server, client) = loopback_session_pair().await;
+        client.close().await;
+        let slot: Arc<tokio::sync::Mutex<Option<Arc<TunnelSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        *slot.lock().await = Some(client.clone());
+        let (start_tx, mut start_rx) = mpsc::channel::<()>(1);
+        let (vtx, _vtx_rx) = mpsc::channel::<crate::service::VisitorRequest>(1);
+        let cfg = XtcpPunchConfig {
+            visitor_name: "t".into(),
+            sn: "tunnel".into(),
+            sk: String::new(),
+            stun_server: String::new(),
+            pp: "kcp".into(),
+            daa: true,
+            vtx,
+            cancel: CancellationToken::new(),
+            #[cfg(feature = "quic")]
+            quic_params: frp_core::quic::QuicTransportParams::default(),
+        };
+        let cancel = CancellationToken::new();
+        let armed = AtomicBool::new(true);
+        let worker = tokio::spawn({
+            let slot = slot.clone();
+            let start_tx = start_tx.clone();
+            let cancel = cancel.clone();
+            async move {
+                keep_tunnel_open_worker(cfg, slot, start_tx, &armed, cancel, 1, 8).await;
+            }
+        });
+        // Initial punch signal (first action).
+        tokio::time::timeout(Duration::from_secs(3), start_rx.recv())
+            .await
+            .expect("initial punch signal")
+            .expect("channel open");
+        // The first tick (1s) probes the dead session → cleared + re-signal.
+        tokio::time::timeout(Duration::from_secs(5), start_rx.recv())
+            .await
+            .expect("re-punch signal after dead probe")
+            .expect("channel open");
+        assert!(slot.lock().await.is_none(), "dead session must be cleared");
+        cancel.cancel();
+        let _ = worker.await;
+    }
+
+    /// The retry token bucket: burst tokens are consumed without waiting; an
+    /// exhausted bucket sleeps one refill interval.
+    #[tokio::test]
+    async fn retry_token_bucket_limits_consecutive_failures() {
+        let mut tokens = 2usize;
+        let start = tokio::time::Instant::now();
+        wait_for_retry_token(&mut tokens, 10.0).await;
+        wait_for_retry_token(&mut tokens, 10.0).await;
+        assert_eq!(tokens, 0);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "burst tokens must not sleep (elapsed {:?})",
+            start.elapsed()
+        );
+        // Exhausted bucket sleeps one refill interval.
+        let start = tokio::time::Instant::now();
+        wait_for_retry_token(&mut tokens, 0.05).await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(50),
+            "exhausted bucket must sleep the refill interval (elapsed {:?})",
+            start.elapsed()
+        );
     }
 }
 

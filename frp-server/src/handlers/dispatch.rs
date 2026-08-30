@@ -1132,36 +1132,24 @@ pub(crate) async fn validate_new_work_conn_auth(
 }
 
 /// Run the NewWorkConn plugin hook. Returns `Err(reason)` if a plugin
-/// rejects the connection.
+/// rejects the connection, `Ok(Some(mutated))` when a plugin replaced the
+/// message with its mutated content, `Ok(None)` when no plugin mutated it
+/// (or none are configured).
 ///
-/// Yamux work-conn path (control/mod.rs): no `NewWorkConn` message is
-/// available, so the payload carries the user object + run_id only.
-#[instrument(skip(state), fields(run_id = %run_id))]
-pub(crate) async fn run_new_work_conn_plugin(run_id: &str, state: &AppState) -> Result<(), String> {
-    run_new_work_conn_plugin_inner(None, run_id, state).await
-}
-
-/// Standalone work-conn path (dispatch.rs): full Go payload — the `user`
-/// object + the flat NewWorkConn msg (run_id, timestamp, privilege_key).
+/// Both work-conn paths (dispatch.rs standalone TCP, control/mod.rs yamux
+/// stream) carry the full `NewWorkConn` message — Go's RegisterWorkConn
+/// payload is always `{user, NewWorkConn msg}`.
 #[instrument(skip(state), fields(run_id = %run_id))]
 pub(crate) async fn run_new_work_conn_plugin_with_msg(
     msg: &msg::NewWorkConn,
     run_id: &str,
     state: &AppState,
-) -> Result<(), String> {
-    run_new_work_conn_plugin_inner(Some(msg), run_id, state).await
-}
-
-async fn run_new_work_conn_plugin_inner(
-    msg: Option<&msg::NewWorkConn>,
-    run_id: &str,
-    state: &AppState,
-) -> Result<(), String> {
+) -> Result<Option<msg::NewWorkConn>, String> {
     // Skip payload construction entirely when no plugins are configured
     // (the default) — every work conn / yamux stream used to build a
     // full json! Value just for the notify loop.
     if state.plugin_manager.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     // Go pkg/plugin/server/types.go NewWorkConnContent: `user` object +
     // the flat NewWorkConn msg (run_id, timestamp, privilege_key).
@@ -1169,29 +1157,35 @@ async fn run_new_work_conn_plugin_inner(
     let nwc_content = serde_json::json!({
         "user": user_info,
         "run_id": run_id,
-        "timestamp": msg.and_then(|m| m.timestamp),
-        "privilege_key": msg.and_then(|m| m.privilege_key.clone()),
+        "timestamp": msg.timestamp,
+        "privilege_key": msg.privilege_key.clone(),
     });
-    state
+    let ret = state
         .plugin_manager
         .notify("new_work_conn", nwc_content)
-        .await
-        // Deviation from Go v0.71.0 (server/service.go:878-885): Go
-        // applies the plugin's mutated content to the NewWorkConn before
-        // auth verification (`newMsg = &retContent.NewWorkConn`); frp-rs
-        // keeps the notify-only behavior and deliberately discards the
-        // mutation because validate_new_work_conn_auth runs BEFORE this
-        // hook — consuming a plugin mutation here would bypass that
-        // verification.
-        .map(|_| ())
+        .await?;
+    match ret {
+        // Go parity (server/service.go:878-885): on success
+        // `newMsg = &retContent.NewWorkConn` — the plugin's mutated content
+        // REPLACES the message, and auth verifies the mutation.
+        // `apply_plugin_mutation` mirrors Go handleMutableContent
+        // (manager.go:75-96): `unchange:false` + content decoded into a
+        // FRESH zero-value struct — fields the plugin omits are zeroed, not
+        // preserved. Fail closed on an undecodable mutation.
+        Some(mutated) => crate::plugin::apply_plugin_mutation(msg, mutated).map(Some),
+        None => Ok(None),
+    }
 }
 
-/// Handle an incoming work connection. Verifies auth, then routes the
-/// IoStream to the appropriate control handler via InternalMsg.
+/// Handle an incoming work connection. Go frp v0.71.0 `RegisterWorkConn`
+/// ordering (server/service.go:852-888): run_id present → wire-protocol
+/// match → NewWorkConn plugin hook (may REPLACE the message) → auth on the
+/// mutated message → route the IoStream to the control handler via
+/// InternalMsg.
 #[instrument(skip(stream, state), fields(run_id = %msg.run_id.clone().unwrap_or_default()))]
 pub(crate) async fn handle_work_conn_inner(
     stream: IoStream,
-    msg: msg::NewWorkConn,
+    mut msg: msg::NewWorkConn,
     state: Arc<AppState>,
     v2: bool,
 ) {
@@ -1203,64 +1197,70 @@ pub(crate) async fn handle_work_conn_inner(
         }
     };
 
-    if let Err(e) = validate_new_work_conn_auth(&msg, &run_id, &state).await {
-        warn!(run_id = %run_id, error = %e, "Work conn auth failed for run_id {}: {}", run_id, e);
+    // Go frp v0.71.0 RegisterWorkConn (server/service.go:849-888): the
+    // control lookup happens FIRST — a work conn for an unregistered run_id
+    // is rejected before the plugin hook runs, so plugins are never invoked
+    // for garbage run_ids (Go's GetByID returns early with a warn + error).
+    let Some(ctl) = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.clone()) else {
+        warn!(run_id = %run_id, "no client control found for run id [{}]", run_id);
         return;
-    }
+    };
 
     // Go frp v0.71.0: the work connection's wire protocol must match the
     // control session it references ("work connection wire protocol
     // mismatch"). A mixed-protocol work conn would be misparsed by the
     // control's frame reader.
-    if let Some(ctl) = state.run_id_to_ctl_tx.get(&run_id) {
-        if ctl.wire_v2 != v2 {
-            warn!(
-                run_id = %run_id,
-                work_wire = if v2 { "v2" } else { "v1" },
-                control_wire = if ctl.wire_v2 { "v2" } else { "v1" },
-                "Work conn wire protocol mismatch for run_id {} (work={}, control={}); rejecting",
-                run_id,
-                if v2 { "v2" } else { "v1" },
-                if ctl.wire_v2 { "v2" } else { "v1" }
-            );
+    if ctl.wire_v2 != v2 {
+        warn!(
+            run_id = %run_id,
+            work_wire = if v2 { "v2" } else { "v1" },
+            control_wire = if ctl.wire_v2 { "v2" } else { "v1" },
+            "Work conn wire protocol mismatch for run_id {} (work={}, control={}); rejecting",
+            run_id,
+            if v2 { "v2" } else { "v1" },
+            if ctl.wire_v2 { "v2" } else { "v1" }
+        );
+        return;
+    }
+
+    // NewWorkConn plugin hook — Go parity: runs BEFORE auth and may
+    // REPLACE the message (`newMsg = &retContent.NewWorkConn`), so a
+    // plugin that rewrites privilege_key/timestamp changes what auth
+    // validates. Control-enabled plugins can also reject.
+    match run_new_work_conn_plugin_with_msg(&msg, &run_id, &state).await {
+        Ok(Some(mutated)) => msg = mutated,
+        Ok(None) => {}
+        Err(reason) => {
+            warn!(run_id = %run_id, reason = %reason, "NewWorkConn plugin hook rejected: {}", reason);
             return;
         }
     }
 
-    // NewWorkConn plugin hook — control-enabled plugins can reject
-    if let Err(reason) = run_new_work_conn_plugin_with_msg(&msg, &run_id, &state).await {
-        warn!(run_id = %run_id, reason = %reason, "NewWorkConn plugin hook rejected: {}", reason);
+    // Auth verifies the (possibly plugin-mutated) message.
+    if let Err(e) = validate_new_work_conn_auth(&msg, &run_id, &state).await {
+        warn!(run_id = %run_id, error = %e, "Work conn auth failed for run_id {}: {}", run_id, e);
         return;
     }
 
-    let ctl_tx = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.clone());
-
-    match ctl_tx {
-        Some(ctl) => {
-            // Use send().await: a dropped NewWorkConn leaves the proxy
-            // without a work connection until the control handler times out
-            // and requests a new one. Backpressure is correct — but bounded
-            // (audit H3): a control handler that stops draining its channel
-            // must not pin this task + fd + permit forever; after
-            // CTL_SEND_TIMEOUT the work conn drops and the control side
-            // re-requests.
-            match tokio::time::timeout(
-                crate::state::CTL_SEND_TIMEOUT,
-                ctl.tx.send(InternalMsg::NewWorkConn(stream)),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    warn!(run_id = %run_id, "Control handler for {} has gone away", run_id);
-                }
-                Err(_elapsed) => {
-                    warn!(run_id = %run_id, "NewWorkConn delivery for {} timed out; dropping work conn", run_id);
-                }
-            }
+    // Use send().await: a dropped NewWorkConn leaves the proxy
+    // without a work connection until the control handler times out
+    // and requests a new one. Backpressure is correct — but bounded
+    // (audit H3): a control handler that stops draining its channel
+    // must not pin this task + fd + permit forever; after
+    // CTL_SEND_TIMEOUT the work conn drops and the control side
+    // re-requests.
+    match tokio::time::timeout(
+        crate::state::CTL_SEND_TIMEOUT,
+        ctl.tx.send(InternalMsg::NewWorkConn(stream)),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            warn!(run_id = %run_id, "Control handler for {} has gone away", run_id);
         }
-        None => {
-            warn!(run_id = %run_id, "No control handler found for run_id {}", run_id);
+        Err(_elapsed) => {
+            warn!(run_id = %run_id, "NewWorkConn delivery for {} timed out; dropping work conn", run_id);
         }
     }
 }

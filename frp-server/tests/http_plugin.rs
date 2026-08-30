@@ -5,19 +5,22 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 
 use common::{
     allocate_port, login_with_identity, login_with_test_token, raw_login_full, start_test_server,
-    test_auth_cfg, TEST_TOKEN,
+    start_test_server_tcpmux_on, test_auth_cfg, TEST_TOKEN,
 };
-use frp_core::config::{HttpPluginConfig, ServerConfig};
+use frp_core::config::{AuthServerConfig, HttpPluginConfig, ServerConfig};
 use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::transport::IoStream;
 
 /// Mock plugin state: captures the request shape and decides the response.
 #[derive(Default)]
@@ -1000,4 +1003,399 @@ async fn test_plugin_mutation_repairs_negative_pool_count() {
         resp.error
     );
     drop(conn);
+}
+
+/// Go parity (server/service.go:852-888): the NewWorkConn plugin hook runs
+/// BEFORE auth verification and its mutation REPLACES the message
+/// (`newMsg = &retContent.NewWorkConn`), then VerifyNewWorkConn verifies
+/// the MUTATED message. A plugin that rewrites privilege_key to a WRONG
+/// value turns a VALID work conn into a rejected one — under the old
+/// auth-before-plugin order the valid key passed auth first and the conn
+/// would have been pooled.
+#[tokio::test]
+async fn test_plugin_new_work_conn_mutation_bad_key_rejects_valid_conn() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let good_key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let mutator = Arc::new(MockPluginState {
+        mutate_response: Some(json!({ "privilege_key": "bogus" })),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(mutator.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: AuthServerConfig {
+            additional_auth_scopes: vec!["NewWorkConns".into()],
+            ..test_auth_cfg()
+        },
+        http_plugins: vec![plugin_cfg(port, vec!["NewWorkConn"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let (provider, resp) = login_with_test_token(addr).await.expect("login succeeds");
+    assert!(resp.error.is_none(), "login rejected: {:?}", resp.error);
+    let run_id = resp.run_id.expect("run_id");
+
+    // A VALID-key work conn; the plugin rewrites the key to a wrong one, so
+    // auth (which runs AFTER the hook, on the mutated message) rejects it
+    // and the server closes the connection.
+    let mut work = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect work conn");
+    write_msg_v1(
+        &mut work,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: Some(ts),
+            privilege_key: Some(good_key.clone()),
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(2), work.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!("rejected work conn must be closed, got {n} bytes"),
+        Ok(Err(_)) => {} // RST is also a valid close
+        Err(_) => panic!(
+            "valid-key work conn must be REJECTED after the plugin rewrote its privilege_key \
+             (auth must run on the mutated message)"
+        ),
+    }
+
+    // The hook must have fired with the Go wire shape: `user` object + the
+    // flat NewWorkConn msg (run_id, timestamp, privilege_key).
+    let requests = mutator.requests.lock().unwrap();
+    let (_, content) = requests
+        .iter()
+        .find(|(op, _)| op == "NewWorkConn")
+        .expect("new_work_conn hook must fire");
+    assert_eq!(content["run_id"], run_id);
+    assert_eq!(content["timestamp"], ts);
+    assert_eq!(content["privilege_key"], good_key);
+    assert_eq!(content["user"]["run_id"], run_id);
+    drop(provider);
+}
+
+/// Go parity: VerifyNewWorkConn verifies the MUTATED message — a plugin
+/// that repairs privilege_key (for the client's timestamp) turns a
+/// mismatched work conn into an accepted (pooled) one.
+#[tokio::test]
+async fn test_plugin_new_work_conn_mutation_repairs_bad_key() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let good_key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let mutator = Arc::new(MockPluginState {
+        mutate_response: Some(json!({ "privilege_key": good_key })),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(mutator.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: AuthServerConfig {
+            additional_auth_scopes: vec!["NewWorkConns".into()],
+            ..test_auth_cfg()
+        },
+        http_plugins: vec![plugin_cfg(port, vec!["NewWorkConn"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let (provider, resp) = login_with_test_token(addr).await.expect("login succeeds");
+    assert!(resp.error.is_none(), "login rejected: {:?}", resp.error);
+    let run_id = resp.run_id.expect("run_id");
+
+    // A WRONG-key work conn; the plugin repairs the key, so auth (which
+    // runs AFTER the hook, on the mutated message) passes and the conn is
+    // pooled (held open — no StartWorkConn without a pending proxy request).
+    let mut work = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect work conn");
+    write_msg_v1(
+        &mut work,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id),
+            timestamp: Some(ts),
+            privilege_key: Some("wrong-key".into()),
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+
+    let mut buf = [0u8; 64];
+    let pooled = tokio::time::timeout(Duration::from_millis(300), work.read(&mut buf)).await;
+    assert!(
+        pooled.is_err(),
+        "plugin-repaired work conn must be accepted (pooled, stream stays open)"
+    );
+    drop(provider);
+}
+
+/// Regression: with a plugin configured that does NOT mutate
+/// (`unchange:true` default), a VALID work conn must still pool — the hook
+/// must not consume or drop the connection.
+#[tokio::test]
+async fn test_plugin_new_work_conn_noop_keeps_valid_conn_pooled() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let good_key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let noop = Arc::new(MockPluginState::default());
+    let port = start_mock_plugin(noop.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: AuthServerConfig {
+            additional_auth_scopes: vec!["NewWorkConns".into()],
+            ..test_auth_cfg()
+        },
+        http_plugins: vec![plugin_cfg(port, vec!["NewWorkConn"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let (provider, resp) = login_with_test_token(addr).await.expect("login succeeds");
+    assert!(resp.error.is_none(), "login rejected: {:?}", resp.error);
+    let run_id = resp.run_id.expect("run_id");
+
+    let mut work = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect work conn");
+    write_msg_v1(
+        &mut work,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id),
+            timestamp: Some(ts),
+            privilege_key: Some(good_key),
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+
+    let mut buf = [0u8; 64];
+    let pooled = tokio::time::timeout(Duration::from_millis(300), work.read(&mut buf)).await;
+    assert!(
+        pooled.is_err(),
+        "valid work conn must pool even with a no-op plugin hook (stream stays open)"
+    );
+    assert!(
+        noop.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(op, _)| op == "NewWorkConn"),
+        "the new_work_conn hook must fire for a no-op plugin too"
+    );
+    drop(provider);
+}
+
+/// Log in over a yamux control stream (V1, tcp_mux ON): dial, wrap in
+/// yamux, open the control stream, send Login, read LoginResp, drain the
+/// pre-warm ReqWorkConn. Returns the encrypted control stream, the yamux
+/// session (for opening work streams), and the run_id.
+///
+/// Same pattern as work_conn_auth.rs::yamux_login (test files are separate
+/// crates; helpers are duplicated).
+async fn yamux_login(addr: SocketAddr) -> (IoStream, frp_core::mux::YamuxSession, String) {
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to server");
+    let (control_yamux, session) =
+        frp_core::mux::client_mux(tcp, &frp_core::mux::TcpMuxConfig::default())
+            .await
+            .expect("yamux client init");
+    let mut control = IoStream::Yamux(control_yamux);
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let login = FrpMessage::Login(Box::new(msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("yamux-plugin-test".into()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: None,
+        run_id: None,
+        client_id: None,
+        pool_count: Some(0),
+        timestamp: Some(ts),
+        privilege_key: Some(key),
+        metas: None,
+        client_spec: None,
+        multiplexer: Some("yamux".into()),
+    }));
+    write_msg_v1(&mut control, &login)
+        .await
+        .expect("send Login");
+
+    let run_id = match read_msg_v1(&mut control).await.expect("read LoginResp") {
+        FrpMessage::LoginResp(resp) => {
+            assert!(resp.error.is_none(), "login failed: {:?}", resp.error);
+            resp.run_id.expect("run_id")
+        }
+        other => panic!("expected LoginResp, got {:?}", other.v1_type_byte()),
+    };
+
+    // The pre-warm ReqWorkConn arrives through the encrypted writer.
+    let mut control = control
+        .into_encrypted(frp_core::encryption::derive_key(TEST_TOKEN))
+        .expect("wrap control in encryption");
+    let warm = tokio::time::timeout(Duration::from_secs(2), read_msg_v1(&mut control))
+        .await
+        .expect("pre-warm ReqWorkConn must arrive after LoginResp")
+        .expect("read pre-warm ReqWorkConn");
+    match warm {
+        FrpMessage::ReqWorkConn(_) => {}
+        other => panic!(
+            "expected pre-warm ReqWorkConn after login, got type {}",
+            other.v1_type_byte(),
+        ),
+    }
+    (control, session, run_id)
+}
+
+/// Open a fresh yamux stream on `session` and write one message on it.
+async fn open_yamux_and_write(session: &frp_core::mux::YamuxSession, msg: &FrpMessage) -> IoStream {
+    let stream = session.open_stream().await.expect("open yamux stream");
+    let mut io = IoStream::Yamux(stream);
+    write_msg_v1(&mut io, msg)
+        .await
+        .expect("write message on yamux stream");
+    io
+}
+
+/// Assert the server DROPS the yamux stream: EOF or RST within 2s.
+async fn assert_stream_closed(mut io: IoStream, what: &str) {
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(2), io.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!("{what}: expected EOF, got {n} bytes"),
+        Ok(Err(_)) => {} // RST is also a valid close
+        Err(_) => panic!("{what}: stream was NOT closed by the server (still open / pooled)"),
+    }
+}
+
+/// Go parity on the yamux work-conn path (control/mod.rs): the plugin hook
+/// runs BEFORE auth on the yamux stream too — a plugin that rewrites
+/// privilege_key to a WRONG value drops a VALID work stream.
+#[tokio::test]
+async fn test_plugin_new_work_conn_mutation_yamux_rejects_valid_stream() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let good_key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let mutator = Arc::new(MockPluginState {
+        mutate_response: Some(json!({ "privilege_key": "bogus" })),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(mutator.clone()).await;
+
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth: AuthServerConfig {
+            additional_auth_scopes: vec!["NewWorkConns".into()],
+            ..test_auth_cfg()
+        },
+        http_plugins: vec![plugin_cfg(port, vec!["NewWorkConn"], true)],
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server_tcpmux_on(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let (_control, session, run_id) = yamux_login(addr).await;
+
+    let io = open_yamux_and_write(
+        &session,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id),
+            timestamp: Some(ts),
+            privilege_key: Some(good_key),
+        }),
+    )
+    .await;
+    assert_stream_closed(io, "valid-key yamux work stream rewritten by plugin").await;
+
+    assert!(
+        mutator
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(op, _)| op == "NewWorkConn"),
+        "the new_work_conn hook must fire on the yamux path"
+    );
+}
+
+/// Go parity on the yamux work-conn path (control/mod.rs): a plugin that
+/// repairs privilege_key turns a mismatched work stream into a pooled one.
+#[tokio::test]
+async fn test_plugin_new_work_conn_mutation_yamux_repairs_bad_key() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let good_key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let mutator = Arc::new(MockPluginState {
+        mutate_response: Some(json!({ "privilege_key": good_key })),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(mutator.clone()).await;
+
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth: AuthServerConfig {
+            additional_auth_scopes: vec!["NewWorkConns".into()],
+            ..test_auth_cfg()
+        },
+        http_plugins: vec![plugin_cfg(port, vec!["NewWorkConn"], true)],
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server_tcpmux_on(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let (_control, session, run_id) = yamux_login(addr).await;
+
+    let mut io = open_yamux_and_write(
+        &session,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id),
+            timestamp: Some(ts),
+            privilege_key: Some("wrong-key".into()),
+        }),
+    )
+    .await;
+    let mut buf = [0u8; 64];
+    let kept = tokio::time::timeout(Duration::from_millis(300), async {
+        io.read(&mut buf).await
+    })
+    .await;
+    assert!(
+        kept.is_err(),
+        "plugin-repaired yamux work stream must be pooled (stays open), not closed"
+    );
 }

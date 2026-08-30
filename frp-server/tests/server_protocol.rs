@@ -2,14 +2,15 @@ mod common;
 
 use frp_core::auth;
 use frp_core::config::ServerConfig;
-use frp_core::msg::{self, FrpMessage, NewProxy};
+use frp_core::encryption;
+use frp_core::msg::{self, FrpMessage, LoginResp, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
 use common::{
     allocate_port, login_with_test_token, raw_login_resp, start_test_server, test_auth_cfg,
     TEST_TOKEN,
 };
-use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
+use frp_core::transport::{dial_server, DialOptions, IoStream, TransportProtocol};
 use frp_server::service::Service;
 use std::path::PathBuf;
 
@@ -327,7 +328,11 @@ async fn test_new_proxy_duplicate_name_fails() {
             proxy_name: "dup-tcp".into(),
             proxy_type: "tcp".into(),
             local_str: Some("127.0.0.1:9876".into()),
-            remote_port: Some(0),
+            // Explicit allocated port: remote_port=0 would make the server
+            // scan the whole 1..65535 range with probe-binds, racing
+            // parallel test servers for the same low port (EADDRINUSE flake
+            // observed in this test at server_protocol.rs:370).
+            remote_port: Some(allocate_port() as i32),
             use_encryption: None,
             use_compression: None,
             group: None,
@@ -768,5 +773,311 @@ async fn test_login_via_tls() {
             assert!(r.run_id.is_some(), "expected run_id");
         }
         other => panic!("expected LoginResp, got: {:?}", other.v1_type_byte()),
+    }
+}
+
+// ---------------------------------------------------------------
+// Duplicate run_id supersession
+// ---------------------------------------------------------------
+
+/// Like `common::raw_login`, but sends an explicit `run_id` and a
+/// MILLISECOND timestamp. The shared helper hardcodes `run_id: None` and
+/// second-precision timestamps, both of which the supersession test needs
+/// to differ from: the server's ReplayTable deliberately admits a
+/// seconds-precision duplicate (Go frpc reconnects within the same second)
+/// but rejects an identical millisecond (timestamp, run_id) pair as a
+/// replay — so callers must use a DIFFERENT millisecond timestamp for each
+/// login with the same run_id.
+async fn raw_login_with_run_id(
+    addr: std::net::SocketAddr,
+    run_id: &str,
+    timestamp_ms: i64,
+) -> Result<(IoStream, LoginResp), frp_core::Error> {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| frp_core::Error::Transport(format!("connect to {}: {}", addr, e).into()))?;
+
+    let key = auth::generate_token(TEST_TOKEN, timestamp_ms);
+    let login = FrpMessage::Login(Box::new(msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("test-host".into()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: None,
+        run_id: Some(run_id.to_string()),
+        client_id: None,
+        pool_count: Some(1),
+        timestamp: Some(timestamp_ms),
+        privilege_key: Some(key),
+        metas: None,
+        client_spec: None,
+        multiplexer: None,
+    }));
+
+    let mut io = IoStream::Tcp(stream);
+    write_msg_v1(&mut io, &login).await?;
+
+    match read_msg_v1(&mut io).await? {
+        FrpMessage::LoginResp(resp) => {
+            // Wrap in AES-128-CFB encryption (matches server post-login),
+            // exactly as common::raw_login does.
+            let enc_key = encryption::derive_key(TEST_TOKEN);
+            let mut encrypted = io.into_encrypted(enc_key)?;
+
+            // Drain the pool_count ReqWorkConn messages the server sends
+            // immediately after LoginResp (mirrors common::raw_login;
+            // pool_count is fixed at 1 above).
+            for _ in 0..1 {
+                match read_msg_v1(&mut encrypted).await {
+                    Ok(FrpMessage::ReqWorkConn(_)) => continue,
+                    Ok(_) => break,
+                    Err(_) => break,
+                }
+            }
+            Ok((encrypted, resp))
+        }
+        other => Err(frp_core::Error::Protocol(
+            format!(
+                "expected LoginResp, got type byte {:?}",
+                other.v1_type_byte()
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Control-plane supersession: a second Login with the same run_id must
+/// tear down the first control connection and route that run_id to the new
+/// connection (Go frp control.go lifecycle — the old handler receives a
+/// Shutdown and its socket is dropped).
+#[tokio::test]
+async fn test_duplicate_run_id_supersedes_old_control() {
+    let port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // First login with an explicit run_id at millisecond ts.
+    let (mut first, resp1) = raw_login_with_run_id(addr, "r1", ts)
+        .await
+        .expect("first login should succeed");
+    assert!(
+        resp1.error.is_none(),
+        "first login should succeed, got: {:?}",
+        resp1.error
+    );
+
+    // Second login with the SAME run_id at ts + 1 (fresh auth key for the
+    // new timestamp — an identical (ts, run_id) pair would be rejected as
+    // a replay, so the timestamp MUST differ). Wrapped in a 10s timeout so
+    // a handoff-barrier deadlock fails the test instead of hanging the
+    // whole suite.
+    let (mut second, resp2) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_login_with_run_id(addr, "r1", ts + 1),
+    )
+    .await
+    .expect("superseding login hung (handoff blocked?)")
+    .expect("second login with same run_id should succeed");
+    assert!(
+        resp2.error.is_none(),
+        "second login should succeed, got: {:?}",
+        resp2.error
+    );
+
+    // The FIRST control connection must be torn down within 5s. Loop on
+    // reads: Ok(frame) = stray frame flushed before the close (skip),
+    // Err = EOF/reset = teardown. A 5s read timeout elapsing instead
+    // means the old control was never superseded.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while read_msg_v1(&mut first).await.is_ok() {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "old control connection was not closed within 5s of the superseding login"
+    );
+
+    // The NEW connection must be live: Ping → Pong with no error.
+    let ping = FrpMessage::Ping(msg::Ping {
+        privilege_key: None,
+        timestamp: None,
+    });
+    write_msg_v1(&mut second, &ping)
+        .await
+        .expect("send ping on new control");
+    match read_msg_v1(&mut second).await.expect("read pong") {
+        FrpMessage::Pong(pong) => assert!(
+            pong.error.is_none(),
+            "expected clean Pong on new control, got: {:?}",
+            pong.error
+        ),
+        other => panic!("expected Pong, got type byte: {:?}", other.v1_type_byte()),
+    }
+}
+
+/// Supersession after a burst: the old control completes a burst of 200
+/// proxy registrations, then the superseding login lands. The old control
+/// must still be torn down promptly — the Shutdown/teardown must not hang
+/// behind the 200 registered proxies — and the NEW control must be fully
+/// functional (NewProxyResp resolves, Ping→Pong clean).
+#[tokio::test]
+async fn test_duplicate_run_id_supersedes_under_proxy_burst() {
+    let port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let mk_burst_proxy = |i: usize| {
+        FrpMessage::NewProxy(Box::new(msg::NewProxy {
+            proxy_name: format!("burst-{i}"),
+            proxy_type: "tcp".into(),
+            local_str: Some("127.0.0.1:9876".into()),
+            // Explicit port per proxy: 200 auto-assign scans (remote_port=0)
+            // would each probe the low port range, racing parallel test
+            // servers for the same port (EADDRINUSE flake).
+            remote_port: Some(allocate_port() as i32),
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: None,
+            sk: None,
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: None,
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        }))
+    };
+
+    // First login with an explicit run_id at millisecond ts.
+    let (mut first, resp1) = raw_login_with_run_id(addr, "burst-r1", ts)
+        .await
+        .expect("first login should succeed");
+    assert!(
+        resp1.error.is_none(),
+        "first login should succeed, got: {:?}",
+        resp1.error
+    );
+
+    // Burst of proxy registrations on the OLD control.
+    for i in 0..200 {
+        write_msg_v1(&mut first, &mk_burst_proxy(i))
+            .await
+            .expect("send NewProxy");
+        match read_msg_v1(&mut first).await.expect("read NewProxyResp") {
+            FrpMessage::NewProxyResp(r) => {
+                assert!(
+                    r.error.is_none(),
+                    "burst registration {i} failed: {:?}",
+                    r.error
+                );
+            }
+            other => panic!(
+                "expected NewProxyResp, got type byte {:?}",
+                other.v1_type_byte()
+            ),
+        }
+    }
+
+    // Second login with the SAME run_id (fresh timestamp ts + 1). Wrapped
+    // in a 10s timeout: the supersession handoff must not be blocked
+    // behind the old control's in-flight work.
+    let (mut second, resp2) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raw_login_with_run_id(addr, "burst-r1", ts + 1),
+    )
+    .await
+    .expect("superseding login hung behind the burst (handoff blocked?)")
+    .expect("second login with same run_id should succeed");
+    assert!(
+        resp2.error.is_none(),
+        "second login should succeed, got: {:?}",
+        resp2.error
+    );
+
+    // The OLD control must be torn down within 5s despite the burst.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while read_msg_v1(&mut first).await.is_ok() {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "old control connection was not closed within 5s of the superseding login (under burst)"
+    );
+
+    // The NEW control must be fully functional: a fresh registration gets
+    // its NewProxyResp.
+    write_msg_v1(&mut second, &mk_burst_proxy(999))
+        .await
+        .expect("send NewProxy on new control");
+    match read_msg_v1(&mut second)
+        .await
+        .expect("read NewProxyResp on new control")
+    {
+        FrpMessage::NewProxyResp(r) => {
+            assert!(
+                r.error.is_none(),
+                "post-supersession registration failed: {:?}",
+                r.error
+            );
+        }
+        other => panic!(
+            "expected NewProxyResp, got type byte {:?}",
+            other.v1_type_byte()
+        ),
+    }
+
+    // And Ping → Pong with no error.
+    let ping = FrpMessage::Ping(msg::Ping {
+        privilege_key: None,
+        timestamp: None,
+    });
+    write_msg_v1(&mut second, &ping)
+        .await
+        .expect("send ping on new control");
+    match read_msg_v1(&mut second).await.expect("read pong") {
+        FrpMessage::Pong(pong) => assert!(
+            pong.error.is_none(),
+            "expected clean Pong on new control, got: {:?}",
+            pong.error
+        ),
+        other => panic!("expected Pong, got type byte: {:?}", other.v1_type_byte()),
     }
 }

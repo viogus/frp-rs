@@ -131,10 +131,12 @@ impl Service {
             // address (Go `mapped_addrs`); previously it was passed as
             // candidates=&[]/assisted, which always failed with
             // "no candidate addresses" — the provider never hole-punched.
+            // Go frp v0.71: the punch creates a persistent SESSION (one
+            // session per punch); user connections are accepted from it.
             // Scope the pinned punch future so its borrows of `sid`/`p2p_sid`
             // are released before the match arms below move those values.
-            let punch_result = {
-                let punch = frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+            let session_result = {
+                let punch = frp_core::xtcp_p2p::xtcp_p2p_connect_yamux_session(
                     socket,
                     &candidates,
                     &[],
@@ -164,108 +166,25 @@ impl Service {
                     }
                 }
             };
-            match punch_result {
-                Ok(mut p2p_stream) => {
+            match session_result {
+                Ok(session) => {
                     // Send NatHoleReport with success=true after successful hole punch
-                    // (Go frp compat: provider reports hole punch result to server)
+                    // (Go frp compat: provider reports the punch result to the server
+                    // BEFORE the accept loop — Go listenByKCP runs after the report).
                     Self::send_nat_hole_report(&w, v2, sid.clone(), true, "hole punch succeeded")
                         .await;
-                    if let Some(ref local) = local_addr {
-                        // Bound the local connect with the session liveness
-                        // check: a session teardown (reconnect/stop) during a
-                        // slow connect must not leave this provider task
-                        // parked on connect forever.
-                        let connect_fut = tokio::net::TcpStream::connect(local);
-                        tokio::pin!(connect_fut);
-                        let local_result = tokio::select! {
-                            r = &mut connect_fut => r,
-                            _ = wait_session_dead(&alive) => {
-                                debug!(proxy_name = %proxy_name, "XTCP provider '{}': session ended during local connect, aborting", proxy_name);
-                                return;
-                            }
-                            _ = proxy_token.cancelled() => {
-                                debug!(proxy_name = %proxy_name, "XTCP provider '{}': proxy deleted during local connect, aborting", proxy_name);
-                                return;
-                            }
-                        };
-                        match local_result {
-                            Ok(local_stream) => {
-                                frp_core::transport::set_nodelay(&local_stream);
-                                let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
-                                let use_comp = xtcp_use_comp;
-                                let sk = xtcp_sk.clone();
-                                let pn = proxy_name.clone();
-                                let alive_inner = alive.clone();
-                                let p2p_token = proxy_token.clone();
-                                tokio::spawn(async move {
-                                    let (local_r, local_w) = local_stream.into_split();
-                                    let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
-                                    let bridge = async {
-                                        if use_enc {
-                                            let key = frp_core::encryption::derive_key(&sk);
-                                            frp_core::bridge::bridge_encrypted(
-                                                local_r,
-                                                local_w,
-                                                p2p_r,
-                                                p2p_w,
-                                                &key,
-                                                use_comp,
-                                                vec![],
-                                                None,
-                                                None,
-                                                None,
-                                                None,
-                                                false,
-                                            )
-                                            .await;
-                                        } else {
-                                            frp_core::bridge::bridge_plain(
-                                                local_r,
-                                                local_w,
-                                                p2p_r,
-                                                p2p_w,
-                                                use_comp,
-                                                vec![],
-                                                None,
-                                                None,
-                                            )
-                                            .await;
-                                        }
-                                    };
-                                    tokio::pin!(bridge);
-                                    tokio::select! {
-                                        _ = &mut bridge => {}
-                                        _ = wait_session_dead(&alive_inner) => {
-                                            // Session torn down: drop the bridge
-                                            // futures, closing the P2P stream and
-                                            // the local connection.
-                                            debug!(proxy_name = %pn, "XTCP provider '{}': session ended, closing P2P bridge", pn);
-                                        }
-                                        _ = p2p_token.cancelled() => {
-                                            // Proxy deleted: drop the bridge
-                                            // futures, closing the P2P stream and
-                                            // the local connection.
-                                            debug!(proxy_name = %pn, "XTCP provider '{}': proxy deleted, closing P2P bridge", pn);
-                                        }
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
-                                Self::send_nat_hole_report(
-                                    &w,
-                                    v2,
-                                    sid,
-                                    false,
-                                    "connect local failed",
-                                )
-                                .await;
-                            }
-                        }
-                    } else {
-                        warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address", proxy_name);
-                        Self::send_nat_hole_report(&w, v2, sid, false, "no local addr").await;
-                    }
+                    let session = crate::visitor::TunnelSession::Kcp(session);
+                    Self::provider_accept_loop(
+                        session,
+                        local_addr,
+                        xtcp_use_enc,
+                        xtcp_use_comp,
+                        xtcp_sk,
+                        proxy_name,
+                        alive,
+                        proxy_token,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     warn!(proxy_name = %proxy_name, error = %e, "XTCP hole punch for '{}' failed: {}", proxy_name, e);
@@ -290,6 +209,200 @@ impl Service {
         });
         if let Err(e) = writer.send(report, v2) {
             debug!(error = %e, "Failed to send NatHoleReport ({reason})");
+        }
+    }
+
+    /// Go frp v0.71 `listenByKCP`/`listenByQUIC` accept loop: after the punch
+    /// succeeds, ONE session serves all subsequent user connections until it
+    /// dies. Each accepted stream is dialed to the local service and bridged
+    /// in a detached task; a local-dial failure only drops that stream (Go
+    /// `HandleTCPWorkConnection` runs per stream and never kills the
+    /// session). The loop exits when the session dies (accept error on a
+    /// dead session), the control session ends (`session_alive`), or the
+    /// proxy is deleted (`proxy_token`).
+    ///
+    /// `PROVIDER_ACCEPT_TIMEOUT` bounds each accept so an idle live session
+    /// is not pinned forever on one recv; after a timeout the loop re-checks
+    /// `is_alive()` to distinguish an idle session (keep accepting) from a
+    /// dead one (exit).
+    ///
+    /// The local dial also runs inside the per-stream task, bounded by
+    /// session teardown, proxy deletion, and `LOCAL_DIAL_TIMEOUT` — a
+    /// blackholed local service can no longer wedge the shared accept loop
+    /// (Go parity: the dial is per-goroutine there; we additionally bound it
+    /// where Go leaks the goroutine forever).
+    #[allow(clippy::too_many_arguments)]
+    async fn provider_accept_loop(
+        session: crate::visitor::TunnelSession,
+        local_addr: Option<String>,
+        use_enc: bool,
+        use_comp: bool,
+        sk: String,
+        proxy_name: String,
+        alive: Arc<AtomicBool>,
+        proxy_token: CancellationToken,
+    ) {
+        const PROVIDER_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+        // Bounded per-stream local dial: a blackholed local service (SYN
+        // silently dropped) must not park the stream + fd forever. Go frp
+        // leaves the dial unbounded in the per-stream goroutine (a leak);
+        // 15s is far beyond any sane local connect.
+        const LOCAL_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+        loop {
+            tokio::select! {
+                _ = wait_session_dead(&alive) => {
+                    // Control session torn down (reconnect/stop): the
+                    // detached bridge tasks are session-bound and abort via
+                    // the same flag; exit here.
+                    debug!(proxy_name = %proxy_name, "XTCP provider '{}': session ended, closing P2P accept loop", proxy_name);
+                    return;
+                }
+                _ = proxy_token.cancelled() => {
+                    // Proxy deleted (CloseProxy/reload): close the session
+                    // (releases UDP socket + KCP + yamux) and exit.
+                    debug!(proxy_name = %proxy_name, "XTCP provider '{}': proxy deleted, closing P2P accept loop", proxy_name);
+                    session.close().await;
+                    return;
+                }
+                accepted = session.accept_stream(PROVIDER_ACCEPT_TIMEOUT) => {
+                    match accepted {
+                        Ok(mut stream) => {
+                            let Some(local) = local_addr.clone() else {
+                                // No local service for this proxy (should not
+                                // happen — registration requires it); drop the
+                                // stream, keep accepting.
+                                warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address for P2P stream, dropping", proxy_name);
+                                drop(stream);
+                                continue;
+                            };
+                            // Go parity: the provider accept loop (Go
+                            // client/proxy/xtcp.go listenByKCP/listenByQUIC
+                            // ~145-172) spawns a GOROUTINE per accepted
+                            // stream — the per-stream local dial must never
+                            // block the shared session's accept loop. The
+                            // dial + bridge run in a spawned task, bounded by
+                            // session teardown, proxy deletion, and
+                            // LOCAL_DIAL_TIMEOUT (bounded divergence from Go,
+                            // which leaks the goroutine on a blackholed local
+                            // service).
+                            let use_enc2 = use_enc && !sk.is_empty();
+                            let sk2 = sk.clone();
+                            let pn = proxy_name.clone();
+                            let alive_inner = alive.clone();
+                            let p2p_token = proxy_token.clone();
+                            tokio::spawn(async move {
+                                // Bound the local connect: session teardown /
+                                // proxy deletion / dial timeout drop the dial
+                                // + stream and return; the accept loop is
+                                // never parked.
+                                let connect_fut =
+                                    tokio::net::TcpStream::connect(local.as_str());
+                                tokio::pin!(connect_fut);
+                                let dial_timeout = tokio::time::sleep(LOCAL_DIAL_TIMEOUT);
+                                tokio::pin!(dial_timeout);
+                                let local_stream = tokio::select! {
+                                    r = &mut connect_fut => match r {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            // Go parity: HandleTCPWorkConnection
+                                            // logs and returns; the session
+                                            // accept loop continues.
+                                            warn!(proxy_name = %pn, error = %e, "XTCP provider '{}': connect local failed, dropping P2P stream", pn);
+                                            return;
+                                        }
+                                    },
+                                    _ = wait_session_dead(&alive_inner) => {
+                                        // Session torn down (reconnect/stop):
+                                        // drop the dial + stream.
+                                        debug!(proxy_name = %pn, "XTCP provider '{}': session ended during local connect, dropping P2P stream", pn);
+                                        return;
+                                    }
+                                    _ = p2p_token.cancelled() => {
+                                        // Proxy deleted (CloseProxy/reload):
+                                        // drop the dial + stream.
+                                        debug!(proxy_name = %pn, "XTCP provider '{}': proxy deleted during local connect, dropping P2P stream", pn);
+                                        return;
+                                    }
+                                    _ = &mut dial_timeout => {
+                                        // Bounded dial: a blackholed local
+                                        // service (SYN silently dropped) must
+                                        // not hold the stream + fd forever.
+                                        warn!(proxy_name = %pn, local = %local, "XTCP provider '{}': local dial timed out ({}s), dropping P2P stream", pn, LOCAL_DIAL_TIMEOUT.as_secs());
+                                        return;
+                                    }
+                                };
+                                frp_core::transport::set_nodelay(&local_stream);
+                                let (local_r, local_w) = local_stream.into_split();
+                                let (p2p_r, p2p_w) = tokio::io::split(&mut stream);
+                                let bridge = async {
+                                    if use_enc2 {
+                                        let key =
+                                            frp_core::encryption::derive_key(&sk2);
+                                        frp_core::bridge::bridge_encrypted(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            &key,
+                                            use_comp,
+                                            vec![],
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            false,
+                                        )
+                                        .await;
+                                    } else {
+                                        frp_core::bridge::bridge_plain(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            use_comp,
+                                            vec![],
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                };
+                                tokio::pin!(bridge);
+                                tokio::select! {
+                                    _ = &mut bridge => {}
+                                    _ = wait_session_dead(&alive_inner) => {
+                                        // Session torn down: drop the
+                                        // bridge futures, closing the
+                                        // P2P stream and the local
+                                        // connection.
+                                        debug!(proxy_name = %pn, "XTCP provider '{}': session ended, closing P2P bridge", pn);
+                                    }
+                                    _ = p2p_token.cancelled() => {
+                                        // Proxy deleted: drop the
+                                        // bridge futures, closing the
+                                        // P2P stream and the local
+                                        // connection.
+                                        debug!(proxy_name = %pn, "XTCP provider '{}': proxy deleted, closing P2P bridge", pn);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            if session.is_alive() {
+                                // Idle timeout on a live session: keep
+                                // accepting.
+                                continue;
+                            }
+                            // Session dead (closed, peer gone, driver exit):
+                            // close the session (releases UDP socket + KCP +
+                            // yamux / QUIC) and exit.
+                            debug!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': P2P session closed: {}", proxy_name, e);
+                            session.close().await;
+                            return;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -369,12 +482,19 @@ impl Service {
         // NatHoleResp.detect_behavior as the hole-punch timeout, not a
         // hardcoded 5000ms. The server computes this as max(SendDelayMs) + 5000
         // (+30000 if listen_random_ports) minus the side's own send_delay.
-        // Default to 5000ms if detect_behavior is not available.
+        // Default to 5000ms if detect_behavior is not available. Go MakeHole
+        // floors the guard at 5s too: `timeout := 5*time.Second; if
+        // m.DetectBehavior.ReadTimeoutMs > 0 {...}` (pkg/nathole/nathole.go:
+        // 248-250) — a hostile/misbehaving server sending 0 (or a negative)
+        // must not make the punch fail instantly.
         let hole_punch_timeout = resp
             .detect_behavior
             .as_ref()
-            .map(|db| db.read_timeout_ms.max(0) as u64)
-            .unwrap_or(5000);
+            .map(|db| {
+                (db.read_timeout_ms.max(0) as u64)
+                    .max(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS)
+            })
+            .unwrap_or(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS);
 
         // Spawn hole punch task (don't block control loop)
         let proxy_info = self.proxy_info_map.read().await.get(&proxy_name).map(|p| {
@@ -395,6 +515,26 @@ impl Service {
         let hp_timeout = hole_punch_timeout;
         let resp_writer = writer.clone();
         let resp_v2 = self.cfg.read().await.v2;
+        // Client QUIC transport params for the provider-side tunnel session
+        // (Go `listenByQUIC` reads `pxy.clientCfg.Transport.QUIC`).
+        #[cfg(feature = "quic")]
+        let quic_params = {
+            let cfg = self.cfg.read().await;
+            frp_core::quic::quic_params_from_option_values(
+                cfg.quic_options
+                    .as_ref()
+                    .map(|q| q.keepalive_period)
+                    .unwrap_or(0),
+                cfg.quic_options
+                    .as_ref()
+                    .map(|q| q.max_idle_timeout)
+                    .unwrap_or(0),
+                cfg.quic_options
+                    .as_ref()
+                    .map(|q| q.max_incoming_streams)
+                    .unwrap_or(0),
+            )
+        };
         tokio::spawn(async move {
             // Session-bound task: `session_alive` is cleared at session
             // teardown, which aborts both the hole punch and the P2P bridge
@@ -451,7 +591,22 @@ impl Service {
                 }
             };
 
-            // UDP hole punch + KCP data plane (Go v0.70 compat).
+            // Go frp v0.71: the punch creates a persistent SESSION (one
+            // session per punch); user connections are accepted from it.
+            // Data-plane protocol dispatch: the server echoes the visitor's
+            // `protocol` (NatHoleVisitor → NatHoleResp) back to both peers.
+            // Go provider dispatch (client/proxy/xtcp.go:124): ONLY "kcp"
+            // selects listenByKCP; anything else — "quic", "" or an unknown
+            // value — falls through to listenByQUIC. (Round-8 read "" as
+            // KCP — a divergence for explicitly-empty protocol echoes.)
+            //
+            // Provider roles: yamux server (accepts the visitor's yamux
+            // streams) or QUIC server (accepts the QUIC connection + streams).
+            // candidate_addrs = the peer's mapped addrs, assisted_addrs = the
+            // peer's assisted addrs, and the server's detect_behavior drives
+            // the MakeHole probe. Scope the pinned punch future so its
+            // borrows of `candidate_addrs`/`p2p_sid` are released before the
+            // match arms below move the session values.
             let conv = frp_core::xtcp_p2p::conv_from_sid(&sid_clone);
             let kcp_cfg = frp_core::kcp::default_kcp_config();
             let p2p_key = if !xtcp_sk.is_empty() {
@@ -464,57 +619,10 @@ impl Service {
             } else {
                 Some(sid_clone.as_str())
             };
-            // Data-plane protocol dispatch: the server echoes the visitor's
-            // `protocol` (NatHoleVisitor → NatHoleResp) back to both peers.
-            // Go v0.70.1 visitors default to "quic"; a Rust visitor's
-            // `protocol` config field selects it. Anything else (incl. "" or
-            // "tcp") falls through to the KCP+yamux data plane.
-            //
-            // Provider roles: yamux server (accepts the visitor's yamux
-            // stream) or QUIC server (accepts the QUIC connection + stream).
-            // Go v0.70.1 semantics: candidate_addrs = the peer's mapped addrs,
-            // assisted_addrs = the peer's assisted addrs, and the server's
-            // detect_behavior drives the MakeHole probe. (Previously these were
-            // passed as candidates=&[]/behavior=None, which made the simplified
-            // punch fail with "no candidate addresses" — the provider never
-            // actually hole-punched.)
-            // Scope the pinned punch future so its borrows of
-            // `candidate_addrs`/`p2p_sid` are released before the match arms
-            // below move `p2p_stream`/`local_addr` values.
-            let p2p_stream: Result<Box<dyn frp_core::xtcp_p2p::P2pStream>, String> = {
+            let session_result: Result<crate::visitor::TunnelSession, String> = {
                 let p2p_fut = async {
-                    match p2p_protocol.as_str() {
-                        "quic" => {
-                            #[cfg(all(feature = "quic", feature = "kcp"))]
-                            {
-                                match frp_core::xtcp_p2p::xtcp_p2p_connect_quic(
-                                    socket,
-                                    &candidate_addrs,
-                                    &assisted_addrs,
-                                    detect_behavior.as_ref(),
-                                    hp_timeout,
-                                    p2p_sid,
-                                    p2p_key.as_ref(),
-                                    true, // is_server = true (provider is QUIC server)
-                                )
-                                .await
-                                {
-                                    Ok(s) => Ok(Box::new(s) as Box<_>),
-                                    Err(e) => Err(e),
-                                }
-                            }
-                            #[cfg(not(all(feature = "quic", feature = "kcp")))]
-                            {
-                                warn!(proxy_name = %proxy_name_clone,
-                                "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
-                                proxy_name_clone);
-                                Err(format!(
-                                    "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features",
-                                    proxy_name_clone
-                                ))
-                            }
-                        }
-                        _ => match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                    if p2p_protocol == "kcp" {
+                        match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux_session(
                             socket,
                             &candidate_addrs,
                             &assisted_addrs,
@@ -528,9 +636,40 @@ impl Service {
                         )
                         .await
                         {
-                            Ok(s) => Ok(Box::new(s) as Box<_>),
+                            Ok(s) => Ok(crate::visitor::TunnelSession::Kcp(s)),
                             Err(e) => Err(e),
-                        },
+                        }
+                    } else {
+                        // default is quic (Go parity: anything not "kcp")
+                        #[cfg(all(feature = "quic", feature = "kcp"))]
+                        {
+                            match frp_core::xtcp_session::xtcp_p2p_connect_quic_session_with_params(
+                                socket,
+                                &candidate_addrs,
+                                &assisted_addrs,
+                                detect_behavior.as_ref(),
+                                hp_timeout,
+                                p2p_sid,
+                                p2p_key.as_ref(),
+                                true, // is_server = true (provider is QUIC server)
+                                quic_params,
+                            )
+                            .await
+                            {
+                                Ok(s) => Ok(crate::visitor::TunnelSession::Quic(s)),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        #[cfg(not(all(feature = "quic", feature = "kcp")))]
+                        {
+                            warn!(proxy_name = %proxy_name_clone,
+                            "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features (the QUIC data plane reuses the KCP hole-punch machinery); refusing to silently fall back to KCP (Go peers may be on a QUIC data plane)",
+                            proxy_name_clone);
+                            Err(format!(
+                                "XTCP provider '{}': protocol 'quic' requires both the quic and kcp features",
+                                proxy_name_clone
+                            ))
+                        }
                     }
                 };
                 tokio::pin!(p2p_fut);
@@ -551,110 +690,32 @@ impl Service {
                     }
                 }
             };
-            match p2p_stream {
-                Ok(mut p2p_stream) => {
+            match session_result {
+                Ok(session) => {
                     // Send NatHoleReport with success=true after successful hole punch
-                    // (Go frp compat: provider reports hole punch result to server).
+                    // (Go frp compat: provider reports the punch result to the server
+                    // BEFORE the accept loop — Go listenByKCP/listenByQUIC run
+                    // after the report).
                     let ok_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                         sid: Some(sid_clone.clone()),
                         success: true,
                     });
                     let _ = resp_writer.send(ok_report, resp_v2);
-                    info!(proxy_name = %proxy_name_clone, protocol = %p2p_protocol, "XTCP provider '{}': P2P connected", proxy_name_clone);
-                    if let Some(ref local) = local_addr {
-                        // Bound the local connect with the session liveness
-                        // check: a session teardown (reconnect/stop) during a
-                        // slow connect must not leave this provider task
-                        // parked on connect forever.
-                        let connect_fut = tokio::net::TcpStream::connect(local);
-                        tokio::pin!(connect_fut);
-                        let local_result = tokio::select! {
-                            r = &mut connect_fut => r,
-                            _ = wait_session_dead(&alive) => {
-                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': session ended during local connect, aborting", proxy_name_clone);
-                                return;
-                            }
-                            _ = proxy_token.cancelled() => {
-                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': proxy deleted during local connect, aborting", proxy_name_clone);
-                                return;
-                            }
-                        };
-                        match local_result {
-                            Ok(local_conn) => {
-                                frp_core::transport::set_nodelay(&local_conn);
-                                let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
-                                let (local_r, local_w) = local_conn.into_split();
-                                let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
-                                let bridge = async {
-                                    if use_enc {
-                                        let key = frp_core::encryption::derive_key(&xtcp_sk);
-                                        frp_core::bridge::bridge_encrypted(
-                                            local_r,
-                                            local_w,
-                                            p2p_r,
-                                            p2p_w,
-                                            &key,
-                                            xtcp_use_comp,
-                                            vec![],
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                            false,
-                                        )
-                                        .await;
-                                    } else {
-                                        frp_core::bridge::bridge_plain(
-                                            local_r,
-                                            local_w,
-                                            p2p_r,
-                                            p2p_w,
-                                            xtcp_use_comp,
-                                            vec![],
-                                            None,
-                                            None,
-                                        )
-                                        .await;
-                                    }
-                                };
-                                tokio::pin!(bridge);
-                                tokio::select! {
-                                    _ = &mut bridge => {}
-                                    _ = wait_session_dead(&alive) => {
-                                        // Session torn down: drop the bridge
-                                        // futures, closing the P2P stream and
-                                        // the local connection.
-                                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': session ended, closing P2P bridge", proxy_name_clone);
-                                    }
-                                    _ = proxy_token.cancelled() => {
-                                        // Proxy deleted: drop the bridge
-                                        // futures, closing the P2P stream and
-                                        // the local connection.
-                                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}': proxy deleted, closing P2P bridge", proxy_name_clone);
-                                    }
-                                }
-                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
-                            }
-                            Err(e) => {
-                                warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': connect local failed", proxy_name_clone);
-                                let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                                    sid: Some(sid_clone.clone()),
-                                    success: false,
-                                });
-                                let _ = resp_writer.send(fail_report, resp_v2);
-                            }
-                        }
-                    } else {
-                        warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': no local address", proxy_name_clone);
-                        let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                            sid: Some(sid_clone.clone()),
-                            success: false,
-                        });
-                        let _ = resp_writer.send(fail_report, resp_v2);
-                    }
+                    info!(proxy_name = %proxy_name_clone, protocol = %p2p_protocol, "XTCP provider '{}': P2P session established", proxy_name_clone);
+                    Self::provider_accept_loop(
+                        session,
+                        local_addr,
+                        xtcp_use_enc,
+                        xtcp_use_comp,
+                        xtcp_sk,
+                        proxy_name_clone,
+                        alive,
+                        proxy_token,
+                    )
+                    .await;
                 }
                 Err(e) => {
-                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': UDP hole punch + data plane connect failed", proxy_name_clone);
+                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': UDP hole punch + session connect failed", proxy_name_clone);
                     let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                         sid: Some(sid_clone.clone()),
                         success: false,

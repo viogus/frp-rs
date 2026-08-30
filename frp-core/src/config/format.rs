@@ -201,8 +201,17 @@ fn infer_ini_value(s: &str) -> toml::Value {
         return toml::Value::String(String::new());
     }
 
-    // Quoted string → strip quotes
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+    // Quoted string → strip quotes. A value that IS a lone quote character
+    // (`"` or `'`, length 1) satisfies both starts_with and ends_with — the
+    // old `s[1..s.len() - 1]` became `s[1..0]` and panicked ("slice index
+    // starts at 1 but ends at 0"), aborting in release builds (panic=abort);
+    // reachable from any `.ini` config at startup and on runtime reload
+    // (frpc SIGUSR1 / admin API). Go ini.v1 keeps a lone quote as a
+    // one-character literal string, so require len >= 2 and let the
+    // one-char value fall through to the string branch below.
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
         return toml::Value::String(s[1..s.len() - 1].to_string());
     }
 

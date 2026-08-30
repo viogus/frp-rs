@@ -95,13 +95,18 @@ impl Controller {
         Ok(rx)
     }
 
-    /// Unregister a provider and cleanup orphaned sessions.
-    pub async fn close_client(&self, name: &str) {
-        self.client_cfgs.write().await.remove(name);
-        // Remove any sessions belonging to this provider.
-        let mut sessions = self.sessions.write().await;
-        sessions.retain(|_sid, session| session.proxy_name != name);
-    }
+    // NOTE: Go frp's `CloseClient` (server/proxy/xtcp.go:98, called from
+    // proxy close) has NO counterpart here by design: frp-rs never registers
+    // providers in `client_cfgs` — `listen_client`/`notify_provider` have
+    // zero callers and the visitor path resolves providers via
+    // `proxy_manager`/`run_id_to_ctl_tx` (dispatch.rs handle_nat_hole_visitor)
+    // instead, which `unregister_control` already cleans up on control exit.
+    // Wiring CloseClient here would be a no-op on a permanently empty map.
+    // Go sessions are deleted by the visitor's own goroutine
+    // (`defer delete(c.sessions, sid)` — controller.go newSessionForVisitor),
+    // not by provider close; frp-rs sessions are likewise owned by the
+    // visitor/control paths (NAT_HOLE_TIMEOUT + session completion), so the
+    // "cleanup orphaned sessions" half has nothing to add either.
 
     /// Notify a provider about a new visitor (send sid to provider).
     pub async fn notify_provider(&self, name: &str, sid: &str) -> Result<(), String> {

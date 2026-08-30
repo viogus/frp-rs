@@ -9,21 +9,32 @@ use std::net::IpAddr;
 /// Produces `PROXY TCP4 <src> <dst> <sport> <dport>\r\n` for IPv4 pairs and
 /// `PROXY TCP6 <src> <dst> <sport> <dport>\r\n` when either address is IPv6
 /// (matching Go's go-proxyproto: the v1 family is chosen from the addresses).
+///
+/// Both addresses MUST parse as [`IpAddr`] — Go validates them via
+/// `net.ResolveTCPAddr` (client/proxy/proxy.go) and skips the header on
+/// failure. Rejecting unparsable addresses here also blocks header-injection
+/// (a CRLF-bearing `src_addr` can never reach the wire verbatim).
 pub fn build_proxy_protocol_v1(
     src_addr: &str,
     dst_addr: &str,
     src_port: u16,
     dst_port: u16,
-) -> String {
-    let family = match (src_addr.parse::<IpAddr>(), dst_addr.parse::<IpAddr>()) {
-        (Ok(IpAddr::V4(_)), Ok(IpAddr::V4(_))) => "TCP4",
+) -> Result<String, String> {
+    let src_ip: IpAddr = src_addr
+        .parse()
+        .map_err(|e| format!("v1 src_addr parse: {e}"))?;
+    let dst_ip: IpAddr = dst_addr
+        .parse()
+        .map_err(|e| format!("v1 dst_addr parse: {e}"))?;
+    let family = match (src_ip, dst_ip) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => "TCP4",
         // Mixed or IPv6 pairs use TCP6.
         _ => "TCP6",
     };
-    format!(
+    Ok(format!(
         "PROXY {family} {} {} {} {}\r\n",
         src_addr, dst_addr, src_port, dst_port,
-    )
+    ))
 }
 
 /// Build a PROXY protocol v2 binary header.
@@ -93,7 +104,9 @@ pub fn build_proxy_protocol_header(
     version: &str,
 ) -> Result<Vec<u8>, String> {
     match version {
-        "v1" => Ok(build_proxy_protocol_v1(src_addr, dst_addr, src_port, dst_port).into_bytes()),
+        "v1" => {
+            build_proxy_protocol_v1(src_addr, dst_addr, src_port, dst_port).map(|s| s.into_bytes())
+        }
         "v2" => build_proxy_protocol_v2(src_addr, dst_addr, src_port, dst_port),
         _ => Err(format!("unknown PROXY protocol version: {version}")),
     }
@@ -105,18 +118,45 @@ mod tests {
 
     #[test]
     fn test_v1_format() {
-        let h = build_proxy_protocol_v1("10.0.0.1", "10.0.0.2", 1234, 5678);
+        let h = build_proxy_protocol_v1("10.0.0.1", "10.0.0.2", 1234, 5678).unwrap();
         assert_eq!(h, "PROXY TCP4 10.0.0.1 10.0.0.2 1234 5678\r\n");
     }
 
     #[test]
     fn test_v1_ipv6_emits_tcp6() {
         // Either address being IPv6 selects TCP6 (Go go-proxyproto family).
-        let h = build_proxy_protocol_v1("::1", "2001:db8::2", 1234, 5678);
+        let h = build_proxy_protocol_v1("::1", "2001:db8::2", 1234, 5678).unwrap();
         assert_eq!(h, "PROXY TCP6 ::1 2001:db8::2 1234 5678\r\n");
         // Mixed families also use TCP6.
-        let mixed = build_proxy_protocol_v1("10.0.0.1", "::1", 1234, 5678);
+        let mixed = build_proxy_protocol_v1("10.0.0.1", "::1", 1234, 5678).unwrap();
         assert_eq!(mixed, "PROXY TCP6 10.0.0.1 ::1 1234 5678\r\n");
+    }
+
+    #[test]
+    fn test_v1_rejects_unparsable_addrs() {
+        // M2 regression: Go resolves both addresses via net.ResolveTCPAddr
+        // and SKIPS the header on failure (client/proxy/proxy.go:183-197).
+        // A CRLF-bearing src_addr must never reach the wire verbatim — it
+        // would let an attacker inject a second PROXY header / fake the
+        // client address on the backend.
+        let crlf = build_proxy_protocol_v1(
+            "10.0.0.1\r\nPROXY TCP4 9.9.9.9 9.9.9.9 1 1",
+            "10.0.0.2",
+            1,
+            2,
+        );
+        assert!(crlf.is_err(), "CRLF-bearing src_addr must be rejected");
+
+        let hostname = build_proxy_protocol_v1("example.com", "10.0.0.2", 1, 2);
+        assert!(hostname.is_err(), "hostname src_addr must be rejected");
+
+        let bad_dst = build_proxy_protocol_v1("10.0.0.1", "not-an-ip\r\n", 1, 2);
+        assert!(bad_dst.is_err(), "unparsable dst_addr must be rejected");
+
+        // Ports are u16 already; a 0 port is rejected by the CALLER gate
+        // (Go `m.SrcPort != 0`), not here — the builder stays pure.
+        let ok = build_proxy_protocol_v1("10.0.0.1", "10.0.0.2", 0, 0).unwrap();
+        assert_eq!(ok, "PROXY TCP4 10.0.0.1 10.0.0.2 0 0\r\n");
     }
 
     #[test]
@@ -157,6 +197,9 @@ mod tests {
     fn test_unified_v1() {
         let h = build_proxy_protocol_header("10.0.0.1", "10.0.0.2", 1, 2, "v1").unwrap();
         assert_eq!(h, b"PROXY TCP4 10.0.0.1 10.0.0.2 1 2\r\n");
+        // The unified builder rejects unparsable addrs too (Go parity).
+        let bad = build_proxy_protocol_header("10.0.0.1\r\n", "10.0.0.2", 1, 2, "v1");
+        assert!(bad.is_err(), "unified v1 must reject CRLF-bearing src_addr");
     }
 
     #[test]

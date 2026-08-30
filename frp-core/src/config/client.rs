@@ -10,6 +10,20 @@ fn default_udp_packet_size_i64() -> i64 {
     1500
 }
 
+/// Maximum UDP payload size (IPv4: 65535 - 8 UDP - 20 IP = 65507). Clamps
+/// `udp_packet_size` at config load — a hostile config value (e.g. 2^31)
+/// would otherwise allocate a multi-GiB receive buffer per UDP proxy at
+/// runtime (work_conn.rs `vec![0u8; udp_packet_size.max(1)]`).
+const MAX_UDP_PACKET_SIZE: i64 = 65507;
+
+fn clamp_udp_packet_size<'de, D>(d: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = i64::deserialize(d)?;
+    Ok(v.clamp(0, MAX_UDP_PACKET_SIZE))
+}
+
 fn default_visitor_bind_addr() -> String {
     "127.0.0.1".into()
 }
@@ -165,6 +179,7 @@ pub struct HealthCheckHttpHeader {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
+    #[serde(default = "default_server_addr")]
     pub server_addr: String,
     #[serde(default = "default_server_port")]
     pub server_port: u16,
@@ -301,9 +316,16 @@ pub struct ClientConfig {
     #[serde(default, alias = "featureGates")]
     pub feature: FeatureConfig,
     /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
-    /// proxy datagrams. Default: 1500 (Go frp compat).
+    /// proxy datagrams. Default: 1500 (Go frp compat). Clamped to
+    /// [0, 65507] at load — the max UDP payload — so a hostile config value
+    /// cannot force a multi-GiB per-proxy allocation at runtime (the
+    /// use-sites in work_conn.rs size their buffers from this value).
     /// Go frp compat: udpPacketSize / UDPPacketSize.
-    #[serde(default = "default_udp_packet_size_i64", alias = "udpPacketSize")]
+    #[serde(
+        default = "default_udp_packet_size_i64",
+        alias = "udpPacketSize",
+        deserialize_with = "clamp_udp_packet_size"
+    )]
     pub udp_packet_size: i64,
     /// OpenTelemetry / observability settings.
     #[serde(default)]
@@ -385,15 +407,18 @@ impl ClientConfig {
             }
         }
 
-        // Go v0.70.1: with tcpMux enabled, application-layer heartbeats are
-        // disabled by default (-1) and yamux keepalive covers liveness. An
-        // explicit value is preserved (Option-style set tracking). This
-        // branch keeps its exact current behavior.
+        // Go v0.71.0: with tcpMux enabled, application-layer heartbeats are
+        // disabled by default (-1) and yamux keepalive covers liveness.
+        // util.EmptyOr(v, -1): a zero value — explicit or default — means
+        // "use the default" = -1; only positive explicit values survive
+        // (round-8 fix 5: the old code preserved an explicit 0, diverging
+        // from Go's value-level semantics; runtime-equivalent, but Go frpc
+        // shows -1 in status output).
         if self.tcp_mux {
-            if !heartbeat_interval_set {
+            if !heartbeat_interval_set || self.heartbeat_interval == 0 {
                 self.heartbeat_interval = -1;
             }
-            if !heartbeat_timeout_set {
+            if !heartbeat_timeout_set || self.heartbeat_timeout == 0 {
                 self.heartbeat_timeout = -1;
             }
         } else {
@@ -423,6 +448,17 @@ impl ClientConfig {
         if self.dial_server_timeout == 0 {
             self.dial_server_timeout = default_dial_server_timeout();
         }
+
+        // No clamp here — Go frp has none (Go frpc uses 7200; round-8
+        // blocker: the old 3600 cap disconnected a Go frpc ↔ Rust frps
+        // pair in a reconnect loop). Any positive i64 is honored; the
+        // client watchdog arithmetic is overflow-safe by construction:
+        // `Duration::from_secs(u64)` never panics, the watchdog sleeps
+        // `hb_timeout_dur.saturating_sub(last_pong.elapsed())`
+        // (frp-client/src/service.rs), and tokio's sleep/interval saturate
+        // to tokio's far-future deadline via `Instant::checked_add` rather
+        // than panicking. Values <= 0 (explicit disable) keep their
+        // semantics.
     }
 
     /// Merge file-stored proxies/visitors over this config.
@@ -465,6 +501,12 @@ impl ClientConfig {
 
 fn default_server_port() -> u16 {
     7000
+}
+/// Go `ClientCommonConfig.Complete()` defaults `serverAddr` to "0.0.0.0"
+/// (client.go:86) — `server_addr` is the only Go-defaulted field that had no
+/// serde default, so a config omitting it failed at load (round 10 MEDIUM).
+fn default_server_addr() -> String {
+    "0.0.0.0".into()
 }
 fn default_transport_protocol() -> String {
     "tcp".into()
@@ -540,7 +582,10 @@ pub struct ProxyConfig {
     pub multiplexer: String,
     #[serde(default)]
     pub group: String,
-    #[serde(default)]
+    // Go frp v1 proxy config carries `groupKey` as a TOP-LEVEL proxy field
+    // (ProxyBaseConf.GroupKey) — without this alias the key is silently
+    // dropped by the lenient unknown-key tolerance.
+    #[serde(default, alias = "groupKey")]
     pub group_key: String,
     #[serde(default)]
     pub health_check_type: String,
@@ -606,8 +651,15 @@ pub struct VisitorConfig {
     /// Protocol for XTCP P2P connections: "quic" (default, matching Go frp
     /// v0.70.1) or "kcp". Both data planes are implemented; "quic" requires
     /// BOTH the `quic` and `kcp` features (the QUIC data plane reuses the
-    /// KCP hole-punch machinery).
-    #[serde(default = "default_xtcp_protocol", alias = "protocol")]
+    /// KCP hole-punch machinery). An EXPLICIT empty value normalizes to
+    /// "quic" (Go frp: `Protocol = util.EmptyOr(Protocol, "quic")` at
+    /// pkg/config/v1/visitor.go:160 — a missing field is covered by the
+    /// serde default; the deserializer covers `protocol = ""`).
+    #[serde(
+        default = "default_xtcp_protocol",
+        alias = "protocol",
+        deserialize_with = "deserialize_xtcp_protocol"
+    )]
     pub protocol: String,
     /// Optional server user for auth matching.
     #[serde(default, alias = "serverUser")]
@@ -720,9 +772,58 @@ fn default_xtcp_protocol() -> String {
     // Go frp v0.70.1 XTCP visitors default to "quic".
     "quic".into()
 }
+
+/// Serde helper for `VisitorConfig.protocol`: Go frp normalizes an EXPLICIT
+/// empty value to "quic" (`util.EmptyOr(Protocol, "quic")` in
+/// pkg/config/v1/visitor.go:160, applied during config Complete()). The
+/// `default = "default_xtcp_protocol"` serde attribute only covers a MISSING
+/// field; this covers `protocol = ""` — which would otherwise dispatch to
+/// the KCP data plane ("" is not "quic"), diverging from Go where "" is
+/// impossible after Complete(). "kcp" and other values pass through
+/// unchanged (validation later rejects anything outside kcp/quic).
+fn deserialize_xtcp_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(if s.is_empty() { "quic".into() } else { s })
+}
 fn default_vnet_netmask() -> String {
     "255.255.255.0".to_string()
 }
 fn default_vnet_mtu() -> u16 {
     1420
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_udp_packet_size;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(deserialize_with = "clamp_udp_packet_size")]
+        v: i64,
+    }
+
+    fn parse(s: &str) -> i64 {
+        serde_json::from_str::<Wrapper>(s).unwrap().v
+    }
+
+    #[test]
+    fn udp_packet_size_clamped_at_load() {
+        // Above the IPv4 UDP max → clamped down (a hostile 2^31 would
+        // allocate a multi-GiB receive buffer per UDP proxy).
+        assert_eq!(parse(r#"{"v": 2147483647}"#), 65507);
+        assert_eq!(parse(r#"{"v": 999999999}"#), 65507);
+        assert_eq!(parse(r#"{"v": 65507}"#), 65507);
+        // In-range values pass through untouched.
+        assert_eq!(parse(r#"{"v": 2048}"#), 2048);
+        assert_eq!(parse(r#"{"v": 1500}"#), 1500);
+        // Negative / zero → clamped to 0 (runtime use-sites floor at 1).
+        assert_eq!(parse(r#"{"v": -5}"#), 0);
+        assert_eq!(parse(r#"{"v": 0}"#), 0);
+        // Non-integer still fails deserialization.
+        assert!(serde_json::from_str::<Wrapper>(r#"{"v": "big"}"#).is_err());
+    }
 }

@@ -8,12 +8,24 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
+use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg, TEST_TOKEN};
+use frp_core::auth;
 use frp_core::config::ServerConfig;
 use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::transport::{dial_server, DialOptions};
+
+fn test_cert_dir() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop(); // workspace root
+    p.push("frp-core");
+    p.push("tests");
+    p.push("certs");
+    p
+}
 
 /// Build a minimal TLS 1.2 ClientHello with SNI (same construction as the
 /// vhost.rs unit tests — byte-exact lengths matter for SNI extraction).
@@ -213,5 +225,103 @@ async fn test_https_vhost_sni_passthrough() {
 
     println!("HTTPS vhost SNI passthrough verified: raw TLS bytes forwarded to backend");
     drop(client);
+    drop(provider);
+}
+
+/// M11 regression: the main port must NEVER parse the TLS ClientHello (Go
+/// parity — Go's main port reads a single 0x17/0x16 byte for TLS detection,
+/// pkg/util/net/tls.go; HTTPS proxies are served exclusively on
+/// vhost_https_port). The old SNI sniff on the main port hijacked frpc TLS
+/// control connections on a route collision: with an https proxy registered
+/// under a wildcard domain covering the server hostname, a TLS control
+/// login's SNI matched the wildcard route and the connection was diverted to
+/// the https backend instead of being accepted as a control connection.
+#[tokio::test]
+async fn test_tls_control_login_not_hijacked_by_https_wildcard() {
+    let bind_port = allocate_port();
+    let vhost_https_port = allocate_port();
+    let cert_dir = test_cert_dir();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        vhost_https_port,
+        tls_enable: true,
+        tls_cert_file: cert_dir.join("server.crt").to_string_lossy().into(),
+        tls_key_file: cert_dir.join("server.key").to_string_lossy().into(),
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+
+    // Provider registers an https proxy under a BARE wildcard: it covers the
+    // server hostname ("localhost"/"127.0.0.1"), so the old main-port SNI
+    // sniff would have routed the TLS control login's ClientHello here.
+    let (mut provider, _resp) = login_with_test_token(addr).await.expect("provider login");
+    let np = FrpMessage::NewProxy(Box::new(https_proxy("wildcard-https", vec!["*".into()])));
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
+    match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
+        FrpMessage::NewProxyResp(ref resp) => {
+            assert!(
+                resp.error.is_none(),
+                "wildcard https proxy registration should succeed: {:?}",
+                resp.error
+            );
+        }
+        other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
+    }
+
+    // TLS control login to the MAIN port: must be accepted as a control
+    // connection (LoginResp without error), NOT diverted to the https route.
+    let opts = DialOptions {
+        server_addr: "127.0.0.1".into(),
+        server_port: bind_port,
+        tls_enable: true,
+        tls_server_name: "localhost".into(),
+        tls_ca_file: Some(cert_dir.join("ca.crt").to_string_lossy().into()),
+        ..Default::default()
+    };
+    let mut io = dial_server(&opts).await.expect("TLS control dial");
+    assert_eq!(io.debug_name(), "IoStream::Tls");
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = auth::generate_token(TEST_TOKEN, ts);
+    let login = FrpMessage::Login(Box::new(msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("tls-not-hijacked".into()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: None,
+        run_id: None,
+        client_id: None,
+        pool_count: Some(1),
+        timestamp: Some(ts),
+        privilege_key: Some(key),
+        metas: None,
+        client_spec: None,
+        multiplexer: None,
+    }));
+    io.write_v1_frame(&login)
+        .await
+        .expect("send login over TLS");
+    match io.read_v1_frame().await.expect("read LoginResp over TLS") {
+        FrpMessage::LoginResp(r) => {
+            assert!(
+                r.error.is_none(),
+                "TLS control login must succeed despite the https wildcard route: {:?}",
+                r.error
+            );
+            assert!(r.run_id.is_some(), "expected run_id");
+        }
+        other => panic!("expected LoginResp, got: {:?}", other.v1_type_byte()),
+    }
+
+    drop(io);
     drop(provider);
 }

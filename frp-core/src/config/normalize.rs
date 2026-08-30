@@ -242,10 +242,20 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
     i
 }
 
+/// Cap on the number of numbers a single range expression may produce.
+/// Go's `util.ParseRangeNumbers` expands `0-65535` into 65536 entries; a
+/// hostile config could ask for the full port space (or an arbitrarily long
+/// comma list), ballooning into ~450 KB of comma-joined text here and up to
+/// 65536 per-port proxies in the legacy `[range:...]` INI path. Real configs
+/// stay far below this; exceeding it makes the expression invalid (warned
+/// and kept verbatim, same as any other invalid segment).
+const MAX_RANGE_EXPANSION_NUMBERS: usize = 4096;
+
 /// Expand a Go-style range expression (`"7000-7003"`, `"7000,7005"`) into a
 /// comma-separated list of numbers, following `util.ParseRangeNumbers`:
 /// split on `,`; each segment is a single number or an inclusive `N-M`
-/// range (step 1, N <= M). Returns `None` for any invalid segment.
+/// range (step 1, N <= M). Returns `None` for any invalid segment or when
+/// the expansion would exceed [`MAX_RANGE_EXPANSION_NUMBERS`].
 fn expand_number_range_expr(expr: &str) -> Option<String> {
     let mut numbers: Vec<u32> = Vec::new();
     for segment in expr.split(',') {
@@ -255,14 +265,25 @@ fn expand_number_range_expr(expr: &str) -> Option<String> {
         }
         let parts: Vec<&str> = segment.split('-').collect();
         match parts.as_slice() {
-            [single] => numbers.push(parse_port_num(single)?),
+            [single] => {
+                numbers.push(parse_port_num(single)?);
+                if numbers.len() > MAX_RANGE_EXPANSION_NUMBERS {
+                    return None;
+                }
+            }
             [start, end] => {
                 let start = parse_port_num(start)?;
                 let end = parse_port_num(end)?;
                 if start > end {
                     return None;
                 }
-                numbers.extend(start..=end);
+                // `take` caps the materialization BEFORE the range is fully
+                // expanded; the over-cap check then rejects the expression.
+                let remaining = MAX_RANGE_EXPANSION_NUMBERS - numbers.len();
+                numbers.extend((start..=end).take(remaining.saturating_add(1)));
+                if numbers.len() > MAX_RANGE_EXPANSION_NUMBERS {
+                    return None;
+                }
             }
             // More than one `-` in a segment (e.g. "1-2-3") — invalid.
             _ => return None,
@@ -1200,7 +1221,9 @@ fn normalize_web_server_section(table: &mut toml::Table) {
 /// - `[proxies.responseHeaders.set]` → `response_headers.*`
 ///
 /// Expand "6000-6006,6007" into the sorted list of individual ports.
-/// Matches Go `util.ParseRangeNumbers` semantics.
+/// Matches Go `util.ParseRangeNumbers` semantics; capped at
+/// [`MAX_RANGE_EXPANSION_NUMBERS`] per call so a hostile range expression
+/// cannot balloon into 65536 per-port proxies.
 fn ini_range_numbers(s: &str) -> Option<Vec<u16>> {
     let mut out = Vec::new();
     for part in s.split(',') {
@@ -1214,9 +1237,18 @@ fn ini_range_numbers(s: &str) -> Option<Vec<u16>> {
             if lo > hi {
                 return None;
             }
-            out.extend(lo..=hi);
+            // `take` caps the materialization BEFORE the range is fully
+            // expanded; the over-cap check then rejects the expression.
+            let remaining = MAX_RANGE_EXPANSION_NUMBERS - out.len();
+            out.extend((lo..=hi).take(remaining.saturating_add(1)));
+            if out.len() > MAX_RANGE_EXPANSION_NUMBERS {
+                return None;
+            }
         } else {
             out.push(part.parse().ok()?);
+            if out.len() > MAX_RANGE_EXPANSION_NUMBERS {
+                return None;
+            }
         }
     }
     Some(out)
@@ -1539,6 +1571,28 @@ fn normalize_proxies(table: &mut toml::Table) {
                     proxy_table.get_mut("plugin").and_then(Value::as_table_mut)
                 {
                     plugin.insert("request_headers".to_string(), Value::Table(set.clone()));
+                }
+            }
+        }
+
+        // Go frp compat (client/health/health.go:57-64): the health check
+        // interval/timeout/maxFailed fields are Go `int` fields where `<= 0`
+        // falls back to the defaults. The ProxyConfig fields are u64/u32, so
+        // a bare `-1` (accepted by Go) would fail serde and kill the whole
+        // config load on every path — file, --config-dir, reload, and the
+        // admin API all funnel through normalize_client_config, and the
+        // `[proxies.healthCheck]`/legacy-INI keys were flattened to these
+        // names just above. Clamp `<= 0` to the Go defaults pre-
+        // deserialization; the runtime `== 0` fallback (frp-client
+        // service.rs spawn_health_checks) remains for programmatic configs.
+        for (key, default) in [
+            ("health_check_interval_seconds", 10i64),
+            ("health_check_timeout_seconds", 3i64),
+            ("health_check_max_failed", 1i64),
+        ] {
+            if let Some(Value::Integer(n)) = proxy_table.get(key) {
+                if *n <= 0 {
+                    proxy_table.insert(key.to_string(), Value::Integer(default));
                 }
             }
         }

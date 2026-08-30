@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -24,6 +23,20 @@ mod vhost_h2c;
 pub struct VhostRoute {
     pub proxy_name: Arc<str>,
     pub run_id: Arc<str>,
+    /// Scheme this route was registered under: "http" or "https". Go frp
+    /// keeps SEPARATE router sets per muxer — HTTP proxies share
+    /// `httpVhostRouter` (server/service.go:179) while HTTPS proxies
+    /// register in their own Muxer's `registryRouter` (vhost/vhost.go:56-70)
+    /// — so an HTTP proxy and an HTTPS proxy for the same domain never
+    /// conflict in Go, and lookups never cross schemes: http.go routes by
+    /// Host inside httpVhostRouter only, https.go by SNI inside the HTTPS
+    /// Muxer's registryRouter only. frp-rs stores both schemes in one
+    /// VhostTables, so the scheme partitions BOTH the conflict check and
+    /// every lookup — find_matching_route only matches routes whose scheme
+    /// equals the lookup's (HTTP call sites pass "http", SNI call sites
+    /// "https"), so a plain HTTP request can never land on an HTTPS
+    /// proxy's backend nor an SNI connection on an HTTP proxy's backend.
+    pub scheme: String,
     /// Non-empty when this route belongs to an HTTP/HTTPS group (Go frp
     /// v0.71.0 HTTPGroup): requests are dispatched round-robin across the
     /// group's members instead of always to `proxy_name`. The route is
@@ -101,30 +114,59 @@ impl std::fmt::Display for RouterConfigConflict {
 
 impl std::error::Error for RouterConfigConflict {}
 
-/// Find the first route in a sorted Vec whose location prefix-matches the path.
-/// If the route has no locations (e.g. HTTPS SNI routes), it matches any path.
-fn find_matching_route(vrs: &[VhostRoute], path: &str) -> Option<VhostRouteMatch> {
+/// Find the route whose location prefix-matches the path, preferring the
+/// LONGEST matching location (Go frp flattened-Router semantics).
+///
+/// Go registers one `Routers` entry per (domain, location, httpUser) triple
+/// and sorts ALL of them by location lexicographically descending before
+/// first-match probing (router.go `slices.SortFunc` + `getLocked`). A
+/// route-level scan that probes each route's locations in registration order
+/// diverges when routes carry interleaved multi-location sets: route A at
+/// ["/zz", "/a"] and route B at ["/aa"] — Go flattens to "/zz"(A),
+/// "/aa"(B), "/a"(A) and routes path "/aa" to B, while route-first probing
+/// would check A's "/a" and wrongly pick A. Scanning every (route, location)
+/// pair and keeping the largest matching location reproduces the flattened
+/// order exactly (a tie in the flattened order can only be the same
+/// location — same route — so any tie-break is equivalent).
+///
+/// Routes with no locations (e.g. HTTPS SNI routes) match any path with the
+/// empty-string key — Go's "" location sorts LAST, so they only win when
+/// nothing else matches.
+/// The scheme filter mirrors Go's separate router sets (httpVhostRouter vs
+/// the HTTPS Muxer's registryRouter): an HTTP lookup must never match an
+/// HTTPS route and vice versa.
+fn find_matching_route(vrs: &[VhostRoute], path: &str, scheme: &str) -> Option<VhostRouteMatch> {
+    let mut best: Option<(&VhostRoute, &str)> = None;
     for route in vrs {
+        if route.scheme != scheme {
+            continue;
+        }
         if route.locations.is_empty() {
-            return Some(VhostRouteMatch::from_route(route));
+            // Go's "" location sorts last; record only as a fallback.
+            if best.is_none() {
+                best = Some((route, ""));
+            }
+            continue;
         }
         for loc in &route.locations {
-            if path.starts_with(loc.as_str()) {
-                return Some(VhostRouteMatch::from_route(route));
+            if path.starts_with(loc.as_str()) && best.is_none_or(|(_, bl)| loc.as_str() > bl) {
+                best = Some((route, loc.as_str()));
             }
         }
     }
-    None
+    best.map(|(route, _)| VhostRouteMatch::from_route(route))
 }
 
-/// Find best matching route for a given host, path, and httpUser.
+/// Find best matching route for a given host, path, httpUser, and scheme.
 /// Corresponds to Go frp's `getLocked` + calls through `getExactOrAllUsersLocked`:
 /// tries httpUser-specific routes first, then falls back to empty-string httpUser.
+/// `scheme` is the route-scheme key ("http"/"https") — see find_matching_route.
 fn get_locked(
     routes: &HashMap<String, HashMap<String, Vec<VhostRoute>>>,
     host: &str,
     path: &str,
     http_user: &str,
+    scheme: &str,
 ) -> Option<VhostRouteMatch> {
     // Go frp compat (pkg/util/vhost/router.go): `Get` does
     // `strings.ToLower(host)` before lookup — domains are stored lowercased
@@ -143,13 +185,13 @@ fn get_locked(
     let user_map = routes.get(host_key)?;
     // Try httpUser-specific first
     if let Some(vrs) = user_map.get(http_user) {
-        if let Some(route) = find_matching_route(vrs, path) {
+        if let Some(route) = find_matching_route(vrs, path, scheme) {
             return Some(route);
         }
     }
     // Fall back to empty-string httpUser (matching Go frp's all-users fallback)
     if let Some(vrs) = user_map.get("") {
-        if let Some(route) = find_matching_route(vrs, path) {
+        if let Some(route) = find_matching_route(vrs, path, scheme) {
             return Some(route);
         }
     }
@@ -188,24 +230,13 @@ struct VhostTables {
     /// have different location prefixes (matching Go frp's `map[string]routerByHTTPUser`
     /// where each httpUser maps to a slice of Routers sorted by location descending).
     routes: HashMap<String, HashMap<String, Vec<VhostRoute>>>,
-    /// path prefix -> { route_by_http_user -> Vec<VhostRoute> }
-    location_routes: HashMap<String, HashMap<String, Vec<VhostRoute>>>,
     /// proxy_name -> Vec<(domain, route_by_http_user)>
     by_proxy: HashMap<String, Vec<(String, String)>>,
-    /// proxy_name -> Vec<(location, route_by_http_user)>
-    by_proxy_locations: HashMap<String, Vec<(String, String)>>,
 }
 
 /// Manages HTTP VHost routing table (domain + location -> proxy).
 pub struct VhostManager {
     inner: RwLock<VhostTables>,
-    /// Gate for `lookup_by_path`: true while any location route exists.
-    /// Every HTTP request used to linearly scan all location routes even
-    /// when none were registered; the flag skips the scan (and the RwLock
-    /// read) in that common case. Relaxed ordering is fine — a stale false
-    /// after a register only defers the scan by one request, and a stale
-    /// true after unregister just runs a scan that finds nothing.
-    has_location_routes: AtomicBool,
 }
 
 impl Default for VhostManager {
@@ -219,11 +250,8 @@ impl VhostManager {
         Self {
             inner: RwLock::new(VhostTables {
                 routes: HashMap::new(),
-                location_routes: HashMap::new(),
                 by_proxy: HashMap::new(),
-                by_proxy_locations: HashMap::new(),
             }),
-            has_location_routes: AtomicBool::new(false),
         }
     }
 
@@ -233,6 +261,7 @@ impl VhostManager {
         &self,
         proxy_name: &str,
         domains: &[String],
+        scheme: &str,
         locations: &[String],
         run_id: &str,
         host_header_rewrite: &str,
@@ -245,6 +274,7 @@ impl VhostManager {
         let route = VhostRoute {
             proxy_name: proxy_name.into(),
             run_id: run_id.into(),
+            scheme: scheme.to_string(),
             group: group.into(),
             locations: locations.to_vec(),
             host_header_rewrite: host_header_rewrite.into(),
@@ -262,17 +292,54 @@ impl VhostManager {
         // the conflict check, the routes insert, and the by_proxy
         // bookkeeping, keeping register/unregister symmetric (unregister
         // looks up by the same lowered key).
-        let domains: Vec<String> = domains.iter().map(|d| d.to_lowercase()).collect();
+        //
+        // Go buildDomains parity (server/proxy/proxy.go:218-229): empty
+        // custom_domains entries are SKIPPED (`if d != ""`) — so
+        // custom_domains=["",""] yields ZERO domains, the register loop
+        // never runs, and the proxy is accepted (listening nothing). The
+        // skip happens before lowercasing in Go; filtering here is
+        // equivalent. An empty domains list also keeps the same-call
+        // dedup from tripping on the ("","") duplicate.
+        let domains: Vec<String> = domains
+            .iter()
+            .filter(|d| !d.is_empty())
+            .map(|d| d.to_lowercase())
+            .collect();
 
-        // Check for conflicts: each (domain, route_by_http_user, location) triple
-        // must be unique. Matching Go's exist() which checks exact location match.
+        // Effective location set for conflict checking. HTTPS/SNI (and the
+        // tcpmux-mirroring) registrations pass an empty location list, but Go
+        // registers them with location "" (`listenForDomain` → `Muxer.Listen`
+        // → `Routers.Add(domain, "", routeByHTTPUser)`), so an empty list
+        // means the single location "".
+        let effective_locations: Vec<&str> = if locations.is_empty() {
+            vec![""]
+        } else {
+            locations.iter().map(String::as_str).collect()
+        };
+
+        // A route registered with an empty location list covers ONLY the
+        // location "" — Go stores the catch-all as `Router.location = ""`
+        // and `exist()` compares `path == route.location` exactly. The
+        // lookup-side "empty locations match any path" convenience
+        // (find_matching_route) must not widen the conflict check.
+        let route_covers = |vr: &VhostRoute, loc: &str| {
+            (vr.locations.is_empty() && loc.is_empty()) || vr.locations.iter().any(|vl| vl == loc)
+        };
+
+        // Cross-call conflicts: each (domain, route_by_http_user, location)
+        // triple must be unique against already-registered routes. Matching
+        // Go's exist() which checks exact location match. The scheme
+        // partitions the check: Go keeps separate router sets for HTTP and
+        // HTTPS (shared httpVhostRouter vs per-muxer registryRouter), so an
+        // HTTP and an HTTPS proxy for the same domain never conflict even
+        // when both would land on effective location "".
         for domain in &domains {
             if let Some(user_map) = tables.routes.get(domain) {
                 if let Some(vrs) = user_map.get(route_by_http_user) {
-                    for loc in locations {
+                    for loc in &effective_locations {
                         if let Some(vr) = vrs
                             .iter()
-                            .find(|vr| vr.locations.iter().any(|vl| vl == loc))
+                            .find(|vr| vr.scheme == scheme && route_covers(vr, loc))
                         {
                             return Err(RouterConfigConflict {
                                 domain: domain.clone(),
@@ -282,6 +349,32 @@ impl VhostManager {
                             });
                         }
                     }
+                }
+            }
+        }
+
+        // Same-call duplicate detection. Go's registration loops call
+        // `Routers.Add` once per (domain, location, routeByHTTPUser) triple
+        // (http.go:78-101, https.go:54-90, tcpmux.go:73-105) and buildDomains
+        // (proxy.go:218-229) does NO dedup — so a triple that repeats WITHIN
+        // one proxy's own domain list — a duplicate custom_domains entry,
+        // subdomain expansion (`subDomain + "." + SubDomainHost`) colliding
+        // with a custom_domains entry, or a case-only variant (Add
+        // lowercases) — hits exist() on the second Add and REJECTS the whole
+        // registration. The old proxy_ops `contains` guards made frp-rs more
+        // lenient than Go; duplicates now flow through to this check.
+        // route_by_http_user is registration-constant, so (domain, location)
+        // is the full triple.
+        let mut seen: HashSet<(&str, &str)> = HashSet::with_capacity(domains.len());
+        for domain in &domains {
+            for loc in &effective_locations {
+                if !seen.insert((domain.as_str(), *loc)) {
+                    return Err(RouterConfigConflict {
+                        domain: domain.clone(),
+                        route_by_http_user: route_by_http_user.to_string(),
+                        existing_proxy: proxy_name.to_string(),
+                        incoming_proxy: proxy_name.to_string(),
+                    });
                 }
             }
         }
@@ -312,35 +405,6 @@ impl VhostManager {
                 .insert(proxy_name.to_string(), domain_entries);
         }
 
-        // Register location routes (path-only routing)
-        let mut loc_entries = Vec::new();
-        for loc in locations {
-            let vrs = tables
-                .location_routes
-                .entry(loc.clone())
-                .or_default()
-                .entry(route_by_http_user.to_string())
-                .or_default();
-            vrs.push(route.clone());
-            loc_entries.push((loc.clone(), route_by_http_user.to_string()));
-        }
-        // Sort once after all location insertions.
-        for loc in locations {
-            if let Some(user_map) = tables.location_routes.get_mut(loc) {
-                if let Some(vrs) = user_map.get_mut(route_by_http_user) {
-                    sort_by_longest_location(vrs);
-                }
-            }
-        }
-        if !loc_entries.is_empty() {
-            tables
-                .by_proxy_locations
-                .insert(proxy_name.to_string(), loc_entries);
-            // Enable the lookup_by_path scan gate (held under the write lock,
-            // so it stays consistent with the tables).
-            self.has_location_routes.store(true, Ordering::Relaxed);
-        }
-
         Ok(())
     }
 
@@ -364,39 +428,22 @@ impl VhostManager {
                 }
             }
         }
-        if let Some(entries) = tables.by_proxy_locations.remove(proxy_name) {
-            for (loc, rubu) in &entries {
-                if let Some(user_map) = tables.location_routes.get_mut(loc) {
-                    if let Some(vrs) = user_map.get_mut(rubu) {
-                        vrs.retain(|r| r.proxy_name.as_ref() != proxy_name);
-                        if vrs.is_empty() {
-                            user_map.remove(rubu);
-                        }
-                    }
-                    if user_map.is_empty() {
-                        tables.location_routes.remove(loc);
-                    }
-                }
-            }
-            // Clear the scan gate when the last location route is removed
-            // (held under the write lock, so it stays consistent).
-            if tables.location_routes.is_empty() {
-                self.has_location_routes.store(false, Ordering::Relaxed);
-            }
-        }
     }
 
     /// Look up by domain (exact match) with path prefix matching.
     /// Tries httpUser-specific routes first, then falls back to empty-string httpUser
     /// (matching Go frp's `getLocked` → `getExactOrAllUsersLocked`).
+    /// `scheme` partitions the lookup like Go's separate router sets: pass
+    /// "http" from HTTP request paths and "https" from SNI paths.
     pub async fn lookup(
         &self,
         domain: &str,
         path: &str,
         http_user: &str,
+        scheme: &str,
     ) -> Option<VhostRouteMatch> {
         let tables = self.inner.read().await;
-        get_locked(&tables.routes, domain, path, http_user)
+        get_locked(&tables.routes, domain, path, http_user, scheme)
     }
 
     /// Look up by domain with wildcard and path prefix support (Go frp dev compat).
@@ -409,16 +456,19 @@ impl VhostManager {
     ///
     /// Only checks wildcards for domains with >=3 labels (matching Go frp's
     /// `for len(hostSplit) >= 3` — prevents matching `*.com` for `example.com`).
+    /// `scheme` partitions the lookup like Go's separate router sets: pass
+    /// "http" from HTTP request paths and "https" from SNI paths.
     pub async fn lookup_wildcard(
         &self,
         domain: &str,
         path: &str,
         http_user: &str,
+        scheme: &str,
     ) -> Option<VhostRouteMatch> {
         let tables = self.inner.read().await;
 
         // 1. Exact match
-        if let Some(route) = get_locked(&tables.routes, domain, path, http_user) {
+        if let Some(route) = get_locked(&tables.routes, domain, path, http_user, scheme) {
             return Some(route);
         }
         // 2. Replace leftmost label with "*" progressively.
@@ -427,73 +477,42 @@ impl VhostManager {
         while parts.len() > 2 {
             parts[0] = "*";
             let wildcard_host = parts.join(".");
-            if let Some(route) = get_locked(&tables.routes, &wildcard_host, path, http_user) {
+            if let Some(route) = get_locked(&tables.routes, &wildcard_host, path, http_user, scheme)
+            {
                 return Some(route);
             }
             parts.remove(0);
         }
         // 3. Catch-all "*"
-        get_locked(&tables.routes, "*", path, http_user)
+        get_locked(&tables.routes, "*", path, http_user, scheme)
     }
 
-    /// Look up by URL path (longest prefix match among registered locations).
-    /// Returns the VhostRoute whose location prefix best matches the given path.
-    /// Tries httpUser-specific routes first, then falls back to empty-string httpUser.
-    /// For each matching prefix, finds the first route whose location prefix-matches
-    /// the path by iterating the sorted Vec (matching Go's getLocked pattern).
-    pub async fn lookup_by_path(&self, path: &str, http_user: &str) -> Option<VhostRouteMatch> {
-        // Fast path: with no location routes registered the scan below can
-        // never match — skip the RwLock read and the linear iteration (every
-        // HTTP request used to pay this scan).
-        if !self.has_location_routes.load(Ordering::Relaxed) {
-            return None;
-        }
-        let tables = self.inner.read().await;
-        // Find longest matching prefix
-        let mut best: Option<(usize, VhostRouteMatch)> = None;
-        for (prefix, user_map) in tables.location_routes.iter() {
-            if path.starts_with(prefix.as_str()) {
-                // Try httpUser-specific first, then empty-string fallback,
-                // then find first matching route in the Vec.
-                let route = user_map
-                    .get(http_user)
-                    .or_else(|| user_map.get(""))
-                    .and_then(|vrs| find_matching_route(vrs, path));
-                if let Some(route) = route {
-                    match best {
-                        Some((best_len, _)) if prefix.len() > best_len => {
-                            best = Some((prefix.len(), route));
-                        }
-                        None => {
-                            best = Some((prefix.len(), route));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        best.map(|(_, route)| route)
-    }
-
-    /// Combined lookup: tries domain match first, then falls back to path-only match.
-    /// Calls `lookup_wildcard` which handles both domain wildcard expansion and
-    /// location prefix matching (Go frp's getLocked/getByRoute pattern).
-    /// If no domain match, tries location-only routing (for proxies without custom_domains).
+    /// Combined lookup: domain match with wildcard expansion and location
+    /// prefix matching (Go frp's getLocked/getByRoute pattern).
     /// `http_user` is the Basic Auth username from the request (empty if none).
+    ///
+    /// Round 10 (MEDIUM, Go parity): the path-only fallback was removed. Go
+    /// registers HTTP proxies as `for domain { for location { register } }`
+    /// (server/proxy/http.go:78-101) — a proxy with empty customDomains gets
+    /// ZERO routes, and every location is always scoped under a domain. The
+    /// host-agnostic `lookup_by_path` fallback let an authenticated client
+    /// register `custom_domains=[]` + `locations=[""]` and capture every
+    /// fallthrough request on the vhost port (the round-6 catch-all hijack
+    /// recreated via the path table). Domain-scoped locations still work
+    /// through `lookup_wildcard`'s get_locked path-matching.
+    /// `scheme` partitions the lookup like Go's separate router sets: pass
+    /// "http" from HTTP request paths and "https" from SNI paths.
     pub async fn lookup_combined(
         &self,
         domain: &str,
         path: &str,
         http_user: &str,
+        scheme: &str,
     ) -> Option<VhostRouteMatch> {
-        // Try host-based routing first (with wildcard support and path matching)
+        // Host-based routing with wildcard support and path matching.
         // lookup_wildcard internally calls get_locked which finds the first
         // route whose location prefix-matches the path.
-        if let Some(route) = self.lookup_wildcard(domain, path, http_user).await {
-            return Some(route);
-        }
-        // Try location-only routing (for proxies without custom_domains)
-        self.lookup_by_path(path, http_user).await
+        self.lookup_wildcard(domain, path, http_user, scheme).await
     }
 }
 /// Write an HTTP error response, optionally with a custom body.
@@ -540,6 +559,19 @@ pub(crate) async fn write_http_error(
 /// stream via InternalMsg::ProxyUserConn. `scheme` labels log lines
 /// ("HTTP"/"HTTPS"). `wrap` converts the (readable+writable) stream into the
 /// IoStream variant carried to the control handler.
+///
+/// Go parity (pkg/util/vhost/http.go `NewHTTPReverseProxy`): a
+/// `vhost_http_timeout <= 0` value floors at 60s; positive values pass
+/// through unchanged. Shared by every vhost accept path (HTTP/1.1 head,
+/// h2c handshake, HTTPS SNI, h2c response-head).
+pub(crate) fn clamp_vhost_timeout(t: u64) -> u64 {
+    if t > 0 {
+        t
+    } else {
+        60
+    }
+}
+
 async fn serve_vhost_request<S>(
     mut stream: S,
     peer: std::net::SocketAddr,
@@ -549,8 +581,8 @@ async fn serve_vhost_request<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    // Read the first 4096 bytes to extract Host header (with configured timeout)
-    let timeout_secs = state.vhost_http_timeout.max(1);
+    // Read the first 4096 bytes to extract Host header (with configured timeout).
+    let timeout_secs = clamp_vhost_timeout(state.vhost_http_timeout);
     let mut buf = [0u8; 4096];
     let n = match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
@@ -581,10 +613,19 @@ async fn serve_vhost_request<S>(
             // preface before committing to the h2 path. A truncated HTTP/1.1
             // request (e.g. "POST …" cut to "P") falls back to the HTTP/1.1
             // parser (Go's bufio-based h2 server matches the exact line).
+            // Single absolute deadline for the whole preface completion
+            // (same idiom as the HTTP/1.1 head at handle_http1_request): a
+            // slow-drip client sending one byte per read window would
+            // otherwise stretch the completion loop to 23 × timeout (a
+            // sub-1s-per-byte drip would never trip a per-read timeout and
+            // would park the task + fd + permit for minutes). The full
+            // preface must arrive within vhost_http_timeout.
+            let preface_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
             let mut prefix_len = n;
             while prefix_len < vhost_h2c::H2_PREFACE.len() {
-                let m = match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
+                let m = match tokio::time::timeout_at(
+                    preface_deadline,
                     stream.read(&mut buf[prefix_len..vhost_h2c::H2_PREFACE.len()]),
                 )
                 .await
@@ -632,7 +673,7 @@ async fn handle_http1_request<S>(
 {
     // The vhost listener's single read may be short (e.g. an h2c-misdetected
     // HTTP/1.1 request): keep reading until the head terminator or the cap.
-    let timeout_secs = state.vhost_http_timeout.max(1);
+    let timeout_secs = clamp_vhost_timeout(state.vhost_http_timeout);
     // Single absolute deadline for the whole head (audit fix): a slow-drip
     // client sending one byte per read window would otherwise stretch the
     // head read to 4096 × timeout. The whole head must arrive within
@@ -688,13 +729,17 @@ async fn handle_http1_request<S>(
     // Round 6 (A3/A4/A7): Go net/http request-line semantics — version
     // gates (malformed shape → 400, non-1.x → 505), absolute-form routing
     // (req.Host = req.URL.Host — Host header ignored), path minus query.
-    let (host, path) = match parse_vhost_request_line(request_text) {
-        RequestLine::Ok { host, path } => {
+    let (host, path, is_absolute_form) = match parse_vhost_request_line(request_text) {
+        RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } => {
             let Some(host) = host else {
                 let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                 return;
             };
-            (host.to_string(), path.to_string())
+            (host.to_string(), path.to_string(), absolute_form)
         }
         RequestLine::BadRequest => {
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
@@ -720,7 +765,39 @@ async fn handle_http1_request<S>(
 
     // Parse Basic Auth once — reused for route matching, auth check,
     // and per-user routing (Go frp compat: getByRoute(host, path, username)).
-    let http_auth = extract_basic_auth(request_text);
+    // Go `checkRouteAuthByRequest`: an absolute-form request target
+    // (req.URL.Host != "") authenticates against `Proxy-Authorization`
+    // only; origin-form against `Authorization` (and answers 407 vs 401
+    // below accordingly).
+    let http_auth = if is_absolute_form {
+        extract_basic_auth_named(request_text, "proxy-authorization:")
+    } else {
+        extract_basic_auth(request_text)
+    };
+    // Go getRequestRouteUser (pkg/util/vhost/http.go:231-243): ROUTING
+    // ONLY — an absolute-form request without Proxy-Authorization falls
+    // back to the Authorization header's Basic Auth username so the request
+    // still hits the matched per-user route and returns 407 instead of 404.
+    // Go falls back ONLY when `proxyAuth == ""` (absent or empty-valued);
+    // a PRESENT but malformed Proxy-Authorization makes `ParseBasicAuth`
+    // fail and Go routes to the EMPTY user bucket ("") — never to the
+    // Authorization header's username. Auth validation deliberately does
+    // not share the fallback (checkRouteAuthByRequest reads
+    // Proxy-Authorization only on absolute-form); http_auth above stays
+    // the single source of truth for the credential check.
+    let route_user: Option<String> = if is_absolute_form && http_auth.is_none() {
+        if has_nonempty_header(request_text, "proxy-authorization:") {
+            // Header present but unparseable — Go ParseBasicAuth fails →
+            // empty user bucket (Some("") ≡ "", no Authorization fallback).
+            Some(String::new())
+        } else {
+            // Header absent or empty-valued — Go's `proxyAuth == ""`
+            // fallback to the Authorization header's Basic username.
+            extract_basic_auth(request_text).map(|(u, _)| u)
+        }
+    } else {
+        None
+    };
 
     debug!(host = %host, path = %path, peer = %peer, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
 
@@ -729,9 +806,11 @@ async fn handle_http1_request<S>(
         &host,
         &path,
         http_auth.as_ref(),
+        route_user.as_deref(),
         pre_read,
         peer,
         scheme,
+        is_absolute_form,
     )
     .await
     {
@@ -776,7 +855,16 @@ async fn handle_http1_request<S>(
                 write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
             }
         }
-        Err(VhostResolveError::Unauthorized) => {
+        Err(VhostResolveError::Unauthorized { proxy_form: true }) => {
+            // Absolute-form request → Go checkRouteAuthByRequest 407 +
+            // Proxy-Authenticate.
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"frp\"\r\n\r\n",
+                )
+                .await;
+        }
+        Err(VhostResolveError::Unauthorized { proxy_form: false }) => {
             let _ = stream
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n",
@@ -808,8 +896,11 @@ pub(crate) struct VhostForward {
 pub(crate) enum VhostResolveError {
     /// No route matched → 404.
     NotFound,
-    /// HTTP Basic Auth failed → 401.
-    Unauthorized,
+    /// HTTP Basic Auth failed. `proxy_form` mirrors Go
+    /// `checkRouteAuthByRequest` (`req.URL.Host != ""`): absolute-form
+    /// requests (h2c always; HTTP/1.1 absolute-form request lines) answer
+    /// 407 + Proxy-Authenticate, origin-form 401 + WWW-Authenticate.
+    Unauthorized { proxy_form: bool },
 }
 
 /// Shared routing + header rewriting for HTTP/1.1 and h2c vhost requests.
@@ -820,23 +911,43 @@ pub(crate) enum VhostResolveError {
 /// X-Forwarded-For / requestHeaders into the forwarded head. The caller
 /// renders rejection (404/401) or success (ProxyUserConn dispatch) in its own
 /// protocol (HTTP/1.1 text vs HTTP/2 frames).
+#[allow(clippy::too_many_arguments)] // mirrors tcpmux::route (same request-context tuple)
 pub(crate) async fn resolve_vhost_request(
     state: &AppState,
     host: &str,
     path: &str,
     http_auth: Option<&(String, String)>,
+    route_user: Option<&str>,
     request_head: Vec<u8>,
     peer: std::net::SocketAddr,
     scheme: &str,
+    is_absolute_form: bool,
 ) -> Result<VhostForward, VhostResolveError> {
-    let http_user = http_auth
-        .as_ref()
-        .map(|(u, _)| u.as_str())
+    // Routing username: the caller's routing-only BasicAuth fallback
+    // (Go getRequestRouteUser) takes precedence when present; otherwise the
+    // authenticated header's username. Auth validation below still checks
+    // only `http_auth` — the fallback never weakens the credential gate.
+    let http_user = route_user
+        .or_else(|| http_auth.map(|(u, _)| u.as_str()))
         .unwrap_or_default();
 
+    // Route-scheme key for the lookup. Routes are registered with lowercase
+    // "http"/"https"; callers of resolve_vhost_request pass the scheme as a
+    // log label ("HTTP"). The lookup must be scheme-partitioned — Go routes
+    // plain-HTTP requests exclusively through httpVhostRouter, so they must
+    // never match an HTTPS proxy's SNI route (which would bypass the HTTP
+    // proxy's http_user/auth gate and land on the HTTPS backend).
+    let scheme_key = if scheme.eq_ignore_ascii_case("http") {
+        "http"
+    } else {
+        // Current callers pass only "HTTP"/"HTTPS" (log labels), so this
+        // fallback covers "https"/"HTTPS" only — a future caller passing a
+        // third scheme would silently key as "https".
+        "https"
+    };
     let Some(route) = state
         .vhost_manager
-        .lookup_combined(host, path, http_user)
+        .lookup_combined(host, path, http_user, scheme_key)
         .await
     else {
         warn!(host = %host, path = %path, peer = %peer, "No {} VHost route for '{}' path '{}' from {}", scheme, host, path, peer);
@@ -852,7 +963,12 @@ pub(crate) async fn resolve_vhost_request(
             })
             .unwrap_or(false);
         if !auth_ok {
-            return Err(VhostResolveError::Unauthorized);
+            // Go checkRouteAuthByRequest: the response shape depends on the
+            // request form — absolute-form → 407 + Proxy-Authenticate,
+            // origin-form → 401 + WWW-Authenticate (the caller renders it).
+            return Err(VhostResolveError::Unauthorized {
+                proxy_form: is_absolute_form,
+            });
         }
     }
 
@@ -1058,7 +1174,7 @@ pub async fn run_vhost_https_listener(
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let timeout_secs = state.vhost_http_timeout.max(1);
+                    let timeout_secs = clamp_vhost_timeout(state.vhost_http_timeout);
                     // Read the TLS ClientHello (SNI lives in the first
                     // record; 4096 bytes comfortably covers it).
                     let mut buf = [0u8; 4096];
@@ -1085,9 +1201,11 @@ pub async fn run_vhost_https_listener(
                     // resolve case-insensitively. get_locked is the sole
                     // routing lowercaser, so pass the raw SNI here — the
                     // debug/warn lines below log it case-preserved.
+                    // Scheme "https": the HTTPS Muxer's registryRouter only
+                    // (Go parity) — SNI must never match an HTTP route.
                     if let Some(route) = state
                         .vhost_manager
-                        .lookup_combined(&sni, "/", "")
+                        .lookup_combined(&sni, "/", "", "https")
                         .await
                     {
                         let internal_tx = state
@@ -1129,6 +1247,16 @@ pub async fn run_vhost_https_listener(
                         }
                     } else {
                         warn!(sni = %sni, peer = %peer, "No HTTPS VHost route for '{}' from {}", sni, peer);
+                        // Best-effort TLS alert before the drop: fatal
+                        // unrecognized_name — record type 0x15 (alert),
+                        // TLS 1.2 record, 2-byte payload 0x02 0x70
+                        // (fatal, alertUnrecognizedName=112) — so a TLS
+                        // client fails fast instead of hanging on a
+                        // handshake timeout. Write failure is ignored;
+                        // the connection is dropped either way.
+                        let _ = stream
+                            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70])
+                            .await;
                     }
                 });
             }
@@ -1193,9 +1321,13 @@ pub async fn run_vhost_https_listener(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestLine<'a> {
     /// host: None when no Host header is present (caller replies 400).
+    /// `absolute_form` mirrors Go `req.URL.Host != ""` — an absolute-form
+    /// request target ("GET http://host/…") — and drives the auth shape
+    /// (Proxy-Authorization + 407, Go `checkRouteAuthByRequest`).
     Ok {
         host: Option<&'a str>,
         path: &'a str,
+        absolute_form: bool,
     },
     /// Malformed version shape or malformed absolute URL (Go 400).
     BadRequest,
@@ -1225,6 +1357,13 @@ enum RequestLine<'a> {
 /// not influence location matching).
 fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
     let first_line = request.lines().next().unwrap_or("");
+    // Go readRequest parity: a request that opens with a blank line is
+    // "malformed HTTP request" → 400. (Go's HTTP/0.9 default only applies
+    // once a non-empty request line parses with <3 space-separated tokens;
+    // an empty first line fails readRequest's shape check before that.)
+    if first_line.is_empty() {
+        return RequestLine::BadRequest;
+    }
     let mut parts = first_line.splitn(3, ' ');
     let _method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -1268,6 +1407,7 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
         return RequestLine::Ok {
             host: Some(canonicalize_authority(authority)),
             path,
+            absolute_form: true,
         };
     }
 
@@ -1282,6 +1422,7 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
                 path
             }
         },
+        absolute_form: false,
     }
 }
 
@@ -1354,16 +1495,14 @@ fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
 /// Inject `X-Forwarded-For` (append semantics, Go httputil.ReverseProxy) and
 /// configured requestHeaders (Set semantics, Go `req.Header.Set`) into the
 /// request head bytes. Only the header block up to `\r\n\r\n` is touched.
-/// When no request headers are configured, the input is returned unchanged
-/// (ownership transferred, no copy).
+/// The X-Forwarded-For append runs even when no requestHeaders are
+/// configured — Go's Rewrite hook (pkg/util/vhost/http.go) unconditionally
+/// calls `r.SetXForwarded()`; a configured header list is not a gate.
 fn inject_vhost_request_headers(
     data: Vec<u8>,
     peer: std::net::SocketAddr,
     request_headers: &[(String, String)],
 ) -> Vec<u8> {
-    if request_headers.is_empty() {
-        return data;
-    }
     let header_end = data
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -1461,15 +1600,67 @@ fn inject_vhost_request_headers(
 /// Extract HTTP Basic Auth credentials from the Authorization header.
 /// Returns Some((username, password)) or None if no/invalid auth header.
 fn extract_basic_auth(request: &str) -> Option<(String, String)> {
-    let auth_line = request
-        .lines()
-        .find(|line| line.len() >= 14 && line[..14].eq_ignore_ascii_case("authorization:"))?;
-    let value = auth_line[14..].trim();
-    let encoded = value.strip_prefix("Basic ")?.trim();
+    extract_basic_auth_named(request, "authorization:")
+}
+
+/// Same parser with a configurable header name — absolute-form requests
+/// (Go `req.URL.Host != ""`) carry credentials in `Proxy-Authorization`
+/// instead (Go `checkRouteAuthByRequest` reads ONLY that header there).
+/// `header` must include the trailing colon (e.g. "proxy-authorization:").
+fn extract_basic_auth_named(request: &str, header: &str) -> Option<(String, String)> {
+    // `get(..header.len())`, not `line[..header.len()]`: a hostile header
+    // line with a multibyte UTF-8 char straddling the fixed-offset cut
+    // would panic the slice (process abort under panic=abort) on EVERY
+    // vhost request. get() returns None at any length/boundary violation
+    // and behaves identically when the cut is on a char boundary.
+    let auth_line = request.lines().find(|line| {
+        line.get(..header.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(header))
+    })?;
+    // Go parity (pkg/util/http/http.go ParseBasicAuth, net/textproto
+    // readMIMEHeader): the MIME reader trims the value's outer whitespace
+    // (leading AND trailing — `trim` in readContinuedLineSlice), the
+    // "Basic " scheme prefix matches CASE-INSENSITIVELY (Go Issue 22736),
+    // and the base64 payload is taken verbatim — NO interior trim, so
+    // "Basic  xyz" (double space) fails the decode exactly like Go's
+    // base64.StdEncoding.
+    let value = auth_line[header.len()..].trim();
+    let encoded = if value
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("Basic "))
+    {
+        &value[6..]
+    } else {
+        return None;
+    };
     let decoded = frp_core::base64::decode(encoded).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;
     Some((user.to_string(), pwd.to_string()))
+}
+
+/// Does the head carry a `header:` line with a non-empty value? Go
+/// `http.Header.Get` returns "" both for an absent header and an
+/// empty-valued one, so the two are indistinguishable there — only a
+/// PRESENT non-empty value forces the `ParseBasicAuth` path in
+/// `getRequestRouteUser` (a malformed value then routes to the "" user
+/// bucket instead of falling back to Authorization).
+///
+/// FIRST-VALUE semantics: Go readMIMEHeader stores duplicate headers as a
+/// slice and `Header.Get` returns `v[0]` only — a first empty-valued line
+/// shadows a later non-empty one (keeping the "" → Authorization
+/// fallback). `.any()` would see the later line and force the "" bucket;
+/// `.find()` by header name + value check on THAT line matches Go. The
+/// `get(..header.len())` scan (not `line[..header.len()]`) also keeps a
+/// multibyte char straddling the cut from panicking (panic=abort).
+fn has_nonempty_header(request: &str, header: &str) -> bool {
+    request
+        .lines()
+        .find(|line| {
+            line.get(..header.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(header))
+        })
+        .is_some_and(|line| !line[header.len()..].trim().is_empty())
 }
 
 /// Count Host header lines (RFC 7230 §5.4 allows at most one). Must only be
@@ -1496,44 +1687,58 @@ pub(crate) fn count_host_headers(request: &str) -> usize {
         .count()
 }
 
-/// Extract the Host header value from an HTTP request (hostname only,
-/// exactly one trailing dot trimmed — Go frp `CanonicalHost`,
-/// pkg/util/http/http.go). Port handling follows Go's `hasPort` gate: the
-/// port is split only when the value has exactly one colon (host:port /
-/// IPv4:port) or is a bracket-start with `]:` (bracketed IPv6), and the
-/// port itself is never validated — `net.SplitHostPort` accepts any
-/// suffix, so Go routes "Host: example.com:abc" to example.com (the
-/// numeric gate exists only on the CONNECT request line via
-/// url.ParseRequestURI's validOptionalPort). Portless values are used
-/// as-is — "example.com", or "[::1]" which stays bracketed (unroutable,
-/// nothing registers brackets).
 /// Canonicalize an authority value (host[:port] or [v6]:port) for vhost
 /// routing — port strip, bracket handling, exactly one trailing dot.
-/// Go frp `CanonicalHost` semantics (pkg/util/http/http.go), shared by
-/// the Host-header path and the absolute-form URL authority path (A3).
+/// Go frp `CanonicalHost` semantics (pkg/util/http/http.go:54-67), shared
+/// by the Host-header path, the absolute-form URL authority path (A3), and
+/// the h2c path (vhost_h2c.rs): `hasPort` gate (colons==1, or
+/// bracket-start with `]:`), then `net.SplitHostPort`, then exactly one
+/// trailing dot trimmed. (CanonicalHost also lowercases — `strings.ToLower`
+/// before the gate; here the lowercase lives at the ROUTE LOOKUP instead —
+/// router.go `Get` parity, see `get_locked` — with identical
+/// case-insensitive routing and the same accepted Unicode-case divergence.
+/// The function stays borrowed `&str` because vhost_h2c.rs shares it.)
 ///
-/// Round 6 (A5): the bracket branch now requires the ']' to be
-/// immediately followed by ':'. Go `SplitHostPort` brackets the FIRST '['
-/// to the LAST ']' ("[::1]x]:8080" → host "::1]x" — unroutable); accepting
-/// the first ']' would route a malformed value as "::1" when that literal
-/// is registered.
-fn canonicalize_authority(value: &str) -> &str {
+/// SplitHostPort ACCEPTS an empty port — it slices `port = hostport[i+1:]`
+/// unconditionally (net/ipsock.go; the official test pins {"golang.org:",
+/// "golang.org", ""}) — so "example.com:" routes to "example.com" — and
+/// never validates the port digits ("example.com:abc" → "example.com"; the
+/// digit gate exists only on the CONNECT request line via
+/// url.ParseRequestURI's validOptionalPort). Bracket errors are
+/// fail-closed: a ']' not immediately followed by the last colon
+/// ("[::1]x]:8080" → "missing port in address") and a second colon after
+/// the bracket's port ("[::1]:80:90" → "too many colons in address") are
+/// SplitHostPort ERRORS → "" (unroutable), never the bare "::1". Portless
+/// values are used as-is — "example.com", or "[::1]" which stays bracketed
+/// (unroutable, nothing registers brackets).
+pub(crate) fn canonicalize_authority(value: &str) -> &str {
     let colons = value.bytes().filter(|b| *b == b':').count();
     let hostname = if colons == 1 {
         // host:port — SplitHostPort never validates the port digits
         // (Go frp routes "Host: example.com:abc" to example.com); the
         // digit gate exists only on the CONNECT request line, where
-        // url.ParseRequestURI enforces it (validOptionalPort).
-        let (h, _port) = value.rsplit_once(':').unwrap_or((value, ""));
-        h
+        // url.ParseRequestURI enforces it (validOptionalPort). An EMPTY
+        // port part ("example.com:") is legal — Go slices `port =
+        // hostport[i+1:]` unconditionally and its own test suite pins
+        // {"golang.org:", "golang.org", ""} — CanonicalHost routes the
+        // bare hostname (lowercased, trailing dot trimmed).
+        value.rsplit_once(':').unwrap_or((value, "")).0
     } else if colons >= 2 && value.starts_with('[') && value.contains("]:") {
         let end = value.find(']').unwrap_or(0);
         if !value[end + 1..].starts_with(':') {
-            // ']' not immediately followed by ':' — not a bracket form.
-            // Go routes the raw value (unroutable → 404); mirror that
-            // rather than 400ing (the header path has no 400 trigger).
-            value
+            // ']' not immediately followed by ':' — Go SplitHostPort
+            // errors ("missing port in address": the bracket's port must
+            // run to the LAST colon) → CanonicalHost "" (unroutable).
+            ""
+        } else if value[end + 2..].contains(':') {
+            // Too many colons ("[::1]:80:90") — Go ipsock.go errors when
+            // the colon behind the ']' is not the last one ("too many
+            // colons in address") → CanonicalHost "" (unroutable).
+            ""
         } else {
+            // Bracket form with a port (possibly empty: "[::1]:" → "::1")
+            // — Go's bracket branch strips the brackets
+            // (`host = hostport[1:end]`).
             &value[1..end]
         }
     } else {
@@ -1553,9 +1758,18 @@ fn extract_host_header(request: &str) -> Option<&str> {
         if line.len() < 6 {
             continue;
         }
-        if !line[..5].eq_ignore_ascii_case("host:") {
+        // `get(..5)`, not `line[..5]`: len ≥ 6 does NOT imply byte 5 is a
+        // char boundary — "abcéé…" has é (2 bytes) straddling the cut, and
+        // the fixed-offset slice panicked (process abort under panic=abort)
+        // on every origin-form vhost request. get() returns None on any
+        // boundary violation; identical match when byte 5 is a boundary.
+        if !line
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("host:"))
+        {
             continue;
         }
+        // Safe: the get(..5) match above guarantees byte 5 is a boundary.
         let value = line[5..].trim();
         return Some(canonicalize_authority(value));
     }
@@ -1808,6 +2022,158 @@ mod tests {
         );
     }
 
+    /// Round-15 correction: a trailing colon with an EMPTY port part is
+    /// LEGAL — Go `net.SplitHostPort` slices `port = hostport[i+1:]`
+    /// unconditionally (net/ipsock.go; the official test pins
+    /// {"golang.org:", "golang.org", ""}) → `CanonicalHost` routes the
+    /// bare hostname (lowercased, trailing dot trimmed).
+    #[test]
+    fn test_canonicalize_authority_empty_port() {
+        // "example.com:" routes to "example.com".
+        assert_eq!(canonicalize_authority("example.com:"), "example.com");
+        // Lowercase is applied at the route lookup (Go router.go `Get` —
+        // see `get_locked`), not here — identical case-insensitive routing
+        // to Go's CanonicalHost while keeping the borrowed `&str` that
+        // vhost_h2c.rs shares.
+        assert_eq!(canonicalize_authority("GOLANG.ORG:"), "GOLANG.ORG");
+        // The trailing-dot trim still applies after the port strip.
+        assert_eq!(canonicalize_authority("example.com.:"), "example.com");
+        // A normal port still strips (and is never digit-validated —
+        // SplitHostPort accepts any suffix).
+        assert_eq!(canonicalize_authority("example.com:8080"), "example.com");
+        assert_eq!(canonicalize_authority("example.com:abc"), "example.com");
+        // Bracketed IPv6 with a port — possibly empty — strips the
+        // brackets (Go bracket branch `host = hostport[1:end]`).
+        assert_eq!(canonicalize_authority("[::1]:8080"), "::1");
+        assert_eq!(canonicalize_authority("[::1]:"), "::1");
+        // Too many colons after the bracket: Go errors ("too many colons
+        // in address") → "" (unroutable), NOT the bare "::1".
+        assert_eq!(canonicalize_authority("[::1]:80:90"), "");
+        // ']' not immediately followed by the last colon: Go errors
+        // ("missing port in address") → "" (unroutable).
+        assert_eq!(canonicalize_authority("[::1]x]:8080"), "");
+        // Portless values and other shapes are untouched.
+        assert_eq!(canonicalize_authority("example.com"), "example.com");
+        assert_eq!(canonicalize_authority("[::1]"), "[::1]");
+        assert_eq!(
+            canonicalize_authority("example.com:8080:90"),
+            "example.com:8080:90"
+        );
+    }
+
+    /// The header-scan helpers must never panic on hostile multi-byte
+    /// input: they used to slice `&str` at fixed byte offsets
+    /// (`line[..header.len()]` / `line[..5]`), and a UTF-8 char straddling
+    /// the cut aborted the process (panic=abort) on ANY vhost request.
+    /// Now `line.get(..n)` returns None at a non-boundary cut, so the line
+    /// is skipped like any non-matching one.
+    #[test]
+    fn test_header_scans_panic_proof_multibyte() {
+        // é (U+00E9) = 0xC3 0xA9. "x-pad: abcdefé": byte 13 is the FIRST
+        // byte of é → the 14-byte "authorization:" scan cuts mid-char.
+        let req = "GET / HTTP/1.1\r\nx-pad: abcdefé\r\n\r\n";
+        assert_eq!(extract_basic_auth(req), None);
+        assert!(!has_nonempty_header(req, "authorization:"));
+        // Same shape for the 20-byte "proxy-authorization:" scan: é spans
+        // bytes 19-20 of "proxy-authorizationé".
+        let req = "GET / HTTP/1.1\r\nproxy-authorizationé\r\n\r\n";
+        assert_eq!(extract_basic_auth_named(req, "proxy-authorization:"), None);
+        assert!(!has_nonempty_header(req, "proxy-authorization:"));
+        // "abcéé": byte 4 is the CONTINUATION byte of the first é → the
+        // 5-byte "host:" scan cuts mid-char. The scan skips the line and
+        // still finds the real Host header...
+        let req = "GET / HTTP/1.1\r\nabcéé\r\nHost: example.com\r\n\r\n";
+        assert_eq!(extract_host_header(req), Some("example.com"));
+        // ...and a head with no Host at all yields None, not a panic.
+        assert_eq!(
+            extract_host_header("GET / HTTP/1.1\r\nabcéé\r\nx-pad: abcdefé\r\n\r\n"),
+            None
+        );
+    }
+
+    /// Go frp ParseBasicAuth parity (pkg/util/http/http.go:81-97): the
+    /// "Basic " scheme prefix matches CASE-INSENSITIVELY (Go Issue 22736)
+    /// and the base64 payload is taken verbatim — an interior space after
+    /// the scheme ("Basic  xyz") fails the decode exactly like Go's
+    /// base64.StdEncoding, while line-end whitespace is stripped by the
+    /// MIME reader in both (textproto `trim` handles both ends). An
+    /// unpadded payload is rejected: Go StdEncoding requires padding and
+    /// the inline codec requires `len % 4 == 0`.
+    #[test]
+    fn test_extract_basic_auth_case_insensitive_no_trim() {
+        // Case-insensitive scheme prefix.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: bAsIc dXNlcjpwYXNz\r\n\r\n"),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+        // "user:pass" (9 bytes) encodes without '=' padding — decodes fine.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n"),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+        // Interior whitespace after the scheme is NOT trimmed (Go takes
+        // auth[6:] verbatim) → base64 decode fails → None.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic  dXNlcjpwYXNz\r\n\r\n"),
+            None
+        );
+        // An unpadded payload (this one needs "==") is rejected — Go
+        // StdEncoding and the inline codec agree.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNzIQ\r\n\r\n"),
+            None
+        );
+        // Trailing line whitespace: Go's textproto trims both ends of the
+        // value, so this decodes — unlike the interior-space case above.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz  \r\n\r\n"),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+        // Wrong scheme still fails.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Bearer dXNlcjpwYXNz\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_clamp_vhost_timeout() {
+        // Go parity: `<= 0` floors at 60s; positive values pass through.
+        assert_eq!(clamp_vhost_timeout(0), 60);
+        assert_eq!(clamp_vhost_timeout(1), 1);
+        assert_eq!(clamp_vhost_timeout(30), 30);
+        assert_eq!(clamp_vhost_timeout(60), 60);
+        assert_eq!(clamp_vhost_timeout(120), 120);
+    }
+
+    #[test]
+    fn test_has_nonempty_header() {
+        // Absent → false (Go Header.Get returns "" for absent too).
+        assert!(!has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n",
+            "proxy-authorization:"
+        ));
+        // Present with a value → true (forces the ParseBasicAuth path).
+        assert!(has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nProxy-Authorization: Basic !!!\r\n\r\n",
+            "proxy-authorization:"
+        ));
+        // Empty-valued / whitespace-only → false (Go Get returns "").
+        assert!(!has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nProxy-Authorization:\r\n\r\n",
+            "proxy-authorization:"
+        ));
+        assert!(!has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nProxy-Authorization:   \r\n\r\n",
+            "proxy-authorization:"
+        ));
+        // Case-insensitive header name match.
+        assert!(has_nonempty_header(
+            "GET http://x.example.com/ HTTP/1.1\r\nproxy-authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+            "proxy-authorization:"
+        ));
+    }
+
     #[test]
     fn test_count_host_headers() {
         let single = "GET / HTTP/1.1\r\nHost: a.example.com\r\n\r\n";
@@ -1880,27 +2246,37 @@ mod tests {
             RequestLine::VersionNotSupported
         );
         // HTTP/1.x routes.
-        let RequestLine::Ok { host, path } =
-            parse_vhost_request_line("GET /abc HTTP/1.1\r\nHost: x.example.com\r\n\r\n")
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line("GET /abc HTTP/1.1\r\nHost: x.example.com\r\n\r\n")
         else {
             panic!("expected Ok");
         };
         assert_eq!(host, Some("x.example.com"));
         assert_eq!(path, "/abc");
+        assert!(!absolute_form, "origin-form must not be marked absolute");
     }
 
     #[test]
     fn test_parse_vhost_request_line_absolute_form() {
         // A3/A4: absolute-form routes on the URL authority; ANY Host
         // header is ignored (RFC 7230 §5.3, req.Host = req.URL.Host).
-        let RequestLine::Ok { host, path } = parse_vhost_request_line(
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line(
             "GET http://a.example.com:8080/api?x=1 HTTP/1.1\r\nHost: ignored.example.com\r\n\r\n",
-        ) else {
+        )
+        else {
             panic!("expected Ok");
         };
         assert_eq!(host, Some("a.example.com")); // port stripped
         assert_eq!(path, "/api"); // query stripped, Go req.URL.Path
-                                  // Absolute-form with no path → "/".
+        assert!(absolute_form, "absolute-form must be marked");
+        // Absolute-form with no path → "/".
         let RequestLine::Ok { path, .. } =
             parse_vhost_request_line("GET http://a.example.com HTTP/1.1\r\nHost: x\r\n\r\n")
         else {
@@ -1923,26 +2299,35 @@ mod tests {
             panic!("expected Ok");
         };
         assert_eq!(host, Some("::1"));
-        // A5: mis-bracketed authority stays unroutable, never "::1".
+        // A5: mis-bracketed authority — Go SplitHostPort errors ("missing
+        // port in address": the ']' is not immediately before the last
+        // colon, net/ipsock.go) → CanonicalHost "" (unroutable), never the
+        // bare "::1" nor the raw literal.
         let RequestLine::Ok { host, .. } =
             parse_vhost_request_line("GET http://[::1]x]:8080/ HTTP/1.1\r\nHost: x\r\n\r\n")
         else {
             panic!("expected Ok");
         };
-        assert_eq!(host, Some("[::1]x]:8080"));
+        assert_eq!(host, Some(""));
     }
 
     #[test]
     fn test_parse_vhost_request_line_origin_form_query() {
         // A4: origin-form path minus query (Go req.URL.Path) — query
         // strings must not influence location matching.
-        let RequestLine::Ok { host, path } = parse_vhost_request_line(
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line(
             "GET /api/v1?user=admin#frag HTTP/1.1\r\nHost: a.example.com:8080\r\n\r\n",
-        ) else {
+        )
+        else {
             panic!("expected Ok");
         };
         assert_eq!(host, Some("a.example.com"));
         assert_eq!(path, "/api/v1");
+        assert!(!absolute_form, "origin-form must not be marked absolute");
         // Missing Host header → Ok with host None (caller 400s).
         let RequestLine::Ok { host, .. } = parse_vhost_request_line("GET / HTTP/1.1\r\n\r\n")
         else {
@@ -1985,6 +2370,7 @@ mod tests {
         mgr.register(
             "p1",
             &["MixedCase.Example.com".into()],
+            "http",
             &["/".into()],
             "run-1",
             "",
@@ -2005,7 +2391,7 @@ mod tests {
             "MixedCase.Example.com",
         ] {
             let route = mgr
-                .lookup(host, "/", "")
+                .lookup(host, "/", "", "http")
                 .await
                 .unwrap_or_else(|| panic!("lookup for '{host}' must resolve"));
             assert_eq!(route.proxy_name.as_ref(), "p1");
@@ -2017,6 +2403,7 @@ mod tests {
             .register(
                 "p2",
                 &["MIXEDCASE.EXAMPLE.COM".into()],
+                "http",
                 &["/".into()],
                 "run-2",
                 "",
@@ -2036,6 +2423,1310 @@ mod tests {
         // Unregister removes the route regardless of the original casing
         // (by_proxy bookkeeping holds the same lowered keys).
         mgr.unregister("p1").await;
-        assert!(mgr.lookup("mixedcase.example.com", "/", "").await.is_none());
+        assert!(mgr
+            .lookup("mixedcase.example.com", "/", "", "http")
+            .await
+            .is_none());
+    }
+
+    /// Go frp parity (round 8): buildDomains does no dedup, so a duplicate
+    /// custom_domains entry produces a repeated (domain, location,
+    /// routeByHTTPUser) triple WITHIN one registration — Go's registration
+    /// loop hits ErrRouterConfigConflict on the second Routers.Add and
+    /// rejects the whole proxy. The old proxy_ops `contains` guards were
+    /// more lenient than Go.
+    #[tokio::test]
+    async fn test_vhost_register_same_call_duplicate_domain_rejected() {
+        let mgr = VhostManager::new();
+        let err = mgr
+            .register(
+                "p1",
+                &["a.example.com".into(), "a.example.com".into()],
+                "http",
+                &["/".into()],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect_err("duplicate custom_domains entry must be a config conflict");
+        assert!(
+            err.to_string().contains("a.example.com"),
+            "conflict must name the duplicated domain: {err}"
+        );
+        // Nothing was inserted — no half-registered route.
+        assert!(mgr.lookup("a.example.com", "/", "", "http").await.is_none());
+    }
+
+    /// Go parity: Routers.Add lowercases before exist(), so a case-only
+    /// variant of an earlier entry in the same registration is a duplicate
+    /// and rejects the registration (custom_domains "a.example.com" +
+    /// "A.example.com").
+    #[tokio::test]
+    async fn test_vhost_register_same_call_case_variant_rejected() {
+        let mgr = VhostManager::new();
+        let err = mgr
+            .register(
+                "p1",
+                &["a.example.com".into(), "A.EXAMPLE.COM".into()],
+                "http",
+                &["/".into()],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect_err("case-only duplicate must be a config conflict");
+        assert!(
+            err.to_string().contains("a.example.com"),
+            "conflict must name the lowered domain: {err}"
+        );
+    }
+
+    /// Go parity: the registration loop is `for domain { for location { Add } }`,
+    /// so a duplicate domain repeats every (domain, location) triple — the
+    /// second domain iteration conflicts even when locations differ.
+    #[tokio::test]
+    async fn test_vhost_register_duplicate_domain_with_multi_locations_rejected() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["d.example.com".into(), "d.example.com".into()],
+            "http",
+            &["/".into(), "/api".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect_err("duplicate domain × locations must conflict on the second domain");
+    }
+
+    /// Go parity: distinct (domain, location) triples within one
+    /// registration are legal — one domain with several locations registers
+    /// each as its own Router (http.go `for _, location := range locations`).
+    #[tokio::test]
+    async fn test_vhost_register_same_domain_different_locations_accepted() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["example.com".into()],
+            "http",
+            &["/".into(), "/api".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("one domain with distinct locations must register");
+        let r = mgr
+            .lookup("example.com", "/api/users", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        let r = mgr
+            .lookup("example.com", "/other", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+    }
+
+    /// Go parity: HTTPS registration passes location "" (https.go
+    /// listenForDomain → Muxer.Listen → Routers.Add(domain, "", ...)), so a
+    /// duplicate domain WITHIN one HTTPS registration (duplicate
+    /// custom_domains entry, or subdomain expansion colliding with a custom
+    /// domain) repeats the (domain, "") SNI triple and rejects.
+    #[tokio::test]
+    async fn test_vhost_register_https_same_call_duplicate_domain_rejected() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["tls.example.com".into(), "tls.example.com".into()],
+            "https",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect_err("HTTPS duplicate SNI domain must be a config conflict");
+    }
+
+    /// Go parity: HTTPS (empty locations = location "") also conflicts
+    /// ACROSS registrations — two HTTPS proxies with the same domain are
+    /// rejected by the muxer's Routers.Add (previously frp-rs skipped the
+    /// conflict check entirely for empty-location registrations, letting
+    /// the first proxy silently win).
+    #[tokio::test]
+    async fn test_vhost_register_https_cross_call_duplicate_domain_rejected() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["tls.example.com".into()],
+            "https",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("first HTTPS registration must succeed");
+        let err = mgr
+            .register(
+                "p2",
+                &["tls.example.com".into()],
+                "https",
+                &[],
+                "run-2",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect_err("second HTTPS proxy claiming the same SNI domain must be rejected");
+        assert!(
+            err.to_string().contains("p1"),
+            "conflict must name the existing proxy: {err}"
+        );
+        // The first route survives (scheme "https" — SNI lookup).
+        let r = mgr
+            .lookup("tls.example.com", "", "", "https")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+    }
+
+    /// Go parity: a location-less (catch-all) route is registered with
+    /// location "", so it conflicts with a new HTTPS (location "") route on
+    /// the same domain — but NOT with a location-scoped HTTP route.
+    #[tokio::test]
+    async fn test_vhost_register_catch_all_location_conflict_parity() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["c.example.com".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("catch-all registration must succeed");
+        // Location-scoped route on the same domain is a distinct triple.
+        mgr.register(
+            "p2",
+            &["c.example.com".into()],
+            "http",
+            &["/".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("location-scoped route must coexist with the catch-all");
+        // A second location-less route is the same (domain, "") triple.
+        mgr.register(
+            "p3",
+            &["c.example.com".into()],
+            "http",
+            &[],
+            "run-3",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect_err("second location-less route must conflict with the catch-all");
+    }
+
+    /// Go parity: HTTP and HTTPS vhost routes live in SEPARATE router sets
+    /// in Go frp — HTTP proxies share `httpVhostRouter`
+    /// (server/service.go:179), HTTPS proxies register in their own Muxer's
+    /// `registryRouter` (vhost/vhost.go:56-70) — so an HTTP proxy and an
+    /// HTTPS proxy for the SAME domain never conflict, whatever their
+    /// locations. frp-rs stores both schemes in one VhostTables, so the
+    /// scheme partitions the cross-call conflict check (round-10 regression:
+    /// both defaulted to effective location "" and cross-rejected a pair Go
+    /// accepts).
+    #[tokio::test]
+    async fn test_vhost_http_https_same_domain_both_accepted() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "http-p",
+            &["example.com".into()],
+            "http",
+            &["/a".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTP registration must succeed");
+        mgr.register(
+            "https-p",
+            &["example.com".into()],
+            "https",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTPS registration for the same domain must not conflict with the HTTP route");
+    }
+
+    /// The scheme partition must hold even when BOTH registrations land on
+    /// effective location "" (empty locations list → [""]) — pre-diff this
+    /// pair was cross-rejected as a duplicate (domain, "", "") triple,
+    /// while Go accepts it (separate router sets).
+    #[tokio::test]
+    async fn test_vhost_http_https_same_effective_location_accepted() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "http-p",
+            &["same.example.com".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTP catch-all registration must succeed");
+        mgr.register(
+            "https-p",
+            &["same.example.com".into()],
+            "https",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTPS registration must not conflict with the HTTP catch-all");
+    }
+
+    /// Regression (round-12 MEDIUM): the conflict check is scheme-partitioned
+    /// (HTTP and HTTPS proxies for the same domain both register), and the
+    /// LOOKUPS must be too — Go routes HTTP requests through httpVhostRouter
+    /// and SNI through the HTTPS Muxer's registryRouter, so the two routes
+    /// are independently reachable and never cross. Pre-fix the lookups were
+    /// scheme-blind: find_matching_route returned whichever route came first,
+    /// so a plain HTTP request could be routed to the HTTPS proxy's backend
+    /// (bypassing the HTTP proxy's http_user/401 gate) and an SNI lookup
+    /// could pick the HTTP route.
+    #[tokio::test]
+    async fn test_vhost_http_https_same_domain_scheme_partitioned_lookup() {
+        let mgr = VhostManager::new();
+        // HTTP proxy on the shared domain with a Basic Auth gate...
+        mgr.register(
+            "http-p",
+            &["example.com".into()],
+            "http",
+            &["/".into()],
+            "run-1",
+            "",
+            "alice",
+            "secret",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTP registration must succeed");
+        // ...and an HTTPS (SNI) proxy for the SAME domain.
+        mgr.register(
+            "https-p",
+            &["example.com".into()],
+            "https",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTPS registration for the same domain must succeed");
+
+        // HTTP lookup (scheme "http") must land on the HTTP backend only —
+        // never on the HTTPS route.
+        let r = mgr.lookup("example.com", "/", "", "http").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "http-p");
+        // The HTTP route carries the auth gate (http_user), so a request
+        // routed to it can still be 401'd — the cross-scheme bug would have
+        // handed the same request to the HTTPS backend with no gate.
+        assert_eq!(r.http_user.as_ref(), "alice");
+        // SNI lookup (scheme "https") must land on the HTTPS backend only.
+        let r = mgr.lookup("example.com", "/", "", "https").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "https-p");
+        // The wildcard/combined paths partition identically.
+        let r = mgr
+            .lookup_wildcard("example.com", "/", "", "https")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "https-p");
+        let r = mgr
+            .lookup_combined("example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "http-p");
+
+        // Unregistering one scheme's route leaves the other reachable.
+        mgr.unregister("http-p").await;
+        assert!(
+            mgr.lookup("example.com", "/", "", "http").await.is_none(),
+            "HTTP route must be gone"
+        );
+        let r = mgr.lookup("example.com", "/", "", "https").await.unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "https-p");
+    }
+
+    /// Within one scheme, the (domain, route_by_http_user, location) triple
+    /// stays unique: a second HTTP proxy with the same domain and same
+    /// location is rejected (Go httpVhostRouter Routers.Add exist()).
+    #[tokio::test]
+    async fn test_vhost_http_same_domain_same_location_conflict() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["dup.example.com".into()],
+            "http",
+            &["/".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("first HTTP registration must succeed");
+        let err = mgr
+            .register(
+                "p2",
+                &["dup.example.com".into()],
+                "http",
+                &["/".into()],
+                "run-2",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect_err("second HTTP proxy with the same domain+location must conflict");
+        assert!(
+            err.to_string().contains("p1"),
+            "conflict must name the existing proxy: {err}"
+        );
+    }
+
+    /// Go buildDomains parity (server/proxy/proxy.go:218-229): empty-string
+    /// custom_domains entries are skipped (`if d != ""`), so
+    /// custom_domains=["",""] produces ZERO domains, the register loop
+    /// never runs, and the proxy is ACCEPTED (listening nothing) — for both
+    /// HTTP and HTTPS. The registration must not trip the same-call dedup
+    /// on the ("","") duplicate, and nothing must be routable for "".
+    #[tokio::test]
+    async fn test_vhost_empty_custom_domains_accepted() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "http-p",
+            &["".into(), "".into()],
+            "http",
+            &["/".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("HTTP custom_domains=[\"\",\"\"] must be accepted (Go buildDomains skips empties)");
+        mgr.register(
+            "https-p",
+            &["".into(), "".into()],
+            "https",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect(
+            "HTTPS custom_domains=[\"\",\"\"] must be accepted (Go buildDomains skips empties)",
+        );
+        // Zero domains registered — nothing resolves for "".
+        assert!(mgr.lookup("", "/", "", "http").await.is_none());
+        assert!(mgr.lookup_combined("", "/", "", "http").await.is_none());
+        // A real domain must not resolve to either proxy either (zero
+        // routes were inserted, not just ""-keyed ones).
+        assert!(mgr.lookup("example.com", "/", "", "http").await.is_none());
+    }
+
+    /// Minimal AppState for routing-only tests (mirrors state.rs test_state).
+    fn test_app_state() -> Arc<AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(AppState::new(
+            frp_core::auth::AuthConfig::with_token("test-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("test-token"),
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
+            String::new(),
+            true,
+            30,
+            7200,
+            0,
+            0,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    /// Hand-built VhostRoute for find_matching_route / sort_by_longest_location.
+    fn route(name: &str, locations: &[String]) -> VhostRoute {
+        VhostRoute {
+            proxy_name: name.into(),
+            run_id: "run".into(),
+            scheme: "http".into(),
+            group: "".into(),
+            locations: locations.to_vec(),
+            host_header_rewrite: "".into(),
+            http_user: "".into(),
+            http_pwd: "".into(),
+            route_by_http_user: "".into(),
+            headers: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Go frp v0.71.0 compat (pkg/util/vhost/router.go getByRoute): vhost
+    /// lookup walks exact → leftmost-label wildcard (>=3 labels) → "*"
+    /// catch-all — the same walk tcpmux uses (see the tcpmux tests).
+    #[tokio::test]
+    async fn test_vhost_lookup_wildcard_leftmost_label() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["*.example.com".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("wildcard registration must succeed");
+
+        // A 4-label host walks "*.b.example.com" (miss) then "*.example.com"
+        // (hit) — the progressive leftmost-label replacement.
+        let r = mgr
+            .lookup_wildcard("a.b.example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        // A 3-label host walks straight to "*.example.com".
+        let r = mgr
+            .lookup_wildcard("b.example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        // Two-label hosts never match the wildcard (Go's >=3-label guard
+        // keeps `*.com` from matching `example.com`) — and no catch-all is
+        // registered, so the lookup misses entirely.
+        assert!(mgr
+            .lookup_wildcard("example.com", "/", "", "http")
+            .await
+            .is_none());
+        // Unrelated suffixes stay misses.
+        assert!(mgr
+            .lookup_wildcard("a.example.net", "/", "", "http")
+            .await
+            .is_none());
+    }
+
+    /// When both a specific wildcard and a broader one are registered, the
+    /// first (more specific) candidate in the leftmost-label walk wins.
+    #[tokio::test]
+    async fn test_vhost_lookup_wildcard_most_specific_wins() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "specific",
+            &["*.b.example.com".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("specific wildcard registration must succeed");
+        mgr.register(
+            "broad",
+            &["*.example.com".into()],
+            "http",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("broad wildcard registration must succeed");
+
+        // "a.b.example.com": the walk hits "*.b.example.com" first.
+        let r = mgr
+            .lookup_wildcard("a.b.example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "specific");
+        // "c.example.com": "*.b.example.com" misses, "*.example.com" hits.
+        let r = mgr
+            .lookup_wildcard("c.example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "broad");
+    }
+
+    #[tokio::test]
+    async fn test_vhost_lookup_wildcard_catch_all() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["*".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("catch-all registration must succeed");
+
+        for host in ["anything.example.com", "example.com", "localhost"] {
+            let r = mgr
+                .lookup_wildcard(host, "/", "", "http")
+                .await
+                .unwrap_or_else(|| panic!("catch-all must match '{host}'"));
+            assert_eq!(r.proxy_name.as_ref(), "p1");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vhost_lookup_exact_beats_wildcard() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("exact registration must succeed");
+        mgr.register(
+            "p2",
+            &["*.example.com".into()],
+            "http",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("wildcard registration must succeed");
+
+        // Exact match wins; the wildcard catches everything else under the
+        // domain.
+        let r = mgr
+            .lookup_wildcard("a.example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        let r = mgr
+            .lookup_wildcard("b.example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p2");
+    }
+
+    /// proxy_ops expands a subdomain + sub_domain_host to
+    /// `format!("{}.{}", subdomain, sub_host)` before registering the vhost
+    /// route; the expanded domain must register and route like any other
+    /// domain, while the bare sub_domain_host itself stays unrouted.
+    #[tokio::test]
+    async fn test_vhost_register_subdomain_expansion_routes() {
+        let mgr = VhostManager::new();
+        let sub_domain_host = "example.com";
+        let expanded = format!("app.{sub_domain_host}");
+        mgr.register(
+            "p1",
+            std::slice::from_ref(&expanded),
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("expanded subdomain registration must succeed");
+
+        let r = mgr
+            .lookup_wildcard(&expanded, "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+        // The bare host has no route — the subdomain supplies the first label.
+        assert!(mgr
+            .lookup_wildcard(sub_domain_host, "/", "", "http")
+            .await
+            .is_none());
+    }
+
+    /// Go frp compat (pkg/util/vhost/router.go): routes are sorted by
+    /// lexicographically-DESCENDING location (`slices.SortFunc` with
+    /// `-cmp.Compare`), and `find_matching_route` returns the FIRST route in
+    /// that order whose location prefix-matches — so the longest-prefix
+    /// match is found without a length comparison at match time. Routes with
+    /// no locations (HTTPS SNI) sort last and match any path.
+    #[test]
+    fn test_find_matching_route_longest_location_precedence() {
+        let mut routes = vec![
+            route("a", &["/aa".into()]),
+            route("b", &["/aa/bb/cc".into()]),
+            route("c", &[]),
+        ];
+        sort_by_longest_location(&mut routes);
+        assert_eq!(routes[0].proxy_name.as_ref(), "b");
+        assert_eq!(routes[1].proxy_name.as_ref(), "a");
+        assert_eq!(routes[2].proxy_name.as_ref(), "c");
+
+        // Path under the longest location → b.
+        let m = find_matching_route(&routes, "/aa/bb/cc/d", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "b");
+        // "/aa/bb" misses b's "/aa/bb/cc" and hits a's "/aa".
+        let m = find_matching_route(&routes, "/aa/bb", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "a");
+        // No prefix matches → falls through to the no-location route.
+        let m = find_matching_route(&routes, "/zz", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "c");
+        // A no-location route matches ANY path (even an empty one).
+        assert_eq!(
+            find_matching_route(&routes, "", "http")
+                .unwrap()
+                .proxy_name
+                .as_ref(),
+            "c"
+        );
+        // The scheme filter keeps other-scheme routes out: with only an
+        // "http" route in the list, an "https" lookup misses entirely.
+        let m = find_matching_route(&routes, "/aa/bb/cc/d", "https");
+        assert!(m.is_none(), "cross-scheme lookup must not match");
+    }
+
+    /// Go registers one Router per (domain, location, httpUser) triple and
+    /// sorts ALL of them flat before first-match probing. A route-first scan
+    /// over interleaved multi-location sets diverges: with A at
+    /// ["/zz", "/a"] and B at ["/aa"], Go's flattened order "/zz"(A),
+    /// "/aa"(B), "/a"(A) routes "/aa" to B — a route-first probe would check
+    /// A's "/a" first and wrongly pick A. The best-match scan reproduces the
+    /// flattened order exactly.
+    #[test]
+    fn test_find_matching_route_interleaved_multi_location() {
+        let mut routes = vec![
+            route("a", &["/zz".into(), "/a".into()]),
+            route("b", &["/aa".into()]),
+        ];
+        sort_by_longest_location(&mut routes);
+        // A sorts first (its "/zz" key is largest), so a route-first
+        // first-match scan would probe A first.
+        assert_eq!(routes[0].proxy_name.as_ref(), "a");
+
+        // "/aa" → B (flattened order: "/aa" before "/a").
+        let m = find_matching_route(&routes, "/aa", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "b");
+        // "/a" → A (B's "/aa" does not prefix-match "/a").
+        let m = find_matching_route(&routes, "/a", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "a");
+        // "/zzzz" → A (A's "/zz").
+        let m = find_matching_route(&routes, "/zzzz", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "a");
+        // "/aab" → B ("/aa" is longer than "/a").
+        let m = find_matching_route(&routes, "/aab", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "b");
+        // A no-location route only wins when nothing else matches.
+        let mut with_catchall = vec![
+            route("a", &["/zz".into(), "/a".into()]),
+            route("b", &["/aa".into()]),
+            route("c", &[]),
+        ];
+        sort_by_longest_location(&mut with_catchall);
+        let m = find_matching_route(&with_catchall, "/none", "http").unwrap();
+        assert_eq!(m.proxy_name.as_ref(), "c");
+    }
+
+    /// Re-registration must restore the sorted order, and the httpUser-
+    /// specific bucket must win over the "" (all-users) fallback bucket.
+    #[tokio::test]
+    async fn test_vhost_sort_stable_after_reregistration_and_http_user_bucket() {
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &["example.com".into()],
+            "http",
+            &["/".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        mgr.register(
+            "p2",
+            &["example.com".into()],
+            "http",
+            &["/api".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        // Longest location prefix wins.
+        let r = mgr
+            .lookup("example.com", "/api/users", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p2");
+        let r = mgr
+            .lookup("example.com", "/other", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+
+        // Unregister + re-register p2: the sort must be restored so the
+        // longer "/api" location still wins over "/".
+        mgr.unregister("p2").await;
+        mgr.register(
+            "p2",
+            &["example.com".into()],
+            "http",
+            &["/api".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        let r = mgr
+            .lookup("example.com", "/api/users", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(
+            r.proxy_name.as_ref(),
+            "p2",
+            "re-registration must restore longest-location order"
+        );
+
+        // httpUser-specific bucket wins for matching users; everyone else
+        // falls back to the "" bucket (Go getExactOrAllUsersLocked). The
+        // bucket key is route_by_http_user at register (8th arg) and the
+        // request's username at lookup.
+        mgr.register(
+            "auth-p",
+            &["example.com".into()],
+            "http",
+            &["/".into()],
+            "run-3",
+            "",
+            "",
+            "",
+            "alice",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        let r = mgr
+            .lookup("example.com", "/x", "alice", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "auth-p");
+        let r = mgr
+            .lookup("example.com", "/x", "bob", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+    }
+
+    #[tokio::test]
+    async fn test_vhost_locations_require_a_domain() {
+        // Round 10 (MEDIUM, Go parity): Go registers HTTP proxies as
+        // `for domain { for location { register } }` — zero domains means
+        // zero routes, so a location without a custom_domain must never
+        // route (the removed host-agnostic path-only fallback would have
+        // matched "/static/...", recreating the vhost-port catch-all).
+        let mgr = VhostManager::new();
+        mgr.register(
+            "p1",
+            &[],
+            "http",
+            &["/static".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(
+            mgr.lookup_combined("example.com", "/static/img/logo.png", "", "http")
+                .await
+                .is_none(),
+            "locations without custom_domains must register zero routes (Go parity)"
+        );
+        // Domain-scoped locations still match: same location with a domain.
+        mgr.register(
+            "p2",
+            &["example.com".into()],
+            "http",
+            &["/static".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .unwrap();
+        let r = mgr
+            .lookup_combined("example.com", "/static/css/site.css", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p2");
+    }
+
+    #[test]
+    fn test_extract_basic_auth_valid() {
+        // base64("user:pass") = "dXNlcjpwYXNz".
+        let req = "GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n";
+        assert_eq!(
+            extract_basic_auth(req),
+            Some(("user".into(), "pass".into()))
+        );
+        // Header name is matched case-insensitively.
+        let req = "GET / HTTP/1.1\r\nauthorization: Basic dXNlcjpwYXNz\r\n\r\n";
+        assert_eq!(
+            extract_basic_auth(req),
+            Some(("user".into(), "pass".into()))
+        );
+        // Whitespace between "Basic" and the payload is NOT trimmed (Go
+        // takes auth[6:] verbatim — a space is an invalid base64 char, so
+        // StdEncoding fails → None, exactly like the round-16 fix's
+        // test_extract_basic_auth_case_insensitive_no_trim).
+        let req = "GET / HTTP/1.1\r\nAuthorization: Basic   dXNlcjpwYXNz\r\n\r\n";
+        assert_eq!(extract_basic_auth(req), None);
+        // Empty password after the colon.
+        let req = "GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjo=\r\n\r\n";
+        assert_eq!(extract_basic_auth(req), Some(("user".into(), "".into())));
+    }
+
+    #[test]
+    fn test_extract_basic_auth_invalid_and_missing() {
+        // Missing header.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+            None
+        );
+        // Wrong scheme.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Bearer abc\r\n\r\n"),
+            None
+        );
+        // "Basic" without a trailing space.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic\r\n\r\n"),
+            None
+        );
+        // "Basic" with an empty payload.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic \r\n\r\n"),
+            None
+        );
+        // Decodes but has no colon separator (base64("use") = "dXNl").
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic dXNl\r\n\r\n"),
+            None
+        );
+        // Not valid base64.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic !!!\r\n\r\n"),
+            None
+        );
+        // Decodes to non-UTF-8 bytes (base64(0xff) = "/w==").
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\nAuthorization: Basic /w==\r\n\r\n"),
+            None
+        );
+        // The caller bounds the text to the head (up to \r\n\r\n); given an
+        // unbounded string a body line IS found — mirroring the fn's
+        // documented contract.
+        assert_eq!(
+            extract_basic_auth("GET / HTTP/1.1\r\n\r\nAuthorization: Basic dXNlcjpwYXNz"),
+            Some(("user".into(), "pass".into()))
+        );
+    }
+
+    /// HTTP Basic Auth enforcement in resolve_vhost_request uses
+    /// constant_time_eq_str on both the username and the password — a wrong
+    /// password (or username, or no credentials) must produce
+    /// VhostResolveError::Unauthorized, and only the exact pair forwards.
+    #[tokio::test]
+    async fn test_vhost_resolve_auth_rejects_wrong_password() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "auth-p",
+                &["auth.example.com".into()],
+                "http",
+                &[],
+                "run-1",
+                "",
+                "user1",
+                "pass1",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect("auth route registration must succeed");
+        let head = b"GET / HTTP/1.1\r\nHost: auth.example.com\r\n\r\n".to_vec();
+        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 1234));
+
+        // `head` is passed in per call (a clone) so the closure never
+        // borrows the fn-local `head` — the `abs_bad` block below MOVES
+        // `head` into its future, which would otherwise collide with the
+        // closure's capture borrow.
+        let resolve = |auth: Option<(&str, &str)>, head: Vec<u8>| {
+            let auth = auth.map(|(u, p)| (u.to_string(), p.to_string()));
+            // Shadow `state` with a Copy reference: the move future copies
+            // the reference instead of consuming the fn-local AppState, so
+            // the outer closure stays Fn and can be called repeatedly.
+            let state = &state;
+            async move {
+                resolve_vhost_request(
+                    state,
+                    "auth.example.com",
+                    "/",
+                    auth.as_ref(),
+                    None, // no routing-only fallback user
+                    head,
+                    peer,
+                    "HTTP",
+                    false, // origin-form request
+                )
+                .await
+            }
+        };
+
+        // No credentials → origin-form 401 shape.
+        assert!(matches!(
+            resolve(None, head.clone()).await,
+            Err(VhostResolveError::Unauthorized { proxy_form: false })
+        ));
+        // Wrong password → 401 shape.
+        assert!(matches!(
+            resolve(Some(("user1", "wrong")), head.clone()).await,
+            Err(VhostResolveError::Unauthorized { proxy_form: false })
+        ));
+        // Wrong username → 401 shape.
+        assert!(matches!(
+            resolve(Some(("other", "pass1")), head.clone()).await,
+            Err(VhostResolveError::Unauthorized { proxy_form: false })
+        ));
+        // Absolute-form shape: the SAME auth failure must be flagged
+        // `proxy_form: true` so the caller answers 407 + Proxy-Authenticate.
+        let abs = {
+            let auth = Some(("user1".to_string(), "pass1".to_string()));
+            let state = &state;
+            let head = head.clone(); // the async move below captures it by value
+            async move {
+                resolve_vhost_request(
+                    state,
+                    "auth.example.com",
+                    "/",
+                    auth.as_ref(),
+                    None, // no routing-only fallback user
+                    head,
+                    peer,
+                    "HTTP",
+                    true, // absolute-form request
+                )
+                .await
+            }
+        };
+        // Correct credentials pass on the absolute-form path too — the flag
+        // must not change the credential check itself.
+        assert!(
+            abs.await.is_ok(),
+            "valid credentials must forward on both forms"
+        );
+        let abs_bad = {
+            let auth = Some(("user1".to_string(), "wrong".to_string()));
+            let state = &state;
+            let head = head.clone(); // `head` is still needed by the final resolve() below
+            async move {
+                resolve_vhost_request(
+                    state,
+                    "auth.example.com",
+                    "/",
+                    auth.as_ref(),
+                    None, // no routing-only fallback user
+                    head,
+                    peer,
+                    "HTTP",
+                    true,
+                )
+                .await
+            }
+        };
+        assert!(matches!(
+            abs_bad.await,
+            Err(VhostResolveError::Unauthorized { proxy_form: true })
+        ));
+        // Correct credentials → forward to the route's proxy (moves `head`).
+        let fwd = resolve(Some(("user1", "pass1")), head)
+            .await
+            .expect("valid credentials must forward");
+        assert_eq!(fwd.proxy_name, "auth-p");
+        assert_eq!(fwd.run_id, "run-1");
+    }
+
+    /// Go frp v0.71.0 HTTPGroup.chooseEndpoint fallback: when the chosen
+    /// group member is not registered in the proxy manager (gone between
+    /// choose_endpoint and lookup), the route's recorded proxy — the first
+    /// member that owns the shared route — is the fallback target.
+    #[tokio::test]
+    async fn test_vhost_group_member_gone_falls_back_to_recorded_proxy() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "owner-p",
+                &["g.example.com".into()],
+                "http",
+                &[],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "grp-1",
+            )
+            .await
+            .expect("route registration must succeed");
+        // The group lists "member-1", but the proxy manager has no such
+        // proxy — exactly the "gone between choose and lookup" state.
+        state
+            .http_group_ctl
+            .register_member("grp-1", "key", "g.example.com", "/", "", "member-1")
+            .await
+            .expect("member registration must succeed");
+
+        let fwd = resolve_vhost_request(
+            &state,
+            "g.example.com",
+            "/",
+            None,
+            None, // no routing-only fallback user
+            b"GET / HTTP/1.1\r\nHost: g.example.com\r\n\r\n".to_vec(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            "HTTP",
+            false,
+        )
+        .await
+        .expect("member-gone fallback must forward");
+        assert_eq!(
+            fwd.proxy_name, "owner-p",
+            "member gone → recorded proxy fallback"
+        );
+        assert_eq!(fwd.run_id, "run-1");
+    }
+
+    /// choose_endpoint returns None when the group is not registered (or has
+    /// no members) — the request routes to the route's recorded proxy.
+    #[tokio::test]
+    async fn test_vhost_group_no_members_falls_back_to_recorded_proxy() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "owner-p",
+                &["g2.example.com".into()],
+                "http",
+                &[],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "grp-ghost",
+            )
+            .await
+            .expect("route registration must succeed");
+        // "grp-ghost" is never registered with the controller, so
+        // choose_endpoint returns None.
+        let fwd = resolve_vhost_request(
+            &state,
+            "g2.example.com",
+            "/",
+            None,
+            None, // no routing-only fallback user
+            b"GET / HTTP/1.1\r\nHost: g2.example.com\r\n\r\n".to_vec(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            "HTTP",
+            false,
+        )
+        .await
+        .expect("no-member fallback must forward");
+        assert_eq!(
+            fwd.proxy_name, "owner-p",
+            "no members → recorded proxy fallback"
+        );
+        assert_eq!(fwd.run_id, "run-1");
     }
 }

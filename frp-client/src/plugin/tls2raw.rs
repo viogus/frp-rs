@@ -437,7 +437,8 @@ mod tests {
             "127.0.0.1",
             45678,
             6000,
-        );
+        )
+        .expect("valid v1 header");
         let mut tls = connect_with_proxy_header(handle.local_addr, header.as_bytes()).await;
 
         tls.write_all(b"hello-tls2raw").await.unwrap();

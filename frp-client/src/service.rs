@@ -105,6 +105,10 @@ impl frp_core::ControlSink for ControlWriter {
     fn send_msg(&self, msg: FrpMessage, v2: bool) -> Result<(), String> {
         self.send(msg, v2)
     }
+
+    fn is_failed(&self) -> bool {
+        ControlWriter::is_failed(self)
+    }
 }
 #[cfg(feature = "vnet")]
 use crate::vnet::{
@@ -1082,7 +1086,25 @@ impl Service {
                             (rand::thread_rng().gen::<f64>() * 0.1 * delay_ms as f64) as u64;
                         Duration::from_millis(delay_ms.saturating_add(jitter_ms).min(10_000))
                     };
-                    tokio::time::sleep(delay).await;
+                    // Race the backoff against a stop request: with
+                    // login_fail_exit = false and an unreachable server, the
+                    // plain sleep below would hold a buffered admin/signal
+                    // stop (cap-1 stop_tx) until a login eventually succeeds —
+                    // shutdown would hang indefinitely (Go client/service.go
+                    // loopLoginUntilSuccess has no stop path either; this is
+                    // client-side robustness beyond parity, same shape as the
+                    // reconnect-sleep select below). There is no ctx on the
+                    // login-failure path (it is bound only in the Ok arm
+                    // above), so this branch only cancels the detached
+                    // health/admin tasks and returns.
+                    tokio::select! {
+                        Some(()) = stop_rx.recv() => {
+                            info!("Stop requested while waiting to retry login, shutting down");
+                            self.cancel_detached_tasks(&health_cancels, admin_handle).await;
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
                     continue;
                 }
             };
@@ -1218,7 +1240,12 @@ impl Service {
             // Reset the consecutive-error count when the previous session was
             // healthy for ≥5 minutes, so a stable connection followed by an
             // occasional blip reconnects from Phase 1 instead of the 20s cap.
-            if ctx.session_started_at.elapsed() > Duration::from_secs(300) {
+            if healthy_resets_error_count(
+                consecutive_err_count,
+                Some(ctx.session_started_at),
+                Instant::now(),
+                Duration::from_secs(300),
+            ) {
                 consecutive_err_count = 0;
             }
             let delay = crate::backoff::reconnect_delay_after_session(
@@ -1278,6 +1305,10 @@ impl Service {
         let wc_tls_cert_file = opt_if_empty!(cfg_local.tls_cert_file);
         let wc_tls_key_file = opt_if_empty!(cfg_local.tls_key_file);
         let wc_dns_server = opt_if_empty!(cfg_local.dns_server);
+        // Upper bound (65507, max UDP payload) is enforced at config load
+        // (frp-core config/client.rs — every load path, reload included);
+        // `.max(0)` guards programmatically-built configs with a negative
+        // value so the buffer size stays sane.
         let wc_udp_packet_size = cfg_local.udp_packet_size.max(0) as usize;
         let wc_disable_custom_tls_first_byte = cfg_local.disable_custom_tls_first_byte;
         let wc_keepalive_secs = cfg_local.dial_server_keepalive.max(0) as u64;
@@ -2242,6 +2273,26 @@ impl Service {
             // Clone the negotiated UDPPacket codec before `ctx` moves into
             // the spawn (Go frp v0.71.0 sessionCtx.UDPPacketCodec).
             let ctx_udp_packet_codec = ctx.wc_udp_packet_codec.clone();
+            // Client QUIC transport params for the XTCP tunnel session (Go
+            // `clientCfg.Transport.QUIC`).
+            #[cfg(feature = "quic")]
+            let visitor_quic_params = frp_core::quic::quic_params_from_option_values(
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.keepalive_period)
+                    .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.max_idle_timeout)
+                    .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.max_incoming_streams)
+                    .unwrap_or(0),
+            );
             let handle = tokio::spawn(async move {
                 crate::visitor::run_visitor_listener(crate::visitor::VisitorListenerConfig {
                     server_addr: sa,
@@ -2287,6 +2338,8 @@ impl Service {
                     // byte-stream bridge; mismatches fall back to the
                     // message-level transcoding bridge.
                     udp_packet_codec: ctx_udp_packet_codec.clone(),
+                    #[cfg(feature = "quic")]
+                    quic_params: visitor_quic_params,
                 })
                 .await;
             });
@@ -3590,9 +3643,27 @@ impl Service {
                 .map(|info| info.local_addr.clone())
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
             let pn = wn.clone();
-            let interval = std::time::Duration::from_secs(p.health_check_interval_seconds.max(10));
-            let timeout = std::time::Duration::from_secs(p.health_check_timeout_seconds.max(3));
-            let max_failed = p.health_check_max_failed.max(1);
+            // Round 10 (MEDIUM, Go parity): Go only substitutes defaults when
+            // the configured value is <= 0 (health.go:57-64; the fields are
+            // u64 here, so a negative config fails deserialization up front).
+            // `.max(N)` silently rewrote an explicit 1-9s value, so an
+            // operator asking for fast 2s checks got 10s instead.
+            let interval =
+                std::time::Duration::from_secs(if p.health_check_interval_seconds == 0 {
+                    10
+                } else {
+                    p.health_check_interval_seconds
+                });
+            let timeout = std::time::Duration::from_secs(if p.health_check_timeout_seconds == 0 {
+                3
+            } else {
+                p.health_check_timeout_seconds
+            });
+            let max_failed = if p.health_check_max_failed == 0 {
+                1
+            } else {
+                p.health_check_max_failed
+            };
             let tx = health_tx.clone();
             let hc_url = if hc_type == "http" {
                 let url = p.health_check_url.clone();
@@ -3860,6 +3931,16 @@ impl Service {
         for name in delta.added.iter().chain(delta.changed.iter()) {
             if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
                 if let Some(ref plugin_cfg) = p.plugin {
+                    // virtual_net is not a local-listener plugin (startup
+                    // skip at plugin/mod.rs start_plugin): start_plugin
+                    // returns None for it, which the changed-arm below would
+                    // misread as a restart FAILURE and abort the ENTIRE
+                    // reload (dropping every other changed proxy). Skip it
+                    // here — vnet proxies are handled by the TUN
+                    // open/register section below.
+                    if plugin_cfg.plugin_type == "virtual_net" {
+                        continue;
+                    }
                     if let Some(handle) = self
                         .start_plugin(name, plugin_cfg, p.use_encryption, p.use_compression)
                         .await
@@ -4112,8 +4193,16 @@ impl Service {
                     let snapshot = crate::reload::config_snapshot(p);
                     let mut err = String::new();
                     // If this proxy has a plugin but plugin_addrs doesn't have it,
-                    // the plugin failed to start — record the error
-                    if p.plugin.is_some() && !plugin_addrs.contains_key(name) {
+                    // the plugin failed to start — record the error. virtual_net
+                    // is not a local-listener plugin (start_plugin skips it, see
+                    // the plugin-restart loop above), so its name never lands in
+                    // plugin_addrs — stamping the err here would report a false
+                    // "failed to start" after every vnet-touching reload
+                    // (transient until NewProxyResp clears it).
+                    if p.plugin.is_some()
+                        && plugin_type != "virtual_net"
+                        && !plugin_addrs.contains_key(name)
+                    {
                         err = format!("plugin '{}' failed to start", plugin_type);
                     }
                     map.insert(
@@ -4213,6 +4302,28 @@ impl Service {
         Ok(format!("reload success: {summary}"))
     }
 }
+/// Whether a session that stayed up for at least `healthy_duration` warrants
+/// resetting the consecutive-error count before the next reconnect backoff.
+///
+/// A long-healthy session followed by an occasional blip must reconnect from
+/// Phase 1 (fast retry) instead of the 20s exponential cap — Go frp's
+/// FastBackoffManager only counts consecutive failures. Sessions shorter than
+/// the healthy duration keep their error count so the backoff cap is
+/// preserved across rapid reconnects.
+///
+/// Pure decision (no clock reads) so the 5-minute production window can be
+/// unit-tested without wall-clock sleeps; the call site supplies `now` and
+/// the production healthy duration.
+fn healthy_resets_error_count(
+    consecutive_err_count: u32,
+    last_session_start: Option<Instant>,
+    now: Instant,
+    healthy_duration: Duration,
+) -> bool {
+    consecutive_err_count > 0
+        && last_session_start.is_some_and(|start| now.duration_since(start) > healthy_duration)
+}
+
 /// Reclaim a stale XTCP entry whose NatHoleResp never arrived in time.
 ///
 /// `key` carries two independent namespaces: it is a provider-side NAT session
@@ -5655,5 +5766,50 @@ mod tests {
                 "dead-proxy NatHoleResp must not spawn a punch task holding the STUN socket"
             );
         }
+    }
+
+    /// The ≥5-minute-healthy-session error-count reset, extracted into a
+    /// pure function so the production window needs no wall-clock sleeps.
+    /// A session that lasted at least the healthy duration resets the
+    /// consecutive-error count (the next reconnect comes back at Phase 1
+    /// instead of the 20s exponential cap); a shorter session keeps the
+    /// count. The comparison is strict (`>`), matching the production
+    /// `elapsed() > 300s` semantics exactly.
+    #[test]
+    fn healthy_session_resets_consecutive_error_count() {
+        let now = Instant::now();
+        let healthy = Duration::from_secs(300);
+
+        // Short session with prior errors: no reset — the backoff cap is
+        // preserved across rapid reconnects.
+        assert!(!healthy_resets_error_count(
+            3,
+            Some(now - Duration::from_secs(60)),
+            now,
+            healthy
+        ));
+        // Session started exactly `healthy` ago: NOT a reset (strict `>`).
+        assert!(!healthy_resets_error_count(
+            3,
+            Some(now - healthy),
+            now,
+            healthy
+        ));
+        // Session longer than the healthy duration with prior errors: reset.
+        assert!(healthy_resets_error_count(
+            3,
+            Some(now - healthy - Duration::from_millis(1)),
+            now,
+            healthy
+        ));
+        // No prior errors: the reset is a no-op — and must not report one.
+        assert!(!healthy_resets_error_count(
+            0,
+            Some(now - healthy - Duration::from_secs(60)),
+            now,
+            healthy
+        ));
+        // No session start (never logged in): no reset.
+        assert!(!healthy_resets_error_count(3, None, now, healthy));
     }
 }

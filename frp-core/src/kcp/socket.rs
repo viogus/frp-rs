@@ -4,9 +4,10 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
+use crossbeam_queue::ArrayQueue;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::{interval, Duration};
@@ -44,31 +45,40 @@ pub(crate) const CHUNK_POOL_CAP: usize = 8;
 /// Pop a reusable write chunk from the pool, or allocate one with
 /// `min_capacity` when the pool is empty (first write, or the pool drained
 /// by a burst of in-flight writes). The pool is bounded by CHUNK_POOL_CAP.
-pub(crate) fn chunk_pool_pop(pool: &Mutex<Vec<Vec<u8>>>, min_capacity: usize) -> Vec<u8> {
-    pool.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .pop()
+/// Lock-free (`crossbeam` `ArrayQueue` — the same queue type the bridge
+/// buffer pool uses), so the pop/push on the driver hot path never
+/// contends on a mutex.
+pub(crate) fn chunk_pool_pop(pool: &ArrayQueue<Vec<u8>>, min_capacity: usize) -> Vec<u8> {
+    pool.pop()
         .unwrap_or_else(|| Vec::with_capacity(min_capacity))
 }
 
 /// Return a consumed write chunk to the pool. Clears the payload (keeping
 /// the allocation so the next writer reuses it) and drops the chunk when
-/// the pool is at its cap.
-pub(crate) fn chunk_pool_push(pool: &Mutex<Vec<Vec<u8>>>, mut chunk: Vec<u8>) {
+/// the pool is at its cap (`push` returns it as `Err`).
+pub(crate) fn chunk_pool_push(pool: &ArrayQueue<Vec<u8>>, mut chunk: Vec<u8>) {
     chunk.clear();
-    let mut pool = pool.lock().unwrap_or_else(|p| p.into_inner());
-    if pool.len() < CHUNK_POOL_CAP {
-        pool.push(chunk);
-    }
+    let _ = pool.push(chunk);
 }
 
 /// Hard limit on total KCP sessions. Prevents an attacker from exhausting
 /// server memory by sending UDP packets with random conv values.
 const MAX_SESSIONS: usize = 1024;
 
-/// Per-IP session limit. Prevents a single host from monopolizing the
-/// session table.
-const MAX_SESSIONS_PER_IP: usize = 64;
+// NOTE: a per-IP steady-state session cap was deliberately NOT kept
+// (formerly MAX_SESSIONS_PER_IP = 64). Two reasons:
+//   1. Same-NAT collateral DoS: UDP source IPs are shared by NAT, and one
+//      frpc legitimately holds multiple sessions (a control conn plus one
+//      KCP session per work conn). 64 sessions — a few loaded frpc behind
+//      one NAT — blocked ALL new sessions from that NAT, including control
+//      reconnects: a real availability regression vs Go (kcp-go has no
+//      per-IP limit).
+//   2. The cap defended nothing: UDP source IPs are spoofable, so per-IP
+//      accounting is trivially bypassed by attackers. The actual flood
+//      defenses are the global MAX_SESSIONS cap, the global + per-IP
+//      session-creation RATE limits (32/IP/10 s), the 24-byte minimum
+//      packet check, first-packet input() validation, and the 30 s
+//      unaccepted-session reaper — all retained.
 
 /// Maximum time a KCP session can exist without being accepted by the
 /// listener. Sessions that haven't been picked up within this window
@@ -132,8 +142,8 @@ pub(crate) struct KcpSocketHandle {
     /// poll_write pops a chunk (avoiding a fresh 32 KiB Vec + memcpy per
     /// bridge write); the driver returns chunks after the session's
     /// segmentation has copied the payload out. Bounded by CHUNK_POOL_CAP;
-    /// pops/pushes are mutex-serialized so a chunk is never in two hands.
-    pub chunk_pool: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// lock-free (`ArrayQueue`), so a chunk is never in two hands.
+    pub chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
 }
 
 pub(crate) struct KcpSocket {
@@ -143,9 +153,6 @@ pub(crate) struct KcpSocket {
     /// conv → peer addr index for O(1) write-path lookups.
     /// Avoids O(n) `iter().find()` on `sessions` in Data/Flush handlers.
     conv_index: HashMap<u32, SocketAddr>,
-    /// Per-IP session count for admission control (keyed by IpAddr, not
-    /// SocketAddr, so varying source port cannot bypass the per-IP limit).
-    peer_session_counts: HashMap<IpAddr, usize>,
     /// Session creation timestamps for sessions not yet accepted by the
     /// listener. Removed on accept (via accept_notify_rx) or on session
     /// removal (dead/error).
@@ -173,7 +180,7 @@ pub(crate) struct KcpSocket {
     /// Recycled write-chunk pool (see KcpSocketHandle::chunk_pool). The
     /// driver returns consumed chunks here after segmenting them into the
     /// session's send queue.
-    chunk_pool: Arc<Mutex<Vec<Vec<u8>>>>,
+    chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
     start: Instant,
     /// UDP packets that could not be sent immediately because the socket
     /// send buffer was full (try_send_to). Drained on the next tick — keeps
@@ -223,13 +230,12 @@ impl KcpSocket {
         let write_backlog = Arc::new(AtomicUsize::new(0));
         let write_notify = Arc::new(Notify::new());
         let alive_streams = Arc::new(AtomicUsize::new(0));
-        let chunk_pool = Arc::new(Mutex::new(Vec::with_capacity(CHUNK_POOL_CAP)));
+        let chunk_pool = Arc::new(ArrayQueue::new(CHUNK_POOL_CAP));
         let this = Self {
             socket,
             config,
             sessions: HashMap::new(),
             conv_index: HashMap::new(),
-            peer_session_counts: HashMap::new(),
             session_created_at: HashMap::new(),
             session_create_log: VecDeque::new(),
             ip_session_create_log: HashMap::new(),
@@ -346,13 +352,6 @@ impl KcpSocket {
                             }
                         }
                         self.session_created_at.remove(&key);
-                        let ip = key.1.ip();
-                        if let Some(count) = self.peer_session_counts.get_mut(&ip) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                self.peer_session_counts.remove(&ip);
-                            }
-                        }
                     }
                     // Trim per-IP session-creation logs and drop empty keys so
                     // a many-IP flood cannot accumulate map entries after their
@@ -392,8 +391,24 @@ impl KcpSocket {
                     // guaranteed to see the final count. Reading the counter
                     // first could observe a stale 0 while a concurrent
                     // KcpStream::new is mid-increment.
+                    //
+                    // Pending-work gates: the driver must not exit while
+                    // sessions still hold unsent/unacked segments, or while
+                    // WriteRequests handed off by a dropped stream sit
+                    // unprocessed in the write channel. `write_all` +
+                    // `shutdown` + stream drop completes in milliseconds —
+                    // long before the peer ACKs a full window — so
+                    // `alive_streams == 0` alone (the round-7 leak fix)
+                    // silently discarded trailing data: the session keeps
+                    // its 268 queued segments forever, the peer's ACKs are
+                    // never read, and the connection wedges. Once the stream
+                    // is gone no new writes can arrive (write_tx dropped
+                    // with it), so the write channel drains monotonically
+                    // and `is_empty()` is race-free here.
                     if self.register_rx.is_closed()
                         && self.alive_streams.load(Ordering::Acquire) == 0
+                        && self.write_rx.is_empty()
+                        && !self.sessions.values().any(|s| s.wait_snd() > 0)
                     {
                         tracing::debug!(
                             "KCP SOCKET: dial driver exiting (no live streams, register channel closed)"
@@ -415,8 +430,15 @@ impl KcpSocket {
                             // segmentation copies it into segments, so the
                             // chunk survives and is recycled into the pool
                             // below (M1: no fresh Vec alloc per bridge write).
+                            //
+                            // `send_chunked` splits by the window bound:
+                            // `send` rejects one buffer larger than the send
+                            // window (~176 KiB) with UserBufTooBig, which
+                            // would silently drop the payload after
+                            // poll_write already claimed it (write chunk >
+                            // one KCP window = data loss).
                             let _result = match addr.and_then(|a| self.sessions.get_mut(&(conv, a))) {
-                                Some(session) => session.send(&data),
+                                Some(session) => session.send_chunked(&data),
                                 None => Err(io::Error::new(
                                     io::ErrorKind::NotConnected,
                                     "session not found",
@@ -537,17 +559,17 @@ impl KcpSocket {
                                         continue;
                                     }
 
-                                    // Admission control — reject if global or per-IP
-                                    // limit is reached. Key by IpAddr (not SocketAddr)
-                                    // so varying source port cannot bypass per-IP cap.
+                                    // Admission control — reject if the global
+                                    // session limit is reached (see the note
+                                    // above the constants: the per-IP
+                                    // steady-state cap was removed — same-NAT
+                                    // collateral DoS, and spoofable source IPs
+                                    // make per-IP accounting useless against
+                                    // attackers; rate limits below are the
+                                    // flood defense).
                                     let ip = src.ip();
-                                    let ip_count = self.peer_session_counts.get(&ip).copied().unwrap_or(0);
                                     if self.sessions.len() >= MAX_SESSIONS {
                                         tracing::warn!(conv = key.0, peer = %src, total = self.sessions.len(), "KCP: session limit reached ({MAX_SESSIONS}), dropping new conv={}", key.0);
-                                        continue;
-                                    }
-                                    if ip_count >= MAX_SESSIONS_PER_IP {
-                                        tracing::warn!(conv = key.0, peer = %src, ip_sessions = ip_count, "KCP: per-IP session limit reached ({MAX_SESSIONS_PER_IP}), dropping new conv={}", key.0);
                                         continue;
                                     }
                                     // Session-creation RATE limiting (defense
@@ -637,19 +659,11 @@ impl KcpSocket {
                                         // silently dropping their FEC parity shards.
                                         self.sessions.remove(&key);
                                         self.conv_index.remove(&key.0);
-                                        let ip = key.1.ip();
-                                        if let Some(count) = self.peer_session_counts.get_mut(&ip) {
-                                            *count = count.saturating_sub(1);
-                                            if *count == 0 {
-                                                self.peer_session_counts.remove(&ip);
-                                            }
-                                        }
                                         continue;
                                     }
                                     self.conv_index.insert(key.0, key.1);
                                     self.peer_addr_index.insert(key.1, key.0);
                                     self.sessions.insert(key, session);
-                                    *self.peer_session_counts.entry(src.ip()).or_default() += 1;
                                     let now_ms = self.start.elapsed().as_millis() as u32;
                                     self.session_created_at.insert(key, now_ms);
                                     // Charge the rate counters only now that the
@@ -721,13 +735,6 @@ impl KcpSocket {
                 }
             }
             self.session_created_at.remove(&key);
-            let ip = key.1.ip();
-            if let Some(count) = self.peer_session_counts.get_mut(&ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.peer_session_counts.remove(&ip);
-                }
-            }
         }
     }
 
@@ -906,5 +913,36 @@ mod tests {
         // An in-range mtu is untouched.
         let default = KcpConfig::default();
         assert_eq!(default.clone().clamped().mtu, default.mtu);
+    }
+
+    /// Round-13: pin the chunk-pool contract — pooled reuse without
+    /// reallocation, the CHUNK_POOL_CAP bound on recycled chunks, and
+    /// min_capacity allocation when the pool is empty.
+    #[test]
+    fn chunk_pool_reuse_and_bounds() {
+        let pool = ArrayQueue::new(CHUNK_POOL_CAP);
+        // Empty pool: allocate with min_capacity.
+        let c = chunk_pool_pop(&pool, 4096);
+        assert!(c.capacity() >= 4096);
+        // Return then re-pop: same allocation reused, length cleared.
+        let cap = c.capacity();
+        chunk_pool_push(&pool, c);
+        let c2 = chunk_pool_pop(&pool, 4096);
+        assert_eq!(
+            c2.capacity(),
+            cap,
+            "pooled chunk must be reused without realloc"
+        );
+        assert!(c2.is_empty());
+        // Cap: returns beyond CHUNK_POOL_CAP are dropped.
+        chunk_pool_push(&pool, c2);
+        for _ in 0..CHUNK_POOL_CAP + 4 {
+            chunk_pool_push(&pool, vec![0u8; 1024]);
+        }
+        assert!(pool.len() <= CHUNK_POOL_CAP);
+        // Empty pool (drained): min_capacity takes effect.
+        while pool.pop().is_some() {}
+        let c3 = chunk_pool_pop(&pool, 8192);
+        assert!(c3.capacity() >= 8192);
     }
 }

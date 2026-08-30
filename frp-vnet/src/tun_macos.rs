@@ -11,6 +11,18 @@ use super::tun::TunDevice;
 const UTUN_CONTROL_NAME: &str = "com.apple.net.utun_control";
 const UTUN_OPT_IFNAME: i32 = 2;
 
+/// Select the utun AF header family byte for a raw IP packet:
+/// AF_INET (2) for IPv4, AF_INET6 (30 on macOS/BSD — not Linux's 10)
+/// for IPv6. Empty or unparseable buffers default to IPv4, matching the
+/// pre-fix hardcoded AF_INET behavior.
+fn write_family(buf: &[u8]) -> u8 {
+    if !buf.is_empty() && (buf[0] >> 4) == 6 {
+        30
+    } else {
+        2
+    }
+}
+
 /// macOS TUN device using utun via socket(SYSPROTO_CONTROL).
 ///
 /// On macOS, the kernel writes a 4-byte address-family header (AF_INET=2 in
@@ -322,10 +334,16 @@ impl AsyncWrite for MacOSTun {
 
             match guard.try_io(|fd| {
                 let fd = fd.as_raw_fd();
-                // Prepend the 4-byte AF header (AF_INET = 2 in network
-                // byte order) with a single writev: header and payload
-                // form one datagram without a per-packet heap allocation.
-                let header: [u8; 4] = [0, 0, 0, 2];
+                // Prepend the 4-byte AF header with a single writev: header
+                // and payload form one datagram without a per-packet heap
+                // allocation. The family is in network byte order and must
+                // match the packet: AF_INET (2) for IPv4, AF_INET6 (30 on
+                // macOS/BSD — not Linux's 10) for IPv6. Round 10 (MEDIUM):
+                // the old code hardcoded AF_INET, so every IPv6 packet was
+                // tagged IPv4 and dropped by the kernel — macOS vnet IPv6
+                // TX was broken (RX stripping below is unaffected).
+                let family = write_family(buf);
+                let header: [u8; 4] = [0, 0, 0, family];
                 let iovs = [
                     libc::iovec {
                         iov_base: header.as_ptr() as *mut libc::c_void,
@@ -378,5 +396,22 @@ impl AsyncWrite for MacOSTun {
     }
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_family;
+
+    #[test]
+    fn af_family_header_selection() {
+        // IPv4 packet (version nibble 4) → AF_INET (2).
+        assert_eq!(write_family(&[0x45, 0x00, 0x00, 0x14]), 2);
+        // IPv6 packet (version nibble 6) → AF_INET6 (30 on macOS/BSD).
+        assert_eq!(write_family(&[0x60, 0x00, 0x00, 0x00]), 30);
+        // Empty buffer → IPv4 default (hardcoded pre-fix behavior).
+        assert_eq!(write_family(&[]), 2);
+        // Unknown version nibble → IPv4 default.
+        assert_eq!(write_family(&[0x50, 0x00]), 2);
     }
 }

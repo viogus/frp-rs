@@ -20,4 +20,12 @@ pub trait ControlSink: Send + Sync {
     /// accepted by the writer funnel; `Err` when the writer has failed or
     /// the bounded queue is full.
     fn send_msg(&self, msg: FrpMessage, v2: bool) -> Result<(), String>;
+
+    /// Whether the underlying writer task has failed (control connection
+    /// dead). Distinguishes a transient `send_msg` error (channel full,
+    /// recoverable — drop the packet) from a terminal one (writer failed,
+    /// the control connection is gone — teardown time).
+    fn is_failed(&self) -> bool {
+        false
+    }
 }

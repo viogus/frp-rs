@@ -65,9 +65,17 @@ COPY frpc/ frpc/
 
 # Use -p <package> to avoid building frp-vnet workspace member on tiny/micro,
 # which would force-enable frp-core/vnet via feature unification.
+# NOTE: no `|| true` on this RUN — a bare `a && b && c || true` would mask a
+# zigbuild/cp failure, exit 0 with no /usr/bin/frp, and surface only later as
+# a confusing `COPY ... not found` in the runtime stage.
 RUN cargo zigbuild -p ${FRP_COMPONENT%-*} --target $(cat /tmp/rust_target) --release ${FRP_FEATURES} && \
-    cp target/$(cat /tmp/rust_target)/release/${FRP_COMPONENT} /usr/bin/frp && \
-    strip /usr/bin/frp || true
+    cp target/$(cat /tmp/rust_target)/release/${FRP_COMPONENT} /usr/bin/frp
+
+# Best-effort strip. GNU strip cannot parse zig-produced binaries
+# ("Unable to recognise the format"), and zig already strips in release mode,
+# so this RUN may fail — but it must never mask a zigbuild/cp failure, which
+# is why it lives in its own RUN instead of sharing the && chain above.
+RUN strip /usr/bin/frp || true
 
 # Cross-compile the C entrypoint — fully static (musl, no libc dep)
 COPY docker/entrypoint.c /tmp/entrypoint.c

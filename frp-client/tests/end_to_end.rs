@@ -354,6 +354,94 @@ async fn test_e2e_tcp_proxy_over_tls() {
     assert_eq!(&buf, payload, "echo through TLS tunnel should match");
 }
 
+/// Deterministic pseudo-random bytes (xorshift64, platform-independent) —
+/// exercises the bridge with incompressible data without a rand dev-dep.
+fn pseudo_random_bytes(len: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// End-to-end volume test: encrypted + compressed tunnel (AES-128-CFB +
+/// Snappy), 2 MiB byte-exact round-trip. The harness hardcodes
+/// `use_compression: false` in its other constructors, so this exercises the
+/// only path that combines both transforms on the data plane — a regression
+/// in either (e.g. the snappy streaming bridge or the CFB framing) shows up
+/// as a mismatch or truncation at the far end.
+#[tokio::test]
+async fn test_e2e_tcp_proxy_encrypted_compressed_volume() {
+    let harness = TestHarness::new_compressed(true, true, "e2e-enc-comp-token").await;
+
+    let proxy_addr = format!("127.0.0.1:{}", harness.proxy_port);
+    let mut stream = tokio::net::TcpStream::connect(&proxy_addr)
+        .await
+        .expect("connect to proxy port");
+
+    let payload = pseudo_random_bytes(2 * 1024 * 1024);
+    stream.write_all(&payload).await.expect("write volume");
+    stream.flush().await.expect("flush");
+
+    // Read the echo back in 64 KiB slices (partial-frame boundaries through
+    // the CipherStream are exercised too; a single read_exact would not).
+    let mut got = Vec::with_capacity(payload.len());
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = stream.read(&mut buf).await.expect("read echo");
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+        if got.len() >= payload.len() {
+            break;
+        }
+    }
+    assert_eq!(
+        got.len(),
+        payload.len(),
+        "full 2 MiB payload must be echoed"
+    );
+    assert_eq!(
+        got, payload,
+        "2 MiB echo through encrypted+compressed tunnel must be byte-exact"
+    );
+}
+
+/// End-to-end half-close test: encrypted + compressed tunnel. The client
+/// sends a payload, shuts down its write half, and reads to EOF — the
+/// bridge must propagate the half-close through the tunnel to the echo
+/// server (round-8 half-close EOF handling), which then echoes everything
+/// back and closes. A bridge that never propagates the shutdown leaves the
+/// read_to_end hanging (caught by the 20s timeout).
+#[tokio::test]
+async fn test_e2e_tcp_proxy_encrypted_compressed_half_close() {
+    let harness = TestHarness::new_compressed(true, true, "e2e-enc-comp-hc-token").await;
+
+    let proxy_addr = format!("127.0.0.1:{}", harness.proxy_port);
+    let mut stream = tokio::net::TcpStream::connect(&proxy_addr)
+        .await
+        .expect("connect to proxy port");
+
+    let payload = pseudo_random_bytes(512 * 1024);
+    stream.write_all(&payload).await.expect("write payload");
+    stream.flush().await.expect("flush");
+    stream.shutdown().await.expect("shutdown write half");
+
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut got))
+        .await
+        .expect("read_to_end must finish — EOF was not propagated through the bridge")
+        .expect("read echo to EOF");
+
+    assert_eq!(got, payload, "half-close echo must be byte-exact");
+}
+
 /// End-to-end test: TCP proxy over yamux (tcpMux).
 ///
 /// Server wraps TCP in yamux. Client wraps TCP in yamux. All control

@@ -843,6 +843,134 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// Half-close through the plain bridge (the classic frp data-loss bug
+    /// shape): the user shuts down its write half — NOT a drop — so the
+    /// work side must first drain the payload, then observe EOF; and the
+    /// work→user direction must keep delivering afterwards.
+    #[tokio::test]
+    async fn test_bridge_plain_half_close() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);
+        let (mut w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(65536);
+
+        let handle = tokio::spawn(async move {
+            bridge_plain(
+                u_r_bridge,
+                u_w_bridge,
+                w_r_bridge,
+                w_w_bridge,
+                false,
+                vec![],
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // User → Work: write the payload, then half-close the write side.
+        u_w_test.write_all(b"user->work half-close").await.unwrap();
+        u_w_test.flush().await.unwrap();
+        u_w_test.shutdown().await.unwrap();
+
+        // Work side must see the payload ...
+        let mut buf = vec![0u8; 1024];
+        let n = w_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"user->work half-close");
+        // ... and then EOF: the bridge must propagate the half-close.
+        let n2 = w_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(
+            n2, 0,
+            "user→work EOF must propagate through the plain bridge"
+        );
+
+        // Work → User must still deliver after the user half-closed.
+        w_w_test
+            .write_all(b"work->user after half-close")
+            .await
+            .unwrap();
+        w_w_test.flush().await.unwrap();
+        let n3 = u_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n3], b"work->user after half-close");
+
+        // Close the work→user direction too so the spawned bridge task
+        // (join! of both halves) can exit.
+        drop(w_w_test);
+        handle.await.unwrap();
+    }
+
+    /// Half-close through the encrypted bridge with byte-exact verification.
+    ///
+    /// Asymmetry note: on the encrypted bridge the user→work direction
+    /// arrives at the work side as ciphertext (the bridge wraps its writer
+    /// in a `CipherWriter`), so the work side must decrypt with a
+    /// `CipherReader` before asserting; conversely the work→user direction
+    /// is decrypted by the bridge's internal `CipherReader`, so the test
+    /// side must write CIPHERTEXT (through a `CipherWriter`), not
+    /// plaintext.
+    #[tokio::test]
+    async fn test_encrypted_bridge_half_close() {
+        let key = crate::encryption::derive_key("half_close_enc_key_7");
+
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, w_r_test) = tokio::io::duplex(65536);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(65536);
+
+        let handle = tokio::spawn(async move {
+            bridge_encrypted(
+                u_r_bridge,
+                u_w_bridge,
+                w_r_bridge,
+                w_w_bridge,
+                &key,
+                false,
+                vec![],
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await;
+        });
+
+        // User → Work: plaintext in, half-close the write side (NOT a drop).
+        u_w_test.write_all(b"encrypted user->work").await.unwrap();
+        u_w_test.flush().await.unwrap();
+        u_w_test.shutdown().await.unwrap();
+
+        // Work side: decrypt the ciphertext (CipherReader consumes the IV
+        // written by the bridge's CipherWriter) and verify byte-exactness.
+        let mut dec = CipherReader::new(w_r_test, key);
+        let mut buf = vec![0u8; 1024];
+        let n = dec.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"encrypted user->work");
+        // The half-close must propagate as EOF through the encrypted
+        // user→work direction.
+        let n2 = dec.read(&mut buf).await.unwrap();
+        assert_eq!(
+            n2, 0,
+            "user→work EOF must propagate through the encrypted bridge"
+        );
+
+        // Work → User: encrypt on the test side; the bridge decrypts and
+        // delivers plaintext to the user side.
+        let mut enc_w_w_test = CipherWriter::new(w_w_test, key);
+        enc_w_w_test
+            .write_all(b"encrypted work->user")
+            .await
+            .unwrap();
+        enc_w_w_test.flush().await.unwrap();
+        let n3 = u_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n3], b"encrypted work->user");
+
+        // Drop the CipherWriter to close the work→user direction, letting
+        // the bridge's work_to_user half see EOF and the task exit.
+        drop(enc_w_w_test);
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn bridge_plain_batches_flushes_on_full_reads() {
         use std::pin::Pin;

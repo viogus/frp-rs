@@ -43,7 +43,10 @@ jobs:
   tests:
     name: Tests (lib + integration + dashboard)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 1505 tests with `-j 1` serial integration suites runs ~24.5 min on a
+    # cold runner (measured 2026-08-30: 24m39s green run) — 25 left no
+    # headroom and cancelled the job at the limit twice in one day.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
@@ -58,6 +61,16 @@ jobs:
         run: rustup default stable
       - name: Run all-features lib tests (QUIC admission and feature combos)
         run: cargo test --workspace --all-features --lib
+      - name: Run vnet unit tests (nathole membership/cap guards)
+        # frps/frpc default features exclude `vnet`, so the default-feature
+        # `cargo test --workspace` steps never compile the nathole.rs vnet
+        # tests (round-14 HIGH: default-net membership guard, proxy-less
+        # host-route admission, 64-route cap). The all-features lib step
+        # above covers them only incidentally; pin `--features vnet`
+        # explicitly so a future default/all-features change cannot
+        # silently drop the gate. --lib: the vnet-gated tests are unit
+        # tests in nathole.rs (no vnet-gated integration bins exist).
+        run: cargo test -p frp-server --features vnet --lib
       - name: Build binaries (needed for integration tests)
         run: cargo build --bin frps --bin frpc
       - name: Build frps with dashboard feature (for dashboard integration tests)

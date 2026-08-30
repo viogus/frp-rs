@@ -32,9 +32,9 @@ use super::pool::PendingRequest;
 fn build_start_work_conn(
     req: &PendingRequest,
     src_addr: &str,
-    src_port: i32,
+    src_port: u16,
     dst_addr: &str,
-    dst_port: i32,
+    dst_port: u16,
 ) -> FrpMessage {
     FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
@@ -1552,7 +1552,7 @@ pub(crate) async fn assign_work_to_proxy(
         .user_conn
         .try_tcp()
         .and_then(|s| s.peer_addr().ok())
-        .map(|a| (a.ip().to_string(), a.port() as i32))
+        .map(|a| (a.ip().to_string(), a.port()))
         .unwrap_or_default();
 
     // Proxy metadata is carried in the request (fetched once by the
@@ -1572,11 +1572,7 @@ pub(crate) async fn assign_work_to_proxy(
         .as_ref()
         .and_then(|p| p.local_addr.clone())
         .unwrap_or_default();
-    let dst_port = proxy_info
-        .as_ref()
-        .and_then(|p| p.remote_port)
-        .map(|p| p as i32)
-        .unwrap_or(0);
+    let dst_port = proxy_info.as_ref().and_then(|p| p.remote_port).unwrap_or(0);
 
     let swc = build_start_work_conn(&req, &src_addr, src_port, &dst_addr, dst_port);
 
