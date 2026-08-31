@@ -601,8 +601,15 @@ impl<Output> Kcp<Output> {
             match sn.cmp(&self.snd_buf[i].sn) {
                 cmp::Ordering::Equal => {
                     // frp-rs patch: recycle the ACKed segment's payload (F3).
-                    let seg = self.snd_buf.remove(i).expect("index found by loop");
-                    self.recycle_segment_data(seg);
+                    // `i` was found by the loop, so `i < snd_buf.len()` is a
+                    // loop invariant — a panic here is unreachable (round-18
+                    // review: expect → debug_assert; the cost of a wrong
+                    // guess is a skipped recycle, not a crash). The slot is
+                    // an `Option` (kcp-go's sparse send buffer), but the
+                    // matching segment at `i` is by definition `Some`.
+                    debug_assert!(i < self.snd_buf.len());
+                    let seg = self.snd_buf.remove(i);
+                    self.recycle_segment_data(seg.expect("ACKed segment must be Some"));
                     break;
                 }
                 cmp::Ordering::Less => break,

@@ -6,12 +6,14 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 
@@ -32,6 +34,63 @@ use crate::state::{AppState, ControlTx, InternalMsg, PoolStats, ReplayCheck};
 use super::pool::{PendingRequest, PoolEntry, WORK_POOL_ABS_CEILING, WORK_POOL_EXTRA};
 use super::proxy_ops::{err_msg, unregister_control};
 use super::{write_ctl_msg, ControlContext, ControlState};
+
+/// Counts raw wire bytes consumed from the underlying stream — CFB IV,
+/// AEAD frame headers, ciphertext: everything read before any decryption.
+///
+/// Fed to the control-loop stall reaper (S1, round-17 security review): the
+/// reaper's `ProgressRead` sits ABOVE the cipher and only sees decrypted
+/// bytes, so a peer that sends exactly the 16-byte CFB IV and then goes
+/// silent (while ponging yamux keepalives to keep the session alive)
+/// delivers zero decrypted bytes — `mark_progress` would never fire and the
+/// task + fd + conn_semaphore permit + run_id registration would stay pinned
+/// forever (~512 such connections exhaust every permit). Wrapping the raw
+/// stream below the cipher makes the IV (and AEAD frame headers) count as
+/// "a frame has started", so the fixed-anchor reap arm closes the stall.
+/// Pure wire counting — semantics of the anchor (first byte of the frame,
+/// not a per-byte extension) are unchanged.
+struct CountingIoStream<S> {
+    inner: S,
+    raw: Arc<AtomicU64>,
+}
+
+impl<S> CountingIoStream<S> {
+    fn new(inner: S, raw: Arc<AtomicU64>) -> Self {
+        Self { inner, raw }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingIoStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let filled_before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let consumed = buf.filled().len() - filled_before;
+        if consumed > 0 {
+            self.raw.fetch_add(consumed as u64, Ordering::Relaxed);
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIoStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 /// Identity used for authorization decisions.
 ///
@@ -498,9 +557,13 @@ pub(crate) async fn authenticate(
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
         Option<IncomingStreams>,
+        Arc<AtomicU64>,
     ),
     (),
 > {
+    // Raw wire-byte counter (S1): wrapped below the cipher in both
+    // encryption branches so the stall reaper sees IV/frame-header bytes.
+    let raw = Arc::new(AtomicU64::new(0));
     // Login throttle: FAIL-ONLY rate limiting (deliberate frp-rs hardening
     // — Go frp v0.71.0 has no login throttle).
     // `check_login_throttle` is invoked on authentication failure below and
@@ -1096,7 +1159,7 @@ pub(crate) async fn authenticate(
                 // Server reads from client → client_to_server (= read_key).
                 // Server writes to client → server_to_client (= write_key).
                 match frp_core::crypto::AeadStream::new(
-                    stream,
+                    Box::new(CountingIoStream::new(stream, raw.clone())),
                     ctx.algorithm,
                     &read_key,
                     &write_key,
@@ -1137,7 +1200,10 @@ pub(crate) async fn authenticate(
         // integrity protection).
         info!(peer = ?peer, run_id = %run_id, "Wrapping control stream in CipherStream (AES-128-CFB)");
         let enc_key = encryption::derive_key(&reloadable.auth_cfg.token);
-        let cipher = frp_core::cipher_stream::CipherStream::new(stream, enc_key);
+        let cipher = frp_core::cipher_stream::CipherStream::new(
+            CountingIoStream::new(stream, raw.clone()),
+            enc_key,
+        );
         // ReqWorkConn pre-warming is done AFTER the if/else block below,
         // so BOTH V1 and V2+AEAD paths benefit from pre-warmed work conns.
         let (r, w) = tokio::io::split(cipher);
@@ -1228,6 +1294,7 @@ pub(crate) async fn authenticate(
         reader,
         writer,
         incoming,
+        raw,
     ))
 }
 #[cfg(test)]

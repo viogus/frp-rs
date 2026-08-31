@@ -337,7 +337,9 @@ struct Active<T> {
     /// returned by `frame::Io` once the frame is fully written; read bodies
     /// are drawn at ReadState::Body init and returned once the chunk is
     /// fully consumed in `Stream::poll_read`. Removes the per-chunk `Vec`
-    /// allocation + zero-fill in both directions.
+    /// allocation in both directions, and the read side's `vec![0; len]`
+    /// zero-fill as well (the send side never zero-filled — it wrote the
+    /// payload bytes directly).
     body_pool: Arc<ArrayQueue<Vec<u8>>>,
     /// frp-rs patch: exact count of outbound streams still awaiting
     /// acknowledgment, replacing the O(N) `ack_backlog()` scan (which locked

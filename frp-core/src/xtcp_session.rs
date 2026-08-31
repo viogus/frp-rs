@@ -1224,4 +1224,57 @@ mod tests {
         session.close().await;
         assert!(!session.is_alive(), "close must mark the session dead");
     }
+
+    /// Round-18-review C-3 (production-boundary pin): the test above runs
+    /// at CAP=4 — the mechanism — but production runs at
+    /// MAX_TUNNEL_STREAMS=256, where yamux-rs's own ACK backlog is ALSO 256
+    /// (the duplex peer never reads, so every open's SYN sits un-ACKed).
+    /// CAP=4 deliberately stays below that collision; this pin runs the cap
+    /// at its production value to prove the 257th open is still refused by
+    /// the caller-side mirror (no ACK dependency) and the session survives
+    /// — no yamux TooManyStreams cleanup at the real boundary, and a freed
+    /// slot re-opens there too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tunnel_driver_cap_at_production_boundary_refuses_and_survives() {
+        let (driver_io, _peer_io) = tokio::io::duplex(65536);
+        let mut cfg = yamux::Config::default();
+        cfg.set_max_num_streams(MAX_TUNNEL_STREAMS);
+        let conn = yamux::Connection::new(driver_io.compat(), cfg, yamux::Mode::Client);
+        let session = spawn_tunnel_driver(
+            conn,
+            false,
+            MAX_TUNNEL_STREAMS,
+            10,
+            Arc::new(AtomicU64::new(now_epoch_ms())),
+        );
+
+        let mut streams: Vec<Box<dyn P2pStream>> = Vec::with_capacity(MAX_TUNNEL_STREAMS);
+        for i in 0..MAX_TUNNEL_STREAMS {
+            let s = session
+                .open_stream(Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|e| panic!("open #{i} refused below the cap: {e}"));
+            streams.push(s);
+        }
+
+        let err = expect_open_error(&session, "open past the production cap must fail").await;
+        assert!(err.contains("cap"), "unexpected error: {err}");
+        assert!(
+            session.is_alive(),
+            "session must survive the cap hit at the 256 boundary"
+        );
+
+        drop(streams.pop().expect("held stream"));
+        let s = session
+            .open_stream(Duration::from_secs(2))
+            .await
+            .expect("open after a slot frees at the 256 boundary");
+        streams.push(s);
+
+        let err = expect_open_error(&session, "open past the re-engaged cap must fail").await;
+        assert!(err.contains("cap"), "unexpected error: {err}");
+        assert!(session.is_alive(), "session must survive repeated cap hits");
+
+        session.close().await;
+    }
 }

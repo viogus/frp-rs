@@ -374,14 +374,17 @@ pub(crate) fn valid_cidr(subnet: &str) -> bool {
             }
             // Reject the default-route hijack prefix: `0.0.0.0/0` / `::/0`
             // (`ip route add ... dev tun`) would redirect the ENTIRE
-            // outbound traffic into the TUN. Also reject ANY `/1` — every
-            // /1 covers the default-route half once the route table masks
-            // the base, so non-canonical spellings (`10.0.0.0/1`,
-            // zero-padded IPv6) are just as much a hijack (round-17 review
-            // MEDIUM). A /2+/3+ is still a wide route but not a full
-            // default-route hijack — the server independently refuses these
-            // (nathole.rs `is_route_hijack_prefix`); this is defense-in-depth.
-            let hijack = len <= 1;
+            // outbound traffic into the TUN. Also reject ANY prefix
+            // ≤ `/6` — every /1 covers the default-route half once the
+            // route table masks the base (`10.0.0.0/1` ≡ `0.0.0.0/1`,
+            // round-17 review MEDIUM), and the 64-route per-client cap
+            // means 64 × /6 covers the entire family (2^32 v4 / 2^128 v6,
+            // round-18 review) — a full default-route hijack within the
+            // cap. Legitimate vnet routes (RFC1918 /8-/12, ULA /8) are
+            // all ≥ `/8`. Mirrors nathole.rs `is_route_hijack_prefix`
+            // (defense-in-depth; the server's membership guard is the
+            // primary gate).
+            let hijack = len <= 6;
             !hijack
         }
         None => subnet.parse::<std::net::IpAddr>().is_ok(),
@@ -466,6 +469,17 @@ mod tests {
         assert!(!valid_cidr("10.0.0.0/1"));
         assert!(!valid_cidr("200.0.0.0/1"));
         assert!(!valid_cidr("8000:0000:0000:0000:0000:0000:0000:0000/1"));
+        // Prefixes ≤ /6 are full-family hijacks within the 64-route
+        // per-client cap: 64 × /6 = 2^32 (v4) / 2^128 (v6) (round-18
+        // review). Non-canonical bases included.
+        assert!(!valid_cidr("10.0.0.0/2"));
+        assert!(!valid_cidr("0.0.0.0/6"));
+        assert!(!valid_cidr("128.0.0.0/6"));
+        assert!(!valid_cidr("::/6"));
+        assert!(!valid_cidr("8000::/6"));
+        // /7 is above the family-coverage threshold — boundary pinned
+        // intentionally (no legitimate vnet route is a /7 either).
+        assert!(valid_cidr("10.0.0.0/7"));
     }
 
     #[test]

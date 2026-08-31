@@ -1946,6 +1946,11 @@ impl Service {
     /// Re-reads the TOML config and applies safe-to-reload settings
     /// (allow_ports, auth token, encryption key, TLS certificates).
     /// Returns a summary of changes, or an error if the config cannot be read.
+    ///
+    /// NOT reloadable — restart-only (checked once in `AppState::new`, never
+    /// re-applied here): `max_ports_per_client`, `max_conns_per_proxy`,
+    /// `max_proxies_per_client`. They gate live registrations via their
+    /// semaphores/maps, so a reload cannot retroactively rescale them.
     pub async fn reload(&self) -> Result<String, String> {
         let config_path = match &self.config_file {
             Some(p) => p.clone(),

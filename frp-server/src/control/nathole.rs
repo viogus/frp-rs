@@ -985,8 +985,14 @@ fn is_route_hijack_prefix(subnet: &str) -> bool {
     // the identical network once the route table masks it (`10.0.0.0/1`
     // ≡ `0.0.0.0/1`, `200.0.0.0/1` ≡ `128.0.0.0/1`, zero-padded IPv6 ≡
     // `::/1`), so the pole-string check was bypassable (round-17 review,
-    // both finders). No legitimate vnet route is a /1.
-    len <= 1
+    // both finders). The per-client cap of 64 routes bounds how many
+    // prefixes one peer can install — and 64 × `/6` covers exactly
+    // 2^32 (v4) / 2^128 (v6), the ENTIRE address family — so any prefix
+    // ≤ `/6` is a full default-route-equivalent hijack within the cap
+    // (round-18 review; `10.0.0.0/2` in the old test was itself such a
+    // 2^30-coverage attack). Legitimate vnet routes (RFC1918 /8-/12,
+    // ULA /8) are all ≥ `/8`.
+    len <= 6
 }
 
 #[cfg(feature = "vnet")]
@@ -2107,7 +2113,31 @@ mod vnet_route_tests {
         assert!(crate::control::nathole::is_route_hijack_prefix(
             "8000:0000:0000:0000:0000:0000:0000:0000/1"
         ));
+        // Prefixes ≤ /6 are full-family hijacks within the 64-route
+        // per-client cap: 64 × /6 = 2^32 (v4) / 2^128 (v6) (round-18
+        // review). Non-canonical bases included.
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "10.0.0.0/2"
+        ));
+        assert!(crate::control::nathole::is_route_hijack_prefix("0.0.0.0/6"));
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "128.0.0.0/6"
+        ));
+        assert!(crate::control::nathole::is_route_hijack_prefix("::/6"));
+        assert!(crate::control::nathole::is_route_hijack_prefix("8000::/6"));
+        // /7 is above the family-coverage threshold, but still no
+        // legitimate vnet route needs one — the boundary is pinned so a
+        // future relaxer sees it is intentional.
+        assert!(!crate::control::nathole::is_route_hijack_prefix(
+            "0.0.0.0/7"
+        ));
         // Legitimate vnet routes are NOT hijack prefixes.
+        assert!(!crate::control::nathole::is_route_hijack_prefix(
+            "10.0.0.0/8"
+        ));
+        assert!(!crate::control::nathole::is_route_hijack_prefix(
+            "172.16.0.0/12"
+        ));
         assert!(!crate::control::nathole::is_route_hijack_prefix(
             "10.0.0.0/24"
         ));
@@ -2115,8 +2145,5 @@ mod vnet_route_tests {
             "100.86.0.1/32"
         ));
         assert!(!crate::control::nathole::is_route_hijack_prefix("fd00::/8"));
-        assert!(!crate::control::nathole::is_route_hijack_prefix(
-            "10.0.0.0/2"
-        ));
     }
 }

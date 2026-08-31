@@ -1112,6 +1112,150 @@ mod tests {
         assert!(result.is_err(), "oversized payload should error");
     }
 
+    /// Round-18-review C-1 (writev partial-progress accounting): the
+    /// writev loop's `hdr_off`/`payload_off` bookkeeping has no dedicated
+    /// coverage. A transport that accepts only a few bytes per poll must
+    /// still produce the exact wire frame — header bytes first, payload
+    /// after, no skips or repeats — and terminate. Also pins the n == 0
+    /// guard: a transport returning 0 for a non-empty buffer must produce
+    /// a hard error, not an infinite loop.
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    struct TrickleWriter {
+        inner: tokio::io::DuplexStream,
+        max_per_call: usize,
+        writes: usize,
+    }
+
+    impl tokio::io::AsyncWrite for TrickleWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            let n = buf.len().min(self.max_per_call);
+            Pin::new(&mut self.inner).poll_write(cx, &buf[..n])
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            // Accept at most `max_per_call` bytes across the vectored
+            // buffers, in order — a hostile/odd transport may satisfy
+            // only part of a writev(2).
+            let mut stack = [0u8; 64];
+            let mut total = 0usize;
+            for b in bufs {
+                if total >= self.max_per_call {
+                    break;
+                }
+                let take = b.len().min(self.max_per_call - total);
+                stack[total..total + take].copy_from_slice(&b[..take]);
+                total += take;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, &stack[..total])
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_v1_frame_partial_progress_vectored() {
+        let (writer, mut server) = duplex(4096);
+        let msg = FrpMessage::Ping(msg::Ping {
+            privilege_key: None,
+            timestamp: None,
+        });
+        let mut trickle = TrickleWriter {
+            inner: writer,
+            max_per_call: 2,
+            writes: 0,
+        };
+        write_v1_frame(&mut trickle, &msg)
+            .await
+            .expect("partial-progress write must complete");
+        let writes = trickle.writes;
+        // Close the write half so `read_to_end` sees EOF (a live duplex
+        // write half never signals EOF — read_to_end would hang).
+        drop(trickle);
+
+        // Expected wire bytes: type byte + 8-byte BE length + JSON payload.
+        let payload = serde_json::to_vec(&msg).unwrap();
+        let mut expected = Vec::with_capacity(9 + payload.len());
+        expected.push(msg.v1_type_byte());
+        expected.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        expected.extend_from_slice(&payload);
+
+        let mut got = Vec::new();
+        server.read_to_end(&mut got).await.expect("read back");
+        assert_eq!(got, expected, "partial-write frame must be byte-exact");
+        assert!(
+            writes >= 2,
+            "partial-progress transport must need multiple polls (saw {writes})"
+        );
+    }
+
+    /// A transport whose writes consume nothing: the writev loop must bail
+    /// out with an error instead of spinning forever. The duplex is held
+    /// (never read) only as a concrete `AsyncWrite` carrier.
+    #[allow(dead_code)] // held for its type only, never read
+    struct ZeroWriter(tokio::io::DuplexStream);
+
+    impl tokio::io::AsyncWrite for ZeroWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_v1_frame_zero_write_errors() {
+        let (writer, _reader) = duplex(1024);
+        let msg = FrpMessage::Ping(msg::Ping {
+            privilege_key: None,
+            timestamp: None,
+        });
+        let err = write_v1_frame(&mut ZeroWriter(writer), &msg).await;
+        assert!(
+            err.is_err(),
+            "zero-length write must error out, not loop forever"
+        );
+    }
+
     #[tokio::test]
     async fn test_v1_frame_invalid_length() {
         let (mut client, mut server) = duplex(1024);

@@ -109,9 +109,18 @@ impl StallState {
 /// in-flight frame has consumed any bytes. A read that returns Pending after
 /// consuming bytes is mid-frame (trickle/stalled body); a read that never
 /// consumes anything is indistinguishable from a heartbeat-disabled client.
+///
+/// Progress counts BOTH decrypted bytes delivered to the caller AND raw
+/// wire bytes consumed below the cipher (via `raw`, the `CountingIoStream`
+/// counter from `login::authenticate`): a peer that sends exactly the
+/// 16-byte CFB IV (or an AEAD frame header) then goes silent has started a
+/// frame — the stall reaper must see it (S1).
 struct ProgressRead<'a, R> {
     inner: &'a mut R,
     stall: &'a StallState,
+    /// Raw wire-byte counter (below the cipher): IV / AEAD frame headers /
+    /// ciphertext bytes consumed from the underlying stream.
+    raw: &'a AtomicU64,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<'_, R> {
@@ -120,9 +129,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<'_, R> {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        let raw_before = self.raw.load(Ordering::Relaxed);
         let filled_before = buf.filled().len();
         let res = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if buf.filled().len() > filled_before {
+        if buf.filled().len() > filled_before || self.raw.load(Ordering::Relaxed) > raw_before {
             self.stall.mark_progress();
         }
         res
@@ -350,7 +360,7 @@ async fn handle_control_inner<S>(
     // monomorphization (saves ~30KB per copy in release binary).
     let stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin> = Box::new(stream);
     // 1. Authenticate and set up per-client state (login.rs)
-    let (mut ctx, mut ctl, _internal_tx, mut internal_rx, reader, mut writer, mut incoming) =
+    let (mut ctx, mut ctl, _internal_tx, mut internal_rx, reader, mut writer, mut incoming, raw) =
         match login::authenticate(
             stream,
             &login,
@@ -500,11 +510,13 @@ async fn handle_control_inner<S>(
             stall.reset();
             let reader = reader.clone();
             let stall_clone = stall.clone();
+            let raw_clone = raw.clone();
             pending_read = Some(Box::pin(async move {
                 let mut guard = reader.lock().await;
                 let mut progress = ProgressRead {
                     inner: &mut *guard,
                     stall: &stall_clone,
+                    raw: &raw_clone,
                 };
                 read_ctl_msg(&mut progress, v2).await
             }));
@@ -1358,6 +1370,218 @@ mod idle_reap_tests {
         assert!(
             control_task.is_finished(),
             "mid-frame stall must be reaped at CONTROL_IDLE_TIMEOUT"
+        );
+        control_task.await.expect("control task exits");
+    }
+
+    /// Round-17-review residual (S1, MEDIUM, security review round 3): an
+    /// authenticated client that sends EXACTLY the 16-byte CFB IV and then
+    /// goes silent (ponging yamux keepalive so the session survives) delivers
+    /// ZERO decrypted bytes — a `ProgressRead` counting only decrypted bytes
+    /// never fires `mark_progress`, the reap arm parks on `notified()` with no
+    /// stall recorded, and task + fd + conn_semaphore permit + run_id
+    /// registration stay pinned forever. ~512 such connections exhaust every
+    /// permit ("Max connections reached") — the exact HIGH this arm was built
+    /// to close, bypassed by the 16-byte IV. RED on the decrypted-bytes-only
+    /// progress site: the raw-wire counter (CountingIoStream, below the
+    /// cipher) must count the IV as progress.
+    #[tokio::test(start_paused = true)]
+    async fn iv_only_stall_is_reaped_when_heartbeat_disabled() {
+        let mut state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        Arc::get_mut(&mut state)
+            .expect("sole state ref")
+            .heartbeat_timeout = 0; // disabled; exercises the stall arm (<=0 guard)
+
+        let (server, mut client) = tokio::io::duplex(1024);
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("iv-test-run".into()),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("test-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        let state_clone = state.clone();
+        let control_task = tokio::spawn(handle_control(
+            server,
+            login,
+            state_clone,
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+        ));
+
+        // Login handshake completes (real duplex I/O).
+        let error = read_login_resp_error(&mut client).await;
+        assert!(error.is_empty(), "login failed: {error}");
+
+        // The peer's first post-login write is exactly the 16-byte CFB IV —
+        // consumed into `CipherStream.iv_buf`, never visible as decrypted
+        // bytes. Then silence. A decrypted-bytes-only progress counter never
+        // marks the stall; the raw-wire counter must.
+        use tokio::io::AsyncWriteExt;
+        client.write_all(&[0u8; 16]).await.expect("write IV only");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONTROL_IDLE_TIMEOUT + Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            control_task.is_finished(),
+            "IV-only stall must be reaped at CONTROL_IDLE_TIMEOUT"
+        );
+        control_task.await.expect("control task exits");
+    }
+
+    /// Round-18-review C-2 regression pin (green): a mid-frame completion
+    /// must reset the stall timer. Sequence: partial frame (stall recorded,
+    /// reap arm armed at the FIRST stall start) → frame completed (the read
+    /// arm calls `stall.reset()` — a stale deadline surviving the reset
+    /// would reap this connection at the first stall's deadline despite the
+    /// healthy completion: a false positive disconnecting any client that
+    /// ever trickled a frame slowly). The conn must survive past that
+    /// deadline. Then a SECOND partial frame re-arms the stall from a fresh
+    /// start and IS reaped at the new deadline — both halves of the arm's
+    /// contract in one test.
+    ///
+    /// The client writes through a real `CipherWriter` (same
+    /// `derive_key("test-token")` as the server's `authenticate` wrap), so
+    /// the completed frame is legitimate ciphertext the server can parse:
+    /// an unauthenticated `Ping` (no `HeartBeats` scope in test_state) is
+    /// answered with a Pong and the control stays up — the 4 partial
+    /// plaintext bytes before it are decrypted as the start of the frame
+    /// header and never complete a `read_exact(9)`.
+    #[tokio::test(start_paused = true)]
+    async fn mid_frame_completion_resets_stall_and_second_stall_is_reaped() {
+        use frp_core::cipher_stream::CipherWriter;
+        use frp_core::encryption::derive_key;
+        use tokio::io::AsyncWriteExt;
+
+        let mut state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        Arc::get_mut(&mut state)
+            .expect("sole state ref")
+            .heartbeat_timeout = 0; // disabled; exercises the stall arm (<=0 guard)
+
+        let (server, mut client) = tokio::io::duplex(1024);
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("mid-stall-test-run".into()),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("test-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        let state_clone = state.clone();
+        let control_task = tokio::spawn(handle_control(
+            server,
+            login,
+            state_clone,
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+        ));
+
+        // Login handshake completes (real duplex I/O).
+        let error = read_login_resp_error(&mut client).await;
+        assert!(error.is_empty(), "login failed: {error}");
+
+        // Client-side cipher: the server wraps the control stream in
+        // CipherStream with derive_key("test-token") after LoginResp; the
+        // peer must encrypt with the same key so the decrypted bytes parse.
+        let mut cw = CipherWriter::new(client, derive_key("test-token"));
+
+        // Build one valid V1 Ping frame (type byte + 8-byte BE length +
+        // JSON payload) by hand. Writing it through the cipher in TWO
+        // pieces — the first 4 bytes as the "partial frame", the rest as
+        // the completion — must reassemble into exactly the same byte
+        // stream `write_v1_frame` would emit: the server's `read_exact(9)`
+        // consumes 4 (partial) + 5 (frame head) bytes = the full correct
+        // header, then reads the payload. (Writing a garbage partial frame
+        // and THEN a complete frame would corrupt the header with garbage
+        // type/length bytes — the frame would fail to parse.)
+        let ping = frp_core::msg::FrpMessage::Ping(msg::Ping {
+            privilege_key: None,
+            timestamp: None,
+        });
+        let payload = serde_json::to_vec(&ping).expect("serialize ping");
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.push(ping.v1_type_byte());
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        frame.extend_from_slice(&payload);
+
+        // Frame 1 begins: the first 4 bytes of the header as a partial
+        // frame → CipherWriter emits IV(16) + 4 ciphertext bytes. The
+        // server consumes the IV into `CipherStream.iv_buf` (raw-wire
+        // progress) and decrypts 4 bytes → `stall.mark_progress()` records
+        // the FIRST stall start and notifies the reap arm.
+        cw.write_all(&frame[..4])
+            .await
+            .expect("write partial frame");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Frame 1 completes: the remaining header + payload. The server
+        // finishes `read_exact(9)`, parses the Ping, answers a Pong into
+        // the duplex (harmless — it is never read), and the read arm
+        // resets the stall timer.
+        cw.write_all(&frame[4..]).await.expect("write ping frame");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Past the FIRST stall's deadline: the reset must have re-based the
+        // timer — the reap arm's re-check (`stall_start().is_some()`) finds
+        // no stall and must NOT reap a healthy connection.
+        tokio::time::advance(CONTROL_IDLE_TIMEOUT + Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !control_task.is_finished(),
+            "completed frame must reset the stall: conn must NOT be reaped \
+             at the first stall's deadline"
+        );
+
+        // Frame 2: another partial frame → fresh stall start → the reap arm
+        // re-arms at the NEW deadline and must fire.
+        cw.write_all(&[0u8; 4])
+            .await
+            .expect("write second partial frame");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONTROL_IDLE_TIMEOUT + Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            control_task.is_finished(),
+            "second stall must be reaped at its own deadline"
         );
         control_task.await.expect("control task exits");
     }

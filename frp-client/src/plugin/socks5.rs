@@ -460,6 +460,42 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// C-5: a peer that connects but stalls mid-handshake (here: greeting
+    /// read_exact(2) stuck at 1/2) must be released by the single absolute
+    /// SOCKS5_HANDSHAKE_TIMEOUT deadline — the handler task + fd cannot park
+    /// forever. Pinned under paused time so the test is deterministic.
+    #[tokio::test(start_paused = true)]
+    async fn test_socks5_handshake_deadline_releases_handler() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_socks5_conn(stream, None, None).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Version byte only — greeting read_exact(2) stays at 1/2 forever.
+        client.write_all(&[SOCKS5_VERSION]).await.unwrap();
+        tokio::task::yield_now().await;
+
+        // The deadline is anchored at handler entry, so advancing past it
+        // fires regardless of how far the task has progressed.
+        tokio::time::advance(SOCKS5_HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+
+        let res = server.await.unwrap();
+        assert!(
+            res.is_err(),
+            "handshake deadline must release the handler task"
+        );
+    }
+
     #[tokio::test]
     async fn test_socks5_auth_negotiation_user_pass() {
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
