@@ -5485,14 +5485,11 @@ max_custom_domains_per_proxy = 128
     let cfg: ServerConfig = load_server_config_from_str(toml).unwrap();
     assert_eq!(cfg.max_custom_domains_per_proxy, 128);
 
-    let cfg: ServerConfig = load_server_config_from_str(
-        "bind_port = 7000\nmaxCustomDomainsPerProxy = 64\n",
-    )
-    .unwrap();
+    let cfg: ServerConfig =
+        load_server_config_from_str("bind_port = 7000\nmaxCustomDomainsPerProxy = 64\n").unwrap();
     assert_eq!(cfg.max_custom_domains_per_proxy, 64);
 
-    let cfg: ServerConfig =
-        load_server_config_from_str("bind_port = 7000\n").unwrap();
+    let cfg: ServerConfig = load_server_config_from_str("bind_port = 7000\n").unwrap();
     assert_eq!(cfg.max_custom_domains_per_proxy, 0);
 
     let cfg = ServerConfig {

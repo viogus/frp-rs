@@ -1346,8 +1346,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                     let fallback_timeout_ms = conn_cfg.fallback_timeout_ms;
 
                     // Dial options for STCP fallback (fresh connections only).
-                    let plan =
-                        plan_visitor_dial(&sa, sp, &pt, tls_enable, &tls_sn, &tls_ca, &transport);
+                    let plan = plan_visitor_dial(sa, sp, pt, tls_enable, tls_sn, tls_ca, transport);
                     let opts = plan.opts;
                     let yamux_keepalive = plan.yamux_keepalive_secs;
 
@@ -1374,7 +1373,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             Duration::from_millis(fallback_timeout_ms.clamp(1, 20_000))
                         };
                         match open_tunnel(
-                            &visitor_name,
+                            visitor_name,
                             &tunnel_slot,
                             &start_tx,
                             &start_armed,
@@ -1398,9 +1397,9 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     .into_split();
                                 let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
                                 if use_enc {
-                                    let key = frp_core::encryption::derive_key(&sk);
+                                    let key = frp_core::encryption::derive_key(sk);
                                     if !bridge_until_cancelled(
-                                        &visitor_name,
+                                        visitor_name,
                                         "XTCP encrypted P2P",
                                         "shutting down, aborting XTCP encrypted P2P bridge",
                                         &conn_cancel,
@@ -1424,7 +1423,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                         return; // drops both bridge halves
                                     }
                                 } else if !bridge_until_cancelled(
-                                    &visitor_name,
+                                    visitor_name,
                                     "XTCP",
                                     "shutting down, aborting XTCP P2P bridge",
                                     &conn_cancel,
@@ -1496,8 +1495,8 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         // visitor's encryption/compression is a pragmatic approximation
                         // that is strictly better than the previous always-plain behavior.
                         let nvc = crate::proxy::create_visitor_conn_msg(
-                            &stcp_proxy_name,
-                            &sk,
+                            stcp_proxy_name,
+                            sk,
                             use_encryption,
                             use_compression,
                             Some(su).filter(|s| !s.is_empty()),
@@ -1558,9 +1557,9 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         };
                         let use_enc_relay = use_encryption && !sk.is_empty();
                         if use_enc_relay {
-                            let key = frp_core::encryption::derive_key(&sk);
+                            let key = frp_core::encryption::derive_key(sk);
                             if !bridge_until_cancelled(
-                                &visitor_name,
+                                visitor_name,
                                 "STCP fallback encrypted relay",
                                 "shutting down, aborting STCP fallback encrypted relay",
                                 &conn_cancel,
@@ -1583,7 +1582,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             {}
                         } else {
                             if !bridge_until_cancelled(
-                                &visitor_name,
+                                visitor_name,
                                 "STCP fallback relay",
                                 "shutting down, aborting STCP fallback relay",
                                 &conn_cancel,
@@ -1631,8 +1630,8 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         };
 
                         let nvc = crate::proxy::create_visitor_conn_msg(
-                            &sn,
-                            &sk,
+                            sn,
+                            sk,
                             use_encryption,
                             use_compression,
                             Some(su).filter(|s| !s.is_empty()),
@@ -1693,9 +1692,9 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         };
                         let use_enc_relay = use_encryption && !sk.is_empty();
                         if use_enc_relay {
-                            let key = frp_core::encryption::derive_key(&sk);
+                            let key = frp_core::encryption::derive_key(sk);
                             if !bridge_until_cancelled(
-                                &visitor_name,
+                                visitor_name,
                                 "STCP encrypted relay",
                                 "shutting down, aborting STCP encrypted relay",
                                 &conn_cancel,
@@ -1718,7 +1717,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             {}
                         } else {
                             if !bridge_until_cancelled(
-                                &visitor_name,
+                                visitor_name,
                                 "STCP relay",
                                 "shutting down, aborting STCP relay",
                                 &conn_cancel,

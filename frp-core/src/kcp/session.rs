@@ -647,7 +647,10 @@ impl KcpSession {
                     // returning; on error the Vec is dropped and `u8` is
                     // always-initialized, so the unwritten tail is never
                     // observed.
-                    unsafe { data.set_len(size) };
+                    #[allow(clippy::uninit_vec)] // sound: u8, filled before read or dropped
+                    unsafe {
+                        data.set_len(size)
+                    };
                     match self.kcp.recv(&mut data[..size]) {
                         Ok(n) => {
                             data.truncate(n);

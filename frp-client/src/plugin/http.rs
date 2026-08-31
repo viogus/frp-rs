@@ -285,8 +285,7 @@ async fn handle_http_forward(
         // audit E: `lines()` already strips the trailing CRLF, so the common
         // path (no mid-line `\r`) appends the slice directly, no String.
         if line.contains(['\r', '\n']) {
-            let safe_line: String =
-                line.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
             fwd.extend_from_slice(safe_line.as_bytes());
         } else {
             fwd.extend_from_slice(line.as_bytes());

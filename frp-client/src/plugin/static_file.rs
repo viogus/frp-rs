@@ -42,8 +42,8 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
         "static_file",
         state,
         |stream, peer, (a, lp, base, sp)| async move {
-            if let Err(e) = handle_static_file_conn(stream, a, &lp, base.as_ref(), sp.as_deref())
-                .await
+            if let Err(e) =
+                handle_static_file_conn(stream, a, &lp, base.as_ref(), sp.as_deref()).await
             {
                 debug!(%peer, error = %e, "static_file: {peer} error: {e}");
             }

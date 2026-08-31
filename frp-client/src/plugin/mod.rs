@@ -521,7 +521,8 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         // but then stalls must not pin the handler task + fd forever. Any
         // byte resets the clock — only a fully-silent / stalled peer trips
         // this (Go sets a connection read deadline per-read).
-        let read_res = tokio::time::timeout(PLUGIN_HEADER_READ_TIMEOUT, stream.read(&mut chunk)).await;
+        let read_res =
+            tokio::time::timeout(PLUGIN_HEADER_READ_TIMEOUT, stream.read(&mut chunk)).await;
         let n = match read_res {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(format!("read: {e}")),
@@ -601,8 +602,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         // X-Forwarded-For line is collected here and re-emitted canonically
         // after the loop — the original line must not pass through as well,
         // or the backend sees two X-Forwarded-For headers.
-        if x_forwarded_for.is_some() && starts_with_ignore_ascii_case(line, "x-forwarded-for:")
-        {
+        if x_forwarded_for.is_some() && starts_with_ignore_ascii_case(line, "x-forwarded-for:") {
             if let Some(v) = line.split_once(':').map(|(_, v)| v.trim().to_string()) {
                 if !v.is_empty() {
                     prior_xff.push(v);
@@ -610,7 +610,10 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
             }
             continue;
         }
-        if hop_by_hop.iter().any(|h| starts_with_ignore_ascii_case(line, h)) {
+        if hop_by_hop
+            .iter()
+            .any(|h| starts_with_ignore_ascii_case(line, h))
+        {
             continue;
         }
         // Drop every original Content-Length line: when the body is chunked
@@ -648,8 +651,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
             // only be mid-line (malformed client) — the common path appends
             // the line slice directly, no per-line String (round-17 audit E).
             if line.contains(['\r', '\n']) {
-                let safe_line: String =
-                    line.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
                 fwd.push_str(&safe_line);
             } else {
                 fwd.push_str(line);

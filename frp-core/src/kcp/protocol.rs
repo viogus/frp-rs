@@ -588,13 +588,12 @@ impl<Output> Kcp<Output> {
         // Fast path: ACKs normally target the oldest unacked segment
         // (snd_una). pop_front is O(1); the linear scan below is only for
         // out-of-order ACKs.
-        if let Some(front) = self.snd_buf.front() {
-            if front.sn == sn {
-                // frp-rs patch: recycle the ACKed segment's payload (F3).
-                let seg = self.snd_buf.pop_front().expect("front checked above");
-                self.recycle_segment_data(seg);
-                return;
-            }
+        // frp-rs patch: recycle the ACKed segment's payload (F3). The closure
+        // only reads the peeked front (no `self` capture), so pop_front_if's
+        // borrow is fine — the owned segment is recycled after it returns.
+        if let Some(seg) = self.snd_buf.pop_front_if(|front| front.sn == sn) {
+            self.recycle_segment_data(seg);
+            return;
         }
 
         let mut i = 0usize;
@@ -613,14 +612,13 @@ impl<Output> Kcp<Output> {
     }
 
     fn parse_una(&mut self, una: u32) {
-        while let Some(seg) = self.snd_buf.front() {
-            if timediff(una, seg.sn) > 0 {
-                // frp-rs patch: recycle the discarded segment's payload (F3).
-                let seg = self.snd_buf.pop_front().expect("front checked above");
-                self.recycle_segment_data(seg);
-            } else {
-                break;
-            }
+        // frp-rs patch: recycle the discarded segment's payload (F3) — pop
+        // while the front is within the una window, same loop semantics.
+        while let Some(seg) = self
+            .snd_buf
+            .pop_front_if(|front| timediff(una, front.sn) > 0)
+        {
+            self.recycle_segment_data(seg);
         }
     }
 
@@ -798,7 +796,11 @@ impl<Output> Kcp<Output> {
                             // dropped and `u8` is always-initialized, so the
                             // unwritten tail is never observed. Saves the
                             // memset of `vec![0u8; len]` per received segment.
-                            unsafe { sbuf.set_len(len) };
+                            #[allow(clippy::uninit_vec)]
+                            // sound: u8, filled before read or dropped
+                            unsafe {
+                                sbuf.set_len(len)
+                            };
                             buf.read_exact(&mut sbuf)?;
                             has_read_data = true;
 
