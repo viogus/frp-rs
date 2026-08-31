@@ -79,6 +79,12 @@ pub(crate) async fn serve_h2_connection<S>(
         }
     };
 
+    // Per-stream handlers, collected so they cannot outlive this h2
+    // connection. The enclosing serve_plugin JoinSet tracks the connection
+    // handler task only — a bare spawn here would escape it, leaving an
+    // in-flight stream (holding its backend TCP connection) detached until
+    // its own I/O resolves after the connection is gone.
+    let mut streams: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         match connection.accept().await {
             Some(Ok((request, respond))) => {
@@ -86,7 +92,7 @@ pub(crate) async fn serve_h2_connection<S>(
                 let host_rewrite = host_rewrite.clone();
                 let request_headers = request_headers.clone();
                 let backend = backend.clone();
-                tokio::spawn(async move {
+                streams.spawn(async move {
                     if let Err(e) = handle_stream(
                         request,
                         respond,
@@ -100,6 +106,13 @@ pub(crate) async fn serve_h2_connection<S>(
                         debug!(error = %e, "https plugin h2 stream error");
                     }
                 });
+                // Reap completed stream tasks so their JoinSet nodes and
+                // outputs do not accumulate for this connection's lifetime —
+                // a keep-alive h2 connection can open hundreds of streams,
+                // but memory and scan cost must track concurrency, not
+                // cumulative stream count. Errors are already logged inside
+                // the handler, so the () output is dropped.
+                while streams.try_join_next().is_some() {}
             }
             Some(Err(e)) => {
                 debug!(error = %e, "https plugin h2 connection error");
@@ -108,6 +121,11 @@ pub(crate) async fn serve_h2_connection<S>(
             None => break,
         }
     }
+    // Streams cannot outlive the connection (Go http.Server.Close() closes
+    // active streams too): abort any still-running stream task — a stall
+    // against the backend must not linger detached past the connection.
+    streams.abort_all();
+    while streams.join_next().await.is_some() {}
 }
 
 /// Handle one HTTP/2 stream: forward to the backend as plain HTTP/1.1 and

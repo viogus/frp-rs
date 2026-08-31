@@ -84,6 +84,18 @@ fn is_udp_port_bindable(bind_addr: &str, port: u16) -> bool {
     }
 }
 
+/// First candidate whose OS-level bind probe succeeds, each probed off the
+/// executor via `spawn_blocking` (audit r3/server#1 — the sync bind must not
+/// run on a worker thread during a registration burst).
+async fn first_bindable(bind_addr: &str, candidates: impl IntoIterator<Item = u16>) -> Option<u16> {
+    for p in candidates {
+        if crate::proxy::is_tcp_port_bindable_async(bind_addr, p).await {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Allocate the remote port for a new proxy (Go frp `ports.Manager` compat):
 /// SUDP override, per-client reservations with 24h expiry, allow-ports range
 /// scans, and OS-level bind probes. Extracted from `handle_new_proxy`'s
@@ -224,26 +236,30 @@ async fn allocate_proxy_port(
                 None => None,
             };
             // Probe bindability OUTSIDE the reservations write lock: the
-            // blocking std::net::TcpListener::bind must not serialize
-            // reservation lookups (audit D3-6).
+            // bind probe must not serialize reservation lookups (audit D3-6).
+            // Probe runs off the executor (audit r3/server#1).
             let res_candidate = match res_candidate {
-                Some(p) if !crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, p) => None,
+                Some(p) => {
+                    if !crate::proxy::is_tcp_port_bindable_async(&state.proxy_bind_addr, p).await {
+                        None
+                    } else {
+                        Some(p)
+                    }
+                }
                 other => other,
             };
             match res_candidate {
                 Some(p) => Some(p),
                 None => {
                     // Collect candidates under a brief read lock, then probe
-                    // each one OUTSIDE the lock (the blocking bind probe must
-                    // not serialize registrations). `find` continues past
-                    // occupied ports, matching the old in-lock scan.
+                    // each one OUTSIDE the lock (the bind probe must not
+                    // serialize registrations). Continues past occupied
+                    // ports, matching the old in-lock scan.
                     let candidates = {
                         let used = state.used_ports.read().await;
                         crate::proxy::pick_tcp_port_candidates(&used, 0, &allow_ports, 4096)
                     };
-                    candidates
-                        .into_iter()
-                        .find(|p| crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, *p))
+                    first_bindable(&state.proxy_bind_addr, candidates).await
                 }
             }
         } else {
@@ -251,9 +267,7 @@ async fn allocate_proxy_port(
                 let used = state.used_ports.read().await;
                 crate::proxy::pick_tcp_port_candidates(&used, remote_port, &allow_ports, 4096)
             };
-            candidates
-                .into_iter()
-                .find(|p| crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, *p))
+            first_bindable(&state.proxy_bind_addr, candidates).await
         };
         // Commit under write lock; re-check to close the race with a
         // concurrent registration. On conflict (TOCTOU: two registrations
@@ -270,15 +284,13 @@ async fn allocate_proxy_port(
                     );
                     let retry = {
                         let used = &*ports;
-                        crate::proxy::pick_tcp_port_candidates(used, 0, &allow_ports, 64)
-                            .into_iter()
-                            .find(|c| {
-                                !ports.contains(c)
-                                    && crate::proxy::is_tcp_port_bindable(
-                                        &state.proxy_bind_addr,
-                                        *c,
-                                    )
-                            })
+                        first_bindable(
+                            &state.proxy_bind_addr,
+                            crate::proxy::pick_tcp_port_candidates(used, 0, &allow_ports, 64)
+                                .into_iter()
+                                .filter(|c| !ports.contains(c)),
+                        )
+                        .await
                     };
                     match retry {
                         Some(p2) => {
@@ -1490,8 +1502,18 @@ async fn setup_proxy_listeners(
         let addr = format_socket_addr(&bind_addr, port);
         info!(addr = %addr, proxy_name = %np.proxy_name, "Proxy listener started on {} for '{}'", addr, np.proxy_name);
         let tcp_keepalive = state.tcp_keepalive;
+        // Capture this proxy's user-conn semaphore for the accept loop
+        // (M5 mirror). The registry entry was inserted by
+        // register_proxy_entry before this spawn; a listener outliving its
+        // proxy keeps a clone of the Arc, so caps stay enforced even as the
+        // registry entry is removed.
+        let user_conn_sem = state
+            .proxy_manager
+            .get(&pn)
+            .await
+            .and_then(|p| p.user_conn_sem.clone());
         let handle = tokio::spawn(async move {
-            listen_and_proxy(listener, port, pn, itx, tcp_keepalive).await;
+            listen_and_proxy(listener, port, pn, itx, tcp_keepalive, user_conn_sem).await;
         });
         listener_handles.insert(np.proxy_name.clone(), handle);
     } else {
@@ -1630,6 +1652,62 @@ pub(crate) async fn handle_new_proxy(
                 format!(
                     "maximum number of ports ({}) reached for this client",
                     state.max_ports_per_client
+                ),
+                v2,
+            )
+            .await;
+            return false;
+        }
+    }
+
+    // Per-client proxy-count cap (Rust-only opt-in; Go frp has no such
+    // limit). Bound how many proxies one authenticated client can hold —
+    // each registration carries config + runtime info + routing entries,
+    // so an unbounded count lets a client drive server memory growth.
+    // Default 0 = unlimited. Same benign TOCTOU as the port gate: register
+    // is the only writer of `by_client`, so a concurrent burst can overshoot
+    // by a couple of entries at most.
+    if state.max_proxies_per_client > 0 {
+        let used = state.proxy_manager.client_proxy_count(run_id).await;
+        if used + 1 > state.max_proxies_per_client as usize {
+            reject_new_proxy(
+                writer,
+                &np.proxy_name,
+                format!(
+                    "maximum number of proxies ({}) reached for this client",
+                    state.max_proxies_per_client
+                ),
+                v2,
+            )
+            .await;
+            return false;
+        }
+    }
+
+    // Per-proxy route-claiming domain cap (Rust-only opt-in; Go frp has no
+    // such limit). One HTTP/HTTPS/tcpmux proxy with a huge
+    // custom_domains/locations list would grow the shared vhost/tcpmux
+    // routing tables (and per-request conflict-check cost) in a SINGLE
+    // register call — the per-client proxy cap does not bound that, since it
+    // is one proxy. Estimate = custom_domains + (subdomain ? 1 : 0) +
+    // locations, an upper bound on the route entries this NewProxy adds.
+    // Pairs with `max_proxies_per_client` to bound total routes.
+    let max_route_domains = state.server_config_snapshot.max_custom_domains_per_proxy;
+    if max_route_domains > 0 && matches!(np.proxy_type.as_str(), "http" | "https" | "tcpmux") {
+        let estimate = np.custom_domains.as_ref().map(|d| d.len()).unwrap_or(0)
+            + usize::from(np.subdomain.as_deref().filter(|s| !s.is_empty()).is_some())
+            + np.locations.as_ref().map(|l| l.len()).unwrap_or(0);
+        // `as i64` is safe: the estimate is bounded by the message's
+        // serialized size — a single V1/V2 frame is capped at 10 KiB/256
+        // KiB of JSON, so the count of list entries is far below i64::MAX
+        // (round-18 review; the cap itself is clamped to 2^20 upstream).
+        if estimate as i64 > max_route_domains {
+            reject_new_proxy(
+                writer,
+                &np.proxy_name,
+                format!(
+                    "proxy '{}' declares {} route-claiming domain(s)/location(s), exceeding the configured maximum of {max_route_domains}",
+                    np.proxy_name, estimate,
                 ),
                 v2,
             )
@@ -2132,6 +2210,7 @@ pub(crate) async fn listen_and_proxy(
     proxy_name: String,
     internal_tx: mpsc::Sender<InternalMsg>,
     tcp_keepalive: i64,
+    user_conn_sem: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     loop {
         match listener.accept().await {
@@ -2140,6 +2219,28 @@ pub(crate) async fn listen_and_proxy(
                 if tcp_keepalive > 0 {
                     frp_core::transport::set_keepalive(&user_conn, tcp_keepalive as u64);
                 }
+                // Acquire the proxy's user-conn permit BEFORE the send (M5
+                // mirror of the group path). Without this, a flood of user
+                // conns to an at-cap proxy queues raw sockets (each holding
+                // an fd) in the 1024-slot internal channel ahead of the
+                // handler-side permit check — starving the control's other
+                // internal traffic. The permit crosses the message boundary
+                // and the handler consumes it instead of re-acquiring (no
+                // double-count). No semaphore = unlimited — send with None.
+                let user_conn_permit = match &user_conn_sem {
+                    Some(sem) => match sem.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            debug!(
+                                proxy_name = %proxy_name,
+                                "Proxy '{}' at user-conn cap, dropping connection",
+                                proxy_name,
+                            );
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 // send().await: backpressure is correct — the control channel
                 // (cap 1024) can fill under a burst of user connections; Go frp
                 // blocks here and lets the TCP backlog absorb the burst. This
@@ -2156,7 +2257,7 @@ pub(crate) async fn listen_and_proxy(
                         proxy_name: proxy_name.clone(),
                         user_conn: IoStream::Tcp(user_conn),
                         pre_read: vec![],
-                        user_conn_permit: None,
+                        user_conn_permit,
                         // Local sender — no group selection was done.
                         group_selected: false,
                     }),
@@ -2938,6 +3039,7 @@ pub(crate) mod unregister_generation_tests {
             false,
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
             0,
             0,
             168,
@@ -3843,6 +3945,207 @@ pub(crate) mod unregister_generation_tests {
                 .is_none(),
             "no route may be left behind by the rejected registration"
         );
+    }
+
+    /// Round-18-review C-4: the per-client proxy-count cap and the
+    /// per-proxy route-claiming domain cap are enforced inside
+    /// `handle_new_proxy` but had no handler-level test (only the internal
+    /// helpers). Registering past `max_proxies_per_client` must reject with
+    /// a NewProxyResp error and register nothing.
+    #[tokio::test]
+    async fn client_proxy_cap_rejected_at_handler_level() {
+        let mut state = test_state();
+        Arc::get_mut(&mut state)
+            .expect("sole state ref")
+            .max_proxies_per_client = 2;
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        for (name, port) in [("cap-p1", 24031), ("cap-p2", 24032)] {
+            let mut np = new_proxy(name, "tcp");
+            np.remote_port = Some(port);
+            let mut writer = Vec::new();
+            let ok = handle_new_proxy(
+                np,
+                "run-1",
+                1,
+                &state,
+                &mut writer,
+                &itx,
+                &mut handles,
+                &mut udp_sockets,
+                false,
+            )
+            .await;
+            assert!(ok, "{name} must register within the cap");
+            assert!(state.proxy_manager.get(name).await.is_some());
+        }
+
+        // Third proxy crosses the cap → rejected, not registered.
+        let mut np = new_proxy("cap-p3", "tcp");
+        np.remote_port = Some(24033);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(!ok, "third proxy must be rejected at the client cap");
+        assert!(
+            state.proxy_manager.get("cap-p3").await.is_none(),
+            "rejected proxy must not be registered"
+        );
+        assert!(
+            String::from_utf8_lossy(&writer).contains("maximum number of proxies"),
+            "rejection response must surface the cap error"
+        );
+    }
+
+    /// Round-18-review C-4: the route-claiming domain cap
+    /// (`max_custom_domains_per_proxy`) rejects a single proxy whose
+    /// custom_domains/locations estimate exceeds the configured maximum —
+    /// one proxy is not bounded by the per-client proxy cap.
+    #[tokio::test]
+    async fn route_domain_cap_rejected_at_handler_level() {
+        let mut state = test_state();
+        Arc::get_mut(&mut state)
+            .expect("sole state ref")
+            .server_config_snapshot
+            .max_custom_domains_per_proxy = 3;
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // Exactly at the cap (3 domains) → accepted.
+        let mut np = new_proxy("dom-ok", "http");
+        np.custom_domains = Some(vec![
+            "a.example.com".to_string(),
+            "b.example.com".to_string(),
+            "c.example.com".to_string(),
+        ]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "3 domains must be accepted at a cap of 3");
+        assert!(state.proxy_manager.get("dom-ok").await.is_some());
+
+        // One domain past the cap → rejected.
+        let mut np = new_proxy("dom-over", "http");
+        np.custom_domains = Some(vec![
+            "a.example.com".to_string(),
+            "b.example.com".to_string(),
+            "c.example.com".to_string(),
+            "d.example.com".to_string(),
+        ]);
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(!ok, "4 domains must be rejected at a cap of 3");
+        assert!(
+            state.proxy_manager.get("dom-over").await.is_none(),
+            "rejected proxy must not be registered"
+        );
+        assert!(
+            String::from_utf8_lossy(&writer).contains("exceeding the configured maximum"),
+            "rejection response must surface the route-domain cap error"
+        );
+    }
+
+    /// Round-18-review C-5 (M5 mirror): the per-proxy user-conn cap permit
+    /// is acquired at the LISTENER (accept) side before the message is
+    /// queued — an at-cap proxy must drop new conns instead of parking raw
+    /// sockets (fds) in the internal channel ahead of the handler-side
+    /// check. With max_conns_per_proxy = 1: the first user conn carries the
+    /// permit into the message; the second (concurrent) conn is dropped at
+    /// accept and never reaches the control channel.
+    #[tokio::test]
+    async fn user_conn_sem_acquired_at_listener_side() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = tokio::spawn(listen_and_proxy(
+            listener,
+            port,
+            "sem-proxy".to_string(),
+            tx,
+            0,
+            Some(sem.clone()),
+        ));
+
+        let _c1 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("conn 1");
+        let _c2 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("conn 2");
+        // Give the accept loop time to accept both and run the permit check.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let first = rx.recv().await.expect("first conn must reach the control");
+        match first {
+            InternalMsg::ProxyUserConn {
+                proxy_name,
+                user_conn_permit,
+                ..
+            } => {
+                assert_eq!(proxy_name, "sem-proxy");
+                assert!(
+                    user_conn_permit.is_some(),
+                    "first conn must carry the user-conn permit"
+                );
+            }
+            other => panic!("expected ProxyUserConn, got {other:?}"),
+        }
+        // The second conn must have been dropped at the listener — no
+        // second message may arrive.
+        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            second.is_err(),
+            "at-cap conn must be dropped at the listener, not queued"
+        );
+
+        task.abort();
     }
 
     /// Go parity: the same duplicate-domain rejection on the tcpmux path
@@ -5098,12 +5401,16 @@ pub(crate) mod unregister_generation_tests {
         });
 
         // Wait until the task has registered the proxy (parked at the
-        // client_ports_used increment, before its bind).
+        // client_ports_used increment, before its bind). The OS probe for
+        // port 24051 runs on the spawn_blocking pool (r3/server#1), so
+        // yield_now alone cannot observe its completion on slow CI
+        // machines — warm the pool, then poll with real time.
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
         for _ in 0..100 {
             if state.proxy_manager.get("m1").await.is_some() {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(
             state.proxy_manager.get("m1").await.is_some(),
@@ -5468,10 +5775,13 @@ mod tcp_auto_bind_retry_tests {
         });
         // Run the registration task to its first suspension (the commit
         // WRITE lock — it cannot proceed while the READ guard is held, and
-        // nothing before the commit is contended).
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        // nothing before the commit is contended). The OS probe itself now
+        // runs on the spawn_blocking pool (r3/server#1), so plain yield_now
+        // cannot observe its completion: warm the pool, then give the
+        // blocking thread real time to finish the probe (a microsecond bind
+        // after pool warm-up; 50ms is a wide margin) before the thief binds.
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let thief = std::net::TcpListener::bind(("127.0.0.1", stolen)).expect("thief bind");
         drop(guard);
 
@@ -5570,9 +5880,11 @@ mod tcp_auto_bind_retry_tests {
             )
             .await
         });
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        // Same probe→bind seam as the auto-assign test: warm the
+        // spawn_blocking pool and let the probe finish before the thief
+        // binds, so the steal lands on the bind itself.
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let thief = std::net::TcpListener::bind(("127.0.0.1", requested)).expect("thief bind");
         drop(guard);
 

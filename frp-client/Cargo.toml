@@ -11,6 +11,10 @@ md-5.workspace = true
 tower = "0.5"
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 tempfile = "3"
+# test-util enables `#[tokio::test(start_paused = true)]` + time::pause for
+# the socks5 handshake-deadline audit test — same pattern as frp-server's
+# dev-dependencies; never compiled into non-test builds.
+tokio = { workspace = true, features = ["test-util"] }
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }

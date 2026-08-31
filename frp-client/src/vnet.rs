@@ -361,7 +361,31 @@ pub(crate) fn valid_cidr(subnet: &str) -> bool {
     }
     match subnet.split_once('/') {
         Some((ip, prefix)) => {
-            prefix.parse::<u8>().is_ok() && ip.parse::<std::net::IpAddr>().is_ok()
+            let Ok(len) = prefix.parse::<u8>() else {
+                return false;
+            };
+            let Ok(parsed_ip) = ip.parse::<std::net::IpAddr>() else {
+                return false;
+            };
+            // Reject out-of-family prefixes (10.0.0.0/99) — invalid CIDR.
+            let max_prefix = if parsed_ip.is_ipv4() { 32 } else { 128 };
+            if len > max_prefix {
+                return false;
+            }
+            // Reject the default-route hijack prefix: `0.0.0.0/0` / `::/0`
+            // (`ip route add ... dev tun`) would redirect the ENTIRE
+            // outbound traffic into the TUN. Also reject ANY prefix
+            // ≤ `/6` — every /1 covers the default-route half once the
+            // route table masks the base (`10.0.0.0/1` ≡ `0.0.0.0/1`,
+            // round-17 review MEDIUM), and the 64-route per-client cap
+            // means 64 × /6 covers the entire family (2^32 v4 / 2^128 v6,
+            // round-18 review) — a full default-route hijack within the
+            // cap. Legitimate vnet routes (RFC1918 /8-/12, ULA /8) are
+            // all ≥ `/8`. Mirrors nathole.rs `is_route_hijack_prefix`
+            // (defense-in-depth; the server's membership guard is the
+            // primary gate).
+            let hijack = len <= 6;
+            !hijack
         }
         None => subnet.parse::<std::net::IpAddr>().is_ok(),
     }
@@ -421,5 +445,56 @@ pub(crate) fn remove_os_route(subnet: &str, tun_name: &str) {
         let _ = std::process::Command::new("route")
             .args(["delete", "-net", net, "-interface", tun_name])
             .output();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_cidr_rejects_default_route_hijack() {
+        // Route-hijack MED: `0.0.0.0/0` and `::/0` would send the ENTIRE
+        // outbound traffic into the TUN via `ip route add ... dev tun`.
+        assert!(!valid_cidr("0.0.0.0/0"));
+        assert!(!valid_cidr("::/0"));
+        // The /1 splits that together cover a whole family must also be
+        // refused — including non-canonical bases, which are the same
+        // network once the route table masks the base (round-17 review
+        // MEDIUM).
+        assert!(!valid_cidr("0.0.0.0/1"));
+        assert!(!valid_cidr("128.0.0.0/1"));
+        assert!(!valid_cidr("::/1"));
+        assert!(!valid_cidr("8000::/1"));
+        assert!(!valid_cidr("10.0.0.0/1"));
+        assert!(!valid_cidr("200.0.0.0/1"));
+        assert!(!valid_cidr("8000:0000:0000:0000:0000:0000:0000:0000/1"));
+        // Prefixes ≤ /6 are full-family hijacks within the 64-route
+        // per-client cap: 64 × /6 = 2^32 (v4) / 2^128 (v6) (round-18
+        // review). Non-canonical bases included.
+        assert!(!valid_cidr("10.0.0.0/2"));
+        assert!(!valid_cidr("0.0.0.0/6"));
+        assert!(!valid_cidr("128.0.0.0/6"));
+        assert!(!valid_cidr("::/6"));
+        assert!(!valid_cidr("8000::/6"));
+        // /7 is above the family-coverage threshold — boundary pinned
+        // intentionally (no legitimate vnet route is a /7 either).
+        assert!(valid_cidr("10.0.0.0/7"));
+    }
+
+    #[test]
+    fn valid_cidr_accepts_real_networks() {
+        // Legitimate vnet shapes are still accepted.
+        assert!(valid_cidr("10.0.0.0/24"));
+        assert!(valid_cidr("192.168.1.0/24"));
+        assert!(valid_cidr("10.0.0.5/32"));
+        assert!(valid_cidr("fd00::/8"));
+        assert!(valid_cidr("fd00::1/128"));
+        assert!(valid_cidr("100.64.0.0/10"));
+        // Garbage / malformed still refused (unchanged behavior).
+        assert!(!valid_cidr("not-a-cidr"));
+        assert!(!valid_cidr("10.0.0.0/99"));
+        assert!(!valid_cidr(""));
+        assert!(!valid_cidr("-x"));
     }
 }

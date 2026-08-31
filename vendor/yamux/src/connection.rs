@@ -332,13 +332,30 @@ struct Active<T> {
     pending_write_frame: Option<Frame<()>>,
     new_outbound_stream_waker: Option<Waker>,
 
-    /// frp-rs patch: connection-scoped send-side body-buffer pool. Data-frame
-    /// bodies are drawn from here in `Stream::poll_write` and returned by
-    /// `frame::Io` once the frame is fully written (WriteState::Body
-    /// completion), removing the per-chunk `Vec` allocation on the send path.
-    /// Send-side only: read bodies move into `Shared::buffer` and are
-    /// consumed lazily, so they must never be pooled.
+    /// frp-rs patch: connection-scoped body-buffer pool (send + read side).
+    /// Data-frame bodies are drawn from here in `Stream::poll_write` and
+    /// returned by `frame::Io` once the frame is fully written; read bodies
+    /// are drawn at ReadState::Body init and returned once the chunk is
+    /// fully consumed in `Stream::poll_read`. Removes the per-chunk `Vec`
+    /// allocation in both directions, and the read side's `vec![0; len]`
+    /// zero-fill as well (the send side never zero-filled — it wrote the
+    /// payload bytes directly).
     body_pool: Arc<ArrayQueue<Vec<u8>>>,
+    /// frp-rs patch: exact count of outbound streams still awaiting
+    /// acknowledgment, replacing the O(N) `ack_backlog()` scan (which locked
+    /// every stream on each `poll_new_outbound`). Incremented on outbound
+    /// creation; decremented when an outbound stream leaves
+    /// `Open { acknowledged: false }` (remote ACK, RST, FIN, or removal).
+    /// Saturating ops keep it drift-bounded.
+    ///
+    /// Documented divergence: `Stream::poll_close` on an *unacked* outbound
+    /// stream moves it to `SendClosed` without decrementing here (the counter
+    /// lives in `Active`, the update in `Stream`). Upstream's scan excludes
+    /// such streams, so a `poll_close`-happy caller would see the gate
+    /// trigger 256 streams early. frp never calls `poll_close` on mux streams
+    /// (they are dropped — `on_drop_stream` — not gracefully closed), so the
+    /// counter is exact for every reachable transition.
+    outbound_unacked: usize,
 
     rtt: rtt::Rtt,
 
@@ -404,7 +421,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     fn new(socket: T, cfg: Config, mode: Mode, body_pool: Arc<ArrayQueue<Vec<u8>>>) -> Self {
         let id = Id::next();
         log::debug!("new connection: {id} ({mode:?})");
-        let socket = frame::Io::new(id, socket, body_pool.clone()).fuse();
+        let socket = frame::Io::new(id, socket, body_pool.clone(), cfg.split_send_size).fuse();
         Active {
             id,
             mode,
@@ -424,6 +441,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             rtt: rtt::Rtt::new(),
             accumulated_max_stream_windows: Default::default(),
             body_pool,
+            outbound_unacked: 0,
         }
     }
 
@@ -615,6 +633,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
         log::debug!("{}: new outbound {} of {}", self.id, stream, self);
         self.streams.insert(id, stream.clone_shared());
+        // frp-rs patch: the new outbound stream is pending-ack until the
+        // remote ACKs it; the `outbound_unacked` counter (not an O(N) scan)
+        // gates `ack_backlog()`.
+        self.outbound_unacked += 1;
 
         Poll::Ready(Ok(stream))
     }
@@ -625,7 +647,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         log::trace!("{}: removing dropped stream {}", self.id, stream_id);
         let frame = {
             let mut shared = s.lock();
-            let frame = match shared.update_state(self.id, stream_id, State::Closed) {
+            let prev = shared.update_state(self.id, stream_id, State::Closed);
+            // frp-rs patch: a dropped outbound stream that was never acked no
+            // longer counts toward the ACK backlog.
+            if Self::is_outbound_id(self.mode, stream_id)
+                && matches!(prev, State::Open { acknowledged: false })
+            {
+                self.outbound_unacked = self.outbound_unacked.saturating_sub(1);
+            }
+            let frame = match prev {
                 // The stream was dropped without calling `poll_close`.
                 // We reset the stream to inform the remote of the closure.
                 State::Open { .. } => {
@@ -681,10 +711,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             && matches!(frame.header().tag(), Tag::Data | Tag::WindowUpdate)
         {
             let id = frame.header().stream_id();
+            // frp-rs patch: an ACK retires a pending outbound stream from the
+            // backlog. The flag is computed inside the `streams.get` borrow
+            // and applied after it, so the counter mutation does not overlap
+            // the map borrow.
+            let mut unacked_acked = false;
             if let Some(stream) = self.streams.get(&id) {
-                stream
+                let prev = stream
                     .lock()
                     .update_state(self.id, id, State::Open { acknowledged: true });
+                unacked_acked = Self::is_outbound_id(self.mode, id)
+                    && matches!(prev, State::Open { acknowledged: false });
+            }
+            if unacked_acked {
+                self.outbound_unacked = self.outbound_unacked.saturating_sub(1);
             }
             if let Some(waker) = self.new_outbound_stream_waker.take() {
                 waker.wake();
@@ -707,7 +747,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             // stream reset
             if let Some(s) = self.streams.get_mut(&stream_id) {
                 let mut shared = s.lock();
-                shared.update_state(self.id, stream_id, State::Closed);
+                let prev = shared.update_state(self.id, stream_id, State::Closed);
+                // frp-rs patch: a remote RST retires a pending outbound ACK.
+                if Self::is_outbound_id(self.mode, stream_id)
+                    && matches!(prev, State::Open { acknowledged: false })
+                {
+                    self.outbound_unacked = self.outbound_unacked.saturating_sub(1);
+                }
                 if let Some(w) = shared.reader.take() {
                     w.wake()
                 }
@@ -784,7 +830,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             }
 
             if is_finish {
-                shared.update_state(self.id, stream_id, State::RecvClosed);
+                let prev = shared.update_state(self.id, stream_id, State::RecvClosed);
+                // frp-rs patch: a remote half-close retires a pending outbound
+                // ACK (an inbound stream is never counted).
+                if Self::is_outbound_id(self.mode, stream_id)
+                    && matches!(prev, State::Open { acknowledged: false })
+                {
+                    self.outbound_unacked = self.outbound_unacked.saturating_sub(1);
+                }
             }
 
             shared.buffer.push(frame.into_body());
@@ -817,7 +870,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             // stream reset
             if let Some(s) = self.streams.get_mut(&stream_id) {
                 let mut shared = s.lock();
-                shared.update_state(self.id, stream_id, State::Closed);
+                let prev = shared.update_state(self.id, stream_id, State::Closed);
+                // frp-rs patch: a remote RST retires a pending outbound ACK.
+                if Self::is_outbound_id(self.mode, stream_id)
+                    && matches!(prev, State::Open { acknowledged: false })
+                {
+                    self.outbound_unacked = self.outbound_unacked.saturating_sub(1);
+                }
                 if let Some(w) = shared.reader.take() {
                     w.wake()
                 }
@@ -875,7 +934,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 return Action::Terminate(Frame::protocol_error());
             }
             if is_finish {
-                shared.update_state(self.id, stream_id, State::RecvClosed);
+                let prev = shared.update_state(self.id, stream_id, State::RecvClosed);
+                // frp-rs patch: a remote half-close (here carried on a
+                // WindowUpdate frame) retires a pending outbound ACK.
+                if Self::is_outbound_id(self.mode, stream_id)
+                    && matches!(prev, State::Open { acknowledged: false })
+                {
+                    self.outbound_unacked = self.outbound_unacked.saturating_sub(1);
+                }
 
                 if let Some(w) = shared.reader.take() {
                     w.wake()
@@ -983,23 +1049,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         Ok(proposed)
     }
 
+    /// Whether `id` identifies a stream this endpoint opened (client → odd
+    /// ids, server → even ids) — i.e. a stream counted by `outbound_unacked`.
+    fn is_outbound_id(mode: Mode, id: StreamId) -> bool {
+        match mode {
+            Mode::Client => id.is_client(),
+            Mode::Server => id.is_server(),
+        }
+    }
+
     /// The ACK backlog is defined as the number of outbound streams that have not yet been acknowledged.
     fn ack_backlog(&mut self) -> usize {
-        self.streams
-            .iter()
-            // Whether this is an outbound stream.
-            //
-            // Clients use odd IDs and servers use even IDs.
-            // A stream is outbound if:
-            //
-            // - Its ID is odd and we are the client.
-            // - Its ID is even and we are the server.
-            .filter(|(id, _)| match self.mode {
-                Mode::Client => id.is_client(),
-                Mode::Server => id.is_server(),
-            })
-            .filter(|(_, s)| s.lock().is_pending_ack())
-            .count()
+        // frp-rs patch: exact counter maintained at outbound creation and on
+        // every transition out of `Open { acknowledged: false }` (remote ACK,
+        // RST, FIN, or removal) — replaces the O(N) per-`poll_new_outbound`
+        // scan that locked every stream in the map.
+        self.outbound_unacked
     }
 
     // Check if the given stream ID is valid w.r.t. the provided tag and our connection mode.
@@ -1027,5 +1092,8 @@ impl<T> Active<T> {
                 w.wake()
             }
         }
+        // frp-rs patch: every stream died with the connection; a fresh
+        // `Active` starts at 0.
+        self.outbound_unacked = 0;
     }
 }

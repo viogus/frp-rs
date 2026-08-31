@@ -301,6 +301,7 @@ impl KcpSocket {
                                         &mut self.pending_udp,
                                         pkt,
                                         key.1,
+                                        &self.chunk_pool,
                                     );
                                 }
                             }
@@ -619,8 +620,9 @@ impl KcpSocket {
                                     // If input() fails on the very first packet, the
                                     // data is garbage — don't create a permanent session.
                                     let (read_tx, read_rx) = mpsc::channel(256);
-                                    let mut session = KcpSession::new(
+                                    let mut session = KcpSession::with_chunk_pool(
                                         key.0, src, self.config.clone(), read_tx,
+                                        self.chunk_pool.clone(),
                                     );
                                     if let Err(e) = session.input(data) {
                                         tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
@@ -751,16 +753,29 @@ impl KcpSocket {
         pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
         pkt: Vec<u8>,
         peer: SocketAddr,
+        pool: &ArrayQueue<Vec<u8>>,
     ) {
         match socket.try_send_to(&pkt, peer) {
-            Ok(_) => {}
+            Ok(_) => {
+                // Sent — recycle the datagram buffer (F3). Only terminal
+                // states return to the pool: a WouldBlock-queued packet keeps
+                // its buffer until `drain_pending_udp` actually sends it.
+                chunk_pool_push(pool, pkt);
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if pending_udp.len() < 2048 {
                     pending_udp.push_back((peer, pkt));
+                } else {
+                    // Queue full — KCP retransmission resends the packet, so
+                    // dropping is safe; recycle its buffer.
+                    chunk_pool_push(pool, pkt);
                 }
             }
             Err(e) => {
                 tracing::debug!(peer = %peer, error = %e, "KCP UDP send error");
+                // Terminal failure — the datagram is not going anywhere
+                // (retransmission re-encodes it); recycle its buffer.
+                chunk_pool_push(pool, pkt);
             }
         }
     }
@@ -770,12 +785,13 @@ impl KcpSocket {
         let mut still_pending = VecDeque::new();
         while let Some((pa, pkt)) = self.pending_udp.pop_front() {
             match self.socket.try_send_to(&pkt, pa) {
-                Ok(_) => {}
+                Ok(_) => chunk_pool_push(&self.chunk_pool, pkt),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     still_pending.push_back((pa, pkt));
                 }
                 Err(e) => {
                     tracing::debug!(peer = %pa, error = %e, "KCP UDP pending send error");
+                    chunk_pool_push(&self.chunk_pool, pkt);
                 }
             }
         }
@@ -805,7 +821,13 @@ impl KcpSocket {
         };
         let n = packets.len();
         for pkt in packets {
-            Self::send_udp_packet(&self.socket, &mut self.pending_udp, pkt, peer_addr);
+            Self::send_udp_packet(
+                &self.socket,
+                &mut self.pending_udp,
+                pkt,
+                peer_addr,
+                &self.chunk_pool,
+            );
         }
         n
     }

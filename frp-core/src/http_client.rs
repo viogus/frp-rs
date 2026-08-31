@@ -13,7 +13,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, LOCATION};
 use http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use rustls::pki_types::CertificateDer;
@@ -23,6 +23,20 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum number of redirect hops before giving up.
 const MAX_REDIRECTS: usize = 10;
+
+/// Upper bound on a single HTTP response body read by `http_client`
+/// (OIDC discovery/JWKS, plugin backends, proxyURL JWT fetch). Prevents an
+/// unbounded `collect()` from streaming arbitrary data into memory (OOM
+/// under panic=abort). 1 MiB far exceeds any legitimate payload.
+// Response body cap for http_client's OIDC/plugin/proxyURL endpoints. Go frp
+// reads these with an unbounded `ioutil.ReadAll`; frp-rs bounds them so a
+// hostile endpoint cannot stream arbitrary data into memory (OOM under
+// panic=abort kills the whole process). 16 MiB is deliberately generous —
+// multi-tenant OIDC JWKS documents can exceed 1 MiB, and the fail-closed
+// error must not break real logins (round-17 review LOW: the original 1 MiB
+// diverged from Go for large JWKS / plugin responses). Still far under any
+// memory limit, so the OOM bound is intact.
+const MAX_RESPONSE_BODY_SIZE: usize = 16 * 1024 * 1024;
 
 type HttpsClient = Client<HttpConnect, Full<Bytes>>;
 
@@ -572,7 +586,14 @@ impl HttpClient {
 
             if !is_redirect(resp.status()) {
                 let status = resp.status();
-                let body = resp
+                // Bound the response body: an unbounded `collect()` lets a
+                // malicious/compromised endpoint (OIDC discovery, plugin
+                // backends, proxyURL JWT fetch) stream arbitrary data into
+                // memory — OOM under panic=abort kills the whole process
+                // (MED: http_client unbounded response body). The cap is 16
+                // MiB — see `MAX_RESPONSE_BODY_SIZE` for the Go-divergence
+                // rationale (large JWKS must not fail-closed).
+                let body = Limited::new(resp.into_body(), MAX_RESPONSE_BODY_SIZE)
                     .collect()
                     .await
                     .map_err(|e| format!("failed to read response body: {e}"))?
@@ -588,8 +609,12 @@ impl HttpClient {
                 .ok_or_else(|| format!("redirect without Location header at {current_uri}"))?
                 .to_owned();
 
-            // Drain the redirect response body before following.
-            let _ = resp.collect().await;
+            // Drain the redirect response body before following (bounded —
+            // a hostile endpoint must not force us to buffer more than the
+            // cap we would accept as a real response).
+            let _ = Limited::new(resp.into_body(), MAX_RESPONSE_BODY_SIZE)
+                .collect()
+                .await;
 
             // Resolve relative Location against the current URI.
             current_uri = resolve_uri(&current_uri, &loc)?;

@@ -122,7 +122,7 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     let mut proxy_auth = String::new();
     for line in lines {
         if let Some((key, value)) = line.split_once(':') {
-            if key.trim().to_lowercase() == "proxy-authorization" {
+            if key.trim().eq_ignore_ascii_case("proxy-authorization") {
                 proxy_auth = value.trim().to_string();
             }
         }
@@ -252,8 +252,13 @@ async fn handle_http_forward(
         // Skip the head's trailing blank line(s) too: lines() yields "" for
         // the \r\n\r\n terminator, and forwarding it would terminate the
         // head early, pushing `Connection: close` into the body.
-        let lower = line.to_lowercase();
-        if line.is_empty() || hop_by_hop.iter().any(|h| lower.starts_with(h)) {
+        // Round-17 audit E: zero-alloc ASCII case-insensitive prefix scan
+        // (was a per-line lowercase String).
+        if line.is_empty()
+            || hop_by_hop
+                .iter()
+                .any(|h| super::starts_with_ignore_ascii_case(line, h))
+        {
             return false;
         }
         // Drop every original Content-Length line: when chunked per RFC
@@ -261,7 +266,7 @@ async fn handle_http_forward(
         // CL lines are then replaced by a single canonical line appended
         // after the loop (RFC 7230 §3.3.2; forwarding duplicate/conflicting
         // values would desync the backend).
-        if lower.starts_with("content-length:")
+        if super::starts_with_ignore_ascii_case(line, "content-length:")
             && (framing == Some(super::BodyFraming::Chunked) || content_length.is_some())
         {
             return false;
@@ -276,9 +281,15 @@ async fn handle_http_forward(
         // `\n`, so a lone `\r` inside a header line (malformed client) would
         // otherwise survive into the forwarded request as an injected line
         // (request-smuggling shape). Same policy as read_request_and_build_
-        // forward and the h2 path, which reject CR/LF outright.
-        let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
-        fwd.extend_from_slice(safe_line.as_bytes());
+        // forward and the h2 path, which reject CR/LF outright. Round-17
+        // audit E: `lines()` already strips the trailing CRLF, so the common
+        // path (no mid-line `\r`) appends the slice directly, no String.
+        if line.contains(['\r', '\n']) {
+            let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            fwd.extend_from_slice(safe_line.as_bytes());
+        } else {
+            fwd.extend_from_slice(line.as_bytes());
+        }
         fwd.extend_from_slice(b"\r\n");
     }
     if framing == Some(super::BodyFraming::Chunked) {

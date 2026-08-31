@@ -39,7 +39,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "tls")]
 use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
+use tokio::time::{timeout, Duration};
+#[cfg(feature = "tls")]
 use tracing::{debug, warn};
+
+/// Bounded time for the tls2raw handshake phase (PROXY header read + TLS
+/// ServerHello): a remote client that sends TLS bytes but never completes
+/// the handshake must not pin the handler task + fd (and the work-conn
+/// bridge) forever. The subsequent bridge is long-lived and NOT bounded.
+#[cfg(feature = "tls")]
+const PLUGIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Start a TLS-to-raw plugin (Go frp compat: TLS2RawPlugin).
 #[cfg(feature = "tls")]
@@ -89,17 +98,29 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
             //    Any bytes that arrived past the header are returned and
             //    replayed into the TLS handshake below.
             let (proxy_header, extra) = match proxy_proto_ver.as_str() {
-                "v1" => match read_proxy_header_v1(&mut tunnel_stream).await {
-                    Ok(v) => v,
-                    Err(e) => {
+                "v1" => match timeout(PLUGIN_HANDSHAKE_TIMEOUT, read_proxy_header_v1(&mut tunnel_stream))
+                    .await
+                {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
                         warn!(%target, ?e, "tls2raw: failed to read PROXY v1 header: {e}");
                         return;
                     }
+                    Err(_elapsed) => {
+                        warn!(%target, timeout = ?PLUGIN_HANDSHAKE_TIMEOUT, "tls2raw: PROXY v1 header read timed out");
+                        return;
+                    }
                 },
-                "v2" => match read_proxy_header_v2(&mut tunnel_stream).await {
-                    Ok(v) => v,
-                    Err(e) => {
+                "v2" => match timeout(PLUGIN_HANDSHAKE_TIMEOUT, read_proxy_header_v2(&mut tunnel_stream))
+                    .await
+                {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
                         warn!(%target, ?e, "tls2raw: failed to read PROXY v2 header: {e}");
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        warn!(%target, timeout = ?PLUGIN_HANDSHAKE_TIMEOUT, "tls2raw: PROXY v2 header read timed out");
                         return;
                     }
                 },
@@ -110,10 +131,14 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
             //    Handshake), replaying bytes read past the PROXY header.
             let mut stream = Tls2RawStream::new(tunnel_stream);
             stream.prepend(extra);
-            let mut tls_stream = match acceptor.accept(stream).await {
-                Ok(tls) => tls,
-                Err(e) => {
+            let mut tls_stream = match timeout(PLUGIN_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => tls,
+                Ok(Err(e)) => {
                     warn!(%target, ?e, "tls2raw: TLS handshake failed: {e}");
+                    return;
+                }
+                Err(_elapsed) => {
+                    warn!(%target, timeout = ?PLUGIN_HANDSHAKE_TIMEOUT, "tls2raw: TLS handshake timed out");
                     return;
                 }
             };

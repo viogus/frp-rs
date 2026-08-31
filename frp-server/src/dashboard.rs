@@ -152,6 +152,9 @@ impl axum::serve::Listener for TlsListener {
                     continue;
                 }
             };
+            // Go net/http sets TCP_NODELAY on accepted conns by default —
+            // parity for the dashboard TLS path (before the TLS wrap).
+            frp_core::transport::set_nodelay(&stream);
             let tls_acceptor = match self.acceptor.read_ok().clone() {
                 Some(acceptor) => acceptor,
                 None => {
@@ -166,6 +169,37 @@ impl axum::serve::Listener for TlsListener {
                     continue;
                 }
             }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+/// Plain-HTTP listener wrapper: axum serves the dashboard's non-TLS path
+/// directly from a `TcpListener` with no nodelay hook, while Go net/http sets
+/// TCP_NODELAY on accepted conns by default. Mirrors `TlsListener`'s retry
+/// loop (transient accept errors must not kill the dashboard listener).
+struct NoDelayListener {
+    inner: TcpListener,
+}
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.inner.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!(error = %e, "dashboard listener accept error: {}", e);
+                    continue;
+                }
+            };
+            frp_core::transport::set_nodelay(&stream);
+            return (stream, addr);
         }
     }
 
@@ -1091,7 +1125,12 @@ async fn run_traffic_events(state: Arc<AppState>) {
     let mut last_values: HashMap<String, MetricsSnapshot> = HashMap::new();
 
     loop {
-        interval.tick().await;
+        // Stop promptly on graceful shutdown (serve loop exits on the same
+        // token); the task only owns a stats clone and a subscriber set.
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.shutdown_token.cancelled() => return,
+        }
 
         // Skip work entirely when no WebSocket clients are listening
         if state.event_tx.receiver_count() == 0 {
@@ -2576,6 +2615,7 @@ mod v2 {
                 Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
                 0,
                 0,
+                0,
                 168,
                 true,
                 0,
@@ -3018,6 +3058,7 @@ pub async fn run_dashboard(
     tls_cert_file: Option<String>,
     tls_key_file: Option<String>,
     assets_dir: String,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // API routes (auth-protected)
     let api_routes = Router::new()
@@ -3100,11 +3141,17 @@ pub async fn run_dashboard(
     // Go frp v0.70.0 runs this sweep every 12h
     // (server/metrics/mem/server.go runUntil → clearUselessInfo(7*24h)).
     let prune_state = state.clone();
+    let shutdown_prune = shutdown.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            // Stop promptly on graceful shutdown: this task only owns a stats
+            // clone, and the serve loop below exits on the same token.
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = shutdown_prune.cancelled() => return,
+            }
             let (cleared, total) = v2::prune_offline_stats(&prune_state).await;
             if cleared > 0 {
                 tracing::debug!(
@@ -3146,7 +3193,9 @@ pub async fn run_dashboard(
                 let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
                 tracing::info!(addr = %bind_addr, "Dashboard listening on {} (TLS)", bind_addr);
                 let tls_listener = TlsListener::new(listener, acceptor);
-                axum::serve(tls_listener, app).await?;
+                axum::serve(tls_listener, app)
+                    .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+                    .await?;
             }
             #[cfg(not(feature = "tls"))]
             {
@@ -3156,7 +3205,9 @@ pub async fn run_dashboard(
         }
         _ => {
             tracing::info!(addr = %bind_addr, "Dashboard listening on {}", bind_addr);
-            axum::serve(listener, app).await?;
+            axum::serve(NoDelayListener { inner: listener }, app)
+                .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+                .await?;
         }
     }
     Ok(())

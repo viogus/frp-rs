@@ -36,6 +36,8 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "allow_port_end",
         "allow_ports",
         "max_ports_per_client",
+        "max_proxies_per_client",
+        "max_custom_domains_per_proxy",
         "vhost_http_timeout",
         "user_conn_timeout",
         "detailed_errors_to_client",
@@ -100,6 +102,8 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "proxyBindAddr",
         "websocketPort",
         "maxPortsPerClient",
+        "maxProxiesPerClient",
+        "maxCustomDomainsPerProxy",
         "userConnTimeout",
         "natholeAnalysisDataReserveHours",
         // Go frp v0.70.1 camelCase aliases accepted by serde that are not

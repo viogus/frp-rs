@@ -289,7 +289,10 @@ pub(crate) async fn handle_visitor_conn_inner(
         return;
     }
 
-    let ctl_tx = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.clone());
+    // Only the mpsc::Sender is consumed here — cloning the full ControlTx
+    // (two Strings + two Arc bumps) per visitor conn was pure waste
+    // (round-3 server finding 6).
+    let ctl_tx = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.tx.clone());
 
     match ctl_tx {
         Some(ctl) => {
@@ -312,7 +315,7 @@ pub(crate) async fn handle_visitor_conn_inner(
             // conn drops and the visitor retries.
             match tokio::time::timeout(
                 crate::state::CTL_SEND_TIMEOUT,
-                ctl.tx.send(InternalMsg::VisitorConn {
+                ctl.send(InternalMsg::VisitorConn {
                     proxy_name,
                     visitor_conn: stream,
                     visitor_use_encryption,
@@ -416,7 +419,10 @@ pub(crate) async fn handle_nat_hole_visitor(
         }
     };
 
-    let ctl_tx = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.clone());
+    // Only the mpsc::Sender is consumed here — the full-ControlTx clone per
+    // NatHoleVisitor (two Strings + two Arc bumps) was pure waste
+    // (round-3 server finding 6).
+    let ctl_tx = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.tx.clone());
 
     let ctl_tx = match ctl_tx {
         Some(ctl) => ctl,
@@ -630,7 +636,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     // timeout from SendError in the log message.
     let send_result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        ctl_tx.tx.send(InternalMsg::NatHoleSidOnWorkConn {
+        ctl_tx.send(InternalMsg::NatHoleSidOnWorkConn {
             sid: sid.clone(),
             proxy_name: proxy_name.clone(),
         }),
@@ -869,7 +875,6 @@ pub(crate) async fn handle_nat_hole_visitor(
     // (which would cause a permanent visitor hang).
     if let Some(ref cr) = c_resp {
         let _ = ctl_tx
-            .tx
             .send(InternalMsg::WriteNatHoleResp {
                 transaction_id: cr.transaction_id.clone(),
                 error: cr.error.clone(),
@@ -1201,24 +1206,31 @@ pub(crate) async fn handle_work_conn_inner(
     // control lookup happens FIRST — a work conn for an unregistered run_id
     // is rejected before the plugin hook runs, so plugins are never invoked
     // for garbage run_ids (Go's GetByID returns early with a warn + error).
-    let Some(ctl) = state.run_id_to_ctl_tx.get(&run_id).map(|v| v.clone()) else {
-        warn!(run_id = %run_id, "no client control found for run id [{}]", run_id);
-        return;
+    // Extract only what the handler consumes (wire protocol bool + the
+    // mpsc::Sender) from one Ref — the old full-ControlTx clone (two Strings
+    // + two Arc bumps) per work conn was pure waste, and the Ref itself must
+    // be dropped before the send().await below (round-3 server finding 6).
+    let (ctl_wire_v2, ctl_tx) = {
+        let Some(ctl) = state.run_id_to_ctl_tx.get(&run_id) else {
+            warn!(run_id = %run_id, "no client control found for run id [{}]", run_id);
+            return;
+        };
+        (ctl.wire_v2, ctl.tx.clone())
     };
 
     // Go frp v0.71.0: the work connection's wire protocol must match the
     // control session it references ("work connection wire protocol
     // mismatch"). A mixed-protocol work conn would be misparsed by the
     // control's frame reader.
-    if ctl.wire_v2 != v2 {
+    if ctl_wire_v2 != v2 {
         warn!(
             run_id = %run_id,
             work_wire = if v2 { "v2" } else { "v1" },
-            control_wire = if ctl.wire_v2 { "v2" } else { "v1" },
+            control_wire = if ctl_wire_v2 { "v2" } else { "v1" },
             "Work conn wire protocol mismatch for run_id {} (work={}, control={}); rejecting",
             run_id,
             if v2 { "v2" } else { "v1" },
-            if ctl.wire_v2 { "v2" } else { "v1" }
+            if ctl_wire_v2 { "v2" } else { "v1" }
         );
         return;
     }
@@ -1251,7 +1263,7 @@ pub(crate) async fn handle_work_conn_inner(
     // re-requests.
     match tokio::time::timeout(
         crate::state::CTL_SEND_TIMEOUT,
-        ctl.tx.send(InternalMsg::NewWorkConn(stream)),
+        ctl_tx.send(InternalMsg::NewWorkConn(stream)),
     )
     .await
     {

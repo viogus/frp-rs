@@ -615,7 +615,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         .state
         .run_id_to_ctl_tx
         .get(&provider_run_id)
-        .map(|v| v.clone());
+        .map(|v| v.tx.clone());
     let provider_ctl = match provider_ctl {
         Some(ctl) => ctl,
         None => {
@@ -660,7 +660,6 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
 
     // Send NatHoleSid to provider ON A WORK CONNECTION (Go frp compat).
     if provider_ctl
-        .tx
         .try_send(InternalMsg::NatHoleSidOnWorkConn {
             sid: transaction_id.clone(),
             proxy_name: proxy_name.clone(),
@@ -677,7 +676,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     // and sends NatHoleResp to both sides.
     let nat_hole = ctx.state.xtcp.nat_hole.clone();
     let visitor_tx = ctx.internal_tx.clone();
-    let provider_tx = provider_ctl.tx.clone();
+    let provider_tx = provider_ctl.clone();
     let tid = transaction_id.clone();
     let visitor_msg = nhv.clone();
     let _proxy = proxy_name.clone();
@@ -960,6 +959,42 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
 /// subnets injected into peers' kernel routing tables).
 const MAX_VNET_ROUTES_PER_CLIENT: usize = 64;
 
+/// Reject default-route / near-default hijack prefixes before they reach
+/// peers' kernel routing tables (via `ip route add` targeting the tun
+/// device).
+///
+/// A broad prefix here is an authenticated-net escalation: a malicious or
+/// compromised vnet member advertising `0.0.0.0/0` (or the `0.0.0.0/1` +
+/// `128.0.0.0/1` pair that together cover all IPv4, or the `::/1` +
+/// `8000::/1` pair for IPv6) redirects a peer's ENTIRE outbound traffic
+/// into the TUN.
+///
+/// Membership checks gate WHO may advertise, not WHAT — so the prefix
+/// itself is validated here as defense-in-depth (the client-side
+/// `valid_cidr` also rejects these prefixes).
+#[cfg(feature = "vnet")]
+fn is_route_hijack_prefix(subnet: &str) -> bool {
+    let Some((_ip, prefix)) = subnet.split_once('/') else {
+        return false;
+    };
+    let Ok(len) = prefix.parse::<u8>() else {
+        return false;
+    };
+    // `/0` is the clearest form of default-route hijack (both families).
+    // ANY `/1` is the same attack split in two — a non-canonical base is
+    // the identical network once the route table masks it (`10.0.0.0/1`
+    // ≡ `0.0.0.0/1`, `200.0.0.0/1` ≡ `128.0.0.0/1`, zero-padded IPv6 ≡
+    // `::/1`), so the pole-string check was bypassable (round-17 review,
+    // both finders). The per-client cap of 64 routes bounds how many
+    // prefixes one peer can install — and 64 × `/6` covers exactly
+    // 2^32 (v4) / 2^128 (v6), the ENTIRE address family — so any prefix
+    // ≤ `/6` is a full default-route-equivalent hijack within the cap
+    // (round-18 review; `10.0.0.0/2` in the old test was itself such a
+    // 2^30-coverage attack). Legitimate vnet routes (RFC1918 /8-/12,
+    // ULA /8) are all ≥ `/8`.
+    len <= 6
+}
+
 #[cfg(feature = "vnet")]
 pub(crate) async fn handle_vnet_route_advertise(
     ctx: &ControlContext,
@@ -968,6 +1003,20 @@ pub(crate) async fn handle_vnet_route_advertise(
     adv: msg::VnetRouteAdvertise,
 ) {
     let vn = adv.virtual_net.clone().unwrap_or_default();
+
+    // Defense-in-depth (route-hijack MED): reject default/near-default
+    // prefixes BEFORE any membership accounting — a vnet member must not
+    // be able to add `0.0.0.0/0` to peers' kernel routing tables even when
+    // it legitimately holds a membership in the net.
+    if is_route_hijack_prefix(&adv.subnet) {
+        warn!(
+            run_id = %ctx.run_id,
+            virtual_net = %vn,
+            subnet = %adv.subnet,
+            "vnet route advertise refused: hijack prefix (default /0 or its /1 split)"
+        );
+        return;
+    }
     // Membership guard (round 10 HIGH): the advertiser must hold a vnet
     // proxy registered in `vn`. `control_txs_in_vnet` derives broadcast
     // membership from `vnet_routes`, so without this check any
@@ -1417,6 +1466,7 @@ mod vnet_route_tests {
             false,
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
             0,
             0,
             168,
@@ -2038,5 +2088,62 @@ mod vnet_route_tests {
             FrpMessage::VnetRouteRemove(forwarded) => assert_remove_eq(&forwarded, &rem),
             other => panic!("expected remove frame, got {:?}", other),
         }
+    }
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn hijack_prefix_detection() {
+        // Route-hijack MED: default / near-default prefixes must be refused.
+        assert!(crate::control::nathole::is_route_hijack_prefix("0.0.0.0/0"));
+        assert!(crate::control::nathole::is_route_hijack_prefix("::/0"));
+        // The /1 splits covering a whole family.
+        assert!(crate::control::nathole::is_route_hijack_prefix("0.0.0.0/1"));
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "128.0.0.0/1"
+        ));
+        assert!(crate::control::nathole::is_route_hijack_prefix("::/1"));
+        assert!(crate::control::nathole::is_route_hijack_prefix("8000::/1"));
+        // ANY /1 is a hijack — non-canonical bases are the same network
+        // once the route table masks the base (round-17 review MEDIUM).
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "10.0.0.0/1"
+        ));
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "200.0.0.0/1"
+        ));
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "8000:0000:0000:0000:0000:0000:0000:0000/1"
+        ));
+        // Prefixes ≤ /6 are full-family hijacks within the 64-route
+        // per-client cap: 64 × /6 = 2^32 (v4) / 2^128 (v6) (round-18
+        // review). Non-canonical bases included.
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "10.0.0.0/2"
+        ));
+        assert!(crate::control::nathole::is_route_hijack_prefix("0.0.0.0/6"));
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "128.0.0.0/6"
+        ));
+        assert!(crate::control::nathole::is_route_hijack_prefix("::/6"));
+        assert!(crate::control::nathole::is_route_hijack_prefix("8000::/6"));
+        // /7 is above the family-coverage threshold, but still no
+        // legitimate vnet route needs one — the boundary is pinned so a
+        // future relaxer sees it is intentional.
+        assert!(!crate::control::nathole::is_route_hijack_prefix(
+            "0.0.0.0/7"
+        ));
+        // Legitimate vnet routes are NOT hijack prefixes.
+        assert!(!crate::control::nathole::is_route_hijack_prefix(
+            "10.0.0.0/8"
+        ));
+        assert!(!crate::control::nathole::is_route_hijack_prefix(
+            "172.16.0.0/12"
+        ));
+        assert!(!crate::control::nathole::is_route_hijack_prefix(
+            "10.0.0.0/24"
+        ));
+        assert!(!crate::control::nathole::is_route_hijack_prefix(
+            "100.86.0.1/32"
+        ));
+        assert!(!crate::control::nathole::is_route_hijack_prefix("fd00::/8"));
     }
 }

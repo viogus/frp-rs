@@ -112,9 +112,11 @@ pub struct Stream {
     sender_wu: mpsc::Sender<StreamCommand>,
     flag: Flag,
     shared: Arc<Mutex<Shared>>,
-    /// frp-rs patch: connection-scoped send-side body-buffer pool. Data-frame
-    /// bodies are drawn from here in `poll_write` (instead of a fresh `Vec`
-    /// per chunk) and returned once `frame::Io` has fully written the frame.
+    /// frp-rs patch: connection-scoped body-buffer pool (send + read side).
+    /// Data-frame bodies are drawn from here in `poll_write` (instead of a
+    /// fresh `Vec` per chunk) and returned once `frame::Io` has fully
+    /// written the frame; read bodies are returned here once a chunk is
+    /// fully consumed in `poll_read`.
     body_pool: Arc<ArrayQueue<Vec<u8>>>,
 }
 
@@ -347,7 +349,17 @@ impl AsyncRead for Stream {
         let mut n = 0;
         while let Some(chunk) = shared.buffer.front_mut() {
             if chunk.is_empty() {
-                shared.buffer.pop();
+                // frp-rs patch: the chunk is fully consumed and exclusively
+                // owned here — return its buffer to the connection-scoped pool
+                // for reuse by the next read (mirror of the write-side return
+                // in `frame::Io`). Best-effort: a full pool or a buffer above
+                // the configured split-send size is simply dropped.
+                if let Some(chunk) = shared.buffer.pop() {
+                    let buf = chunk.into_vec();
+                    if !buf.is_empty() && buf.capacity() <= self.config.split_send_size {
+                        let _ = self.body_pool.push(buf);
+                    }
+                }
                 continue;
             }
             let k = std::cmp::min(chunk.len(), buf.len() - n);

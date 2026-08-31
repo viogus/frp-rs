@@ -39,6 +39,10 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
         // Throttle accept-error warnings: under persistent EMFILE the loop
         // fails ~10/s (100ms pause below), which would flood the logs.
         let mut last_accept_warn: Option<std::time::Instant> = None;
+        // In-flight connection handlers, so shutdown can abort them — mirrors
+        // serve_plugin's JoinSet (audit r4/client#5). Without this a dropped
+        // PluginHandle left relay tasks running until the tunnel closed.
+        let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -52,7 +56,7 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                             // Forwarded interactive data path — disable Nagle.
                             frp_core::transport::set_nodelay(&tcp_stream);
                             let path = path_clone.clone();
-                            tokio::spawn(async move {
+                            handlers.spawn(async move {
                                 match UnixStream::connect(&path).await {
                                     Ok(mut unix_stream) => {
                                         if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
@@ -75,6 +79,14 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                                     }
                                 }
                             });
+                            // Reap completed handlers so their JoinSet nodes
+                            // and outputs do not accumulate for the
+                            // listener's lifetime — a long-lived listener
+                            // would otherwise grow with cumulative connection
+                            // count instead of concurrency. Errors are
+                            // already logged inside the handler, so the ()
+                            // output is dropped.
+                            while handlers.try_join_next().is_some() {}
                         }
                         Err(e) => {
                             // Warn at most once per second while the accept
@@ -96,6 +108,11 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                 }
             }
         }
+        // Abort in-flight relay tasks and wait until every one has stopped,
+        // so the plugin's local port is never left half-served after the
+        // handle is dropped (serve_plugin parity).
+        handlers.abort_all();
+        while handlers.join_next().await.is_some() {}
     });
 
     Ok(PluginHandle {

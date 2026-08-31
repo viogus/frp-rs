@@ -30,6 +30,11 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
     } else {
         Some(cfg.strip_prefix.trim_matches('/').to_string())
     };
+    // The base directory is canonicalized PER REQUEST inside
+    // `handle_static_file_conn` (see the audit-F comment there) — a startup
+    // cache went stale when a base-dir symlink retargeted after startup
+    // (versioned deploys like /var/www/current), 403ing every file
+    // (round-17 review LOW).
     let state = (auth, local_path, strip_prefix);
     serve_plugin(
         "static_file",
@@ -153,6 +158,11 @@ async fn handle_static_file_conn(
     // The verification must resolve the open fd's inode, not re-resolve the
     // path: re-canonicalizing the path after open() lets a symlink swap
     // between the two make the check disagree with the opened inode (TOCTOU).
+    // Round-17 audit F: the base is canonicalized per request — a startup
+    // cache went stale when a base-dir symlink retargeted (versioned deploys)
+    // and 403'd every file (round-17 review LOW). Go's http.FileServer
+    // canonicalizes per request too; the cost is a short path walk per
+    // request, not per byte.
     let base = std::fs::canonicalize(local_path)
         .map_err(|e| format!("failed to resolve base directory '{}': {e}", local_path))?;
 

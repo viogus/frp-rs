@@ -169,6 +169,11 @@ impl KcpSegment {
 ///
 /// `Output` is the packet sink; `Kcp` writes complete datagrams to it through
 /// `std::io::Write` (each `write_all` call is one outgoing packet).
+/// frp-rs patch: cap on recycled segment payload buffers (F3). 64 × ~1376 B
+/// (MSS) ≈ 88 KiB worst case per KCP session — bounded, so the freelist is a
+/// cache, not an unbounded sink.
+const KCP_SEGMENT_POOL_CAP: usize = 64;
+
 pub struct Kcp<Output> {
     /// Conversation ID.
     conv: u32,
@@ -237,6 +242,14 @@ pub struct Kcp<Output> {
     rcv_queue: VecDeque<KcpSegment>,
     snd_buf: VecDeque<KcpSegment>,
     rcv_buf: VecDeque<KcpSegment>,
+    /// frp-rs patch: freelist of retired segment payload buffers (F3).
+    /// ACKed / `snd_una`-discarded segments return their `data` `Vec` here
+    /// instead of freeing it; `send()` reuses a buffer instead of a fresh
+    /// `to_vec()`. Bounded by `KCP_SEGMENT_POOL_CAP`, so a flood of
+    /// out-of-order ACKs cannot grow it without bound. `Kcp` is owned by a
+    /// single `KcpSession` (one driver task), so a plain `Vec` freelist is
+    /// safe — no Arc, no lock.
+    snd_data_pool: Vec<Vec<u8>>,
 
     /// Pending ACKs `(sn, ts)`.
     acklist: VecDeque<(u32, u32)>,
@@ -340,6 +353,7 @@ impl<Output> Kcp<Output> {
             rcv_queue: VecDeque::new(),
             snd_buf: VecDeque::new(),
             rcv_buf: VecDeque::new(),
+            snd_data_pool: Vec::new(),
             acklist: VecDeque::new(),
             buf: Vec::with_capacity((KCP_MTU_DEF + KCP_OVERHEAD) * 3),
             fastresend: 0,
@@ -347,6 +361,17 @@ impl<Output> Kcp<Output> {
             stream,
             input_conv: false,
             output,
+        }
+    }
+
+    /// frp-rs patch: recycle a retired segment's payload buffer (F3). Called
+    /// when an ACKed / `snd_una`-discarded segment leaves `snd_buf`; the
+    /// `data` `Vec` is cached for the next `send()` instead of being freed.
+    /// Empty payloads (ACK / probe segments) and a full freelist are dropped.
+    #[inline]
+    fn recycle_segment_data(&mut self, seg: KcpSegment) {
+        if !seg.data.is_empty() && self.snd_data_pool.len() < KCP_SEGMENT_POOL_CAP {
+            self.snd_data_pool.push(seg.data);
         }
     }
 
@@ -492,8 +517,17 @@ impl<Output> Kcp<Output> {
             let size = cmp::min(self.mss, buf.len() - offset);
             // One exact-size copy per segment, straight out of the original
             // buffer (no split_off tail moves): each byte is copied exactly
-            // once, into the single segment that owns it.
-            let data = buf[offset..offset + size].to_vec();
+            // once, into the single segment that owns it. frp-rs patch (F3):
+            // reuse a retired segment's payload buffer instead of a fresh
+            // `to_vec()` per segment (~24 segments per 32 KiB bridge chunk).
+            let data = match self.snd_data_pool.pop() {
+                Some(mut v) => {
+                    v.clear();
+                    v.extend_from_slice(&buf[offset..offset + size]);
+                    v
+                }
+                None => buf[offset..offset + size].to_vec(),
+            };
             let mut new_segment = KcpSegment::new_with_data(data);
             offset += size;
 
@@ -554,18 +588,28 @@ impl<Output> Kcp<Output> {
         // Fast path: ACKs normally target the oldest unacked segment
         // (snd_una). pop_front is O(1); the linear scan below is only for
         // out-of-order ACKs.
-        if let Some(front) = self.snd_buf.front() {
-            if front.sn == sn {
-                self.snd_buf.pop_front();
-                return;
-            }
+        // frp-rs patch: recycle the ACKed segment's payload (F3). The closure
+        // only reads the peeked front (no `self` capture), so pop_front_if's
+        // borrow is fine — the owned segment is recycled after it returns.
+        if let Some(seg) = self.snd_buf.pop_front_if(|front| front.sn == sn) {
+            self.recycle_segment_data(seg);
+            return;
         }
 
         let mut i = 0usize;
         while i < self.snd_buf.len() {
             match sn.cmp(&self.snd_buf[i].sn) {
                 cmp::Ordering::Equal => {
-                    self.snd_buf.remove(i);
+                    // frp-rs patch: recycle the ACKed segment's payload (F3).
+                    // `i` was found by the loop, so `i < snd_buf.len()` is a
+                    // loop invariant — a panic here is unreachable (round-18
+                    // review: expect → debug_assert; the cost of a wrong
+                    // guess is a skipped recycle, not a crash). The slot is
+                    // an `Option` (kcp-go's sparse send buffer), but the
+                    // matching segment at `i` is by definition `Some`.
+                    debug_assert!(i < self.snd_buf.len());
+                    let seg = self.snd_buf.remove(i);
+                    self.recycle_segment_data(seg.expect("ACKed segment must be Some"));
                     break;
                 }
                 cmp::Ordering::Less => break,
@@ -575,12 +619,13 @@ impl<Output> Kcp<Output> {
     }
 
     fn parse_una(&mut self, una: u32) {
-        while let Some(seg) = self.snd_buf.front() {
-            if timediff(una, seg.sn) > 0 {
-                self.snd_buf.pop_front();
-            } else {
-                break;
-            }
+        // frp-rs patch: recycle the discarded segment's payload (F3) — pop
+        // while the front is within the una window, same loop semantics.
+        while let Some(seg) = self
+            .snd_buf
+            .pop_front_if(|front| timediff(una, front.sn) > 0)
+        {
+            self.recycle_segment_data(seg);
         }
     }
 
@@ -752,7 +797,17 @@ impl<Output> Kcp<Output> {
                             if len > self.mss {
                                 return Err(Error::InvalidSegmentDataSize(self.mss, len));
                             }
-                            let mut sbuf = vec![0u8; len];
+                            let mut sbuf = Vec::with_capacity(len);
+                            // SAFETY: read_exact below fills exactly `len`
+                            // bytes before returning; on error the Vec is
+                            // dropped and `u8` is always-initialized, so the
+                            // unwritten tail is never observed. Saves the
+                            // memset of `vec![0u8; len]` per received segment.
+                            #[allow(clippy::uninit_vec)]
+                            // sound: u8, filled before read or dropped
+                            unsafe {
+                                sbuf.set_len(len)
+                            };
                             buf.read_exact(&mut sbuf)?;
                             has_read_data = true;
 

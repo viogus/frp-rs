@@ -18,11 +18,12 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crossbeam_queue::ArrayQueue;
 use tokio::sync::{mpsc, Notify};
 
 use super::config::KcpConfig;
 use super::protocol::{Error as KcpError, Kcp, KCP_WND_RCV};
-use super::socket::KCP_SND_BACKLOG_THRESHOLD;
+use super::socket::{chunk_pool_pop, CHUNK_POOL_CAP, KCP_SND_BACKLOG_THRESHOLD};
 use crate::kcp_compat::Fec;
 
 /// FEC wire header size (SEQID 4B + TYPE 2B) before the per-shard SIZE(2B)
@@ -53,8 +54,18 @@ struct ShardGroup {
 ///
 /// `drain()` replaces the internal Vec with a fresh pre-allocated one so that
 /// `write()` calls between drains don't reallocate the outer Vec on every push.
+///
+/// frp-rs patch (F3): each KCP output datagram is drawn from a buffer pool
+/// instead of a fresh `to_vec()` — a 32 KiB bridge write over KCP costs ~24
+/// segment allocs in `Kcp::send` plus ~24 datagram allocs here; the datagram
+/// side drops to pool pops. The pool is the socket's shared `chunk_pool`: the
+/// driver returns a datagram to it after `try_send_to` (terminal states only —
+/// a queued datagram stays in `pending_udp` until sent), and `KcpStream` write
+/// chunks cycle through the same pool. Best-effort like every pool in this
+/// codebase: a full pool just allocates fresh.
 struct KcpWriter {
     packets: Vec<Vec<u8>>,
+    pool: Arc<ArrayQueue<Vec<u8>>>,
 }
 
 /// Typical number of KCP output packets per tick. Pre-allocating avoids
@@ -62,9 +73,10 @@ struct KcpWriter {
 const PACKET_POOL_CAPACITY: usize = 64;
 
 impl KcpWriter {
-    fn new() -> Self {
+    fn new(pool: Arc<ArrayQueue<Vec<u8>>>) -> Self {
         Self {
             packets: Vec::with_capacity(PACKET_POOL_CAPACITY),
+            pool,
         }
     }
 
@@ -78,7 +90,13 @@ impl KcpWriter {
 
 impl Write for KcpWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.packets.push(buf.to_vec());
+        // frp-rs patch (F3): reuse a pooled datagram buffer instead of a
+        // fresh `to_vec()` per KCP output packet. The driver returns the
+        // buffer to the pool after `try_send_to`.
+        let mut out = chunk_pool_pop(&self.pool, buf.len());
+        out.clear();
+        out.extend_from_slice(buf);
+        self.packets.push(out);
         Ok(buf.len())
     }
 
@@ -101,7 +119,6 @@ pub struct KcpSession {
     /// Clock override: when set, `fec_now_ms()` returns it instead of the
     /// real clock, so tests can simulate long silent gaps deterministically.
     fec_clock_override: Option<u64>,
-    recv_buf: Vec<u8>,
     read_tx: mpsc::Sender<Vec<u8>>,
     shutdown: bool,
     /// Frame that couldn't be delivered to the read channel on the previous
@@ -135,11 +152,36 @@ pub struct KcpSession {
 }
 
 impl KcpSession {
+    /// Create a session with a private datagram buffer pool. Used where no
+    /// shared socket pool is in play (unit tests, `XtcpP2pStream`); the pool
+    /// is a harmless cache — never refilled, it degrades to one fresh alloc
+    /// per datagram, identical to the pre-pool `to_vec()` behavior.
     pub fn new(
+        conv: u32,
+        peer_addr: std::net::SocketAddr,
+        config: KcpConfig,
+        read_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Self {
+        Self::with_chunk_pool(
+            conv,
+            peer_addr,
+            config,
+            read_tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        )
+    }
+
+    /// Create a session whose KCP output datagrams are drawn from `chunk_pool`
+    /// (F3). The driver uses this for sessions on its socket, sharing the
+    /// socket's `chunk_pool` so datagrams are recycled across ticks (sent
+    /// packets are pushed back by `send_udp_packet`/`drain_pending_udp`).
+    /// Callers without a shared pool use [`Self::new`].
+    pub fn with_chunk_pool(
         conv: u32,
         peer_addr: std::net::SocketAddr,
         mut config: KcpConfig,
         read_tx: mpsc::Sender<Vec<u8>>,
+        chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
     ) -> Self {
         let fec = if config.data_shards > 0 && config.parity_shards > 0 {
             // FEC data shards are capped at 256 by the GF(2^8) Vandermonde
@@ -153,7 +195,7 @@ impl KcpSession {
             None
         };
 
-        let writer = KcpWriter::new();
+        let writer = KcpWriter::new(chunk_pool);
         let mut kcp = if config.stream {
             Kcp::new_stream(conv, writer)
         } else {
@@ -186,7 +228,6 @@ impl KcpSession {
             shard_groups: HashMap::new(),
             fec_clock_base: std::time::Instant::now(),
             fec_clock_override: None,
-            recv_buf: Vec::new(), // lazily allocated on first recv_and_push
             read_tx,
             shutdown: false,
             pending_read: None,
@@ -595,18 +636,30 @@ impl KcpSession {
                     continue;
                 }
                 Ok(size) => {
-                    if size > self.recv_buf.len() {
-                        self.recv_buf.resize(size, 0);
-                    }
-                    match self.kcp.recv(&mut self.recv_buf[..size]) {
+                    // Zero-copy recv: kcp.recv writes directly into the
+                    // buffer handed to the read channel — the per-frame
+                    // `recv_buf[..n].to_vec()` copy is gone. The channel
+                    // message owns the allocation. `size` is bounded by the
+                    // reassembly window (`(KCP_WND_RCV-1) * mss`, see
+                    // session.rs:364), so a hostile peer cannot inflate it.
+                    let mut data = Vec::with_capacity(size);
+                    // SAFETY: kcp.recv below fills `[..size]` before
+                    // returning; on error the Vec is dropped and `u8` is
+                    // always-initialized, so the unwritten tail is never
+                    // observed.
+                    #[allow(clippy::uninit_vec)] // sound: u8, filled before read or dropped
+                    unsafe {
+                        data.set_len(size)
+                    };
+                    match self.kcp.recv(&mut data[..size]) {
                         Ok(n) => {
+                            data.truncate(n);
                             tracing::trace!(
                                 conv = self.conv,
                                 n,
                                 "KCP SESSION: recv_and_push got {} bytes",
                                 n
                             );
-                            let data = self.recv_buf[..n].to_vec();
                             match self.read_tx.try_send(data) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(d)) => {

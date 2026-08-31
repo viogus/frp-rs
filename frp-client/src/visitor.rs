@@ -83,6 +83,33 @@ pub(crate) struct VisitorListenerConfig {
     pub quic_params: frp_core::quic::QuicTransportParams,
 }
 
+/// Loop-invariant per-listener state an accepted user connection needs to
+/// spawn its handler task. Built ONCE per listener from the destructured
+/// `VisitorListenerConfig`; each accepted connection clones the `Arc`
+/// (one refcount bump) instead of cloning ~16 Strings + a
+/// `VisitorTransportConfig` per connection (round-17 audit C). The handler
+/// task borrows from the Arc it owns for its whole lifetime.
+struct VisitorConnCtx {
+    server_addr: String,
+    server_port: u16,
+    protocol: TransportProtocol,
+    server_name: String,
+    server_user: String,
+    secret_key: String,
+    name: String,
+    tls_enable: bool,
+    tls_server_name: String,
+    tls_ca_file: Option<String>,
+    visitor_type: String,
+    fallback_timeout_ms: u64,
+    fallback_to: String,
+    user: String,
+    run_id: String,
+    transport: VisitorTransportConfig,
+    use_encryption: bool,
+    use_compression: bool,
+}
+
 /// Configuration for a no-bind `virtual_net` visitor tunnel.
 #[cfg(feature = "vnet")]
 pub(crate) struct VirtualNetVisitorConfig {
@@ -1225,11 +1252,47 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         }
     }
 
+    // Round-17 audit C: the per-connection payload used to clone ~16 Strings
+    // + a VisitorTransportConfig on every accepted connection. All of it is
+    // loop-invariant — build once, share via Arc, clone the Arc per conn.
+    let conn_cfg = Arc::new(VisitorConnCtx {
+        server_addr,
+        server_port,
+        protocol,
+        server_name,
+        server_user,
+        secret_key,
+        name,
+        tls_enable,
+        tls_server_name,
+        tls_ca_file,
+        visitor_type,
+        fallback_timeout_ms,
+        fallback_to,
+        user,
+        run_id,
+        transport: VisitorTransportConfig {
+            tcp_mux,
+            tcp_mux_keepalive_interval,
+            proxy_url,
+            dns_server,
+            dial_timeout_secs,
+            keepalive_secs,
+            connect_bind_addr,
+            disable_custom_tls_first_byte,
+            tls_cert_file,
+            tls_key_file,
+            v2,
+        },
+        use_encryption,
+        use_compression,
+    });
+
     loop {
         // Check graceful shutdown signal before each accept (Go frp compat:
         // visitor listeners exit cleanly instead of being aborted).
         if shutdown.load(Ordering::Relaxed) {
-            info!(name = %name, "Visitor '{}' shutting down gracefully", name);
+            info!(name = %conn_cfg.name, "Visitor '{}' shutting down gracefully", conn_cfg.name);
             listener_cancel.cancel();
             return;
         }
@@ -1237,34 +1300,12 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         match listener.accept().await {
             Ok((user_conn, peer)) => {
                 frp_core::transport::set_nodelay(&user_conn);
-                debug!(name = %name, peer = %peer, "Visitor '{}': user connection from {}", name, peer);
+                debug!(name = %conn_cfg.name, peer = %peer, "Visitor '{}': user connection from {}", conn_cfg.name, peer);
 
-                let sa = server_addr.clone();
-                let sp = server_port;
-                let pt = protocol.clone();
-                let sn = server_name.clone();
-                let su = server_user.clone();
-                let sk = secret_key.clone();
-                let visitor_name = name.clone();
-                let tls_sn = tls_server_name.clone();
-                let tls_ca = tls_ca_file.clone();
-                let vt = visitor_type.clone();
-                let fb_to = fallback_to.clone();
-                let u = user.clone();
-                let rid = run_id.clone();
-                let transport = VisitorTransportConfig {
-                    tcp_mux,
-                    tcp_mux_keepalive_interval,
-                    proxy_url: proxy_url.clone(),
-                    dns_server: dns_server.clone(),
-                    dial_timeout_secs,
-                    keepalive_secs,
-                    connect_bind_addr: connect_bind_addr.clone(),
-                    disable_custom_tls_first_byte,
-                    tls_cert_file: tls_cert_file.clone(),
-                    tls_key_file: tls_key_file.clone(),
-                    v2,
-                };
+                // Round-17 audit C: one Arc clone per connection instead of the
+                // ~16 String + transport-struct clones. The spawned task
+                // borrows from the Arc it owns (binds below).
+                let conn_cfg = conn_cfg.clone();
 
                 // Per-connection shutdown token: a child of the listener
                 // token, cancelled on listener exit so this task aborts its
@@ -1283,9 +1324,29 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let start_armed = start_armed.clone();
 
                 tokio::spawn(async move {
+                    // Borrow the listener-invariant payload from the Arc this
+                    // task owns (round-17 audit C) — no per-connection clones.
+                    let sa: &str = &conn_cfg.server_addr;
+                    let sp = conn_cfg.server_port;
+                    let pt: &TransportProtocol = &conn_cfg.protocol;
+                    let tls_enable = conn_cfg.tls_enable;
+                    let tls_sn: &str = &conn_cfg.tls_server_name;
+                    let tls_ca: &Option<String> = &conn_cfg.tls_ca_file;
+                    let sn: &str = &conn_cfg.server_name;
+                    let su: &str = &conn_cfg.server_user;
+                    let sk: &str = &conn_cfg.secret_key;
+                    let visitor_name: &str = &conn_cfg.name;
+                    let vt: &str = &conn_cfg.visitor_type;
+                    let fb_to: &str = &conn_cfg.fallback_to;
+                    let u: &str = &conn_cfg.user;
+                    let rid: &str = &conn_cfg.run_id;
+                    let transport: &VisitorTransportConfig = &conn_cfg.transport;
+                    let use_encryption = conn_cfg.use_encryption;
+                    let use_compression = conn_cfg.use_compression;
+                    let fallback_timeout_ms = conn_cfg.fallback_timeout_ms;
+
                     // Dial options for STCP fallback (fresh connections only).
-                    let plan =
-                        plan_visitor_dial(&sa, sp, &pt, tls_enable, &tls_sn, &tls_ca, &transport);
+                    let plan = plan_visitor_dial(sa, sp, pt, tls_enable, tls_sn, tls_ca, transport);
                     let opts = plan.opts;
                     let yamux_keepalive = plan.yamux_keepalive_secs;
 
@@ -1312,7 +1373,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             Duration::from_millis(fallback_timeout_ms.clamp(1, 20_000))
                         };
                         match open_tunnel(
-                            &visitor_name,
+                            visitor_name,
                             &tunnel_slot,
                             &start_tx,
                             &start_armed,
@@ -1336,9 +1397,9 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     .into_split();
                                 let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
                                 if use_enc {
-                                    let key = frp_core::encryption::derive_key(&sk);
+                                    let key = frp_core::encryption::derive_key(sk);
                                     if !bridge_until_cancelled(
-                                        &visitor_name,
+                                        visitor_name,
                                         "XTCP encrypted P2P",
                                         "shutting down, aborting XTCP encrypted P2P bridge",
                                         &conn_cancel,
@@ -1362,7 +1423,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                         return; // drops both bridge halves
                                     }
                                 } else if !bridge_until_cancelled(
-                                    &visitor_name,
+                                    visitor_name,
                                     "XTCP",
                                     "shutting down, aborting XTCP P2P bridge",
                                     &conn_cancel,
@@ -1426,11 +1487,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             raw_stream
                         };
 
-                        let stcp_proxy_name = if fb_to.is_empty() {
-                            sn.clone()
-                        } else {
-                            fb_to.clone()
-                        };
+                        let stcp_proxy_name = if fb_to.is_empty() { sn } else { fb_to };
                         // Apply the visitor's own encryption/compression config to the
                         // STCP fallback bridge. Go frp semantics: `fallbackTo` routes to
                         // a SEPARATE STCP visitor with its own encryption config, but we
@@ -1438,13 +1495,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         // visitor's encryption/compression is a pragmatic approximation
                         // that is strictly better than the previous always-plain behavior.
                         let nvc = crate::proxy::create_visitor_conn_msg(
-                            &stcp_proxy_name,
-                            &sk,
+                            stcp_proxy_name,
+                            sk,
                             use_encryption,
                             use_compression,
-                            Some(su.as_str()).filter(|s| !s.is_empty()),
-                            Some(u.as_str()).filter(|s| !s.is_empty()),
-                            Some(rid.as_str()).filter(|s| !s.is_empty()),
+                            Some(su).filter(|s| !s.is_empty()),
+                            Some(u).filter(|s| !s.is_empty()),
+                            Some(rid).filter(|s| !s.is_empty()),
                         );
                         debug!(visitor_name = %visitor_name, "NewVisitorConn message prepared");
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
@@ -1500,9 +1557,9 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         };
                         let use_enc_relay = use_encryption && !sk.is_empty();
                         if use_enc_relay {
-                            let key = frp_core::encryption::derive_key(&sk);
+                            let key = frp_core::encryption::derive_key(sk);
                             if !bridge_until_cancelled(
-                                &visitor_name,
+                                visitor_name,
                                 "STCP fallback encrypted relay",
                                 "shutting down, aborting STCP fallback encrypted relay",
                                 &conn_cancel,
@@ -1525,7 +1582,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             {}
                         } else {
                             if !bridge_until_cancelled(
-                                &visitor_name,
+                                visitor_name,
                                 "STCP fallback relay",
                                 "shutting down, aborting STCP fallback relay",
                                 &conn_cancel,
@@ -1573,13 +1630,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         };
 
                         let nvc = crate::proxy::create_visitor_conn_msg(
-                            &sn,
-                            &sk,
+                            sn,
+                            sk,
                             use_encryption,
                             use_compression,
-                            Some(su.as_str()).filter(|s| !s.is_empty()),
-                            Some(u.as_str()).filter(|s| !s.is_empty()),
-                            Some(rid.as_str()).filter(|s| !s.is_empty()),
+                            Some(su).filter(|s| !s.is_empty()),
+                            Some(u).filter(|s| !s.is_empty()),
+                            Some(rid).filter(|s| !s.is_empty()),
                         );
                         debug!(visitor_name = %visitor_name, "NewVisitorConn message prepared");
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
@@ -1635,9 +1692,9 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         };
                         let use_enc_relay = use_encryption && !sk.is_empty();
                         if use_enc_relay {
-                            let key = frp_core::encryption::derive_key(&sk);
+                            let key = frp_core::encryption::derive_key(sk);
                             if !bridge_until_cancelled(
-                                &visitor_name,
+                                visitor_name,
                                 "STCP encrypted relay",
                                 "shutting down, aborting STCP encrypted relay",
                                 &conn_cancel,
@@ -1660,7 +1717,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             {}
                         } else {
                             if !bridge_until_cancelled(
-                                &visitor_name,
+                                visitor_name,
                                 "STCP relay",
                                 "shutting down, aborting STCP relay",
                                 &conn_cancel,
@@ -1682,7 +1739,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 });
             }
             Err(e) => {
-                warn!(name = %name, error = %e, "Visitor '{}': accept error: {}", name, e);
+                warn!(name = %conn_cfg.name, error = %e, "Visitor '{}': accept error: {}", conn_cfg.name, e);
                 listener_cancel.cancel();
                 break;
             }

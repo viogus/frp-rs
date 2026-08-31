@@ -263,6 +263,7 @@ impl Service {
             )),
             cfg.max_ports_per_client,
             cfg.max_conns_per_proxy,
+            cfg.max_proxies_per_client,
             cfg.nat_hole_analysis_data_reserve_hours,
             cfg.detailed_errors_to_client,
             max_connections,
@@ -1428,6 +1429,7 @@ impl Service {
             };
             let enable_prom = self.cfg.web_server.enable_prometheus;
             let dash_assets = self.cfg.web_server.assets_dir.clone();
+            let dash_shutdown = self.state.shutdown_token.clone();
             tokio::spawn(async move {
                 if let Err(e) = crate::dashboard::run_dashboard(
                     dash_addr,
@@ -1438,6 +1440,7 @@ impl Service {
                     dash_tls_cert,
                     dash_tls_key,
                     dash_assets,
+                    dash_shutdown,
                 )
                 .await
                 {
@@ -1601,7 +1604,14 @@ impl Service {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
+                // Stop promptly on graceful shutdown (port-reservation pruner
+                // pattern): the drain path cancels control handlers whose
+                // cleanup() already runs unregister_control, so a final sweep
+                // here would be both unnecessary and a teardown-linger.
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = state.shutdown_token.cancelled() => return,
+                }
                 let stale: Vec<(String, u64)> = state
                     .run_id_to_ctl_tx
                     .iter()
@@ -1823,7 +1833,6 @@ impl Service {
                             }
                         };
 
-                        Box::pin(async move {
                         match ct {
                                 #[cfg(feature = "tls")]
                                 ConnectionType::Tls(first_byte) => {
@@ -1876,7 +1885,6 @@ impl Service {
                                     .await;
                                 }
                         }
-                        }).await;
                     }));
                 }
                 Err(e) => {
@@ -1938,6 +1946,11 @@ impl Service {
     /// Re-reads the TOML config and applies safe-to-reload settings
     /// (allow_ports, auth token, encryption key, TLS certificates).
     /// Returns a summary of changes, or an error if the config cannot be read.
+    ///
+    /// NOT reloadable — restart-only (checked once in `AppState::new`, never
+    /// re-applied here): `max_ports_per_client`, `max_conns_per_proxy`,
+    /// `max_proxies_per_client`. They gate live registrations via their
+    /// semaphores/maps, so a reload cannot retroactively rescale them.
     pub async fn reload(&self) -> Result<String, String> {
         let config_path = match &self.config_file {
             Some(p) => p.clone(),
