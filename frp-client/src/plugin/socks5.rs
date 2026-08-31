@@ -14,8 +14,11 @@ use frp_core::auth::constant_time_eq;
 // ---------------------------------------------------------------
 
 const SOCKS5_VERSION: u8 = 0x05;
-/// Bound the SOCKS5 client greeting: a peer that connects but never sends a
-/// greeting must not pin the handler task + fd + bridge forever.
+/// Bound the whole SOCKS5 handshake: a peer that connects but never completes
+/// it (greeting, auth-method list, user/pass, CONNECT request) must not pin
+/// the handler task + fd + bridge forever. One absolute deadline covers every
+/// handshake read — total budget 60s from the first byte. The data-relay
+/// phase after CONNECT is deliberately unbounded.
 const SOCKS5_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const AUTH_NO_AUTH: u8 = 0x00;
 const AUTH_USER_PASS: u8 = 0x02;
@@ -54,12 +57,15 @@ async fn handle_socks5_conn(
 ) -> Result<(), String> {
     let mut buf = [0u8; 512];
 
-    // Step 1: Auth method negotiation. The greeting MUST arrive within this
-    // bound — a remote SOCKS client that connects but never sends a greeting
-    // would otherwise pin the handler task + fd (and the work-conn bridge)
-    // forever. Bytes are present once the greeting arrives, so later reads
-    // are only bounded by the client staying active.
-    match tokio::time::timeout(SOCKS5_HANDSHAKE_TIMEOUT, client.read_exact(&mut buf[..2])).await {
+    // One absolute deadline anchors the whole handshake — greeting, auth
+    // methods, user/pass, CONNECT request. A peer that connects but stalls
+    // mid-handshake would otherwise pin the handler task + fd (and the
+    // work-conn bridge) forever. The relay phase after CONNECT stays
+    // unbounded: the bridge copies for as long as the tunnel lives.
+    let deadline = tokio::time::Instant::now() + SOCKS5_HANDSHAKE_TIMEOUT;
+
+    // Step 1: Auth method negotiation.
+    match tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..2])).await {
         Ok(Ok(_n)) => {}
         Ok(Err(e)) => return Err(format!("read greeting: {e}")),
         Err(_elapsed) => return Err("socks5 greeting timed out".into()),
@@ -72,9 +78,9 @@ async fn handle_socks5_conn(
     if nmethods == 0 {
         return Err("no auth methods offered".into());
     }
-    client
-        .read_exact(&mut buf[..nmethods])
+    tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..nmethods]))
         .await
+        .map_err(|_| "socks5 handshake timed out".to_string())?
         .map_err(|e| format!("read methods: {e}"))?;
     let methods = &buf[..nmethods];
 
@@ -106,9 +112,9 @@ async fn handle_socks5_conn(
             .as_deref()
             .expect("AUTH_USER_PASS chosen only when pass is Some");
 
-        client
-            .read_exact(&mut buf[..2])
+        tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..2]))
             .await
+            .map_err(|_| "socks5 handshake timed out".to_string())?
             .map_err(|e| format!("read user/pass ver: {e}"))?;
         if buf[0] != USERPASS_VERSION {
             client
@@ -121,25 +127,25 @@ async fn handle_socks5_conn(
         if ulen > 255 {
             return Err("username too long".into());
         }
-        client
-            .read_exact(&mut buf[..ulen])
+        tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..ulen]))
             .await
+            .map_err(|_| "socks5 handshake timed out".to_string())?
             .map_err(|e| format!("read username: {e}"))?;
         let client_user = std::str::from_utf8(&buf[..ulen])
             .map_err(|e| format!("username utf8: {e}"))?
             .to_string();
 
-        client
-            .read_exact(&mut buf[..1])
+        tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..1]))
             .await
+            .map_err(|_| "socks5 handshake timed out".to_string())?
             .map_err(|e| format!("read plen: {e}"))?;
         let plen = buf[0] as usize;
         if plen > 255 {
             return Err("password too long".into());
         }
-        client
-            .read_exact(&mut buf[..plen])
+        tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..plen]))
             .await
+            .map_err(|_| "socks5 handshake timed out".to_string())?
             .map_err(|e| format!("read password: {e}"))?;
         let client_pass = std::str::from_utf8(&buf[..plen])
             .map_err(|e| format!("password utf8: {e}"))?
@@ -165,9 +171,9 @@ async fn handle_socks5_conn(
     }
 
     // Step 3: Read request
-    client
-        .read_exact(&mut buf[..4])
+    tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..4]))
         .await
+        .map_err(|_| "socks5 handshake timed out".to_string())?
         .map_err(|e| format!("read request hdr: {e}"))?;
     if buf[0] != SOCKS5_VERSION {
         return Err(format!("bad request version: {}", buf[0]));
@@ -185,7 +191,7 @@ async fn handle_socks5_conn(
     }
 
     // Parse target address
-    let (host, port) = parse_socks5_target(&mut client, atyp, &mut buf).await?;
+    let (host, port) = parse_socks5_target(deadline, &mut client, atyp, &mut buf).await?;
 
     // Step 4: Connect to target
     let target = format!("{host}:{port}");
@@ -279,48 +285,50 @@ fn parse_socks5_addr(buf: &[u8]) -> Result<(String, u16, usize), String> {
 }
 
 /// Parse target address from SOCKS5 request (ATYP + addr + port) over TCP.
+/// Reads run under the shared handshake deadline.
 async fn parse_socks5_target(
+    deadline: tokio::time::Instant,
     client: &mut TcpStream,
     atyp: u8,
     buf: &mut [u8; 512],
 ) -> Result<(String, u16), String> {
     match atyp {
         ATYP_IPV4 => {
-            client
-                .read_exact(&mut buf[..6])
+            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..6]))
                 .await
+                .map_err(|_| "socks5 handshake timed out".to_string())?
                 .map_err(|e| format!("read ipv4: {e}"))?;
             let host = format!("{}.{}.{}.{}", buf[0], buf[1], buf[2], buf[3]);
             let port = u16::from_be_bytes([buf[4], buf[5]]);
             Ok((host, port))
         }
         ATYP_DOMAIN => {
-            client
-                .read_exact(&mut buf[..1])
+            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..1]))
                 .await
+                .map_err(|_| "socks5 handshake timed out".to_string())?
                 .map_err(|e| format!("read domain len: {e}"))?;
             let dlen = buf[0] as usize;
             if dlen > 255 {
                 return Err("domain name too long".into());
             }
-            client
-                .read_exact(&mut buf[..dlen])
+            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..dlen]))
                 .await
+                .map_err(|_| "socks5 handshake timed out".to_string())?
                 .map_err(|e| format!("read domain: {e}"))?;
             let domain = std::str::from_utf8(&buf[..dlen])
                 .map_err(|e| format!("domain utf8: {e}"))?
                 .to_string();
-            client
-                .read_exact(&mut buf[..2])
+            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..2]))
                 .await
+                .map_err(|_| "socks5 handshake timed out".to_string())?
                 .map_err(|e| format!("read port: {e}"))?;
             let port = u16::from_be_bytes([buf[0], buf[1]]);
             Ok((domain, port))
         }
         ATYP_IPV6 => {
-            client
-                .read_exact(&mut buf[..18])
+            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..18]))
                 .await
+                .map_err(|_| "socks5 handshake timed out".to_string())?
                 .map_err(|e| format!("read ipv6: {e}"))?;
             let host = format!(
                 "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",

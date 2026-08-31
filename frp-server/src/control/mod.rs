@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -57,8 +57,6 @@ struct StallState {
     /// Fixed at construction; `now_ms()`/`stall_start()` are relative to it so
     /// the whole state is readable from sync `poll_read` without a mutex.
     anchor: Instant,
-    /// Set the moment the in-flight read consumes any byte.
-    saw_data: AtomicBool,
     /// Millis (relative to `anchor`) at which the current mid-frame stall
     /// began, or `u64::MAX` when the read is fresh / no frame in flight.
     stall_start_ms: AtomicU64,
@@ -71,7 +69,6 @@ impl StallState {
     fn new() -> Self {
         Self {
             anchor: Instant::now(),
-            saw_data: AtomicBool::new(false),
             stall_start_ms: AtomicU64::new(u64::MAX),
             notify: tokio::sync::Notify::new(),
         }
@@ -91,7 +88,6 @@ impl StallState {
     /// mark the stall in progress, record its start (first consumption of the
     /// frame), and wake the reap arm so it arms a live deadline.
     fn mark_progress(&self) {
-        self.saw_data.store(true, Ordering::Relaxed);
         let _ = self.stall_start_ms.compare_exchange(
             u64::MAX,
             self.now_ms(),
@@ -105,7 +101,6 @@ impl StallState {
     /// clears the stall: the reaper goes back to never-firing until the NEXT
     /// partial frame.
     fn reset(&self) {
-        self.saw_data.store(false, Ordering::Relaxed);
         self.stall_start_ms.store(u64::MAX, Ordering::Release);
     }
 }
@@ -595,12 +590,15 @@ async fn handle_control_inner<S>(
                 // re-checking on wake (the frame may have completed meanwhile).
                 let stall = stall.clone();
                 loop {
-                    // Park until a read consumes a byte (a stall begins or
-                    // extends). A fresh read / completed frame clears
-                    // `saw_data`, so a stall never starts without this notify.
-                    stall.notify.notified().await;
-                    // A fresh read (no stall in progress) → back to the notify
-                    // park.
+                    // Only park on the notify when no stall is live: once a
+                    // mid-frame stall exists, the deadline is recomputed from
+                    // the FIXED stall start on every re-poll, so a competing
+                    // arm winning a select round (internal msg, yamux stream)
+                    // can no longer strand the reaper by consuming the
+                    // one-shot notify permit.
+                    if stall.stall_start().is_none() {
+                        stall.notify.notified().await;
+                    }
                     while let Some(start) = stall.stall_start() {
                         // Live deadline from the stall START — not from this
                         // notification (a multi-byte trickle would otherwise
@@ -609,7 +607,7 @@ async fn handle_control_inner<S>(
                         if let Some(deadline) = deadline {
                             tokio::time::sleep_until(deadline).await;
                             // Re-check after the sleep: if the frame completed
-                            // while sleeping, `saw_data` is cleared and we go
+                            // while sleeping, the stall is cleared and we go
                             // back to parking on notify. Still stalled → reap.
                             if stall.stall_start().is_some() {
                                 return;
@@ -1360,6 +1358,102 @@ mod idle_reap_tests {
         assert!(
             control_task.is_finished(),
             "mid-frame stall must be reaped at CONTROL_IDLE_TIMEOUT"
+        );
+        control_task.await.expect("control task exits");
+    }
+
+    /// Round-17-review residual (MEDIUM): the self-arming reap arm parks on
+    /// `stall.notify.notified()` and only re-arms its deadline after a
+    /// subsequent notification. A competing select arm winning a round (an
+    /// internal message here; a yamux stream — or any server-side internal
+    /// event — in production) drops the arm's in-flight `sleep_until`; the
+    /// re-created arm then parks on `notified()` with the one-shot notify
+    /// permit already consumed by the stall-start wake, and a staller that
+    /// sends no further bytes never wakes it — the stall is never reaped. A
+    /// partial-frame staller that ALSO opens one yamux stream (any time
+    /// within the 90s window) pins its permit / task / fd forever, defeating
+    /// exactly the DoS this arm was built to close.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_control_reaped_despite_competing_select_arm() {
+        let mut state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        Arc::get_mut(&mut state)
+            .expect("sole state ref")
+            .heartbeat_timeout = 0; // disabled; exercises the stall arm (<=0 guard)
+
+        let (server, mut client) = tokio::io::duplex(1024);
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("idle-test-run".into()),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("test-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        let state_clone = state.clone();
+        let control_task = tokio::spawn(handle_control(
+            server,
+            login,
+            state_clone,
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+        ));
+
+        // Login handshake completes (real duplex I/O).
+        let error = read_login_resp_error(&mut client).await;
+        assert!(error.is_empty(), "login failed: {error}");
+
+        // Send a partial frame and stall (same shape as the sibling test:
+        // 16-byte CFB IV + 4-byte partial V1 header).
+        use tokio::io::AsyncWriteExt;
+        client
+            .write_all(&[0u8; 20])
+            .await
+            .expect("write partial frame");
+        // Let the control task consume the 4 bytes and arm the reap arm.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Competing arm: an internal message delivered mid-stall (production
+        // equivalent: the attacker opens a yamux stream). The select picks it
+        // over the reap arm's sleep, dropping the sleep; the re-created arm
+        // parks on `notified()` — the one-shot permit from the stall-start
+        // wake is already consumed, and no further bytes ever arrive.
+        let ctl_tx = state
+            .run_id_to_ctl_tx
+            .get("idle-test-run")
+            .expect("control registered at login")
+            .tx
+            .clone();
+        ctl_tx
+            .send(crate::state::InternalMsg::WriteNatHoleSid {
+                sid: "no-such-session".into(),
+            })
+            .await
+            .expect("send internal msg");
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(CONTROL_IDLE_TIMEOUT + Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            control_task.is_finished(),
+            "mid-frame stall must still be reaped at CONTROL_IDLE_TIMEOUT even after a competing select arm wins a round"
         );
         control_task.await.expect("control task exits");
     }

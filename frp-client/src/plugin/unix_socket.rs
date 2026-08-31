@@ -79,6 +79,14 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                                     }
                                 }
                             });
+                            // Reap completed handlers so their JoinSet nodes
+                            // and outputs do not accumulate for the
+                            // listener's lifetime — a long-lived listener
+                            // would otherwise grow with cumulative connection
+                            // count instead of concurrency. Errors are
+                            // already logged inside the handler, so the ()
+                            // output is dropped.
+                            while handlers.try_join_next().is_some() {}
                         }
                         Err(e) => {
                             // Warn at most once per second while the accept

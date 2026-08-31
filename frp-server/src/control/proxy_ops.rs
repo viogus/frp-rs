@@ -5566,10 +5566,13 @@ mod tcp_auto_bind_retry_tests {
         });
         // Run the registration task to its first suspension (the commit
         // WRITE lock — it cannot proceed while the READ guard is held, and
-        // nothing before the commit is contended).
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        // nothing before the commit is contended). The OS probe itself now
+        // runs on the spawn_blocking pool (r3/server#1), so plain yield_now
+        // cannot observe its completion: warm the pool, then give the
+        // blocking thread real time to finish the probe (a microsecond bind
+        // after pool warm-up; 50ms is a wide margin) before the thief binds.
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let thief = std::net::TcpListener::bind(("127.0.0.1", stolen)).expect("thief bind");
         drop(guard);
 
@@ -5668,9 +5671,11 @@ mod tcp_auto_bind_retry_tests {
             )
             .await
         });
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        // Same probe→bind seam as the auto-assign test: warm the
+        // spawn_blocking pool and let the probe finish before the thief
+        // binds, so the steal lands on the bind itself.
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let thief = std::net::TcpListener::bind(("127.0.0.1", requested)).expect("thief bind");
         drop(guard);
 

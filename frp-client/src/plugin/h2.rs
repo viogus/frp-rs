@@ -106,6 +106,13 @@ pub(crate) async fn serve_h2_connection<S>(
                         debug!(error = %e, "https plugin h2 stream error");
                     }
                 });
+                // Reap completed stream tasks so their JoinSet nodes and
+                // outputs do not accumulate for this connection's lifetime —
+                // a keep-alive h2 connection can open hundreds of streams,
+                // but memory and scan cost must track concurrency, not
+                // cumulative stream count. Errors are already logged inside
+                // the handler, so the () output is dropped.
+                while streams.try_join_next().is_some() {}
             }
             Some(Err(e)) => {
                 debug!(error = %e, "https plugin h2 connection error");
