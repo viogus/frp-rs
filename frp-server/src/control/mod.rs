@@ -51,6 +51,28 @@ async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
 /// login reject/success deadlines — those keep their tighter budget.
 const CTL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Idle deadline for the main control connection when the heartbeat watchdog
+/// is DISABLED (tcp_mux enabled by default forces `heartbeat_timeout = -1`,
+/// see `frp-core/src/config/server.rs` — Go frp parity: Go keeps a
+/// control-plane heartbeat via its independent heartbeatWorker goroutine
+/// calling `ctl.Close()` on long silence, frp-rs disables its check under
+/// tcp_mux). Without a fallback here, an authenticated client that stays
+/// silent (or only emits 12-byte yamux PINGs, which are not FRP control
+/// frames so `last_completed_frame` never advances) can pin its
+/// conn_semaphore permit + task + fd forever. 512 such connections exhaust
+/// every permit → the whole server rejects all new login / work / visitor /
+/// vhost / tcpmux connections with "Max connections reached" (HIGH: auth'd
+/// silent-control DoS).
+///
+/// The anchor is "most recently COMPLETED control FRAME", reset when any
+/// frame — including the frpc heartbeat Ping — is read. Healthy clients send
+/// a heartbeat control frame every `heartbeat_interval` (default 30s), so
+/// this 90s (= 3×) deadline never fires for them; a client emitting only
+/// yamux PINGs never advances the anchor and is reaped. Only compiled when
+/// the watchdog is off (`heartbeat_timeout <= 0`), so the normal
+/// `heartbeat_timeout > 0` path is untouched.
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Deadline for yamux-stream reads in the control select loop (round 10
 /// HIGH). Unlike the main control-read branch (the persisted
 /// `pending_read` future — which yields back to the select when the peer
@@ -311,6 +333,15 @@ async fn handle_control_inner<S>(
     type PendingRead = Pin<Box<dyn Future<Output = Result<FrpMessage, frp_core::Error>> + Send>>;
     let mut pending_read: Option<PendingRead> = None;
 
+    // Idle-reap anchor when the heartbeat watchdog is disabled (tcp_mux
+    // default → heartbeat_timeout = -1). Advanced on every COMPLETED control
+    // frame (health monitor: frpc heartbeat Ping arrives every 30s by
+    // default); the select's `CONTROL_IDLE_TIMEOUT` arm (guard
+    // `heartbeat_timeout <= 0`) reaps a peer that never completes a frame —
+    // a silent conn or one that only emits 12-byte yamux PINGs, which are
+    // not FRP control frames and never move this anchor.
+    let mut last_completed_frame = Instant::now();
+
     loop {
         // Superseded by a newer login (same run_id) whose Shutdown message
         // could not be delivered through a full channel (round-7 review
@@ -432,6 +463,32 @@ async fn handle_control_inner<S>(
                 }
             }, if state.heartbeat_timeout > 0 => {
                 warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
+                break;
+            }
+
+            // HIGH: idle-reap fallback for when the heartbeat watchdog is
+            // DISABLED (`heartbeat_timeout <= 0` — tcp_mux enabled by default
+            // sets -1). Reap a control connection that has not COMPLETED a
+            // control frame within `CONTROL_IDLE_TIMEOUT`. The anchor
+            // (`last_completed_frame`) only advances on real FRP frames — a
+            // peer emitting only 12-byte yamux PINGs (which keep yamux alive
+            // but are not FRP control frames) is indistinguishable from a
+            // silent conn and is reaped, so it cannot pin its
+            // conn_semaphore permit / task / fd indefinitely. Healthy frpc
+            // send a heartbeat control frame every 30s and are unaffected.
+            // Mutually exclusive with the heartbeat arm above, so only one
+            // idle ramp can ever fire.
+            _ = async {
+                // checked_add: `Instant` overflow must never panic the
+                // process — degrade to never firing (the loop-top expiry and
+                // socket teardown still apply; this arm is belt-and-suspenders
+                // for permit reclamation).
+                match last_completed_frame.checked_add(CONTROL_IDLE_TIMEOUT) {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if state.heartbeat_timeout <= 0 => {
+                warn!(peer = ?peer, idle = ?CONTROL_IDLE_TIMEOUT, "Control connection for {:?} idle (no completed frame in {:?}, heartbeat watchdog disabled), disconnecting", peer, CONTROL_IDLE_TIMEOUT);
                 break;
             }
 
@@ -557,6 +614,14 @@ async fn handle_control_inner<S>(
                 pending_read = None;
                 match msg {
                     Ok(msg) => {
+                        // Any COMPLETED control frame keeps the connection
+                        // alive for the idle-reap anchor (HIGH fix): a
+                        // healthy frpc sends a heartbeat control frame every
+                        // `heartbeat_interval` (default 30s), so a peer that
+                        // completes frames is never reaped even with the
+                        // heartbeat watchdog off (tcp_mux default). Only
+                        // yamux-PING-only / fully-silent peers stall this.
+                        last_completed_frame = Instant::now();
                         if dispatch::dispatch_frp_message(&mut ctx, &mut ctl, &mut writer, msg, &authenticated_user).await.is_err() {
                             break;
                         }
@@ -983,5 +1048,103 @@ mod partial_read_tests {
         // Teardown: closing the client side ends the control (read EOF).
         drop(client);
         control_task.await.expect("control task must exit");
+    }
+}
+
+#[cfg(test)]
+mod idle_reap_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Read one V1 LoginResp frame (shared local copy — the sibling module's
+    /// helper is private).
+    async fn read_login_resp_error(client: &mut tokio::io::DuplexStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut header = [0u8; 9];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("read frame header");
+        let len = u64::from_be_bytes(header[1..9].try_into().unwrap()) as usize;
+        assert!(len < 4096, "implausible frame length {len}");
+        let mut payload = vec![0u8; len];
+        client
+            .read_exact(&mut payload)
+            .await
+            .expect("read frame payload");
+        let resp: frp_core::msg::LoginResp =
+            serde_json::from_slice(&payload).expect("parse LoginResp");
+        resp.error.unwrap_or_default()
+    }
+
+    /// HIGH regression: an authenticated control connection that completes
+    /// NO control frame (a silent conn, or one that only emits 12-byte yamux
+    /// PINGs — which are not FRP control frames) must be reaped even when
+    /// the heartbeat watchdog is DISABLED (tcp_mux on by default forces
+    /// `heartbeat_timeout = -1`). Without the `CONTROL_IDLE_TIMEOUT` arm such
+    /// a connection pins its conn_semaphore permit / task / fd forever, and
+    /// 512 of them exhaust every permit → whole-server connection rejection.
+    ///
+    /// Paused time advances `CONTROL_IDLE_TIMEOUT` instantly while the duplex
+    /// login handshake still runs (real socket I/O — frame delivery isn't
+    /// time-driven). After login we send nothing; the idle arm (guard
+    /// `heartbeat_timeout <= 0`) fires and the control task exits of its own
+    /// accord, reclaiming the permit/task/fd.
+    #[tokio::test(start_paused = true)]
+    async fn silent_control_reaped_when_heartbeat_disabled() {
+        let mut state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        Arc::get_mut(&mut state)
+            .expect("sole state ref")
+            .heartbeat_timeout = 0; // disabled; exercises the idle arm (<=0 guard)
+
+        let (server, mut client) = tokio::io::duplex(1024);
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("idle-test-run".into()),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("test-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        let state_clone = state.clone();
+        let control_task = tokio::spawn(handle_control(
+            server,
+            login,
+            state_clone,
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+        ));
+
+        // Login handshake completes (real duplex I/O).
+        let error = read_login_resp_error(&mut client).await;
+        assert!(error.is_empty(), "login failed: {error}");
+
+        // Send NOTHING — the connection is idle. Advance past the idle
+        // deadline; the arm must fire and the control task exit (reap the
+        // permit/task/fd).
+        tokio::time::advance(CONTROL_IDLE_TIMEOUT + Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            control_task.is_finished(),
+            "idle control conn with heartbeat disabled must be reaped at CONTROL_IDLE_TIMEOUT"
+        );
+        control_task.await.expect("control task exits");
     }
 }

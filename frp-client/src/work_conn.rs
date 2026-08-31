@@ -887,7 +887,9 @@ async fn run_udp_work_conn(
     };
     let writer = async move {
         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
-        let mut payload = Vec::with_capacity(udp_packet_size.max(1));
+        // Each packet brings its own Vec by move (round-17 audit B); the slot
+        // is (re)assigned before every use, so no initializer is needed.
+        let mut payload: Vec<u8>;
         // local_addr is loop-invariant (already parsed to a SocketAddr at
         // startup); pre-build the UdpAddr once and move it in/out per packet
         // instead of re-parsing the string every packet (audit D1-5). An
@@ -899,6 +901,16 @@ async fn run_udp_work_conn(
         let mut scratch_c: Vec<u8> = Vec::new();
         // Reused binary-codec wire buffer: type ID + encoded packet.
         let mut wire_scratch: Vec<u8> = Vec::new();
+        // Per-remote IP-string cache. UDPPacket.remote_addr.ip is a String
+        // (Go msg.UDPPacket.RemoteAddr parity), so the IpAddr would be
+        // re-formatted per packet. Cache the formatted string per remote:
+        // repeated packets to the same remote (the dominant UDP pattern)
+        // skip the formatting work (IPv6 to_string scans for zero runs).
+        // Bounded: distinct remotes mirror the reader-side session map
+        // (idle-swept), but a hostile flood of distinct source addrs must
+        // not grow this unboundedly — clear on overflow (cheap fail-safe;
+        // the cache is a perf aid, not state).
+        let mut ip_cache: HashMap<SocketAddr, String> = HashMap::new();
         let mut keepalive = tokio::time::interval(Duration::from_secs(if udp_keepalive_secs > 0 {
             udp_keepalive_secs
         } else {
@@ -913,8 +925,13 @@ async fn run_udp_work_conn(
                     if changed.is_err() || *writer_cancel.borrow() { break; }
                 }
                 Some((remote, data)) = write_rx.recv() => {
-                    payload.clear();
-                    payload.extend_from_slice(&data);
+                    // Round-17 audit B: take the received Vec by move — it
+                    // crossed the async channel already owned, so the old
+                    // clear + extend_from_slice was a second full datagram
+                    // copy per packet. Compression (when enabled) compresses
+                    // out of the moved-in payload and swaps the scratch in,
+                    // preserving the reused-buffer path exactly.
+                    payload = data;
                     if use_comp && encryption::compress_into(&payload, &mut scratch_c).is_ok()
                     {
                         std::mem::swap(&mut payload, &mut scratch_c);
@@ -933,7 +950,17 @@ async fn run_udp_work_conn(
                             msg::UdpAddr::from_string(&local_addr_str)
                         }),
                         remote_addr: Some(msg::UdpAddr {
-                            ip: remote.ip().to_string(),
+                            ip: match ip_cache.get(&remote) {
+                                Some(s) => s.clone(),
+                                None => {
+                                    let s = remote.ip().to_string();
+                                    if ip_cache.len() >= 256 {
+                                        ip_cache.clear();
+                                    }
+                                    ip_cache.insert(remote, s.clone());
+                                    s
+                                }
+                            },
                             port: remote.port(),
                             zone: String::new(),
                         }),

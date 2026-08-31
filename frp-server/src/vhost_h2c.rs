@@ -312,7 +312,7 @@ async fn handle_stream(
     let internal_tx = state
         .run_id_to_ctl_tx
         .get(&forward.run_id)
-        .map(|v| v.clone());
+        .map(|v| v.tx.clone());
     let Some(ctl_tx) = internal_tx else {
         tracing::warn!(host = %host, path = %path, "HTTP VHost (h2c) route for '{}' path '{}' found but control handler gone", host, path);
         return send_h2_error(&mut respond, 502, &[], Bytes::new()).await;
@@ -332,7 +332,7 @@ async fn handle_stream(
     // CTL_SEND_TIMEOUT the send is abandoned and the h2 stream answers 502.
     match tokio::time::timeout(
         crate::state::CTL_SEND_TIMEOUT,
-        ctl_tx.tx.send(InternalMsg::ProxyUserConn {
+        ctl_tx.send(InternalMsg::ProxyUserConn {
             proxy_name: forward.proxy_name,
             user_conn: frp_core::transport::IoStream::SshChannel(Box::new(control)),
             pre_read: forward.request_head,

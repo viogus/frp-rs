@@ -15,20 +15,24 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
     // extensions. Go frp v0.70.0 treats unknown type bytes as errors.
     // These MUST NOT be sent to Go peers. See msg.rs lines 26-29.
     let type_byte = msg.v1_type_byte();
-    let mut buf = serde_json::to_vec(msg)
+    let buf = serde_json::to_vec(msg)
         .map_err(|e| crate::Error::Protocol(format!("serialize V1 msg: {e}").into()))?;
 
     if buf.len() as u64 > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol("V1 message too large".into()));
     }
 
-    // Prepend 9-byte header (1 type byte + 8 length bytes) in-place,
-    // avoiding a second Vec allocation (previous code used Vec::with_capacity + copy).
-    let payload_len = buf.len();
-    buf.resize(payload_len + V1_HEADER_LEN, 0);
-    buf.copy_within(0..payload_len, V1_HEADER_LEN);
-    buf[0] = type_byte;
-    buf[1..V1_HEADER_LEN].copy_from_slice(&(payload_len as u64).to_be_bytes());
+    // Header + payload go out as ONE writev(2) call (mirrors
+    // write_v2_frame_raw): the old resize + copy_within was a full-payload
+    // memmove per control message. The 9-byte header lives in a stack array —
+    // no allocation, no payload copy. Transports without native vectored
+    // writes fall back to per-buffer poll_write (tokio's default impl),
+    // semantically identical to the old single write_all for buffered
+    // transports (KCP, yamux, WebSocket, CipherWriter).
+    let payload_len = buf.len() as u64;
+    let mut header = [0u8; V1_HEADER_LEN];
+    header[0] = type_byte;
+    header[1..V1_HEADER_LEN].copy_from_slice(&payload_len.to_be_bytes());
 
     tracing::trace!(
         type_byte = %type_byte,
@@ -38,10 +42,36 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
         payload_len
     );
 
-    writer
-        .write_all(&buf)
-        .await
-        .map_err(|e| crate::Error::Protocol(format!("write V1 frame: {e}").into()))?;
+    let mut hdr_off = 0usize;
+    let mut payload_off = 0usize;
+    loop {
+        if hdr_off >= V1_HEADER_LEN && payload_off >= buf.len() {
+            break;
+        }
+        let bufs = [
+            std::io::IoSlice::new(&header[hdr_off..]),
+            std::io::IoSlice::new(&buf[payload_off..]),
+        ];
+        let n = writer
+            .write_vectored(&bufs)
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("write V1 frame: {e}").into()))?;
+        if n == 0 {
+            return Err(crate::Error::Protocol(
+                "write V1 frame: zero-length write".into(),
+            ));
+        }
+        let mut rem = n;
+        if hdr_off < V1_HEADER_LEN {
+            let take = rem.min(V1_HEADER_LEN - hdr_off);
+            hdr_off += take;
+            rem -= take;
+        }
+        let take = rem.min(buf.len() - payload_off);
+        payload_off += take;
+        rem -= take;
+        debug_assert_eq!(rem, 0);
+    }
     // Flush is NOT called here — callers that need it (KCP control channel
     // after login) flush explicitly.  Adding a blanket flush breaks CipherStream
     // layered writes because the intermediate flush can split encrypted blocks.

@@ -76,6 +76,27 @@ pub struct ServerConfig {
     /// exhaustion; set to 0 for unlimited. Go frp compat: maxPortsPerClient.
     #[serde(default, alias = "maxPortsPerClient")]
     pub max_ports_per_client: u64,
+    /// Max total proxies a single client can register (any type — TCP/UDP,
+    /// HTTP/HTTPS/tcpmux, STCP/XTCP, vnet). Bound the unbounded growth of
+    /// `proxy_manager`, vhost/tcpmux routes, `sk_index` and the prometheus
+    /// label set that a single authenticated client could otherwise drive
+    /// (per-client proxy DoS; Go frp has no equivalent, so this is a
+    /// Rust-only opt-in). Set 0 for unlimited (default, Go-relaxed). Clamped
+    /// to 1,048,576 (2^20) at normalization like its port-count sibling.
+    #[serde(default, alias = "maxProxiesPerClient")]
+    pub max_proxies_per_client: u64,
+    /// Max route-claiming domains a single proxy registration may carry.
+    /// Counts `custom_domains` + (1 when a `subdomain` is set) + `locations`
+    /// — an upper bound on the routing-table entries one NewProxy call can
+    /// add. Without it, one authenticated client can register a single
+    /// HTTP/HTTPS/tcpmux proxy with an enormous `custom_domains`/`locations`
+    /// list and grow the shared vhost/tcpmux routing tables (and per-request
+    /// conflict-check cost) without bound (per-client route DoS; Go frp has
+    /// no equivalent, so this is a Rust-only opt-in). Pairs with
+    /// `max_proxies_per_client` to bound total routes. 0 = unlimited
+    /// (default, Go-relaxed).
+    #[serde(default, alias = "maxCustomDomainsPerProxy")]
+    pub max_custom_domains_per_proxy: u64,
     /// Maximum concurrent user connections per proxy. 0 = unlimited (Go frp
     /// has no per-proxy cap; default). A flood of user connections to one
     /// proxy would otherwise grow `pending_requests` + fds without bound
@@ -170,6 +191,8 @@ pub struct ServerConfigSnapshot {
     pub max_pool_count: i64,
     pub max_ports_per_client: i64,
     pub max_conns_per_proxy: i64,
+    pub max_proxies_per_client: i64,
+    pub max_custom_domains_per_proxy: i64,
     pub heartbeat_timeout: i64,
     pub allow_ports_str: String,
     pub tls_force: bool,
@@ -193,6 +216,8 @@ impl ServerConfigSnapshot {
             max_pool_count: cfg.transport.max_pool_count,
             max_ports_per_client: cfg.max_ports_per_client.min(1_048_576) as i64,
             max_conns_per_proxy: cfg.max_conns_per_proxy.min(1_048_576) as i64,
+            max_proxies_per_client: cfg.max_proxies_per_client.min(1_048_576) as i64,
+            max_custom_domains_per_proxy: cfg.max_custom_domains_per_proxy.min(1_048_576) as i64,
             heartbeat_timeout: cfg.transport.heartbeat_timeout,
             allow_ports_str: cfg.allow_ports.clone(),
             tls_force: cfg.tls_only,
@@ -303,6 +328,8 @@ impl Default for ServerConfig {
             allow_ports: String::new(),
             max_ports_per_client: 0,
             max_conns_per_proxy: 0,
+            max_proxies_per_client: 0,
+            max_custom_domains_per_proxy: 0,
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
@@ -943,6 +970,16 @@ impl ServerTransportConfig {
         // passes through; the downstream watchdog arithmetic is
         // overflow-safe (`Duration::from_secs` + `Instant::checked_add`).
         // Values <= 0 keep their disable semantics untouched.
+
+        // Go v0.71.0: TcpMuxKeepaliveInterval = EmptyOr(0, 30) — an explicit
+        // 0 OR an omitted value (`#[serde(default)]` deserializes to 0) means
+        // "use the default" (30), not "1s scan". Without this the runtime
+        // `.max(1)` clamped yamux to a 1s scan / 30s dead-peer cadence,
+        // diverging from Go's 30s keepalive / 90s detection (MED compat
+        // deviation).
+        if self.tcp_mux_keepalive_interval == 0 {
+            self.tcp_mux_keepalive_interval = 30;
+        }
     }
 }
 

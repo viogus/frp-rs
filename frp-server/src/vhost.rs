@@ -232,6 +232,14 @@ struct VhostTables {
     routes: HashMap<String, HashMap<String, Vec<VhostRoute>>>,
     /// proxy_name -> Vec<(domain, route_by_http_user)>
     by_proxy: HashMap<String, Vec<(String, String)>>,
+    /// Number of registered wildcard domains (domain starting with `*`, e.g.
+    /// `*.example.com` or bare `*`). Maintained by register/unregister. Lets
+    /// the lookup fast-exit to the exact-match path when no wildcard route
+    /// exists — the per-request `parts.join(".")` expansion then never runs.
+    /// A re-registered proxy that leaves an orphan wildcard route behind
+    /// still has that route matchable, so this counter can only over-count,
+    /// never under-count; the `== 0` gate is therefore always safe.
+    wildcard_count: usize,
 }
 
 /// Manages HTTP VHost routing table (domain + location -> proxy).
@@ -251,6 +259,7 @@ impl VhostManager {
             inner: RwLock::new(VhostTables {
                 routes: HashMap::new(),
                 by_proxy: HashMap::new(),
+                wildcard_count: 0,
             }),
         }
     }
@@ -379,6 +388,13 @@ impl VhostManager {
             }
         }
 
+        // Keep wildcard_count in lockstep with the routes map: every wildcard
+        // domain this registration is about to add is matchable, so it must be
+        // counted (see the field doc for the over-count safety argument).
+        // Placed after the conflict/dedup checks so a rejected registration
+        // never bumps the counter.
+        tables.wildcard_count += domains.iter().filter(|d| d.starts_with('*')).count();
+
         // Register domain routes: append to Vec; sort once after all inserts.
         let mut domain_entries = Vec::new();
         for domain in &domains {
@@ -412,6 +428,11 @@ impl VhostManager {
         let mut tables = self.inner.write().await;
 
         if let Some(entries) = tables.by_proxy.remove(proxy_name) {
+            // Decrement the contribution this proxy's registrations made.
+            // If another proxy shares a wildcard domain, its own registration
+            // still holds the counter up — so the subtraction never
+            // under-counts below the actually-matchable wildcard set.
+            tables.wildcard_count -= entries.iter().filter(|(d, _)| d.starts_with('*')).count();
             for (domain, rubu) in &entries {
                 if let Some(user_map) = tables.routes.get_mut(domain) {
                     if let Some(vrs) = user_map.get_mut(rubu) {
@@ -466,6 +487,13 @@ impl VhostManager {
         scheme: &str,
     ) -> Option<VhostRouteMatch> {
         let tables = self.inner.read().await;
+
+        // Fast exit: no wildcard routes registered — the exact match IS the
+        // whole answer, and the per-request `parts.join(".")` expansion for
+        // >=3-label domains never runs.
+        if tables.wildcard_count == 0 {
+            return get_locked(&tables.routes, domain, path, http_user, scheme);
+        }
 
         // 1. Exact match
         if let Some(route) = get_locked(&tables.routes, domain, path, http_user, scheme) {
@@ -815,10 +843,13 @@ async fn handle_http1_request<S>(
     .await
     {
         Ok(forward) => {
+            // Only the mpsc::Sender is consumed here — the full-ControlTx
+            // clone (two Strings + two Arc bumps) per vhost forward was pure
+            // waste (round-3 server finding 6).
             let internal_tx = state
                 .run_id_to_ctl_tx
                 .get(&forward.run_id)
-                .map(|v| v.clone());
+                .map(|v| v.tx.clone());
             if let Some(ctl_tx) = internal_tx {
                 // send().await: backpressure is correct — a full control
                 // channel must not silently drop a user connection (Go frp
@@ -829,7 +860,7 @@ async fn handle_http1_request<S>(
                 // after CTL_SEND_TIMEOUT the connection drops.
                 match tokio::time::timeout(
                     crate::state::CTL_SEND_TIMEOUT,
-                    ctl_tx.tx.send(InternalMsg::ProxyUserConn {
+                    ctl_tx.send(InternalMsg::ProxyUserConn {
                         proxy_name: forward.proxy_name,
                         user_conn: wrap(stream),
                         pre_read: forward.request_head,
@@ -1211,7 +1242,7 @@ pub async fn run_vhost_https_listener(
                         let internal_tx = state
                             .run_id_to_ctl_tx
                             .get(route.run_id.as_ref())
-                            .map(|v| v.clone());
+                            .map(|v| v.tx.clone());
                         if let Some(ctl_tx) = internal_tx {
                             // send().await: same backpressure rationale as the
                             // HTTP vhost path — runs in a per-connection
@@ -1222,7 +1253,7 @@ pub async fn run_vhost_https_listener(
                             // CTL_SEND_TIMEOUT the connection drops.
                             match tokio::time::timeout(
                                 crate::state::CTL_SEND_TIMEOUT,
-                                ctl_tx.tx.send(InternalMsg::ProxyUserConn {
+                                ctl_tx.send(InternalMsg::ProxyUserConn {
                                     proxy_name: route.proxy_name.to_string(),
                                     // Passthrough: raw encrypted bytes, no TLS wrap.
                                     user_conn: frp_core::transport::IoStream::Tcp(stream),
@@ -2961,6 +2992,7 @@ mod tests {
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
             0,
             0,
+            0,
             168,
             true,
             0,
@@ -3158,6 +3190,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.proxy_name.as_ref(), "p2");
+    }
+
+    /// wildcard_count stays symmetric across register/unregister, and the
+    /// fast-exit (no wildcard routes registered) resolves the exact match
+    /// without running the wildcard expansion.
+    #[tokio::test]
+    async fn test_vhost_wildcard_count_gate() {
+        let mgr = VhostManager::new();
+        // Exact-only registrations leave the counter at 0.
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            "http",
+            &[],
+            "run-1",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("exact registration must succeed");
+        {
+            let tables = mgr.inner.read().await;
+            assert_eq!(tables.wildcard_count, 0, "exact route must not count");
+        }
+        // Wildcard registration bumps the counter once per wildcard domain.
+        mgr.register(
+            "p2",
+            &["*.example.com".into(), "exact2.example.com".into()],
+            "http",
+            &[],
+            "run-2",
+            "",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("wildcard registration must succeed");
+        {
+            let tables = mgr.inner.read().await;
+            assert_eq!(tables.wildcard_count, 1, "one wildcard domain counted");
+        }
+        // The gate still routes the exact match when a wildcard exists.
+        let r = mgr
+            .lookup_wildcard("a.example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
+
+        // Unregistering the wildcard proxy restores the counter.
+        mgr.unregister("p2").await;
+        {
+            let tables = mgr.inner.read().await;
+            assert_eq!(tables.wildcard_count, 0, "unregister must decrement");
+        }
+        // With no wildcards left, the fast-exit path answers the exact match.
+        let r = mgr
+            .lookup_wildcard("a.example.com", "/", "", "http")
+            .await
+            .unwrap();
+        assert_eq!(r.proxy_name.as_ref(), "p1");
     }
 
     /// proxy_ops expands a subdomain + sub_domain_host to

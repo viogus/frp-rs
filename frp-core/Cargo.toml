@@ -46,7 +46,7 @@ hyper = { workspace = true, optional = true }
 hyper-rustls = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 tower-service = { workspace = true, optional = true }
-http-body-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true, features = ["full"] }
 webpki-roots = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 http = { workspace = true, optional = true }

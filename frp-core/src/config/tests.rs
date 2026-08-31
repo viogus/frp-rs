@@ -1467,6 +1467,69 @@ tcpMuxKeepaliveInterval = 15
 }
 
 #[test]
+fn test_server_tcp_mux_keepalive_omitted_defaults_to_30() {
+    // Go v0.71.0: TcpMuxKeepaliveInterval = EmptyOr(0, 30) — omitted OR
+    // explicit 0 resolves to 30, NOT the runtime `.max(1)` (1s scan).
+    let cfg = load_server_config_from_str(
+        r#"
+bindPort = 7000
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.transport.tcp_mux_keepalive_interval, 30);
+}
+
+#[test]
+fn test_server_tcp_mux_keepalive_explicit_zero_defaults_to_30() {
+    let cfg = load_server_config_from_str(
+        r#"
+bindPort = 7000
+[transport]
+tcpMuxKeepaliveInterval = 0
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.transport.tcp_mux_keepalive_interval, 30);
+}
+
+#[test]
+fn test_client_tcp_mux_keepalive_omitted_defaults_to_30() {
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.tcp_mux_keepalive_interval, 30);
+}
+
+#[test]
+fn test_client_tcp_mux_keepalive_explicit_zero_defaults_to_30() {
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+tcpMuxKeepaliveInterval = 0
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.tcp_mux_keepalive_interval, 30);
+}
+
+#[test]
+fn test_client_tcp_mux_keepalive_explicit_value_preserved() {
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+tcpMuxKeepaliveInterval = 45
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.tcp_mux_keepalive_interval, 45);
+}
+
+#[test]
 fn test_explicit_server_heartbeat_timeout_90_is_preserved_with_tcp_mux() {
     let cfg = load_server_config_from_str(
         r#"
@@ -5409,6 +5472,35 @@ fn test_max_conns_per_proxy_snapshot_clamped_to_2pow20() {
     };
     let snap = ServerConfigSnapshot::from_config(&cfg);
     assert_eq!(snap.max_conns_per_proxy, 1000);
+}
+
+#[test]
+fn test_max_custom_domains_per_proxy_parse_and_snapshot_clamp() {
+    // Snake + camelCase parse; default 0 = unlimited; snapshot clamps to
+    // 2^20 like its siblings (u64::MAX would overflow the i64 field).
+    let toml = r#"
+bind_port = 7000
+max_custom_domains_per_proxy = 128
+"#;
+    let cfg: ServerConfig = load_server_config_from_str(toml).unwrap();
+    assert_eq!(cfg.max_custom_domains_per_proxy, 128);
+
+    let cfg: ServerConfig = load_server_config_from_str(
+        "bind_port = 7000\nmaxCustomDomainsPerProxy = 64\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.max_custom_domains_per_proxy, 64);
+
+    let cfg: ServerConfig =
+        load_server_config_from_str("bind_port = 7000\n").unwrap();
+    assert_eq!(cfg.max_custom_domains_per_proxy, 0);
+
+    let cfg = ServerConfig {
+        max_custom_domains_per_proxy: u64::MAX,
+        ..Default::default()
+    };
+    let snap = ServerConfigSnapshot::from_config(&cfg);
+    assert_eq!(snap.max_custom_domains_per_proxy, 1_048_576);
 }
 
 // ─── Exec token-source validation branches ────────────────────────────

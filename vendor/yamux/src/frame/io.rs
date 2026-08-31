@@ -36,23 +36,38 @@ pub(crate) struct Io<T> {
     io: T,
     read_state: ReadState,
     write_state: WriteState,
-    /// frp-rs patch: connection-scoped send-side body-buffer pool. A fully
-    /// written data-frame body is returned here instead of dropped
-    /// (WriteState::Body completion); `Stream::poll_write` draws from it,
-    /// removing the per-chunk `Vec` allocation on the send path. Send-side
-    /// only — read bodies move into `Shared::buffer` and are consumed
-    /// lazily, so they must never be pooled.
+    /// frp-rs patch: connection-scoped body-buffer pool (send + read side).
+    /// A fully written data-frame body is returned here (WriteState::Body
+    /// completion) and `Stream::poll_write` draws from it on the send path;
+    /// read bodies are drawn at ReadState::Body init and returned once the
+    /// chunk is fully consumed in `Stream::poll_read`, removing the
+    /// per-chunk `Vec` allocation + zero-fill in both directions.
     body_pool: Arc<ArrayQueue<Vec<u8>>>,
+    /// frp-rs patch: the configured send-split size. A fully-written body at
+    /// or below this size is returned to `body_pool`; larger buffers are
+    /// dropped (best-effort pool — a pool must not grow its stored buffers
+    /// arbitrarily large, or reuse would pin oversized allocations). Using
+    /// the CONFIG value (not `DEFAULT_SPLIT_SEND_SIZE`) matters: frp-rs sets
+    /// `split_send_size = 32KiB`, so bodies of that size must qualify for
+    /// reuse — the DEFAULT (16KiB) gate silently disabled the send pool,
+    /// leaving one fresh `Vec` alloc + zeroing per 32KiB chunk.
+    split_send_size: usize,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
-    pub(crate) fn new(id: Id, io: T, body_pool: Arc<ArrayQueue<Vec<u8>>>) -> Self {
+    pub(crate) fn new(
+        id: Id,
+        io: T,
+        body_pool: Arc<ArrayQueue<Vec<u8>>>,
+        split_send_size: usize,
+    ) -> Self {
         Io {
             id,
             io,
             read_state: ReadState::Init,
             write_state: WriteState::Init,
             body_pool,
+            split_send_size,
         }
     }
 }
@@ -170,7 +185,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
                             // Buffers lost to WriteZero / Poisoned / teardown
                             // are fine — the pool dies with the connection.
                             if !buffer.is_empty()
-                                && buffer.capacity() <= crate::DEFAULT_SPLIT_SEND_SIZE
+                                && buffer.capacity() <= this.split_send_size
                             {
                                 let _ = this.body_pool.push(buffer);
                             }
@@ -266,10 +281,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
                             ))));
                         }
 
+                        // frp-rs patch: draw the read body from the
+                        // connection-scoped pool instead of `vec![0; len]`
+                        // (which also zero-fills every byte `poll_read` then
+                        // overwrites). `resize` reuses a pooled allocation
+                        // when it is large enough; a bigger body (peer used a
+                        // larger split size) just allocates fresh. The buffer
+                        // is returned to the pool in `Stream::poll_read` once
+                        // the chunk is fully consumed. Empty bodies stay out
+                        // of the pool (they are dropped by `Chunks::push`
+                        // anyway).
+                        let buffer = if body_len == 0 {
+                            Vec::new()
+                        } else {
+                            let mut buf = this.body_pool.pop().unwrap_or_default();
+                            buf.resize(body_len, 0);
+                            buf
+                        };
                         this.read_state = ReadState::Body {
                             header,
                             offset: 0,
-                            buffer: vec![0; body_len],
+                            buffer,
                         };
 
                         continue;
@@ -413,6 +445,7 @@ mod tests {
                     id,
                     futures::io::Cursor::new(Vec::new()),
                     Arc::new(ArrayQueue::new(1)),
+                    crate::DEFAULT_SPLIT_SEND_SIZE,
                 );
                 if io.send(f.clone()).await.is_err() {
                     return false;

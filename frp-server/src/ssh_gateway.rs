@@ -1128,6 +1128,7 @@ mod tests {
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
             0,
             0,
+            0,
             168,
             true,
             max_connections,

@@ -210,7 +210,13 @@ impl HealthState {
 /// TCP health check: connect to addr, then close. Success = connection established.
 pub(crate) async fn run_tcp_check(addr: &str, timeout: Duration) -> Result<(), String> {
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(stream)) => {
+            // Go parity: health checks dial with net/http (NoDelay=true
+            // default). Cosmetic for a connect+close probe, but keeps the
+            // "every raw TcpStream" nodelay invariant uniform.
+            frp_core::transport::set_nodelay(&stream);
+            Ok(())
+        }
         Ok(Err(e)) => Err(format!("TCP connect: {e}")),
         Err(_) => Err("timeout".into()),
     }
@@ -228,6 +234,10 @@ pub(crate) async fn run_http_check(
         .await
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("TCP connect: {e}"))?;
+    // Go's health checks dial with net/http (NoDelay=true by default); the
+    // small GET must not sit in Nagle's buffer waiting for the ACK. This
+    // probe is not a relay, so no buffer-size setup is needed — just nodelay.
+    frp_core::transport::set_nodelay(&stream);
 
     // Extract host from addr for the Host header. Go URL.Hostname():
     // port stripped, IPv6 brackets removed — a plain split(':') would

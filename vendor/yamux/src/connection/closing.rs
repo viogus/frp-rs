@@ -193,6 +193,7 @@ mod tests {
                 crate::connection::Id(0),
                 &mut socket,
                 std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(1)),
+                crate::DEFAULT_SPLIT_SEND_SIZE,
             )
             .fuse(),
         );

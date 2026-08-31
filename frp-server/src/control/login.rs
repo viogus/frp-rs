@@ -177,9 +177,14 @@ async fn verify_login_auth(
 > {
     // --- Authenticate ---
     // Internal connections (SSH gateway) with AlwaysAuthPass bypass all auth.
-    // always_auth_pass is Option<Option<bool>>: outer Option is ClientSpec presence
-    // (Go clients never send ClientSpec; only internal/Rust connections do).
-    // Inner Option<bool> defaults to false. Only Some(Some(true)) triggers bypass.
+    // always_auth_pass is Option<Option<bool>>: the outer Option is ClientSpec
+    // presence — Go's Login.ClientSpec is a VALUE struct with omitempty, which
+    // is a no-op on structs, so Go ALWAYS emits `"client_spec":{"type":"",
+    // "always_auth_pass":false}` (msg.go:89); the inner Option is the
+    // always_auth_pass bool itself, default false. The bypass is gated on
+    // `internal`, so only the SSH-gateway connection (which sets
+    // Some(Some(true))) triggers it — a regular frpc's always-emitted
+    // {"always_auth_pass": false} never bypasses.
     let is_auth_bypass = internal
         && login
             .client_spec
@@ -1265,6 +1270,7 @@ mod auth_signal_tests {
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
             0,
             0,
+            0,
             168,
             true,
             0,
@@ -1711,6 +1717,7 @@ mod oidc_throttle_tests {
             false,
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
             0,
             0,
             168,

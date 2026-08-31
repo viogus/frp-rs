@@ -853,6 +853,12 @@ pub struct AppState {
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
     /// Per-client proxy count limit. 0 = unlimited.
     pub max_ports_per_client: u64,
+    /// Per-client TOTAL proxy-count limit (any type, not just port-using).
+    /// 0 = unlimited (default, Go-relaxed). Bounds the growth of
+    /// proxy_manager / vhost / tcpmux / sk_index / prometheus labels that a
+    /// single authenticated client could otherwise drive without a port.
+    /// Rust-only opt-in; see `ServerConfig.max_proxies_per_client`.
+    pub max_proxies_per_client: u64,
     /// Per-proxy concurrent user-connection cap. 0 = unlimited (Go frp
     /// default). Bounds per-proxy connection floods (audit D2-2).
     pub max_conns_per_proxy: u64,
@@ -968,6 +974,7 @@ impl AppState {
         plugin_manager: Arc<crate::plugin::HttpPluginManager>,
         max_ports_per_client: u64,
         max_conns_per_proxy: u64,
+        max_proxies_per_client: u64,
         nat_hole_analysis_data_reserve_hours: u64,
         detailed_errors_to_client: bool,
         max_connections: usize,
@@ -1017,6 +1024,7 @@ impl AppState {
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             max_ports_per_client,
             max_conns_per_proxy,
+            max_proxies_per_client,
             client_ports_used: Arc::new(RwLock::new(std::collections::HashMap::new())),
             sudp_port,
             tcp_group_ctl: TcpGroupCtl::new(),
@@ -1383,6 +1391,7 @@ mod tests {
             false,
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
             0,
             0,
             168,

@@ -438,6 +438,17 @@ impl ClientConfig {
             self.pool_count = default_pool_count();
         }
 
+        // Go v0.71.0: TcpMuxKeepaliveInterval = EmptyOr(0, 30) — an explicit
+        // 0 OR an omitted value (`#[serde(default)]` deserializes to 0, and
+        // this struct is the top-level ClientConfig) means "use the default"
+        // (30), not "every frame / 1s scan". Without this, an omitted
+        // tcpMuxKeepaliveInterval stayed 0 and the runtime `.max(1)` clamped
+        // yamux to a 1s scan / 30s dead-detection cadence — diverging from
+        // Go's 30s keepalive / 90s dead peer (MED compat deviation).
+        if self.tcp_mux_keepalive_interval == 0 {
+            self.tcp_mux_keepalive_interval = 30;
+        }
+
         // Go v0.71.0: DialServerKeepAlive = EmptyOr(0, 7200) — an explicit
         // 0 means "use the default" (7200), not "disabled".
         if self.dial_server_keepalive == 0 {

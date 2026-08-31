@@ -485,7 +485,7 @@ pub async fn run_tcpmux_listener(
             let internal_tx = state
                 .run_id_to_ctl_tx
                 .get(&route.run_id)
-                .map(|v| v.clone());
+                .map(|v| v.tx.clone());
 
             if let Some(ctl_tx) = internal_tx {
                 // send().await: backpressure is correct — a full control
@@ -497,7 +497,7 @@ pub async fn run_tcpmux_listener(
                 // after CTL_SEND_TIMEOUT the connection drops.
                 match tokio::time::timeout(
                     crate::state::CTL_SEND_TIMEOUT,
-                    ctl_tx.tx.send(InternalMsg::ProxyUserConn {
+                    ctl_tx.send(InternalMsg::ProxyUserConn {
                         proxy_name: route.proxy_name.clone(),
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
                         pre_read,

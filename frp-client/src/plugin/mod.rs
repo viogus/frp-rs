@@ -357,6 +357,19 @@ pub(super) enum BodyFraming {
 
 /// Determine the request body framing from raw header lines. Chunked
 /// transfer-encoding wins over Content-Length (RFC 7230 §3.3.3); neither
+/// Case-insensitive `starts_with` on ASCII header-name prefixes. The
+/// forward builders scan every header line against hop-by-hop /
+/// content-length / host / x-forwarded-for prefixes; allocating a lowercase
+/// String per line was a per-request alloc cluster (round-17 audit E). The
+/// prefix constants are ASCII, so byte-slice comparison is equivalent and
+/// zero-alloc. `s.len() >= p.len()` mirrors `str::starts_with`'s short-length
+/// short-circuit.
+pub(super) fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    let s = s.as_bytes();
+    let p = prefix.as_bytes();
+    s.len() >= p.len() && s[..p.len()].eq_ignore_ascii_case(p)
+}
+
 /// header means the request has no body.
 ///
 /// Content-Length is resolved by [`resolve_content_length`]: duplicate
@@ -504,10 +517,16 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     loop {
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
+        // Bound each read: a peer that connects (or sends a partial header)
+        // but then stalls must not pin the handler task + fd forever. Any
+        // byte resets the clock — only a fully-silent / stalled peer trips
+        // this (Go sets a connection read deadline per-read).
+        let read_res = tokio::time::timeout(PLUGIN_HEADER_READ_TIMEOUT, stream.read(&mut chunk)).await;
+        let n = match read_res {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(format!("read: {e}")),
+            Err(_elapsed) => return Err("timed out reading request headers".into()),
+        };
         if n == 0 {
             return Err("connection closed".into());
         }
@@ -578,12 +597,12 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         if line.is_empty() {
             continue;
         }
-        let lower = line.to_lowercase();
         // When appending the peer IP (https plugins), the inbound
         // X-Forwarded-For line is collected here and re-emitted canonically
         // after the loop — the original line must not pass through as well,
         // or the backend sees two X-Forwarded-For headers.
-        if x_forwarded_for.is_some() && lower.starts_with("x-forwarded-for:") {
+        if x_forwarded_for.is_some() && starts_with_ignore_ascii_case(line, "x-forwarded-for:")
+        {
             if let Some(v) = line.split_once(':').map(|(_, v)| v.trim().to_string()) {
                 if !v.is_empty() {
                     prior_xff.push(v);
@@ -591,7 +610,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
             }
             continue;
         }
-        if hop_by_hop.iter().any(|h| lower.starts_with(h)) {
+        if hop_by_hop.iter().any(|h| starts_with_ignore_ascii_case(line, h)) {
             continue;
         }
         // Drop every original Content-Length line: when the body is chunked
@@ -601,7 +620,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         // resolved — all CL lines are then replaced by a single canonical
         // line appended after the loop (RFC 7230 §3.3.2; forwarding
         // duplicate/conflicting values would desync the backend).
-        if lower.starts_with("content-length:")
+        if starts_with_ignore_ascii_case(line, "content-length:")
             && (framing == Some(BodyFraming::Chunked) || content_length.is_some())
         {
             continue;
@@ -615,7 +634,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
                 continue;
             }
         }
-        if !host_rewrite.is_empty() && lower.starts_with("host:") {
+        if !host_rewrite.is_empty() && starts_with_ignore_ascii_case(line, "host:") {
             let safe_host: String = host_rewrite
                 .chars()
                 .filter(|&c| c != '\r' && c != '\n')
@@ -625,8 +644,16 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
             // Strip CR/LF from forwarded header lines: header injection /
             // request-smuggling defense (the h2 plugin path rejects CR/LF
             // outright — mirror that policy here for the HTTP/1.0 path).
-            let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
-            fwd.push_str(&safe_line);
+            // `lines()` already strips the trailing CRLF, so a lone `\r` can
+            // only be mid-line (malformed client) — the common path appends
+            // the line slice directly, no per-line String (round-17 audit E).
+            if line.contains(['\r', '\n']) {
+                let safe_line: String =
+                    line.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                fwd.push_str(&safe_line);
+            } else {
+                fwd.push_str(line);
+            }
             fwd.push_str("\r\n");
         }
     }
@@ -690,6 +717,14 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
 /// response-side chunked reader (plugin/h2.rs), which enforces the same
 /// bound on chunk-size / trailer lines read from the backend.
 pub(super) const CHUNK_LINE_MAX: usize = 64 * 1024;
+
+/// Bound on a single read while parsing an HTTP request head / chunk line /
+/// trailer in the plugins. A peer that connects (or sends a partial line)
+/// then stalls must not pin the handler task + fd forever; any fresh byte
+/// resets the clock, so only a silent/stalled peer trips this (Go sets a
+/// per-read connection deadline).
+pub(super) const PLUGIN_HEADER_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 /// Stream a request body to `writer`: first the bytes that arrived together
 /// with the request head (`body_prefix`), then the rest of the body per its

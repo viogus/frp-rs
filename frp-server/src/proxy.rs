@@ -254,6 +254,21 @@ impl ProxyManager {
         self.proxies.get(name).map(|r| r.value().clone())
     }
 
+    /// Number of live proxies registered by one client (run_id).
+    ///
+    /// Backs the Rust-only `max_proxies_per_client` cap. Counts the
+    /// `by_client` index, which is the same source the register path writes
+    /// under the exclusive lock, so the count reflects the current registry
+    /// state. Callers gate on `cap > 0` before consulting this.
+    pub async fn client_proxy_count(&self, run_id: &str) -> usize {
+        self.by_client
+            .read()
+            .await
+            .get(run_id)
+            .map(|proxies| proxies.len())
+            .unwrap_or(0)
+    }
+
     /// Hot-update server-side runtime settings for a live proxy without
     /// re-registering it or reloading the frpc side.
     ///
@@ -816,7 +831,23 @@ pub fn is_tcp_port_bindable(bind_addr: &str, port: u16) -> bool {
 
 fn is_port_bindable(bind_addr: &str, port: u16) -> bool {
     let addr = frp_core::format_socket_addr(bind_addr, port);
-    match std::net::TcpListener::bind(&addr) {
+    is_port_bindable_at(bind_addr, port, &addr)
+}
+
+/// Async port-bindability probe. Offloads the synchronous `TcpListener::bind`
+/// to a blocking thread so a registration burst can't stall the worker thread
+/// that owns the accept loop (audit r3/server#1). Falls back to `false` if the
+/// blocking pool is shutting down.
+pub async fn is_tcp_port_bindable_async(bind_addr: &str, port: u16) -> bool {
+    let bind_addr = bind_addr.to_owned();
+    let addr = frp_core::format_socket_addr(&bind_addr, port);
+    tokio::task::spawn_blocking(move || is_port_bindable_at(&bind_addr, port, &addr))
+        .await
+        .unwrap_or(false)
+}
+
+fn is_port_bindable_at(bind_addr: &str, port: u16, addr: &str) -> bool {
+    match std::net::TcpListener::bind(addr) {
         Ok(listener) => {
             // Probe succeeded — port is available. Drop immediately.
             drop(listener);

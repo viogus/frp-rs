@@ -210,8 +210,11 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
     // Pre-size the compression buffer to the bridge chunk size only when
     // compression is on — the plaintext path never touches it, so a
     // pre-sized Vec there is a 32 KiB dead allocation per bridge.
+    // Snappy worst-case expansion is ~1.06× + tag overhead (max ~cap + cap/6 +
+    // 32), so pre-sizing to `cap` alone reallocs + copies once on the first
+    // incompressible 32 KiB chunk (round-3 core F6).
     let mut comp_buf = if use_compression {
-        Vec::with_capacity(cap)
+        Vec::with_capacity(cap + cap / 6 + 32)
     } else {
         Vec::new()
     };

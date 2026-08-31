@@ -84,6 +84,18 @@ fn is_udp_port_bindable(bind_addr: &str, port: u16) -> bool {
     }
 }
 
+/// First candidate whose OS-level bind probe succeeds, each probed off the
+/// executor via `spawn_blocking` (audit r3/server#1 — the sync bind must not
+/// run on a worker thread during a registration burst).
+async fn first_bindable(bind_addr: &str, candidates: impl IntoIterator<Item = u16>) -> Option<u16> {
+    for p in candidates {
+        if crate::proxy::is_tcp_port_bindable_async(bind_addr, p).await {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Allocate the remote port for a new proxy (Go frp `ports.Manager` compat):
 /// SUDP override, per-client reservations with 24h expiry, allow-ports range
 /// scans, and OS-level bind probes. Extracted from `handle_new_proxy`'s
@@ -224,26 +236,30 @@ async fn allocate_proxy_port(
                 None => None,
             };
             // Probe bindability OUTSIDE the reservations write lock: the
-            // blocking std::net::TcpListener::bind must not serialize
-            // reservation lookups (audit D3-6).
+            // bind probe must not serialize reservation lookups (audit D3-6).
+            // Probe runs off the executor (audit r3/server#1).
             let res_candidate = match res_candidate {
-                Some(p) if !crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, p) => None,
+                Some(p) => {
+                    if !crate::proxy::is_tcp_port_bindable_async(&state.proxy_bind_addr, p).await {
+                        None
+                    } else {
+                        Some(p)
+                    }
+                }
                 other => other,
             };
             match res_candidate {
                 Some(p) => Some(p),
                 None => {
                     // Collect candidates under a brief read lock, then probe
-                    // each one OUTSIDE the lock (the blocking bind probe must
-                    // not serialize registrations). `find` continues past
-                    // occupied ports, matching the old in-lock scan.
+                    // each one OUTSIDE the lock (the bind probe must not
+                    // serialize registrations). Continues past occupied
+                    // ports, matching the old in-lock scan.
                     let candidates = {
                         let used = state.used_ports.read().await;
                         crate::proxy::pick_tcp_port_candidates(&used, 0, &allow_ports, 4096)
                     };
-                    candidates
-                        .into_iter()
-                        .find(|p| crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, *p))
+                    first_bindable(&state.proxy_bind_addr, candidates).await
                 }
             }
         } else {
@@ -251,9 +267,7 @@ async fn allocate_proxy_port(
                 let used = state.used_ports.read().await;
                 crate::proxy::pick_tcp_port_candidates(&used, remote_port, &allow_ports, 4096)
             };
-            candidates
-                .into_iter()
-                .find(|p| crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, *p))
+            first_bindable(&state.proxy_bind_addr, candidates).await
         };
         // Commit under write lock; re-check to close the race with a
         // concurrent registration. On conflict (TOCTOU: two registrations
@@ -270,15 +284,13 @@ async fn allocate_proxy_port(
                     );
                     let retry = {
                         let used = &*ports;
-                        crate::proxy::pick_tcp_port_candidates(used, 0, &allow_ports, 64)
-                            .into_iter()
-                            .find(|c| {
-                                !ports.contains(c)
-                                    && crate::proxy::is_tcp_port_bindable(
-                                        &state.proxy_bind_addr,
-                                        *c,
-                                    )
-                            })
+                        first_bindable(
+                            &state.proxy_bind_addr,
+                            crate::proxy::pick_tcp_port_candidates(used, 0, &allow_ports, 64)
+                                .into_iter()
+                                .filter(|c| !ports.contains(c)),
+                        )
+                        .await
                     };
                     match retry {
                         Some(p2) => {
@@ -1490,8 +1502,18 @@ async fn setup_proxy_listeners(
         let addr = format_socket_addr(&bind_addr, port);
         info!(addr = %addr, proxy_name = %np.proxy_name, "Proxy listener started on {} for '{}'", addr, np.proxy_name);
         let tcp_keepalive = state.tcp_keepalive;
+        // Capture this proxy's user-conn semaphore for the accept loop
+        // (M5 mirror). The registry entry was inserted by
+        // register_proxy_entry before this spawn; a listener outliving its
+        // proxy keeps a clone of the Arc, so caps stay enforced even as the
+        // registry entry is removed.
+        let user_conn_sem = state
+            .proxy_manager
+            .get(&pn)
+            .await
+            .and_then(|p| p.user_conn_sem.clone());
         let handle = tokio::spawn(async move {
-            listen_and_proxy(listener, port, pn, itx, tcp_keepalive).await;
+            listen_and_proxy(listener, port, pn, itx, tcp_keepalive, user_conn_sem).await;
         });
         listener_handles.insert(np.proxy_name.clone(), handle);
     } else {
@@ -1630,6 +1652,58 @@ pub(crate) async fn handle_new_proxy(
                 format!(
                     "maximum number of ports ({}) reached for this client",
                     state.max_ports_per_client
+                ),
+                v2,
+            )
+            .await;
+            return false;
+        }
+    }
+
+    // Per-client proxy-count cap (Rust-only opt-in; Go frp has no such
+    // limit). Bound how many proxies one authenticated client can hold —
+    // each registration carries config + runtime info + routing entries,
+    // so an unbounded count lets a client drive server memory growth.
+    // Default 0 = unlimited. Same benign TOCTOU as the port gate: register
+    // is the only writer of `by_client`, so a concurrent burst can overshoot
+    // by a couple of entries at most.
+    if state.max_proxies_per_client > 0 {
+        let used = state.proxy_manager.client_proxy_count(run_id).await;
+        if used + 1 > state.max_proxies_per_client as usize {
+            reject_new_proxy(
+                writer,
+                &np.proxy_name,
+                format!(
+                    "maximum number of proxies ({}) reached for this client",
+                    state.max_proxies_per_client
+                ),
+                v2,
+            )
+            .await;
+            return false;
+        }
+    }
+
+    // Per-proxy route-claiming domain cap (Rust-only opt-in; Go frp has no
+    // such limit). One HTTP/HTTPS/tcpmux proxy with a huge
+    // custom_domains/locations list would grow the shared vhost/tcpmux
+    // routing tables (and per-request conflict-check cost) in a SINGLE
+    // register call — the per-client proxy cap does not bound that, since it
+    // is one proxy. Estimate = custom_domains + (subdomain ? 1 : 0) +
+    // locations, an upper bound on the route entries this NewProxy adds.
+    // Pairs with `max_proxies_per_client` to bound total routes.
+    let max_route_domains = state.server_config_snapshot.max_custom_domains_per_proxy;
+    if max_route_domains > 0 && matches!(np.proxy_type.as_str(), "http" | "https" | "tcpmux") {
+        let estimate = np.custom_domains.as_ref().map(|d| d.len()).unwrap_or(0)
+            + usize::from(np.subdomain.as_deref().filter(|s| !s.is_empty()).is_some())
+            + np.locations.as_ref().map(|l| l.len()).unwrap_or(0);
+        if estimate as i64 > max_route_domains {
+            reject_new_proxy(
+                writer,
+                &np.proxy_name,
+                format!(
+                    "proxy '{}' declares {} route-claiming domain(s)/location(s), exceeding the configured maximum of {max_route_domains}",
+                    np.proxy_name, estimate,
                 ),
                 v2,
             )
@@ -2132,6 +2206,7 @@ pub(crate) async fn listen_and_proxy(
     proxy_name: String,
     internal_tx: mpsc::Sender<InternalMsg>,
     tcp_keepalive: i64,
+    user_conn_sem: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     loop {
         match listener.accept().await {
@@ -2140,6 +2215,28 @@ pub(crate) async fn listen_and_proxy(
                 if tcp_keepalive > 0 {
                     frp_core::transport::set_keepalive(&user_conn, tcp_keepalive as u64);
                 }
+                // Acquire the proxy's user-conn permit BEFORE the send (M5
+                // mirror of the group path). Without this, a flood of user
+                // conns to an at-cap proxy queues raw sockets (each holding
+                // an fd) in the 1024-slot internal channel ahead of the
+                // handler-side permit check — starving the control's other
+                // internal traffic. The permit crosses the message boundary
+                // and the handler consumes it instead of re-acquiring (no
+                // double-count). No semaphore = unlimited — send with None.
+                let user_conn_permit = match &user_conn_sem {
+                    Some(sem) => match sem.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            debug!(
+                                proxy_name = %proxy_name,
+                                "Proxy '{}' at user-conn cap, dropping connection",
+                                proxy_name,
+                            );
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 // send().await: backpressure is correct — the control channel
                 // (cap 1024) can fill under a burst of user connections; Go frp
                 // blocks here and lets the TCP backlog absorb the burst. This
@@ -2156,7 +2253,7 @@ pub(crate) async fn listen_and_proxy(
                         proxy_name: proxy_name.clone(),
                         user_conn: IoStream::Tcp(user_conn),
                         pre_read: vec![],
-                        user_conn_permit: None,
+                        user_conn_permit,
                         // Local sender — no group selection was done.
                         group_selected: false,
                     }),
@@ -2938,6 +3035,7 @@ pub(crate) mod unregister_generation_tests {
             false,
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
             0,
             0,
             168,

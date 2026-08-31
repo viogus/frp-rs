@@ -695,9 +695,9 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             .state
             .run_id_to_ctl_tx
             .get(&target_run_id)
-            .map(|v| v.clone());
+            .map(|v| v.tx.clone());
         if let Some(ctl) = ctl_tx {
-            match ctl.tx.try_send(InternalMsg::ProxyUserConn {
+            match ctl.try_send(InternalMsg::ProxyUserConn {
                 proxy_name: target_proxy.clone(),
                 user_conn,
                 pre_read,
@@ -919,6 +919,7 @@ mod tests {
             false,
             String::new(),
             Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
             0,
             0,
             168,

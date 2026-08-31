@@ -133,6 +133,13 @@ pub struct Login {
     pub metas: Option<std::collections::HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_spec: Option<ClientSpec>,
+    /// Rust-only extension: Go frp v0.71.0's Login has no `multiplexer` field
+    /// (msg.go:76-93) — the per-proxy `NewProxy.multiplexer` is the field Go
+    /// consumes. frpc sets this to `Some("yamux")` whenever tcp-mux is
+    /// proposed (the default config), so a default Rust frpc → Go frps Login
+    /// carries `"multiplexer":"yamux"`; Go ignores the unknown key (benign,
+    /// verified by the 86/86 compat matrix). Like the other Rust-only wire
+    /// extensions, must NOT be relied on by Go peers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multiplexer: Option<String>,
 }

@@ -14,6 +14,9 @@ use frp_core::auth::constant_time_eq;
 // ---------------------------------------------------------------
 
 const SOCKS5_VERSION: u8 = 0x05;
+/// Bound the SOCKS5 client greeting: a peer that connects but never sends a
+/// greeting must not pin the handler task + fd + bridge forever.
+const SOCKS5_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const AUTH_NO_AUTH: u8 = 0x00;
 const AUTH_USER_PASS: u8 = 0x02;
 const AUTH_NO_ACCEPTABLE: u8 = 0xFF;
@@ -51,11 +54,16 @@ async fn handle_socks5_conn(
 ) -> Result<(), String> {
     let mut buf = [0u8; 512];
 
-    // Step 1: Auth method negotiation
-    client
-        .read_exact(&mut buf[..2])
-        .await
-        .map_err(|e| format!("read greeting: {e}"))?;
+    // Step 1: Auth method negotiation. The greeting MUST arrive within this
+    // bound — a remote SOCKS client that connects but never sends a greeting
+    // would otherwise pin the handler task + fd (and the work-conn bridge)
+    // forever. Bytes are present once the greeting arrives, so later reads
+    // are only bounded by the client staying active.
+    match tokio::time::timeout(SOCKS5_HANDSHAKE_TIMEOUT, client.read_exact(&mut buf[..2])).await {
+        Ok(Ok(_n)) => {}
+        Ok(Err(e)) => return Err(format!("read greeting: {e}")),
+        Err(_elapsed) => return Err("socks5 greeting timed out".into()),
+    }
     let ver = buf[0];
     let nmethods = buf[1] as usize;
     if ver != SOCKS5_VERSION {

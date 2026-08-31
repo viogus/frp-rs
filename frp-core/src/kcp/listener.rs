@@ -139,7 +139,13 @@ pub async fn dial_kcp_with_driver(
     let config = config.clamped();
     let (kcp_socket, handle, _accept_rx) = KcpSocket::new(socket, config.clone());
     let (read_tx, read_rx) = mpsc::channel(256);
-    let session = KcpSession::new(conv, remote, config.clone(), read_tx);
+    let session = KcpSession::with_chunk_pool(
+        conv,
+        remote,
+        config.clone(),
+        read_tx,
+        handle.chunk_pool.clone(),
+    );
     let alive_handle = session.alive_handle();
     // Share the session's send-queue backlog counter with the stream so
     // poll_write can gate on a stalled peer (window 0) instead of letting
