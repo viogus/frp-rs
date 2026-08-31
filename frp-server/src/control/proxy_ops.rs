@@ -5196,12 +5196,16 @@ pub(crate) mod unregister_generation_tests {
         });
 
         // Wait until the task has registered the proxy (parked at the
-        // client_ports_used increment, before its bind).
+        // client_ports_used increment, before its bind). The OS probe for
+        // port 24051 runs on the spawn_blocking pool (r3/server#1), so
+        // yield_now alone cannot observe its completion on slow CI
+        // machines — warm the pool, then poll with real time.
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
         for _ in 0..100 {
             if state.proxy_manager.get("m1").await.is_some() {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(
             state.proxy_manager.get("m1").await.is_some(),
