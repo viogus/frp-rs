@@ -974,28 +974,19 @@ const MAX_VNET_ROUTES_PER_CLIENT: usize = 64;
 /// `valid_cidr` also rejects these prefixes).
 #[cfg(feature = "vnet")]
 fn is_route_hijack_prefix(subnet: &str) -> bool {
-    let Some((ip, prefix)) = subnet.split_once('/') else {
+    let Some((_ip, prefix)) = subnet.split_once('/') else {
         return false;
     };
     let Ok(len) = prefix.parse::<u8>() else {
         return false;
     };
     // `/0` is the clearest form of default-route hijack (both families).
-    // A `/1` is the same attack split in two — but only when the address
-    // base is the null/0x80 pole (0.0.0.0/1 + 128.0.0.0/1, ::/1 +
-    // 8000::/1). Non-pole `/1` (e.g. 10.0.0.0/1) does not cover the
-    // default route and is left alone.
-    if len == 0 {
-        return true;
-    }
-    if len > 1 {
-        return false;
-    }
-    let base = ip.to_lowercase();
-    matches!(
-        base.as_str(),
-        "0.0.0.0" | "128.0.0.0" | "::" | "8000::" | "8000:0:0:0:0:0:0:0"
-    )
+    // ANY `/1` is the same attack split in two — a non-canonical base is
+    // the identical network once the route table masks it (`10.0.0.0/1`
+    // ≡ `0.0.0.0/1`, `200.0.0.0/1` ≡ `128.0.0.0/1`, zero-padded IPv6 ≡
+    // `::/1`), so the pole-string check was bypassable (round-17 review,
+    // both finders). No legitimate vnet route is a /1.
+    len <= 1
 }
 
 #[cfg(feature = "vnet")]
@@ -2105,6 +2096,17 @@ mod vnet_route_tests {
         ));
         assert!(crate::control::nathole::is_route_hijack_prefix("::/1"));
         assert!(crate::control::nathole::is_route_hijack_prefix("8000::/1"));
+        // ANY /1 is a hijack — non-canonical bases are the same network
+        // once the route table masks the base (round-17 review MEDIUM).
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "10.0.0.0/1"
+        ));
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "200.0.0.0/1"
+        ));
+        assert!(crate::control::nathole::is_route_hijack_prefix(
+            "8000:0000:0000:0000:0000:0000:0000:0000/1"
+        ));
         // Legitimate vnet routes are NOT hijack prefixes.
         assert!(!crate::control::nathole::is_route_hijack_prefix(
             "10.0.0.0/24"

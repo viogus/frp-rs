@@ -22,9 +22,10 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, instrument, warn};
 
@@ -44,6 +45,95 @@ async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
     }
 }
 
+/// Shared per-control stall state, written by the persisted read future
+/// (via [`ProgressRead::poll_read`]) and read by the self-arming reap arm to
+/// compute its deadline LIVE. The arm cannot snapshot loop-top state: when a
+/// mid-frame poll consumes bytes and returns Pending, the select parks with no
+/// Ready arm — loop-top only runs after a select returns — so a loop-top
+/// snapshot of the stall start would arm a never-firing timer exactly when the
+/// stall begins mid-iteration (the round-17 reaper silently never fired for
+/// the exact HIGH it was meant to close).
+struct StallState {
+    /// Fixed at construction; `now_ms()`/`stall_start()` are relative to it so
+    /// the whole state is readable from sync `poll_read` without a mutex.
+    anchor: Instant,
+    /// Set the moment the in-flight read consumes any byte.
+    saw_data: AtomicBool,
+    /// Millis (relative to `anchor`) at which the current mid-frame stall
+    /// began, or `u64::MAX` when the read is fresh / no frame in flight.
+    stall_start_ms: AtomicU64,
+    /// Wakes the reap arm when a stall begins or extends so it can arm a live
+    /// deadline (see the reap arm).
+    notify: tokio::sync::Notify,
+}
+
+impl StallState {
+    fn new() -> Self {
+        Self {
+            anchor: Instant::now(),
+            saw_data: AtomicBool::new(false),
+            stall_start_ms: AtomicU64::new(u64::MAX),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        (Instant::now() - self.anchor).as_millis() as u64
+    }
+
+    /// The moment the current stall began, or None for a fresh read.
+    fn stall_start(&self) -> Option<Instant> {
+        let ms = self.stall_start_ms.load(Ordering::Acquire);
+        (ms != u64::MAX).then(|| self.anchor + Duration::from_millis(ms))
+    }
+
+    /// Called from [`ProgressRead::poll_read`] when a poll consumed bytes:
+    /// mark the stall in progress, record its start (first consumption of the
+    /// frame), and wake the reap arm so it arms a live deadline.
+    fn mark_progress(&self) {
+        self.saw_data.store(true, Ordering::Relaxed);
+        let _ = self.stall_start_ms.compare_exchange(
+            u64::MAX,
+            self.now_ms(),
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+        self.notify.notify_one();
+    }
+
+    /// A fresh read (loop-top recreation) or a completed frame (read arm)
+    /// clears the stall: the reaper goes back to never-firing until the NEXT
+    /// partial frame.
+    fn reset(&self) {
+        self.saw_data.store(false, Ordering::Relaxed);
+        self.stall_start_ms.store(u64::MAX, Ordering::Release);
+    }
+}
+
+/// Wraps the control read so the half-frame-stall reaper can see whether the
+/// in-flight frame has consumed any bytes. A read that returns Pending after
+/// consuming bytes is mid-frame (trickle/stalled body); a read that never
+/// consumes anything is indistinguishable from a heartbeat-disabled client.
+struct ProgressRead<'a, R> {
+    inner: &'a mut R,
+    stall: &'a StallState,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<'_, R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if buf.filled().len() > filled_before {
+            self.stall.mark_progress();
+        }
+        res
+    }
+}
+
 /// Deadline for control-plane writes (audit H2). A wedged-but-alive peer
 /// must not pin the control task + fd + semaphore permit forever: the
 /// heartbeat timeout can never fire while the select loop is blocked inside
@@ -51,26 +141,34 @@ async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
 /// login reject/success deadlines — those keep their tighter budget.
 const CTL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Idle deadline for the main control connection when the heartbeat watchdog
-/// is DISABLED (tcp_mux enabled by default forces `heartbeat_timeout = -1`,
-/// see `frp-core/src/config/server.rs` — Go frp parity: Go keeps a
-/// control-plane heartbeat via its independent heartbeatWorker goroutine
-/// calling `ctl.Close()` on long silence, frp-rs disables its check under
-/// tcp_mux). Without a fallback here, an authenticated client that stays
-/// silent (or only emits 12-byte yamux PINGs, which are not FRP control
-/// frames so `last_completed_frame` never advances) can pin its
-/// conn_semaphore permit + task + fd forever. 512 such connections exhaust
-/// every permit → the whole server rejects all new login / work / visitor /
-/// vhost / tcpmux connections with "Max connections reached" (HIGH: auth'd
-/// silent-control DoS).
+/// Mid-frame stall deadline for the main control connection when the
+/// heartbeat watchdog is DISABLED (`heartbeat_timeout <= 0` — tcp_mux enabled
+/// by default forces `heartbeat_timeout = -1`, see
+/// `frp-core/src/config/server.rs`, and under tcp_mux frpc also normalizes
+/// its `heartbeat_interval` to -1, so a HEALTHY default client completes no
+/// control frames while idle).
 ///
-/// The anchor is "most recently COMPLETED control FRAME", reset when any
-/// frame — including the frpc heartbeat Ping — is read. Healthy clients send
-/// a heartbeat control frame every `heartbeat_interval` (default 30s), so
-/// this 90s (= 3×) deadline never fires for them; a client emitting only
-/// yamux PINGs never advances the anchor and is reaped. Only compiled when
-/// the watchdog is off (`heartbeat_timeout <= 0`), so the normal
-/// `heartbeat_timeout > 0` path is untouched.
+/// Without a fallback here, an authenticated client that pins its
+/// conn_semaphore permit + task + fd forever (512 such connections exhaust
+/// every permit → the whole server rejects all new login / work / visitor /
+/// vhost / tcpmux connections with "Max connections reached" — HIGH: auth'd
+/// silent-control DoS) would never be reclaimed. But the anchor CANNOT be
+/// "last completed frame": a healthy idle default client also completes no
+/// frames, and reaping it every 90s was a BLOCKER (round-17 review,
+/// reproduced live — an idle frpc behind tcp_mux was disconnected exactly
+/// every 90s).
+///
+/// So the reaper targets only a MID-FRAME stall: the in-flight control read
+/// has consumed bytes (progress flag set by [`ProgressRead`]) but has not
+/// completed a frame within `CONTROL_IDLE_TIMEOUT`. A fresh read that has
+/// consumed nothing is indistinguishable from a heartbeat-disabled client and
+/// is deliberately left alone — Go frp parity, since Go under tcpMux performs
+/// no app-level reap at all (yamux keepalive bounds fully-silent peers via
+/// `MAX_IDLE_KEEPALIVE_TICKS`; only a peer that pongs keepalive while
+/// stalling a control frame can pin resources — exactly the case this arm
+/// closes). Only active when the heartbeat watchdog is off
+/// (`heartbeat_timeout <= 0`), so the normal `heartbeat_timeout > 0` path is
+/// untouched.
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Deadline for yamux-stream reads in the control select loop (round 10
@@ -333,14 +431,13 @@ async fn handle_control_inner<S>(
     type PendingRead = Pin<Box<dyn Future<Output = Result<FrpMessage, frp_core::Error>> + Send>>;
     let mut pending_read: Option<PendingRead> = None;
 
-    // Idle-reap anchor when the heartbeat watchdog is disabled (tcp_mux
-    // default → heartbeat_timeout = -1). Advanced on every COMPLETED control
-    // frame (health monitor: frpc heartbeat Ping arrives every 30s by
-    // default); the select's `CONTROL_IDLE_TIMEOUT` arm (guard
-    // `heartbeat_timeout <= 0`) reaps a peer that never completes a frame —
-    // a silent conn or one that only emits 12-byte yamux PINGs, which are
-    // not FRP control frames and never move this anchor.
-    let mut last_completed_frame = Instant::now();
+    // Half-frame-stall reaper state for when the heartbeat watchdog is
+    // disabled (tcp_mux default → heartbeat_timeout = -1). Shared between the
+    // persisted read future (writes via `ProgressRead`) and the self-arming
+    // reap arm (reads for its live deadline). See `CONTROL_IDLE_TIMEOUT` for
+    // why a completed-frame anchor would falsely reap healthy idle tcp_mux
+    // clients.
+    let stall = Arc::new(StallState::new());
 
     loop {
         // Superseded by a newer login (same run_id) whose Shutdown message
@@ -403,10 +500,18 @@ async fn handle_control_inner<S>(
         // next frame boundary. The async block owns an Arc clone and takes
         // the lock only while the frame is in flight.
         if pending_read.is_none() {
+            // Fresh frame: clear the stall state from any previous read
+            // (belt-and-suspenders — the completed-read arm resets it too).
+            stall.reset();
             let reader = reader.clone();
+            let stall_clone = stall.clone();
             pending_read = Some(Box::pin(async move {
                 let mut guard = reader.lock().await;
-                read_ctl_msg(&mut *guard, v2).await
+                let mut progress = ProgressRead {
+                    inner: &mut *guard,
+                    stall: &stall_clone,
+                };
+                read_ctl_msg(&mut progress, v2).await
             }));
         }
 
@@ -466,29 +571,58 @@ async fn handle_control_inner<S>(
                 break;
             }
 
-            // HIGH: idle-reap fallback for when the heartbeat watchdog is
-            // DISABLED (`heartbeat_timeout <= 0` — tcp_mux enabled by default
-            // sets -1). Reap a control connection that has not COMPLETED a
-            // control frame within `CONTROL_IDLE_TIMEOUT`. The anchor
-            // (`last_completed_frame`) only advances on real FRP frames — a
-            // peer emitting only 12-byte yamux PINGs (which keep yamux alive
-            // but are not FRP control frames) is indistinguishable from a
-            // silent conn and is reaped, so it cannot pin its
-            // conn_semaphore permit / task / fd indefinitely. Healthy frpc
-            // send a heartbeat control frame every 30s and are unaffected.
-            // Mutually exclusive with the heartbeat arm above, so only one
-            // idle ramp can ever fire.
+            // Round-17-review BLOCKER fix: reap only a MID-FRAME stall, not
+            // an idle connection. Under tcp_mux both the server heartbeat
+            // watchdog and the client's own heartbeats are disabled, so an
+            // idle-but-healthy default client completes no control frames — a
+            // completed-frame anchor disconnected it every 90s. `stall_since`
+            // is only set while a read has consumed bytes without completing
+            // a frame; a fresh read keeps it None and is never reaped (Go
+            // frp parity: under tcpMux Go performs no app-level reap at all,
+            // and yamux keepalive bounds fully-silent peers via
+            // `MAX_IDLE_KEEPALIVE_TICKS`). Mutually exclusive with the
+            // heartbeat arm above, so only one idle ramp can ever fire.
             _ = async {
-                // checked_add: `Instant` overflow must never panic the
-                // process — degrade to never firing (the loop-top expiry and
-                // socket teardown still apply; this arm is belt-and-suspenders
-                // for permit reclamation).
-                match last_completed_frame.checked_add(CONTROL_IDLE_TIMEOUT) {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
+                // Self-arming stall reap. This arm CANNOT snapshot loop-top
+                // state: when a mid-frame read consumes bytes and returns
+                // Pending, the select parks with no Ready arm — loop-top only
+                // re-runs after a select returns, so a snapshot would arm a
+                // `pending()` timer exactly when the stall starts (the
+                // round-17 reaper never fired for the HIGH it was built to
+                // close). Instead the arm parks on `stall.notify` (fired by
+                // `ProgressRead` on byte consumption) and, once in a stall,
+                // sleeps until the stall START + CONTROL_IDLE_TIMEOUT,
+                // re-checking on wake (the frame may have completed meanwhile).
+                let stall = stall.clone();
+                loop {
+                    // Park until a read consumes a byte (a stall begins or
+                    // extends). A fresh read / completed frame clears
+                    // `saw_data`, so a stall never starts without this notify.
+                    stall.notify.notified().await;
+                    // A fresh read (no stall in progress) → back to the notify
+                    // park.
+                    while let Some(start) = stall.stall_start() {
+                        // Live deadline from the stall START — not from this
+                        // notification (a multi-byte trickle would otherwise
+                        // keep pushing the deadline out forever).
+                        let deadline = start.checked_add(CONTROL_IDLE_TIMEOUT);
+                        if let Some(deadline) = deadline {
+                            tokio::time::sleep_until(deadline).await;
+                            // Re-check after the sleep: if the frame completed
+                            // while sleeping, `saw_data` is cleared and we go
+                            // back to parking on notify. Still stalled → reap.
+                            if stall.stall_start().is_some() {
+                                return;
+                            }
+                        } else {
+                            // `Instant` overflow — degrade to reaping rather
+                            // than never firing.
+                            return;
+                        }
+                    }
                 }
             }, if state.heartbeat_timeout <= 0 => {
-                warn!(peer = ?peer, idle = ?CONTROL_IDLE_TIMEOUT, "Control connection for {:?} idle (no completed frame in {:?}, heartbeat watchdog disabled), disconnecting", peer, CONTROL_IDLE_TIMEOUT);
+                warn!(peer = ?peer, idle = ?CONTROL_IDLE_TIMEOUT, "Control connection for {:?} stalled mid-frame (partial control frame not completed in {:?}, heartbeat watchdog disabled), disconnecting", peer, CONTROL_IDLE_TIMEOUT);
                 break;
             }
 
@@ -612,16 +746,12 @@ async fn handle_control_inner<S>(
                 // loop-top `if pending_read.is_none()` recreates a fresh
                 // one for the next frame.
                 pending_read = None;
+                // A completed frame (Ok or Err) ends the mid-frame stall:
+                // clear the progress flag + stall clock so the reaper arm
+                // goes back to never-firing until the NEXT partial frame.
+                stall.reset();
                 match msg {
                     Ok(msg) => {
-                        // Any COMPLETED control frame keeps the connection
-                        // alive for the idle-reap anchor (HIGH fix): a
-                        // healthy frpc sends a heartbeat control frame every
-                        // `heartbeat_interval` (default 30s), so a peer that
-                        // completes frames is never reaped even with the
-                        // heartbeat watchdog off (tcp_mux default). Only
-                        // yamux-PING-only / fully-silent peers stall this.
-                        last_completed_frame = Instant::now();
                         if dispatch::dispatch_frp_message(&mut ctx, &mut ctl, &mut writer, msg, &authenticated_user).await.is_err() {
                             break;
                         }
@@ -1077,21 +1207,21 @@ mod idle_reap_tests {
         resp.error.unwrap_or_default()
     }
 
-    /// HIGH regression: an authenticated control connection that completes
-    /// NO control frame (a silent conn, or one that only emits 12-byte yamux
-    /// PINGs — which are not FRP control frames) must be reaped even when
-    /// the heartbeat watchdog is DISABLED (tcp_mux on by default forces
-    /// `heartbeat_timeout = -1`). Without the `CONTROL_IDLE_TIMEOUT` arm such
-    /// a connection pins its conn_semaphore permit / task / fd forever, and
-    /// 512 of them exhaust every permit → whole-server connection rejection.
+    /// Round-17-review BLOCKER regression: a silent (healthy, heartbeat-
+    /// disabled) control connection must NOT be reaped. Under tcp_mux the
+    /// client's heartbeats are normalized off too, so an idle default client
+    /// completes no control frames; the old completed-frame anchor
+    /// disconnected it every 90s (reproduced live). A fresh read (zero bytes
+    /// consumed) is indistinguishable from a heartbeat-disabled client and is
+    /// deliberately left alone — Go frp parity (Go under tcpMux performs no
+    /// app-level reap at all).
     ///
     /// Paused time advances `CONTROL_IDLE_TIMEOUT` instantly while the duplex
     /// login handshake still runs (real socket I/O — frame delivery isn't
-    /// time-driven). After login we send nothing; the idle arm (guard
-    /// `heartbeat_timeout <= 0`) fires and the control task exits of its own
-    /// accord, reclaiming the permit/task/fd.
+    /// time-driven). After login we send nothing and assert the control
+    /// survives past the deadline, then close the duplex for a clean exit.
     #[tokio::test(start_paused = true)]
-    async fn silent_control_reaped_when_heartbeat_disabled() {
+    async fn silent_control_not_reaped_when_heartbeat_disabled() {
         let mut state = crate::control::proxy_ops::unregister_generation_tests::test_state();
         Arc::get_mut(&mut state)
             .expect("sole state ref")
@@ -1135,15 +1265,101 @@ mod idle_reap_tests {
         let error = read_login_resp_error(&mut client).await;
         assert!(error.is_empty(), "login failed: {error}");
 
-        // Send NOTHING — the connection is idle. Advance past the idle
-        // deadline; the arm must fire and the control task exit (reap the
-        // permit/task/fd).
+        // Send NOTHING — the connection is idle with a fresh (zero-byte)
+        // read. Advance past the old idle deadline: the reaper must NOT fire
+        // (a healthy heartbeat-disabled client is indistinguishable from this
+        // silent conn and is left alone).
+        tokio::time::advance(CONTROL_IDLE_TIMEOUT + Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !control_task.is_finished(),
+            "silent conn must NOT be reaped (healthy heartbeat-disabled client)"
+        );
+        // Close the duplex → the server read sees EOF → control exits cleanly.
+        drop(client);
+        control_task.await.expect("control task exits on EOF");
+    }
+
+    /// Retained security property: a conn that sends a PARTIAL control frame
+    /// (half-frame trickle — consumes bytes but never completes a frame,
+    /// while ponging yamux keepalive so the session stays up) MUST still be
+    /// reaped. This is the only case the `CONTROL_IDLE_TIMEOUT` arm closes.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_control_reaped_when_heartbeat_disabled() {
+        let mut state = crate::control::proxy_ops::unregister_generation_tests::test_state();
+        Arc::get_mut(&mut state)
+            .expect("sole state ref")
+            .heartbeat_timeout = 0; // disabled; exercises the stall arm (<=0 guard)
+
+        let (server, mut client) = tokio::io::duplex(1024);
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("idle-test-run".into()),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("test-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        let state_clone = state.clone();
+        let control_task = tokio::spawn(handle_control(
+            server,
+            login,
+            state_clone,
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+        ));
+
+        // Login handshake completes (real duplex I/O).
+        let error = read_login_resp_error(&mut client).await;
+        assert!(error.is_empty(), "login failed: {error}");
+
+        // Send a partial frame and stall. The control stream is always
+        // AES-128-CFB-wrapped after LoginResp (Go frp encrypts the control
+        // plane unconditionally), so the peer's first 16 bytes are consumed as
+        // the CFB IV into `CipherReader.iv_buf` — invisible to `ProgressRead`
+        // (its filled-buffer check sees only decrypted bytes). Only bytes past
+        // the IV reach the user read buffer. So: write a 16-byte IV followed by
+        // the first 4 bytes of a V1 frame header (type 0x01 + 3 of 8 length
+        // bytes). The read consumes those 4 decrypted bytes →
+        // `stall.mark_progress()` records the stall start and notifies → the
+        // self-arming reap arm fires at CONTROL_IDLE_TIMEOUT. The 4 bytes are
+        // any 4 decrypted bytes: `read_exact(9)` can never complete on 4, so
+        // the read stays mid-header regardless of what the CFB decrypts them
+        // to.
+        use tokio::io::AsyncWriteExt;
+        client
+            .write_all(&[0u8; 20]) // 16-byte CFB IV + 4-byte partial frame
+            .await
+            .expect("write partial frame");
+        // Two scheduler passes: the first lets the control task consume the
+        // 4 bytes (notifying the reap arm), the second lets the reap arm
+        // re-poll, complete its `notified()`, and reach `sleep_until` with
+        // its live deadline armed — only then can `advance` fire it.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
         tokio::time::advance(CONTROL_IDLE_TIMEOUT + Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
 
         assert!(
             control_task.is_finished(),
-            "idle control conn with heartbeat disabled must be reaped at CONTROL_IDLE_TIMEOUT"
+            "mid-frame stall must be reaped at CONTROL_IDLE_TIMEOUT"
         );
         control_task.await.expect("control task exits");
     }

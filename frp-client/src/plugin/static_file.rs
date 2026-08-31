@@ -30,21 +30,17 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
     } else {
         Some(cfg.strip_prefix.trim_matches('/').to_string())
     };
-    // Round-17 audit F: canonicalize the base directory ONCE at plugin
-    // startup — the path never changes, and the per-request canonicalize was
-    // a full path walk + syscalls on every file served. `None` (startup
-    // resolve failed) makes `handle_static_file_conn` fall back to the old
-    // per-request canonicalize, so a transient startup failure preserves
-    // prior behavior exactly instead of turning into a hard plugin error.
-    let canonical_base = std::fs::canonicalize(&local_path).ok();
-    let state = (auth, local_path, canonical_base, strip_prefix);
+    // The base directory is canonicalized PER REQUEST inside
+    // `handle_static_file_conn` (see the audit-F comment there) — a startup
+    // cache went stale when a base-dir symlink retargeted after startup
+    // (versioned deploys like /var/www/current), 403ing every file
+    // (round-17 review LOW).
+    let state = (auth, local_path, strip_prefix);
     serve_plugin(
         "static_file",
         state,
-        |stream, peer, (a, lp, base, sp)| async move {
-            if let Err(e) =
-                handle_static_file_conn(stream, a, &lp, base.as_ref(), sp.as_deref()).await
-            {
+        |stream, peer, (a, lp, sp)| async move {
+            if let Err(e) = handle_static_file_conn(stream, a, &lp, sp.as_deref()).await {
                 debug!(%peer, error = %e, "static_file: {peer} error: {e}");
             }
         },
@@ -56,7 +52,6 @@ async fn handle_static_file_conn(
     mut client: TcpStream,
     auth: HttpProxyAuth,
     local_path: &str,
-    canonical_base: Option<&std::path::PathBuf>,
     strip_prefix: Option<&str>,
 ) -> Result<(), String> {
     // Read HTTP request headers in chunks until \r\n\r\n. Stop at the FIRST
@@ -163,13 +158,13 @@ async fn handle_static_file_conn(
     // The verification must resolve the open fd's inode, not re-resolve the
     // path: re-canonicalizing the path after open() lets a symlink swap
     // between the two make the check disagree with the opened inode (TOCTOU).
-    // Round-17 audit F: the base was canonicalized once at plugin startup;
-    // this per-request fallback only runs when that startup resolve failed.
-    let base = match canonical_base {
-        Some(b) => b.clone(),
-        None => std::fs::canonicalize(local_path)
-            .map_err(|e| format!("failed to resolve base directory '{}': {e}", local_path))?,
-    };
+    // Round-17 audit F: the base is canonicalized per request — a startup
+    // cache went stale when a base-dir symlink retargeted (versioned deploys)
+    // and 403'd every file (round-17 review LOW). Go's http.FileServer
+    // canonicalizes per request too; the cost is a short path walk per
+    // request, not per byte.
+    let base = std::fs::canonicalize(local_path)
+        .map_err(|e| format!("failed to resolve base directory '{}': {e}", local_path))?;
 
     // Open the file first, then check the canonical path on the open handle.
     let file = match std::fs::File::open(&full_path) {

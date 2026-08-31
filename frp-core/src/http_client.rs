@@ -28,7 +28,15 @@ const MAX_REDIRECTS: usize = 10;
 /// (OIDC discovery/JWKS, plugin backends, proxyURL JWT fetch). Prevents an
 /// unbounded `collect()` from streaming arbitrary data into memory (OOM
 /// under panic=abort). 1 MiB far exceeds any legitimate payload.
-const MAX_RESPONSE_BODY_SIZE: usize = 1024 * 1024;
+// Response body cap for http_client's OIDC/plugin/proxyURL endpoints. Go frp
+// reads these with an unbounded `ioutil.ReadAll`; frp-rs bounds them so a
+// hostile endpoint cannot stream arbitrary data into memory (OOM under
+// panic=abort kills the whole process). 16 MiB is deliberately generous —
+// multi-tenant OIDC JWKS documents can exceed 1 MiB, and the fail-closed
+// error must not break real logins (round-17 review LOW: the original 1 MiB
+// diverged from Go for large JWKS / plugin responses). Still far under any
+// memory limit, so the OOM bound is intact.
+const MAX_RESPONSE_BODY_SIZE: usize = 16 * 1024 * 1024;
 
 type HttpsClient = Client<HttpConnect, Full<Bytes>>;
 
@@ -582,9 +590,9 @@ impl HttpClient {
                 // malicious/compromised endpoint (OIDC discovery, plugin
                 // backends, proxyURL JWT fetch) stream arbitrary data into
                 // memory — OOM under panic=abort kills the whole process
-                // (MED: http_client unbounded response body). 1 MiB is far
-                // beyond any real OIDC/plugin payload and well under
-                // configured memory limits.
+                // (MED: http_client unbounded response body). The cap is 16
+                // MiB — see `MAX_RESPONSE_BODY_SIZE` for the Go-divergence
+                // rationale (large JWKS must not fail-closed).
                 let body = Limited::new(resp.into_body(), MAX_RESPONSE_BODY_SIZE)
                     .collect()
                     .await

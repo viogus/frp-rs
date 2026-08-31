@@ -374,18 +374,14 @@ pub(crate) fn valid_cidr(subnet: &str) -> bool {
             }
             // Reject the default-route hijack prefix: `0.0.0.0/0` / `::/0`
             // (`ip route add ... dev tun`) would redirect the ENTIRE
-            // outbound traffic into the TUN. Also reject the `/1` pair
-            // (0.0.0.0/1 + 128.0.0.0/1, ::/1 + 8000::/1) that together cover
-            // the same total, and any address whose prefix is 0. A /2+/3+ is
-            // still a wide route but not a full default-route hijack — the
-            // server independently refuses these (nathole.rs
-            // `is_route_hijack_prefix`); this is defense-in-depth.
-            let hijack = len == 0
-                || (len == 1
-                    && matches!(
-                        ip,
-                        "0.0.0.0" | "128.0.0.0" | "::" | "8000::" | "8000:0:0:0:0:0:0:0"
-                    ));
+            // outbound traffic into the TUN. Also reject ANY `/1` — every
+            // /1 covers the default-route half once the route table masks
+            // the base, so non-canonical spellings (`10.0.0.0/1`,
+            // zero-padded IPv6) are just as much a hijack (round-17 review
+            // MEDIUM). A /2+/3+ is still a wide route but not a full
+            // default-route hijack — the server independently refuses these
+            // (nathole.rs `is_route_hijack_prefix`); this is defense-in-depth.
+            let hijack = len <= 1;
             !hijack
         }
         None => subnet.parse::<std::net::IpAddr>().is_ok(),
@@ -460,11 +456,16 @@ mod tests {
         assert!(!valid_cidr("0.0.0.0/0"));
         assert!(!valid_cidr("::/0"));
         // The /1 splits that together cover a whole family must also be
-        // refused.
+        // refused — including non-canonical bases, which are the same
+        // network once the route table masks the base (round-17 review
+        // MEDIUM).
         assert!(!valid_cidr("0.0.0.0/1"));
         assert!(!valid_cidr("128.0.0.0/1"));
         assert!(!valid_cidr("::/1"));
         assert!(!valid_cidr("8000::/1"));
+        assert!(!valid_cidr("10.0.0.0/1"));
+        assert!(!valid_cidr("200.0.0.0/1"));
+        assert!(!valid_cidr("8000:0000:0000:0000:0000:0000:0000:0000/1"));
     }
 
     #[test]
