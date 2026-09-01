@@ -271,3 +271,9 @@ jobs:
             echo "Uploading: ${asset}"
             gh release upload "$RELEASE_TAG" "${asset}" --clobber
           done
+          # sha256 checksums (bare filenames, so `sha256sum -c checksums.txt`
+          # works against the downloaded assets in one directory)
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+            -exec sha256sum {} \; \
+            | awk '{n = split($2, a, "/"); print $1, a[n]}' > checksums.txt
+          gh release upload "$RELEASE_TAG" checksums.txt --clobber
