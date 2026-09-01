@@ -1707,24 +1707,27 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                     {
                         Ok(mut local) => {
                             // Write PROXY protocol header if configured. Go
-                            // parity (client/proxy/proxy.go:183-197,210):
-                            // the header is only emitted when the source
-                            // address is non-empty AND the source port is
-                            // non-zero; both addresses are resolved as
-                            // IpAddr, and a resolution failure logs and
-                            // skips the header (Go closes the conn — the
-                            // header is informational, dropping it keeps the
-                            // data plane alive).
+                            // parity (client/proxy/proxy.go:183-197,210,
+                            // f6688e2): the header is only emitted when the
+                            // source address is non-empty AND the source
+                            // port is non-zero; an empty destination address
+                            // defaults to "127.0.0.1" (Go net.ResolveTCPAddr
+                            // with the pre-set localhost default) and both
+                            // addresses are resolved as IpAddr. A resolution
+                            // failure logs and skips the header (Go closes
+                            // the conn — the header is informational,
+                            // dropping it keeps the data plane alive).
                             let src_port = swc.src_port.unwrap_or(0);
                             if !info.proxy_protocol_version.is_empty()
                                 && swc.src_addr.is_some()
                                 && src_port != 0
                             {
                                 if let Some(ref src) = swc.src_addr {
+                                    let dst = swc.dst_addr.as_deref().unwrap_or("127.0.0.1");
                                     if info.proxy_protocol_version == "v1" {
                                         match frp_core::proxy_protocol::build_proxy_protocol_v1(
                                             src,
-                                            swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
+                                            dst,
                                             src_port,
                                             swc.dst_port.unwrap_or(0),
                                         ) {
@@ -1742,7 +1745,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                                     } else if info.proxy_protocol_version == "v2" {
                                         match frp_core::proxy_protocol::build_proxy_protocol_v2(
                                             src,
-                                            swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
+                                            dst,
                                             src_port,
                                             swc.dst_port.unwrap_or(0),
                                         ) {
