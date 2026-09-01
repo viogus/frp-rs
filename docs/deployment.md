@@ -167,10 +167,11 @@ Available tags:
 
 Images are built from **scratch** (no base image). The Rust binary is linked
 statically against musl, and the C entrypoint is compiled with `-static`.
-Image size tracks the default-features binary: ~5.3 MB frps / ~4.5 MB frpc
-(declared release profile, measured 2026-08-08) plus a few hundred KB of
-busybox-free C entrypoint — a default frps image is roughly 5.5–6 MB. The
-`tiny` tier (~3.3 MB frps / ~3.2 MB frpc) is the right choice for small
+Image size tracks the default-features binary: ~8.5 MB frps / ~6.8 MB frpc
+(declared release profile, glibc build measured 2026-09-01 Linux x86_64;
+musl link is the same order of magnitude) plus a few hundred KB of
+busybox-free C entrypoint — a default frps image is roughly 8.8–9.3 MB. The
+`tiny` tier (~5.2 MB frps / ~4.6 MB frpc) is the right choice for small
 images.
 
 ### Docker Compose Example

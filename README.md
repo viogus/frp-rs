@@ -168,16 +168,16 @@ Four size tiers (see [Technical Differences](#technical-differences-vs-go-frp) f
 enabled by default; dashboard is opt-in:
 
 ```bash
-# Default — core transports + SSH + QUIC, no dashboard (~5.3 MB frps, ~4.5 MB frpc)
+# Default — core transports + SSH + QUIC, no dashboard (~8.5 MB frps, ~6.8 MB frpc)
 cargo build --release -p frps -p frpc
 
-# Full — default + dashboard (~5.7 MB frps, ~4.5 MB frpc)
+# Full — default + dashboard (~9.2 MB frps, ~6.8 MB frpc)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
 
-# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard/compression, keeps TLS+TCP mux (frps also HTTP proxy) (~3.3 MB / ~3.2 MB)
+# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard/compression, keeps TLS+TCP mux (frps also HTTP proxy) (~5.2 MB / ~4.6 MB)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
 
-# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~2.3 MB / ~2.2 MB)
+# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~3.2 MB / ~3.5 MB)
 cargo build --release -p frps -p frpc --no-default-features --features micro
 ```
 
@@ -492,11 +492,11 @@ buffer defaults to 32 KiB (matching Go frp) and can be tuned via the
 
 | Metric | Go frp v0.71.0 | frp-rs (default) | frp-rs (`tiny`) | frp-rs (`micro`) |
 |--------|---------------|------------------|-----------------|-------------------|
-| frps binary | ~14 MB | ~5.3 MB | ~3.3 MB | ~2.3 MB |
-| frpc binary | ~12 MB | ~4.5 MB | ~3.2 MB | ~2.2 MB |
+| frps binary | ~14 MB | ~8.5 MB | ~5.2 MB | ~3.2 MB |
+| frpc binary | ~12 MB | ~6.8 MB | ~4.6 MB | ~3.5 MB |
 | Memory (idle) | ~8-12 MB | ~2-4 MB | ~1.5-3 MB | ~1-2 MB |
 
-> Binary sizes measured 2026-08-08 (macOS arm64) with the **declared release profile** (`fat-LTO`, `opt-level=z`, `strip = true`, `panic=abort`). Local/CI dev builds override LTO/opt (`lto=false opt-level=2` for build speed) and come out ~70% larger (measured 2026-08-09: 9.1MB vs 5.3MB) — they do not reflect release artifacts.
+> Binary sizes measured 2026-09-01 (Linux x86_64, glibc, rustc 1.98.0) with the **declared release profile** (`fat-LTO`, `opt-level=z`, `codegen-units=1`, `strip = "symbols"`, `panic=abort`) — verified via `cargo build -v` rustc flags. Sizes are platform- and toolchain-dependent: the same profile measured 2026-08-08 on macOS arm64 was ~5.3/4.5 MB. CI/dev builds override LTO/opt (`lto=false opt-level=2` for build speed; frps ~9.1 MB measured 2026-08-09) and come out larger — they do not reflect release artifacts.
 
 **Build sizes via feature flags.** Trim unused protocols and features to match your deployment. `frps`'s `default` feature set already enables every transport and the SSH gateway (the Cargo `full` feature is identical to `default`); opt-in features are `dashboard`, `vnet`, `mimalloc`, `otel`, and the dev-only profiling flags:
 
@@ -524,7 +524,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 **协议兼容。** 完全兼容 Go frp v0.71.0 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 86 项常规兼容性测试加 17 项 XTCP 两两矩阵测试（含 QUIC 数据面）。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
-**体积与内存。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.3 MB，frpc ~4.5 MB（含 QUIC/KCP/SSH 等全部默认 feature，声明 release profile 实测），约为 Go frp 的 1/3，且仍在持续收缩（`strip=true` + fat-LTO + `opt-level=z`）。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
+**体积与内存。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps ~8.5 MB，frpc ~6.8 MB（含 QUIC/KCP/SSH 等全部默认 feature，声明 release profile 实测，Linux x86_64），约为 Go frp 的 60%，微核心版本（micro）frps 仅 ~3.2 MB。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
 **性能工程（多轮审计实证）。** 热路径经过三轮独立审计与交叉验证，数据面干净利落：
 
@@ -540,10 +540,10 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 | 版本 | 体积 (frps/frpc) | 保留能力 | 适用场景 |
 |------|-----------------|---------|---------|
-| **default** | ~5.3MB / ~4.5MB | TCP/WS/TLS/KCP/QUIC、SSH、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
-| **full** | ~5.7MB / ~4.5MB | default + dashboard（`--features dashboard`；ssh/quic 等其余能力已在 default 内）；L3 VPN / TUN 路由可再叠加 `--features vnet` | 全功能部署 |
-| **tiny** | ~3.3MB / ~3.2MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/TCP mux（frps 另保留 HTTP 代理；frpc 的 h2 支持也独立为 `http2http` feature） | 边缘设备、嵌入式 |
-| **micro** | ~2.3MB / ~2.2MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
+| **default** | ~8.5MB / ~6.8MB | TCP/WS/TLS/KCP/QUIC、SSH、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
+| **full** | ~9.2MB / ~6.8MB | default + dashboard（`--features dashboard`；ssh/quic 等其余能力已在 default 内）；L3 VPN / TUN 路由可再叠加 `--features vnet` | 全功能部署 |
+| **tiny** | ~5.2MB / ~4.6MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/TCP mux（frps 另保留 HTTP 代理；frpc 的 h2 支持也独立为 `http2http` feature） | 边缘设备、嵌入式 |
+| **micro** | ~3.2MB / ~3.5MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
 
 每个 feature 均可独立开关（frps 21 个、frpc 20 个编译期 feature flag），精细控制二进制内容。无需修改代码，Cargo feature 即按需裁剪。
 

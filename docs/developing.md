@@ -447,27 +447,29 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 ```bash
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~5.3MB), frpc (~4.5MB)
+# → frps (~8.5MB), frpc (~6.8MB)
 
 # Full (all features; dashboard the main opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~5.7MB), frpc (~4.5MB)
+# → frps (~9.2MB), frpc (~6.8MB)
 
 # Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~3.3MB), frpc-tiny (~3.2MB)
+# → frps-tiny (~5.2MB), frpc-tiny (~4.6MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~2.3MB), frpc-micro (~2.2MB)
+# → frps-micro (~3.2MB), frpc-micro (~3.5MB)
 ```
 
-> Sizes measured 2026-08-08 (macOS arm64) with the declared release profile
-> (fat-LTO, opt-level=z, strip=symbols, panic=abort). The local
-> `.cargo/config.toml` override was removed 2026-08-09 — local release
-> builds use the declared profile. Only CI workflows write
-> `lto=false opt-level=2` on runners (build speed) and come out ~70% larger
-> (measured 2026-08-09: 9.1MB vs 5.3MB).
+> Sizes measured 2026-09-01 (Linux x86_64, glibc, rustc 1.98.0) with the
+> declared release profile (fat-LTO, opt-level=z, codegen-units=1,
+> strip=symbols, panic=abort) — rustc flags verified via `cargo build -v`.
+> Platform-dependent: the same profile on macOS arm64 measured ~5.3/4.5MB on
+> 2026-08-08. The local `.cargo/config.toml` override was removed 2026-08-09
+> — local release builds use the declared profile. Only CI workflows write
+> `lto=false opt-level=2` on runners (build speed) and come out larger
+> (frps ~9.1MB measured 2026-08-09).
 
 The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and `frps-micro`/`frpc-micro` respectively.
 
