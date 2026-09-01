@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::base64::{decode as b64_decode, encode as b64_encode};
-use rand::RngCore;
+use rand::TryRng;
 use ring::digest;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -235,7 +235,9 @@ impl ClientHello {
     /// Generates 32 random bytes for client_random.
     pub fn new(transport: &'static str, tls: bool, tcp_mux: bool) -> Self {
         let mut client_random = vec![0u8; CRYPTO_RANDOM_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut client_random);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut client_random)
+            .expect("SysRng failure");
 
         Self {
             bootstrap: BootstrapInfo {
@@ -442,7 +444,7 @@ pub async fn v2_handshake_client_recv_hello(
     with_crypto: bool,
 ) -> Result<Option<CryptoContext>, crate::Error> {
     // Re-derive hello for algorithm-offer validation.
-    // NOTE: this re-creates ClientHello with fresh OsRng. Currently safe
+    // NOTE: this re-creates ClientHello with fresh SysRng. Currently safe
     // because `preferred_aead_algorithms()` is deterministic. If algorithm
     // preferences ever become non-deterministic (e.g. runtime feature
     // detection), this validation will use a different algorithm list than
@@ -708,7 +710,9 @@ pub async fn v2_handshake_server(
                 }
 
                 let mut server_random = vec![0u8; CRYPTO_RANDOM_SIZE];
-                rand::rngs::OsRng.fill_bytes(&mut server_random);
+                rand::rngs::SysRng
+                    .try_fill_bytes(&mut server_random)
+                    .expect("SysRng failure");
                 // Negotiate the UDPPacket codec: mirror Go frp v0.71.0
                 // NewServerHello (selectUDPPacketCodec over client's offers).
                 let udp_codec =

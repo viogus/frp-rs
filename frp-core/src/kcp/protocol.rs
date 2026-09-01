@@ -1338,7 +1338,7 @@ fn read_u32_le(buf: &mut Cursor<&[u8]>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -1952,7 +1952,7 @@ mod tests {
                 }
                 self.size = self.seeds.len();
             }
-            let i = rand::thread_rng().gen_range(0..self.size);
+            let i = rand::rng().random_range(0..self.size);
             let x = self.seeds[i];
             self.size -= 1;
             self.seeds[i] = self.seeds[self.size];
@@ -2008,7 +2008,7 @@ mod tests {
 
             let mut delay = self.rttmin;
             if self.rttmax > self.rttmin {
-                delay += rand::thread_rng().gen_range(0..(self.rttmax - self.rttmin));
+                delay += rand::rng().random_range(0..(self.rttmax - self.rttmin));
             }
 
             let pkg = DelayPacket {

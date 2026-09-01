@@ -353,7 +353,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | OIDC/JWT | `jsonwebtoken` | |
 | Logging | `tracing` + `tracing-subscriber` + `tracing-appender` | env-filter |
 | Error handling | `anyhow` + `thiserror` | |
-| Random | `rand` | 0.8 |
+| Random | `rand` | 0.10 (0.8.7 remains in the lock only via the opt-in `otel` chain: opentelemetry_sdk → … → tonic → tower — third-party pins, latest releases) |
 | Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `prometheus` | |
 
 **Removed and banned as direct dependencies** (do not reintroduce without approval):

@@ -318,7 +318,8 @@ struct CipherWriterState {
 impl CipherWriterState {
     fn new(key: [u8; 16]) -> Self {
         let mut write_iv = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut write_iv);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut write_iv)
+            .expect("SysRng failure");
         Self {
             key,
             cfb: None,

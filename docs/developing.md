@@ -823,7 +823,7 @@ The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be 
 | OIDC/JWT | `jsonwebtoken` |
 | Logging | `tracing` + `tracing-subscriber` + `tracing-appender` |
 | Error handling | `anyhow` + `thiserror` |
-| Random | `rand` 0.8 |
+| Random | `rand` 0.10 (0.8.7 remains in the lock only via the opt-in `otel` chain: opentelemetry_sdk → … → tonic → tower — third-party pins, latest releases) |
 | Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `prometheus` |
 
 **Banned** (do not reintroduce without approval): `aws-lc-sys`, `aws-lc-rs`, `hmac`, `base64`, `sha2`, `aes-gcm`, `hkdf`, `hickory-resolver`, `lazy_static`, `data-encoding`, `hex`, `tokio-tungstenite`. Note: `libc` is an **active** direct dependency (frp-core Linux `splice(2)`, frp-vnet TUN ioctl), not banned. "Banned" means no direct dependency — several still exist transitively via the SSH feature chain (russh → ssh-key).

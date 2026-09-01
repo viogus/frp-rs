@@ -24,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use chacha20poly1305::aead::AeadInPlace;
 #[cfg(feature = "chacha20")]
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-use rand::RngCore;
+use rand::TryRng;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::hkdf::{Salt, HKDF_SHA256};
 
@@ -871,7 +871,9 @@ fn increment_nonce(nonce: &mut [u8]) -> bool {
 
 pub fn generate_random(len: usize) -> Result<Vec<u8>, String> {
     let mut buf = vec![0u8; len];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut buf)
+        .map_err(|e| format!("sys rng fill: {e}"))?;
     Ok(buf)
 }
 

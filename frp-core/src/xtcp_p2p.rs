@@ -193,7 +193,7 @@ impl NatHoleDetectSid {
             response,
             // Go v0.70.1 sets Nonce to a random string of 0-19 '0' chars
             // (`strings.Repeat("0", rand.IntN(20))` in sendSidMessage).
-            nonce: "0".repeat(rand::random::<usize>() % 20),
+            nonce: "0".repeat(rand::random::<u32>() as usize % 20),
         }
     }
 }
@@ -1792,9 +1792,9 @@ async fn send_random_ports_probe(
 /// Go `getUnusedPort`: a random port in [1024, 65535] not yet used, retrying
 /// up to 10 times; returns 0 when none was found (caller skips the round).
 fn get_unused_random_port(used: &mut std::collections::HashSet<u16>) -> u16 {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for _ in 0..10 {
-        let port = rand::Rng::gen_range(&mut rng, 1024..=65534);
+        let port = rand::RngExt::random_range(&mut rng, 1024..=65534);
         if used.insert(port) {
             return port;
         }

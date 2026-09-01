@@ -1168,7 +1168,7 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
         let state = test_state(1);
-        let mut rng = rand010::rng();
+        let mut rng = rand::rng();
         let host_key =
             russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
         let listener = SshListener {
@@ -1245,7 +1245,7 @@ mod tests {
         let (auth_tx, _auth_rx) = tokio::sync::watch::channel(false);
         let run_id_arc = Arc::new(std::sync::Mutex::new(None));
         let key =
-            russh::keys::PrivateKey::random(&mut rand010::rng(), russh::keys::Algorithm::Ed25519)
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
                 .unwrap();
         let pubkey = key.public_key().clone();
         let mut session = SshSession::new(
@@ -2280,7 +2280,7 @@ async fn load_or_generate_host_key(
     }
 
     // Generate new Ed25519 key
-    let mut rng = rand010::rng();
+    let mut rng = rand::rng();
     let key = russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
         .map_err(|e| format!("generate key: {}", e))?;
     let pem = key
@@ -2367,7 +2367,7 @@ mod key_tests {
 
         // Create explicit key
         let explicit_path = dir.path().join("explicit_key");
-        let mut rng = rand010::rng();
+        let mut rng = rand::rng();
         let explicit =
             russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
         let pem = explicit
