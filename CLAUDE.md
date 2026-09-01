@@ -36,25 +36,27 @@ Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in
 ```bash
 # Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~5.3MB), frpc (~4.5MB)
-#   (measured 2026-08-08 with the DECLARED release profile: fat-LTO,
-#   opt-level=z, strip=symbols, panic=abort — see [profile.release] in
-#   Cargo.toml. There is no local `.cargo/config.toml` override anymore
-#   (removed 2026-08-09); local `cargo build --release` uses the declared
-#   profile. CI workflows still write `lto=false opt-level=2` on runners
-#   for build speed, so CI artifact sizes do not reflect release.)
+# → frps (~8.5MB), frpc (~6.8MB)
+#   (measured 2026-09-01 Linux x86_64/glibc/rustc 1.98.0 with the DECLARED
+#   release profile: fat-LTO, opt-level=z, strip=symbols, panic=abort — see
+#   [profile.release] in Cargo.toml; flags verified via `cargo build -v`.
+#   Sizes are platform-dependent: the same profile on macOS arm64 measured
+#   ~5.3/4.5MB on 2026-08-08. There is no local `.cargo/config.toml` override
+#   anymore (removed 2026-08-09); local `cargo build --release` uses the
+#   declared profile. CI workflows still write `lto=false opt-level=2` on
+#   runners for build speed, so CI artifact sizes do not reflect release.)
 
 # Full (all features; dashboard is the main opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~5.7MB), frpc (~4.5MB)
+# → frps (~9.2MB), frpc (~6.8MB)
 
 # Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~3.3MB), frpc-tiny (~3.2MB)
+# → frps-tiny (~5.2MB), frpc-tiny (~4.6MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~2.3MB), frpc-micro (~2.2MB)
+# → frps-micro (~3.2MB), frpc-micro (~3.5MB)
 ```
 
 Feature flags across crates:
@@ -70,6 +72,7 @@ Feature flags across crates:
 | `compression` | frp-core | Snappy bridge compression (snap) |
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
 | `http-proxy` | frp-server | HTTP proxy plugin (hyper/http-client) |
+| `http2http` | frp-client | HTTP/2 (h2) support for the https2http/https2https plugins (enableHTTP2 path); implies `tls` |
 | `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
 | `vnet` | frp-core/server/client | L3 VPN / TUN device routing |
 | `admin` | frp-client | frpc admin API (axum) |
@@ -80,9 +83,9 @@ Feature flags across crates:
 | `otel` | frp-core/server/client | OpenTelemetry tracing + OTLP export (~+2-3MB) — frp-server exposes no `otel` feature; frps/frpc forward frp-core's |
 | `debug-logs` | frp-core | debug/trace logging (dev only) |
 
-Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compression, chacha20, tcp-mux, ssh; frpc = websocket, kcp, quic, oidc, tls, admin, compression, chacha20, tcp-mux. `quic` implies `tls`. `oidc` implies `http-client` (hyper). `ssh` implies `rand`. Note: `frp-core`'s own default includes `vnet`/`stun`/`tcp-mux`, but frps/frpc default binaries do **not** include `vnet` (opt-in) — only the `stun` (NAT hole punch) and `tcp-mux` parts that they forward.
+Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compression, chacha20, tcp-mux, ssh; frpc = websocket, kcp, quic, oidc, tls, compression, chacha20, tcp-mux, http2http. `quic` implies `tls`. `oidc` implies `http-client` (hyper). `ssh` implies `rand`. Note: `frp-core`'s own default includes `vnet`/`stun`/`tcp-mux`, but frps/frpc default binaries do **not** include `vnet` (opt-in) — only the `stun` (NAT hole punch) and `tcp-mux` parts that they forward.
 
-**Opt-in (NOT default):** `dashboard`, `mimalloc`, `otel`, `debug-logs`, `profiling`, `mem-profile`, `vnet` (frps/frpc — L3 VPN/TUN routing, drops frp-vnet from default binaries); `http-proxy` is a server-side opt-in (the client http_proxy plugin compiles unconditionally). `mem-profile` installs a `CountingAlloc` global allocator + a 1 Hz `MEMPROFILE` stderr emitter and is mutually exclusive with `mimalloc` (the `#[global_allocator]` guards are cfg-exclusive — with both enabled neither allocator is installed and the emitter does not run). Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
+**Opt-in (NOT default):** `admin` (frpc — the axum-based admin API, ~1 MB; was default until the 2026-08-09 audit round), `dashboard`, `mimalloc`, `otel`, `debug-logs`, `profiling`, `mem-profile`, `vnet` (frps/frpc — L3 VPN/TUN routing, drops frp-vnet from default binaries); `http-proxy` is a server-side opt-in (the client http_proxy plugin compiles unconditionally). `mem-profile` installs a `CountingAlloc` global allocator + a 1 Hz `MEMPROFILE` stderr emitter and is mutually exclusive with `mimalloc` (the `#[global_allocator]` guards are cfg-exclusive — with both enabled neither allocator is installed and the emitter does not run). Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
 
 - No `cargo check` variation needed for day-to-day work — `cargo build` covers the full workspace; ci.yml additionally gates the size tiers with `cargo check --no-default-features --features tiny|micro`.
 - Unit tests live inline (`#[cfg(test)] mod tests`); integration tests live in per-crate `tests/` dirs (`frp-server/tests/`, `frp-client/tests/`, `frp-core/tests/`).
@@ -121,7 +124,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 1529 passed, 0 failed (full suite incl. dashboard — requires an all-features frps binary, see Testing & Tooling) |
-| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~5.3MB/frpc ~4.5MB default; ~5.7/4.5 full; frps-tiny ~3.3MB/frpc-tiny ~3.2MB; frps-micro ~2.3MB/frpc-micro ~2.2MB — measured 2026-08-08 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort); CI dev builds override LTO/opt (`lto=false opt-level=2`, written by ci.yml on runners) for build speed and come out ~70% larger (measured 2026-08-09: 9.1MB vs 5.3MB), so CI artifact sizes do not reflect release; local builds use the declared profile; hyper-based HTTP client + otel/prometheus default-features pruning) |
+| `cargo build --release` | passes, zero warnings on all 4 profiles (frps ~8.5MB/frpc ~6.8MB default; ~9.2/6.8 full; frps-tiny ~5.2MB/frpc-tiny ~4.6MB; frps-micro ~3.2MB/frpc-micro ~3.5MB — measured 2026-09-01 Linux x86_64/glibc/rustc 1.98.0 with the DECLARED release profile (fat-LTO + opt-level=z + strip=symbols + panic=abort), flags verified via `cargo build -v`; sizes are platform-dependent (same profile on macOS arm64: ~5.3/4.5MB on 2026-08-08); CI dev builds override LTO/opt (`lto=false opt-level=2`, written by ci.yml on runners) for build speed and come out larger (frps ~9.1MB measured 2026-08-09), so CI artifact sizes do not reflect release; local builds use the declared profile; hyper-based HTTP client + otel/prometheus default-features pruning) |
 | `compat-test.sh` (Go frp v0.71.0) | 86 passed, 0 failed (run_test + XTCP pairwise; re-verified locally vs Go 0.71.0 on 2026-08-30) |
 | `unsafe` blocks | 17 in frp-core, ~38 in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |

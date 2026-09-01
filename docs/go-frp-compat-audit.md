@@ -1,12 +1,14 @@
-# Go frp v0.70.1 → frp-rs Compatibility Audit
+# Go frp v0.71.0 → frp-rs Compatibility Audit
 
-> Source-level comparison. Updated 2026-07-14.
+> Source-level comparison. Updated 2026-07-14; compat re-verified against Go
+> frp v0.71.0 2026-08-30/31 (round-18 gates: 86/86 compat, protocol-matrix
+> 11/11).
 
 ## Summary
 
-frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 10 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
+frp-rs targets Go frp v0.71.0 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 10 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
 
-**76 non-XTCP compatibility tests and the 17-test XTCP pairwise matrix run against Go frp v0.70.1 (V2 included).**
+**86 non-XTCP compatibility tests and the 17-test XTCP pairwise matrix run against Go frp v0.71.0 (V2 included).**
 
 ---
 
@@ -19,7 +21,7 @@ frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/S
 | HTTP | ✅ Compat | `response_headers` injection, `route_by_http_user`, `health_check_http_headers` |
 | HTTPS | ✅ Compat | SNI-only routing; also supports TLS termination mode |
 | STCP | ✅ Compat | Real visitor plugin, `bind_port=-1` no-bind mode, visitor auth via MD5(sk+timestamp) |
-| XTCP | ✅ Compat | TCP simultaneous open, `keepTunnelOpen`/`maxRetriesAnHour`/`minRetryInterval` retry, `fallbackTimeoutMs`, `disableAssistedAddrs` |
+| XTCP | ✅ Compat | UDP MakeHole hole punching (KCP-over-UDP or QUIC P2P data plane — no TCP simultaneous open; that pre-v0.7.0 mechanism is incompatible), `keepTunnelOpen`/`maxRetriesAnHour`/`minRetryInterval` retry, `fallbackTimeoutMs` (clamped to 20s), `disableAssistedAddrs` |
 | SUDP | ✅ Compat | frp-rs uses explicit `sudp_port` config; Go frp auto-manages via VisitorManager |
 | TCPMux | ✅ Compat | Auth: frp-rs uses `Proxy-Authorization` header; Go frp uses HTTP Basic Auth |
 
@@ -31,7 +33,7 @@ frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/S
 |-----------|------|--------|-------------|-------|
 | TCP | ✅ | ✅ | ✅ | Full interop verified by compat tests |
 | WebSocket | ✅ | ✅ | ✅ | Both client and server use Raw mode WsByteStream — treats all WS data frames as opaque bytes, tolerating Go frp TEXT frames with non-UTF-8 payload. Client masks outgoing frames per RFC 6455 §5.3. |
-| KCP | ✅ | ✅ | ✅ Full interop | Window 1024, MTU 1350. Go↔Rust KCP passes both directions, including KCP+TLS and KCP+tcpMux — Go frp v0.70.1 applies TLS and yamux over its KCP session layer exactly like TCP (frps `server/service.go` HandleListener runs CheckAndEnableTLSServerConn + fmux.Server over kcpListener; frpc `client/connector.go` realConnect applies TLS hooks with WithProtocol("kcp") and Open wraps in fmux.Client). Rust side uses the in-tree KCP implementation (kcp-go v5.6.13 aligned). |
+| KCP | ✅ | ✅ | ✅ Full interop | Window 1024, MTU 1350. Go↔Rust KCP passes both directions, including KCP+TLS and KCP+tcpMux — Go frp v0.71.0 applies TLS and yamux over its KCP session layer exactly like TCP (frps `server/service.go` HandleListener runs CheckAndEnableTLSServerConn + fmux.Server over kcpListener; frpc `client/connector.go` realConnect applies TLS hooks with WithProtocol("kcp") and Open wraps in fmux.Client). Rust side uses the in-tree KCP implementation (kcp-go v5.6.13 aligned). |
 | QUIC | ✅ | ✅ | ✅ Full interop | ALPN `"frp"`. Multi-stream QuicConnection wrapper accepts Go frp quic-go additional streams. Full Go↔Rust cross-compat verified. |
 | TLS | ✅ | ✅ | ✅ | `disableCustomTLSFirstByte` controls 0x17 prefix. Full interop with Go frp TLS. |
 
@@ -97,7 +99,7 @@ frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/S
 | `tls2raw` | ✅ |
 | `virtual_net` | ✅ Proxy work-conn plugin + visitor tunnel packet path |
 
-**10 of 10 client plugin types implemented. The Go frp v0.70.1 `virtual_net`
+**10 of 10 client plugin types implemented. The Go frp v0.71.0 `virtual_net`
 proxy plugin hands work connections to the vnet controller (TUN ingress plus
 source-IP return routing), and the `virtual_net` visitor plugin delivers
 inbound `VnetPacket`s into its no-bind STCP/XTCP tunnel while forwarding
@@ -123,7 +125,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 
 ## Resolved (2026-06-28)
 
-1. **V2 AEAD encryption + capability negotiation** — ✅ Full implementation: Login plaintext, AEAD after LoginResp, crypto negotiation in handshake. V2 compat tests run against the Go frp v0.70.1 pre-built binary (V2 is included since v0.70.1).
+1. **V2 AEAD encryption + capability negotiation** — ✅ Full implementation: Login plaintext, AEAD after LoginResp, crypto negotiation in handshake. V2 compat tests run against the Go frp v0.71.0 pre-built binary (V2 is included since v0.70.1).
 
 2. **XTCP Go frp cross-compat** — ✅ Full implementation: server coordinates NAT analysis with address exchange. Compat tests guarded behind `RUN_XTCP=1` (requires public internet for STUN/NAT probes).
 
@@ -132,24 +134,24 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 ## Out of Scope
 
 - **Pprof profiling endpoint** — out of scope (Go-specific; Rust equivalent is tokio-console)
-- **gRPC management API** — Go frp v0.70.1 has no gRPC; REST API covers all management
+- **gRPC management API** — Go frp v0.71.0 has no gRPC; REST API covers all management
 
 ### Recently Fixed (2026-06-27)
 
-- ✅ Client reconnect: two-phase fast backoff (escalating phase, 20s cap) — matches Go frp v0.70.1's `fastBackoffImpl`
+- ✅ Client reconnect: two-phase fast backoff (escalating phase, 20s cap) — matches Go frp v0.71.0's `fastBackoffImpl`
 - ✅ Group load balancing: true round-robin with per-group atomic counter
 - ✅ Admin `/api/status`: reports actual `plugin`, `remote_addr`, `err`; status reflects registration state
 - ✅ Config reload: detects changed proxies via config_snapshot hash, supports CloseProxy+NewProxy cycle for add/remove/modify without restart
-- ✅ Go↔Rust XTCP: server-side routing fixed (handle_client() for NatHoleResp wire path); frp-rs visitors default the P2P protocol to KCP so Go providers negotiate KCP (Go frp v0.70.1 defaults visitors to QUIC)
+- ✅ Go↔Rust XTCP: server-side routing fixed (handle_client() for NatHoleResp wire path); frp-rs visitors default the P2P protocol to **QUIC** (Go parity — empty protocol normalized to `"quic"` via Go `EmptyOr`), `protocol="kcp"` selects the KCP+yamux data plane
 - ✅ KCP parameters: window 128→1024, MTU 1400→1350 (matches Go frp)
 - ✅ QUIC: verified both sides use one bidirectional stream per logical channel
 - ✅ Client `/api/metrics`: Prometheus-format metrics endpoint (traffic_in/out, connection_counts, current_conns) — matches server `/metrics`
-- ✅ KCP cross-compat: Rust↔Rust KCP + Go↔Rust KCP (plain, TLS, tcpMux) all pass in both directions — in-tree Rust KCP is aligned with Go kcp-go session layer (kcp-go v5.6.13), verified against Go frp v0.70.1
+- ✅ KCP cross-compat: Rust↔Rust KCP + Go↔Rust KCP (plain, TLS, tcpMux) all pass in both directions — in-tree Rust KCP is aligned with Go kcp-go session layer (kcp-go v5.6.13), verified against Go frp v0.71.0
 - ✅ QUIC cross-compat: Rust↔Rust QUIC transport test added (r2r); Go↔Rust guarded — stream model mismatch (Go quic-go multi-stream-per-connection vs Rust one-stream-per-connection)
 - ✅ Multi-port STUN, IPv6 parsing, session limit, stable key generation
 - ✅ Rust→Go HTTPS compat test: fixed TLS termination architecture (Go frps vhostHTTPSPort forwards raw TLS; local echo server upgraded to HTTPS with proper SSL error resilience)
 - ✅ Go→Rust SOCKS5 compat test: symmetric coverage with existing r2g test
-- ✅ WebSocket + encryption compat tests: g2r + r2g both pass. Client-side Raw mode WsByteStream (manual WS upgrade + RFC 6455 masking) bypasses tungstenite UTF-8 validation, tolerating Go frps TEXT frames with encrypted binary payload.
+- ✅ WebSocket + encryption compat tests: g2r + r2g both pass. Client-side Raw mode WsByteStream (manual WS upgrade + RFC 6455 masking, in-tree framing — tungstenite removed 2026-08-09) tolerates Go frps TEXT frames with encrypted binary payload.
 
 ---
 

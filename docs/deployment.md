@@ -167,7 +167,31 @@ Available tags:
 
 Images are built from **scratch** (no base image). The Rust binary is linked
 statically against musl, and the C entrypoint is compiled with `-static`.
-Total image size is approximately 2–3 MB.
+Image size tracks the default-features binary: ~8.5 MB frps / ~6.8 MB frpc
+(declared release profile, glibc build measured 2026-09-01 Linux x86_64;
+musl link is the same order of magnitude) plus a few hundred KB of
+busybox-free C entrypoint — a default frps image is roughly 8.8–9.3 MB. The
+`tiny` tier (~5.2 MB frps / ~4.6 MB frpc) is the right choice for small
+images.
+
+### Optional UPX Compression
+
+Not recommended by default — see the trade-offs below — but available for
+storage-constrained deployments (embedded, air-gapped transfers):
+
+```bash
+upx -9 -o frps-upx frps && upx -9 -o frpc-upx frpc
+```
+
+Measured 2026-09-01 Linux x86_64, UPX 4.2.4, `-9` on the declared release
+profile: frps 8,454,704 → 2,993,996 bytes, frpc 6,805,576 → 2,640,192
+(~35–39% of original across all four tiers; `upx --test` verified, 1 MiB
+byte-exact data-plane smoke-tested). Costs: **+30% idle RSS** (8.3 → 10.8 MB
+frps, decompressed image lives in anonymous memory — raw binaries keep
+demand-paged, evictable text), ~60 ms one-time startup decompression, and
+classic antivirus false-positive risk (Go frp ships uncompressed for the
+same reason). Docker layer compression already shrinks the raw binary in
+transit, so the main win is raw artifact download, not image size.
 
 ### Docker Compose Example
 
@@ -185,9 +209,10 @@ services:
       # Optional overrides (only applied when /app/frp.toml is missing/empty)
       - FRP_BIND_PORT=7000
       - FRP_AUTH_TOKEN=${FRP_TOKEN}
-      - FRP_DASHBOARD_PORT=7500
-      - FRP_DASHBOARD_USER=admin
-      - FRP_DASHBOARD_PWD=${DASHBOARD_PASS}
+      # NOTE: the published images build with default features only — the
+      # dashboard is opt-in and NOT compiled in, so FRP_DASHBOARD_* vars are
+      # ignored by ghcr.io/viogus/frps-rs:latest. To use the dashboard, build
+      # your own image with `FRP_FEATURES="dashboard"` (see Dockerfile.source).
 
   frpc:
     image: ghcr.io/viogus/frpc-rs:latest
@@ -298,6 +323,8 @@ tls_cert_file = "/etc/frp/server.crt"
 tls_key_file = "/etc/frp/server.key"
 tls_only = false         # false: accept both TLS and plain TCP
                           # true:  reject non-TLS connections
+                          # NOTE: setting tls_ca_file below auto-forces
+                          # tls_only = true (Go TrustedCaFile parity)
 
 # Mutual TLS (require client certificates)
 tls_ca_file = "/etc/frp/ca.crt"    # CA that signed client certs
@@ -437,6 +464,12 @@ tls_server_name = "frps.example.com"
 ## 4. Monitoring
 
 ### Prometheus Metrics
+
+The dashboard (and its `/metrics` endpoint) is **opt-in**: build frps with
+the `dashboard` feature — `cargo build --release -p frps --features
+"ssh,quic,dashboard"` (or set `FRP_FEATURES="dashboard"` when building the
+Docker image). With a default-features binary the `[web_server]` section is
+parsed but inert — no dashboard, no `/metrics`.
 
 Enable Prometheus scraping on the dashboard port:
 
@@ -717,12 +750,16 @@ consumes negligible resources when idle.
 heartbeat_timeout = 90   # server disconnects if no ping within this window
 
 # frpc.toml
-heartbeat_interval = 30   # client sends a ping every 30s
+heartbeat_interval = -1   # -1 = disabled under tcp_mux (Go v0.71.0 default)
 ```
 
-The server's `heartbeat_timeout` should be at least 2x the client's
-`heartbeat_interval`. Defaults (90s / 30s) work well for most deployments.
-For high-latency or lossy links, increase `heartbeat_timeout` to 180s.
+With tcp_mux enabled (the default), app-layer heartbeats are **disabled
+by default on the client** (`heartbeat_interval`/`heartbeat_timeout` default
+to `-1`, Go v0.71.0 parity): yamux keepalive (30s) plus the server's 90s
+control idle watchdog (active when `heartbeat_timeout <= 0`) cover
+liveness. The server's `heartbeat_timeout` should be at least 2x the
+client's `heartbeat_interval` when you re-enable client pings. For
+high-latency or lossy links, increase `heartbeat_timeout` to 180s.
 
 ### Connection Pooling
 
@@ -763,7 +800,10 @@ bandwidth_limit_mode = "client"   # "client" or "server"
 |--------|-------|
 | `KB` | kibibytes (1024 bytes) |
 | `MB` | mebibytes (1024 × 1024 bytes) |
-| Any other suffix (e.g. `K`, `G`, `GB`) or no suffix | **not accepted** — the value is treated as unlimited |
+| Any other suffix (e.g. `K`, `G`, `GB`), a lowercase suffix (`kb`/`mb`), or no suffix | **config-load error** — "invalid bandwidth_limit", proxy rejected at registration |
+
+An empty string or a non-positive value (e.g. `0`, `0KB`) means unlimited
+(`Some(0)`), matching Go frp's `BuildBandwidthLimit` semantics.
 
 `bandwidth_limit_mode`:
 - `"client"` — limit bandwidth on the frpc side (download from local service)

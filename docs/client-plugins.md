@@ -312,8 +312,13 @@ host_header_rewrite = "app.local"
 ### Behavior
 
 - Accepts TLS on the incoming connection using the provided `crt_file`/`key_file`
-- After TLS decryption, reads and parses the HTTP request
-- Forwards the request to `local_addr` over plain HTTP/1.0
+- Advertises ALPN `h2` + `http/1.1` by default (`enable_http2 = true`,
+  matching Go frp `Complete()` backfilling nil → true; `http2http` Cargo
+  feature, frpc default ON — tiny builds advertise `http/1.1` only)
+- After TLS decryption, reads and parses the HTTP request — HTTP/2 inbound
+  frames are decoded (`frp-client/src/plugin/h2.rs`) and forwarded to the
+  backend as HTTP/1.1
+- Forwards the request to `local_addr` over plain HTTP
 - Copies the backend response back over the encrypted TLS channel
 
 ### TLS Requirements
@@ -330,6 +335,13 @@ host_header_rewrite = "app.local"
 | `crt_file`            | string | **yes**  | Path to TLS certificate PEM file          |
 | `key_file`            | string | **yes**  | Path to TLS private key PEM file          |
 | `host_header_rewrite` | string | no       | Override the Host header sent to backend  |
+| `enable_http2`        | bool   | no       | Advertise ALPN `h2` (default `true`)      |
+
+> **Header-size note:** the plugin's h2 listener keeps Go frp's 16 MiB
+> `max_header_list_size` (`defaultMaxHeaderListSize`) deliberately — it binds
+> the operator's own 127.0.0.1 port and serves the local user's browser, so
+> large Cookie jars/JWTs must not be rejected. The 4096-byte cap exists only
+> on the server-side vhost h2c surface (untrusted public traffic).
 
 ------------------------------------------------------------------------------
 
@@ -359,6 +371,8 @@ host_header_rewrite = "internal-api.example.com"
 ### Behavior
 
 - Accepts TLS on the incoming connection using `crt_file`/`key_file`
+- Advertises ALPN `h2` + `http/1.1` by default (`enable_http2 = true`;
+  HTTP/2 inbound decoded via `plugin/h2.rs` and forwarded as HTTP/1.1)
 - Decrypts the HTTP request
 - Establishes a new TLS connection to the backend (SNI from `local_addr`
   hostname, without backend certificate verification)
@@ -380,6 +394,7 @@ host_header_rewrite = "internal-api.example.com"
 | `crt_file`            | string | **yes**  | Path to TLS certificate PEM file          |
 | `key_file`            | string | **yes**  | Path to TLS private key PEM file          |
 | `host_header_rewrite` | string | no       | Override the Host header sent to backend  |
+| `enable_http2`        | bool   | no       | Advertise ALPN `h2` (default `true`)      |
 
 ------------------------------------------------------------------------------
 
@@ -481,7 +496,7 @@ at startup rather than silently failing.
 
 ## Proxy Virtual Net Plugin (`[proxies.plugin] type = "virtual_net"`)
 
-The Go frp v0.70.1 `virtual_net` proxy plugin exposes the client's TUN device
+The Go frp v0.71.0 `virtual_net` proxy plugin exposes the client's TUN device
 to remote `virtual_net` visitors. It does not bind a local listener. When the
 server assigns a work connection to this proxy, frpc hands the connection to
 the vnet controller: bytes from the remote tunnel are written into the local
@@ -510,7 +525,7 @@ default binaries), and a valid IPv4 `[virtualNet] address`.
 
 ## Visitor Virtual Net Plugin (`[visitors.plugin] type = "virtual_net"`)
 
-Go frp v0.70.1 also supports a visitor-side `virtual_net` plugin. It does not
+Go frp v0.71.0 also supports a visitor-side `virtual_net` plugin. It does not
 bind a local TCP listener; instead it advertises `destinationIP` as a host
 route through the virtual network routing path.
 

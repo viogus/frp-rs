@@ -95,7 +95,7 @@ dispatch it:
 | '7'       | CloseProxyResp  | Server to Client | **Rust-only** — proxy close acknowledgment |
 | '8'       | Error           | Server to Client | **Rust-only** — protocol error message |
 
-> **Rust-only types ('7', '8'):** These are frp-rs extensions not present in Go frp v0.70.1. Go frp treats unknown message types as errors. Only send on Rust↔Rust connections after capability negotiation. See `frp-core/src/msg.rs` for the payload structs.
+> **Rust-only types ('7', '8'):** These are frp-rs extensions not present in Go frp v0.71.0. Go frp treats unknown message types as errors. Only send on Rust↔Rust connections after capability negotiation. See `frp-core/src/msg.rs` for the payload structs.
 
 ### Work Connection Lifecycle
 
@@ -167,7 +167,7 @@ The server uses an `InternalMsg` channel for cross-task communication:
 
 ### Authentication
 
-Authentication uses **MD5(token + timestamp)** → hex string, matching Go frp v0.70.1:
+Authentication uses **MD5(token + timestamp)** → hex string, matching Go frp v0.71.0:
 
 ```
 privilege_key = hex(MD5(token + timestamp))
@@ -179,7 +179,7 @@ the Login message, then compares directly.
 ### Encryption
 
 When `use_encryption = true` on a proxy, data between frps and frpc is encrypted
-with **AES-128-CFB**, matching Go frp v0.70.1. The encryption key (16 bytes) is
+with **AES-128-CFB**, matching Go frp v0.71.0. The encryption key (16 bytes) is
 derived from the auth token via PBKDF2-SHA1:
 
 ```
@@ -189,7 +189,7 @@ encryption_key = PBKDF2(token, "frp", iterations=64, key_len=16, hash=SHA1)
 ### Compression
 
 When `use_compression = true`, data is compressed with **Snappy** (matching Go frp
-v0.70.1) before encryption. Compression is applied first, then encryption:
+v0.71.0) before encryption. Compression is applied first, then encryption:
 
 ```
 plaintext → Snappy compress → AES-128-CFB encrypt → [16-byte IV][ciphertext stream]
@@ -201,7 +201,7 @@ shared cipher state (`CipherWriter`/`CipherReader` in `frp-core/src/cipher_strea
 there is no per-frame length prefix. The reader consumes the IV on its first read.
 
 - Supported for TCP proxies (both client and server bridge paths), XTCP P2P channels, and control connections.
-- Note: Go frp v0.70.1 golib source says salt `"crypto"` but the pre-built binary uses `"frp"`. This codebase uses `"frp"` for binary compatibility.
+- Note: Go frp v0.71.0 golib source says salt `"crypto"` but the pre-built binary uses `"frp"`. This codebase uses `"frp"` for binary compatibility.
 
 ---
 
@@ -230,13 +230,18 @@ frp-rs/
       msg.rs              Wire protocol message structs
       mux.rs              TCP multiplexing (yamux)
       protocol.rs         V1/V2 frame read/write
-      quic.rs             QUIC transport wrapper
-      transport.rs        TCP/TLS/WebSocket/KCP/QUIC dial + accept + IoStream abstraction
+      transport/          transport.rs → directory: tcp.rs, tls.rs, kcp.rs, quic.rs,
+                          websocket.rs (manual RFC 6455), yamux.rs, cipher.rs, aead.rs,
+                          ssh_channel.rs, pre_read.rs, buffered_read.rs — IoStream
+                          is a Box<dyn Transport> newtype
+      udp_binary.rs       V2 UDP packet binary codec (frame type 19, Go v0.71.0)
+      xtcp_session.rs     Persistent XTCP tunnel session (keepTunnelOpenWorker parity)
       xtcp_p2p.rs         XTCP MakeHole hole punching (Go frp semantics)
       stun.rs             STUN client for NAT traversal
       proxy_protocol.rs   HAProxy PROXY protocol header builder
       bandwidth.rs        Token-bucket bandwidth limiter
       buffer_pool.rs      Reusable bridge buffers (FRP_BRIDGE_BUF_KB)
+      base64.rs, crc32c.rs, http_client.rs, snappy_stream.rs, control_sink.rs
       backoff.rs, logging.rs, system.rs, splice.rs, mem_profile.rs, profiling.rs,
       feature_gate.rs, unsafe_features.rs, internal_listener.rs
   frp-server/             Server library
@@ -308,7 +313,7 @@ frp-rs/
     entrypoint.c           Minimal static entrypoint (FRP_MODE, conf path)
     README.md              Docker build documentation
   scripts/
-    compat-test.sh         Go↔Rust cross-compatibility test suite (76 regular + 17 XTCP scenarios)
+    compat-test.sh         Go↔Rust cross-compatibility test suite (86 regular + 17 XTCP scenarios)
   frps.toml               Example server config
   frpc.toml               Example client config
   CLAUDE.md               Claude Code project instructions

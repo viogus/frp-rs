@@ -5,6 +5,11 @@
 > current source with file:line evidence).
 > **Milestone**: [v0.69.1 — Go frp parity + innovation](https://github.com/viogus/frp-rs/milestone/1) — 25/25 closed.
 > **Parity**: 100% vs Go frp v0.69.1. All tracked issues closed.
+>
+> **Status 2026-09-01**: historical record — this backlog is fully resolved.
+> Current version alignment is **Go frp v0.71.0** (tracked since 2026-08-16);
+> post-0.71.0 hardening rounds 1-18 live in the CHANGELOG "Unreleased"
+> section and the Current Health table in CLAUDE.md.
 
 ---
 

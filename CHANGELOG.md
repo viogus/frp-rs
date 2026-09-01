@@ -2,6 +2,192 @@
 
 All notable changes to frp-rs.
 
+## Unreleased — post-v0.71.0 hardening series (2026-08-16 → 2026-09-01)
+
+30 PRs (#248-#277), 175 files, +46296/−4364: five full code reviews (4
+finders + adversarial verifiers), 18 pre-release hardening rounds, 2
+data-corruption BLOCKERs, 2 leak-fix batches, Go frp v0.71.0 divergence
+closure, yamux vendor patches, and +380 tests (1149 → 1529, 0 failed).
+Version stays aligned at 0.71.0 (Go frp has not released a newer number).
+
+### Features
+- **SUDP wire protocol v2 + mixed-codec message bridge** (Go frp v0.71.0
+  `joinSUDPMessageBridge` parity, PR #248): SUDP work-conn data planes
+  negotiate the V2 binary UDP codec (`binary-v1`, frame type 19) per
+  session; a mixed-codec bridge relays `UDPPacket` frames between V1 and
+  V2 peers so a binary-codec sender can reach a JSON-codec receiver and
+  vice versa. Cross-implementation V2 SUDP compat scenarios added.
+- **HTTP/HTTPS group load balancing** (Go frp v0.71.0 `HTTPGroupController`
+  parity): same-domain HTTP/HTTPS proxies sharing `group`/`group_key`
+  distribute requests across group members; dashboard proxy-delete paths
+  honor group route ownership.
+- **Legacy INI proxy/visitor sections** (PR #250): `[web]`, `[ssh]`,
+  `[range:*]`, `[plugin:*]` INI sections load as typed proxies/visitors
+  (Go frp INI parity), incl. the `authentication_method` legacy mapping
+  (BLOCKER: previously ignored silently) and `webServer` keys after
+  `[common]` merge.
+- **Control idle watchdog** (PR #276): `CONTROL_IDLE_TIMEOUT` 90s on the
+  main control read, active only when `heartbeat_timeout <= 0`
+  (Go keepTunnelOpenWorker-style guard); ProgressRead counts decrypted +
+  raw wire bytes.
+- **Full-matrix A/B throughput gate** (`scripts/ab-matrix.sh` + CI): VPS-
+  measured A/B comparisons for data-plane changes, server-side flock
+  serialization, SSH keepalive, shared-runner noise filtering.
+
+### Fixes (Go parity & hardening)
+- **2 data-corruption BLOCKERs (round 13)**: AEAD `claimed` /
+  CipherWriter `first_write_data_len` stashed a mid-frame flush claim
+  across polls — a re-poll re-encrypted the same buffer into a duplicate
+  frame (multi-chunk `write_all` could loop forever); XTCP raw-KCP HWM-park
+  select stored as a struct field (`hwm_wait_fut`) — the old
+  select-inside-`poll_write` dropped both wakers on future drop, a
+  permanent high-water deadlock with tcp-mux off.
+- **yamux lost-wakeup deadlock (vendor patch #2)**: `tokio::io::split`
+  read+write halves polled the same `futures::channel::mpsc` Sender,
+  violating its one-poller contract — a `poll_read` window update
+  overwrote a parked writer's waker and the writer was orphaned forever
+  (~7.5% intermittent on the 2 MiB bidirectional byte-exact test). Fixed
+  with a dedicated `sender_wu` clone for the read path.
+- **yamux stream-cap semantics (round 11, vendor patch #1)**: crates.io
+  yamux 0.14 closes the ENTIRE mux session when the stream cap is hit
+  (Go frp's fork survives, per-open reject); frp-rs now vendored at
+  `vendor/yamux` with per-stream RST on inbound SYN at the 1024-stream
+  cap + asymmetric-cap regression test. (An earlier Aug 18 experiment —
+  vendoring a batched-build yamux — measured 114 vs 150.1 MB/s and was
+  reverted; the round-11 vendored copy uses different patches.)
+- **Go frp v0.71.0 audit closures (PRs #249, #252, #253, #260, #272)**:
+  strict config whitelists (auth token_source snake_case, camelCase OIDC
+  keys, top-level oidc_skip_* flatten), `oidc_token_endpoint_url` server
+  alias, strict `subDomainHost`, Go explicit-0 defaults, crypto-less
+  ClientHello reject, control-send timeouts, plugin hook ordering parity
+  (mutating hook runs BEFORE auth on NewWorkConn, Go service.go parity),
+  visitor comment/scope fixes, dashboard_tls_mode no-op documented.
+- **15-item code review (PR #260)**: wedge/cipher/splice/metrics/dedup
+  fixes across core+server.
+- **WS-over-TLS data-plane stall recovery (PR #258)**: wake after partial
+  reads (lost-wakeup on the TLS→WS handoff).
+- **3 LOW data-path fixes (PR #257)**: single-spawn bridge, lock-free UDP
+  liveness, WS server writev.
+- **High-leak fixes (PR #267)**: server bridge cancel via per-control
+  CancellationToken; KCP dial-driver self-exit via alive-streams counter;
+  client work-conn abort + bounded join; XTCP/STCP bridge cancellation on
+  teardown and proxy deletion (per-proxy `p2p_bridge_tokens` cancelled by
+  CloseProxy/HealthEvent::Close/reload); frpc SIGINT/SIGTERM incl.
+  config-dir mode; case-insensitive vhost/tcpmux/SNI routing (Go parity).
+- **Pre-release hardening rounds 8-16 (PR #273)**, incl.: h2c slowloris
+  handshake+first-accept under one absolute `vhost_http_timeout` deadline
+  + `max_header_list_size(4096)` on the server vhost surface; ini
+  lone-quote panic (abort under `panic=abort`, startup + reload); login
+  backoff shutdown race; header-scan byte-slice panics on multibyte UTF-8
+  straddling fixed-offset cuts (4 sites, unauthenticated abort under
+  `panic=abort`); Go origin-form/empty-port/CONNECT status-line parity
+  (3 oracles flipped in vhost + h2c); h2c origin-form auth split
+  (absolute-form → Proxy-Authorization 407, path-form → Authorization
+  401); vhost scheme partition (HTTP+HTTPS same-domain both register,
+  lookups match scheme — no-auth HTTP can no longer land on the HTTPS
+  backend); `keepTunnelOpenWorker` persistent XTCP tunnel session
+  (one hole-punched QUIC/yamux session reused across user connections);
+  NewWorkConn plugin order; ReplayTable + per-IP login throttle gate
+  (pre-auth, invalid-run_id logins consume throttle slots); run_id
+  validation on ALL auth paths + `Some("")` normalized to UUID;
+  3600s heartbeat clamps REMOVED both sides (Go frpc's 7200 disconnected
+  in a reconnect loop vs Rust frps — watchdog overflows degrade to
+  never-fire); control-loop half-frame loss (read future persisted in a
+  loop-outer Option, deterministic regression test); generation-guarded
+  cleanup (`remove_if_control_id` closes a get-then-remove TOCTOU);
+  CONNECT routes on request-line authority first (RFC 7230 §5.3);
+  PROXY header only when src_addr non-empty AND src_port != 0;
+  X-Forwarded-For appended unconditionally + preserved in
+  https2http/https2https; WS control frames masked client-side
+  (RFC 6455 §5.3) + protocol errors on FIN=0 / 126-127 encodings /
+  stray continuations; static_file 64 KiB streaming (was `read_to_end`
+  truncated at 64 MiB with a lying Content-Length); vnet default-net
+  membership null normalization + 64-route per-client cap + route
+  advertise membership guard + `/2` prefix-split bypass fixed
+  (threshold `len <= 6`); `udp_packet_size` clamp [0, 65507];
+  negative poolCount → config error at load (fail-fast, documented
+  divergence); KCP hostile-ACK RTT clamped to KCP_RTO_MAX (u32 overflow
+  = one-packet session kill); mux `MAX_PENDING_OPEN_REQUESTS=64` +
+  driver drain cap; yamux per-stream receive-window cap + send-side
+  body-buffer pool (ArrayQueue cap 16); heartbeat clamp 3600s→removed;
+  TLS connector-key cache carries (mtime, size) stamps (certbot in-place
+  rotation re-detected); snappy CRC32C verified on decompress;
+  `--config-dir` symlink-cycle guard (stack overflow SIGSEGV under
+  `panic=abort`); INI range expansion cap 4096; levenshtein skipped for
+  >256-char keys; unknown visitor types rejected at load; token-exec
+  bounded 10s both arms; ssh_gateway bridge head+payload reads bounded
+  30s; vnet >MTU pre-reject + rate-limited warnings; h2c declared-
+  Content-Length enforcement (excess body → RST_STREAM PROTOCOL_ERROR —
+  request smuggling closed); vendor yamux patch #4: O(1)
+  `outbound_unacked` counter replaces per-frame ack_backlog scans.
+- **Round-17/18 review fixes (PR #276)**: vnet prefix-split bypass (S2,
+  threshold `len <= 1` → `len <= 6`, 64×/6 covers 2^32 v4 / 2^128 v6,
+  legal prefixes ≥/8 unaffected — nathole + frp-client vnet both sides);
+  `write_v1_frame` vectored partial progress (TrickleWriter, byte-exact)
+  + zero-write loop guard (ZeroWriter); client proxy cap + custom-domain
+  cap rejected at handler level + `user_conn_sem` permit on listener side
+  (M5 mirror); yamux outbound refuses at the production 256 boundary and
+  survives (old CAP=4 test bypassed ACK-backlog=256 collision); mid-stall
+  completed frame resets reaper timer; socks5 handshake under one 60s
+  absolute deadline (handler released, paused-time pin); group
+  create-bind-race timing fix for slow CI; rustc 1.96 clippy
+  `-D warnings` compat.
+
+### Performance
+- **KCP**: chunk pool (lock-free ArrayQueue cap 8, socket/session/
+  listener shared — `write()` pop+clear+extend replaces `buf.to_vec()`);
+  `snd_data_pool` freelist (cap 64, ACKed segments recycle data);
+  single-copy send segmentation (offset walk, no `split_off` tail chain —
+  every byte copied exactly once); batch user→work compressed flushes;
+  skip pool-miss memset.
+- **Snappy**: zero-copy compress/decompress hot paths, CRC-32C
+  slice-by-8, buffer reuse (zero alloc per bridge iteration).
+- **Bridge**: pool-backed `PoolGuard` buffers, dead-buffer gating,
+  enlarged splice(2) pipe (Linux zero-copy relay).
+- **V2 frames**: single `writev` frame write + zero-alloc binary UDP
+  encode (PR #263).
+- **CFB cipher**: u128 XOR block path (~16x encrypt throughput, from the
+  PR #260 review cycle).
+
+### Tests
+- **1149 → 1529 (+380, 0 failed)**: round-9 test-gap filling alone added
+  114 (incl. yamux work-conn auth-chain e2e regression for the round-8
+  auth-bypass fix, login replay × throttle interaction, h2c preface
+  determinism, pool replenishment, relay integrity); rounds 13-18 added
+  login retry cadence, yamux RST wire shape, reload virtual_net survival,
+  in-process Rust↔Rust KCP/QUIC e2e, 2 MiB bidirectional byte-exact +
+  window-exhaustion stall, kcp 512 KiB volume, raw-KCP HWM recover,
+  SNI no-hijack, tcpmux negative-window, h2c 431/407/slow-drip, CONNECT
+  9-case Go matrix, multibyte panic-proof header scans, cross-instance
+  TCP auto-assign port flake (flock-serialized `allocate_port()`).
+- **Protocol matrix**: 11/11 rows green (tcp/ws/wss/kcp/quic × tls ×
+  tcp_mux).
+- **Cross-compat**: 86/86 vs Go frp v0.71.0 + 17 XTCP pairwise
+  (re-verified 2026-08-30).
+
+### CI & Tooling
+- **Stress workflow repair (PRs #274/#275)**: 3 stacked breakages —
+  duplicate `[profile.release]` TOML key (9 consecutive weekly reds),
+  proxy pointed at ssh port 22 instead of the echo backend, memory
+  scenario mode collision (`--mode` shared by latency/memory). All
+  scenarios validated locally: 6/6 PASS, 283 MB/s real echo data.
+- **ab-matrix**: private temp dir, REF worktree cleanup, macOS Bash 3.2
+  compat, VPS-side flock, confirm-retry noise filter.
+- **CI gate repair (round 16)**: tiny/micro feature-set builds restored
+  (missing `MAX_HOLE_PUNCH_TIMEOUT_MS` stub in the no-kcp xtcp_p2p
+  stub); Dockerfile `|| true` scoped to strip only (zigbuild/cp failures
+  loud again); tests job timeout 25 → 35 min; check job split into
+  lint/tests/verify lanes; rust 1.97/1.98 clippy fixes.
+
+### Dependencies
+- `cargo update` (latest patch/minor pins, PR #261).
+- **yamux** → vendored at `vendor/yamux` (`[patch.crates-io]`) with 4
+  patches: per-stream RST at cap, lost-wakeup `sender_wu`, receive-window
+  cap, body-buffer pool + O(1) outbound_unacked.
+- Removed as direct deps (banned): `hex`, `data-encoding`, `base64`,
+  `lazy_static`, `sha2`, `aes-gcm`, `hkdf`, `hickory-resolver`,
+  `aws-lc-rs`, `hmac`, `tokio-tungstenite` (manual RFC 6455 framing).
+
 ## v0.71.0 (2026-08-16)
 
 ### Features

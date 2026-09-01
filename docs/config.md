@@ -1,7 +1,7 @@
 # Configuration Reference
 
 Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field maps
-1:1 to a Go frp v0.70.1 equivalent.
+1:1 to a Go frp v0.71.0 equivalent.
 
 ---
 
@@ -30,12 +30,14 @@ Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field map
 | `allow_port_start` | `u16` | `1` | `allowPorts` (start) | Start of auto-assigned port range. Used when `allow_ports` is empty. |
 | `allow_port_end` | `u16` | `65535` | `allowPorts` (end) | End of auto-assigned port range (inclusive). Used when `allow_ports` is empty. |
 | `allow_ports` | `string` | `""` | `allowPorts` | Comma-separated port ranges, e.g. `"10000-20000,30000-40000"`. Each range is inclusive on both ends. When non-empty, takes precedence over `allow_port_start`/`allow_port_end`. |
-| `max_ports_per_client` | `u64` | `0` | `maxPortsPerClient` | Maximum number of proxies a single client can register. 0 = unlimited. |
+| `max_ports_per_client` | `u64` | `0` | `maxPortsPerClient` | Maximum number of proxies a single client can register. 0 = unlimited. **Restart-only** (not reloadable). |
+| `max_conns_per_proxy` | `u64` | `0` | `maxConnsPerProxy` | Maximum concurrent connections per proxy. 0 = unlimited. **Restart-only**. |
+| `max_proxies_per_client` | `u64` | `0` | `maxProxiesPerClient` | Maximum number of proxy registrations per client (distinct from `max_ports_per_client`). 0 = unlimited. **Restart-only**. |
 | `vhost_http_timeout` | `u64` | `60` | `vhostHTTPTimeout` | Timeout in seconds for backend HTTP response in VHost handler. |
 | `user_conn_timeout` | `u64` | `10` | `userConnTimeout` | Idle timeout in seconds on user-facing proxy connections. |
 | `detailed_errors_to_client` | `bool` | `true` | `detailedErrorsToClient` | When true (default), full Rust error details are included in client-facing error responses. When false, internal errors are replaced with generic messages. |
 | `tcp_mux_passthrough` | `bool` | `false` | `tcpMuxPassthrough` | When `tcp_mux` is enabled and yamux init fails, forward raw bytes to the VHost handler instead of closing the connection. |
-| `udp_packet_size` | `usize` | `1500` | `udpPacketSize` | UDP packet buffer size in bytes. Controls the receive buffer for UDP proxy datagrams. |
+| `udp_packet_size` | `usize` | `1500` | `udpPacketSize` | UDP packet buffer size in bytes. Controls the receive buffer for UDP proxy datagrams. Clamped to **[0, 65507]** at load (hostile values rejected — a 2^31 value would otherwise allocate multi-GiB UDP buffers). |
 | `nat_hole_analysis_data_reserve_hours` | `u64` | `168` | `natholeAnalysisDataReserveHours` | How long historical NAT behavior records are kept (in hours). Used by XTCP NAT analysis. |
 | `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional config files to merge (`.toml`, `.ini`, `.json`, `.yaml`, `.yml`). Relative to the main config file directory. |
 
@@ -110,13 +112,14 @@ Transport-level settings for the server.
 | `tcp_mux` | `bool` | `true` | `transport.tcpMux` | Enable TCP multiplexing (yamux) for work connections. When enabled, all proxies share a single TCP connection. |
 | `tcp_mux_keepalive_interval` | `i64` | `30` | `transport.tcpMuxKeepaliveInterval` | Keepalive interval in seconds for mux connections. Serde default is `0`; a zero value is normalized to the 30s default at load time. |
 | `heartbeat_timeout` | `i64` | `90` | `transport.heartbeatTimeout` | Heartbeat timeout in seconds. Server disconnects the client if no `Ping` received within this interval. When `tcp_mux` is enabled (the default), this is normalized to `-1` (disabled — yamux keepalive covers liveness). |
-| `tcp_keepalive` | `i64` | `300` | `transport.tcpKeepalive` | TCP keepalive idle time in seconds for server-side accepted connections. 0 = disabled. Probe interval and retries are also set so dead peers are reclaimed quickly. |
+| `tcp_keepalive` | `i64` | `7200` | `transport.tcpKeepalive` | TCP keepalive idle time in seconds for server-side accepted connections. 0 = disabled. Probe interval and retries are also set so dead peers are reclaimed quickly. |
 
 ### `[ssh_tunnel_gateway]` Section
 
 SSH tunnel gateway. When `bind_port > 0`, an embedded SSH server accepts SSH
 proxy-registration commands. Reverse forwarding (`ssh -R`, `tcpip-forward` /
-`forwarded-tcpip`) is supported since the 0.7.1 parity pass (Go semantics: the
+`forwarded-tcpip`) is supported since the 0.70.1-era parity pass (PR #221,
+2026-08-02; Go semantics: the
 port is recorded, not bound; a `forwarded-tcpip` channel is opened when a work
 connection is requested).
 
@@ -168,9 +171,9 @@ Send `SIGUSR1` to the frps process to hot-reload these settings from the config 
 |---------|--------|
 | `auth.token` | Updates encryption key; new logins use new token. Existing connections are unaffected. |
 | `allow_ports` / `allow_port_start` / `allow_port_end` | Adjusts port allocation range. Already-allocated ports are not released. |
-| `max_ports_per_client` | Updates the per-client proxy limit. |
+| TLS certificate/key/CA file paths | Rebuilds the TLS acceptor and swaps it atomically. Existing connections keep the old config; new connections pick up the new cert immediately. (A background task also re-stats the cert/key files every 60s, so in-place rotation — e.g. certbot — is picked up even without a reload.) |
 
-Settings that require a full restart: `bind_port`, `bind_addr`, TLS settings, OIDC settings, transport settings.
+Settings that require a full restart: `bind_port`, `bind_addr`, `tls_enable`, OIDC settings, transport settings, and the per-client/proxy registration caps `max_ports_per_client`, `max_conns_per_proxy`, `max_proxies_per_client` (they gate live registrations via semaphores/maps, so a reload cannot retroactively rescale them).
 
 ### Server TOML Example
 
@@ -265,7 +268,7 @@ enable_control = true
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `server_addr` | `string` | — | `serverAddr` | **Required.** Server address (IP or hostname). |
+| `server_addr` | `string` | `"0.0.0.0"` | `serverAddr` | Server address (IP or hostname). Defaults to `0.0.0.0` (Go frp parity, client.go:86 — only useful with an explicit `server_port`). |
 | `server_port` | `u16` | `7000` | `serverPort` | Server control port. |
 | `transport_protocol` | `string` | `"tcp"` | `protocol` | Transport protocol: `"tcp"`, `"websocket"` / `"ws"`, `"wss"`, `"quic"`, `"kcp"`. |
 | `token` | `string` | `""` | `auth.token` | Authentication token. Must match the server's token. This is a convenience field; for full auth config use `[auth]` section. |
@@ -283,10 +286,10 @@ enable_control = true
 | `tls_server_name` | `string` | `""` | `tlsServerName` | Server name for TLS SNI. Empty = use `server_addr`. |
 | `disable_custom_tls_first_byte` | `bool` | `true` | `disableCustomTLSFirstByte` | When true, the client skips the Go frp protocol marker byte (`0x17`) and starts TLS directly. Set this when connecting to a non-frp TLS endpoint. |
 | `login_fail_exit` | `bool` | `true` | `loginFailExit` | When true, the client exits on login failure. When false, it keeps retrying. |
-| `pool_count` | `i32` | `1` | `poolCount` | Number of pre-established work connections kept in the server-side pool. Higher values reduce latency for new proxy connections. |
+| `pool_count` | `i32` | `1` | `poolCount` | Number of pre-established work connections kept in the server-side pool. Higher values reduce latency for new proxy connections. Negative values are rejected at config load (fail-fast divergence — Go frp has no client-side check and the server rejects at login instead). |
 | `heartbeat_interval` | `i64` | `30` | `transport.heartbeatInterval` | Ping interval in seconds. Client sends a heartbeat `Ping` at this interval. When `tcp_mux` is enabled (the default), this is normalized to `-1` (disabled — yamux keepalive covers liveness). |
 | `dns_server` | `string` | `""` | `dnsServer` | Custom DNS server address for resolving `server_addr`. Empty = system DNS. Queries `A` and `AAAA` records concurrently, preferring IPv4 (an `A` answer wins even when `AAAA` also succeeds); falls back to IPv6 when only `AAAA` resolves. |
-| `dial_server_keepalive` | `i64` | `300` | `dialServerKeepalive` | TCP keepalive idle time in seconds for outbound connections to the server. 0 = disabled. |
+| `dial_server_keepalive` | `i64` | `7200` | `dialServerKeepalive` | TCP keepalive idle time in seconds for outbound connections to the server. 0 = use the 7200s default (Go parity — not a disable switch). |
 | `connect_server_local_ip` | `string` | `""` | `connectServerLocalIP` | Local IP address to bind when dialing the frp server. Empty = system default. |
 | `tcp_mux` | `bool` | `true` | `transport.tcpMux` | Enable TCP multiplexing (yamux) for work connections. |
 | `v2` | `bool` | `false` | `transport.wireProtocol = "v2"` | Enable V2 wire protocol framing. Requires `tcp_mux` for yamux multiplexing. |
@@ -468,9 +471,9 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 | `health_check_type` | `string` | `""` | `healthCheckType` | Health check type: `"tcp"` (connect check) or `"http"` (HTTP GET check). Empty = no health checks. |
 | `health_check_url` | `string` | `""` | `healthCheckURL` | URL path for HTTP health checks. Only used when `health_check_type = "http"`. |
 | `health_check_http_headers` | `map<string,string>` | `{}` | `healthCheckHTTPHeaders` | Custom HTTP headers sent with health check requests. |
-| `health_check_interval_seconds` | `u64` | `10` | `healthCheckIntervalS` | Seconds between health checks. Minimum 10. |
-| `health_check_timeout_seconds` | `u64` | `3` | `healthCheckTimeoutS` | Health check connect/read timeout in seconds. Minimum 3. |
-| `health_check_max_failed` | `u32` | `1` | `healthCheckMaxFailed` | Consecutive failures before marking the proxy unhealthy. Minimum 1. |
+| `health_check_interval_seconds` | `u64` | `10` | `healthCheckIntervalS` | Seconds between health checks. `0` = default (10). Explicit values below the old minimum are honored (Go parity — the `.max(10)` floor was removed, health.go:57-64). |
+| `health_check_timeout_seconds` | `u64` | `3` | `healthCheckTimeoutS` | Health check connect/read timeout in seconds. `0` = default (3). |
+| `health_check_max_failed` | `u32` | `1` | `healthCheckMaxFailed` | Consecutive failures before marking the proxy unhealthy. `0` = default (1). |
 | `multiplexer` | `string` | `""` | `multiplexer` | Multiplexer type for the proxy connection (e.g. `"yamux"`). |
 
 ### HTTP/HTTPS Proxy Fields
@@ -630,20 +633,20 @@ datagrams to a remote SUDP proxy — see [SUDP Visitor](proxies.md#sudp-visitor-
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `name` | `string` | `""` | `name` | Visitor name for logging. |
+| `name` | `string` | `""` | `name` | **Required.** Visitor name (config load error when empty — Go parity, validation/visitor.go:42-63). |
 | `type` | `string` | `""` | `type` | Visitor type: `"stcp"`, `"xtcp"`, or `"sudp"`. |
 | `server_name` | `string` | `""` | `serverName` | **Required.** The STCP/XTCP proxy name to connect to (must match the proxy's `name`). |
 | `secret_key` | `string` | `""` | `sk` / `secretKey` | **Required.** Shared secret key. Must match the STCP proxy's `sk`. |
 | `server_user` | `string` | `""` | `serverUser` | Optional server-side user for auth matching. |
 | `bind_addr` | `string` | `"127.0.0.1"` | `bindAddr` | Local address to bind for accepting visitor connections. |
-| `bind_port` | `u16` | `0` | `bindPort` | Local port for the visitor listener. 0 = disabled. |
+| `bind_port` | `i32` | `0` | `bindPort` | Local port for the visitor listener. `0` = rejected at config load (Go parity — "bind port is required"); `-1` = no-bind mode (no local listener; used by `virtual_net` plugin visitors); positive = start a local listener. |
 | `plugin` | `[visitors.plugin]` | — | `plugin` | Optional visitor plugin. `type = "virtual_net"` with `destinationIP` advertises the IP as a vnet host route instead of binding a local listener. |
 | `fallback_timeout_ms` | `u64` | `1000` | `fallbackTimeoutMs` | XTCP fallback timeout in milliseconds. After this time without a successful hole punch, fall back to the `fallback_to` visitor (usually STCP). |
 | `fallback_to` | `string` | `""` | `fallbackTo` | Fallback visitor name if XTCP hole punch fails. Typically points to an STCP visitor. |
 | `disable_assisted_addrs` | `bool` | `false` | `disableAssistedAddrs` | Disable NAT traversal assisted address reporting (STUN-discovered mapped addresses shared between peers during XTCP hole punching). |
 | `use_encryption` | `bool` | `false` | `useEncryption` | Encrypt tunnel traffic with AES-128-CFB (key derived from `secret_key`). |
 | `use_compression` | `bool` | `false` | `useCompression` | Compress tunnel traffic with Snappy. |
-| `protocol` | `string` | `"kcp"` | `protocol` | XTCP P2P data-plane protocol: `"kcp"` (default) or `"quic"`. The QUIC data plane (Go v0.70.1 `protocol=quic` compat: hole-punched UDP socket handed to quinn, no yamux, self-signed TLS + InsecureSkipVerify) is built in by default (the `quic` feature is default ON); use `"quic"` when interoperating with a Go frp visitor (Go defaults to `"quic"`). On a build without the feature, `"quic"` fails loudly instead of silently falling back to KCP. |
+| `protocol` | `string` | `"quic"` | `protocol` | XTCP P2P data-plane protocol: `"quic"` (default — Go frp parity, an empty value normalizes to `"quic"` via `EmptyOr`) or `"kcp"`. The QUIC data plane (Go v0.71.0 `protocol=quic` compat: hole-punched UDP socket handed to quinn, no yamux, self-signed TLS + InsecureSkipVerify) is built in by default (the `quic` feature is default ON). On a build without the feature, `"quic"` fails loudly instead of silently falling back to KCP. |
 | `keep_tunnel_open` | `bool` | `false` | `keepTunnelOpen` | When true, the XTCP visitor retries NAT hole punching instead of falling back to STCP after a connection ends. |
 | `max_retries_an_hour` | `i32` | `8` | `maxRetriesAnHour` | Maximum XTCP NAT hole punch retries per hour. |
 | `min_retry_interval` | `i64` | `90` | `minRetryInterval` | Minimum interval in seconds between XTCP retry attempts. |
@@ -840,12 +843,13 @@ All other features gate only the runtime behavior. Their config fields are alway
 | `ssh` | `[ssh_tunnel_gateway]` section | SSH gateway not compiled |
 | `dashboard` | `[web_server]` section | Dashboard HTTP endpoints not compiled |
 | `http-proxy` | `type = "http_proxy"` plugin config | Server-side HTTP plugin manager not compiled; the client `http_proxy` plugin compiles unconditionally |
+| `vnet` | `[[proxies]]`/`[[visitors]]` `plugin.type = "virtual_net"` + `virtual_net` section fields | L3 VPN / TUN device routing not compiled; `virtual_net` plugin and visitor configs are accepted but the tunnel is never established |
 
 ---
 
 ### Parse-Only Compatibility Fields
 
-Some Go frp v0.70.1 fields are parsed and validated for source-level
+Some Go frp v0.71.0 fields are parsed and validated for source-level
 compatibility but are not yet consumed by the frp-rs runtime. They are
 accepted so Go frp configs load unchanged; setting them currently has no
 runtime effect: `log.disablePrintColor`, and `webServer.pprofEnable`
