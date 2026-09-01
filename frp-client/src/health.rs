@@ -57,9 +57,9 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
     info!(check_type = %check_type, proxy_name = %proxy_name, local_addr = %local_addr, interval = ?interval, timeout = ?timeout, "Health check ({}) started for '{}' -> {} (interval: {:?}, timeout: {:?})",
         check_type, proxy_name, local_addr, interval, timeout);
 
-    // Go frp v0.70.1 compat: failedTimes is a monotonic uint64 that NEVER resets.
-    // State transitions are tracked by was_failed/statusOK, not by resetting the counter.
-    // See /tmp/frp-source/client/health/health.go:45,128-135.
+    // Go frp compat: failedTimes resets on a successful check (#5502, dev).
+    // State transitions are tracked by was_failed/statusOK; the counter
+    // counts only the CURRENT failure streak.
     let mut state = HealthState::new();
 
     // Go frp v0.70.1 compat: add 500ms startup delay before the first check.
@@ -85,7 +85,7 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
         // Close is only ever fired from a FAILURE tick (Go frp: statusFailedFn
         // runs in the error branch). The old guard ran on every tick, so the
         // first success after a failure sent Recover AND re-fired Close in the
-        // same tick (failures is monotonic and was_failed had just been cleared)
+        // same tick (failures was monotonic and was_failed had just been cleared)
         // — flapping CloseProxy/NewProxy every health interval.
         match state.on_check(result.is_ok(), max_failed) {
             HealthAction::Recover => {
@@ -329,7 +329,7 @@ mod tests {
     /// Regression: the Close guard must only ever run on FAILURE ticks. The
     /// old guard (`was_healthy && failures >= max_failed && !was_failed`) ran
     /// after every tick including successes, so the first success after a
-    /// recovery sent Recover AND re-fired Close in the same tick (failures is
+    /// recovery sent Recover AND re-fired Close in the same tick (failures was
     /// monotonic and was_failed had just been cleared) — flapping
     /// CloseProxy/NewProxy every health interval.
     #[test]
@@ -360,10 +360,11 @@ mod tests {
         assert_eq!(st.on_check(false, 2), HealthAction::None);
         // One more failure reaches max_failed again -> Close.
         assert_eq!(st.on_check(false, 2), HealthAction::Close);
-        // And the following success tick is again silent.
+        // The first success after Close recovers (was_failed=true)...
         st.confirm_close();
         assert_eq!(st.on_check(true, 2), HealthAction::Recover);
         st.confirm_recover();
+        // ...and the following success tick is silent.
         assert_eq!(st.on_check(true, 2), HealthAction::None);
     }
 
