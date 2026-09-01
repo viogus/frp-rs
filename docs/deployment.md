@@ -174,6 +174,25 @@ busybox-free C entrypoint — a default frps image is roughly 8.8–9.3 MB. The
 `tiny` tier (~5.2 MB frps / ~4.6 MB frpc) is the right choice for small
 images.
 
+### Optional UPX Compression
+
+Not recommended by default — see the trade-offs below — but available for
+storage-constrained deployments (embedded, air-gapped transfers):
+
+```bash
+upx -9 -o frps-upx frps && upx -9 -o frpc-upx frpc
+```
+
+Measured 2026-09-01 Linux x86_64, UPX 4.2.4, `-9` on the declared release
+profile: frps 8,454,704 → 2,993,996 bytes, frpc 6,805,576 → 2,640,192
+(~35–39% of original across all four tiers; `upx --test` verified, 1 MiB
+byte-exact data-plane smoke-tested). Costs: **+30% idle RSS** (8.3 → 10.8 MB
+frps, decompressed image lives in anonymous memory — raw binaries keep
+demand-paged, evictable text), ~60 ms one-time startup decompression, and
+classic antivirus false-positive risk (Go frp ships uncompressed for the
+same reason). Docker layer compression already shrinks the raw binary in
+transit, so the main win is raw artifact download, not image size.
+
 ### Docker Compose Example
 
 ```yaml
