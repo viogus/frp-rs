@@ -79,7 +79,7 @@ Each accepted connection spawns a `tokio::spawn` task. `detect_and_strip_magic()
 
 **TLS connections** get additional processing:
 - **TLS-only mode** (`tls_only: true`): non-TLS connections are rejected
-- **SNI-based HTTPS proxy routing**: the server peeks at the ClientHello for SNI hostname, looks up the VHostManager, and if a matching HTTPS proxy exists, routes the raw TLS stream directly to the proxy handler (bypasses the normal Login/NewWorkConn flow)
+- **SNI-based HTTPS proxy routing** happens only on the **`vhost_https_port` listener** (`vhost.rs`, `extract_sni_from_client_hello`): the server peeks at the ClientHello for the SNI hostname, looks up the VHostManager, and routes the raw TLS stream directly to the HTTPS proxy handler. The **main port does NOT sniff SNI** — round-13 Go parity: it reads only the 0x17/0x16 TLS marker to detect TLS vs plain (a wildcard https route must not hijack frpc TLS control logins)
 - **TCPMux over TLS** (`tcp_mux: true`): after TLS handshake, the stream is wrapped in a yamux multiplexer. The first yamux stream is the control channel; subsequent streams carry work connections
 
 **Additional listeners** are started alongside the main accept loop when their ports are configured:
@@ -145,8 +145,6 @@ The control handler (`frp-server/src/control/mod.rs`, `handle_control()`) is the
 
 ```rust
 tokio::select! {
-    biased;  // <-- internal_rx is evaluated first, every iteration
-
     internal = internal_rx.recv() => {
         // Process InternalMsg variants:
         // - NewWorkConn: defer to pending_nat_hole_sids → pending_udp → pending_requests → work_pool
@@ -173,7 +171,12 @@ tokio::select! {
 }
 ```
 
-The `biased` keyword is critical: `internal_rx` is always checked first. Without this, a flood of client messages could starve proxy connections, causing latency spikes. Internal messages represent real user traffic, so they get priority.
+The loop is deliberately **FAIR** — no `biased` keyword: an always-ready
+internal queue must not starve control reads (heartbeat pings, Shutdown).
+Internal messages represent real user traffic, so they get priority via the
+queue discipline itself; fairness is pinned by a regression test in
+`control/mod.rs` (asserts no `biased;` in the loop and bounded control p99
+under internal pressure).
 
 ### Work Connection Pooling
 
@@ -191,7 +194,7 @@ When a new work connection arrives:
 1. Pop from `pending_requests` if non-empty -- bridge immediately
 2. If no pending requests, push to `work_pool` (if below `pool_cap`)
 
-**Bridging** (`control/bridge.rs`, `assign_work_to_proxy`): after sending `StartWorkConn` with proxy metadata (encryption flag, compression flag), the server bridges the user connection to the work connection using either `tokio::io::copy_bidirectional` (plain) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy, streaming — a single 16-byte IV then continuous ciphertext, no per-frame length prefix).
+**Bridging** (`control/bridge.rs`, `assign_work_to_proxy`): after sending `StartWorkConn` with proxy metadata (encryption flag, compression flag), the server bridges the user connection to the work connection using either `tokio::io::copy_bidirectional_with_sizes` with the 32 KiB `BUFFER_SIZE` (plain, overridable via `FRP_BRIDGE_BUF_KB`) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy, streaming — a single 16-byte IV then continuous ciphertext, no per-frame length prefix).
 
 ### NAT Hole Punching (XTCP)
 
@@ -227,7 +230,7 @@ Two paths for visitor connections:
 
 1. **Fresh TCP connection** (primary): visitor sends `NatHoleVisitor` on a new TCP connection. Server creates session, sends `NatHoleSidOnWorkConn` internal msg. Provider control handler writes `StartWorkConn`+`NatHoleSid` on work conn. Provider does STUN, sends `NatHoleClient` on control, server runs NAT analysis, sends `NatHoleResp` to both sides.
 
-2. **Control connection** (Go frp compat): Go frpc v0.70.1 sends `NatHoleVisitor` on its existing control channel. Server creates session with `create_session_with_ctl`, spawns task waiting for provider's `NatHoleClient` on control, runs NAT analysis, and sends `NatHoleResp` to both sides.
+2. **Control connection** (Go frp compat): Go frpc v0.71.0 sends `NatHoleVisitor` on its existing control channel. Server creates session with `create_session_with_ctl`, spawns task waiting for provider's `NatHoleClient` on control, runs NAT analysis, and sends `NatHoleResp` to both sides.
 
 **NAT analysis** (`frp-server/src/nathole/analysis.rs`): 5-mode behavior table with score-based `Analyzer`. Each mode tests how the NAT behaves for different address/port combinations. The analyzer learns from success feedback -- successful hole punches increase the score for the modes that predicted the correct behavior.
 
@@ -236,19 +239,26 @@ Two paths for visitor connections:
 **XTCP P2P data plane**: after the hole punch, the P2P stream runs on the
 socket that received the peer's detect reply (Go `result.lConn` semantics —
 only that socket has a working NAT mapping). Two transports are supported,
-selected by the `protocol` field (visitor decides; Go visitors default to
-`"quic"`):
-- **KCP + yamux** (`protocol="kcp"`, default): the punched UDP socket runs
-  KCP (`XtcpP2pStream`) with yamux on top.
-- **QUIC** (`protocol="quic"`): the punched socket is handed directly to
-  quinn (`xtcp_p2p_connect_quic` — no yamux, QUIC multiplexes streams
-  itself), self-signed TLS + InsecureSkipVerify, ALPN `frp`. The visitor is
-  the QUIC client, the provider the QUIC server. Requires the `quic` feature
-  (default ON). Go visitors with `protocol="quic"` interoperate: Go frp
-  v0.70.1 sends `"ip:port"` as the QUIC SNI, which upstream rustls 0.23
-  rejects — frp-rs vendors rustls with a server-side patch that treats an
-  invalid SNI as "no SNI" (see the audit note §6; drop the patch when the
-  workspace moves past rustls 0.23).
+selected by the `protocol` field (visitor decides; empty protocol is
+normalized to `"quic"` — Go `EmptyOr` parity; **`"quic"` is the default**):
+- **QUIC** (`protocol="quic"`, default): the punched socket is handed
+  directly to quinn (`xtcp_p2p_connect_quic` — no yamux, QUIC multiplexes
+  streams itself), self-signed TLS + InsecureSkipVerify, ALPN `frp`. The
+  visitor is the QUIC client, the provider the QUIC server. Requires the
+  `quic` feature (default ON). Go visitors with `protocol="quic"`
+  interoperate: Go frp v0.71.0 sends `"ip:port"` as the QUIC SNI, which
+  upstream rustls 0.23 rejects — frp-rs vendors rustls (0.23.43 at
+  `vendor/rustls`) with a server-side patch that treats an invalid SNI as
+  "no SNI" (see `docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md`
+  §6; drop the patch when the workspace moves past rustls 0.23).
+- **KCP + yamux** (`protocol="kcp"`): the punched UDP socket runs KCP
+  (`XtcpP2pStream`) with yamux on top.
+
+The persistent XTCP tunnel session (`frp-core/src/xtcp_session.rs`,
+round-11 keepTunnelOpenWorker parity): one hole-punched QUIC/yamux session
+per proxy is reused across user connections instead of re-punching per
+connection; the visitor re-signals `startTunnel` on every error path, and
+the budget clamps to `min(20s, fallbackTimeoutMs)`.
 
 **XTCP P2P encryption**: after hole punch, the P2P stream is bridged to the
 local service with `bridge_encrypted` when `use_encryption=true` and `sk` is
@@ -306,7 +316,7 @@ The `FrpMessage` enum is `#[serde(untagged)]` -- serde matches the first variant
 
 **V2** (fully implemented in `frp-core/src/protocol.rs`):
 
-V2 uses 7-byte magic `FRP\0\x02\r\n` + different framing with numeric type IDs (u16). Full AEAD encryption with capability negotiation via `frp-core/src/v2_handshake.rs` and `frp-core/src/crypto.rs` (AES-256-GCM or ChaCha20-Poly1305, HKDF-SHA256 key derivation). V2 frame read/write (`read_v2_frame_raw`/`write_v2_frame_raw`), message dispatch (`read_msg_v2`/`write_msg_v2`), and `deserialize_v2()` all fully operational. V2 compat tests run against the Go frp v0.70.1 pre-built binary.
+V2 uses 7-byte magic `FRP\0\x02\r\n` + different framing with numeric type IDs (u16). Full AEAD encryption with capability negotiation via `frp-core/src/v2_handshake.rs` and `frp-core/src/crypto.rs` (AES-256-GCM or ChaCha20-Poly1305, HKDF-SHA256 key derivation). V2 frame read/write (`read_v2_frame_raw`/`write_v2_frame_raw`), message dispatch (`read_msg_v2`/`write_msg_v2`), and `deserialize_v2()` all fully operational. V2 compat tests run against the Go frp v0.71.0 pre-built binary.
 
 Encryption in the control handler is protocol-aware: V1 uses AES-128-CFB (`CipherStream`), V2 with AEAD keys wraps the stream in `AeadStream` after LoginResp.
 
@@ -318,35 +328,42 @@ Encryption in the control handler is protocol-aware: V1 uses AES-128-CFB (`Ciphe
 
 **V2 control:** AEAD (AES-256-GCM or ChaCha20-Poly1305). Keys derived via HKDF-SHA256 from the transcript hash. Implemented in `frp-core/src/crypto.rs`.
 
-**Important:** Go frp v0.70.1 golib source says PBKDF2 salt `"crypto"` but the pre-built binary uses salt `"frp"`. This codebase uses `"frp"` for binary compatibility.
+**Important:** Go frp golib source says PBKDF2 salt `"crypto"` but the pre-built binary uses salt `"frp"` (verified against the v0.70.1 and v0.71.0 binaries). This codebase uses `"frp"` for binary compatibility.
 
 ### Authentication
 
-Auth uses `MD5(token + timestamp)` -> hex string. Matches Go frp v0.70.1 behavior (Go frp switched from HMAC-SHA256 to MD5 in commit `78f9394`). See `frp-core/src/auth.rs`.
+Auth uses `MD5(token + timestamp)` -> hex string. Matches Go frp v0.71.0 behavior (Go frp switched from HMAC-SHA256 to MD5 in commit `78f9394`). See `frp-core/src/auth.rs`.
 
 OIDC authentication is also supported when the `oidc` feature is enabled. The server verifies JWTs against an OIDC provider and maps subjects to proxy names.
 
 ### Transport Abstraction
 
-`IoStream` (`frp-core/src/transport.rs`) is a unified enum over all transport types:
+`IoStream` (`frp-core/src/transport/`) is a type-erased newtype over a
+boxed trait object — the 11-variant enum is gone:
 
 ```rust
-pub enum IoStream {
-    Tcp(TcpStream),
-    Tls(Box<dyn AsyncReadWrite>, SocketAddr),      // TLS-wrapped transport
-    Kcp(KcpStream),                                // #[cfg(feature = "kcp")]
-    Quic(QuicStream),                              // #[cfg(feature = "quic")]
-    WebSocket(WsByteStream),                       // #[cfg(feature = "websocket")]
-    Yamux(YamuxStream),
-    Cipher(Box<CipherStream<IoStream>>),           // AES-128-CFB control stream
-    Aead(Box<AeadStream>),                         // V2 AEAD control stream
-    SshChannel(Box<dyn AsyncReadWrite>),           // SSH reverse-forward channel
-    PreRead(Vec<u8>, TcpStream),                   // replay bytes before TCP stream
-    BufferedRead(Vec<u8>, usize, Box<IoStream>),   // buffered bytes before inner stream
-}
+pub struct IoStream(Box<dyn Transport>);
 ```
 
-`IoStream::into_split()` returns the static enum halves `ReadHalf`/`WriteHalf` — enum dispatch replaces the old `Box<dyn AsyncRead>` / `Box<dyn AsyncWrite>` (zero heap allocation, match-based static dispatch instead of vtable). The `WebSocket` variant wraps WebSocket binary messages into `AsyncRead`/`AsyncWrite` so the V1 protocol operates over WebSocket without changes.
+Each transport implements the `Transport` trait (`AsyncRead + AsyncWrite +
+Unpin + Send + 'static` plus the consuming methods) in its own file under
+`frp-core/src/transport/`: `tcp.rs` (`TcpStream`), `tls.rs`
+(`TlsTransport`), `kcp.rs` (`KcpStream`), `quic.rs` (`QuicStream`),
+`websocket.rs` (`WsByteStream`, manual RFC 6455 framing — tungstenite was
+removed 2026-08-09), `yamux.rs` (`YamuxStream`), `cipher.rs`
+(`CipherStream<S>`), `aead.rs` (`AeadStream`), `ssh_channel.rs`
+(`SshChannelTransport`), `pre_read.rs` (`PreReadTransport`),
+`buffered_read.rs` (`BufferedReadTransport`). IoStream's constructors are
+named after the old variants (`IoStream::Tcp(stream)`, …) so construction
+sites read identically.
+
+`into_split()` returns the boxed `(BoxedReadHalf, BoxedWriteHalf)` halves
+(the old static `ReadHalf`/`WriteHalf` enums are deleted; QUIC uses quinn's
+native halves). The `WebSocket` wrapper exposes binary messages as
+`AsyncRead`/`AsyncWrite` so the V1 protocol operates over WebSocket
+without changes. `try_tcp`/`try_tcp_mut` downcast to the raw `TcpStream`
+for the Linux `splice(2)` fast path; `is_yamux_wrappable` is false for QUIC
+only.
 
 **Config normalization** (`frp-core/src/config/`): full Go to Rust config compatibility layer. TOML values are converted via `toml_to_json()` to `serde_json::Value`, then deserialized into config structs. Legacy fields like `[common]`, `auth_method`, `log_file`, `web_server_*` are normalized.
 
@@ -446,8 +463,11 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 ```
 
 > Sizes measured 2026-08-08 (macOS arm64) with the declared release profile
-> (fat-LTO, opt-level=z, strip=symbols, panic=abort). Local dev builds that
-> override `lto=false opt-level=2` (`.cargo/config.toml`) come out ~70% larger (measured 2026-08-09: 9.1MB vs 5.3MB).
+> (fat-LTO, opt-level=z, strip=symbols, panic=abort). The local
+> `.cargo/config.toml` override was removed 2026-08-09 — local release
+> builds use the declared profile. Only CI workflows write
+> `lto=false opt-level=2` on runners (build speed) and come out ~70% larger
+> (measured 2026-08-09: 9.1MB vs 5.3MB).
 
 The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and `frps-micro`/`frpc-micro` respectively.
 
@@ -461,13 +481,22 @@ The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, an
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, hyper via `http-client`) |
 | `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
 | `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
-| `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots) |
+| `admin` | frp-client | frpc admin API (axum) — opt-in since 2026-08-09 |
+| `http2http` | frp-client | HTTP/2 (h2) support for the https2http/https2https plugins; implies `tls` |
+| `tls` | frp-core/server/client | TLS encryption (rustls — **vendored** at `vendor/rustls` 0.23.43 with an SNI patch, see below) |
 | `compression` | frp-core | Snappy bridge compression (snap) |
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
-| `http-proxy` | frp-server | HTTP proxy plugin (hyper/http-client) |
-| `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
+| `http-proxy` | frp-server | HTTP proxy plugin (hyper/http-client) — server-side opt-in |
+| `tcp-mux` | frp-core/server/client | yamux stream multiplexing (**vendored** at `vendor/yamux`, see below) |
+| `vnet` | frp-core/server/client | L3 VPN / TUN device routing — opt-in |
+| `admin-auth` | frp-core | shared admin auth helpers (token/basic) |
+| `mimalloc` | frps/frpc | mimalloc global allocator — opt-in |
+| `mem-profile` | frp-core/server/client | CountingAlloc + MEMPROFILE emitter (dev only; **exclusive with `mimalloc`**) |
+| `profiling` | frp-core | profiling gate (dev only) |
+| `otel` | frp-core/server/client | OpenTelemetry tracing + OTLP export — opt-in |
+| `debug-logs` | frp-core | debug/trace logging (dev only) |
 
-frps default ON: `websocket`, `kcp`, `quic`, `oidc`, `tls`, `http-proxy`, `compression`, `chacha20`, `tcp-mux`, `ssh`. Opt-in: `dashboard`, `vnet`, `otel`, `mimalloc`, dev-only flags. `quic` implies `tls`. `oidc` implies `http-client` (hyper). `ssh` implies `rand`.
+frps default ON: `websocket`, `kcp`, `quic`, `oidc`, `tls`, `http-proxy`, `compression`, `chacha20`, `tcp-mux`, `ssh`. frpc default ON: `websocket`, `kcp`, `quic`, `oidc`, `tls`, `compression`, `chacha20`, `tcp-mux`, `http2http` (**no `admin`** since 2026-08-09). Opt-in: `admin`, `dashboard`, `vnet`, `otel`, `mimalloc`, dev-only flags (`debug-logs`, `mem-profile`, `profiling`). `quic` implies `tls`. `oidc` implies `http-client` (hyper). `ssh` implies `rand`. `mem-profile` is mutually exclusive with `mimalloc` (cfg-exclusive global-allocator guards).
 
 ### Release Profile
 
@@ -591,7 +620,7 @@ cargo test -- --ignored
 The compat test suite verifies Go frp <-> Rust frp interop across all proxy types and transport protocols:
 
 ```bash
-# Full suite (76 run_test scenarios, 2 of which are gated on Go frp V2)
+# Full suite (86 run_test scenarios, 2 of which are gated on Go frp V2)
 bash scripts/compat-test.sh --verbose
 
 # Filter by proxy type and direction
@@ -610,7 +639,7 @@ The compat tests require Go frp binaries. Download them first:
 bash scripts/download-go-frp.sh
 ```
 
-This downloads Go frp v0.70.1 binaries to `scripts/go-frp/`. The CI gate is `.github/workflows/compat.yml`.
+This downloads Go frp v0.71.0 binaries to `scripts/go-frp/`. The CI gate is `.github/workflows/compat.yml`.
 
 ### XTCP CI Tests
 
@@ -676,7 +705,10 @@ Proptest-based tests verify correctness under adversarial inputs:
 
 ### Version Bumping
 
-Versions follow semver. Update the version in all `Cargo.toml` files:
+**frp-rs 自身版本号严格对齐 Go frp 的发布号** (mandatory): the version
+equals the current compat target Go frp release — currently **0.71.0** — and
+bumps only when Go frp releases a new number. Update the version in ALL
+sync locations:
 
 ```bash
 # All crates share the same version
@@ -687,13 +719,18 @@ Versions follow semver. Update the version in all `Cargo.toml` files:
 #   frp-client/Cargo.toml
 #   frps/Cargo.toml
 #   frpc/Cargo.toml
+#   frp-core/src/lib.rs  (VERSION constant)
+#   scripts/download-frp-rs.sh  (default version)
+#   README.md
 ```
+
+Exception: `frp-vnet` stays independent at `0.1.0`.
 
 ### Building Release Binaries
 
-The release workflow (`.github/workflows/release.yml`) cross-compiles for 14 targets:
+The release workflow (`.github/workflows/release.yml`) cross-compiles for 13 targets:
 
-- **Linux**: x86_64, aarch64, armv7, arm, i686, riscv64gc (both glibc and musl) -- built with `cargo zigbuild`
+- **Linux**: x86_64, aarch64, armv7, arm, i686, riscv64gc — glibc builds for all six, musl only for x86_64/aarch64/armv7 (built with `cargo zigbuild`)
 - **macOS**: x86_64, aarch64 -- native builds
 - **Windows**: x86_64, aarch64 -- native builds
 
@@ -742,12 +779,12 @@ Releases are triggered by pushing a version tag or manually via workflow dispatc
 
 ```bash
 # Tag and push (triggers .github/workflows/release.yml)
-git tag v0.3.2
-git push origin v0.3.2
+git tag v0.71.0
+git push origin v0.71.0
 ```
 
 The release workflow:
-1. Builds all 14 Linux targets (cargo-zigbuild) + macOS + Windows
+1. Builds all 13 targets (9 Linux via cargo-zigbuild + 2 macOS + 2 Windows)
 2. Packages each as `.tar.gz` (Linux/macOS) or `.zip` (Windows)
 3. Creates a GitHub Release with auto-generated notes
 4. Uploads all artifacts
@@ -772,7 +809,7 @@ The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be 
 | Crypto (general) | `ring` 0.17 |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` |
-| TLS | `rustls` + `tokio-rustls` + `rustls-pki-types` (PEM via `PemObject`) + `rustls-platform-verifier` |
+| TLS | `rustls` + `tokio-rustls` + `rustls-platform-verifier` — **vendored** at `vendor/rustls` 0.23.43 via `[patch.crates-io]` with a one-line SNI patch (`ServerNamePayload::Invalid` → treat as no-SNI) for Go XTCP QUIC visitor compat; delete the vendored copy when upgrading to rustls ≥0.24 (native `invalid_sni_policy`) |
 | SSH | `russh` (ring backend, NOT aws-lc-rs) |
 | HTTP client | `hyper` + `hyper-rustls` + `hyper-util` (inline `frp_core::http_client`; OIDC/proxy/plugin — no reqwest) |
 | HTTP server | `axum` |
@@ -780,13 +817,13 @@ The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be 
 | Encoding | inline `frp_core::base64` (encode/decode) + `frp_core::hex_encode` |
 | Compression | `snap` |
 | QUIC | `quinn` |
-| TcpMux | `yamux` |
+| TcpMux | `yamux` 0.14 — **vendored** at `vendor/yamux` via `[patch.crates-io]` with four patches (per-stream RST on stream-cap hit, lost-wakeup `sender_wu` fix, receive-window cap, body-buffer pools) |
 | OIDC/JWT | `jsonwebtoken` |
 | Logging | `tracing` + `tracing-subscriber` + `tracing-appender` |
 | Error handling | `anyhow` + `thiserror` |
 | Random | `rand` 0.8 |
 | Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `prometheus` |
 
-**Banned** (do not reintroduce without approval): `aws-lc-sys`, `aws-lc-rs`, `hmac`, `base64`, `sha2`, `aes-gcm`, `hkdf`, `hickory-resolver`, `lazy_static`, `libc`.
+**Banned** (do not reintroduce without approval): `aws-lc-sys`, `aws-lc-rs`, `hmac`, `base64`, `sha2`, `aes-gcm`, `hkdf`, `hickory-resolver`, `lazy_static`, `data-encoding`, `hex`, `tokio-tungstenite`. Note: `libc` is an **active** direct dependency (frp-core Linux `splice(2)`, frp-vnet TUN ioctl), not banned. "Banned" means no direct dependency — several still exist transitively via the SSH feature chain (russh → ssh-key).
 
 Workspace dependencies use `resolver = "2"` with `[workspace.dependencies]` for all crates. To add a new dependency: add to the workspace level, then reference by name (no version) in sub-crates.

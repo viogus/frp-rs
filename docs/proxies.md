@@ -64,7 +64,7 @@ health_check_url = "/health"
 |-------|-------------|
 | `bandwidth_limit` | Bandwidth limit, e.g. `"1MB"` or `"500KB"`. Only `KB`/`MB` suffixes are supported (1024 base). Empty = unlimited. |
 | `bandwidth_limit_mode` | `"client"` or `"server"`. Which side applies the limit. |
-| `group` / `group_key` | Load balancing group. Proxies with the same group share connections. `group_key` enables sticky sessions (hash-based affinity). |
+| `group` / `group_key` | Load balancing group. Proxies with the same group share connections round-robin; all members' `group_key` must match (it is a shared group secret, not an affinity selector). |
 | `proxy_protocol_version` | HAProxy PROXY protocol: `"v1"`, `"v2"`, or `""` (disabled). |
 
 ---
@@ -179,7 +179,8 @@ supported on the SUDP data plane.
 
 ### Health Checks
 
-Not applicable (same as UDP).
+The client starts a health check for any proxy type (SUDP included) that sets
+a non-empty `health_check_type` — there is no proxy-type filter.
 
 ### Type-Specific Fields
 
@@ -229,11 +230,14 @@ model for the per-packet plane is not unified here yet).
 
 Cross-compat: a Go frpc `sudp` visitor (with `transport.useEncryption = true`)
 works against a Rust frps + Rust provider, and a Rust visitor works against a
-Rust stack. The reverse direction (any visitor → Go frps) is **not supported by
-Go itself**: Go v0.70.1's server-side `UDPProxy` never registers the
-visitor-manager listener its own `sudp` visitor type requires
-("custom listener … doesn't exist"), so Go's sudp is a client-side half
-implementation — frp-rs is a superset.
+Rust stack. The reverse direction (Rust visitor → Go frps) is **not covered by
+the compat suite** — untested, not known-broken: since v0.71.0 Go's server-side
+`SUDPProxy` does register the visitor-manager listener (`startVisitorListener`,
+server/proxy/sudp.go:44 — the v0.70.1 server never did, which surfaced as
+"custom listener … doesn't exist"), but Go's SUDP data path couples its own
+visitor and provider through that shared internal listener plus a work-conn
+`udpPacketCodec`, so a Rust visitor against a Go frps would need to reproduce
+the exact coupling.
 
 ### Visitor Fields
 
@@ -489,9 +493,11 @@ Visitor fields (`[[visitors]]` in frpc.toml):
 
 ## XTCP Proxy (`type = "xtcp"`)
 
-NAT traversal proxy. Uses STUN (Session Traversal Utilities for NAT) and TCP
-simultaneous open to establish a direct peer-to-peer connection between visitor
-and provider, bypassing the frps relay entirely for data transfer.
+NAT traversal proxy. Uses STUN (Session Traversal Utilities for NAT) and
+UDP-based Go-style MakeHole probing to establish a direct peer-to-peer
+connection between visitor and provider, bypassing the frps relay entirely
+for data transfer. (frp prior to v0.7.0 used TCP simultaneous-open, which is
+incompatible and not implemented.)
 
 **Use for:** High-bandwidth streams, large file transfers, or any scenario
 where you want to avoid relaying all traffic through the server. Requires both
@@ -542,7 +548,7 @@ Phase 1: Signaling (via frps)
 Phase 2: Hole Punch
   frps → Visitor: NatHoleResp (provider's public addresses)
   frps → Provider: NatHoleResp (visitor's public addresses)
-  Both sides: TCP simultaneous open to each other's public addresses
+  Both sides: UDP MakeHole probing per the 5-mode DetectBehavior
 
 Phase 3: Direct P2P (frps out of data path)
   App → visitor frpc:8554 → [P2P encrypted bridge] → provider frpc → 127.0.0.1:8554
@@ -560,12 +566,14 @@ Phase 3: Direct P2P (frps out of data path)
 4. frps (`NatHoleCoordinator`) classifies the NAT types and runs the analyzer
    to score hole-punch feasibility.
 5. frps sends `NatHoleResp` to both sides with the peer's public addresses.
-6. Both sides perform **TCP simultaneous open** -- they dial each other's
-   public addresses at the same time. If the NAT is EasyNAT (endpoint-independent
-   mapping), the packets punch holes through both NATs and a direct TCP
-   connection is established.
-7. Once the P2P connection is up, data flows directly between visitor and
-   provider. frps is no longer in the data path.
+6. Both sides run Go-style `MakeHole` UDP probing (`punch_udp_hole_makehole_owned`,
+   one probe packet sequence per `DetectBehavior` mode). If the NAT is EasyNAT
+   (endpoint-independent mapping), the probe packets punch holes through both
+   NATs and the socket that received the peer's detect reply carries the P2P
+   data plane (Go `result.lConn` semantics).
+7. Once the P2P session is up, data flows directly between visitor and
+   provider over KCP-over-UDP (yamux-wrapped) or QUIC. frps is no longer in
+   the data path.
 8. Provider sends `NatHoleReport` to frps to confirm the session completed.
 
 ### NAT Classification
@@ -587,20 +595,29 @@ fallback_timeout_ms = 5000           # Wait up to 5 seconds before falling back
 ```
 
 The visitor starts a timer when it begins the XTCP hole punch. If the P2P
-connection is not established within `fallback_timeout_ms`, it connects to
-the STCP proxy specified by `fallback_to` instead. This should point to a
-separate STCP proxy on the same provider that serves as a relay backup.
+connection is not established within `min(20s, fallback_timeout_ms)`
+(Go `openTunnel` WithTimeout parity — the budget is clamped to 20 seconds),
+it connects to the STCP proxy specified by `fallback_to` instead. This
+should point to a separate STCP proxy on the same provider that serves as a
+relay backup.
 
-### Retry Behavior
+### Persistent Tunnel & Retry Behavior
 
 ```toml
-keep_tunnel_open = true         # Retry hole punch after connection ends
+keep_tunnel_open = true         # Keep the P2P tunnel session alive across connections
 max_retries_an_hour = 8         # Max retry attempts per hour (default: 8)
-min_retry_interval = 30          # Min seconds between retries (default: 30)
+min_retry_interval = 90          # Min seconds between retries (default: 90)
 ```
 
-When `keep_tunnel_open = true`, the visitor retries NAT hole punching instead
-of permanently falling back to STCP. This is useful for transient NAT changes.
+Since round-11 (`frp-core/src/xtcp_session.rs`, Go `keepTunnelOpenWorker`
+parity), the visitor maintains a **persistent tunnel session**: one
+hole-punched QUIC/KCP session per proxy is reused across user connections
+instead of re-punching per connection. When `keep_tunnel_open = true`, a
+`keep_tunnel_open_worker` probes every `min_retry_interval` (default 90s)
+against a `max_retries_an_hour` token bucket (default 8); even with
+`keep_tunnel_open = false`, a per-listener `process_tunnel_start_events`
+re-punches on demand (≥10s apart) instead of permanently falling back to
+STCP. This is useful for transient NAT changes.
 
 ### Encryption & Compression
 
@@ -631,7 +648,8 @@ Visitor fields (`[[visitors]]`):
 | `secret_key` | Secret key matching the provider's `sk`. |
 | `bind_addr` / `bind_port` | Local address and port for the visitor listener. |
 | `fallback_to` | STCP proxy name for fallback if hole punch fails. |
-| `fallback_timeout_ms` | Fallback timeout in milliseconds (default: 1000). |
+| `fallback_timeout_ms` | Fallback timeout in milliseconds (default: 1000; effective budget clamped to 20s). |
+| `protocol` | P2P data-plane transport: `"quic"` (default) or `"kcp"` (KCP+yamux). Empty is normalized to `"quic"` (Go `EmptyOr` parity). |
 | `keep_tunnel_open` | Retry hole punch after connection ends instead of falling back. |
 | `max_retries_an_hour` | Max XTCP retries per hour (default: 8). |
 | `min_retry_interval` | Min seconds between retry attempts (default: 90). |
@@ -693,8 +711,11 @@ frps → 200 Connection Established → [bridge] → frpc → 127.0.0.1:5432
 
 1. External client connects to `tcpmux_httpconnect_port` and sends an HTTP
    `CONNECT` request: `CONNECT db.example.com:443 HTTP/1.1\r\nHost: db.example.com\r\n\r\n`.
-2. frps parses the `Host` header, strips the port, and looks up the hostname
-   in `TcpMuxManager` (a routing table of domain → proxy).
+2. frps routes on the **request-line authority** (the CONNECT target),
+   strips the port, and looks up the hostname in `TcpMuxManager` (a routing
+   table of domain → proxy). The `Host` header is ignored for routing
+   (Go net/http `req.Host = req.URL.Host` parity, RFC 7230 §5.3) and a
+   duplicate `Host` header triggers a 400.
 3. If a matching tcpmux proxy is found, frps responds with
    `HTTP/1.1 200 Connection Established`.
 4. From that point, the connection becomes a raw TCP tunnel. frps bridges it
@@ -748,13 +769,13 @@ Server-level fields (`frps.toml`):
 | Proxy Type | Transport | Public Port? | VHost/SNI Routing? | Enc/Comp? | Health Checks? |
 |------------|-----------|--------------|---------------------|-----------|----------------|
 | `tcp` | TCP | Yes (remote_port) | No | Yes | Yes (tcp/http) |
-| `udp` | UDP | Yes (remote_port) | No | No | No |
-| `sudp` | UDP | Yes (shared port) | No | No | No |
+| `udp` | UDP | Yes (remote_port) | No | Yes (enc + comp) | Yes (any type with a configured `health_check_type`) |
+| `sudp` | UDP | Yes (shared port) | No | Yes (enc, no comp) | Yes (any type with a configured `health_check_type`) |
 | `http` | TCP | No (vhost_http_port) | Yes (Host header) | Yes | Yes (tcp/http) |
 | `https` | TCP | No (vhost_https_port) | Yes (SNI) | Yes | Yes (tcp/http) |
 | `stcp` | TCP | No | No (sk routing) | Yes | Yes (tcp/http) |
-| `xtcp` | TCP (P2P) | No | No (sk routing + STUN) | Yes | Yes (tcp/http) |
-| `tcpmux` | TCP | No (tcpmux port) | Yes (CONNECT host) | Yes | Yes (tcp/http) |
+| `xtcp` | UDP (P2P) | No | No (sk routing + STUN) | Yes | Yes (tcp/http) |
+| `tcpmux` | TCP | No (tcpmux port) | Yes (CONNECT authority) | Yes | Yes (tcp/http) |
 
 ### Common Fields (all proxy types)
 
@@ -770,7 +791,7 @@ Server-level fields (`frps.toml`):
 | `bandwidth_limit` | string | `""` | Bandwidth limit, e.g. `"1MB"` |
 | `bandwidth_limit_mode` | string | `"client"` | `"client"`, `"server"`, or `"both"` |
 | `group` | string | `""` | Proxy group for load balancing |
-| `group_key` | string | `""` | Group key for sticky sessions |
+| `group_key` | string | `""` | Shared group secret — all members must match |
 | `annotations` | map | `{}` | Key-value annotations |
 | `metas` | map | `{}` | Key-value metadata |
 | `enabled` | bool | `true` | Whether the proxy is started |
@@ -782,9 +803,9 @@ Server-level fields (`frps.toml`):
 |-------|---------|-------------|
 | `health_check_type` | `""` | `"tcp"` or `"http"`. Empty = disabled. |
 | `health_check_url` | `""` | URL path for HTTP health checks. |
-| `health_check_interval_seconds` | `10` | Seconds between checks (min 10). |
-| `health_check_timeout_seconds` | `3` | Connect timeout per check (min 3). |
-| `health_check_max_failed` | `1` | Consecutive failures before marking unhealthy (min 1). |
+| `health_check_interval_seconds` | `10` | Seconds between checks; `<= 0` substitutes the default (Go health.go parity — explicit positive values are honored as-is, no clamping floor). |
+| `health_check_timeout_seconds` | `3` | Connect timeout per check; `<= 0` → default. |
+| `health_check_max_failed` | `1` | Consecutive failures before marking unhealthy; `<= 0` → default. |
 | `health_check_http_headers` | `{}` | Custom HTTP headers for health check requests. |
 
 ### Encryption & Compression Details
@@ -811,5 +832,7 @@ plaintext → Snappy compress → AES-128-CFB encrypt → wire
 
 TCP, HTTP, HTTPS, and TCPMux proxies support load balancing across multiple
 frpc instances. Proxies with the same `group` value share incoming connections
-via round-robin selection. When `group_key` is set, the server uses
-hash-based sticky sessions to route the same client to the same backend.
+via true round-robin selection (Go `HTTPGroup.chooseEndpoint` parity — an
+atomic counter, not hash-based affinity). `group_key` is a shared secret:
+all members' keys must match, and a mismatch rejects the proxy. There is no
+sticky-session routing.

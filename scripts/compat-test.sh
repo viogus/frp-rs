@@ -3916,10 +3916,12 @@ TOML
 
 # =============================================================================
 # Test: Go frpc SUDP visitor -> Rust frps (sudpPort) -> Rust frpc SUDP provider
-# NOTE: Go frp v0.70.1 SUDP is a client-side half implementation — its server
-# never registers the visitor listener ("custom listener doesn't exist") — so
-# SUDP is only testable in the go->rust direction (Go visitor + Rust frps +
-# Rust provider). rust->go-sudp is therefore skipped in this suite.
+# NOTE: SUDP is only exercised in the go->rust direction (Go visitor + Rust
+# frps + Rust provider). rust->go-sudp is skipped: Go frp v0.71.0's SUDP data
+# path couples its own visitor and provider through the shared visitor-manager
+# listener + work-conn udpPacketCodec (the v0.70.1 server never registered the
+# listener — "custom listener doesn't exist"), and the Rust visitor does not
+# reproduce that coupling.
 # =============================================================================
 test_g2r_sudp() {
     local name="go-to-rust-sudp"

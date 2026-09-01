@@ -70,6 +70,7 @@ Feature flags across crates:
 | `compression` | frp-core | Snappy bridge compression (snap) |
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
 | `http-proxy` | frp-server | HTTP proxy plugin (hyper/http-client) |
+| `http2http` | frp-client | HTTP/2 (h2) support for the https2http/https2https plugins (enableHTTP2 path); implies `tls` |
 | `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
 | `vnet` | frp-core/server/client | L3 VPN / TUN device routing |
 | `admin` | frp-client | frpc admin API (axum) |
@@ -80,9 +81,9 @@ Feature flags across crates:
 | `otel` | frp-core/server/client | OpenTelemetry tracing + OTLP export (~+2-3MB) — frp-server exposes no `otel` feature; frps/frpc forward frp-core's |
 | `debug-logs` | frp-core | debug/trace logging (dev only) |
 
-Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compression, chacha20, tcp-mux, ssh; frpc = websocket, kcp, quic, oidc, tls, admin, compression, chacha20, tcp-mux. `quic` implies `tls`. `oidc` implies `http-client` (hyper). `ssh` implies `rand`. Note: `frp-core`'s own default includes `vnet`/`stun`/`tcp-mux`, but frps/frpc default binaries do **not** include `vnet` (opt-in) — only the `stun` (NAT hole punch) and `tcp-mux` parts that they forward.
+Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compression, chacha20, tcp-mux, ssh; frpc = websocket, kcp, quic, oidc, tls, compression, chacha20, tcp-mux, http2http. `quic` implies `tls`. `oidc` implies `http-client` (hyper). `ssh` implies `rand`. Note: `frp-core`'s own default includes `vnet`/`stun`/`tcp-mux`, but frps/frpc default binaries do **not** include `vnet` (opt-in) — only the `stun` (NAT hole punch) and `tcp-mux` parts that they forward.
 
-**Opt-in (NOT default):** `dashboard`, `mimalloc`, `otel`, `debug-logs`, `profiling`, `mem-profile`, `vnet` (frps/frpc — L3 VPN/TUN routing, drops frp-vnet from default binaries); `http-proxy` is a server-side opt-in (the client http_proxy plugin compiles unconditionally). `mem-profile` installs a `CountingAlloc` global allocator + a 1 Hz `MEMPROFILE` stderr emitter and is mutually exclusive with `mimalloc` (the `#[global_allocator]` guards are cfg-exclusive — with both enabled neither allocator is installed and the emitter does not run). Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
+**Opt-in (NOT default):** `admin` (frpc — the axum-based admin API, ~1 MB; was default until the 2026-08-09 audit round), `dashboard`, `mimalloc`, `otel`, `debug-logs`, `profiling`, `mem-profile`, `vnet` (frps/frpc — L3 VPN/TUN routing, drops frp-vnet from default binaries); `http-proxy` is a server-side opt-in (the client http_proxy plugin compiles unconditionally). `mem-profile` installs a `CountingAlloc` global allocator + a 1 Hz `MEMPROFILE` stderr emitter and is mutually exclusive with `mimalloc` (the `#[global_allocator]` guards are cfg-exclusive — with both enabled neither allocator is installed and the emitter does not run). Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
 
 - No `cargo check` variation needed for day-to-day work — `cargo build` covers the full workspace; ci.yml additionally gates the size tiers with `cargo check --no-default-features --features tiny|micro`.
 - Unit tests live inline (`#[cfg(test)] mod tests`); integration tests live in per-crate `tests/` dirs (`frp-server/tests/`, `frp-client/tests/`, `frp-core/tests/`).
