@@ -39,12 +39,11 @@ tokio-util.workspace = true
 axum = { workspace = true, optional = true, features = ["ws"] }
 prometheus = { workspace = true, optional = true }
 rand.workspace = true
-rand010 = { package = "rand", version = "0.10", optional = true }  # NOTE: rand 0.10 required by russh 0.61 for SSH feature. Workspace uses rand 0.8. Track russh upstream migration to unified rand version.
 md-5.workspace = true
 
 [features]
 default = ["websocket", "kcp", "quic", "oidc", "tls", "http-proxy", "compression", "chacha20", "tcp-mux", "ssh"]
-ssh = ["dep:russh", "dep:rand010"]
+ssh = ["dep:russh"]
 dashboard = ["dep:prometheus", "dep:axum", "frp-core/admin-auth"]
 websocket = ["frp-core/websocket"]
 quic = ["frp-core/quic"]

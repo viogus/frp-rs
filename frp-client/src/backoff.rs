@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use rand::Rng;
+use rand::RngExt;
 use tokio::time::Duration;
 
 /// Whether a HeartBeats ping must carry auth: union of the client's own
@@ -75,7 +75,7 @@ pub(crate) fn fast_backoff_delay(
     counts_in_fast_retry_window: u32,
     previous_delay: Duration,
 ) -> Duration {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // Phase 1: fast retries
     if counts_in_fast_retry_window <= 3 {
@@ -83,7 +83,7 @@ pub(crate) fn fast_backoff_delay(
         // Multiplicative jitter de-synchronizes clients restarting
         // together: additive jitter confined everyone to a 100ms-wide
         // window that re-clustered on every restart (thundering herd).
-        let ms = 200.0 * rng.gen_range(0.5..=1.5);
+        let ms = 200.0 * rng.random_range(0.5..=1.5);
         return Duration::from_millis(ms as u64);
     }
 
@@ -106,7 +106,7 @@ pub(crate) fn fast_backoff_delay(
     // (Jittering BEFORE the cap keeps the cap neighborhood spread; capping
     // first would pin the last step at exactly 20s with no jitter.)
     let duration = base.saturating_mul(2); // Factor = 2
-    let jitter = rng.gen_range(0.9..=1.1);
+    let jitter = rng.random_range(0.9..=1.1);
     let ms = (duration.as_millis() as f64 * jitter) as u64;
     Duration::from_millis(ms.min(20_000))
 }

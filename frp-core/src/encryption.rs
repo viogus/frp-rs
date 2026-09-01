@@ -22,7 +22,7 @@
 //! interop with Go frp.
 
 use cfb_mode::cipher::KeyIvInit;
-use rand::RngCore;
+use rand::TryRng;
 
 type Aes128CfbEnc = cfb_mode::Encryptor<aes::Aes128>;
 type Aes128CfbDec = cfb_mode::Decryptor<aes::Aes128>;
@@ -79,7 +79,9 @@ pub fn encrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 /// Output layout identical to [`encrypt`]: [16-byte IV][ciphertext].
 pub fn encrypt_into(data: &[u8], key: &[u8; 16], out: &mut Vec<u8>) -> Result<(), String> {
     let mut iv = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut iv);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut iv)
+        .map_err(|e| format!("sys rng: {e}"))?;
     out.clear();
     out.extend_from_slice(&iv);
     out.extend_from_slice(data);

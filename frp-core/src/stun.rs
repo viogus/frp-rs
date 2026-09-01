@@ -2,7 +2,7 @@
 //! Implements Binding Request/Response, XOR-MAPPED-ADDRESS, and OTHER-ADDRESS parsing.
 //! Go frp v0.70 dev compat: pkg/util/stun/stun.go, pkg/nathole/discovery.go
 
-use rand::Rng;
+use rand::RngExt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::UdpSocket;
 use tracing::debug;
@@ -76,7 +76,7 @@ pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
     let socket = bind_matching_family(addr).await?;
 
     let mut tx_id = [0u8; 12];
-    rand::thread_rng().fill(&mut tx_id);
+    rand::rng().fill(&mut tx_id);
     let request = build_binding_request(&tx_id);
 
     socket
@@ -109,7 +109,7 @@ pub async fn stun_binding_on_socket(socket: &UdpSocket, stun_addr: &str) -> Resu
     let addr = resolve_stun_addr(addr_str).await?;
 
     let mut tx_id = [0u8; 12];
-    rand::thread_rng().fill(&mut tx_id);
+    rand::rng().fill(&mut tx_id);
     let request = build_binding_request(&tx_id);
 
     socket
@@ -142,7 +142,7 @@ pub async fn stun_binding_with_socket(stun_addr: &str) -> Result<(UdpSocket, Str
     let socket = bind_matching_family(addr).await?;
 
     let mut tx_id = [0u8; 12];
-    rand::thread_rng().fill(&mut tx_id);
+    rand::rng().fill(&mut tx_id);
     let request = build_binding_request(&tx_id);
 
     socket
@@ -178,7 +178,7 @@ pub async fn stun_binding_with_details(stun_addr: &str) -> Result<(UdpSocket, St
     let socket = bind_matching_family(addr).await?;
 
     let mut tx_id = [0u8; 12];
-    rand::thread_rng().fill(&mut tx_id);
+    rand::rng().fill(&mut tx_id);
     let request = build_binding_request(&tx_id);
 
     socket

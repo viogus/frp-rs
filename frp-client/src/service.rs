@@ -23,7 +23,7 @@ pub(crate) enum HealthEvent {
     Close(String),   // proxy_name
     Recover(String), // proxy_name
 }
-use rand::Rng;
+use rand::RngExt;
 use std::time::Instant;
 use tokio::time::Duration;
 use tracing::{debug, info, instrument, warn};
@@ -1083,7 +1083,7 @@ impl Service {
                             delay_ms = delay_ms.saturating_mul(2).min(10_000);
                         }
                         let jitter_ms =
-                            (rand::thread_rng().gen::<f64>() * 0.1 * delay_ms as f64) as u64;
+                            (rand::rng().random::<f64>() * 0.1 * delay_ms as f64) as u64;
                         Duration::from_millis(delay_ms.saturating_add(jitter_ms).min(10_000))
                     };
                     // Race the backoff against a stop request: with

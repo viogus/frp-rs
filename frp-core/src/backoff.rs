@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::watch;
 use tokio::time;
 
@@ -149,7 +149,7 @@ impl BackoffManager for FastBackoff {
 /// When `max_factor <= 0.0`, defaults to `1.0` (matching Go frp's `Jitter()`).
 pub fn jitter(duration: Duration, max_factor: f64) -> Duration {
     let factor = if max_factor <= 0.0 { 1.0 } else { max_factor };
-    let extra = rand::thread_rng().gen::<f64>() * factor * duration.as_secs_f64();
+    let extra = rand::rng().random::<f64>() * factor * duration.as_secs_f64();
     duration + Duration::from_secs_f64(extra)
 }
 
