@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Download frp-rs release binaries for integration testing.
-# Usage: scripts/download-frp-rs.sh [version] [dest]
+# Usage: scripts/download-frp-rs.sh [version]
 #
-# Places frps and frpc in the workspace root so integration tests can find
-# them via ../frps and ../frpc (test harness checks these paths before
-# falling back to target/ builds).
+# Places frps and frpc in target/debug so integration tests can find them:
+# the test harness resolves <NAME>_BIN env -> CARGO_BIN_EXE_<name> ->
+# target/debug/<name>. Extracting to the workspace root is impossible — the
+# bare frps/frpc tarball entries collide with the crate directories of the
+# same name (and --strip-components=1 silently strips the whole entry).
 # =============================================================================
 set -euo pipefail
 
@@ -34,10 +36,11 @@ TARGET="$(detect_target)"
 ASSET="frp-rs_v${VERSION}_${TARGET}.tar.gz"
 URL="https://github.com/viogus/frp-rs/releases/download/v${VERSION}/${ASSET}"
 TARBALL="/tmp/${ASSET}"
+BIN_DIR="$PROJECT_DIR/target/debug"
 
 echo "Downloading frp-rs v${VERSION} (${TARGET})..."
 echo "  URL: ${URL}"
-echo "  Dest: ${PROJECT_DIR}"
+echo "  Dest: ${BIN_DIR}"
 
 # 3-retry download with backoff
 for i in 1 2 3; do
@@ -53,17 +56,17 @@ if [[ ! -f "$TARBALL" ]]; then
     exit 1
 fi
 
-# Extract to workspace root
-tar xzf "$TARBALL" -C "$PROJECT_DIR" --strip-components=1
+# Extract into target/debug (tarball entries are bare frps/frpc — no
+# strip, no top-level dir).
+mkdir -p "$BIN_DIR"
+tar xzf "$TARBALL" -C "$BIN_DIR"
 rm "$TARBALL"
-chmod +x "$PROJECT_DIR/frps" "$PROJECT_DIR/frpc"
+chmod +x "$BIN_DIR/frps" "$BIN_DIR/frpc"
 
-echo "frp-rs v${VERSION} installed to workspace root:"
-echo "  frps: $PROJECT_DIR/frps"
-echo "  frpc: $PROJECT_DIR/frpc"
-"$PROJECT_DIR/frps" --version 2>&1 || true
-"$PROJECT_DIR/frpc" --version 2>&1 || true
+echo "frp-rs v${VERSION} installed to ${BIN_DIR}:"
+"$BIN_DIR/frps" --version 2>&1 || true
+"$BIN_DIR/frpc" --version 2>&1 || true
 
 echo ""
-echo "Integration tests will now find frps/frpc via ../frps and ../frpc."
-echo "Set FRPS_BIN or FRPC_BIN env vars to override."
+echo "Integration tests resolve frps/frpc via <NAME>_BIN env, CARGO_BIN_EXE_<name>, then target/debug/."
+echo "This install satisfies the target/debug fallback."
