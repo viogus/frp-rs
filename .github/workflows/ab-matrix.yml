@@ -1,14 +1,20 @@
 name: A/B Matrix (throughput gate)
 
-# Detects throughput regressions at two comparison granularities:
-#   1. Pull request: every PR to main is measured against its base.sha
-#      ("before") vs the PR head ("after"). Runs for information only
-#      (continue-on-error) because shared-GitHub-runner throughput is noisy.
-#   2. Scheduled/manual: the true gate. Runs against main~1 vs main on a
-#      dedicated VPS (exclusive CPU) and FAILS on any >GATE_PCT regression.
-#      The measurement is shipped to and executed on the VPS (reusing the XTCP
-#      VPS + frp-test user) rather than on this runner, so the numbers are
-#      stable and comparable.
+# Detects throughput regressions against a dedicated VPS (exclusive CPU).
+#
+# The gate is the scheduled/manual run: main~1 vs main on the VPS, FAILS on
+# any >GATE_PCT regression. The measurement is shipped to and executed on the
+# VPS (reusing the XTCP VPS + frp-test user) rather than on this runner, so
+# the numbers are stable and comparable.
+#
+# Pull requests do NOT trigger the measurement (2026-09-02): the old PR mode
+# ran base-vs-head on the VPS with continue-on-error for information only,
+# but the noise was unusable — the identical binaries of the docs-only #280
+# measured tls -35.1% / -27.9% / +24.5% across three attempts, and #282's
+# first attempt "failed" the same way. Each PR attempt burned VPS time and
+# produced a red check to hand-rerun. If a PR needs numbers, dispatch this
+# workflow with commit_ref = the PR's merge commit; the daily VPS run remains
+# the authoritative gate.
 #
 # Requires GitHub Secrets (same VPS as XTCP compat):
 #   XTCP_VPS_HOST     - VPS public IP or hostname
@@ -37,10 +43,10 @@ jobs:
   ab-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # PR runs are informational only: shared-runner CPU renders the numbers
-    # too noisy to block a merge. The scheduled/manual run is the authoritative
-    # gate and must not silently pass.
-    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    # Scheduled/manual only. PR runs are skipped (see header comment): shared
+    # or VPS, the PR-time numbers were too noisy to act on and every failed
+    # attempt burned VPS time + a red check.
+    if: github.event_name != 'pull_request'
 
     steps:
       # Full history so '~1' parent resolution works in both modes.
@@ -48,19 +54,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # after = PR head for pull_requests, or the user-supplied commit_ref for
-      # dispatch, or main for the scheduled run. before = base parent.
+      # after = user-supplied commit_ref for dispatch, or main for the
+      # scheduled run. before = base parent.
       - name: Resolve before/after refs
         id: refs
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "after=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-            echo "before=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
-          else
-            COMMIT="${{ inputs.commit_ref || 'main' }}"
-            echo "after=$COMMIT" >> "$GITHUB_OUTPUT"
-            echo "before=$(git rev-parse "$COMMIT~1")" >> "$GITHUB_OUTPUT"
-          fi
+          COMMIT="${{ inputs.commit_ref || 'main' }}"
+          echo "after=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "before=$(git rev-parse "$COMMIT~1")" >> "$GITHUB_OUTPUT"
 
       - name: Check VPS secrets
         id: vps
