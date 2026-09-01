@@ -143,8 +143,10 @@ enum HealthAction {
 /// Health-check state machine mirroring Go frp's `health.Monitor`
 /// (`statusOK`/`failedTimes` transitions). Pure and unit-testable.
 struct HealthState {
-    /// Go frp v0.70.1 compat: failedTimes is a monotonic uint64 that NEVER
-    /// resets — recovery is tracked via `was_failed`, not the counter.
+    /// Consecutive failure count since the last successful check. Go frp
+    /// v0.71.0 released with a monotonic counter that never reset (a failure
+    /// streak could accumulate across recovery and misfire Close); fatedier
+    /// fixed it in #5502 (dev) by resetting on success — mirrored here.
     failures: u64,
     /// A Close event was emitted and no Recover has been delivered yet.
     was_failed: bool,
@@ -175,8 +177,11 @@ impl HealthState {
     /// in which case the transition is retried on the next matching tick).
     fn on_check(&mut self, ok: bool, max_failed: u32) -> HealthAction {
         if ok {
-            // Go frp compat: failedTimes is NEVER reset on success — monotonic.
-            // See /tmp/frp-source/client/health/health.go:121-127.
+            // Go frp compat (fatedier/frp #5502, dev): failedTimes is reset
+            // on a successful check, so a failure streak never accumulates
+            // across recovery — a proxy that recovers must fail max_failed
+            // times in a row again before Close fires.
+            self.failures = 0;
             self.was_healthy = true;
             if self.was_failed {
                 HealthAction::Recover
@@ -347,17 +352,41 @@ mod tests {
         assert_eq!(st.on_check(true, 2), HealthAction::Recover);
         st.confirm_recover();
         // Success right after recovery: NO event. Regression: the old guard
-        // fired Close here because `failures` is monotonic and was_failed was
-        // just cleared by the Recover above.
+        // fired Close here because `failures` was monotonic and was_failed
+        // had just been cleared by the Recover above.
         assert_eq!(st.on_check(true, 2), HealthAction::None);
-        // A later failure re-closes immediately (failures is monotonic and
-        // already past max_failed — Go compat) — but ONLY on a failure tick.
+        // A later failure does NOT re-close immediately: the successful check
+        // reset the counter (Go #5502), so the streak restarts from zero.
+        assert_eq!(st.on_check(false, 2), HealthAction::None);
+        // One more failure reaches max_failed again -> Close.
         assert_eq!(st.on_check(false, 2), HealthAction::Close);
         // And the following success tick is again silent.
         st.confirm_close();
         assert_eq!(st.on_check(true, 2), HealthAction::Recover);
         st.confirm_recover();
         assert_eq!(st.on_check(true, 2), HealthAction::None);
+    }
+
+    /// Go #5502 regression: failures must not accumulate across a recovery.
+    /// Old behavior closed a proxy that failed max_failed times over SEPARATE
+    /// outages (e.g. 2 failures, 10 min healthy, 1 failure with max_failed=3)
+    /// because the monotonic counter never reset.
+    #[test]
+    fn failure_streak_does_not_accumulate_across_recovery() {
+        let mut st = HealthState::new();
+        // First success registers (health=1 -> 0).
+        assert_eq!(st.on_check(true, 3), HealthAction::Recover);
+        st.confirm_recover();
+        // Outage 1: 2 failures, below max_failed=3, no Close.
+        assert_eq!(st.on_check(false, 3), HealthAction::None);
+        assert_eq!(st.on_check(false, 3), HealthAction::None);
+        // Recovery.
+        assert_eq!(st.on_check(true, 3), HealthAction::None);
+        // Outage 2: 1 failure — must NOT Close (streak restarted at 0).
+        assert_eq!(st.on_check(false, 3), HealthAction::None);
+        // Outage 2 continues: 2 more failures reach max_failed in one streak.
+        assert_eq!(st.on_check(false, 3), HealthAction::None);
+        assert_eq!(st.on_check(false, 3), HealthAction::Close);
     }
 
     /// Close is only emitted on failure ticks; success ticks can only emit
