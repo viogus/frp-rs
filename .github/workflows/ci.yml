@@ -163,12 +163,16 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      # Restore-only, registry/git only: cargo-audit + cargo-deny never build
+      # the workspace, so target/ is dead weight here. Saving it made the
+      # post-run upload ~5.1 GB and it hung at "Sent 0 of ... (0.0%)" until
+      # GitHub cancelled the job (observed twice 2026-09-01: this job and the
+      # tests job at the 25m limit) — restore-only removes the upload entirely.
+      - uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry/
             ~/.cargo/git/
-            target/
           key: ${{ runner.os }}-cargo-security-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - name: Install Rust stable
