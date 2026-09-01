@@ -2,13 +2,17 @@
 
 All notable changes to frp-rs.
 
-## Unreleased — post-v0.71.0 hardening series (2026-08-16 → 2026-09-01)
+## v0.71.0 — re-release (2026-09-01)
 
-30 PRs (#248-#277), 175 files, +46296/−4364: five full code reviews (4
+Supersedes the 2026-08-16 v0.71.0 build (PR #246 era). Same version number,
+per the Go-alignment rule — Go frp has not released a newer number. All
+assets re-built and re-published from commit `5464adf`.
+
+32 PRs (#248-#279), 175 files, +46296/−4364: five full code reviews (4
 finders + adversarial verifiers), 18 pre-release hardening rounds, 2
 data-corruption BLOCKERs, 2 leak-fix batches, Go frp v0.71.0 divergence
 closure, yamux vendor patches, and +380 tests (1149 → 1529, 0 failed).
-Version stays aligned at 0.71.0 (Go frp has not released a newer number).
+Version stays aligned at 0.71.0.
 
 ### Features
 - **SUDP wire protocol v2 + mixed-codec message bridge** (Go frp v0.71.0
@@ -187,6 +191,16 @@ Version stays aligned at 0.71.0 (Go frp has not released a newer number).
 - Removed as direct deps (banned): `hex`, `data-encoding`, `base64`,
   `lazy_static`, `sha2`, `aes-gcm`, `hkdf`, `hickory-resolver`,
   `aws-lc-rs`, `hmac`, `tokio-tungstenite` (manual RFC 6455 framing).
+- **rand 0.8 → 0.10** (PR #279): unified with russh's rand; `OsRng` →
+  `SysRng`/`TryRng`, `thread_rng` → `rng`, `Rng` → `RngExt`. rand 0.8.7
+  remains in the lock only via the opt-in otel chain
+  (opentelemetry_sdk → tonic → tower, third-party pins).
+
+### Docs
+- Full sync to post-0.71.0 state (PRs #277/#278): CHANGELOG, README,
+  CLAUDE.md Current Health + round 17/18 history, developing.md dep
+  tables; optional UPX compression section added to deployment.md
+  (measured, not recommended by default).
 
 ## v0.71.0 (2026-08-16)
 
