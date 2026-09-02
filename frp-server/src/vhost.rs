@@ -1837,7 +1837,7 @@ fn extract_raw_request_host(request: &str, is_absolute_form: bool) -> &str {
             .lines()
             .next()
             .unwrap_or("")
-            .splitn(3, ' ')
+            .split(' ')
             .nth(1)
             .unwrap_or("");
         let rest = target

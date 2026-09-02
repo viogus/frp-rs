@@ -2007,6 +2007,20 @@ impl OidcVerifier {
     ) -> Result<(), String> {
         Ok(())
     }
+    /// Stub — the jti replay pre-check (S2) is unreachable when the oidc
+    /// feature is disabled (AuthMethod::Oidc is compiled out; the verifier
+    /// is always None on the login path).
+    pub fn extract_claims_unverified(
+        &self,
+        _token: &str,
+    ) -> Result<(Option<String>, String, i64), String> {
+        Err("OIDC feature disabled at compile time".into())
+    }
+    /// Stub — never reports a pending replay; `verify_login` rejects
+    /// everything when the feature is off.
+    pub fn check_replay_pending(&self, _jti: Option<&str>, _subject: &str) -> bool {
+        false
+    }
 }
 
 /// Zeroize a `String` in-place by overwriting each byte with `0x00`.

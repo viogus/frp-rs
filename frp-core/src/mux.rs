@@ -923,7 +923,7 @@ mod tests {
         // The builder must apply the configured value to the yamux config,
         // not a separate hardcoded constant (drift would silently shrink or
         // grow the window).
-        let ycfg = yamux_config(&cfg);
+        let _ = yamux_config(&cfg);
         // Can't read the window back out of the yamux Config (no getter), so
         // assert the plumbing: building with a different value must not
         // panic, and the conn-window floor formula must follow the config
