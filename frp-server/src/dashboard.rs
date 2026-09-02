@@ -2646,6 +2646,7 @@ mod v2 {
                 multiplexer: String::new(),
                 bandwidth_limit: String::new(),
                 bandwidth_limit_mode: String::new(),
+                bandwidth_limiter: None,
                 user: String::new(),
                 user_conn_sem: None,
                 udp_packet_codec: String::new(),

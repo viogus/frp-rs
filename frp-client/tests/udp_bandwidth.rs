@@ -152,9 +152,11 @@ async fn udp_unlimited_by_default() {
 }
 
 /// Explicit `bandwidthLimit = "4KB"` with `bandwidthLimitMode = "server"`
-/// throttles the tunnel: an 8 KiB round trip must take well over a second
-/// (the server applies a two-direction limiter; the client applies its read
-/// direction for server mode) while still delivering the payload intact.
+/// throttles the tunnel: the round trip must take well over a second. Go
+/// v0.71.0 semantics (F1/F2): mode picks the SIDE that owns the limiting —
+/// "server" means ONLY the server creates the per-proxy shared limiter (one
+/// bucket for both directions); the client creates none. The server's
+/// 4 KiB/s bucket gates the whole 16.8 KiB round trip.
 #[tokio::test]
 async fn udp_bandwidth_limits_server_mode() {
     let server_port = allocate_port();
@@ -165,12 +167,12 @@ async fn udp_bandwidth_limits_server_mode() {
         .await
         .expect("tunnel ready");
 
-    // 12 × 1400 B = 16.8 KiB aggregate through a 4 KiB/s server-mode
-    // limiter. The limiting directions (server writer + client read limiter
-    // on the way in, server reader on the echo back) are pipelined, not
-    // serial — measured ~1.75 s for 8 packets, ~3+ s for 12. The >= 2 s
-    // floor has ample headroom while the unlimited path completes in
-    // < 1.5 s, so the two tests cannot cross.
+    // 12 × 1400 B = 16.8 KiB aggregate through the server's single 4 KiB/s
+    // shared bucket (both directions consume from it — Go v0.71.0 one
+    // `*rate.Limiter` wired into limit.NewReader AND limit.NewWriter).
+    // 16.8 KiB / 4 KiB/s ≈ 4.2 s minimum. The >= 2 s floor has ample
+    // headroom while the unlimited path completes in < 1.5 s, so the two
+    // tests cannot cross.
     let payload = [0xABu8; 1400];
     let (received, elapsed) = udp_burst(&sock, target, &payload, 12).await;
     assert_eq!(received, 12 * payload.len(), "echo payload mismatch");
@@ -180,10 +182,11 @@ async fn udp_bandwidth_limits_server_mode() {
     );
 }
 
-/// `bandwidthLimitMode = "client"` throttles upload on frpc: the echo path
-/// (local service → work conn → server → external client) crosses the
-/// client's write limiter, so the round trip is throttled while the server
-/// applies no limiter of its own.
+/// `bandwidthLimitMode = "client"` throttles on frpc (Go v0.71.0: mode picks
+/// the side; the client creates the per-proxy shared limiter — one bucket
+/// covering both directions). The server applies no limiter of its own, but
+/// the client's single 4 KiB/s bucket gates the whole round trip (request +
+/// echo legs both consume from it).
 #[tokio::test]
 async fn udp_bandwidth_limits_client_mode() {
     let server_port = allocate_port();
@@ -199,6 +202,6 @@ async fn udp_bandwidth_limits_client_mode() {
     assert_eq!(received, 12 * payload.len(), "echo payload mismatch");
     assert!(
         elapsed >= Duration::from_millis(2000),
-        "16.8 KiB upload at 4 KiB/s should be throttled, took {elapsed:?}"
+        "16.8 KiB round trip at 4 KiB/s should be throttled, took {elapsed:?}"
     );
 }

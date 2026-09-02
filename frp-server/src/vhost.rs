@@ -829,10 +829,17 @@ async fn handle_http1_request<S>(
 
     debug!(host = %host, path = %path, peer = %peer, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
 
+    // X-Forwarded-Host value: inbound Host as received (Go r.In.Host),
+    // extracted from the ORIGINAL head — `host` above is canonicalized
+    // (port stripped) and `pre_read` is rewritten later. Owned: `request_text`
+    // borrows `pre_read`, which is moved into resolve_vhost_request below.
+    let raw_host = extract_raw_request_host(request_text, is_absolute_form).to_string();
+
     match resolve_vhost_request(
         &state,
         &host,
         &path,
+        &raw_host,
         http_auth.as_ref(),
         route_user.as_deref(),
         pre_read,
@@ -939,14 +946,19 @@ pub(crate) enum VhostResolveError {
 /// Extracted from `serve_vhost_request`: looks up the route (domain/wildcard/
 /// path + httpUser), enforces Basic Auth, applies per-user routing
 /// (`route_by_http_user`), then rewrites the Host header and injects
-/// X-Forwarded-For / requestHeaders into the forwarded head. The caller
-/// renders rejection (404/401) or success (ProxyUserConn dispatch) in its own
-/// protocol (HTTP/1.1 text vs HTTP/2 frames).
+/// X-Forwarded-For / X-Forwarded-Host / X-Forwarded-Proto / requestHeaders
+/// into the forwarded head. `raw_host` is the inbound Host exactly as
+/// received (case + port preserved, NOT canonicalized) — Go's
+/// `SetXForwarded` uses `r.In.Host` (pre-rewrite); CanonicalHost feeds
+/// routing only. The caller renders rejection (404/401) or success
+/// (ProxyUserConn dispatch) in its own protocol (HTTP/1.1 text vs HTTP/2
+/// frames).
 #[allow(clippy::too_many_arguments)] // mirrors tcpmux::route (same request-context tuple)
 pub(crate) async fn resolve_vhost_request(
     state: &AppState,
     host: &str,
     path: &str,
+    raw_host: &str,
     http_auth: Option<&(String, String)>,
     route_user: Option<&str>,
     request_head: Vec<u8>,
@@ -1078,10 +1090,16 @@ pub(crate) async fn resolve_vhost_request(
         request_head
     };
 
-    // Go frp compat (pkg/util/vhost/http.go reverse proxy): inject
-    // X-Forwarded-For (append to existing value) and requestHeaders
-    // (Set semantics) into the forwarded request head.
-    let request_head = inject_vhost_request_headers(request_head, peer, route.headers.as_slice());
+    // Go frp compat (pkg/util/vhost/http.go reverse proxy + stdlib
+    // httputil.ProxyRequest.SetXForwarded): inject X-Forwarded-For (append
+    // to existing value), X-Forwarded-Host (inbound Host as received, BEFORE
+    // host_header_rewrite — Go rewrites `req.Host` after SetXForwarded),
+    // X-Forwarded-Proto (always "http" here: r.In.TLS == nil on this plain
+    // HTTP path; the HTTPS vhost muxer is SNI passthrough and never
+    // injects), then requestHeaders (Set semantics — user-configured
+    // overrides win, exactly like Go's rc.Headers loop after SetXForwarded).
+    let request_head =
+        inject_vhost_request_headers(request_head, peer, raw_host, route.headers.as_slice());
 
     Ok(VhostForward {
         proxy_name: target_proxy_name,
@@ -1523,15 +1541,20 @@ fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
     result
 }
 
-/// Inject `X-Forwarded-For` (append semantics, Go httputil.ReverseProxy) and
-/// configured requestHeaders (Set semantics, Go `req.Header.Set`) into the
-/// request head bytes. Only the header block up to `\r\n\r\n` is touched.
-/// The X-Forwarded-For append runs even when no requestHeaders are
-/// configured — Go's Rewrite hook (pkg/util/vhost/http.go) unconditionally
-/// calls `r.SetXForwarded()`; a configured header list is not a gate.
+/// Inject `X-Forwarded-For` (append semantics, Go httputil.ReverseProxy),
+/// `X-Forwarded-Host` / `X-Forwarded-Proto` (Go `ProxyRequest.SetXForwarded`)
+/// and configured requestHeaders (Set semantics, Go `req.Header.Set`) into
+/// the request head bytes. Only the header block up to `\r\n\r\n` is
+/// touched. The injection runs even when no requestHeaders are configured —
+/// Go's Rewrite hook (pkg/util/vhost/http.go) unconditionally calls
+/// `r.SetXForwarded()`; a configured header list is not a gate.
+/// `x_forwarded_host` must be the PRE-rewrite inbound Host (Go's
+/// SetXForwarded reads `r.In.Host`; host_header_rewrite lands on
+/// `r.Out.Host` after it); empty → line omitted (Go `r.In.Host != ""`).
 fn inject_vhost_request_headers(
     data: Vec<u8>,
     peer: std::net::SocketAddr,
+    x_forwarded_host: &str,
     request_headers: &[(String, String)],
 ) -> Vec<u8> {
     let header_end = data
@@ -1608,6 +1631,20 @@ fn inject_vhost_request_headers(
     out.extend_from_slice(b"X-Forwarded-For: ");
     out.extend_from_slice(&xff);
     out.extend_from_slice(b"\r\n");
+    // X-Forwarded-Host: inbound Host as received (Go SetXForwarded:
+    // `r.In.Host != ""` guard, pre-rewrite value). Emitted AFTER XFF, both
+    // before the configured headers, which may override them (Go `Header.Set`
+    // semantics — the rc.Headers loop runs after SetXForwarded).
+    if !x_forwarded_host.is_empty() {
+        out.extend_from_slice(b"X-Forwarded-Host: ");
+        out.extend_from_slice(x_forwarded_host.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    // X-Forwarded-Proto: "http" — Go `r.In.TLS == nil → "http"`. This
+    // injector only ever runs on the plain-HTTP vhost path (HTTP/1.1 + h2c);
+    // the HTTPS vhost muxer is SNI passthrough with no HTTP layer to inject
+    // into, so "https" is unreachable here.
+    out.extend_from_slice(b"X-Forwarded-Proto: http\r\n");
     // Configured request headers. Sanitize names/values against CR/LF to
     // prevent HTTP header injection / request smuggling — same filter as the
     // response-header path in bridge.rs and the Host rewrite above. A header
@@ -1782,6 +1819,46 @@ pub(crate) fn canonicalize_authority(value: &str) -> &str {
     // not canonicalized, so a user-registered "example.com." is
     // unroutable in Go too).
     hostname.strip_suffix('.').unwrap_or(hostname)
+}
+
+/// Raw inbound host for X-Forwarded-Host — Go net/http `req.Host`, NOT
+/// canonicalized: absolute-form → request-line authority verbatim (port and
+/// case preserved; Go `req.Host = req.URL.Host`); origin-form → the Host
+/// header value, OWS-trimmed only (Go keeps the value as received).
+/// CanonicalHost (lowercase, port strip) feeds ROUTING only — SetXForwarded
+/// uses `r.In.Host` as received, so `canonicalize_authority` must not run
+/// here ("example.com:8080" keeps its port, "ExAmPlE.com." keeps its dot).
+fn extract_raw_request_host(request: &str, is_absolute_form: bool) -> &str {
+    if is_absolute_form {
+        // First-line request target "scheme://authority[/…]" — authority
+        // ends at the first '/', '?' or '#' (Go url.ParseRequestURI). Same
+        // scheme detection as parse_vhost_request_line.
+        let target = request
+            .lines()
+            .next()
+            .unwrap_or("")
+            .splitn(3, ' ')
+            .nth(1)
+            .unwrap_or("");
+        let rest = target
+            .strip_prefix("http://")
+            .or_else(|| target.strip_prefix("https://"));
+        return rest
+            .and_then(|r| r.split(['/', '?', '#']).next())
+            .unwrap_or("");
+    }
+    for line in request.lines() {
+        if line.len() < 5 {
+            continue;
+        }
+        if line
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("host:"))
+        {
+            return line[5..].trim();
+        }
+    }
+    ""
 }
 
 fn extract_host_header(request: &str) -> Option<&str> {
@@ -3649,6 +3726,7 @@ mod tests {
                     state,
                     "auth.example.com",
                     "/",
+                    "auth.example.com", // raw inbound Host (test head's Host)
                     auth.as_ref(),
                     None, // no routing-only fallback user
                     head,
@@ -3686,6 +3764,7 @@ mod tests {
                     state,
                     "auth.example.com",
                     "/",
+                    "auth.example.com", // raw inbound Host (test head's Host)
                     auth.as_ref(),
                     None, // no routing-only fallback user
                     head,
@@ -3711,6 +3790,7 @@ mod tests {
                     state,
                     "auth.example.com",
                     "/",
+                    "auth.example.com", // raw inbound Host (test head's Host)
                     auth.as_ref(),
                     None, // no routing-only fallback user
                     head,
@@ -3769,6 +3849,7 @@ mod tests {
             &state,
             "g.example.com",
             "/",
+            "g.example.com", // raw inbound Host (test head's Host)
             None,
             None, // no routing-only fallback user
             b"GET / HTTP/1.1\r\nHost: g.example.com\r\n\r\n".to_vec(),
@@ -3813,6 +3894,7 @@ mod tests {
             &state,
             "g2.example.com",
             "/",
+            "g2.example.com", // raw inbound Host (test head's Host)
             None,
             None, // no routing-only fallback user
             b"GET / HTTP/1.1\r\nHost: g2.example.com\r\n\r\n".to_vec(),
@@ -3827,5 +3909,88 @@ mod tests {
             "no members → recorded proxy fallback"
         );
         assert_eq!(fwd.run_id, "run-1");
+    }
+
+    // ---------------------------------------------------------------
+    // F3 pin: X-Forwarded-Host / X-Forwarded-Proto injection (Go
+    // `ProxyRequest.SetXForwarded` parity — the tri-plet, not XFF alone)
+    // ---------------------------------------------------------------
+
+    /// The injection must emit X-Forwarded-Host (pre-rewrite inbound Host)
+    /// and X-Forwarded-Proto (always "http" on the plain vhost path) in
+    /// addition to the existing X-Forwarded-For append. Before F3, only XFF
+    /// was injected — the Go frp tri-plet (SetXForwarded) was missing.
+    #[test]
+    fn inject_xfh_xfp_triplet_with_existing_xff() {
+        let head =
+            b"GET / HTTP/1.1\r\nHost: app.example.com\r\nX-Forwarded-For: 203.0.113.1\r\n\r\nbody"
+                .to_vec();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
+        let out = inject_vhost_request_headers(head, peer, "app.example.com", &[]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("GET / HTTP/1.1\r\nHost: app.example.com\r\n"),
+            "original head must be preserved first: {text:?}"
+        );
+        // XFF: existing value chained with the peer (Go ReverseProxy append).
+        assert!(
+            text.contains("X-Forwarded-For: 203.0.113.1, 192.0.2.55\r\n"),
+            "XFF must chain peer to the existing value: {text:?}"
+        );
+        // F3: X-Forwarded-Host = inbound Host as received (Go r.In.Host).
+        assert!(
+            text.contains("X-Forwarded-Host: app.example.com\r\n"),
+            "X-Forwarded-Host must be injected with the inbound Host: {text:?}"
+        );
+        // F3: X-Forwarded-Proto always "http" (Go r.In.TLS == nil).
+        assert!(
+            text.contains("X-Forwarded-Proto: http\r\n"),
+            "X-Forwarded-Proto must be injected as http: {text:?}"
+        );
+        // Header block only — body untouched.
+        assert!(
+            text.ends_with("\r\n\r\nbody"),
+            "body must survive: {text:?}"
+        );
+    }
+
+    /// Empty inbound Host → the X-Forwarded-Host line is OMITTED (Go
+    /// `r.In.Host != ""` guard); XFF and XFP still emit.
+    #[test]
+    fn inject_xfh_omitted_when_host_empty() {
+        let head = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
+        let out = inject_vhost_request_headers(head, peer, "", &[]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("X-Forwarded-Host:"),
+            "empty inbound Host must omit X-Forwarded-Host: {text:?}"
+        );
+        assert!(text.contains("X-Forwarded-For: 192.0.2.55\r\n"), "{text:?}");
+        assert!(text.contains("X-Forwarded-Proto: http\r\n"), "{text:?}");
+    }
+
+    /// Configured requestHeaders may override the forwarded headers (Go
+    /// `req.Header.Set` runs after SetXForwarded) but must not duplicate an
+    /// X-Forwarded-For value (case-insensitive re-emit with the peer chain).
+    #[test]
+    fn inject_request_headers_override_after_forwarded() {
+        let head = b"GET / HTTP/1.1\r\nx-forwarded-for: 198.51.100.7\r\n\r\n".to_vec();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
+        let overrides = [("X-Forwarded-Proto".to_string(), "https".to_string())];
+        let out = inject_vhost_request_headers(head, peer, "h.example.com", &overrides);
+        let text = String::from_utf8(out).unwrap();
+        // The old lowercase xff is re-emitted exactly once, chained.
+        let xff_count = text.matches("X-Forwarded-For:").count();
+        assert_eq!(xff_count, 1, "XFF must appear exactly once: {text:?}");
+        assert!(
+            text.contains("X-Forwarded-For: 198.51.100.7, 192.0.2.55\r\n"),
+            "{text:?}"
+        );
+        // Configured header wins over the forwarded default (Go Set semantics).
+        assert!(
+            text.contains("X-Forwarded-Proto: https\r\n"),
+            "configured requestHeader must override: {text:?}"
+        );
     }
 }

@@ -79,6 +79,13 @@ pub struct ProxyInfo {
     pub multiplexer: String,
     pub bandwidth_limit: String,
     pub bandwidth_limit_mode: String,
+    /// Per-proxy SHARED bandwidth limiter (Go frp v0.71.0 `BaseProxy.limiter`):
+    /// one token bucket covering both directions and all concurrent
+    /// connections, created at registration when mode == "server"/"both"
+    /// and a rate is set. None otherwise (Go: server creates a limiter only
+    /// in "server" mode — proxy.go NewProxy gate; empty mode normalizes to
+    /// "client", which is the client's responsibility).
+    pub bandwidth_limiter: Option<frp_core::bandwidth::SharedBandwidthLimiter>,
     pub user: String,
     /// Per-proxy user-connection cap (audit D2-2): a Semaphore of size
     /// `max_conns_per_proxy` when configured (>0); None = unlimited (Go
@@ -1061,6 +1068,7 @@ mod tests {
             multiplexer: String::new(),
             bandwidth_limit: String::new(),
             bandwidth_limit_mode: String::new(),
+            bandwidth_limiter: None,
             udp_packet_codec: String::new(),
             user: String::new(),
             user_conn_sem: None,

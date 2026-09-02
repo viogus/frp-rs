@@ -13,7 +13,7 @@ use frp_core::transport::IoStream;
 use crate::lock::RwLockExt;
 use crate::proxy::ProxyInfo;
 use crate::service::{AppState, InternalMsg};
-use crate::state::ControlTx;
+use crate::state::{ControlTx, GroupPortQuery};
 
 /// Returns full detail when detailed_errors is enabled, otherwise generic message.
 pub(crate) fn err_msg(detailed: bool, detail: String, generic: &str) -> String {
@@ -349,6 +349,25 @@ async fn build_proxy_info(
         multiplexer: np.multiplexer.clone().unwrap_or_default(),
         bandwidth_limit: np.bandwidth_limit.clone().unwrap_or_default(),
         bandwidth_limit_mode: np.bandwidth_limit_mode.clone().unwrap_or_default(),
+        // Per-proxy SHARED bandwidth limiter, created ONCE at registration
+        // (Go frp v0.71.0: NewProxy builds a single `*rate.Limiter` when
+        // mode == "server" — proxy.go:536-540; "both" is the frp-rs
+        // extension — both sides limit). Empty mode normalizes to "client"
+        // (Go EmptyOr), which the client side handles. One bucket covers
+        // both directions and all concurrent connections; bridges clone
+        // this Arc instead of building per-connection limiters (F1/F2).
+        bandwidth_limiter: {
+            let bw_rate = np
+                .bandwidth_limit
+                .as_deref()
+                .filter(|bl| !bl.is_empty())
+                .and_then(frp_core::config::parse_bandwidth_limit)
+                .unwrap_or(0);
+            frp_core::bandwidth::server_side_limiter(
+                bw_rate,
+                np.bandwidth_limit_mode.as_deref().unwrap_or(""),
+            )
+        },
         user: state
             .run_id_to_ctl_tx
             .get(run_id)
@@ -1393,43 +1412,63 @@ async fn setup_proxy_listeners(
                 // a member instead (audit-fix: group-create bind failure
                 // rejected the first member). Per-proxy TCP listeners keep
                 // the reject behavior: their port is exclusive.
-                if e.kind() == std::io::ErrorKind::AddrInUse
-                    && state
+                if e.kind() == std::io::ErrorKind::AddrInUse {
+                    match state
                         .tcp_group_ctl
                         .get_group_port(&group_name, &group_key, port, &bind_addr)
                         .await
-                        .is_some()
-                {
-                    // The group exists and matches this member's
-                    // group/key/port — join it. Roll back the create-path
-                    // registration (port mark + registry entry + count),
-                    // re-mark the port, then re-register via the member
-                    // path, which writes the NewProxyResp itself.
-                    tracing::warn!(
-                        port = %port,
-                        group = %group_name,
-                        proxy_name = %np.proxy_name,
-                        "TCP group port {port} bind raced a sibling group create for '{}' — joining existing group",
-                        np.proxy_name,
-                    );
-                    rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
-                    state.used_ports.write().await.insert(port);
-                    handle_tcp_group_member_registration(
-                        state,
-                        run_id,
-                        control_id,
-                        writer,
-                        np.clone(),
-                        np.remote_port.unwrap_or(0) as u16,
-                        &itx,
-                        listener_handles,
-                        udp_sockets,
-                        v2,
-                        Some(port),
-                        tcp_group_created,
-                    )
-                    .await;
-                    return Err(());
+                    {
+                        GroupPortQuery::Matched(_) => {
+                            // The group exists and matches this member's
+                            // group/key/port — join it. Roll back the
+                            // create-path registration (port mark + registry
+                            // entry + count), re-mark the port, then
+                            // re-register via the member path, which writes
+                            // the NewProxyResp itself.
+                            tracing::warn!(
+                                port = %port,
+                                group = %group_name,
+                                proxy_name = %np.proxy_name,
+                                "TCP group port {port} bind raced a sibling group create for '{}' — joining existing group",
+                                np.proxy_name,
+                            );
+                            rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
+                            state.used_ports.write().await.insert(port);
+                            handle_tcp_group_member_registration(
+                                state,
+                                run_id,
+                                control_id,
+                                writer,
+                                np.clone(),
+                                np.remote_port.unwrap_or(0) as u16,
+                                &itx,
+                                listener_handles,
+                                udp_sockets,
+                                v2,
+                                Some(port),
+                                tcp_group_created,
+                            )
+                            .await;
+                            return Err(());
+                        }
+                        GroupPortQuery::Mismatch(err_text) => {
+                            // Group exists but with different params — Go
+                            // rejects with the specific text (F5), not a
+                            // generic bind error.
+                            tracing::warn!(
+                                port = %port,
+                                group = %group_name,
+                                proxy_name = %np.proxy_name,
+                                "TCP group port {port} bind raced a sibling group create with mismatched params for '{}' — rejecting",
+                                np.proxy_name,
+                            );
+                            rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
+                            reject_new_proxy(writer, &np.proxy_name, err_text.to_string(), v2)
+                                .await;
+                            return Err(());
+                        }
+                        GroupPortQuery::NotFound => {}
+                    }
                 }
                 tracing::error!(port = %port, error = %e, "Failed to bind TCP group port {} for '{}': {}", port, np.proxy_name, e);
                 rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
@@ -1462,7 +1501,8 @@ async fn setup_proxy_listeners(
         let handle = tokio::spawn(async move {
             tcp_group_listener(listener, port, gn, st, ct).await;
         });
-        if let Err(e) = state
+        let abort_handle = handle.abort_handle();
+        let create_result = state
             .tcp_group_ctl
             .create_group(
                 &group_name,
@@ -1472,15 +1512,68 @@ async fn setup_proxy_listeners(
                 handle,
                 cancel_token,
             )
-            .await
-        {
-            warn!(
-                proxy_name = %np.proxy_name,
-                group = %group_name,
-                error = %e,
-                "Failed to register TCP group '{}': {}",
-                group_name, e,
-            );
+            .await;
+        if let Err(e) = create_result {
+            // A racing member created the group between the NotFound probe
+            // and here. Go's `TCPGroupCtl.Listen` retries on `errGroupStale`
+            // and then validates params; mirror that: abort the redundant
+            // listener we just bound, roll back the create-path
+            // registration, and re-query — Matched → join, else reject with
+            // the Go error text (F5 review finding: the old code logged
+            // warn-only and left the proxy registered on its own port,
+            // splitting the group across two listeners).
+            abort_handle.abort();
+            rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
+            match state
+                .tcp_group_ctl
+                .get_group_port(&group_name, &group_key, port, &bind_addr)
+                .await
+            {
+                GroupPortQuery::Matched(join_port) => {
+                    tracing::warn!(
+                        proxy_name = %np.proxy_name,
+                        group = %group_name,
+                        error = %e,
+                        "TCP group '{}' created concurrently for '{}' — joining on port {}",
+                        group_name, np.proxy_name, join_port,
+                    );
+                    state.used_ports.write().await.insert(join_port);
+                    handle_tcp_group_member_registration(
+                        state,
+                        run_id,
+                        control_id,
+                        writer,
+                        np.clone(),
+                        np.remote_port.unwrap_or(0) as u16,
+                        &itx,
+                        listener_handles,
+                        udp_sockets,
+                        v2,
+                        Some(join_port),
+                        tcp_group_created,
+                    )
+                    .await;
+                }
+                GroupPortQuery::Mismatch(err_text) => {
+                    reject_new_proxy(writer, &np.proxy_name, err_text.to_string(), v2).await;
+                }
+                GroupPortQuery::NotFound => {
+                    // Group vanished between create failure and re-query —
+                    // reject; the client's next attempt re-creates it.
+                    reject_new_proxy(
+                        writer,
+                        &np.proxy_name,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            format!("TCP group registration failed: {e}"),
+                            "TCP group registration failed",
+                        ),
+                        v2,
+                    )
+                    .await;
+                }
+            }
+            return Err(());
         }
     } else if np.proxy_type == "tcp" {
         // Only TCP proxies bind a per-proxy listener. HTTP/HTTPS use
@@ -1730,53 +1823,68 @@ pub(crate) async fn handle_new_proxy(
     if is_tcp_group {
         let group_name = np.group.as_deref().unwrap_or("");
         let group_key = np.group_key.as_deref().unwrap_or("");
-        if let Some(group_port) = state
+        // Go frp parity (server/group/tcp.go `TCPGroup.Listen`): the first
+        // member creates the group; later members are validated — addr
+        // (ErrGroupParamsInvalid), port (ErrGroupDifferentPort), group_key
+        // (ErrGroupAuthFailed) — and REJECTED on mismatch with the Go error
+        // text (F5 review finding: old code conflated mismatch with
+        // missing-group and silently fell through to group-create, so a
+        // mismatched member could end up registered on its own port).
+        match state
             .tcp_group_ctl
             .get_group_port(group_name, group_key, remote_port, &state.proxy_bind_addr)
             .await
         {
-            info!(
-                proxy_name = %np.proxy_name,
-                group = %group_name,
-                port = %group_port,
-                "TCP proxy '{}' joining existing group '{}' on port {}",
-                np.proxy_name, group_name, group_port,
-            );
-            // Group exists — reuse its port and skip port allocation.
-            // The shared group listener handles connection dispatch.
-            // We still create ProxyInfo with the group's port so users
-            // connect to the correct port, but no new listener is spawned.
-            // Scope the write lock: the callee below takes `used_ports.write()`
-            // again (on register failure it removes the port), and tokio's
-            // RwLock is NOT reentrant — holding `ports` here would
-            // self-deadlock the control select loop (audit D3-1).
-            let allocated_port = {
-                let mut ports = state.used_ports.write().await;
-                ports.insert(group_port);
-                Some(group_port)
-            };
-            // Jump to proxy registration, skipping listener creation below.
-            handle_tcp_group_member_registration(
-                state,
-                run_id,
-                control_id,
-                writer,
-                np,
-                remote_port,
-                internal_tx,
-                listener_handles,
-                udp_sockets,
-                v2,
-                allocated_port,
-                false,
-            )
-            .await;
-            // TCP group member path: the callee completed its own
-            // registration (or rejection) — never udp/sudp.
-            return true;
+            GroupPortQuery::Matched(group_port) => {
+                info!(
+                    proxy_name = %np.proxy_name,
+                    group = %group_name,
+                    port = %group_port,
+                    "TCP proxy '{}' joining existing group '{}' on port {}",
+                    np.proxy_name, group_name, group_port,
+                );
+                // Group exists — reuse its port and skip port allocation.
+                // The shared group listener handles connection dispatch.
+                // We still create ProxyInfo with the group's port so users
+                // connect to the correct port, but no new listener is spawned.
+                // Scope the write lock: the callee below takes `used_ports.write()`
+                // again (on register failure it removes the port), and tokio's
+                // RwLock is NOT reentrant — holding `ports` here would
+                // self-deadlock the control select loop (audit D3-1).
+                let allocated_port = {
+                    let mut ports = state.used_ports.write().await;
+                    ports.insert(group_port);
+                    Some(group_port)
+                };
+                // Jump to proxy registration, skipping listener creation below.
+                handle_tcp_group_member_registration(
+                    state,
+                    run_id,
+                    control_id,
+                    writer,
+                    np,
+                    remote_port,
+                    internal_tx,
+                    listener_handles,
+                    udp_sockets,
+                    v2,
+                    allocated_port,
+                    false,
+                )
+                .await;
+                // TCP group member path: the callee completed its own
+                // registration (or rejection) — never udp/sudp.
+                return true;
+            }
+            GroupPortQuery::NotFound => {
+                // No existing group — will create one with a new shared listener.
+                tcp_group_created = true;
+            }
+            GroupPortQuery::Mismatch(err_text) => {
+                reject_new_proxy(writer, &np.proxy_name, err_text.to_string(), v2).await;
+                return false;
+            }
         }
-        // No existing group — will create one with a new shared listener.
-        tcp_group_created = true;
     }
 
     // Separate port managers for TCP and UDP (Go frp compat).
@@ -1848,6 +1956,25 @@ pub(crate) async fn handle_new_proxy(
             // conflict rejects the proxy instead of silently overwriting the
             // live sibling's route (audit finding 5).
             if np.proxy_type == "tcpmux" {
+                // Go frp v0.71.0 parity (server/proxy/tcpmux.go `Run()`):
+                // only the httpconnect multiplexer is valid — anything else
+                // rejects with `unknown multiplexer [%s]`. frp-rs accepts ""
+                // as a lenient default (documented divergence: Go rejects
+                // "", but existing frp-rs configs omit the field and the
+                // client only ever sends httpconnect).
+                let multiplexer = np.multiplexer.as_deref().unwrap_or("");
+                if !multiplexer.is_empty() && multiplexer != "httpconnect" {
+                    rollback_vhost_conflict(state, run_id, port, false).await;
+                    state.proxy_manager.remove(&np.proxy_name).await;
+                    reject_new_proxy(
+                        writer,
+                        &np.proxy_name,
+                        format!("unknown multiplexer [{}]", multiplexer),
+                        v2,
+                    )
+                    .await;
+                    return false;
+                }
                 let mut domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
 
                 // Subdomain routing: {subdomain}.{sub_domain_host} — Go
@@ -3106,6 +3233,7 @@ pub(crate) mod unregister_generation_tests {
             multiplexer: String::new(),
             bandwidth_limit: String::new(),
             bandwidth_limit_mode: String::new(),
+            bandwidth_limiter: None,
             udp_packet_codec: String::new(),
             user: String::new(),
             user_conn_sem: None,
@@ -5463,7 +5591,7 @@ pub(crate) mod unregister_generation_tests {
                 .tcp_group_ctl
                 .get_group_port("g", "k", 24051, "127.0.0.1")
                 .await,
-            Some(24051),
+            GroupPortQuery::Matched(24051),
             "group still exists"
         );
         assert_eq!(
@@ -5475,6 +5603,183 @@ pub(crate) mod unregister_generation_tests {
         assert!(
             resp_text.contains("24051"),
             "member's NewProxyResp must carry the group port: {resp_text}"
+        );
+    }
+
+    /// Drive one full handle_new_proxy registration and return the response
+    /// bytes. No group/listener is pre-created.
+    async fn register_np(np: msg::NewProxy, state: &Arc<AppState>) -> Vec<u8> {
+        insert_control(state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+        let mut writer = Vec::new();
+        handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        writer
+    }
+
+    #[tokio::test]
+    async fn tcp_group_key_mismatch_rejects_with_go_auth_failed() {
+        // F5 pin: Go server/group/tcp.go `TCPGroup.Listen` validates later
+        // members — group_key mismatch → ErrGroupAuthFailed "group auth
+        // failed". The old code conflated the mismatch with a missing group
+        // and silently created a second listener (split group).
+        let state = test_state();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        state
+            .tcp_group_ctl
+            .create_group(
+                "g",
+                "k",
+                24051,
+                "127.0.0.1",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+        let mut np = new_proxy("m1", "tcp");
+        np.group = Some("g".to_string());
+        np.group_key = Some("k2".to_string()); // wrong key
+        np.remote_port = Some(24051);
+        let writer = register_np(np, &state).await;
+        let resp_text = String::from_utf8_lossy(&writer);
+        assert!(
+            resp_text.contains("group auth failed"),
+            "must reject with Go text: {resp_text}"
+        );
+        assert!(
+            state.proxy_manager.get("m1").await.is_none(),
+            "mismatched member must not register"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_group_port_mismatch_rejects_with_go_different_port() {
+        // F5 pin: port mismatch → ErrGroupDifferentPort "group should have
+        // same remote port".
+        let state = test_state();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        state
+            .tcp_group_ctl
+            .create_group(
+                "g",
+                "k",
+                24051,
+                "127.0.0.1",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+        let mut np = new_proxy("m1", "tcp");
+        np.group = Some("g".to_string());
+        np.group_key = Some("k".to_string());
+        np.remote_port = Some(24052); // different port
+        let writer = register_np(np, &state).await;
+        let resp_text = String::from_utf8_lossy(&writer);
+        assert!(
+            resp_text.contains("group should have same remote port"),
+            "must reject with Go text: {resp_text}"
+        );
+        assert!(state.proxy_manager.get("m1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_group_query_distinguishes_notfound_and_all_mismatch_kinds() {
+        // F5 pin: the tri-state query drives the reject-vs-create decision
+        // (Go check order: addr → port → group_key).
+        let state = test_state();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        state
+            .tcp_group_ctl
+            .create_group(
+                "g",
+                "k",
+                24051,
+                "127.0.0.1",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+        let ctl = &state.tcp_group_ctl;
+        // Exact match → the shared port.
+        assert_eq!(
+            ctl.get_group_port("g", "k", 24051, "127.0.0.1").await,
+            GroupPortQuery::Matched(24051)
+        );
+        // Auto-assign (port 0) takes the group's port.
+        assert_eq!(
+            ctl.get_group_port("g", "k", 0, "127.0.0.1").await,
+            GroupPortQuery::Matched(24051)
+        );
+        // Unknown group → NotFound (caller creates).
+        assert_eq!(
+            ctl.get_group_port("nope", "k", 24051, "127.0.0.1").await,
+            GroupPortQuery::NotFound
+        );
+        // Mismatch kinds carry the Go texts (server/group/group.go).
+        assert_eq!(
+            ctl.get_group_port("g", "k", 24052, "127.0.0.1").await,
+            GroupPortQuery::Mismatch("group should have same remote port")
+        );
+        assert_eq!(
+            ctl.get_group_port("g", "k2", 24051, "127.0.0.1").await,
+            GroupPortQuery::Mismatch("group auth failed")
+        );
+        assert_eq!(
+            ctl.get_group_port("g", "k", 24051, "10.0.0.1").await,
+            GroupPortQuery::Mismatch("group params invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn tcpmux_unknown_multiplexer_rejected_empty_accepted() {
+        // F6 pin: Go server/proxy/tcpmux.go `Run()` — only httpconnect is
+        // valid, anything else rejects with `unknown multiplexer [%s]`.
+        // frp-rs accepts "" as a lenient default (documented divergence:
+        // Go rejects "", existing frp-rs configs omit the field).
+        let state = test_state();
+        let mut np = new_proxy("m1", "tcpmux");
+        np.multiplexer = Some("socks5".to_string());
+        np.custom_domains = Some(vec!["a.example.com".to_string()]);
+        let writer = register_np(np, &state).await;
+        let resp_text = String::from_utf8_lossy(&writer);
+        assert!(
+            resp_text.contains("unknown multiplexer [socks5]"),
+            "must reject with Go text: {resp_text}"
+        );
+        assert!(state.proxy_manager.get("m1").await.is_none());
+
+        // "" default (multiplexer omitted) still registers.
+        let state2 = test_state();
+        let mut np2 = new_proxy("m2", "tcpmux");
+        np2.custom_domains = Some(vec!["b.example.com".to_string()]);
+        let writer2 = register_np(np2, &state2).await;
+        let resp_text2 = String::from_utf8_lossy(&writer2);
+        assert!(
+            !resp_text2.contains("unknown multiplexer"),
+            "default multiplexer must register: {resp_text2}"
+        );
+        assert!(
+            state2.proxy_manager.get("m2").await.is_some(),
+            "tcpmux with default multiplexer must register"
         );
     }
 }

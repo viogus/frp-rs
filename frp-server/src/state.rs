@@ -217,6 +217,23 @@ pub struct PoolMetrics {
     // its consumer were dead code.)
 }
 
+/// Result of a TCP group join query.
+///
+/// Mirrors Go frp `server/group/tcp.go` `TCPGroup.Listen` validation:
+/// the first member creates the group with its params (no validation —
+/// first-wins), later members are validated in Go's check order and
+/// rejected on mismatch (Go error texts from `server/group/group.go`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GroupPortQuery {
+    /// Group exists and this member's params match — the shared port.
+    Matched(u16),
+    /// No group with this name exists — the caller creates it.
+    NotFound,
+    /// Group exists but a param differs — Go rejects the registration with
+    /// the carried error text.
+    Mismatch(&'static str),
+}
+
 /// State for a TCP group's shared listener.
 pub(crate) struct TcpGroupEntry {
     pub port: u16,
@@ -243,29 +260,37 @@ impl TcpGroupCtl {
         }
     }
 
-    /// Get the port for an existing group, validating that params match.
-    /// Returns None if the group doesn't exist.
+    /// Query an existing group, validating that params match (Go frp
+    /// `server/group/tcp.go` `TCPGroup.Listen` check order: addr →
+    /// port → group_key). `NotFound` and each mismatch kind are
+    /// distinguished so callers reject with the Go error text instead of
+    /// silently falling through to group-create (F5 review finding).
     pub async fn get_group_port(
         &self,
         group: &str,
         group_key: &str,
         port: u16,
         bind_addr: &str,
-    ) -> Option<u16> {
+    ) -> GroupPortQuery {
         let groups = self.groups.read().await;
-        let entry = groups.get(group)?;
-        // Validate that params match the existing group
-        if entry.group_key != group_key {
-            return None;
-        }
+        let Some(entry) = groups.get(group) else {
+            return GroupPortQuery::NotFound;
+        };
+        // Go: `tg.group != group || tg.addr != addr` → ErrGroupParamsInvalid.
+        // (group is the lookup key here, so only addr can differ.)
         if entry.bind_addr != bind_addr {
-            return None;
+            return GroupPortQuery::Mismatch("group params invalid");
         }
-        // Port must match the group's actual bind port
+        // Go: `tg.port != port` → ErrGroupDifferentPort. Port 0 = auto-assign,
+        // which takes the group's bound port (Go: members reuse realPort).
         if port != 0 && port != entry.port {
-            return None;
+            return GroupPortQuery::Mismatch("group should have same remote port");
         }
-        Some(entry.port)
+        // Go: `tg.groupKey != groupKey` → ErrGroupAuthFailed.
+        if entry.group_key != group_key {
+            return GroupPortQuery::Mismatch("group auth failed");
+        }
+        GroupPortQuery::Matched(entry.port)
     }
 
     /// Register a new TCP group. Returns Err if group already exists.

@@ -778,6 +778,15 @@ impl Service {
                     sk: p.sk.clone(),
                     bandwidth_limit: bw_limit,
                     bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
+                    // Per-proxy SHARED limiter (F1/F2): created once at
+                    // registration when the client side owns the limiting
+                    // (mode ""/client/both — Go EmptyOr default + client
+                    // NewProxy gate). One bucket for both directions and all
+                    // concurrent connections; bridges clone this Arc.
+                    bandwidth_limiter: frp_core::bandwidth::client_side_limiter(
+                        bw_limit,
+                        &p.bandwidth_limit_mode,
+                    ),
                     proxy_protocol_version: p.proxy_protocol_version.clone(),
                     plugin: plugin_type,
                     remote_addr: String::new(),
@@ -4215,6 +4224,10 @@ impl Service {
                             sk: p.sk.clone(),
                             bandwidth_limit: bw_limit,
                             bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
+                            bandwidth_limiter: frp_core::bandwidth::client_side_limiter(
+                                bw_limit,
+                                &p.bandwidth_limit_mode,
+                            ),
                             proxy_protocol_version: p.proxy_protocol_version.clone(),
                             plugin: plugin_type,
                             remote_addr: String::new(),
@@ -5596,6 +5609,7 @@ mod tests {
                     sk: String::new(),
                     bandwidth_limit: 0,
                     bandwidth_limit_mode: String::new(),
+                    bandwidth_limiter: None,
                     proxy_protocol_version: String::new(),
                     plugin: String::new(),
                     remote_addr: String::new(),

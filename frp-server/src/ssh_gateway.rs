@@ -537,6 +537,15 @@ impl Handler for SshSession {
         if constant_time_eq(password.as_bytes(), self.server_token.as_bytes()) {
             Ok(Auth::Accept)
         } else {
+            // Per-IP throttle on the failure path (mirrors login.rs
+            // `throttled_login_error`): only failed attempts consume a
+            // slot, so legitimate sessions are never throttled, and an IP
+            // brute-forcing the SSH gateway is cut off for the 60s window
+            // after the 5th failure. The SSH handshake itself has no rate
+            // limit — this is the same deliberate frp-rs hardening as the
+            // login throttle (Go frp has neither). Throttled attempts
+            // consume nothing; the entry decays via the 90s cleanup.
+            self.state.check_login_throttle(self.peer_addr).await;
             Ok(Auth::Reject {
                 proceed_with_methods: None,
                 partial_success: false,
@@ -1208,6 +1217,44 @@ mod tests {
         assert!(matches!(result, Auth::Accept));
         assert!(session.run_id.is_empty());
         assert!(session.frame_tx.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_password_failures_throttle_per_ip() {
+        // S1 pin: SSH gateway password failures consume the per-IP login
+        // throttle slots (mirror of login.rs `throttled_login_error`) — a
+        // brute-forcing IP is cut off after the 5th wrong password, and the
+        // success path never consumes a slot (legit sessions are never
+        // throttled). Go frp has no SSH-gateway auth throttle; this is the
+        // same deliberate frp-rs hardening as the login throttle.
+        let (mut session, _auth_rx, _run_id) = pre_auth_session();
+        let addr = session.peer_addr;
+        let state = session.state.clone();
+        for _ in 0..5 {
+            let result = session.auth_password("v0", "wrong").await.unwrap();
+            assert!(matches!(result, Auth::Reject { .. }));
+        }
+        assert!(
+            !state.check_login_throttle(addr).await,
+            "6th attempt from the same IP must be throttled"
+        );
+        // Other IPs are unaffected.
+        assert!(
+            state
+                .check_login_throttle(std::net::SocketAddr::from(([127, 0, 0, 2], 1)))
+                .await,
+            "a different IP must not be throttled"
+        );
+        // The success path consumes no slot.
+        let (mut s2, _a2, _r2) = pre_auth_session();
+        let addr2 = s2.peer_addr;
+        let state2 = s2.state.clone();
+        let result = s2.auth_password("v0", "test-token").await.unwrap();
+        assert!(matches!(result, Auth::Accept));
+        assert!(
+            state2.check_login_throttle(addr2).await,
+            "successful auth must not consume a throttle slot"
+        );
     }
 
     #[tokio::test]

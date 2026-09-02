@@ -1,4 +1,12 @@
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex;
+
+/// A per-proxy shared bandwidth limiter: one token bucket covering BOTH
+/// bridge directions and ALL concurrent connections of the proxy (Go frp
+/// v0.71.0 `BaseProxy.limiter` semantics — a single `*rate.Limiter` wired
+/// into both `limit.NewReader` and `limit.NewWriter`).
+pub type SharedBandwidthLimiter = Arc<Mutex<BandwidthLimiter>>;
 
 /// Token-bucket bandwidth limiter.
 ///
@@ -6,8 +14,10 @@ use std::time::Instant;
 /// continuously at `rate` bytes per second. When `rate` is 0, `consume`
 /// returns immediately (no limiting).
 ///
-/// Each bridge direction gets its own limiter so read and write throttling
-/// are independent.
+/// Standalone (unshared) limiters are used by tests; production bridges
+/// share one limiter per proxy via [`SharedBandwidthLimiter`] so the rate
+/// budget covers the combined traffic of both directions (Go parity).
+#[derive(Debug)]
 pub struct BandwidthLimiter {
     /// Bytes per second. 0 = unlimited.
     rate: u64,
@@ -36,6 +46,27 @@ impl BandwidthLimiter {
     /// Create a limiter that never throttles.
     pub fn unlimited() -> Self {
         Self::new(0)
+    }
+
+    /// Build a per-proxy shared limiter (`Some`) when `rate > 0`, else `None`
+    /// (Go `limit.NewBandwidthLimiter` returns nil for <= 0 — empty/unset
+    /// rate stays unlimited). The mode gate deciding WHICH side creates it
+    /// lives at the call sites (server: mode == "server"/"both"; client:
+    /// mode == ""/"client"/"both" — Go `proxy.go` NewProxy gates).
+    pub fn shared(rate: u64) -> Option<SharedBandwidthLimiter> {
+        (rate > 0).then(|| Arc::new(Mutex::new(BandwidthLimiter::new(rate))))
+    }
+
+    /// Consume `n` bytes against a shared (per-proxy) limiter.
+    ///
+    /// The mutex serializes chunk accounting across both bridge directions
+    /// and all concurrent connections of the proxy; the bucket refills from
+    /// the previous consumer's post-sleep timestamp, so the combined budget
+    /// matches Go's single `rate.Limiter` shared by `NewReader` + `NewWriter`
+    /// (bidirectional traffic shares one rate).
+    pub async fn consume_shared(lim: &SharedBandwidthLimiter, n: usize) {
+        let mut l = lim.lock().await;
+        l.consume(n).await;
     }
 
     /// Whether this limiter applies any throttling.
@@ -77,6 +108,31 @@ impl BandwidthLimiter {
         let wait = std::time::Duration::from_secs_f64(deficit / self.rate as f64);
         tokio::time::sleep(wait).await;
         self.last = Instant::now();
+    }
+}
+
+/// Go frp v0.71.0 side-selection parity (F1/F2): `bandwidthLimitMode` names
+/// the SIDE that owns the per-proxy shared limiter, not a direction. The
+/// client creates it for "" (Go `EmptyOr("", "client")` — config/v1/
+/// proxy.go:156), "client", or the frp-rs extension "both"; the server for
+/// "server" or "both" (server/proxy/proxy.go:536-540). One limiter covers
+/// both directions on the owning side; the other side creates none.
+pub fn client_side_limiter(rate: u64, mode: &str) -> Option<SharedBandwidthLimiter> {
+    let mode = if mode.is_empty() { "client" } else { mode };
+    if rate > 0 && (mode == "client" || mode == "both") {
+        BandwidthLimiter::shared(rate)
+    } else {
+        None
+    }
+}
+
+/// Server-side gate: a limiter is created only when the server owns the
+/// limiting (`"server"`, or the frp-rs extension `"both"`).
+pub fn server_side_limiter(rate: u64, mode: &str) -> Option<SharedBandwidthLimiter> {
+    if rate > 0 && (mode == "server" || mode == "both") {
+        BandwidthLimiter::shared(rate)
+    } else {
+        None
     }
 }
 
@@ -131,5 +187,50 @@ mod tests {
     async fn test_consume_zero_is_noop() {
         let mut lim = BandwidthLimiter::new(1024);
         lim.consume(0).await; // should not panic or alter state
+    }
+
+    /// F1/F2 pin: mode names the SIDE that owns the shared limiter. The
+    /// client owns it for "" (Go `EmptyOr("", "client")`), "client", and the
+    /// frp-rs extension "both"; "server" → the client creates NONE (Go:
+    /// client/proxy/proxy.go:66-71 NewProxy gate — the server throttles).
+    #[test]
+    fn client_side_limiter_follows_mode() {
+        let assert_limited = |rate: u64, mode: &str, expected: bool| {
+            let got = client_side_limiter(rate, mode).is_some();
+            assert_eq!(
+                got, expected,
+                "client_side_limiter({rate}, {mode:?}): expected {expected}, got {got}"
+            );
+        };
+        // Empty mode → "client" (Go EmptyOr default) → client owns it.
+        assert_limited(4096, "", true);
+        assert_limited(4096, "client", true);
+        assert_limited(4096, "both", true);
+        // Server owns it: client must NOT limit (was the old per-direction
+        // apply_read gate — now the whole side is skipped).
+        assert_limited(4096, "server", false);
+        // Rate 0 (unset) → unlimited regardless of mode (Go nil limiter).
+        assert_limited(0, "client", false);
+        assert_limited(0, "server", false);
+    }
+
+    /// F1/F2 pin: the server creates the limiter only for "server" (Go
+    /// server/proxy/proxy.go:536-540 gate) and "both". "client"/"" → the
+    /// client owns it — the server must not double-limit (Go: the server's
+    /// NewBandwidthLimiter runs ONLY under the "server" mode branch).
+    #[test]
+    fn server_side_limiter_follows_mode() {
+        let assert_limited = |rate: u64, mode: &str, expected: bool| {
+            let got = server_side_limiter(rate, mode).is_some();
+            assert_eq!(
+                got, expected,
+                "server_side_limiter({rate}, {mode:?}): expected {expected}, got {got}"
+            );
+        };
+        assert_limited(4096, "server", true);
+        assert_limited(4096, "both", true);
+        assert_limited(4096, "client", false);
+        assert_limited(4096, "", false);
+        assert_limited(0, "server", false);
     }
 }

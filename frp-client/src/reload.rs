@@ -252,6 +252,7 @@ mod tests {
             sk: String::new(),
             bandwidth_limit: 0,
             bandwidth_limit_mode: String::new(),
+            bandwidth_limiter: None,
             proxy_protocol_version: String::new(),
             plugin: String::new(),
             remote_addr: String::new(),

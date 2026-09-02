@@ -267,6 +267,38 @@ async fn verify_login_auth(
         None
     } else if let Some(ref verifier) = state.oidc.verifier {
         let token = login.privilege_key.as_deref().unwrap_or("");
+        // S2: jti replay pre-check runs BEFORE the expensive verify_login
+        // (JWKS fetch on a stale cache + signature verify). Claims are
+        // extracted from the JWT payload segment without crypto; a replayed
+        // token (same jti, different subject) is rejected with an O(1)
+        // table hit. The pre-check never records — only fully verified
+        // tokens populate the table, so an unauthenticated flood cannot
+        // poison it or evict live entries. Malformed payloads skip the
+        // pre-check and fall through to verify_login, which reports the
+        // authoritative error.
+        if let Ok((jti, subject, _exp)) = verifier.extract_claims_unverified(token) {
+            if verifier.check_replay_pending(jti.as_deref(), &subject) {
+                warn!(
+                    peer = ?peer,
+                    "OIDC login rejected: JWT jti reused with a different subject (replay suspected)"
+                );
+                if let Some(msg) = throttled_login_error(state, peer).await {
+                    send_login_error(stream, msg, v2).await;
+                    return Err(());
+                }
+                send_login_error(
+                    stream,
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        "OIDC authentication failed".to_string(),
+                        "OIDC authentication failed",
+                    ),
+                    v2,
+                )
+                .await;
+                return Err(());
+            }
+        }
         match verifier.verify_login(token).await {
             Ok(oidc_token) => {
                 if oidc_token.subject.trim().is_empty() {
@@ -1883,6 +1915,100 @@ mod oidc_throttle_tests {
                     "6th attempt must be throttled, got: {error}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_replay_seeded_jti_rejected_at_login() {
+        // S2 pin: a jti already recorded for ANOTHER subject is rejected at
+        // login even when the token is VALIDLY SIGNED (it would pass
+        // verify_login) — the pre-verify replay check
+        // (extract_claims_unverified + check_replay_pending) fires before
+        // verify_login, so a cross-identity replay of a stolen token is
+        // refused with an O(1) table hit instead of a JWKS fetch +
+        // signature verify. (The post-verify check would also reject; the
+        // pre-verify ordering is pinned structurally by code placement and
+        // by the frp-core unit tests.)
+        let (issuer, _stop) = oidc_mock_server();
+        let verifier = frp_core::auth::OidcVerifier::new(
+            issuer.clone(),
+            "test-audience".into(),
+            false, // skip_expiry
+            false, // skip_issuer
+            false, // skip_nbf
+            false, // skip_audience
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("OidcVerifier against mock");
+        // Seed the replay state the way a verified login for ANOTHER
+        // subject would: j1 → mallory.
+        verifier
+            .check_replay(Some("j1"), "mallory", 4_102_444_800)
+            .expect("seed jti");
+        let state = state_with_oidc(verifier);
+
+        // VALIDLY SIGNED token (kid k1 = the mock JWKS key) for alice
+        // reusing j1 — a cross-identity replay.
+        let valid_token = jsonwebtoken::encode(
+            &jsonwebtoken::Header {
+                alg: jsonwebtoken::Algorithm::HS256,
+                kid: Some("k1".into()),
+                ..jsonwebtoken::Header::default()
+            },
+            &serde_json::json!({
+                "sub": "alice",
+                "exp": 4_102_444_800_u64,
+                "jti": "j1",
+                "iss": issuer,
+                "aud": "test-audience",
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(b"mock-jwks-secret"),
+        )
+        .expect("encode valid JWT");
+
+        let peer: std::net::SocketAddr = "127.0.0.1:12346".parse().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = || frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(valid_token.clone()),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        for attempt in 1..=3u32 {
+            let (server, mut client) = tokio::io::duplex(4096);
+            let result = authenticate(
+                Box::new(server),
+                &login(),
+                state.clone(),
+                Some(peer),
+                None,
+                false,
+                None,
+                false,
+                None,
+            )
+            .await;
+            assert!(result.is_err(), "attempt {attempt} must be rejected");
+            let error = read_login_resp_error(&mut client).await;
+            assert!(
+                error.contains("OIDC authentication failed"),
+                "attempt {attempt} must fail auth, got: {error}"
+            );
         }
     }
 
