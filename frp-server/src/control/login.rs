@@ -1749,8 +1749,15 @@ mod oidc_throttle_tests {
                         } else {
                             (404, String::new())
                         };
+                        // Connection: close — the mock serves exactly ONE
+                        // request per accepted socket (the socket is dropped
+                        // at the end of this arm). Without the header, the
+                        // HTTP/1.1 keep-alive default makes hyper's client
+                        // pool the discovery connection and route the JWKS
+                        // fetch into the abandoned socket → flaky
+                        // "client error (SendRequest)".
                         let resp = format!(
-                            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
                             body.len(),
                             body
                         );
