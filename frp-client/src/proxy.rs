@@ -6,7 +6,6 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-use frp_core::bandwidth::BandwidthLimiter;
 use frp_core::bridge;
 use frp_core::metrics::{ConnGuard, ProxyMetricsRegistry};
 use frp_core::msg::{self, FrpMessage};
@@ -301,16 +300,21 @@ pub struct BridgeStreamsParams<'a> {
     pub use_encryption: bool,
     pub use_compression: bool,
     pub enc_key: Option<&'a [u8; 16]>,
-    pub bandwidth_limit: u64,
-    pub bandwidth_limit_mode: &'a str,
+    /// Per-proxy SHARED bandwidth limiter (Go frp v0.71.0 `BaseProxy.limiter`
+    /// parity): one bucket covers BOTH directions and all concurrent
+    /// connections. Created once at registration when the client side owns
+    /// the limiting (mode ""/"client"/"both"); None in "server" mode (the
+    /// server's responsibility). The mode no longer picks a direction — the
+    /// limiting side applies the single budget to the whole proxy.
+    pub bw_limiter: Option<&'a frp_core::bandwidth::SharedBandwidthLimiter>,
     pub metrics: Arc<ProxyMetricsRegistry>,
 }
 
 /// Bridge user↔work connections with optional encryption, compression,
 /// and bandwidth limiting.
 ///
-/// `bandwidth_limit` is in bytes/sec (0 = unlimited).
-/// `bandwidth_limit_mode` is "client" (upload), "server" (download), or "both".
+/// `bw_limiter` is the proxy's shared limiter (one bucket for both
+/// directions, Go v0.71.0 single-`rate.Limiter` parity).
 pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
     let BridgeStreamsParams {
         local,
@@ -319,37 +323,15 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
         use_encryption,
         use_compression,
         enc_key,
-        bandwidth_limit,
-        bandwidth_limit_mode,
+        bw_limiter,
         metrics,
     } = params;
-    debug!(name = %name, encrypted = %use_encryption, compressed = %use_compression, bw_limit = %bandwidth_limit, bw_mode = %bandwidth_limit_mode,
-        "Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bw_limit: {} {})",
-        name, use_encryption, use_compression, bandwidth_limit, bandwidth_limit_mode);
+    debug!(name = %name, encrypted = %use_encryption, compressed = %use_compression, bw_limited = %bw_limiter.is_some(),
+        "Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bandwidth-limited: {})",
+        name, use_encryption, use_compression, bw_limiter.is_some());
 
     let proxy_metrics = metrics.get_or_create(name).await;
     let _guard = ConnGuard::new(proxy_metrics.clone());
-
-    // Build bandwidth limiters per direction.
-    // "client" throttles upload (local→server, write to work).
-    // "server" throttles download (server→local, read from work).
-    // Empty/unspecified: apply both (backward compat).
-    let apply_read = bandwidth_limit_mode == "server"
-        || bandwidth_limit_mode == "both"
-        || bandwidth_limit_mode.is_empty();
-    let apply_write = bandwidth_limit_mode == "client"
-        || bandwidth_limit_mode == "both"
-        || bandwidth_limit_mode.is_empty();
-    let mut read_lim = if bandwidth_limit > 0 && apply_read {
-        Some(BandwidthLimiter::new(bandwidth_limit))
-    } else {
-        None
-    };
-    let mut write_lim = if bandwidth_limit > 0 && apply_write {
-        Some(BandwidthLimiter::new(bandwidth_limit))
-    } else {
-        None
-    };
 
     if use_encryption {
         if let Some(key) = enc_key {
@@ -361,8 +343,7 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
                 &key,
                 use_compression,
                 Vec::new(),
-                read_lim.as_mut(),
-                write_lim.as_mut(),
+                bw_limiter,
                 Some(proxy_metrics.clone()),
                 None,
             )
@@ -378,7 +359,7 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
 
     // Plain path: use rate-limited bridge when bandwidth limiting or compression
     // is active, otherwise use the fast copy_bidirectional path.
-    if use_compression || read_lim.is_some() || write_lim.is_some() {
+    if use_compression || bw_limiter.is_some() {
         let (l_r, l_w) = tokio::io::split(local);
         let (w_r, w_w) = match split_work_conn_halves(work) {
             Ok(pair) => pair,
@@ -394,8 +375,7 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
             w_w,
             use_compression,
             Vec::new(),
-            read_lim.as_mut(),
-            write_lim.as_mut(),
+            bw_limiter,
             Some(proxy_metrics.clone()),
             None,
         )
@@ -449,40 +429,32 @@ async fn relay_plain_fast_inner(
             }
         }
     } else {
-        let mut work = work;
-        let mut local = local;
-        copy_bidirectional_sized(&mut local, &mut work, name, metrics).await;
+        copy_bidirectional_sized(local, work, name, metrics).await;
     }
 }
 
 /// Non-Linux: just use copy_bidirectional.
 #[cfg(not(target_os = "linux"))]
 async fn relay_plain_fast_inner(
-    mut local: tokio::net::TcpStream,
-    mut work: IoStream,
+    local: tokio::net::TcpStream,
+    work: IoStream,
     name: &str,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
-    copy_bidirectional_sized(&mut local, &mut work, name, metrics).await;
+    copy_bidirectional_sized(local, work, name, metrics).await;
 }
 
-/// Bidirectional copy with FRP_BRIDGE_BUF_KB-sized buffers so the plain
-/// path honors the same knob as the encrypted/compressed bridge path
-/// (copy_bidirectional would otherwise use tokio's 8 KiB default).
+/// Bidirectional copy with pooled FRP_BRIDGE_BUF_KB-sized buffers so the
+/// plain path honors the same knob as the encrypted/compressed bridge path
+/// and recycles buffers across connections (mirror of the server's
+/// relay_plain_fast pool — P3).
 async fn copy_bidirectional_sized(
-    local: &mut tokio::net::TcpStream,
-    work: &mut IoStream,
+    local: tokio::net::TcpStream,
+    work: IoStream,
     name: &str,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
-    match tokio::io::copy_bidirectional_with_sizes(
-        local,
-        work,
-        *frp_core::buffer_pool::BUFFER_SIZE,
-        *frp_core::buffer_pool::BUFFER_SIZE,
-    )
-    .await
-    {
+    match frp_core::bridge::relay_plain_pooled(local, work).await {
         Ok((to_work, to_local)) => {
             metrics.bytes_in.fetch_add(to_work, Ordering::Relaxed);
             metrics.bytes_out.fetch_add(to_local, Ordering::Relaxed);

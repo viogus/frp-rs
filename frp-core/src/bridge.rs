@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::bandwidth::BandwidthLimiter;
+use crate::bandwidth::{BandwidthLimiter, SharedBandwidthLimiter};
 use crate::buffer_pool::PoolGuard;
 use crate::cipher_stream::{CipherReader, CipherWriter};
 use crate::encryption;
@@ -173,7 +173,7 @@ impl<W: AsyncWrite + Unpin> WorkWriter<W> {
 }
 
 /// Bridge user→work direction: read from user, optionally compress,
-/// apply write bandwidth limit, write through WorkWriter.
+/// apply the shared per-proxy bandwidth limit, write through WorkWriter.
 ///
 /// When `pre_read` is non-empty (VHost HTTP parsing), the bytes are written
 /// first. If `had_pre_read` is true, the writer is NOT shut down at the end
@@ -183,7 +183,7 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
     mut writer: WorkWriter<W>,
     use_compression: bool,
     pre_read: Vec<u8>,
-    mut write_limiter: Option<&mut BandwidthLimiter>,
+    limiter: Option<&SharedBandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
     let had_pre_read = !pre_read.is_empty();
@@ -196,8 +196,8 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
         // main loop, or a rate-limited HTTP proxy flooded with small GETs
         // (headers+body entirely in the pre-read) would sidestep the cap
         // entirely (every connection's first ~4–8 KiB un-throttled).
-        if let Some(ref mut lim) = write_limiter {
-            lim.consume(pre_read_buf.len()).await;
+        if let Some(lim) = limiter {
+            BandwidthLimiter::consume_shared(lim, pre_read_buf.len()).await;
         }
         if let Err(e) = writer.write_bridge_all(&mut pre_read_buf).await {
             tracing::warn!(error = %e, "bridge user_to_work: pre_read write failed");
@@ -250,8 +250,8 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
                 tracing::warn!("bridge user_to_work: compression failed");
                 break;
             }
-            if let Some(ref mut lim) = write_limiter {
-                lim.consume(comp_buf.len()).await;
+            if let Some(lim) = limiter {
+                BandwidthLimiter::consume_shared(lim, comp_buf.len()).await;
             }
             if let Err(e) = writer.write_bridge_all(&mut comp_buf).await {
                 tracing::debug!(error = %e, "bridge user_to_work: write error (compressed)");
@@ -271,8 +271,8 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
             }
         } else {
             let slice = &mut buf.as_mut_slice()[..n];
-            if let Some(ref mut lim) = write_limiter {
-                lim.consume(slice.len()).await;
+            if let Some(lim) = limiter {
+                BandwidthLimiter::consume_shared(lim, slice.len()).await;
             }
             if let Err(e) = writer.write_bridge_all(slice).await {
                 tracing::debug!(error = %e, "bridge user_to_work: write error");
@@ -300,7 +300,7 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
 }
 
 /// Bridge work→user direction: read from work (plain or via CipherReader),
-/// decompress, apply read bandwidth limit, write to user.
+/// decompress, apply the shared per-proxy bandwidth limit, write to user.
 ///
 /// When `header_timeout` is `Some`, only the FIRST read on this direction is
 /// wrapped in `tokio::time::timeout` — if the backend produces no response
@@ -312,7 +312,7 @@ async fn bridge_work_to_user(
     mut work_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
-    mut read_limiter: Option<&mut BandwidthLimiter>,
+    limiter: Option<&SharedBandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     header_timeout: Option<Duration>,
 ) {
@@ -392,9 +392,11 @@ async fn bridge_work_to_user(
                     break;
                 }
 
-                // Apply read bandwidth limit before writing to user
-                if let Some(ref mut lim) = read_limiter {
-                    lim.consume(added).await;
+                // Apply the shared per-proxy bandwidth limit before writing
+                // to user (same bucket as the user→work direction — Go
+                // single-limiter parity)
+                if let Some(lim) = limiter {
+                    BandwidthLimiter::consume_shared(lim, added).await;
                 }
                 if let Some(ref m) = metrics {
                     m.bytes_out.fetch_add(added as u64, Ordering::Relaxed);
@@ -414,8 +416,8 @@ async fn bridge_work_to_user(
                 // Plaintext passthrough: write immediately, flushing on short
                 // reads for interactive latency.
                 let plaintext = compressed_input;
-                if let Some(ref mut lim) = read_limiter {
-                    lim.consume(plaintext.len()).await;
+                if let Some(lim) = limiter {
+                    BandwidthLimiter::consume_shared(lim, plaintext.len()).await;
                 }
                 if let Some(ref m) = metrics {
                     m.bytes_out
@@ -478,8 +480,7 @@ pub async fn bridge_encrypted_io(
     key: &[u8; 16],
     use_compression: bool,
     pre_read: Vec<u8>,
-    read_limiter: Option<&mut BandwidthLimiter>,
-    write_limiter: Option<&mut BandwidthLimiter>,
+    limiter: Option<&SharedBandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     header_timeout: Option<Duration>,
 ) -> std::io::Result<()> {
@@ -494,8 +495,7 @@ pub async fn bridge_encrypted_io(
         key,
         use_compression,
         pre_read,
-        read_limiter,
-        write_limiter,
+        limiter,
         metrics,
         header_timeout,
         false,
@@ -516,7 +516,9 @@ pub async fn bridge_encrypted_io(
 /// writer before the main bridge loop, ensuring they share the same IV and
 /// CFB state.
 ///
-/// `read_limiter` limits work→user (download). `write_limiter` limits user→work (upload).
+/// `limiter` is the proxy's SHARED bandwidth limiter: one bucket covers both
+/// directions (work→user and user→work) and all concurrent connections of
+/// the proxy (Go frp v0.71.0 single-`rate.Limiter` parity).
 ///
 /// `read_is_decrypted`: when true, `work_r` is assumed to already be a
 /// plaintext stream (e.g. an injector wrapping a `CipherReader`) and is used
@@ -533,8 +535,7 @@ pub async fn bridge_encrypted(
     key: &[u8; 16],
     use_compression: bool,
     pre_read: Vec<u8>,
-    read_limiter: Option<&mut BandwidthLimiter>,
-    write_limiter: Option<&mut BandwidthLimiter>,
+    limiter: Option<&SharedBandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     header_timeout: Option<Duration>,
     read_is_decrypted: bool,
@@ -569,14 +570,14 @@ pub async fn bridge_encrypted(
         WorkWriter::Encrypted(enc_work_w),
         use_compression,
         pre_read,
-        write_limiter,
+        limiter,
         metrics.clone(),
     );
     let work_to_user = bridge_work_to_user(
         work_r,
         user_w,
         use_compression,
-        read_limiter,
+        limiter,
         metrics,
         header_timeout,
     );
@@ -623,6 +624,64 @@ pub async fn bridge_plain(
     let _ = tokio::join!(user_to_work, work_to_user);
 }
 
+/// Bidirectional plain relay between two full-duplex transports using
+/// POOLED buffers (one `PoolGuard` per direction, returned to the pool on
+/// exit). Replaces `tokio::io::copy_bidirectional_with_sizes`, which
+/// allocates two fresh buffers on EVERY bridge call — under connection
+/// churn that is two allocs + two frees per connection on every non-splice
+/// path.
+///
+/// Semantics match tokio's copy_bidirectional (which is also Go frp's
+/// libio.Join model): each direction copies independently, and when one
+/// side's read hits EOF the peer's write half is shut down (TCP FIN /
+/// yamux half-close / QUIC stream finish) so the opposite copy observes EOF
+/// too; the call ends when BOTH directions have completed.
+///
+/// The generic `tokio::io::split` (BiLock) is used rather than
+/// `Transport::into_split`: shutdown forwards to the inner transport's
+/// AsyncWrite identically, and the helper then works for any
+/// AsyncRead+AsyncWrite pair (e.g. the client's local `TcpStream`), not
+/// just `IoStream`.
+pub async fn relay_plain_pooled<A, B>(a: A, b: B) -> io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut a_r, mut a_w) = tokio::io::split(a);
+    let (mut b_r, mut b_w) = tokio::io::split(b);
+    let a_to_b = async {
+        let n = copy_pooled(&mut a_r, &mut b_w).await?;
+        b_w.shutdown().await?;
+        Ok::<u64, io::Error>(n)
+    };
+    let b_to_a = async {
+        let n = copy_pooled(&mut b_r, &mut a_w).await?;
+        a_w.shutdown().await?;
+        Ok::<u64, io::Error>(n)
+    };
+    let (x, y) = tokio::try_join!(a_to_b, b_to_a)?;
+    Ok((x, y))
+}
+
+/// One-direction copy through a pooled `PoolGuard` buffer (length ==
+/// BUFFER_SIZE, so `read` always has a full slice to fill).
+async fn copy_pooled<R, W>(src: &mut R, dst: &mut W) -> io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = PoolGuard::acquire();
+    let mut total = 0u64;
+    loop {
+        let n = src.read(buf.as_mut_slice()).await?;
+        if n == 0 {
+            return Ok(total);
+        }
+        dst.write_all(&buf.raw_buf()[..n]).await?;
+        total += n as u64;
+    }
+}
+
 /// Plain (unencrypted) bidirectional bridge with optional bandwidth limiting
 /// and compression.
 ///
@@ -630,8 +689,9 @@ pub async fn bridge_plain(
 /// both directions run to completion independently. Supports compression
 /// (Snappy) with reusable buffers, matching `bridge_plain`.
 ///
-/// `read_limiter` throttles work→user (download).
-/// `write_limiter` throttles user→work (upload).
+/// `limiter` is the proxy's SHARED bandwidth limiter: one bucket covers both
+/// directions (work→user and user→work) and all concurrent connections of
+/// the proxy (Go frp v0.71.0 single-`rate.Limiter` parity).
 #[allow(clippy::too_many_arguments)]
 pub async fn bridge_plain_rate_limited(
     user_r: impl AsyncReadExt + Unpin,
@@ -640,8 +700,7 @@ pub async fn bridge_plain_rate_limited(
     work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
-    read_limiter: Option<&mut BandwidthLimiter>,
-    write_limiter: Option<&mut BandwidthLimiter>,
+    limiter: Option<&SharedBandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     header_timeout: Option<Duration>,
 ) {
@@ -650,14 +709,14 @@ pub async fn bridge_plain_rate_limited(
         WorkWriter::Plain(work_w),
         use_compression,
         pre_read,
-        write_limiter,
+        limiter,
         metrics.clone(),
     );
     let work_to_user = bridge_work_to_user(
         work_r,
         user_w,
         use_compression,
-        read_limiter,
+        limiter,
         metrics,
         header_timeout,
     );
@@ -758,7 +817,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 false,
             )
             .await;
@@ -791,7 +849,6 @@ mod tests {
                 &key,
                 true,
                 vec![],
-                None,
                 None,
                 None,
                 None,
@@ -828,7 +885,6 @@ mod tests {
                 &key,
                 false,
                 vec![],
-                None,
                 None,
                 None,
                 None,
@@ -929,7 +985,6 @@ mod tests {
                 &key,
                 false,
                 vec![],
-                None,
                 None,
                 None,
                 None,
@@ -1550,9 +1605,9 @@ mod tests {
         let (mut w_w_test, w_r_bridge) = tokio::io::duplex(65536);
         let (u_w_bridge, mut u_r_test) = tokio::io::duplex(65536);
 
-        // 1 GB/s — effectively unlimited for small data
-        let mut wlim = BandwidthLimiter::new(1_000_000_000);
-        let mut rlim = BandwidthLimiter::new(1_000_000_000);
+        // 1 GB/s — effectively unlimited for small data. One shared bucket
+        // for both directions (Go single-limiter model).
+        let lim = BandwidthLimiter::shared(1_000_000_000).unwrap();
 
         tokio::spawn(async move {
             bridge_plain_rate_limited(
@@ -1562,8 +1617,7 @@ mod tests {
                 w_w_bridge,
                 false,
                 vec![],
-                Some(&mut rlim),
-                Some(&mut wlim),
+                Some(&lim),
                 None,
                 None,
             )
@@ -1593,7 +1647,7 @@ mod tests {
         let (u_w_bridge, _u_r_test) = tokio::io::duplex(65536);
 
         // 1 KB/s — very slow. Burst = 1 KB so first KB instant, rest throttled.
-        let mut wlim = BandwidthLimiter::new(1024);
+        let lim = BandwidthLimiter::shared(1024).unwrap();
 
         let start = std::time::Instant::now();
 
@@ -1605,8 +1659,7 @@ mod tests {
                 w_w_bridge,
                 false,
                 vec![],
-                None,
-                Some(&mut wlim),
+                Some(&lim),
                 None,
                 None,
             )

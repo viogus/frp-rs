@@ -711,3 +711,129 @@ async fn test_vhost_blank_first_line_400() {
     drop(client);
     drop(_provider);
 }
+
+// ---------------------------------------------------------------
+// T1: HTTP/1.1 vhost oversized-head 431 (h2c had coverage; the
+// HTTP/1.1 branch of the 4096-byte head cap had none)
+// ---------------------------------------------------------------
+
+/// A head that fills the 4096-byte cap without a `\r\n\r\n` terminator must
+/// be answered with 431 Request Header Fields Too Large and must NOT be
+/// forwarded to a backend (forwarding a truncated head makes the backend
+/// block on the rest, tying up a work-conn slot — the DoS the 431 exists to
+/// prevent). The h2c 431 path was already pinned in vhost_h2c.rs; this pins
+/// the HTTP/1.1 branch (vhost.rs handle_http1_request cap check).
+#[tokio::test]
+async fn test_vhost_http1_oversized_head_431_not_forwarded() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "oversized-head",
+            vec!["big.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    // > 4096 bytes of header bytes with NO \r\n\r\n terminator. Sent in one
+    // write; the server's sniff read may grab any prefix of it, but the head
+    // loop must stop at 4096 and answer 431 regardless of segmentation.
+    let mut head = Vec::with_capacity(6000);
+    head.extend_from_slice(b"GET / HTTP/1.1\r\nHost: big.example.com\r\n");
+    while head.len() < 5000 {
+        head.extend_from_slice(b"X-Junk: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+    }
+    client.write_all(&head).await.expect("send oversized head");
+
+    assert_rejected_and_not_forwarded(&mut client, &mut work_conn, "HTTP/1.1 431").await;
+    drop(client);
+    drop(_provider);
+}
+
+// ---------------------------------------------------------------
+// T2: response_headers injection e2e (the injector chain had no
+// e2e — a break in it would only surface via the compat Go binary)
+// ---------------------------------------------------------------
+
+/// A vhost HTTP proxy configured with `response_headers` must inject them
+/// into the backend's response head before it reaches the client: the client
+/// sees the backend status line + the injected header + the body, while the
+/// raw response on the work conn carries none. Exercises the full chain:
+/// vhost accept → bridge → ResponseHeaderInjector → client socket.
+#[tokio::test]
+async fn test_vhost_response_headers_injected_end_to_end() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let mut np = http_proxy("resp-headers", vec!["resp.example.com".into()], None, None);
+    let mut response_headers = std::collections::HashMap::new();
+    response_headers.insert("X-Backend-Resp".into(), "injected".into());
+    np.response_headers = Some(response_headers);
+    let (_provider, run_id) = register_proxy(addr, FrpMessage::NewProxy(Box::new(np))).await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: resp.example.com\r\n\r\n")
+        .await
+        .expect("send request");
+
+    // The head is forwarded to the backend…
+    match read_msg_v1(&mut work_conn).await.expect("StartWorkConn") {
+        FrpMessage::StartWorkConn(swc) => {
+            assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+    let head = read_forwarded_head(&mut work_conn).await;
+    assert!(
+        String::from_utf8_lossy(&head).starts_with("GET / HTTP/1.1\r\n"),
+        "request head must reach the backend"
+    );
+
+    // …and the backend answers WITHOUT the injected header on the raw conn.
+    let backend_resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    work_conn
+        .write_all(backend_resp)
+        .await
+        .expect("backend response");
+
+    // The client must see the response WITH the injected header.
+    let mut resp = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut chunk))
+            .await
+            .expect("response within 5s")
+            .expect("read response");
+        resp.extend_from_slice(&chunk[..n]);
+        if resp.len() >= backend_resp.len() {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK\r\n"),
+        "backend status line first, got: {text:?}"
+    );
+    assert!(
+        text.contains("X-Backend-Resp: injected\r\n"),
+        "injected header missing from client response: {text:?}"
+    );
+    assert!(
+        text.contains("\r\n\r\nhello"),
+        "body must follow the (injected) head: {text:?}"
+    );
+    drop(client);
+    drop(_provider);
+}

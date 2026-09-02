@@ -1414,7 +1414,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                             None,
                                             None,
                                             None,
-                                            None,
                                             false,
                                         ),
                                     )
@@ -1574,7 +1573,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     None,
                                     None,
                                     None,
-                                    None,
                                     false,
                                 ),
                             )
@@ -1706,7 +1704,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     &key,
                                     use_compression,
                                     vec![],
-                                    None,
                                     None,
                                     None,
                                     None,

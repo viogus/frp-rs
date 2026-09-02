@@ -1568,6 +1568,7 @@ mod vnet_route_tests {
             multiplexer: String::new(),
             bandwidth_limit: String::new(),
             bandwidth_limit_mode: String::new(),
+            bandwidth_limiter: None,
             user: String::new(),
             user_conn_sem: None,
         };

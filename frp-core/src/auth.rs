@@ -969,6 +969,73 @@ mod oidc_impl {
             }
         }
 
+        /// Read-only replay pre-check: does the (jti, subject) pair already
+        /// sit in the table with a DIFFERENT subject (i.e., would
+        /// `check_replay` reject it)? Runs BEFORE the expensive
+        /// `verify_login` (JWKS fetch on a stale cache + signature verify) —
+        /// a replayed token is then rejected with an O(1) table hit instead
+        /// of a full verify (S2 hardening). Same-subject reuse is allowed
+        /// (frpc reconnects reuse the cached token). NEVER records — only
+        /// fully verified tokens populate the table, so an unauthenticated
+        /// peer cannot poison it or evict live entries. Expired entries are
+        /// pruned lazily on the read, mirroring `check_replay`.
+        pub fn check_replay_pending(&self, jti: Option<&str>, subject: &str) -> bool {
+            let Some(jti) = jti else {
+                return false;
+            };
+            // A jti past the size cap is rejected by verify_login anyway
+            // (round 10 LOW); the pre-check cannot be stricter than the
+            // authoritative path, so it just skips the lookup.
+            if jti.len() > MAX_JTI_LEN_BYTES {
+                return false;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let mut seen = self.seen_jtis.lock().unwrap_or_else(|e| e.into_inner());
+            seen.retain(|_, (_, d)| *d > now);
+            matches!(seen.get(jti), Some((stored, _)) if stored != subject)
+        }
+
+        /// Extract the (jti, subject, exp) claims from a JWT payload WITHOUT
+        /// signature verification — base64url-decode the payload segment and
+        /// parse the JSON. Feeds the `check_replay_pending` pre-check so a
+        /// replayed token is rejected before `verify_login`'s expensive
+        /// JWKS fetch + signature verify. Returns Err for any malformed
+        /// input — the caller then falls through to `verify_login`, which
+        /// reports the authoritative error.
+        pub fn extract_claims_unverified(
+            &self,
+            token: &str,
+        ) -> Result<(Option<String>, String, i64), String> {
+            let mut parts = token.split('.');
+            let _header = parts.next();
+            let payload = parts
+                .next()
+                .ok_or_else(|| "OIDC: malformed JWT (missing payload)".to_string())?;
+            if parts.next().is_none() {
+                return Err("OIDC: malformed JWT (missing signature)".to_string());
+            }
+            #[derive(serde::Deserialize)]
+            struct PayloadClaims {
+                #[serde(default)]
+                jti: Option<String>,
+                #[serde(default)]
+                sub: Option<String>,
+                #[serde(default)]
+                exp: Option<i64>,
+            }
+            let bytes = base64url_decode(payload)?;
+            let claims: PayloadClaims = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("OIDC: payload not JSON: {e}"))?;
+            Ok((
+                claims.jti,
+                claims.sub.unwrap_or_default(),
+                claims.exp.unwrap_or_default(),
+            ))
+        }
+
         /// Verify a ping JWT — also checks subject matches.
         pub async fn verify_ping(&self, token: &str, expected_sub: &str) -> Result<(), String> {
             let oidc_token = self.verify_login(token).await?;
@@ -1276,6 +1343,37 @@ mod oidc_impl {
         }
     }
 
+    /// Decode a base64url segment (RFC 4648 §5, URL-safe alphabet, padding
+    /// optional — JWT payloads are emitted unpadded). Inline (repo policy:
+    /// no new deps; `frp_core::base64` is standard-alphabet only and cannot
+    /// read URL-safe input). Rejects non-zero trailing bits per RFC 4648
+    /// §3.2.
+    fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(input.len() / 4 * 3);
+        let mut acc: u32 = 0;
+        let mut nbits: u32 = 0;
+        for c in input.bytes() {
+            let v = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'-' | b'+' => 62,
+                b'_' | b'/' => 63,
+                _ => return Err(format!("OIDC: invalid base64url char {c:#x}")),
+            };
+            acc = (acc << 6) | v as u32;
+            nbits += 6;
+            if nbits >= 8 {
+                nbits -= 8;
+                out.push((acc >> nbits) as u8);
+            }
+        }
+        if nbits != 0 && (acc & ((1u32 << nbits) - 1)) != 0 {
+            return Err("OIDC: invalid base64url trailing bits".to_string());
+        }
+        Ok(out)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1389,6 +1487,89 @@ mod oidc_impl {
                 deadline.is_some_and(|d| d > now),
                 "expired-exp jti must be tracked with a deadline in the future"
             );
+        }
+
+        #[test]
+        fn check_replay_pending_matches_check_replay_without_recording() {
+            // S2: the pre-verify replay pre-check must agree with the
+            // post-verify `check_replay` rejection semantics (same jti +
+            // same subject allowed, different subject → replay) and must
+            // NEVER record — only fully verified tokens populate the table,
+            // so an unauthenticated flood cannot poison it or evict live
+            // entries.
+            let v = test_verifier();
+            let now = now();
+            // Record j1 → alice (as a verified login would).
+            assert!(v.check_replay(Some("j1"), "alice", now + 3600).is_ok());
+            // Different subject → pending replay.
+            assert!(v.check_replay_pending(Some("j1"), "bob"));
+            // Same subject → allowed.
+            assert!(!v.check_replay_pending(Some("j1"), "alice"));
+            // Unknown jti → not pending.
+            assert!(!v.check_replay_pending(Some("j2"), "alice"));
+            // No jti / oversized jti → not pending (verify_login is the
+            // authoritative judge for both).
+            assert!(!v.check_replay_pending(None, "alice"));
+            let long: String = "x".repeat(MAX_JTI_LEN_BYTES + 1);
+            assert!(!v.check_replay_pending(Some(&long), "alice"));
+            // The pre-check never records: table unchanged after the reads.
+            let seen = v.seen_jtis.lock().unwrap();
+            assert_eq!(seen.len(), 1, "pre-check must not record");
+            assert!(seen.contains_key("j1"));
+        }
+
+        #[test]
+        fn extract_claims_unverified_reads_payload_without_signature() {
+            // S2: claims come from the base64url payload segment alone — a
+            // token with a BOGUS signature (which verify_login would reject)
+            // still yields its claims, so the replay pre-check can run
+            // before the expensive verify path.
+            let v = test_verifier();
+            let token = jsonwebtoken::encode(
+                &jsonwebtoken::Header {
+                    alg: jsonwebtoken::Algorithm::HS256,
+                    ..jsonwebtoken::Header::default()
+                },
+                &serde_json::json!({"jti": "j1", "sub": "alice", "exp": 4_102_444_800_u64}),
+                &jsonwebtoken::EncodingKey::from_secret(b"bogus-key"),
+            )
+            .expect("encode JWT");
+            let (jti, sub, exp) = v.extract_claims_unverified(&token).expect("extract claims");
+            assert_eq!(jti.as_deref(), Some("j1"));
+            assert_eq!(sub, "alice");
+            assert_eq!(exp, 4_102_444_800);
+            // No jti claim → None (pre-check is a no-op for such tokens).
+            let token2 = jsonwebtoken::encode(
+                &jsonwebtoken::Header::default(),
+                &serde_json::json!({"sub": "bob"}),
+                &jsonwebtoken::EncodingKey::from_secret(b"bogus-key"),
+            )
+            .expect("encode JWT");
+            let (jti2, sub2, _) = v
+                .extract_claims_unverified(&token2)
+                .expect("extract claims");
+            assert!(jti2.is_none());
+            assert_eq!(sub2, "bob");
+            // Malformed tokens → Err (caller falls through to verify_login).
+            assert!(v.extract_claims_unverified("not-a-jwt").is_err());
+            assert!(v.extract_claims_unverified("a.b").is_err());
+            assert!(v.extract_claims_unverified("a.b!c").is_err());
+        }
+
+        #[test]
+        fn base64url_decode_vectors() {
+            assert_eq!(base64url_decode("").unwrap(), b"");
+            assert_eq!(base64url_decode("Zg").unwrap(), b"f");
+            assert_eq!(base64url_decode("Zm8").unwrap(), b"fo");
+            assert_eq!(base64url_decode("Zm9v").unwrap(), b"foo");
+            assert_eq!(base64url_decode("aGVsbG8").unwrap(), b"hello");
+            // URL-safe chars decode where standard-alphabet decode would fail.
+            assert_eq!(base64url_decode("_w").unwrap(), b"\xff");
+            assert_eq!(base64url_decode("-_w").unwrap(), b"\xfb\xfc");
+            // Rejects invalid characters and non-zero trailing bits
+            // (RFC 4648 §3.2) — padding too (JWT payloads are unpadded).
+            assert!(base64url_decode("ab=c").is_err());
+            assert!(base64url_decode("Zh").is_err());
         }
 
         #[tokio::test]
@@ -1825,6 +2006,20 @@ impl OidcVerifier {
         _expiry: i64,
     ) -> Result<(), String> {
         Ok(())
+    }
+    /// Stub — the jti replay pre-check (S2) is unreachable when the oidc
+    /// feature is disabled (AuthMethod::Oidc is compiled out; the verifier
+    /// is always None on the login path).
+    pub fn extract_claims_unverified(
+        &self,
+        _token: &str,
+    ) -> Result<(Option<String>, String, i64), String> {
+        Err("OIDC feature disabled at compile time".into())
+    }
+    /// Stub — never reports a pending replay; `verify_login` rejects
+    /// everything when the feature is off.
+    pub fn check_replay_pending(&self, _jti: Option<&str>, _subject: &str) -> bool {
+        false
     }
 }
 

@@ -262,6 +262,10 @@ async fn handle_stream(
         &state,
         host,
         path.as_str(),
+        // X-Forwarded-Host = the `:authority` pseudo-header verbatim — Go's
+        // h2 server sets `req.Host` from :authority for every request (with
+        // port, as received), and SetXForwarded reads `r.In.Host`.
+        authority,
         http_auth.as_ref(),
         route_user.as_deref(),
         request_head,

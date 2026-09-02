@@ -39,6 +39,13 @@ pub struct ProxyRuntimeInfo {
     pub sk: String,
     pub bandwidth_limit: u64,
     pub bandwidth_limit_mode: String,
+    /// Per-proxy SHARED bandwidth limiter (Go frp v0.71.0 `BaseProxy.limiter`):
+    /// one token bucket covering both directions and all concurrent
+    /// connections, created at registration when mode == ""/"client"/"both"
+    /// and a rate is set (Go proxy.go:156 `EmptyOr("", "client")` + the
+    /// client NewProxy gate — proxy.go:66-71). None otherwise ("server" mode
+    /// is the server's responsibility).
+    pub bandwidth_limiter: Option<frp_core::bandwidth::SharedBandwidthLimiter>,
     pub proxy_protocol_version: String,
     /// Plugin type (e.g. "http_proxy", "socks5"). Empty if no plugin.
     pub plugin: String,

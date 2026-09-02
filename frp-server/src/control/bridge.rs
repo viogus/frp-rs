@@ -8,7 +8,6 @@ use tracing::{debug, warn};
 
 use futures_util::FutureExt;
 
-use frp_core::bandwidth::BandwidthLimiter;
 use frp_core::buffer_pool::BUFFER_SIZE;
 use frp_core::cipher_stream::{CipherReader, CipherWriter};
 use frp_core::encryption::derive_key;
@@ -242,8 +241,7 @@ async fn run_udp_work_conn(
     enc_key: [u8; 16],
     v2: bool,
     udp_packet_size: usize,
-    bw_rate: u64,
-    bw_mode: String,
+    bw_limiter: Option<frp_core::bandwidth::SharedBandwidthLimiter>,
     cancel: tokio_util::sync::CancellationToken,
     // Negotiated UDPPacket codec (`"binary-v1"` or empty). When set, UDP
     // packets on this V2 work conn use the binary codec (Go frp v0.71.0).
@@ -290,16 +288,12 @@ async fn run_udp_work_conn(
     let mut reader_cancel = cancel_rx.clone();
     let cancel_reader = cancel.clone();
     // UDP bandwidth limiting (frp-rs extension; Go frp v0.70.1 has no UDP
-    // limiter). Go parity for the mode: the server throttles only in
-    // "server" mode, and wraps BOTH directions with a single rate (proxy.go
-    // semantics). Empty/unset rate (0) stays unlimited — a limiter exists
-    // only when the operator explicitly configures bandwidthLimit.
-    let server_limited = bw_mode == "server";
-    let mut read_lim = if bw_rate > 0 && server_limited {
-        Some(BandwidthLimiter::new(bw_rate))
-    } else {
-        None
-    };
+    // limiter). Go v0.71.0 parity for the model: ONE per-proxy shared
+    // limiter created at registration (mode == "server"/"both"), wrapping
+    // BOTH directions with the same bucket (proxy.go single-`rate.Limiter`
+    // semantics). Both bridge tasks clone the Arc; empty/unset rate (0)
+    // stays unlimited (limiter is None).
+    let reader_lim = bw_limiter.clone();
     let reader = async move {
         debug!(proxy_name = %reader_name, "UDP work conn reader task started for '{}'", reader_name);
         // Reusable payload buffer for the V2 UDP read path (avoids a heap
@@ -329,8 +323,12 @@ async fn run_udp_work_conn(
                     // user for nothing — refund=true by consuming only here,
                     // and log the drop for diagnosability.
                     if let Some(ref remote) = up.remote_addr {
-                        if let Some(lim) = &mut read_lim {
-                            lim.consume(up.content.len()).await;
+                        if let Some(lim) = reader_lim.as_ref() {
+                            frp_core::bandwidth::BandwidthLimiter::consume_shared(
+                                lim,
+                                up.content.len(),
+                            )
+                            .await;
                         }
                         // Prefer a direct `SocketAddr` (no per-packet String
                         // alloc + reparse of the destination, audit #14a); fall
@@ -373,11 +371,7 @@ async fn run_udp_work_conn(
     let writer_name = proxy_name.clone();
     let mut writer_cancel = cancel_rx;
     let cancel_writer = cancel;
-    let mut write_lim = if bw_rate > 0 && server_limited {
-        Some(BandwidthLimiter::new(bw_rate))
-    } else {
-        None
-    };
+    let writer_lim = bw_limiter.clone();
     let writer = async move {
         debug!(proxy_name = %writer_name, "UDP work conn writer task started for '{}'", writer_name);
         let mut buf = vec![0u8; udp_packet_size];
@@ -408,8 +402,8 @@ async fn run_udp_work_conn(
                     spare.clear();
                     spare.extend_from_slice(&buf[..n]);
                     let content = std::mem::take(&mut spare);
-                    if let Some(lim) = &mut write_lim {
-                        lim.consume(n).await;
+                    if let Some(lim) = writer_lim.as_ref() {
+                        frp_core::bandwidth::BandwidthLimiter::consume_shared(lim, n).await;
                     }
                     let result = if v2 && udp_codec_opt.is_some() {
                         // V2 binary codec path: encode the remote `SocketAddr`
@@ -565,8 +559,7 @@ pub(crate) async fn assign_udp_work_conn(
     enc_key: [u8; 16],
     v2: bool,
     udp_packet_size: usize,
-    bw_rate: u64,
-    bw_mode: String,
+    bw_limiter: Option<frp_core::bandwidth::SharedBandwidthLimiter>,
     cancel: tokio_util::sync::CancellationToken,
     udp_packet_codec: String,
 ) {
@@ -627,8 +620,7 @@ pub(crate) async fn assign_udp_work_conn(
             enc_key,
             v2,
             udp_packet_size,
-            bw_rate,
-            bw_mode,
+            bw_limiter,
             cancel,
             udp_packet_codec,
         ));
@@ -677,17 +669,10 @@ async fn relay_plain_fast_inner(
             }
         }
     } else {
-        let (mut user_conn, mut work_conn) = (user_conn, work_conn);
-        // Sized buffers so FRP_BRIDGE_BUF_KB governs the plain path too
-        // (copy_bidirectional would otherwise use tokio's 8 KiB default).
-        match tokio::io::copy_bidirectional_with_sizes(
-            &mut user_conn,
-            &mut work_conn,
-            *BUFFER_SIZE,
-            *BUFFER_SIZE,
-        )
-        .await
-        {
+        // Pooled-buffer relay (P3): copy_bidirectional_with_sizes allocated
+        // two fresh 32 KiB buffers per bridge call; PoolGuard recycles them
+        // across connections (FRP_BRIDGE_BUF_KB still governs the size).
+        match frp_core::bridge::relay_plain_pooled(user_conn, work_conn).await {
             Ok((a, b)) => {
                 metrics.record_traffic(a, b);
             }
@@ -698,21 +683,14 @@ async fn relay_plain_fast_inner(
     }
 }
 
-/// Non-Linux: just use copy_bidirectional.
+/// Non-Linux: pooled-buffer bidirectional relay (splice(2) unavailable).
 #[cfg(not(target_os = "linux"))]
 async fn relay_plain_fast_inner(
-    mut user_conn: IoStream,
-    mut work_conn: IoStream,
+    user_conn: IoStream,
+    work_conn: IoStream,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
-    match tokio::io::copy_bidirectional_with_sizes(
-        &mut user_conn,
-        &mut work_conn,
-        *BUFFER_SIZE,
-        *BUFFER_SIZE,
-    )
-    .await
-    {
+    match frp_core::bridge::relay_plain_pooled(user_conn, work_conn).await {
         Ok((a, b)) => {
             metrics.record_traffic(a, b);
         }
@@ -720,27 +698,6 @@ async fn relay_plain_fast_inner(
             tracing::debug!(error = %e, "plain fast-path bridge closed: {}", e);
         }
     }
-}
-
-/// Parse bandwidth limit and mode from proxy info fields.
-/// Pure config parsing — no `.await` calls. Extracted from the
-/// async state machine in `assign_work_to_proxy`.
-#[inline(never)]
-pub(crate) fn parse_bandwidth_config(
-    bandwidth_limit: Option<&str>,
-    bandwidth_limit_mode: Option<&str>,
-) -> (u64, String) {
-    let bw_rate = bandwidth_limit
-        .and_then(|bl| {
-            if bl.is_empty() {
-                None
-            } else {
-                frp_core::config::parse_bandwidth_limit(bl)
-            }
-        })
-        .unwrap_or(0);
-    let bw_mode = bandwidth_limit_mode.unwrap_or_default().to_string();
-    (bw_rate, bw_mode)
 }
 
 /// Type-erased user-side bridge halves: erasing the per-transport types lets
@@ -1026,31 +983,16 @@ async fn run_work_bridge(
         );
     }
 
-    // Create bandwidth limiters per direction.
-    // Go frp dev compat: server-side bandwidth limiter only for "server" mode.
-    // Go wraps BOTH read and write directions with a single rate limiter when
-    // mode == "server" (proxy.go:479-481). "client" mode is the client's
-    // responsibility; "both" is not a recognized Go mode.
-    let (bw_rate, bw_mode) = parse_bandwidth_config(
-        proxy_info.as_ref().and_then(|p| {
-            if p.bandwidth_limit.is_empty() {
-                None
-            } else {
-                Some(p.bandwidth_limit.as_str())
-            }
-        }),
-        proxy_info.as_ref().map(|p| p.bandwidth_limit_mode.as_str()),
-    );
-    let mut read_lim = if bw_rate > 0 && bw_mode == "server" {
-        Some(BandwidthLimiter::new(bw_rate))
-    } else {
-        None
-    };
-    let mut write_lim = if bw_rate > 0 && bw_mode == "server" {
-        Some(BandwidthLimiter::new(bw_rate))
-    } else {
-        None
-    };
+    // The per-proxy SHARED bandwidth limiter (F1/F2): created once at proxy
+    // registration (build_proxy_info) when mode == "server"/"both" and a
+    // rate is set; one bucket covers BOTH directions and all concurrent
+    // connections (Go frp v0.71.0 single-`rate.Limiter` parity — the mode
+    // gate lives at registration, not per bridge call). "client"/empty mode
+    // is the client's responsibility (Go: server creates a limiter only in
+    // "server" mode).
+    let bw_limiter = proxy_info
+        .as_ref()
+        .and_then(|p| p.bandwidth_limiter.clone());
 
     // The response-header injector only fires for HTTP-family proxies
     // with configured headers; clone the HashMap at bridge time instead
@@ -1098,8 +1040,7 @@ async fn run_work_bridge(
                 &key,
                 comp_key,
                 req.pre_read,
-                read_lim.as_mut(),
-                write_lim.as_mut(),
+                bw_limiter.as_ref(),
                 Some(metrics.clone()),
                 header_timeout,
                 true,
@@ -1117,8 +1058,7 @@ async fn run_work_bridge(
             &key,
             comp_key,
             req.pre_read,
-            read_lim.as_mut(),
-            write_lim.as_mut(),
+            bw_limiter.as_ref(),
             Some(metrics.clone()),
             header_timeout,
             false,
@@ -1176,7 +1116,7 @@ async fn run_work_bridge(
                     debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
                 }
             }
-        } else if read_lim.is_some() || write_lim.is_some() {
+        } else if bw_limiter.is_some() {
             // Bandwidth limiting active: use rate-limited plain bridge.
             let Some((u_r, u_w)) =
                 try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
@@ -1195,8 +1135,7 @@ async fn run_work_bridge(
                     w_w,
                     comp_key,
                     bridge_pre_read,
-                    read_lim.as_mut(),
-                    write_lim.as_mut(),
+                    bw_limiter.as_ref(),
                     Some(metrics.clone()),
                     header_timeout,
                 )
@@ -1209,8 +1148,7 @@ async fn run_work_bridge(
                     w_w,
                     comp_key,
                     bridge_pre_read,
-                    read_lim.as_mut(),
-                    write_lim.as_mut(),
+                    bw_limiter.as_ref(),
                     Some(metrics.clone()),
                     header_timeout,
                 )
@@ -1756,8 +1694,7 @@ mod tests {
             [0u8; 16],
             false,
             1500,
-            0,
-            String::new(),
+            None,
             tokio_util::sync::CancellationToken::new(),
             String::new(),
         ));
@@ -1796,8 +1733,7 @@ mod tests {
             [0u8; 16],
             false,
             1500,
-            0,
-            String::new(),
+            None,
             tokio_util::sync::CancellationToken::new(),
             String::new(),
         ));
@@ -1830,8 +1766,7 @@ mod tests {
             [0u8; 16],
             false,
             1500,
-            0,
-            String::new(),
+            None,
             tokio_util::sync::CancellationToken::new(),
             String::new(),
         ));
@@ -1899,8 +1834,7 @@ mod tests {
             [0u8; 16],
             false,
             1500,
-            0,
-            String::new(),
+            None,
             bridge_cancel,
             String::new(),
         ));

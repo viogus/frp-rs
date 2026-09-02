@@ -349,24 +349,11 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                 .and_then(|info| info.local_addr.clone())
                 .and_then(|s| msg::UdpAddr::from_string(&s));
             let udp_use_enc = info.as_ref().is_some_and(|i| i.use_encryption);
-            // UDP bandwidth limiting: parsed from the proxy's
-            // bandwidthLimit/bandwidthLimitMode (server mode applies a
-            // two-direction limiter). Empty/unset stays unlimited — a
-            // limiter is only created when the operator explicitly
-            // configures a rate.
-            let (bw_rate, bw_mode) = info
-                .as_ref()
-                .map(|i| {
-                    bridge::parse_bandwidth_config(
-                        if i.bandwidth_limit.is_empty() {
-                            None
-                        } else {
-                            Some(i.bandwidth_limit.as_str())
-                        },
-                        Some(i.bandwidth_limit_mode.as_str()),
-                    )
-                })
-                .unwrap_or((0, String::new()));
+            // UDP bandwidth limiting: the per-proxy SHARED limiter built at
+            // registration (server mode — one bucket for both directions
+            // and all connections, Go v0.71.0 single-`rate.Limiter` parity).
+            // Empty/unset stays unlimited (limiter is None).
+            let bw_limiter = info.as_ref().and_then(|i| i.bandwidth_limiter.clone());
             bridge::assign_udp_work_conn(
                 stream,
                 &proxy_name,
@@ -376,8 +363,7 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                 ctx.reloadable.encryption_key,
                 ctx.v2,
                 ctx.state.udp_packet_size,
-                bw_rate,
-                bw_mode,
+                bw_limiter,
                 // Per-proxy cancel token (low finding 5): a wedged bridge
                 // exits when the proxy closes (handle_close_proxy cancels
                 // it) instead of lingering until control teardown. Falls

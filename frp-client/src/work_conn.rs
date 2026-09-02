@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
-use frp_core::bandwidth::BandwidthLimiter;
+use frp_core::bandwidth::SharedBandwidthLimiter;
 use frp_core::cipher_stream::{CipherReader, CipherWriter};
 use frp_core::encryption;
 use frp_core::metrics::ProxyMetricsRegistry;
@@ -51,6 +51,11 @@ pub(crate) struct TunnelPacketReader<R> {
     inner: R,
     decompressor: Option<frp_core::encryption::SnappyDecompressor>,
     stream_buf: Vec<u8>,
+    /// Consumed-prefix cursor into `stream_buf`: bytes before it are already
+    /// delivered packets; the next frame starts at `read_pos`. Replaces the
+    /// per-packet `drain(..)` (a memmove of the whole remainder — O(buffered)
+    /// per packet); compaction now happens once per ~4 KiB consumed.
+    read_pos: usize,
     buf: Vec<u8>,
     eof: bool,
 }
@@ -74,6 +79,7 @@ impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
             inner,
             decompressor,
             stream_buf: Vec::new(),
+            read_pos: 0,
             buf: vec![0u8; 4096],
             eof: false,
         }
@@ -92,7 +98,9 @@ impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
             let n = self.inner.read(&mut self.buf).await?;
             if n == 0 {
                 self.eof = true;
-                if !self.stream_buf.is_empty() {
+                // Only bytes past the read cursor are an incomplete frame;
+                // consumed bytes are already-delivered packets.
+                if self.stream_buf.len() > self.read_pos {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "vnet tunnel closed with an incomplete framed packet",
@@ -121,15 +129,17 @@ impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
         }
     }
 
-    /// Extract one `[u32 LE length][data]` message from `stream_buf`.
+    /// Extract one `[u32 LE length][data]` message from `stream_buf`,
+    /// starting at the read cursor.
     fn take_complete_message(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        if self.stream_buf.len() < 4 {
+        let start = self.read_pos;
+        if self.stream_buf.len() < start + 4 {
             return Ok(None);
         }
         let len = u32::from_le_bytes(
-            self.stream_buf[..4]
+            self.stream_buf[start..start + 4]
                 .try_into()
-                .expect("stream_buf.len() >= 4 checked above"),
+                .expect("stream_buf.len() >= start + 4 checked above"),
         ) as usize;
         if len == 0 {
             return Err(std::io::Error::new(
@@ -143,11 +153,19 @@ impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
                 format!("vnet message too large: {len} > {MAX_VNET_MESSAGE}"),
             ));
         }
-        if self.stream_buf.len() < 4 + len {
+        if self.stream_buf.len() < start + 4 + len {
             return Ok(None);
         }
-        let packet = self.stream_buf[4..4 + len].to_vec();
-        self.stream_buf.drain(..4 + len);
+        let packet = self.stream_buf[start + 4..start + 4 + len].to_vec();
+        self.read_pos = start + 4 + len;
+        // Compact the consumed prefix once it grows large (amortized O(1)
+        // per byte — the old per-packet `drain(..4 + len)` memmoved the
+        // whole remainder on EVERY packet). Thresholds bound the buffer at
+        // ~8 KiB of consumed + unconsumed bytes before compaction.
+        if self.read_pos >= 4096 && self.stream_buf.len() - self.read_pos < 4096 {
+            self.stream_buf.drain(..self.read_pos);
+            self.read_pos = 0;
+        }
         Ok(Some(packet))
     }
 }
@@ -383,7 +401,13 @@ async fn read_start_work_conn_with_timeout(
 /// dedicated socket and forwards them to the work-conn writer channel.
 /// Exits after `UDP_SESSION_IDLE_TIMEOUT` of no traffic and removes itself
 /// from the session table so its ephemeral port is released.
-const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// 30s = Go parity (pkg/proto/udp/udp.go writerFn): Go sets a 30s
+/// `SetReadDeadline` on the REAL dialed UDP conn, refreshed on every packet
+/// in BOTH directions — a session that goes 30s without ANY traffic (inbound
+/// reply or outbound write) is evicted. frp-rs was 60s; the extra 30s held
+/// ephemeral ports + a session-table entry on idle remotes.
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The same idle threshold in milliseconds, for the u64 epoch-millis
 /// liveness timestamps (kept in sync with `UDP_SESSION_IDLE_TIMEOUT`).
@@ -463,12 +487,17 @@ impl UdpSessionTable {
 async fn run_udp_session(
     socket: Arc<UdpSocket>,
     remote: SocketAddr,
-    tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    tx: mpsc::Sender<(SocketAddr, Vec<u8>, mpsc::Sender<Vec<u8>>)>,
     session_alive: Arc<AtomicBool>,
     udp_packet_size: usize,
     sessions: Arc<UdpSessionTable>,
     last_active: Arc<AtomicU64>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    // Buffer-return channel pair: ret_tx rides along with each packet so the
+    // writer can hand the content Vec back; ret_rx receives the returned
+    // buffer for reuse as the next recv target.
+    ret_tx: mpsc::Sender<Vec<u8>>,
+    mut ret_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut buf = vec![0u8; udp_packet_size.max(1)];
     let mut idle = tokio::time::interval(Duration::from_secs(1));
@@ -488,8 +517,22 @@ async fn run_udp_session(
                         // store into the Arc shared with the session table —
                         // no shard-lock acquire, no hash lookup.
                         last_active.store(now_epoch_ms(), Ordering::Relaxed);
-                        let payload = buf[..n].to_vec();
-                        if tx.send((remote, payload)).await.is_err() {
+                        // P1: reuse a buffer the writer returned (try_recv —
+                        // no spare is not an error), but only when it is big
+                        // enough for the next datagram: the writer may hand
+                        // back a small compressed buffer, and recv_from into
+                        // an undersized buffer would TRUNCATE the packet.
+                        // A too-small spare is dropped and the steady-state
+                        // buffer is copied as before.
+                        let payload = match ret_rx.try_recv() {
+                            Ok(mut spare) if spare.capacity() >= udp_packet_size.max(1) => {
+                                spare.clear();
+                                spare.extend_from_slice(&buf[..n]);
+                                spare
+                            }
+                            _ => buf[..n].to_vec(),
+                        };
+                        if tx.send((remote, payload, ret_tx.clone())).await.is_err() {
                             break;
                         }
                     }
@@ -510,7 +553,7 @@ async fn run_udp_session(
                         .unwrap_or(UDP_SESSION_IDLE_TIMEOUT_MS)
                 };
                 if idle_for > UDP_SESSION_IDLE_TIMEOUT_MS {
-                    debug!(remote = %remote, "UDP session idle for >60s, closing");
+                    debug!(remote = %remote, "UDP session idle for >30s, closing");
                     break;
                 }
                 if !session_alive.load(Ordering::Acquire) {
@@ -555,8 +598,12 @@ async fn run_udp_work_conn(
     // Application-level keepalive Ping interval in seconds (transport
     // keepalive config; 0 = keep the built-in 30s default).
     udp_keepalive_secs: u64,
-    bw_rate: u64,
-    bw_mode: String,
+    // Per-proxy SHARED bandwidth limiter (Go frp v0.71.0 `BaseProxy.limiter`
+    // parity — one bucket covers both directions and all concurrent
+    // connections). None when the server owns the limiting or no rate set.
+    // Note: Go frp v0.70.1 has no client-side UDP limiter at all; frp-rs
+    // keeps one for consistency with the TCP shared-limiter model.
+    bw_limiter: Option<SharedBandwidthLimiter>,
     // Negotiated UDPPacket codec (`"binary-v1"` or empty; Go frp v0.71.0).
     // When set on a V2 work conn, UDPPacket frames use the binary codec.
     udp_packet_codec: String,
@@ -569,13 +616,10 @@ async fn run_udp_work_conn(
             return;
         }
     };
-    // UDP bandwidth limiting (frp-rs extension; Go frp v0.70.1 has no UDP
-    // limiter). Same direction semantics as the TCP bridge (proxy.rs):
-    // "client" throttles upload (local→work), "server" throttles download
-    // (work→local), "both"/empty apply both. rate 0 (unset) → unlimited; a
-    // limiter is only built when the operator explicitly sets a rate.
-    let apply_read = bw_mode == "server" || bw_mode == "both" || bw_mode.is_empty();
-    let apply_write = bw_mode == "client" || bw_mode == "both" || bw_mode.is_empty();
+    // UDP bandwidth limiting (frp-rs extension; Go frp has no UDP limiter).
+    // Shared-limiter model (F1): one bucket for both directions, already
+    // created at registration when mode == ""/"client"/"both" (the client
+    // side owns the limiting); None in "server" mode. rate 0 → None.
     let (w_r, w_w) = match split_work_conn_halves(work) {
         Ok(pair) => pair,
         Err(e) => {
@@ -612,8 +656,13 @@ async fn run_udp_work_conn(
     // Remote-visitor session table. std Mutex (short critical sections,
     // never held across an await — bind() happens outside the lock).
     let sessions: Arc<UdpSessionTable> = Arc::new(UdpSessionTable::new());
-    // Per-session socket -> single writer aggregation channel.
-    let (write_tx, mut write_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(64);
+    // Per-session socket -> single writer aggregation channel. Each packet
+    // carries its session's buffer-return channel (P1): the writer returns
+    // the content Vec after wire encode and the session reuses it as the
+    // next recv buffer — the per-datagram `buf[..n].to_vec()` alloc is gone
+    // in the steady state.
+    let (write_tx, mut write_rx) =
+        mpsc::channel::<(SocketAddr, Vec<u8>, mpsc::Sender<Vec<u8>>)>(64);
 
     // ---- Reader: work conn -> per-remote sockets ----
     let pn_r = proxy_name.clone();
@@ -621,11 +670,7 @@ async fn run_udp_work_conn(
     let local_addr_str_r = local_addr_str.clone();
     let mut reader_cancel = cancel_rx.clone();
     let reader_udp_codec = udp_packet_codec.clone();
-    let mut read_lim = if bw_rate > 0 && apply_read {
-        Some(BandwidthLimiter::new(bw_rate))
-    } else {
-        None
-    };
+    let reader_lim = bw_limiter.clone();
     let reader = async move {
         debug!(proxy_name = %pn_r, "UDP reader '{}' started", pn_r);
         // Ping-pong scratch for the per-packet decompress chain (per-session).
@@ -768,6 +813,12 @@ async fn run_udp_work_conn(
                                             // lock (one Relaxed store).
                                             let last_active =
                                                 Arc::new(AtomicU64::new(now_epoch_ms()));
+                                            // P1: per-session buffer-return
+                                            // channel (cap 8 — the writer's
+                                            // try_send drops a full channel;
+                                            // the spare is an optimization).
+                                            let (ret_tx, ret_rx) =
+                                                mpsc::channel::<Vec<u8>>(8);
                                             tokio::spawn(run_udp_session(
                                                 sock.clone(),
                                                 remote,
@@ -777,6 +828,8 @@ async fn run_udp_work_conn(
                                                 sessions_for_task,
                                                 last_active.clone(),
                                                 reader_cancel.clone(),
+                                                ret_tx,
+                                                ret_rx,
                                             ));
                                             map.insert(
                                                 remote,
@@ -833,8 +886,12 @@ async fn run_udp_work_conn(
                             // must NOT tear down the whole work conn —
                             // Go frp logs and skips (per-remote model means
                             // other remotes and future packets still work).
-                            if let Some(lim) = &mut read_lim {
-                                lim.consume(final_payload.len()).await;
+                            if let Some(lim) = reader_lim.as_ref() {
+                                frp_core::bandwidth::BandwidthLimiter::consume_shared(
+                                    lim,
+                                    final_payload.len(),
+                                )
+                                .await;
                             }
                             if let Err(e) = sock.send(&final_payload).await {
                                 debug!(proxy_name = %pn_r, error = %e, local = %local_addr,
@@ -880,11 +937,7 @@ async fn run_udp_work_conn(
     let pn_w = proxy_name;
     let session_alive_w = session_alive;
     let mut writer_cancel = cancel_rx;
-    let mut write_lim = if bw_rate > 0 && apply_write {
-        Some(BandwidthLimiter::new(bw_rate))
-    } else {
-        None
-    };
+    let writer_lim = bw_limiter;
     let writer = async move {
         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
         // Each packet brings its own Vec by move (round-17 audit B); the slot
@@ -924,7 +977,7 @@ async fn run_udp_work_conn(
                 changed = writer_cancel.changed() => {
                     if changed.is_err() || *writer_cancel.borrow() { break; }
                 }
-                Some((remote, data)) = write_rx.recv() => {
+                Some((remote, data, ret_tx)) = write_rx.recv() => {
                     // Round-17 audit B: take the received Vec by move — it
                     // crossed the async channel already owned, so the old
                     // clear + extend_from_slice was a second full datagram
@@ -965,10 +1018,10 @@ async fn run_udp_work_conn(
                             zone: String::new(),
                         }),
                     });
-                    if let Some(lim) = &mut write_lim {
+                    if let Some(lim) = writer_lim.as_ref() {
                         // Limiter counts the (compressed) payload the tunnel
                         // actually carries.
-                        lim.consume(pkt_len).await;
+                        frp_core::bandwidth::BandwidthLimiter::consume_shared(lim, pkt_len).await;
                     }
                     let result = if v2 {
                         let codec_opt = if udp_packet_codec.is_empty() {
@@ -987,9 +1040,18 @@ async fn run_udp_work_conn(
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
-                    // Return the invariant UdpAddr for the next packet.
+                    // Return the invariant UdpAddr for the next packet and
+                    // hand the content buffer back to the session (P1) — it
+                    // becomes the session's next recv target. try_send: a
+                    // closed/full return channel just drops the buffer (the
+                    // spare is an optimization, and the session already
+                    // re-allocated if no spare arrived). Note the returned
+                    // Vec may be the writer's compress scratch after a
+                    // swap — either way it is a live allocation the session
+                    // can recv into, so no allocation is lost.
                     if let FrpMessage::UDPPacket(p) = pkt {
                         local_udp_addr = p.local_addr;
+                        let _ = ret_tx.try_send(p.content);
                     }
                     if let Err(e) = result {
                         debug!(proxy_name = %pn_w, error = %e,
@@ -1690,8 +1752,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                         udp_packet_size,
                         info.proxy_protocol_version.clone(),
                         cfg.keepalive_secs,
-                        info.bandwidth_limit,
-                        info.bandwidth_limit_mode.clone(),
+                        info.bandwidth_limiter.clone(),
                         udp_packet_codec.clone(),
                     )
                     .await;
@@ -1776,8 +1837,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                                 use_encryption: use_enc,
                                 use_compression: use_comp,
                                 enc_key: enc,
-                                bandwidth_limit: info.bandwidth_limit,
-                                bandwidth_limit_mode: &info.bandwidth_limit_mode,
+                                bw_limiter: info.bandwidth_limiter.as_ref(),
                                 metrics: proxy_metrics,
                             })
                             .await;
@@ -1808,6 +1868,21 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F4 pin: Go frp v0.71.0 evicts idle UDP remote sessions after 30s of no
+    /// traffic in either direction (pkg/proto/udp/udp.go writerFn 30s
+    /// SetReadDeadline); frp-rs was 60s (double the hold on ephemeral ports +
+    /// session entries). The constant IS the parity contract — pin it so a
+    /// future bump away from Go's 30s is a deliberate change.
+    #[test]
+    fn udp_session_idle_timeout_is_go_parity_30s() {
+        assert_eq!(
+            UDP_SESSION_IDLE_TIMEOUT,
+            Duration::from_secs(30),
+            "Go parity: 30s idle eviction (was 60s)"
+        );
+        assert_eq!(UDP_SESSION_IDLE_TIMEOUT_MS, 30_000);
+    }
 
     async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1941,8 +2016,7 @@ mod tests {
             65535,
             String::new(),
             0,
-            0,
-            String::new(),
+            None,
             String::new(),
         ));
         drop(peer);
@@ -1978,8 +2052,7 @@ mod tests {
             65535,
             String::new(),
             0,
-            0,
-            String::new(),
+            None,
             String::new(),
         ));
 
@@ -2027,8 +2100,7 @@ mod tests {
             65535,
             String::new(),
             0,
-            0,
-            String::new(),
+            None,
             String::new(),
         ));
 
@@ -2091,8 +2163,7 @@ mod tests {
             65535,
             String::new(),
             0,
-            0,
-            String::new(),
+            None,
             String::new(),
         ));
 
