@@ -558,6 +558,21 @@ mod tests {
         oversized_payload_len.push(0); // empty zone
         oversized_payload_len.extend_from_slice(&65535u16.to_be_bytes()); // > 65507
 
+        // Valid address prefix, then only 1 of the 2 payload-length bytes.
+        let mut truncated_len_field = vec![UDP_PACKET_FLAG_REMOTE_ADDR, 4];
+        truncated_len_field.extend_from_slice(&ipv4);
+        truncated_len_field.extend_from_slice(&53u16.to_be_bytes());
+        truncated_len_field.push(0); // empty zone
+        truncated_len_field.push(0x00);
+
+        // Valid length field declaring 5 bytes, only 2 follow.
+        let mut truncated_payload = vec![UDP_PACKET_FLAG_REMOTE_ADDR, 4];
+        truncated_payload.extend_from_slice(&ipv4);
+        truncated_payload.extend_from_slice(&53u16.to_be_bytes());
+        truncated_payload.push(0); // empty zone
+        truncated_payload.extend_from_slice(&5u16.to_be_bytes());
+        truncated_payload.extend_from_slice(&[0xDE, 0xAD]);
+
         let cases: Vec<(&str, Vec<u8>, &str)> = vec![
             ("empty body", vec![], "too short"),
             (
@@ -591,6 +606,16 @@ mod tests {
                 "payload length above 65507",
                 oversized_payload_len,
                 "exceeds limit",
+            ),
+            (
+                "length field truncated to one byte",
+                truncated_len_field,
+                "truncated UDP payload length",
+            ),
+            (
+                "declared payload truncated",
+                truncated_payload,
+                "truncated UDP payload",
             ),
         ];
 

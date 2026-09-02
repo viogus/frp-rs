@@ -89,3 +89,64 @@ impl KcpConfig {
         config
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_default_differs_from_trait_default_on_wire_relevant_knobs() {
+        // Production KCP paths (client/server dial/listen, XTCP hole-punch
+        // sessions, nathole) build their config from `default_kcp_config()`,
+        // which matches Go frp v0.69.1's aggressive ListenKcp() defaults:
+        // nodelay=1/interval=20/resend=2/nc=1 with FEC (10,3) and mtu 1350.
+        // `KcpConfig::default()` stays the conservative kcp-go library
+        // defaults (nodelay=0, interval=40, no FEC). The split is pin:
+        // swapping one for the other would silently disable FEC — a Go peer
+        // then sends FEC-wrapped segments this side cannot parse — or drop
+        // nodelay (a latency regression on every KCP tunnel).
+        let conservative = KcpConfig::default();
+        let aggressive = crate::kcp::default_kcp_config();
+        let aggressive_client = crate::kcp::default_kcp_client_config();
+
+        assert!(
+            !conservative.nodelay.nodelay,
+            "trait default keeps kcp-go nodelay=0"
+        );
+        assert_eq!(conservative.nodelay.interval, 40);
+        assert_eq!(
+            (conservative.data_shards, conservative.parity_shards),
+            (0, 0),
+            "trait default has no FEC"
+        );
+
+        assert!(aggressive.nodelay.nodelay, "Go frp nodelay=1");
+        assert_eq!(aggressive.nodelay.interval, 20);
+        assert_eq!(aggressive.nodelay.resend, 2);
+        assert!(aggressive.nodelay.nc, "Go frp nc=1");
+        assert_eq!((aggressive.data_shards, aggressive.parity_shards), (10, 3));
+        assert_eq!(aggressive.mtu, 1350);
+        assert_eq!(aggressive.wnd_size, (1024, 1024));
+
+        // The client dial helper must stay wire-identical to the server-side
+        // defaults, or FEC-shard counts would diverge per direction.
+        assert_eq!(
+            aggressive_client.nodelay.nodelay,
+            aggressive.nodelay.nodelay
+        );
+        assert_eq!(
+            aggressive_client.nodelay.interval,
+            aggressive.nodelay.interval
+        );
+        assert_eq!(aggressive_client.nodelay.resend, aggressive.nodelay.resend);
+        assert_eq!(aggressive_client.nodelay.nc, aggressive.nodelay.nc);
+        assert_eq!(
+            (
+                aggressive_client.data_shards,
+                aggressive_client.parity_shards
+            ),
+            (10, 3)
+        );
+        assert_eq!(aggressive_client.mtu, aggressive.mtu);
+    }
+}

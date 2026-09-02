@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 // ---------------------------------------------------------------
-// V1 message type bytes (matching Go frp v0.69.1 protocol)
+// V1 message type bytes (matching Go frp v0.71.0 protocol)
 // ---------------------------------------------------------------
 pub const TYPE_LOGIN: u8 = b'o';
 pub const TYPE_LOGIN_RESP: u8 = b'1';
@@ -17,7 +17,7 @@ pub const TYPE_NEW_VISITOR_CONN_RESP: u8 = b'3';
 pub const TYPE_PING: u8 = b'h';
 pub const TYPE_PONG: u8 = b'4';
 pub const TYPE_UDP_PACKET: u8 = b'u';
-// NAT hole punching (Go frp v0.69.1 STCP/XTCP)
+// NAT hole punching (Go frp v0.71.0 STCP/XTCP)
 pub const TYPE_NAT_HOLE_VISITOR: u8 = b'i';
 pub const TYPE_NAT_HOLE_CLIENT: u8 = b'n';
 pub const TYPE_NAT_HOLE_RESP: u8 = b'm';
@@ -35,7 +35,7 @@ pub const TYPE_VNET_PACKET: u8 = 0x41;
 pub const TYPE_VNET_ROUTE_REMOVE: u8 = 0x42;
 
 // ---------------------------------------------------------------
-// V2 message type IDs (matching Go frp v0.69.1 wire_v2.go)
+// V2 message type IDs (matching Go frp v0.71.0 wire_v2.go)
 // ---------------------------------------------------------------
 pub const V2_TYPE_LOGIN: u16 = 1;
 pub const V2_TYPE_LOGIN_RESP: u16 = 2;
@@ -89,7 +89,7 @@ fn b64_de<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
 
 // ---------------------------------------------------------------
 // Concrete message structs — all derive Serialize + Deserialize
-// Field names match Go frp v0.69.1 JSON keys (snake_case Rust with
+// Field names match Go frp v0.71.0 JSON keys (snake_case Rust with
 // serde renames where Go uses different keys).
 // ---------------------------------------------------------------
 
@@ -383,7 +383,7 @@ pub struct NewVisitorConnResp {
     pub error: Option<String>,
 }
 
-/// UDP address matching Go frp v0.69.1 `net.UDPAddr` JSON representation.
+/// UDP address matching Go frp v0.71.0 `net.UDPAddr` JSON representation.
 ///
 /// Go's `net.UDPAddr` has no `omitempty` on `Zone`, so it is ALWAYS emitted
 /// on the wire (`"Zone":""` when empty). The `default` keeps deserialization
@@ -434,7 +434,7 @@ pub struct UDPPacket {
 }
 
 // ---------------------------------------------------------------
-// NAT hole punch messages (Go frp v0.69.1 STCP/XTCP)
+// NAT hole punch messages (Go frp v0.71.0 STCP/XTCP)
 // ---------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -459,7 +459,7 @@ pub struct NatHoleVisitor {
 }
 
 /// Port range for NAT hole punch candidate selection.
-/// Go frp v0.69.1 compat.
+/// Go frp v0.71.0 compat.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PortsRange {
     #[serde(default)]
@@ -469,7 +469,7 @@ pub struct PortsRange {
 }
 
 /// Server-recommended hole-punch behavior for a peer.
-/// Go frp v0.69.1 compat: DetectBehavior in NatHoleResp.
+/// Go frp v0.71.0 compat: DetectBehavior in NatHoleResp.
 /// CRITICAL: Go frps uses `json:"...,omitempty"` on ALL fields.
 /// When an integer field is 0, Go omits it from the JSON.
 /// All i32 fields below MUST have #[serde(default)] to handle this.
@@ -505,7 +505,7 @@ pub struct NatHoleDetectBehavior {
 pub struct NatHoleClient {
     pub transaction_id: String,
     pub proxy_name: String,
-    /// NAT hole session ID (Go frp v0.69.1 compat: sid).
+    /// NAT hole session ID (Go frp v0.71.0 compat: sid).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
     /// NAT traversal protocol: "quic" or "tcp" (Rust frp extension; not in
@@ -528,10 +528,10 @@ pub struct NatHoleResp {
     pub transaction_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// NAT hole session ID (Go frp v0.69.1 compat: sid).
+    /// NAT hole session ID (Go frp v0.71.0 compat: sid).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
-    /// NAT traversal protocol: "quic" or "tcp" (Go frp v0.69.1 compat).
+    /// NAT traversal protocol: "quic" or "tcp" (Go frp v0.71.0 compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     /// Candidate addresses for NAT hole punch (the OTHER side's STUN addresses).
@@ -539,7 +539,7 @@ pub struct NatHoleResp {
     pub candidate_addrs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assisted_addrs: Option<Vec<String>>,
-    /// Server-recommended hole-punch behavior (Go frp v0.69.1 compat).
+    /// Server-recommended hole-punch behavior (Go frp v0.71.0 compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_behavior: Option<NatHoleDetectBehavior>,
 }
@@ -1908,5 +1908,69 @@ mod tests {
         );
         accepts::<NatHoleReport>(r#"{"sid":"s1","success":true,"featureFlags":["quic-ack"]}"#);
         accepts::<Error>(r#"{"error":"boom","featureFlags":["quic-ack"]}"#);
+    }
+
+    #[test]
+    fn test_missing_optional_fields_default_to_none() {
+        // Go peers emit only the fields they set (omitempty). Absent keys must
+        // fill Option fields with None and ints/bools with their serde(default)
+        // zeros — parse-OK alone would not catch a lost #[serde(default)].
+        let nwc: NewWorkConn = serde_json::from_str(r#"{"run_id":"r1"}"#).unwrap();
+        assert_eq!(nwc.run_id, Some("r1".to_string()));
+        assert_eq!(nwc.timestamp, None);
+        assert_eq!(nwc.privilege_key, None);
+
+        let swc: StartWorkConn = serde_json::from_str(r#"{"proxy_name":"p1"}"#).unwrap();
+        assert_eq!(swc.proxy_name, "p1");
+        assert_eq!(swc.src_addr, None);
+        assert_eq!(swc.src_port, None);
+        assert_eq!(swc.dst_addr, None);
+        assert_eq!(swc.dst_port, None);
+        assert_eq!(swc.error, None);
+        assert_eq!(swc.use_encryption, None);
+        assert_eq!(swc.use_compression, None);
+        assert_eq!(swc.nat_hole_sid, None);
+        assert_eq!(swc.nat_hole_visitor_addr, None);
+        assert_eq!(swc.sk, None);
+
+        let resp: NewProxyResp = serde_json::from_str(r#"{"proxy_name":"p1"}"#).unwrap();
+        assert_eq!(resp.remote_addr, None);
+        assert_eq!(resp.error, None);
+
+        let ping: Ping = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(ping.privilege_key, None);
+        assert_eq!(ping.timestamp, None);
+
+        let nc: NatHoleClient =
+            serde_json::from_str(r#"{"transaction_id":"t1","proxy_name":"p1"}"#).unwrap();
+        assert_eq!(nc.sid, None);
+        assert_eq!(nc.protocol, None);
+        assert_eq!(nc.mapped_addrs, None);
+        assert_eq!(nc.assisted_addrs, None);
+        assert_eq!(nc.visitor_addr, None);
+
+        let sid: NatHoleSid = serde_json::from_str(r#"{"sid":"s1"}"#).unwrap();
+        assert_eq!(sid.transaction_id, None);
+        assert!(!sid.response);
+        assert_eq!(sid.nonce, None);
+
+        // Go omitempty drops zero-valued ints — an empty detect_behavior
+        // object must fill every i32 with 0 (field-level #[serde(default)]).
+        let nh: NatHoleResp =
+            serde_json::from_str(r#"{"transaction_id":"t1","detect_behavior":{}}"#).unwrap();
+        let db = nh.detect_behavior.unwrap();
+        assert_eq!(
+            (
+                db.mode,
+                db.ttl,
+                db.send_delay_ms,
+                db.read_timeout_ms,
+                db.send_random_ports,
+                db.listen_random_ports
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(db.role, None);
+        assert_eq!(db.candidate_ports, None);
     }
 }

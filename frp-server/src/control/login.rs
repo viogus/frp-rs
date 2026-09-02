@@ -400,7 +400,7 @@ async fn verify_login_auth(
             #[cfg(feature = "dashboard")]
             {
                 let _ = state.event_tx.send(crate::event::ServerEvent::Error {
-                    message: format!("Authentication failed for {:?}", peer),
+                    message: format!("Authentication failed for {:?}: {}", peer, e),
                     context: Some("login".into()),
                 });
             }

@@ -642,12 +642,19 @@ fn trim_trailing_dot(host: &str) -> &str {
 /// never validates the port).
 fn extract_host_header(request: &str) -> Option<&str> {
     for line in request.lines() {
-        if line.len() < 6 {
+        // `get(..5)`, not `line[..5]`: len >= 6 does NOT imply byte 5 is a
+        // char boundary — a multibyte-UTF-8 header line ("éééé" is 8 bytes)
+        // panics on the direct slice under panic=abort. Same fix as vhost.rs
+        // round-16; tcpmux was the unsynced copy. get() skips = non-match.
+        if !line
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("host:"))
+        {
             continue;
         }
-        if !line[..5].eq_ignore_ascii_case("host:") {
-            continue;
-        }
+        // Safe: the get(..5) match above proves bytes 0-4 are ASCII
+        // (eq_ignore_ascii_case only matches an ASCII prefix), so byte 5 is
+        // a char boundary.
         let value = line[5..].trim();
         return canonicalize_host(value, false);
     }
@@ -719,11 +726,23 @@ fn is_valid_version(version: &str) -> bool {
 
 /// Extract Proxy-Authorization Basic credentials.
 fn extract_proxy_auth(request: &str) -> Option<(String, String)> {
-    let auth_line = request
-        .lines()
-        .find(|line| line.len() >= 20 && line[..20].eq_ignore_ascii_case("proxy-authorization:"))?;
+    let auth_line = request.lines().find(|line| {
+        // `get(..20)`, not `line[..20]`: a line >= 20 bytes whose byte 19
+        // starts a multibyte UTF-8 char panics on the direct slice (round-16
+        // vhost fix; tcpmux was the unsynced copy). Reachable pre-auth on
+        // every CONNECT (this runs before route lookup) — a hostile header
+        // line of 19 ASCII bytes + one non-ASCII char aborts frps. get()
+        // skips = non-match.
+        line.get(..20)
+            .is_some_and(|p| p.eq_ignore_ascii_case("proxy-authorization:"))
+    })?;
+    // Safe: the match above proves bytes 0-19 are ASCII → byte 20 boundary.
     let value = auth_line[20..].trim();
-    let encoded = if value.len() > 6 && value[..6].eq_ignore_ascii_case("Basic ") {
+    let encoded = if value
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("Basic "))
+    {
+        // Safe: match proves bytes 0-5 ASCII → byte 6 is a boundary.
         value[6..].trim()
     } else {
         return None;
@@ -886,6 +905,51 @@ mod tests {
     fn test_extract_proxy_auth_missing() {
         let req = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert_eq!(extract_proxy_auth(req), None);
+    }
+
+    #[test]
+    fn test_extract_host_header_multibyte_utf8_no_panic() {
+        // Regression for the round-16 A1 abort vector (this file's copy was
+        // left unfixed): a header line of 4 multibyte chars is 8 bytes (>= 6)
+        // but byte 5 is NOT a char boundary — `line[..5]` panicked under
+        // panic=abort on every path-form CONNECT. get(..5) skips instead.
+        let req = "CONNECT /path HTTP/1.1\r\néééé\r\n\r\n";
+        assert_eq!(extract_host_header(req), None);
+        assert_eq!(extract_route_host(req), None);
+        // A valid Host line after a hostile one still parses.
+        let req = "CONNECT /path HTTP/1.1\r\néééé\r\nHost: foo.bar\r\n\r\n";
+        assert_eq!(extract_route_host(req), Some("foo.bar"));
+        // A "Host:" prefix followed by a multibyte value: the prefix is pure
+        // ASCII so byte 5 is a boundary — the value parses as an (unroutable)
+        // hostname instead of panicking.
+        let req = "CONNECT /path HTTP/1.1\r\nHost: éééé\r\n\r\n";
+        assert_eq!(extract_host_header(req), Some("éééé"));
+    }
+
+    #[test]
+    fn test_extract_proxy_auth_multibyte_utf8_no_panic() {
+        // Regression for the round-16 A1 abort vector (tcpmux copy): this
+        // runs pre-auth on EVERY CONNECT (route lookup happens after), so a
+        // hostile header line was an unauthenticated remote process kill.
+        // Shape 1: 19 ASCII bytes + one multibyte char — byte 19 starts é,
+        // so byte 20 is not a boundary; `line[..20]` panicked. No real
+        // proxy-authorization prefix needed.
+        let req = format!(
+            "CONNECT example.com:443 HTTP/1.1\r\n{}\r\n\r\n",
+            "A".repeat(19) + "é"
+        );
+        assert_eq!(extract_proxy_auth(&req), None);
+        // Shape 2: real prefix, Basic value whose byte 6 straddles a char.
+        let req = "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: ééAéX\r\n\r\n";
+        assert_eq!(extract_proxy_auth(req), None);
+        // Shape 3: hostile filler line + valid auth line — the valid line
+        // still matches (skip semantics, not whole-request rejection).
+        let req = format!(
+            "CONNECT example.com:443 HTTP/1.1\r\n{}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+            "é".repeat(30)
+        );
+        let (user, pwd) = extract_proxy_auth(&req).unwrap();
+        assert_eq!((user.as_str(), pwd.as_str()), ("user", "pass"));
     }
 
     #[test]

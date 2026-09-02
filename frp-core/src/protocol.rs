@@ -1112,6 +1112,27 @@ mod tests {
         assert!(result.is_err(), "oversized payload should error");
     }
 
+    #[tokio::test]
+    async fn test_v1_frame_read_rejects_oversized_length_header() {
+        // Read-side length gate: a hostile header declaring > V1_MAX_MSG_LENGTH
+        // (10 KiB) must be rejected from the header alone — deterministically,
+        // before any payload byte is read — not by buffering until EOF. The
+        // peer writes the 9-byte header and nothing else; read_msg_v1 must
+        // error immediately instead of hanging on the payload read.
+        let mut header = vec![msg::TYPE_PING];
+        let length = V1_MAX_MSG_LENGTH as u64 + 1;
+        header.extend_from_slice(&length.to_be_bytes());
+        let (mut client, mut server) = duplex(1024);
+        client.write_all(&header).await.expect("write header");
+        drop(client); // no payload bytes ever arrive
+        let result = read_msg_v1(&mut server).await;
+        let err = result.expect_err("oversized declared length must be rejected");
+        assert!(
+            err.to_string().contains("invalid V1 msg length"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// Round-18-review C-1 (writev partial-progress accounting): the
     /// writev loop's `hdr_off`/`payload_off` bookkeeping has no dedicated
     /// coverage. A transport that accepts only a few bytes per poll must

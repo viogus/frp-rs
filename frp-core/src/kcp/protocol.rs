@@ -250,6 +250,12 @@ pub struct Kcp<Output> {
     /// single `KcpSession` (one driver task), so a plain `Vec` freelist is
     /// safe — no Arc, no lock.
     snd_data_pool: Vec<Vec<u8>>,
+    /// frp-rs patch: receive-side counterpart of `snd_data_pool`. `recv()`
+    /// returns consumed segment payloads here; `input()` reuses a buffer
+    /// instead of a fresh `Vec::with_capacity` per PUSH segment (~24
+    /// segments per 32 KiB bridge chunk). Same cap and single-owner rules
+    /// as the send-side pool.
+    rcv_data_pool: Vec<Vec<u8>>,
 
     /// Pending ACKs `(sn, ts)`.
     acklist: VecDeque<(u32, u32)>,
@@ -354,6 +360,7 @@ impl<Output> Kcp<Output> {
             snd_buf: VecDeque::new(),
             rcv_buf: VecDeque::new(),
             snd_data_pool: Vec::new(),
+            rcv_data_pool: Vec::new(),
             acklist: VecDeque::new(),
             buf: Vec::with_capacity((KCP_MTU_DEF + KCP_OVERHEAD) * 3),
             fastresend: 0,
@@ -372,6 +379,20 @@ impl<Output> Kcp<Output> {
     fn recycle_segment_data(&mut self, seg: KcpSegment) {
         if !seg.data.is_empty() && self.snd_data_pool.len() < KCP_SEGMENT_POOL_CAP {
             self.snd_data_pool.push(seg.data);
+        }
+    }
+
+    /// frp-rs patch: receive-side counterpart of [`Self::recycle_segment_data`]
+    /// — return a dropped segment's payload to `rcv_data_pool`. Covers every
+    /// path where a PUSH segment leaves the state machine without being
+    /// stored: `recv()` consumption, the in-window duplicate (repeat) arm and
+    /// the out-of-window / stale early return in `parse_data`. Without these,
+    /// a retransmit flood would drain every buffer `input()` popped from the
+    /// pool (perf-only: `recv()` would refill it).
+    #[inline]
+    fn recycle_rcv_data(&mut self, seg: KcpSegment) {
+        if !seg.data.is_empty() && self.rcv_data_pool.len() < KCP_SEGMENT_POOL_CAP {
+            self.rcv_data_pool.push(seg.data);
         }
     }
 
@@ -412,12 +433,15 @@ impl<Output> Kcp<Output> {
 
         let recover = self.rcv_queue.len() >= self.rcv_wnd as usize;
 
-        // Merge fragment chain.
+        // Merge fragment chain. frp-rs patch: consumed payloads are recycled
+        // into `rcv_data_pool` (F3 mirror) instead of freed; the cap keeps
+        // the cache bounded exactly like the send-side pool.
         let mut cur = Cursor::new(buf);
         while let Some(seg) = self.rcv_queue.pop_front() {
+            let chain_end = seg.frg == 0;
             cur.write_all(&seg.data)?;
-
-            if seg.frg == 0 {
+            self.recycle_rcv_data(seg);
+            if chain_end {
                 break;
             }
         }
@@ -602,11 +626,13 @@ impl<Output> Kcp<Output> {
                 cmp::Ordering::Equal => {
                     // frp-rs patch: recycle the ACKed segment's payload (F3).
                     // `i` was found by the loop, so `i < snd_buf.len()` is a
-                    // loop invariant — a panic here is unreachable (round-18
-                    // review: expect → debug_assert; the cost of a wrong
-                    // guess is a skipped recycle, not a crash). The slot is
-                    // an `Option` (kcp-go's sparse send buffer), but the
-                    // matching segment at `i` is by definition `Some`.
+                    // loop invariant — the expect is unreachable (round-18
+                    // review: index check → debug_assert; the cost of a
+                    // wrong guess is a skipped recycle, not a crash).
+                    // `VecDeque::remove` returns `None` only for an
+                    // out-of-range index — the buffer is never sparse (no
+                    // kcp-go-style nil slots) — so the unwrap is guarded by
+                    // the loop bound above, not by slot occupancy.
                     debug_assert!(i < self.snd_buf.len());
                     let seg = self.snd_buf.remove(i);
                     self.recycle_segment_data(seg.expect("ACKed segment must be Some"));
@@ -652,6 +678,10 @@ impl<Output> Kcp<Output> {
         let sn = new_segment.sn;
 
         if timediff(sn, self.rcv_nxt + self.rcv_wnd as u32) >= 0 || timediff(sn, self.rcv_nxt) < 0 {
+            // Out-of-window / stale (behind rcv_nxt): the buffer `input()`
+            // popped from `rcv_data_pool` returns there instead of being
+            // freed, so a stale-segment flood cannot drain the pool.
+            self.recycle_rcv_data(new_segment);
             return;
         }
 
@@ -671,6 +701,11 @@ impl<Output> Kcp<Output> {
 
         if !repeat {
             self.rcv_buf.insert(new_index, new_segment);
+        } else {
+            // In-window duplicate (network retransmission): not stored, so
+            // recycle its payload — without this a retransmit flood would
+            // drain every buffer popped from the pool.
+            self.recycle_rcv_data(new_segment);
         }
 
         // Move available data from rcv_buf into rcv_queue.
@@ -797,7 +832,18 @@ impl<Output> Kcp<Output> {
                             if len > self.mss {
                                 return Err(Error::InvalidSegmentDataSize(self.mss, len));
                             }
-                            let mut sbuf = Vec::with_capacity(len);
+                            // frp-rs patch (F3 mirror): reuse a recycled
+                            // payload buffer instead of a fresh allocation
+                            // per received segment — the receive-side twin
+                            // of the send path's snd_data_pool pop.
+                            let mut sbuf = match self.rcv_data_pool.pop() {
+                                Some(v) => v,
+                                None => Vec::with_capacity(len),
+                            };
+                            // Reuse-safe: a fresh `with_capacity(len)` needs
+                            // nothing; a recycled buffer may have shrunk
+                            // below `len` (segments vary in size).
+                            sbuf.reserve(len);
                             // SAFETY: read_exact below fills exactly `len`
                             // bytes before returning; on error the Vec is
                             // dropped and `u8` is always-initialized, so the
@@ -1424,12 +1470,157 @@ mod tests {
 
     /// Drive a fresh Kcp through two updates so queued data actually flushes
     /// (the congestion window starts at 0, so the first flush only arms it).
+    /// Note: the caller must `set_nodelay(.., nc=true)` first — without
+    /// nocwnd the cwnd=0 gate below holds every segment in snd_queue until
+    /// the first ACK arrives.
     fn send_and_flush(kcp: &mut Kcp<PacketWriter>, data: &[u8]) {
         kcp.send(data).unwrap();
-        // Default interval is 100ms, so the flush at update(100) moves the
-        // queued segment into snd_buf and writes it to the output.
+        // update(0) arms the flush timer; update(200) is past the interval,
+        // so the queued segment moves into snd_buf and hits the output.
         kcp.update(0).unwrap();
         kcp.update(200).unwrap();
+    }
+
+    // ── receive-side payload recycling (F3 mirror) ───────────────────────
+
+    #[test]
+    fn rcv_data_pool_recycles_consumed_segment_payloads() {
+        let mut out = PacketWriter::default();
+        let mut kcp = Kcp::new_stream(42, &mut out);
+
+        // One PUSH segment: input() allocates the payload buffer, then
+        // recv() hands it back to rcv_data_pool instead of freeing it.
+        let payload = vec![0xAB; 100];
+        kcp.input(&make_push(42, 0, 0, 0, &payload)).unwrap();
+        assert_eq!(kcp.rcv_queue.len(), 1);
+
+        let mut data = [0u8; 100];
+        assert_eq!(kcp.recv(&mut data).unwrap(), 100);
+        assert_eq!(&data[..], &payload[..]);
+        assert_eq!(kcp.rcv_data_pool.len(), 1, "consumed payload recycled");
+        assert_eq!(kcp.rcv_data_pool[0], payload);
+
+        // Second segment: input() pops the pooled buffer instead of
+        // allocating; the pool stays empty until recv() refills it.
+        kcp.input(&make_push(42, 1, 0, 0, &payload)).unwrap();
+        assert!(
+            kcp.rcv_data_pool.is_empty(),
+            "input() must reuse pooled buffers"
+        );
+        assert_eq!(kcp.rcv_queue.len(), 1);
+        assert_eq!(kcp.recv(&mut data).unwrap(), 100);
+        assert_eq!(kcp.rcv_data_pool.len(), 1);
+    }
+
+    #[test]
+    fn rcv_data_pool_respects_cap_under_segment_flood() {
+        let mut out = PacketWriter::default();
+        let mut kcp = Kcp::new_stream(9, &mut out);
+        let payload = vec![0xEF; 60];
+        let mut data = [0u8; 60];
+        // Burst: 2× the cap in flight (rcv_wnd=128 admits them all). recv()
+        // recycles one payload per consumed segment, so the pool must clamp
+        // at KCP_SEGMENT_POOL_CAP, never grow (bounded like the send side).
+        for sn in 0..(KCP_SEGMENT_POOL_CAP as u32 * 2) {
+            kcp.input(&make_push(9, sn, 0, 0, &payload)).unwrap();
+            assert!(kcp.rcv_data_pool.len() <= KCP_SEGMENT_POOL_CAP);
+        }
+        assert_eq!(
+            kcp.rcv_data_pool.len(),
+            0,
+            "pool untouched by the burst: input() only pops (never pushes); \
+             recycling happens solely in recv()"
+        );
+        for _ in 0..(KCP_SEGMENT_POOL_CAP as u32 * 2) {
+            assert_eq!(kcp.recv(&mut data).unwrap(), 60);
+            assert!(kcp.rcv_data_pool.len() <= KCP_SEGMENT_POOL_CAP);
+        }
+        assert_eq!(kcp.rcv_data_pool.len(), KCP_SEGMENT_POOL_CAP);
+    }
+
+    #[test]
+    fn dropped_push_paths_recycle_payloads() {
+        let mut out = PacketWriter::default();
+        let mut kcp = Kcp::new_stream(7, &mut out);
+        let payload = vec![0xCD; 80];
+
+        // In-window duplicate: the repeat arm drops the segment without
+        // inserting it, but its payload returns to the pool (a retransmit
+        // flood of a parked segment cannot drain or grow it — each duplicate
+        // pops exactly the entry it recycles).
+        kcp.input(&make_push(7, 5, 0, 0, &payload)).unwrap(); // out-of-order park
+        kcp.input(&make_push(7, 5, 0, 0, &payload)).unwrap(); // duplicate
+        assert_eq!(kcp.rcv_data_pool.len(), 1, "in-window duplicate recycled");
+        assert_eq!(kcp.rcv_buf.len(), 1, "duplicate not stored twice");
+        for _ in 0..(KCP_SEGMENT_POOL_CAP * 2) {
+            kcp.input(&make_push(7, 5, 0, 0, &payload)).unwrap();
+        }
+        assert_eq!(
+            kcp.rcv_data_pool.len(),
+            1,
+            "retransmit flood neither drains nor grows the pool"
+        );
+        assert_eq!(kcp.rcv_buf.len(), 1);
+
+        // recv() consumes the queued sn0 and refills the pool from it.
+        kcp.input(&make_push(7, 0, 0, 0, &payload)).unwrap(); // moves sn0 → queue
+        let mut data = [0u8; 80];
+        assert_eq!(kcp.recv(&mut data).unwrap(), 80);
+        assert_eq!(&data[..], &payload[..]);
+        assert_eq!(kcp.rcv_data_pool.len(), 1);
+    }
+
+    // ── send-side payload recycling (F3) ─────────────────────────────────
+
+    #[test]
+    fn snd_data_pool_recycles_acked_and_una_discarded_payloads() {
+        let mut out = PacketWriter::default();
+        // Message mode (Kcp::new): each send() produces exactly one segment,
+        // so the pool accounting is unambiguous.
+        let mut kcp = Kcp::new(0x4455_6677, &mut out);
+        kcp.set_nodelay(true, 10, 2, true); // nocwnd: flush moves queued data immediately
+
+        // Two segments in flight; nothing ACKed yet, so the pool is empty.
+        kcp.send(vec![0xAA; 300]).unwrap();
+        kcp.send(vec![0xBB; 300]).unwrap();
+        kcp.update(0).unwrap();
+        kcp.update(200).unwrap();
+        assert_eq!(kcp.snd_buf.len(), 2, "both segments moved into snd_buf");
+        assert!(kcp.snd_data_pool.is_empty(), "nothing ACKed yet");
+
+        // ACK sn=0: parse_ack recycles the oldest segment's payload (F3).
+        kcp.input(&make_ack(0x4455_6677, 0, 128, 0)).unwrap();
+        assert_eq!(kcp.snd_data_pool.len(), 1);
+        assert_eq!(kcp.snd_data_pool[0], vec![0xAA; 300]);
+
+        // ACK sn=1: the pool now holds both retired payloads.
+        kcp.input(&make_ack(0x4455_6677, 1, 128, 0)).unwrap();
+        assert_eq!(kcp.snd_data_pool.len(), 2);
+        assert_eq!(kcp.snd_data_pool[0], vec![0xAA; 300]);
+        assert_eq!(kcp.snd_data_pool[1], vec![0xBB; 300]);
+
+        // send() pops the last retired buffer (LIFO) instead of allocating:
+        // the BB buffer is reused for the CC payload, and the pool shrinks.
+        kcp.send(vec![0xCC; 300]).unwrap();
+        kcp.update(400).unwrap();
+        assert_eq!(
+            kcp.snd_data_pool.len(),
+            1,
+            "send() reused the retired buffer instead of allocating"
+        );
+        assert_eq!(kcp.snd_data_pool[0], vec![0xAA; 300]);
+        assert_eq!(kcp.snd_buf.len(), 1, "CC segment in flight (sn=2)");
+
+        // UNA discard arm: an ACK header with una=3 (byte-patched — make_ack
+        // hardcodes una=0) drops every segment with sn < una; parse_una
+        // recycles the discarded CC payload too.
+        let mut ack = make_ack(0x4455_6677, 0, 128, 0);
+        ack[16..20].copy_from_slice(&3u32.to_le_bytes());
+        kcp.input(&ack).unwrap();
+        assert!(kcp.snd_buf.is_empty(), "una window cleared the buffer");
+        assert_eq!(kcp.snd_data_pool.len(), 2);
+        assert_eq!(kcp.snd_data_pool[0], vec![0xAA; 300]);
+        assert_eq!(kcp.snd_data_pool[1], vec![0xCC; 300]);
     }
 
     // ── 1. 24-byte header encoding / decoding ────────────────────────────

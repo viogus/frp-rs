@@ -709,3 +709,63 @@ async fn mux_writer_stalls_on_window_exhaustion_and_drains_on_peer_read() {
         .expect("writer must finish after the peer drains")
         .expect("write task");
 }
+
+#[tokio::test]
+async fn stream_graceful_shutdown_delivers_clean_eof_and_session_survives() {
+    // Clean half-close: shutting down (FIN) one side of a stream must
+    // surface Ok(0) EOF to the peer's reader while the session and its
+    // other streams stay usable. The bridge/relay paths (plain and
+    // encrypted) depend on this wire shape for half-close EOF. A driver
+    // that dropped the stream instead of FINing it would hang the reader;
+    // one that tore down the session would kill sibling streams.
+    let (_server_control, mut incoming, _client_control, session) =
+        connected_mux_pair(TcpMuxConfig::default(), TcpMuxConfig::default()).await;
+
+    let mut client_stream = tokio::time::timeout(Duration::from_secs(2), session.open_stream())
+        .await
+        .expect("open_stream must resolve")
+        .expect("session must stay open and yield a stream");
+    client_stream.write_all(b"half").await.unwrap();
+    client_stream
+        .shutdown()
+        .await
+        .expect("clean shutdown must FIN");
+
+    let mut server_stream = tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+        .await
+        .expect("server must observe the stream")
+        .expect("session must stay open");
+
+    let mut data = [0u8; 4];
+    server_stream
+        .read_exact(&mut data)
+        .await
+        .expect("server reads the payload");
+    assert_eq!(&data, b"half");
+    let mut byte = [0u8; 1];
+    let n = server_stream
+        .read(&mut byte)
+        .await
+        .expect("EOF read must succeed, not error");
+    assert_eq!(n, 0, "FIN must deliver clean EOF, not a hang");
+
+    // The session survives the half-closed stream: a second stream still
+    // opens and carries data in both directions.
+    let mut second = tokio::time::timeout(Duration::from_secs(2), session.open_stream())
+        .await
+        .expect("second open_stream must resolve")
+        .expect("session must stay open and yield the second stream");
+    second.write_all(b"still alive").await.unwrap();
+    second.shutdown().await.unwrap();
+
+    let mut server_second = tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+        .await
+        .expect("second stream must arrive")
+        .expect("session must stay open");
+    let mut buf = Vec::new();
+    server_second
+        .read_to_end(&mut buf)
+        .await
+        .expect("second payload plus its EOF");
+    assert_eq!(&buf, b"still alive");
+}
