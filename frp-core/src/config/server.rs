@@ -132,7 +132,14 @@ pub struct ServerConfig {
     /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
     /// proxy datagrams. Default: 1500 (Go frp compat).
     /// Go frp compat: udp_packet_size.
-    #[serde(default = "default_udp_packet_size", alias = "udpPacketSize")]
+    /// Clamped at load like the client-side field (client.rs): the UDP bridge
+    /// allocates `vec![0u8; udp_packet_size]` per proxy (bridge.rs), so an
+    /// unclamped hostile value (2^31) would allocate a multi-GiB buffer.
+    #[serde(
+        default = "default_udp_packet_size",
+        alias = "udpPacketSize",
+        deserialize_with = "clamp_udp_packet_size"
+    )]
     pub udp_packet_size: usize,
     /// Server-side HTTP plugin configurations. Each plugin is an external
     /// HTTP service called on lifecycle events (login, new_proxy, close_proxy).
@@ -239,6 +246,19 @@ fn default_user_conn_timeout() -> u64 {
 }
 fn default_udp_packet_size() -> usize {
     1500
+}
+
+/// Maximum UDP payload size (IPv4: 65535 - 8 UDP - 20 IP = 65507). Mirrors
+/// client.rs `MAX_UDP_PACKET_SIZE`; usize cannot be negative so only the
+/// upper bound needs clamping here.
+const MAX_UDP_PACKET_SIZE: usize = 65507;
+
+fn clamp_udp_packet_size<'de, D>(d: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = usize::deserialize(d)?;
+    Ok(v.min(MAX_UDP_PACKET_SIZE))
 }
 
 fn default_nathole_analysis_data_reserve_hours() -> u64 {
@@ -1031,6 +1051,44 @@ mod heartbeat_timeout_tests {
         };
         t.complete_with_heartbeat_timeout_set(true);
         assert_eq!(t.heartbeat_timeout, 7200);
+    }
+}
+
+#[cfg(test)]
+mod udp_packet_size_tests {
+    use super::*;
+
+    fn parse(json: serde_json::Value) -> ServerConfig {
+        serde_json::from_value(json).expect("deserialize ServerConfig")
+    }
+
+    #[test]
+    fn udp_packet_size_clamped_at_load() {
+        // Server-side mirror of the client clamp (client.rs): the UDP
+        // bridge allocates `vec![0u8; udp_packet_size]` per UDP proxy
+        // (frp-server bridge.rs), so an unclamped hostile config value
+        // (2^31) would allocate a multi-GiB receive buffer. Tested through
+        // the real struct attribute (alias + deserialize_with), which the
+        // client-side wrapper test cannot do.
+        let cfg = parse(serde_json::json!({ "bind_port": 7000, "udp_packet_size": 2147483647 }));
+        assert_eq!(cfg.udp_packet_size, 65507, "hostile snake_case clamped");
+        // camelCase alias goes through the same clamp.
+        let cfg = parse(serde_json::json!({ "bind_port": 7000, "udpPacketSize": 999999999 }));
+        assert_eq!(
+            cfg.udp_packet_size, 65507,
+            "hostile camelCase alias clamped"
+        );
+        // Boundary value passes through untouched; default is 1500 (Go).
+        let cfg = parse(serde_json::json!({ "bind_port": 7000, "udp_packet_size": 65507 }));
+        assert_eq!(cfg.udp_packet_size, 65507);
+        let cfg = parse(serde_json::json!({ "bind_port": 7000 }));
+        assert_eq!(cfg.udp_packet_size, 1500, "server default 1500 pinned");
+        // Non-integer still fails deserialization.
+        assert!(serde_json::from_value::<ServerConfig>(serde_json::json!({
+            "bind_port": 7000,
+            "udp_packet_size": "big"
+        }))
+        .is_err());
     }
 }
 
