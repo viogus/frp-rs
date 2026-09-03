@@ -2560,8 +2560,17 @@ mod tests {
             std::future::pending::<()>().await
         });
 
+        // Both connector builds write the SINGLE-slot CONNECTOR_CACHE;
+        // serialize against cache_behavior (tls.rs), whose delta assertions
+        // flake when a foreign build evicts its entry mid-test. The guard is
+        // scoped to this sync region only (no .await under it — clippy
+        // 1.96 `held across an await point`).
+        let _build_serial = crate::transport::tls::CONNECTOR_BUILD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let connector = build_tls_connector_skip_verify(None, None, None, true).unwrap();
         let server_name = || rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        drop(_build_serial);
 
         // Positive: the bounded helper returns TimedOut well under the
         // injected 250ms deadline, not after the OS-level TCP timeout.

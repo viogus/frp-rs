@@ -674,6 +674,17 @@ static CONNECTOR_KEY_CACHE: std::sync::RwLock<Option<(ConnectorInputs, Connector
 static CONNECTOR_CACHE: std::sync::RwLock<Option<(ConnectorKey, TlsConnector)>> =
     std::sync::RwLock::new(None);
 
+// Test-only serialization: CONNECTOR_CACHE is a single slot, so a connector
+// build from ANY test evicts the previous entry. `cache_behavior` asserts
+// build-count deltas across adjacent calls, and
+// `transport::tests::tls_client_handshake_is_bounded_against_silent_acceptor`
+// (transport/mod.rs) builds a skip-verify connector mid-handshake — when the
+// two overlap, the slot clobber makes the delta assertion flake (hit once on
+// CI 2026-09-03). Both tests hold this lock so only one connector-building
+// test runs at a time.
+#[cfg(test)]
+pub(crate) static CONNECTOR_BUILD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Minimum interval between skip-verify warnings. The first occurrence logs
 /// immediately at warn level (the security value); repeat occurrences
 /// within the window are suppressed, then re-logged once per window at warn
@@ -1157,6 +1168,12 @@ mod connector_cache_tests {
 
     #[test]
     fn cache_behavior() {
+        // Serialize against every other connector-building test (see
+        // CONNECTOR_BUILD_TEST_LOCK): the single cache slot cannot serve two
+        // concurrent delta-assertion streams.
+        let _build_serial = super::CONNECTOR_BUILD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 1) Cache hit: identical args must not rebuild.
         let before = connector_build_count();
         let _ = build_tls_connector_skip_verify(None, None, None, false).unwrap();
