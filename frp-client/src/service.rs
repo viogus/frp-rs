@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 #[cfg(all(feature = "vnet", test))]
@@ -2411,11 +2413,15 @@ impl Service {
         ctx: &mut SessionCtx,
         channels: &mut SessionChannels<'_>,
     ) -> LoopExit {
-        // The message loop owns the split reader half.
-        let mut reader = ctx
-            .reader
-            .take()
-            .expect("reader available before message loop");
+        // The message loop owns the split reader half. It is shared with
+        // the persisted read future below via an async Mutex: the future
+        // holds the guard only while a frame is being read (control-plane
+        // rate), and no other loop arm touches `reader`.
+        let reader = Arc::new(Mutex::new(
+            ctx.reader
+                .take()
+                .expect("reader available before message loop"),
+        ));
 
         // Control writes are funneled through the writer handle
         // (always set by phase 5 before the loop starts).
@@ -2475,9 +2481,65 @@ impl Service {
         // when the proxy leaves StartErr.
         let mut last_start_err: HashMap<String, Instant> = HashMap::new();
 
+        // Persist a partial control-frame read across select iterations
+        // (audit finding S3 — HIGH; exact mirror of the server round-14 fix
+        // in frp-server/src/control/mod.rs, whose fairness regression test
+        // this comment chain mirrors too): the select drops every branch
+        // future when another arm wins, and `read_msg`'s two-phase framing
+        // (read_exact header, then read_exact payload) keeps its partial
+        // state only in the branch future's locals. A peer that splits a
+        // frame across two writes while a competing arm wins mid-frame
+        // (heartbeat ping tick, proxy-retry tick, health/reload/xtcp/
+        // visitor/stop event, heartbeat watchdog, writer failure) would
+        // lose the consumed bytes; the next iteration would parse the frame
+        // tail as a fresh header — a garbage type/length → protocol error →
+        // LoopExit::Reconnect → infinite reconnect churn under a
+        // slow-dribbling peer. The boxed future survives the select, so
+        // consumed bytes are retained until the frame completes. The loop
+        // shape stays fair (no biased branch ordering — tokio::select!
+        // without `biased;` randomizes Ready-branch order each round): the
+        // read still progresses only at loop top, exactly like a fresh
+        // future would, and a mid-frame read is NOT polled again until the
+        // select round that follows the competing arm's body. Correctness
+        // never relies on the read winning — the future lives in the
+        // loop-outer Option, so a lost round drops the branch's reference,
+        // not the future: a completed read stays Ready and wins the first
+        // round in which no earlier arm is also Ready (a Ready future needs
+        // no waker to make progress), and a partial read keeps its consumed
+        // bytes until completion. The arm body's reset below therefore can
+        // never strand a completed future.
+        //
+        // The future owns an Arc<Mutex<BoxedReadHalf>> clone and locks
+        // inside its own poll, so it borrows nothing from the loop — a
+        // loop-local borrow could not be stored across select iterations
+        // (the Option's type region would keep the borrow alive for the
+        // whole loop, conflicting with the loop-top recreation below).
+        type PendingRead =
+            Pin<Box<dyn Future<Output = Result<FrpMessage, frp_core::Error>> + Send>>;
+        let mut pending_read: Option<PendingRead> = None;
+
         loop {
+            // Recreate the control-read future when the previous frame
+            // completed (the arm body detached it). Starts a fresh read at
+            // the next frame boundary. The async block owns an Arc clone
+            // and takes the lock only while the frame is in flight.
+            if pending_read.is_none() {
+                let reader = reader.clone();
+                let v2 = ctx.v2;
+                pending_read = Some(Box::pin(async move {
+                    let mut guard = reader.lock().await;
+                    read_msg(&mut *guard, v2).await
+                }));
+            }
             tokio::select! {
-                msg = read_msg(&mut reader, ctx.v2) => {
+                msg = pending_read.as_mut().expect("pending read armed at loop top") => {
+                    // Detach the completed future before handling the
+                    // message: the select has dropped the branch future,
+                    // and the loop-top `if pending_read.is_none()` above
+                    // recreates a fresh one for the next frame. A
+                    // `continue` inside the message match below therefore
+                    // also restarts the read at the next frame boundary.
+                    pending_read = None;
                     match msg {
                         Ok(FrpMessage::ReqWorkConn(_)) => {
                             // Shared with the registration read loop above.

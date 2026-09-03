@@ -845,18 +845,25 @@ async fn handle_store_proxy_create(
 /// Clean up server-side port allocation for a deleted proxy, mirroring the
 /// client CloseProxy path (`control/proxy.rs`): TCP group ports are only
 /// released for the last group member (the shared listener still owns the
-/// port otherwise), the group listener is stopped for the final member, and
-/// the per-client port count is decremented. The dashboard delete paths used
-/// to skip all three — leaking port quota (`max_ports_per_client`) and
+/// port otherwise) and the group listener is stopped for the final member.
+/// The dashboard delete paths used to skip these — leaking port quota and
 /// leaving zombie group listeners holding ports until frps restarts.
 ///
-/// Callers invoke this AFTER `proxy_manager.remove()` — M5 race-safe
-/// ordering: the group-last check then counts only surviving members (the
-/// deleted one is gone), so a dashboard delete racing a client CloseProxy
-/// cannot have both paths snapshot the pre-removal length and both skip the
-/// teardown. (For the same reason the SUDP owner-check below counts only the
-/// other live udp/sudp proxies — identical to the pre-removal semantics,
-/// which excluded the deleted proxy explicitly.)
+/// The per-client port-count decrement does NOT live here: it is released by
+/// `crate::control::remove_proxy_and_release_client_counts` (the caller's
+/// registry removal, gated on remove()'s result — S4). A dashboard delete
+/// racing a client CloseProxy can have both paths observe the same proxy
+/// before either removes it; only the path whose remove() returned true may
+/// release the counters, so both delete paths call the shared helper FIRST
+/// and invoke this mark-cleanup only on its success.
+///
+/// Callers invoke this AFTER the winning `proxy_manager.remove()` — M5
+/// race-safe ordering: the group-last check then counts only surviving
+/// members (the deleted one is gone), so a dashboard delete racing a client
+/// CloseProxy cannot have both paths snapshot the pre-removal length and
+/// both skip the teardown. (For the same reason the SUDP owner-check below
+/// counts only the other live udp/sudp proxies — identical to the
+/// pre-removal semantics, which excluded the deleted proxy explicitly.)
 async fn cleanup_deleted_proxy_port(state: &Arc<AppState>, proxy: &crate::proxy::ProxyInfo) {
     let is_tcp_group =
         proxy.proxy_type == "tcp" && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some();
@@ -875,23 +882,6 @@ async fn cleanup_deleted_proxy_port(state: &Arc<AppState>, proxy: &crate::proxy:
             crate::control::release_udp_port_with_owner_check(state, port, &proxy.name).await;
         } else if !is_tcp_group || last_group_member {
             state.used_ports.write().await.remove(&port);
-        }
-        // Decrement per-client port count (matching Go frp's portsUsedNum).
-        // Only proxies that actually consumed a port were counted (audit
-        // finding 1 symmetry): http/https/tcpmux/stcp/xtcp delete with
-        // remote_port Some(0) and must not decrement — repeated deletes of
-        // non-consuming proxies would drive the shared budget counter down
-        // while live tcp/udp proxies still consume ports, letting the
-        // max_ports_per_client gate undercount.
-        if matches!(proxy.proxy_type.as_str(), "tcp" | "udp" | "sudp") && port > 0 {
-            let run_id = &proxy.run_id;
-            let mut port_counts = state.client_ports_used.write().await;
-            if let Some(count) = port_counts.get_mut(run_id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    port_counts.remove(run_id);
-                }
-            }
         }
     }
     // Stop the shared TCP group listener when the last member closes so it
@@ -951,21 +941,23 @@ async fn handle_store_proxy_delete(
         state.tcpmux_manager.unregister(&name).await;
     }
     state.proxy_metrics.remove(&name).await;
-    // Decrement the SNI-sniff gate count only when the proxy was actually
-    // removed — the client CloseProxy path races this handler and both may
-    // observe the proxy before either removes it. A double decrement would
-    // leave https_proxy_count at 0 while https proxies still exist, silently
-    // disabling SNI sniff (HTTPS vhost routing) until the next lifecycle
-    // event.
-    if state.proxy_manager.remove(&name).await && proxy.proxy_type == "https" {
-        state.dec_https_proxy_count();
+    // Remove the proxy and release the counters it owns (https SNI-sniff
+    // gate count, per-client port-budget slot) ONLY when this call actually
+    // performed the removal — the client CloseProxy handler races this path
+    // and both may observe the proxy before either removes it. A double
+    // release would decrement client_ports_used twice (S4: the budget drifts
+    // below the live count and max_ports_per_client admits extra proxies)
+    // and leave https_proxy_count at 0 while https proxies still exist,
+    // silently disabling SNI sniff (HTTPS vhost routing).
+    if crate::control::remove_proxy_and_release_client_counts(&state, &proxy).await {
+        // Clean up port marks AFTER the registry removal (TCP/UDP manager,
+        // TCP group last-member semantics — same lifecycle as the client
+        // CloseProxy path). M5: post-remove the group-last check counts only
+        // surviving members, so a delete racing a client CloseProxy cannot
+        // double-skip the shared-listener teardown. Skipped on a lost race:
+        // the path that actually removed the proxy ran its own cleanup.
+        cleanup_deleted_proxy_port(&state, &proxy).await;
     }
-    // Clean up port AFTER the registry removal (TCP/UDP manager, TCP group
-    // last-member semantics and per-client port quota — same lifecycle as
-    // the client CloseProxy path). M5: post-remove the group-last check
-    // counts only surviving members, so a delete racing a client CloseProxy
-    // cannot double-skip the shared-listener teardown.
-    cleanup_deleted_proxy_port(&state, &proxy).await;
     // Remove from store if present
     state.proxy_config_store.write().await.remove(&name);
 
@@ -1031,16 +1023,18 @@ async fn handle_proxies_delete(
                 state.tcpmux_manager.unregister(name).await;
             }
             state.proxy_metrics.remove(name).await;
-            // Decrement the SNI-sniff gate count only when the proxy was
-            // actually removed — CloseProxy / client disconnect race this
-            // bulk delete, and a double decrement would leave
+            // Remove the proxy and release the counters it owns (https
+            // SNI-sniff gate count, per-client port-budget slot) ONLY when
+            // this call actually performed the removal — CloseProxy / client
+            // disconnect race this bulk delete, and a double release would
+            // double-decrement client_ports_used (S4) and leave
             // https_proxy_count at 0 while https proxies still exist.
-            if state.proxy_manager.remove(name).await && proxy.proxy_type == "https" {
-                state.dec_https_proxy_count();
+            if crate::control::remove_proxy_and_release_client_counts(&state, &proxy).await {
+                // Port-mark cleanup AFTER the registry removal — same M5
+                // race-safe ordering as the single-delete path. Skipped on a
+                // lost race: the winner ran its own cleanup.
+                cleanup_deleted_proxy_port(&state, &proxy).await;
             }
-            // Port cleanup AFTER the registry removal — same M5 race-safe
-            // ordering as the single-delete path.
-            cleanup_deleted_proxy_port(&state, &proxy).await;
             state.proxy_config_store.write().await.remove(name);
             deleted.push(name.clone());
         }
@@ -3260,14 +3254,17 @@ mod cleanup_deleted_proxy_port_tests {
     use super::*;
     use crate::control::proxy_ops::unregister_generation_tests::{proxy_info, test_state};
 
-    /// Finding-1 symmetry (review round 1): deleting a proxy that never
-    /// consumed a port (http/https/tcpmux/stcp/xtcp register with
-    /// remote_port Some(0)) must not decrement client_ports_used — the
-    /// increment side is gated on `tcp|udp|sudp && port > 0`, so the
-    /// dashboard delete must mirror it. Before the fix, repeated deletes of
-    /// non-consuming proxies drove the shared budget counter down while live
-    /// tcp/udp proxies still consumed ports, letting the max_ports_per_client
-    /// gate undercount.
+    /// Finding-1 symmetry (review round 1) + S4: the per-client count is
+    /// released by the shared removal helper (`remove_proxy_and_release_client_counts`),
+    /// NOT by `cleanup_deleted_proxy_port` — so this test drives the exact
+    /// handler sequence (helper gated on remove()'s result, then the
+    /// port-mark cleanup). Deleting a proxy that never consumed a port
+    /// (http/https/tcpmux/stcp/xtcp register with remote_port Some(0)) must
+    /// not decrement client_ports_used — the increment side is gated on
+    /// `tcp|udp|sudp && port > 0`, so the dashboard delete must mirror it.
+    /// Before the fix, repeated deletes of non-consuming proxies drove the
+    /// shared budget counter down while live tcp/udp proxies still consumed
+    /// ports, letting the max_ports_per_client gate undercount.
     #[tokio::test]
     async fn delete_non_port_consuming_proxy_keeps_client_count() {
         let state = test_state();
@@ -3284,8 +3281,18 @@ mod cleanup_deleted_proxy_port_tests {
             .await
             .insert("run-1".to_string(), 1);
 
-        // Deleting an http proxy (remote_port Some(0)) must not decrement.
+        // Deleting an http proxy (remote_port Some(0)) must not decrement —
+        // full handler sequence: registered first so the removal is real.
         let http = proxy_info("p-http", "http", "run-1", Some(0), 1);
+        state
+            .proxy_manager
+            .register("run-1".to_string(), http.clone())
+            .await
+            .unwrap();
+        assert!(
+            crate::control::remove_proxy_and_release_client_counts(&state, &http).await,
+            "first delete of a live proxy must perform the removal"
+        );
         cleanup_deleted_proxy_port(&state, &http).await;
         assert_eq!(
             state.client_ports_used.read().await.get("run-1"),
@@ -3294,10 +3301,87 @@ mod cleanup_deleted_proxy_port_tests {
         );
 
         // Deleting the tcp proxy returns the counter to zero and removes it.
+        assert!(
+            crate::control::remove_proxy_and_release_client_counts(&state, &tcp).await,
+            "tcp delete must perform the removal"
+        );
         cleanup_deleted_proxy_port(&state, &tcp).await;
         assert!(
             state.client_ports_used.read().await.get("run-1").is_none(),
             "deleting the last port-consuming proxy must clear the count"
+        );
+    }
+
+    /// S4 regression (audit round 2): the delete sequence must decrement
+    /// client_ports_used exactly once even when it runs twice against the
+    /// same proxy name. A dashboard delete racing the client CloseProxy
+    /// handler (or a concurrent duplicate delete request) has both paths
+    /// fetch the proxy before either removes it; the second path's remove()
+    /// then returns false. The old code decremented the budget slot inside
+    /// `cleanup_deleted_proxy_port` unconditionally, so the losing path
+    /// double-decremented: with two live tcp proxies (count == 2), deleting
+    /// proxy A twice drove the count to 0 while proxy B still consumed a
+    /// port — the budget drifted below the live count and
+    /// max_ports_per_client admitted one extra proxy per double-release.
+    /// The https SNI-sniff gate count is protected by the same gate (the
+    /// https decrement already ran behind remove()'s result).
+    #[tokio::test]
+    async fn double_delete_decrements_client_count_exactly_once() {
+        let state = test_state();
+        let a = proxy_info("p-a", "tcp", "run-1", Some(6001), 1);
+        let b = proxy_info("p-b", "tcp", "run-1", Some(6002), 1);
+        state
+            .proxy_manager
+            .register("run-1".to_string(), a.clone())
+            .await
+            .unwrap();
+        state
+            .proxy_manager
+            .register("run-1".to_string(), b.clone())
+            .await
+            .unwrap();
+        state
+            .client_ports_used
+            .write()
+            .await
+            .insert("run-1".to_string(), 2);
+
+        // First delete of p-a: the winning path. remove() returns true, the
+        // helper releases one slot, the port-mark cleanup runs.
+        assert!(
+            crate::control::remove_proxy_and_release_client_counts(&state, &a).await,
+            "first delete must perform the removal"
+        );
+        cleanup_deleted_proxy_port(&state, &a).await;
+        assert_eq!(
+            state.client_ports_used.read().await.get("run-1"),
+            Some(&1),
+            "first delete must release exactly one budget slot (p-b still live)"
+        );
+
+        // Second delete of p-a: the losing path of the race. remove()
+        // returns false, so the helper must release NOTHING — the old code
+        // decremented again here (1 -> 0) while p-b still consumed its port.
+        assert!(
+            !crate::control::remove_proxy_and_release_client_counts(&state, &a).await,
+            "second delete must NOT perform the removal"
+        );
+        cleanup_deleted_proxy_port(&state, &a).await;
+        assert_eq!(
+            state.client_ports_used.read().await.get("run-1"),
+            Some(&1),
+            "a lost race must not double-decrement the budget (S4)"
+        );
+
+        // Deleting the surviving proxy now clears the count.
+        assert!(
+            crate::control::remove_proxy_and_release_client_counts(&state, &b).await,
+            "deleting p-b must perform the removal"
+        );
+        cleanup_deleted_proxy_port(&state, &b).await;
+        assert!(
+            state.client_ports_used.read().await.get("run-1").is_none(),
+            "deleting the last live proxy must clear the count"
         );
     }
 
