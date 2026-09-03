@@ -190,6 +190,8 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
             ctx.state.tcpmux_manager.unregister(&cp.proxy_name).await;
         }
         ctx.state.proxy_metrics.remove(&cp.proxy_name).await;
+        #[cfg(feature = "dashboard")]
+        crate::metrics::prom::proxy_removed(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
         {
             ctx.state

@@ -699,6 +699,16 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         "keep-alive:",
         "expect:",
     ];
+    // A configured X-Forwarded-For replaces the chain (Go Header.Set runs
+    // after SetXForwarded) — computed before the loop because both the
+    // replace-mode and the peer-append mode must suppress the inbound line
+    // (R5: pre-fix the no-peer plugins emitted the configured value twice,
+    // once in the request_headers loop and once below, plus the inbound
+    // line).
+    let configured_xff = request_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+        .map(|(_, v)| v.clone());
     // Inbound X-Forwarded-For chain, preserved by the https plugins (Go
     // SetXForwarded appends the peer to the existing chain).
     let mut prior_xff: Vec<String> = Vec::new();
@@ -707,11 +717,14 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         if line.is_empty() {
             continue;
         }
-        // When appending the peer IP (https plugins), the inbound
-        // X-Forwarded-For line is collected here and re-emitted canonically
-        // after the loop — the original line must not pass through as well,
-        // or the backend sees two X-Forwarded-For headers.
-        if x_forwarded_for.is_some() && starts_with_ignore_ascii_case(line, "x-forwarded-for:") {
+        // When appending the peer IP (https plugins) OR replacing the chain
+        // with a configured value, the inbound X-Forwarded-For line is
+        // collected here and re-emitted canonically after the loop — the
+        // original line must not pass through as well, or the backend sees
+        // two X-Forwarded-For headers.
+        if (x_forwarded_for.is_some() || configured_xff.is_some())
+            && starts_with_ignore_ascii_case(line, "x-forwarded-for:")
+        {
             if let Some(v) = line.split_once(':').map(|(_, v)| v.trim().to_string()) {
                 if !v.is_empty() {
                     prior_xff.push(v);
@@ -772,19 +785,18 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // "host" is skipped: Go's req.Header.Set cannot set Host — it is
     // controlled by hostHeaderRewrite (or the original request).
     // Names/values are sanitized against CR/LF like every other header.
-    // X-Forwarded-For is skipped here when the https plugins append the
-    // peer: it is emitted canonically below — Go's Header.Set runs AFTER
-    // SetXForwarded, so a configured value replaces the appended chain
-    // (emitting both would give the backend two X-Forwarded-For lines).
-    let configured_xff = request_headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
-        .map(|(_, v)| v.clone());
+    // X-Forwarded-For is skipped here whenever a canonical tail line will
+    // be emitted (peer-append mode OR a configured value): it is emitted
+    // canonically below — Go's Header.Set runs AFTER SetXForwarded, so a
+    // configured value replaces the appended chain (emitting both would
+    // give the backend two X-Forwarded-For lines).
     for (k, v) in request_headers {
         if k.eq_ignore_ascii_case("host") {
             continue;
         }
-        if x_forwarded_for.is_some() && k.eq_ignore_ascii_case("x-forwarded-for") {
+        if (x_forwarded_for.is_some() || configured_xff.is_some())
+            && k.eq_ignore_ascii_case("x-forwarded-for")
+        {
             continue;
         }
         let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
@@ -1577,6 +1589,124 @@ mod tests {
         assert_eq!(
             resolve_content_length("Content-Length: abc".lines()).unwrap(),
             None
+        );
+    }
+
+    /// Drive `read_request_and_build_forward` over a duplex stream and
+    /// return the forwarded head.
+    async fn build_forward(
+        raw_head: &[u8],
+        request_headers: &std::collections::HashMap<String, String>,
+        x_forwarded_for: Option<std::net::IpAddr>,
+    ) -> String {
+        use tokio::io::AsyncWriteExt;
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+        client_io.write_all(raw_head).await.unwrap();
+        client_io.flush().await.unwrap();
+        let fwd =
+            read_request_and_build_forward(&mut server_io, "", request_headers, x_forwarded_for)
+                .await
+                .expect("forward build");
+        fwd.head
+    }
+
+    fn xff_lines(head: &str) -> Vec<&str> {
+        head.lines()
+            .filter(|l| starts_with_ignore_ascii_case(l, "x-forwarded-for:"))
+            .collect()
+    }
+
+    /// R5 pin: the https plugins (peer-present) append the tunnel peer to
+    /// the INBOUND X-Forwarded-For chain — one canonical line, the chain
+    /// preserved and extended (Go SetXForwarded semantics).
+    #[tokio::test]
+    async fn forward_xff_appends_peer_to_inbound_chain() {
+        let head = build_forward(
+            b"GET /p HTTP/1.1\r\nHost: b\r\nX-Forwarded-For: 1.2.3.4, 5.6.7.8\r\nUser-Agent: t\r\n\r\n",
+            &Default::default(),
+            Some("203.0.113.9".parse().unwrap()),
+        )
+        .await;
+        let lines = xff_lines(&head);
+        assert_eq!(lines.len(), 1, "exactly one XFF line, got: {lines:?}");
+        assert_eq!(
+            lines[0].trim(),
+            "X-Forwarded-For: 1.2.3.4, 5.6.7.8, 203.0.113.9",
+            "inbound chain preserved and peer appended"
+        );
+    }
+
+    /// R5 pin: a configured X-Forwarded-For REPLACES the appended chain
+    /// (peer + inbound) — one canonical line with the configured value only
+    /// (Go Header.Set runs after SetXForwarded).
+    #[tokio::test]
+    async fn forward_configured_xff_replaces_chain() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Forwarded-For".to_string(), "cfg-value".to_string());
+        let head = build_forward(
+            b"GET /p HTTP/1.1\r\nHost: b\r\nX-Forwarded-For: 1.2.3.4, 5.6.7.8\r\n\r\n",
+            &headers,
+            Some("203.0.113.9".parse().unwrap()),
+        )
+        .await;
+        let lines = xff_lines(&head);
+        assert_eq!(lines.len(), 1, "exactly one XFF line, got: {lines:?}");
+        assert_eq!(
+            lines[0].trim(),
+            "X-Forwarded-For: cfg-value",
+            "configured value replaces the chain (no chain, no peer)"
+        );
+        assert!(
+            !head.contains("1.2.3.4") && !head.contains("203.0.113.9"),
+            "chain and peer must not leak alongside the configured value"
+        );
+    }
+
+    /// R5 pin: the http2http/http2https plugins (peer absent) pass an
+    /// inbound X-Forwarded-For through untouched — single line, verbatim.
+    #[tokio::test]
+    async fn forward_xff_passthrough_when_no_peer() {
+        let head = build_forward(
+            b"GET /p HTTP/1.1\r\nHost: b\r\nX-Forwarded-For: 9.9.9.9\r\n\r\n",
+            &Default::default(),
+            None,
+        )
+        .await;
+        let lines = xff_lines(&head);
+        assert_eq!(lines.len(), 1, "exactly one XFF line, got: {lines:?}");
+        assert_eq!(
+            lines[0].trim(),
+            "X-Forwarded-For: 9.9.9.9",
+            "inbound XFF passes through verbatim when no peer appends"
+        );
+    }
+
+    /// R5 pin (divergence regression): a configured X-Forwarded-For in the
+    /// no-peer plugins must STILL be exactly one header — Go Header.Set
+    /// replaces the inbound value whether or not ReverseProxy later appends
+    /// a peer. Pre-fix this emitted the configured value twice (once in the
+    /// request_headers loop, once in the canonical tail) plus the inbound
+    /// chain.
+    #[tokio::test]
+    async fn forward_configured_xff_single_line_without_peer() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Forwarded-For".to_string(), "cfg-value".to_string());
+        let head = build_forward(
+            b"GET /p HTTP/1.1\r\nHost: b\r\nX-Forwarded-For: 1.2.3.4\r\n\r\n",
+            &headers,
+            None,
+        )
+        .await;
+        let lines = xff_lines(&head);
+        assert_eq!(lines.len(), 1, "exactly one XFF line, got: {lines:?}");
+        assert_eq!(
+            lines[0].trim(),
+            "X-Forwarded-For: cfg-value",
+            "configured value is the only XFF line even without a peer"
+        );
+        assert!(
+            !head.contains("1.2.3.4"),
+            "inbound chain must not leak alongside the configured value"
         );
     }
 }

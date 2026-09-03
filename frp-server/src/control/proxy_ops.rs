@@ -3135,6 +3135,8 @@ pub(crate) async fn unregister_control(
             state.tcpmux_manager.unregister(&p.name).await;
         }
         state.proxy_metrics.remove(&p.name).await;
+        #[cfg(feature = "dashboard")]
+        crate::metrics::prom::proxy_removed(&p.name).await;
     }
     #[cfg(feature = "vnet")]
     {

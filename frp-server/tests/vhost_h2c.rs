@@ -992,3 +992,56 @@ async fn test_h2c_malformed_chunk_tail_resets_stream() {
         String::from_utf8_lossy(&got)
     );
 }
+
+/// T10: a backend response with NO Content-Length and NO Transfer-Encoding is
+/// close-delimited — the server must stream the body to EOF on the work conn
+/// and end the h2 stream cleanly (no CL/TE → the round-8/13 read-to-EOF
+/// branch in stream_h2_response; Go reverse-proxy semantics for HTTP/1.1
+/// responses without length framing).
+#[tokio::test]
+async fn test_h2c_close_delimited_backend_response() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-close-delimited", "closedelimited.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://closedelimited.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    let head = read_request_bytes(&mut work_conn).await;
+    assert!(
+        String::from_utf8_lossy(&head).contains("Host: closedelimited.example.com\r\n"),
+        "head: {:?}",
+        String::from_utf8_lossy(&head)
+    );
+
+    // Backend writes a head + body with NO length framing, then closes the
+    // work conn — the only legal end-of-body signal for this response.
+    work_conn
+        .write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: text/plain\r\n\
+              \r\n\
+              close-delimited body line 1\r\n\
+              close-delimited body line 2",
+        )
+        .await
+        .expect("write backend response");
+    drop(work_conn); // EOF delimits the body
+
+    // The full body must arrive with a clean end_stream (read_h2_body's
+    // `chunk.expect` panics on any RST_STREAM or error frame — a truncated
+    // or error-terminated stream fails here, not silently).
+    let response = response_fut.await.expect("h2 response");
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(!response.headers().contains_key("content-length"));
+    let body = read_h2_body(response.into_body()).await;
+    assert_eq!(
+        body, b"close-delimited body line 1\r\nclose-delimited body line 2",
+        "close-delimited body must be streamed byte-exact to EOF"
+    );
+}

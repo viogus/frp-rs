@@ -2142,4 +2142,172 @@ mod tests {
         // treated as complete) is a protocol error, not a data frame.
         expect_protocol_error(ws_masked_frame_raw(0x00, 3, true, b"abc"), "continuation").await;
     }
+
+    /// Masked control frame builder (client-mode wire shape: MASK bit + a
+    /// fresh random key). Payload must be ≤ 125 bytes (control-frame rule).
+    fn ws_masked_control_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() <= 125, "control frame payload cap");
+        let mask: [u8; 4] = rand::random();
+        let mut frame = vec![0x80 | opcode, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i & 3]);
+        }
+        frame
+    }
+
+    /// Unmask a masked server→client (client-mode outbound) frame payload:
+    /// returns (header_len, payload). Header is 2 + 4 mask bytes for
+    /// payloads ≤ 125.
+    fn ws_unmask_payload(frame: &[u8]) -> (usize, Vec<u8>) {
+        assert!(frame.len() >= 6, "masked frame too short");
+        assert_eq!(frame[1] & 0x80, 0x80, "expected MASK bit set");
+        let mask = &frame[2..6];
+        let payload = frame[6..]
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ mask[i & 3])
+            .collect::<Vec<u8>>();
+        (6, payload)
+    }
+
+    /// Server mode, inbound MASKED ping with a payload (the client-mode wire
+    /// shape): the pong must echo the payload unmasked (server-mode replies
+    /// are never masked — RFC 6455 §5.3), and the ping must NOT surface as
+    /// data — the read stays parked. Control-frame pin (T11).
+    #[tokio::test]
+    async fn ws_server_mode_echoes_masked_ping_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), false); // server mode
+
+        let ping_payload = b"ping-with-payload";
+        raw.write_all(&ws_masked_control_frame(0x09, ping_payload))
+            .await
+            .unwrap();
+
+        let read_task = tokio::spawn(async move {
+            let mut out = [0u8; 4];
+            let _ = timeout(Duration::from_millis(200), ws.read(&mut out)).await;
+        });
+
+        // Server-mode pong: unmasked (no MASK bit), payload echoed verbatim.
+        let mut pong = vec![0u8; 2 + ping_payload.len()];
+        let n = timeout(Duration::from_secs(5), raw.read(&mut pong))
+            .await
+            .expect("pong must arrive")
+            .expect("read pong");
+        assert_eq!(n, pong.len(), "2 header + echoed payload");
+        assert_eq!(pong[0], 0x8a, "FIN + PONG opcode");
+        assert_eq!(pong[1] & 0x80, 0x00, "server-mode pong must be unmasked");
+        assert_eq!(&pong[2..], ping_payload, "pong echoes the ping payload");
+
+        // The ping is a control frame: it must not surface as read data —
+        // the read task stays parked until its timeout fires.
+        read_task.await.expect("read task");
+    }
+
+    /// Client mode, inbound UNMASKED ping with a payload (the server-mode
+    /// wire shape): the pong must be masked with a fresh key and carry the
+    /// SAME payload — unmask it to verify byte-exact echo. Control-frame
+    /// pin (T11).
+    #[tokio::test]
+    async fn ws_client_mode_masks_pong_and_echoes_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), true); // client mode
+
+        let ping_payload = b"client-mode-ping";
+        let mut ping = vec![0x89, ping_payload.len() as u8]; // unmasked ping
+        ping.extend_from_slice(ping_payload);
+        raw.write_all(&ping).await.unwrap();
+
+        let read_task = tokio::spawn(async move {
+            let mut out = [0u8; 4];
+            let _ = timeout(Duration::from_millis(200), ws.read(&mut out)).await;
+        });
+
+        let mut pong = vec![0u8; 2 + 4 + ping_payload.len()];
+        let n = timeout(Duration::from_secs(5), raw.read(&mut pong))
+            .await
+            .expect("pong must arrive")
+            .expect("read pong");
+        read_task.await.expect("read task");
+        assert_eq!(n, pong.len(), "2 header + 4 mask + echoed payload");
+        assert_eq!(pong[0], 0x8a, "FIN + PONG opcode");
+        assert_eq!(pong[1] & 0x80, 0x80, "client-mode pong must be masked");
+        let (_, echoed) = ws_unmask_payload(&pong);
+        assert_eq!(echoed, ping_payload, "masked pong echoes the ping payload");
+    }
+
+    /// Inbound CLOSE (masked, server mode): the stream must reply with an
+    /// unmasked close frame carrying code 1000, and the read must surface
+    /// EOF (0 bytes) — never the close payload as data. Control-frame pin
+    /// (T11).
+    #[tokio::test]
+    async fn ws_server_mode_close_reply_then_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), false); // server mode
+
+        // Masked close with code 1000 (0x03e8), as a compliant client sends.
+        raw.write_all(&ws_masked_control_frame(0x08, &[0x03, 0xe8]))
+            .await
+            .unwrap();
+
+        // Drive the read: the close reply is written, then the read returns
+        // EOF.
+        let mut out = [0u8; 8];
+        let n = timeout(Duration::from_secs(5), ws.read(&mut out))
+            .await
+            .expect("read must return after inbound close")
+            .expect("read ok");
+        assert_eq!(n, 0, "inbound close surfaces as EOF, got {n} bytes of data");
+
+        // Reply close frame: unmasked, code 1000.
+        let mut reply = [0u8; 4];
+        let rn = timeout(Duration::from_secs(5), raw.read(&mut reply))
+            .await
+            .expect("close reply must arrive")
+            .expect("read reply");
+        assert_eq!(rn, 4, "server-mode close reply: 2 header + 2 code bytes");
+        assert_eq!(reply[0], 0x88, "FIN + CLOSE opcode");
+        assert_eq!(
+            reply[1], 0x02,
+            "server-mode reply is unmasked, 2-byte payload"
+        );
+        assert_eq!(&reply[2..], &[0x03, 0xe8], "close code 1000");
+    }
+
+    /// Inbound PONG must be swallowed (never surfaced as data), and frames
+    /// after it must still be delivered. Control-frame pin (T11).
+    #[tokio::test]
+    async fn ws_server_mode_swallows_pong_and_reads_next_frame() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut raw, client_io) = tokio::io::duplex(8192);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), false); // server mode
+
+        // Masked pong with a payload, then a masked binary data frame.
+        raw.write_all(&ws_masked_control_frame(0x0a, b"pong-payload"))
+            .await
+            .unwrap();
+        let data = b"data-after-pong";
+        raw.write_all(&ws_masked_frame(data)).await.unwrap();
+
+        let mut out = vec![0u8; data.len()];
+        let n = ws.read(&mut out).await.expect("read data frame");
+        assert_eq!(
+            n,
+            data.len(),
+            "pong must be swallowed, data frame delivered"
+        );
+        assert_eq!(&out[..n], data);
+    }
 }

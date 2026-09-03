@@ -1882,4 +1882,404 @@ mod tests {
         );
         assert!(elapsed <= 3000, "expected <= 3000 ms, got {elapsed} ms");
     }
+
+    /// Deterministic incompressible payload (xorshift32; not crypto, just
+    /// stable across runs so the Snappy output size is predictable).
+    fn pseudo_random_bytes(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state & 0xff) as u8
+            })
+            .collect()
+    }
+
+    /// Pre-read bytes (the VHost HTTP head) must be charged to the shared
+    /// limiter: with a 1 KB/s bucket (1 KB burst), a 2 KB pre_read forces
+    /// ~0.95 s of debt before the FIRST byte reaches the work side.
+    /// Uncharged (the pre-fix behavior), the head would arrive instantly.
+    /// Limiter-accounting pin (T5): the pre_read charge site.
+    #[tokio::test]
+    async fn test_bridge_plain_rate_limited_pre_read_charged() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, _u_r_test) = tokio::io::duplex(65536);
+
+        let lim = BandwidthLimiter::shared(1024).unwrap();
+        let pre_read = vec![0x5au8; 2000]; // 2 KB pre-read head
+        let body = b"after pre-read".to_vec();
+
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            bridge_plain_rate_limited(
+                u_r_bridge,
+                u_w_bridge,
+                w_r_bridge,
+                w_w_bridge,
+                false,
+                pre_read,
+                Some(&lim),
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Payload is available immediately; the work side only sees bytes
+        // after the pre_read debt is paid (the bridge charges before the
+        // first write).
+        u_w_test.write_all(&body).await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test); // EOF on user_r
+        drop(w_w_test); // EOF on work_r
+
+        let mut buf = vec![0u8; 4096];
+        let mut received = Vec::new();
+        loop {
+            match w_r_test.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        handle.await.unwrap();
+        let elapsed = start.elapsed().as_millis();
+
+        let mut expected = vec![0x5au8; 2000];
+        expected.extend_from_slice(&body);
+        assert_eq!(received, expected, "byte-exact transfer with pre_read");
+        assert!(
+            elapsed >= 400,
+            "pre_read must be charged: 2 KB against a 1 KB burst needs ~0.95 s, got {elapsed} ms"
+        );
+        assert!(elapsed <= 4000, "expected <= 4000 ms, got {elapsed} ms");
+    }
+
+    /// The compressed path must charge comp_buf.len() (the COMPRESSED bytes),
+    /// not the raw input: 8 KB of 'A' under a 1 KB/s limiter arrives almost
+    /// instantly (Snappy squeezes the run to tens of bytes — inside the 1 KB
+    /// burst), but raw-size charging would stall ~7 s. Limiter-accounting
+    /// pin (T5): the compressed-chunk charge site.
+    #[tokio::test]
+    async fn test_bridge_compressed_charges_compressed_size_not_raw() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, _u_r_test) = tokio::io::duplex(65536);
+
+        let lim = BandwidthLimiter::shared(1024).unwrap();
+
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            bridge_plain_rate_limited(
+                u_r_bridge,
+                u_w_bridge,
+                w_r_bridge,
+                w_w_bridge,
+                true,
+                vec![],
+                Some(&lim),
+                None,
+                None,
+            )
+            .await;
+        });
+
+        let data = vec![0x41u8; 8 * 1024]; // 'A' * 8 KiB — Snappy-compressible
+        u_w_test.write_all(&data).await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test);
+        drop(w_w_test);
+
+        // Work side decompresses from byte 0 (production shape).
+        let mut dec = crate::encryption::SnappyDecompressor::new();
+        let mut received = Vec::new();
+        let mut first_byte_ms: Option<u128> = None;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = w_r_test.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let out = dec
+                .feed(&buf[..n])
+                .unwrap_or_else(|e| panic!("decompress from byte 0 failed: {e}"));
+            if !out.is_empty() && first_byte_ms.is_none() {
+                first_byte_ms = Some(start.elapsed().as_millis());
+            }
+            received.extend_from_slice(&out);
+        }
+        // `feed` emits at most one complete frame per call — drain buffered
+        // frames when the last read ended mid-stream.
+        loop {
+            let out = dec
+                .feed(&[])
+                .unwrap_or_else(|e| panic!("decompress drain failed: {e}"));
+            if out.is_empty() {
+                break;
+            }
+            if first_byte_ms.is_none() {
+                first_byte_ms = Some(start.elapsed().as_millis());
+            }
+            received.extend_from_slice(&out);
+        }
+        handle.await.unwrap();
+        let elapsed = start.elapsed().as_millis();
+
+        assert_eq!(received, data, "decompressed payload byte-exact");
+        let ms = first_byte_ms.expect("payload must arrive at the work side");
+        assert!(
+            ms < 1000,
+            "must charge compressed size: 8 KiB of 'A' compresses to ~hundreds of bytes (inside the 1 KB burst), first byte at {ms} ms — raw-size charging would stall ~7 s"
+        );
+        assert!(elapsed <= 2500, "expected <= 2500 ms, got {elapsed} ms");
+    }
+
+    /// The compressed bridge path enforces the limiter on incompressible
+    /// data: ~6 KB of random payload against a 2 KB/s bucket (2 KB burst)
+    /// must stall ~2 s before the work side sees the stream (the compressed
+    /// chunk is charged at its compressed length, which for random data is
+    /// ~the raw length). Limiter-accounting pin (T5): compressed path is
+    /// rate-limited at all.
+    #[tokio::test]
+    async fn test_bridge_compressed_rate_limited_throttles_incompressible() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, _u_r_test) = tokio::io::duplex(65536);
+
+        let lim = BandwidthLimiter::shared(2048).unwrap();
+
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            bridge_plain_rate_limited(
+                u_r_bridge,
+                u_w_bridge,
+                w_r_bridge,
+                w_w_bridge,
+                true,
+                vec![],
+                Some(&lim),
+                None,
+                None,
+            )
+            .await;
+        });
+
+        let data = pseudo_random_bytes(6 * 1024, 0xfeed_beef);
+        u_w_test.write_all(&data).await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test);
+        drop(w_w_test);
+
+        let mut dec = crate::encryption::SnappyDecompressor::new();
+        let mut received = Vec::new();
+        let mut first_byte_ms: Option<u128> = None;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = w_r_test.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let out = dec
+                .feed(&buf[..n])
+                .unwrap_or_else(|e| panic!("decompress from byte 0 failed: {e}"));
+            if !out.is_empty() && first_byte_ms.is_none() {
+                first_byte_ms = Some(start.elapsed().as_millis());
+            }
+            received.extend_from_slice(&out);
+        }
+        loop {
+            let out = dec
+                .feed(&[])
+                .unwrap_or_else(|e| panic!("decompress drain failed: {e}"));
+            if out.is_empty() {
+                break;
+            }
+            if first_byte_ms.is_none() {
+                first_byte_ms = Some(start.elapsed().as_millis());
+            }
+            received.extend_from_slice(&out);
+        }
+        handle.await.unwrap();
+        let elapsed = start.elapsed().as_millis();
+
+        assert_eq!(received, data, "decompressed payload byte-exact");
+        let ms = first_byte_ms.expect("payload must arrive at the work side");
+        assert!(
+            ms >= 900,
+            "compressed path must throttle: ~6 KB of incompressible data against a 2 KB burst needs ~2 s, first byte at {ms} ms"
+        );
+        assert!(ms <= 8000, "expected <= 8000 ms, got {ms} ms");
+        assert!(elapsed <= 9000, "expected <= 9000 ms, got {elapsed} ms");
+    }
+
+    /// AsyncRead wrapper that passes `remaining` bytes through, then fails
+    /// every subsequent read. Used to prove `relay_plain_pooled` propagates a
+    /// direction error instead of parking on the peer's open read half.
+    struct FailAfterRead<R> {
+        inner: R,
+        remaining: usize,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FailAfterRead<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let me = &mut *self;
+            if me.remaining == 0 {
+                return std::task::Poll::Ready(Err(io::Error::other(
+                    "injected relay read failure",
+                )));
+            }
+            let take = buf.remaining().min(me.remaining);
+            let filled = {
+                let init = buf.initialize_unfilled_to(take);
+                let mut sub = tokio::io::ReadBuf::new(init);
+                std::task::ready!(std::pin::Pin::new(&mut me.inner).poll_read(cx, &mut sub))?;
+                sub.filled().len()
+            };
+            me.remaining -= filled;
+            buf.advance(filled);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl<R: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FailAfterRead<R> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// `relay_plain_pooled` direct pin: byte-exact copies in BOTH directions
+    /// over real loopback TCP, and half-close FIN propagation — a write-half
+    /// shutdown at one end must surface as read-EOF at the other (Go
+    /// libio.Join / tokio copy_bidirectional semantics), letting both
+    /// directions end.
+    #[tokio::test]
+    async fn relay_plain_pooled_byte_exact_and_half_close_fin_propagation() {
+        let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = la.local_addr().unwrap();
+        let addr_b = lb.local_addr().unwrap();
+
+        // Test handles (outside) + relay ends (inside).
+        let (conn_a, srv_a) = {
+            let conn_a = tokio::net::TcpStream::connect(addr_a).await.unwrap();
+            let srv_a = la.accept().await.unwrap().0;
+            (conn_a, srv_a)
+        };
+        let (conn_b, srv_b) = {
+            let conn_b = tokio::net::TcpStream::connect(addr_b).await.unwrap();
+            let srv_b = lb.accept().await.unwrap().0;
+            (conn_b, srv_b)
+        };
+        let (mut conn_a, mut conn_b) = (conn_a, conn_b);
+
+        let relay = tokio::spawn(async move { relay_plain_pooled(srv_a, srv_b).await });
+
+        // Direction A -> B.
+        let payload_a2b = pseudo_random_bytes(8192, 0xa2b2_a2b2);
+        conn_a.write_all(&payload_a2b).await.unwrap();
+        // Half-close A's write half: must surface as EOF at B after the data.
+        // tokio's TcpStream::shutdown() closes the write half (sends FIN).
+        conn_a.shutdown().await.unwrap();
+
+        let mut got_a2b = vec![0u8; 8192];
+        conn_b.read_exact(&mut got_a2b).await.unwrap();
+        assert_eq!(got_a2b, payload_a2b, "A -> B byte-exact");
+        let mut eof = [0u8; 1];
+        let n = conn_b.read(&mut eof).await.unwrap();
+        assert_eq!(
+            n, 0,
+            "A's write-half shutdown must propagate as FIN/EOF to B"
+        );
+
+        // Direction B -> A (independent half).
+        let payload_b2a = pseudo_random_bytes(8192, 0xb2a2_b2a2);
+        conn_b.write_all(&payload_b2a).await.unwrap();
+        conn_b.shutdown().await.unwrap();
+
+        let mut got_b2a = vec![0u8; 8192];
+        conn_a.read_exact(&mut got_b2a).await.unwrap();
+        assert_eq!(got_b2a, payload_b2a, "B -> A byte-exact");
+        let n = conn_a.read(&mut eof).await.unwrap();
+        assert_eq!(
+            n, 0,
+            "B's write-half shutdown must propagate as FIN/EOF to A"
+        );
+
+        // Both directions complete -> the relay returns the byte counts.
+        let counts = tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("relay must not hang after both halves close")
+            .unwrap()
+            .expect("relay must succeed");
+        assert_eq!(counts, (8192, 8192), "(A->B, B->A) byte counts");
+    }
+
+    /// `relay_plain_pooled` cancel-on-error pin: when one direction's read
+    /// fails mid-stream (error-injecting wrapper), the sibling direction is
+    /// cancelled and the error propagates — no hang on the peer's still-open
+    /// read half.
+    #[tokio::test]
+    async fn relay_plain_pooled_cancels_sibling_direction_on_error() {
+        let (mut test_a_w, a_r_bridge) = tokio::io::duplex(65536);
+        // Side A fails after 4096 bytes; side B never writes (its read half
+        // stays open forever — a hang pre-fix would park here).
+        let (b_w_bridge, _b_r_bridge) = tokio::io::duplex(65536);
+
+        let failing_a = FailAfterRead {
+            inner: a_r_bridge,
+            remaining: 4096,
+        };
+
+        let start = std::time::Instant::now();
+        let relay = tokio::spawn(async move { relay_plain_pooled(failing_a, b_w_bridge).await });
+
+        // Feed 8 KB: 4096 passes through, then the injected failure fires.
+        let data = pseudo_random_bytes(8192, 0x0f41_aa11);
+        test_a_w.write_all(&data).await.unwrap();
+        test_a_w.flush().await.unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("relay must return (not hang) when a direction errors")
+            .unwrap()
+            .expect_err("injected read failure must propagate");
+        let elapsed = start.elapsed().as_millis();
+        assert!(
+            err.to_string().contains("injected relay read failure"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            elapsed < 4000,
+            "error must surface promptly (no sibling-direction hang), took {elapsed} ms"
+        );
+        // Keep test_a_w alive until the error check is done; the failed
+        // direction owns the a_w half via BiLock split.
+        drop(test_a_w);
+    }
 }

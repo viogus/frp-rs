@@ -117,3 +117,67 @@ async fn test_replayed_login_consumes_throttle_slots_then_throttles() {
         "fresh-timestamp login must still be throttled inside the 60s window, got: {err:?}",
     );
 }
+
+/// R9: stale-timestamp logins are rejected with the freshness error AND
+/// consume per-IP throttle slots. login.rs runs the freshness check before
+/// the replay table (Go VerifyLogin order), so a flood of captured
+/// (ts, md5) pairs with a stale clock must still advance the per-IP
+/// failure counter — after 5 stale rejections the IP is throttled
+/// pre-auth and even a FRESH-timestamp login is refused for the rest of
+/// the 60s window.
+#[tokio::test]
+async fn test_stale_timestamp_logins_consume_throttle_slots_then_throttle_fresh() {
+    let bind_port = allocate_port();
+    let mut auth = test_auth_cfg();
+    auth.authentication_timeout = 90;
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth,
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // 1: a FRESH (run_id, ts) pair succeeds (successes never count against
+    // the throttle).
+    let err = replay_login_once(addr, "stale-ts-target", now_ms).await;
+    assert!(err.is_none(), "fresh-timestamp login must succeed: {err:?}");
+
+    // 2-6: five stale-timestamp logins (2 minutes in the past — outside the
+    // 90s freshness window). Each is rejected with the freshness error and
+    // consumes one of the 5 per-IP throttle slots.
+    let stale_ts = now_ms - 120_000;
+    for attempt in 0..5 {
+        let err = replay_login_once(addr, "stale-ts-target", stale_ts - attempt).await;
+        assert_eq!(
+            err.as_deref(),
+            Some("timestamp outside acceptable window"),
+            "stale login attempt {}: expected freshness rejection, got: {err:?}",
+            attempt + 2,
+        );
+    }
+
+    // 7: over the cap → pre-auth throttle rejects (throttled_login_error
+    // supersedes the freshness error once the IP is throttled).
+    let err = replay_login_once(addr, "stale-ts-target", stale_ts - 100).await;
+    assert_eq!(
+        err.as_deref(),
+        Some("login throttled: too many failed attempts"),
+        "expected pre-auth throttle rejection, got: {err:?}",
+    );
+
+    // 8: even a FRESH timestamp is refused — the throttle gate sits in
+    // front of the freshness/replay checks.
+    let err = replay_login_once(addr, "stale-ts-target", now_ms + 1).await;
+    assert_eq!(
+        err.as_deref(),
+        Some("login throttled: too many failed attempts"),
+        "fresh-timestamp login must still be throttled inside the 60s window, got: {err:?}",
+    );
+}

@@ -109,6 +109,15 @@ pub const MAX_HOLE_PUNCH_TIMEOUT_MS: u64 = 60_000;
 /// punch for weeks via `send_delay_ms` (also i32).
 pub const MAX_SEND_DELAY_MS: u64 = 15_000;
 
+/// Pure clamp applied at every site that turns a peer/server-supplied
+/// timeout into a socket deadline: `timeout_ms.min(MAX_HOLE_PUNCH_TIMEOUT_MS)`.
+/// Extracted so the internal backstop (audit round 6d/§7) is one
+/// unit-testable function instead of three inline `.min` calls. See
+/// `MAX_HOLE_PUNCH_TIMEOUT_MS` for why the cap exists.
+pub fn clamp_hole_punch_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.min(MAX_HOLE_PUNCH_TIMEOUT_MS)
+}
+
 /// Go `nathole.go` `MakeHole` role resolution: only the exact string
 /// `"sender"` takes the sender arm (sleep + probe assisted/candidates);
 /// EVERYTHING else — including a missing role from a hostile or legacy
@@ -281,7 +290,7 @@ pub async fn punch_udp_hole(
     // detect_behavior is omitted. Cap it like wait_detect_on_any does
     // (MAX_HOLE_PUNCH_TIMEOUT_MS = 60s) so a hostile server cannot pin the
     // task + UDP socket for ~24.8 days (`timeout_ms` is an arbitrary u64).
-    let timeout_ms = timeout_ms.min(MAX_HOLE_PUNCH_TIMEOUT_MS);
+    let timeout_ms = clamp_hole_punch_timeout_ms(timeout_ms);
     if candidates.is_empty() {
         return Err("no candidate addresses".into());
     }
@@ -404,7 +413,7 @@ async fn recv_second_attempt(
 ) -> Result<SocketAddr, String> {
     // Same internal backstop as `punch_udp_hole` (callers may pass the
     // caller's original, unclamped value on the retry paths).
-    let timeout_ms = timeout_ms.min(MAX_HOLE_PUNCH_TIMEOUT_MS);
+    let timeout_ms = clamp_hole_punch_timeout_ms(timeout_ms);
     let mut buf = [0u8; 1024];
     let deadline2 = tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms),
@@ -1618,7 +1627,7 @@ pub async fn punch_udp_hole_makehole_owned(
     // (not the caller) is the invariant that bounds the wait; the visitor
     // caller additionally clamps before calling.
     let timeout_ms = if timeout_ms > 0 {
-        timeout_ms.min(MAX_HOLE_PUNCH_TIMEOUT_MS)
+        clamp_hole_punch_timeout_ms(timeout_ms)
     } else {
         DEFAULT_HOLE_PUNCH_TIMEOUT_MS
     };
@@ -1851,5 +1860,20 @@ mod tests {
         assert_eq!(resolve_punch_role(Some("")), "receiver");
         assert_eq!(resolve_punch_role(Some("spoofer")), "receiver");
         assert_eq!(resolve_punch_role(Some("sender")), "sender");
+    }
+
+    #[test]
+    fn clamp_hole_punch_timeout_ms_bounds_server_supplied_wait() {
+        use super::clamp_hole_punch_timeout_ms;
+        // Below and AT the 60 s cap pass through untouched.
+        assert_eq!(clamp_hole_punch_timeout_ms(0), 0);
+        assert_eq!(clamp_hole_punch_timeout_ms(1), 1);
+        assert_eq!(clamp_hole_punch_timeout_ms(59_999), 59_999);
+        assert_eq!(clamp_hole_punch_timeout_ms(60_000), 60_000);
+        // Anything above the cap — including the hostile ~24.8-day i32
+        // maximum the server could emit as read_timeout_ms — is cut to 60 s.
+        assert_eq!(clamp_hole_punch_timeout_ms(60_001), 60_000);
+        assert_eq!(clamp_hole_punch_timeout_ms(2_147_000_000), 60_000);
+        assert_eq!(clamp_hole_punch_timeout_ms(u64::MAX), 60_000);
     }
 }

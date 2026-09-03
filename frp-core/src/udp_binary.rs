@@ -792,4 +792,43 @@ mod tests {
         assert_eq!(&buf[2..6], &[192, 168, 0, 1], "4-byte dotted-quad form");
         assert_eq!(buf[6..8], 12345u16.to_be_bytes(), "port");
     }
+
+    /// Round M1 decode-side pin: a peer that puts an IPv4-mapped address on
+    /// the wire as family 6 (16-byte form — Go's readBinaryUDPAddr performs
+    /// NO To4 normalization on decode, unlike validateBinaryUDPAddr on
+    /// encode) must decode to the mapped textual form Go's net.UDPAddr
+    /// would render, and a re-encode of the decoded value must normalize
+    /// back to family 4 (Go encode symmetry — the typed `SocketAddr` the
+    /// consumer builds re-enters the encode side, which applies To4()).
+    #[test]
+    fn ipv4_mapped_family6_decodes_and_reencores_as_family_4() {
+        // flags=remote(0x02), family 6, ::ffff:192.0.2.1, port 53,
+        // zoneLen 0, payload len 4, payload b"ping".
+        let mut body = vec![
+            0x02, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1,
+        ];
+        body.extend_from_slice(&53u16.to_be_bytes());
+        body.push(0); // zoneLen
+        body.extend_from_slice(&4u16.to_be_bytes());
+        body.extend_from_slice(b"ping");
+
+        let pkt = decode_udp_packet_binary(&body).unwrap();
+        assert_eq!(pkt.content, b"ping");
+        let ra = pkt.remote_addr.as_ref().unwrap();
+        assert_eq!(
+            ra.ip, "::ffff:192.0.2.1",
+            "family-6 decode must not normalize to dotted-quad (Go decode parity)"
+        );
+        assert_eq!(ra.port, 53);
+        assert!(ra.zone.is_empty());
+
+        // Re-encode: the decoded value flows back through encode, which
+        // applies the Go To4() normalization — family 4 on the wire.
+        let re = encode_udp_packet_binary(&pkt).unwrap();
+        assert_eq!(
+            re[1], 4,
+            "re-encode must normalize the mapped address to family 4"
+        );
+        assert_eq!(&re[2..6], &[192, 0, 2, 1]);
+    }
 }

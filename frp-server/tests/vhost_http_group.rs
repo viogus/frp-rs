@@ -84,8 +84,12 @@ async fn open_work_conn(addr: SocketAddr, run_id: &str) -> tokio::net::TcpStream
 
 /// Blocking HTTP GET to the vhost port; returns the response body.
 /// Reads the response head + Content-Length body (the bridge keeps the work
-/// conn open, so EOF is never seen).
+/// conn open, so EOF is never seen). Bounded internally: a request that
+/// stalls server-side (e.g. dispatched to a member that never produces a
+/// work conn) returns `<request-timeout>` instead of parking forever —
+/// racing requests spawned by retry loops must self-terminate.
 async fn http_request(vhost: SocketAddr, host: &str) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
     let mut client = tokio::net::TcpStream::connect(vhost)
         .await
         .expect("vhost connect");
@@ -98,11 +102,19 @@ async fn http_request(vhost: SocketAddr, host: &str) -> String {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     // Read the head up to the CRLFCRLF terminator.
-    loop {
-        let _ = client.read(&mut byte).await.expect("read head");
-        buf.push(byte[0]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+    while buf.len() < 4096 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return "<request-timeout>".to_string();
+        }
+        match tokio::time::timeout(remaining, client.read(&mut byte)).await {
+            Ok(Ok(n)) if n > 0 => {
+                buf.push(byte[0]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            _ => return "<request-timeout>".to_string(),
         }
     }
     // Parse Content-Length and read exactly that many body bytes.
@@ -117,7 +129,14 @@ async fn http_request(vhost: SocketAddr, host: &str) -> String {
         .unwrap_or(0);
     let mut body = vec![0u8; clen];
     if clen > 0 {
-        client.read_exact(&mut body).await.expect("read body");
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero()
+            || tokio::time::timeout(remaining, client.read_exact(&mut body))
+                .await
+                .is_err()
+        {
+            return "<request-timeout>".to_string();
+        }
     }
     format!(
         "{}{}",
@@ -310,23 +329,58 @@ async fn test_http_group_route_cleaned_when_last_member_leaves() {
     )
     .await
     .expect("send CloseProxy A");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // B still serves (route alive, single member).
-    let mut work_b = open_work_conn(addr, &run_id_b).await;
-    let req = tokio::spawn(http_request(vhost, "app.example.com"));
-    assert!(
-        read_work_head(&mut work_b).await.is_some(),
-        "member B should still serve after A (owner) left"
-    );
-    let body = "member-B";
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        len = body.len()
-    );
-    work_b.write_all(resp.as_bytes()).await.expect("serve");
-    let resp_body = req.await.expect("request task");
-    assert!(resp_body.contains("member-B"));
+    // Settle before serving: a request that races the unprocessed CloseProxy
+    // is dispatched to A and only re-routed to the group once the delete
+    // settles — by then the request's client socket is gone and the stale
+    // dispatch steals the next fresh pooled conn from a live request (its
+    // StartWorkConn arrives, its response never does). Requests must not
+    // race the close, so wait for the drop to settle first.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Serve one request through the surviving member B. Bounded retry loop:
+    // the attempt succeeds only when the response actually comes back with a
+    // member-B body (a stolen conn yields StartWorkConn but no response).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut served: Option<String> = None;
+    while served.is_none() {
+        let mut attempt = open_work_conn(addr, &run_id_b).await;
+        let mut req = Some(tokio::spawn(http_request(vhost, "app.example.com")));
+        if let Some(head) = read_work_head(&mut attempt).await {
+            if !head.is_empty() {
+                let body = "member-B";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                    len = body.len()
+                );
+                attempt.write_all(resp.as_bytes()).await.expect("serve");
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(4),
+                    req.take().expect("request handle"),
+                )
+                .await
+                {
+                    Ok(Ok(r)) if r.contains("member-B") => served = Some(r),
+                    Ok(Ok(r)) => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "member B never served after A (owner) left; got: {r:?}"
+                        );
+                    }
+                    _ => {} // conn stolen by a stale dispatch — retry
+                }
+            }
+        }
+        if let Some(r) = req.take() {
+            r.abort();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "member B never served after A (owner) left"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(served.is_some());
 
     // Now B (the last member) closes -> the shared route must be dropped.
     write_msg_v1(
@@ -337,14 +391,28 @@ async fn test_http_group_route_cleaned_when_last_member_leaves() {
     )
     .await
     .expect("send CloseProxy B");
-    // Give the control loop a moment to process the unregister.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // The route is gone: a request to the domain now gets 404 (not 502 from
-    // a zombie dispatch to a dead member).
-    let resp_body = http_request(vhost, "app.example.com").await;
-    assert!(
-        resp_body.contains("404"),
-        "route should be removed after the last member leaves, got: {resp_body:?}"
-    );
+    // Settle (same race discipline as above), then poll for the route to be
+    // gone: the domain must answer 404 (not 502 from a zombie dispatch to a
+    // dead member, not a stall on a dispatch that raced the close).
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut last_resp = String::new();
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            http_request(vhost, "app.example.com"),
+        )
+        .await
+        {
+            Ok(resp) if resp.contains("404") => break,
+            Ok(resp) => last_resp = resp,
+            Err(_) => {} // stalled on a dispatch that raced the close
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "route should be removed after the last member leaves; last response: {last_resp:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

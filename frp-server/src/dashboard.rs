@@ -1059,6 +1059,7 @@ async fn handle_store_proxy_delete(
         state.tcpmux_manager.unregister(&name).await;
     }
     state.proxy_metrics.remove(&name).await;
+    crate::metrics::prom::proxy_removed(&name).await;
     // Remove the proxy and release the counters it owns (https SNI-sniff
     // gate count, per-client port-budget slot) ONLY when this call actually
     // performed the removal — the client CloseProxy handler races this path
@@ -1141,6 +1142,7 @@ async fn handle_proxies_delete(
                 state.tcpmux_manager.unregister(name).await;
             }
             state.proxy_metrics.remove(name).await;
+            crate::metrics::prom::proxy_removed(name).await;
             // Remove the proxy and release the counters it owns (https
             // SNI-sniff gate count, per-client port-budget slot) ONLY when
             // this call actually performed the removal — CloseProxy / client
@@ -2693,6 +2695,7 @@ mod v2 {
         for p in &all {
             if !state.run_id_to_ctl_tx.contains_key(&p.run_id) {
                 state.proxy_metrics.remove(&p.name).await;
+                crate::metrics::prom::proxy_removed(&p.name).await;
                 cleared += 1;
             }
         }

@@ -676,4 +676,132 @@ mod tests {
         drop(client);
         server.await.unwrap();
     }
+
+    /// R8 pin: PASSWORD-only config (user=None, pass=Some) is still an
+    /// armed auth config (Go OR-arm) — a client offering only NO_AUTH must
+    /// be rejected with [0x05, 0xFF], never accepted fail-open.
+    #[tokio::test]
+    async fn test_socks5_password_only_rejects_no_auth_offer() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Password-only config: user=None, pass=Some("s3cret").
+            let _ = handle_socks5_conn(stream, None, Some("s3cret".to_string())).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, 1, AUTH_NO_AUTH])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], SOCKS5_VERSION);
+        assert_eq!(
+            reply[1], AUTH_NO_ACCEPTABLE,
+            "password-only config must not accept NO_AUTH"
+        );
+        drop(client);
+        server.await.unwrap();
+    }
+
+    /// R8 pin: password-only config authenticates the EMPTY username with
+    /// the configured password (Go StaticCredentials {"": pass} — user=None
+    /// normalizes to the literal empty string).
+    #[tokio::test]
+    async fn test_socks5_password_only_accepts_empty_username() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // After USERPASS_OK the handler reads the CONNECT request;
+            // client closes → handler exits, error expected.
+            let _ = handle_socks5_conn(stream, None, Some("s3cret".to_string())).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, 1, AUTH_USER_PASS])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], AUTH_USER_PASS, "USER_PASS must be chosen");
+
+        // USERPASS: version 1, empty username (0), password "s3cret" (6).
+        let mut auth = vec![USERPASS_VERSION, 0];
+        auth.extend_from_slice(&[6]);
+        auth.extend_from_slice(b"s3cret");
+        client.write_all(&auth).await.unwrap();
+        let mut auth_reply = [0u8; 2];
+        client.read_exact(&mut auth_reply).await.unwrap();
+        assert_eq!(
+            auth_reply,
+            [USERPASS_VERSION, USERPASS_OK],
+            "empty username + correct password must authenticate against password-only config"
+        );
+
+        drop(client);
+        server.await.unwrap();
+    }
+
+    /// R8 pin: password-only config rejects a NON-EMPTY username even with
+    /// the correct password (the username half is enforced as the literal
+    /// empty string).
+    #[tokio::test]
+    async fn test_socks5_password_only_rejects_nonempty_username() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_socks5_conn(stream, None, Some("s3cret".to_string())).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, 1, AUTH_USER_PASS])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], AUTH_USER_PASS);
+
+        // Wrong username: "eve" + correct password → USERPASS_FAIL.
+        let mut auth = vec![USERPASS_VERSION, 3];
+        auth.extend_from_slice(b"eve");
+        auth.extend_from_slice(&[6]);
+        auth.extend_from_slice(b"s3cret");
+        client.write_all(&auth).await.unwrap();
+        let mut auth_reply = [0u8; 2];
+        client.read_exact(&mut auth_reply).await.unwrap();
+        assert_eq!(
+            auth_reply,
+            [USERPASS_VERSION, USERPASS_FAIL],
+            "non-empty username must fail against password-only config"
+        );
+        drop(client);
+        server.await.unwrap();
+    }
 }

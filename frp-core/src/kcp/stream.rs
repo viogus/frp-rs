@@ -124,6 +124,15 @@ impl KcpStream {
 
 impl Drop for KcpStream {
     fn drop(&mut self) {
+        // Best-effort (M4): return an undrained read_buffer allocation to
+        // the shared pool. Channel messages still queued in read_rx are
+        // dropped with the channel — draining up to 256 items in Drop is
+        // not worth it, so only the one buffer the stream owns outright is
+        // returned. The allocation is wasted either way once the connection
+        // is gone; this just lets the pool reuse it.
+        if !self.read_buffer.is_empty() {
+            chunk_pool_push(&self.chunk_pool, std::mem::take(&mut self.read_buffer));
+        }
         // Release the socket driver's liveness signal: the dial driver
         // self-exits once the last stream is dropped and no registrations
         // remain (see KcpSocket::run). AcqRel pairs with the driver's
@@ -144,6 +153,15 @@ impl AsyncRead for KcpStream {
             let n = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..n]);
             self.read_pos += n;
+            if self.read_pos == self.read_buffer.len() {
+                // Fully drained (M4): this buffer was the oversized tail of
+                // a channel message stashed by the partial-consume arm —
+                // recycle its allocation instead of holding it until drop.
+                // `chunk_pool_push` clears the payload, so no stale bytes
+                // can leak into a later message.
+                let drained = std::mem::take(&mut self.read_buffer);
+                chunk_pool_push(&self.chunk_pool, drained);
+            }
             self.read_count += n as u64;
             KCP_READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
             #[cfg(debug_assertions)]
@@ -176,6 +194,15 @@ impl AsyncRead for KcpStream {
                 if n < data.len() {
                     self.read_buffer = data;
                     self.read_pos = n;
+                } else {
+                    // Fully consumed (M4): recycle the channel buffer into
+                    // the shared chunk pool instead of dropping it —
+                    // `KcpSession::recv_and_push` pops pooled buffers, so
+                    // the per-message allocation cycles instead of
+                    // allocating on every delivered message. The pool
+                    // clears on return, so no stale bytes can leak into a
+                    // later message.
+                    chunk_pool_push(&self.chunk_pool, data);
                 }
                 self.read_count += n as u64;
                 KCP_READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
