@@ -241,6 +241,17 @@ impl HealthState {
     }
 }
 
+/// Go http.Client redirect cap (http.Client.checkRedirect: "stopped after 10
+/// redirects"). A chain longer than this fails the check like Go's
+/// `http.DefaultClient.Do` error.
+const MAX_HEALTH_CHECK_REDIRECTS: usize = 10;
+
+/// Cap on the response-head bytes read per probe hop. Only the status line +
+/// headers are inspected (the Location header for redirects); the body is
+/// never drained, so the head is all we ever need. 16 KiB bounds a hostile
+/// header flood that would otherwise consume the whole check deadline.
+const MAX_HEALTH_RESPONSE_HEAD: usize = 16 * 1024;
+
 /// TCP health check: connect to addr, then close. Success = connection established.
 pub(crate) async fn run_tcp_check(addr: &str, timeout: Duration) -> Result<(), String> {
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
@@ -256,58 +267,102 @@ pub(crate) async fn run_tcp_check(addr: &str, timeout: Duration) -> Result<(), S
     }
 }
 
-/// HTTP health check: connect, send GET, verify 2xx status code.
-/// Uses raw TCP to avoid adding an HTTP client dependency.
+/// HTTP health check: send GET, verify a 2xx status code.
+///
+/// Hand-rolled on raw TCP (no HTTP client dependency). Wire-shape parity with
+/// Go's `doHTTPCheck` (client/health/health.go:167-183 — `http.NewRequest`
+/// + `http.DefaultClient.Do`):
+///   * ORIGIN-form request target (`GET /path?query HTTP/1.1` — never the
+///     absolute URL; the old probe sent `GET http://host/path HTTP/1.1`,
+///     which Go never sends and some servers reject);
+///   * redirects are followed (301/302/303/307/308 with a Location header,
+///     up to 10 hops — the http.Client default policy), each hop on a fresh
+///     connection, Location resolved RFC-3986-style against the current URL;
+///   * the WHOLE check — every hop's DNS/dial/write/read — runs under ONE
+///     `timeout` deadline (Go checkWorker wraps doCheck in a single
+///     WithDeadline(monitor.timeout), health.go:108), so a slow redirect
+///     chain cannot exceed the configured per-check budget;
+///   * the status-line gate accepts any `HTTP/x.y` version token with a
+///     3-digit numeric code (`HTTP/2.0 200 OK` is valid for Go's ReadResponse
+///     and was rejected by the old `HTTP/1.`-only prefix check).
+///
+/// The response BODY is deliberately not drained (Go `io.Copy(io.Discard,
+/// resp.Body)`): Go drains only so its keep-alive transport can reuse the
+/// connection. This probe opens a fresh connection per hop and sends
+/// `Connection: close`, so there is nothing to reuse — a bounded head read
+/// costs the same and skips the drain. Wire-invisible given close-per-probe.
+///
+/// `_addr` (the local-addr config string) is unused on the HTTP path — the
+/// dial target is the checked URL's authority, exactly like Go, where the
+/// monitor stores only the URL and addr is used solely to build it.
 pub(crate) async fn run_http_check(
-    addr: &str,
+    _addr: &str,
     url: &str,
     timeout: Duration,
     headers: &[frp_core::config::HealthCheckHttpHeader],
 ) -> Result<(), String> {
-    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+    tokio::time::timeout(timeout, http_check_chain(url, headers))
         .await
-        .map_err(|_| "connect timeout".to_string())?
+        .map_err(|_| "timeout".to_string())?
+}
+
+/// Drive the redirect chain until a verdict. `hop` counts requests: the
+/// initial probe plus up to `MAX_HEALTH_CHECK_REDIRECTS` follow-ups; an
+/// 11th redirect fails like Go's "stopped after 10 redirects".
+async fn http_check_chain(
+    url: &str,
+    headers: &[frp_core::config::HealthCheckHttpHeader],
+) -> Result<(), String> {
+    let mut current = url.to_string();
+    for _hop in 0..=MAX_HEALTH_CHECK_REDIRECTS {
+        let response = probe_http_hop(&current, headers).await?;
+        if (200..300).contains(&response.status) {
+            return Ok(());
+        }
+        // Only Go's isRedirect codes with a Location header are followed
+        // (net/http/client.go isRedirect: 301, 302, 303, 307, 308).
+        if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            if let Some(location) = response.location {
+                current = resolve_redirect_url(&current, &location)?;
+                continue;
+            }
+        }
+        // Final response (no Location, non-redirect code, or unsupported
+        // redirect target): the verdict is on THIS response.
+        return Err(format!("non-2xx status: {}", response.status_line));
+    }
+    Err("stopped after 10 redirects".to_string())
+}
+
+/// One probe hop on a fresh connection: dial the URL authority, send an
+/// origin-form GET, and read the response head.
+async fn probe_http_hop(
+    url: &str,
+    headers: &[frp_core::config::HealthCheckHttpHeader],
+) -> Result<HttpProbeResponse, String> {
+    let parsed = parse_health_url(url)?;
+    let mut stream = tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
+        .await
         .map_err(|e| format!("TCP connect: {e}"))?;
     // Go's health checks dial with net/http (NoDelay=true by default); the
     // small GET must not sit in Nagle's buffer waiting for the ACK. This
     // probe is not a relay, so no buffer-size setup is needed — just nodelay.
     frp_core::transport::set_nodelay(&stream);
 
-    // Extract host from addr for the Host header. Go URL.Hostname():
-    // port stripped, IPv6 brackets removed — a plain split(':') would
-    // mangle "[::1]:8080" into "[" and unbracketed "::1:8080" into "".
-    let default_host = addr
-        .parse::<std::net::SocketAddr>()
-        .map(|sa| sa.ip().to_string())
-        .unwrap_or_else(|_| {
-            // Bracketed IPv6 with port: "[::1]:8080" → "::1".
-            if let Some(rest) = addr.strip_prefix('[') {
-                if let Some((host, _)) = rest.split_once(']') {
-                    return host.to_string();
-                }
-            }
-            // Last-colon split only when the port part is numeric (Go
-            // splitHostPort's validOptionalPort gate; a hostname or an
-            // unbracketed IPv6 keeps its colons as-is).
-            match addr.rsplit_once(':') {
-                Some((host, port))
-                    if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
-                {
-                    host.to_string()
-                }
-                _ => addr.to_string(),
-            }
-        });
-    // Support custom Host header override from user-configured headers (Go frp compat).
-    let host = headers
+    // Host header: a user-configured "Host" header overrides everything (Go:
+    // monitor.header is applied wholesale, req.Host = header.Get("Host"));
+    // otherwise the URL authority's hostname, port-stripped and de-bracketed
+    // (Go URL.Hostname() semantics — HTTP/1.1 Host without a port is
+    // equivalent on the default port; the pre-fix probe derived the same
+    // value from `addr`, which for every auto-built URL equals the URL host).
+    let custom_host = headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case("host"))
-        .map(|h| h.value.as_str())
-        .unwrap_or(default_host.as_str());
-    // Use HTTP/1.1 (Go frp compat: http.NewRequestWithContext defaults to HTTP/1.1).
+        .map(|h| h.value.as_str());
+    let host = custom_host.unwrap_or(parsed.host.as_str());
     let mut req = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close",
-        url, host
+        parsed.target, host
     );
     for h in headers {
         // Skip Host header — already included above with the resolved host value.
@@ -318,37 +373,289 @@ pub(crate) async fn run_http_check(
     }
     req.push_str("\r\n\r\n");
 
-    tokio::time::timeout(timeout, stream.write_all(req.as_bytes()))
+    stream
+        .write_all(req.as_bytes())
         .await
-        .map_err(|_| "write timeout".to_string())?
         .map_err(|e| format!("write: {e}"))?;
 
-    let mut buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(timeout, stream.read(&mut buf))
-        .await
-        .map_err(|_| "read timeout".to_string())?
-        .map_err(|e| format!("read: {e}"))?;
+    let head = read_http_response_head(&mut stream).await?;
+    parse_http_response_head(&head)
+}
 
-    if n == 0 {
+/// Read the response head (status line + headers) into a bounded buffer.
+/// Stops at the CRLFCRLF terminator, at EOF (Connection: close servers may
+/// close without a trailing blank line), or at `MAX_HEALTH_RESPONSE_HEAD`.
+/// Never reads past the head — the body is not drained (see run_http_check).
+async fn read_http_response_head(stream: &mut tokio::net::TcpStream) -> Result<String, String> {
+    let mut head = Vec::with_capacity(1024);
+    let mut buf = [0u8; 1024];
+    loop {
+        if head.len() >= MAX_HEALTH_RESPONSE_HEAD {
+            break;
+        }
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break; // EOF: head complete (Connection: close) or peer gone.
+        }
+        head.extend_from_slice(&buf[..n]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+struct HttpProbeResponse {
+    status: u16,
+    status_line: String,
+    location: Option<String>,
+}
+
+/// Parse the response head. The version gate mirrors Go's ReadResponse:
+/// any `HTTP/<major>.<minor>` version token is accepted ("HTTP/2.0 200 OK"
+/// passes), the status code must be a numeric token, and a non-numeric code
+/// is a failure (Go Atoi parity), never a non-2xx verdict.
+fn parse_http_response_head(head: &str) -> Result<HttpProbeResponse, String> {
+    if head.is_empty() {
         return Err("empty response".into());
     }
-    let response = String::from_utf8_lossy(&buf[..n]);
-    let status_line = response.lines().next().unwrap_or("");
-    // Proper HTTP status parsing: check "HTTP/1." prefix, extract the 3-digit
-    // numeric status code, and verify 200 <= code < 300. Substring matching
-    // ("200" or " 2") could misparse multi-line responses or body content.
-    // Matches Go frp's resp.StatusCode / 100 == 2 check.
-    if status_line.starts_with("HTTP/1.") {
-        let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
-        if parts.len() >= 2 {
-            if let Ok(code) = parts[1].parse::<u16>() {
-                if (200..300).contains(&code) {
-                    return Ok(());
-                }
+    let status_line = head.split('\n').next().unwrap_or("").trim_end_matches('\r');
+    let status = parse_status_code(status_line)
+        .ok_or_else(|| format!("malformed status line: {status_line}"))?;
+    let location = response_header_location(head);
+    Ok(HttpProbeResponse {
+        status,
+        status_line: status_line.to_string(),
+        location,
+    })
+}
+
+/// Parse the status code out of a status line: `HTTP/<digits>.<digits> SP
+/// <code>...`. The version token must be exactly HTTP/major.minor (Go
+/// ParseHTTPVersion), the code token all digits (Go Atoi — leading zeros
+/// like "0200" are accepted, exactly like Atoi returning 200).
+fn parse_status_code(line: &str) -> Option<u16> {
+    let line = line.trim_end_matches('\r');
+    let rest = line.strip_prefix("HTTP/")?;
+    let (version, tail) = rest.split_once(' ')?;
+    let (major, minor) = version.split_once('.')?;
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|b| b.is_ascii_digit())
+        || !minor.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let code_token = tail.trim_start().split(' ').next().unwrap_or("");
+    if code_token.is_empty() || !code_token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    code_token.parse::<u16>().ok()
+}
+
+/// First `Location` header value (case-insensitive name), if any.
+fn response_header_location(head: &str) -> Option<String> {
+    for line in head.split('\n').skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break; // end of head
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("location") {
+                return Some(value.trim().to_string());
             }
         }
     }
-    Err(format!("non-2xx status: {}", status_line))
+    None
+}
+
+/// A parsed health-check URL: dial target + origin-form request target.
+struct ProbeUrl {
+    host: String,
+    port: u16,
+    /// Path + query (the origin-form request target); never empty.
+    target: String,
+}
+
+/// Parse an `http://host[:port]/path?query` health URL. https:// is
+/// rejected — the hand-rolled probe has no TLS stack (Go would follow an
+/// https redirect via net/http); see resolve_redirect_url.
+fn parse_health_url(url: &str) -> Result<ProbeUrl, String> {
+    let scheme_end = url
+        .find("://")
+        .ok_or_else(|| format!("invalid health URL '{url}': no scheme"))?;
+    if !url[..scheme_end].eq_ignore_ascii_case("http") {
+        return Err(format!(
+            "invalid health URL '{url}': only http:// is supported by the probe"
+        ));
+    }
+    let rest = &url[scheme_end + 3..];
+    // Authority ends at the first '/', '?' or '#'.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    // Request target: path + query (fragment is never sent — Go strips it
+    // from RequestURI too). A bare authority ("http://h:p") targets "/".
+    let mut target = if authority_end < rest.len() {
+        rest[authority_end..]
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    } else {
+        String::new()
+    };
+    if target.is_empty() || target.starts_with('?') {
+        target = format!("/{target}");
+    }
+    let (host, port) = split_url_authority(authority)
+        .ok_or_else(|| format!("invalid health URL '{url}': bad authority '{authority}'"))?;
+    Ok(ProbeUrl { host, port, target })
+}
+
+/// Split `host[:port]`, handling bracketed IPv6 (`[::1]:8080`, `[::1]`),
+/// unbracketed IPv6 (`::1:8080` — from the last-colon split) and hostnames.
+/// Default port is 80 (Go URL.Port() semantics). `[::1]x]:80`-style garbage
+/// fails closed (None).
+fn split_url_authority(authority: &str) -> Option<(String, u16)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = if tail.is_empty() {
+            80
+        } else {
+            tail.strip_prefix(':')?.parse::<u16>().ok()?
+        };
+        Some((host.to_string(), port))
+    } else if authority.contains(':') {
+        // Unbracketed IPv6 or a host:port pair: split the numeric port off
+        // the LAST colon so IPv6 segments stay in the host.
+        let (host, port) = authority.rsplit_once(':')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = port.parse::<u16>().ok()?;
+        // The host half of a ':'-bearing authority must itself be a valid
+        // IPv6 literal ("::1" splits into host ":" — malformed → None).
+        if host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err() {
+            return None;
+        }
+        Some((host.to_string(), port))
+    } else {
+        Some((authority.to_string(), 80))
+    }
+}
+
+/// Resolve a Location header against the current health URL (RFC 3986 merge
+/// — Go req.URL.Parse(loc) in http.Client redirect handling).
+fn resolve_redirect_url(current: &str, location: &str) -> Result<String, String> {
+    let loc = location.trim();
+    // Empty Location: an empty reference resolves to the current URL
+    // (Go ResolveReference) — the next hop re-probes it and the redirect
+    // counter terminates a loop.
+    if loc.is_empty() {
+        return Ok(current.to_string());
+    }
+    let loc_no_frag = loc.split('#').next().unwrap_or(loc);
+    if loc_no_frag.is_empty() {
+        return Ok(current.to_string());
+    }
+    if let Some(end) = loc_no_frag.find("://") {
+        let scheme = &loc_no_frag[..end];
+        if scheme.eq_ignore_ascii_case("http") {
+            return Ok(loc_no_frag.to_string());
+        }
+        // https (or any other scheme): the hand-rolled probe has no TLS
+        // stack. Go follows via net/http; here the redirect is not
+        // followed and the non-2xx verdict lands on the redirecting
+        // response (documented divergence — an http health endpoint
+        // redirecting to https is not a supported config).
+        return Err(format!(
+            "redirect to '{loc_no_frag}' is not supported (probe has no TLS stack)"
+        ));
+    }
+    // Scheme-relative ("//host/path") → current scheme + value.
+    let loc_resolved = if loc_no_frag.starts_with("//") {
+        format!("http:{loc_no_frag}")
+    } else {
+        // Split the current URL into "http://authority" + path.
+        let scheme_end = current.find("://").map(|i| i + 3).unwrap_or(0);
+        let (base_authority, base_path) = match current[scheme_end..].find('/') {
+            Some(i) => (
+                current[..scheme_end + i].to_string(),
+                &current[scheme_end + i..],
+            ),
+            None => (current.to_string(), "/"),
+        };
+        if loc_no_frag.starts_with('/') {
+            // Absolute-path reference: replace the whole path.
+            format!("{base_authority}{loc_no_frag}")
+        } else {
+            // Relative reference: merge against the base path's directory
+            // (RFC 3986 §5.3: strip the last segment). "/a/b?q" + "ok" →
+            // "/a/ok".
+            let base_path = base_path.split('?').next().unwrap_or(base_path);
+            let dir = match base_path.rsplit_once('/') {
+                Some((head, _tail)) if !head.is_empty() => format!("{head}/"),
+                _ => "/".to_string(),
+            };
+            format!("{base_authority}{dir}{loc_no_frag}")
+        }
+    };
+    Ok(loc_resolved)
+}
+
+/// Robust host/port split of a `host:port` local-addr string (config
+/// `local_ip` is a bare string, so IPv6 literals arrive UNBRACKETED —
+/// `"::1:8080"`; plugin addresses arrive as `"127.0.0.1:port"`). Tries a
+/// full SocketAddr parse first (bracketed v6, v4), then a last-colon split
+/// with a numeric-port gate (keeps unbracketed IPv6 segments in the host).
+/// Returns None for garbage (no port, empty host, non-numeric port).
+fn local_addr_host_port(hostport: &str) -> Option<(String, u16)> {
+    if let Ok(sa) = hostport.parse::<std::net::SocketAddr>() {
+        return Some((sa.ip().to_string(), sa.port()));
+    }
+    let (host, port) = hostport.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // The host half of a ':'-bearing string must itself be a valid IPv6
+    // literal: bare "::1" (no port) splits into host ":" → None.
+    if host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err() {
+        return None;
+    }
+    Some((host.to_string(), port.parse::<u16>().ok()?))
+}
+
+/// Build the auto health-check URL `http://{host}:{port}/{path}` from a
+/// `host:port` local-addr string (Go parity: proxy_wrapper.go JoinHostPort
+/// plus health.go:68-76 `"http://" + addr` construction). Literal IPv6 is
+/// bracketed here because the addr string is not (an unbracketed
+/// "::1:8080" must become `http://[::1]:8080/...`). Garbage input falls
+/// back to 127.0.0.1:0 so the caller never emits a malformed URL.
+pub(crate) fn build_health_check_url(local_addr: &str, path_or_url: &str) -> String {
+    let (host, port) = local_addr_host_port(local_addr)
+        .map(|(h, p)| (h, p.to_string()))
+        .unwrap_or_else(|| ("127.0.0.1".to_string(), "0".to_string()));
+    let path = if path_or_url.starts_with('/') {
+        path_or_url.to_string()
+    } else {
+        format!("/{path_or_url}")
+    };
+    // A parsed SocketAddr ip string is never bracketed; a raw hostname may
+    // carry brackets only if the caller passed "[::1]:8080" through the
+    // non-parse path (impossible — that parses). Bracket any ':'-bearing
+    // host so the URL authority is unambiguous.
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    format!("http://{host}:{port}{path}")
 }
 
 #[cfg(test)]
@@ -446,5 +753,372 @@ mod tests {
         st.confirm_recover();
         // Healthy afterwards: no events.
         assert_eq!(st.on_check(true, 1), HealthAction::None);
+    }
+
+    // --- F3/F4: probe wire-shape + URL-builder pins ---
+
+    /// Spawn a scripted responder: each accepted connection reads the request
+    /// head, records it (full head string, so tests can assert request-line
+    /// and header shape), and answers with the next queued (status line,
+    /// headers) pair. Connections beyond the queue are closed unanswered.
+    async fn spawn_scripted_server(
+        responses: Vec<(String, Vec<(String, String)>)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let idx = Arc::new(AtomicUsize::new(0));
+        let seen_task = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let i = idx.fetch_add(1, Ordering::Relaxed);
+                let Some((status_line, headers)) = responses.get(i) else {
+                    continue; // extra connection: close unanswered
+                };
+                let mut buf = [0u8; 4096];
+                let n = match sock.read(&mut buf).await {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                seen_task.lock().unwrap().push(head);
+                let mut resp = format!("{status_line}\r\n");
+                for (k, v) in headers {
+                    resp.push_str(&format!("{k}: {v}\r\n"));
+                }
+                resp.push_str("Content-Length: 0\r\n\r\n");
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        (addr, seen)
+    }
+
+    /// Wait until `n` request heads have been captured (the probe returns as
+    /// soon as it read its response; the server's capture happens just
+    /// before the response write, so by response-read time the push has
+    /// happened — this poll is a belt-and-braces cross-thread sync).
+    async fn wait_seen(
+        seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        n: usize,
+    ) -> Vec<String> {
+        for _ in 0..200 {
+            {
+                let g = seen.lock().unwrap();
+                if g.len() >= n {
+                    return g.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "only {} of {n} requests observed",
+            seen.lock().unwrap().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_uses_origin_form_request_line() {
+        let (addr, seen) =
+            spawn_scripted_server(vec![("HTTP/1.1 200 OK".to_string(), vec![])]).await;
+        let url = format!("http://{addr}/healthz?x=1");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+        let heads = wait_seen(&seen, 1).await;
+        // Origin-form request target, never the absolute URL (Go
+        // http.NewRequest + RequestURI semantics). The old probe sent
+        // "GET http://{addr}/healthz?x=1 HTTP/1.1".
+        assert!(
+            heads[0].starts_with("GET /healthz?x=1 HTTP/1.1\r\n"),
+            "request line was not origin-form: {:?}",
+            heads[0].lines().next()
+        );
+        assert!(
+            heads[0].contains("\r\nHost: 127.0.0.1\r\n"),
+            "{:?}",
+            heads[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_accepts_2xx_and_rejects_non_2xx() {
+        let (addr, _seen) = spawn_scripted_server(vec![
+            ("HTTP/1.1 200 OK".to_string(), vec![]),
+            ("HTTP/1.1 500 Internal Server Error".to_string(), vec![]),
+        ])
+        .await;
+        let url = format!("http://{addr}/");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("non-2xx status"), "{err}");
+        assert!(err.contains("500"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn http_probe_connect_refusal_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener); // nothing listens on the port any more
+        let url = format!("http://{addr}/");
+        let err = run_http_check(&addr, &url, Duration::from_secs(2), &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("TCP connect"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn http_probe_follows_redirect_to_ok() {
+        let (addr, seen) = spawn_scripted_server(vec![
+            (
+                "HTTP/1.1 302 Found".to_string(),
+                vec![("Location".to_string(), "/ok".to_string())],
+            ),
+            ("HTTP/1.1 200 OK".to_string(), vec![]),
+        ])
+        .await;
+        let url = format!("http://{addr}/start");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+        let heads = wait_seen(&seen, 2).await;
+        assert!(heads[0].starts_with("GET /start HTTP/1.1\r\n"));
+        assert!(heads[1].starts_with("GET /ok HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn http_probe_resolves_relative_redirect_against_base_directory() {
+        let (addr, seen) = spawn_scripted_server(vec![
+            (
+                "HTTP/1.1 302 Found".to_string(),
+                vec![("Location".to_string(), "c".to_string())],
+            ),
+            ("HTTP/1.1 200 OK".to_string(), vec![]),
+        ])
+        .await;
+        let url = format!("http://{addr}/a/b");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+        let heads = wait_seen(&seen, 2).await;
+        assert!(
+            heads[1].starts_with("GET /a/c HTTP/1.1\r\n"),
+            "{:?}",
+            heads[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_redirect_without_location_fails() {
+        let (addr, seen) =
+            spawn_scripted_server(vec![("HTTP/1.1 302 Found".to_string(), vec![])]).await;
+        let url = format!("http://{addr}/");
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .unwrap_err();
+        // Verdict lands on the redirecting response: 302 is not 2xx.
+        assert!(err.contains("non-2xx status"), "{err}");
+        assert!(err.contains("302"), "{err}");
+        // Exactly one hop — no Location, no follow.
+        assert_eq!(wait_seen(&seen, 1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_probe_follows_only_go_is_redirect_codes() {
+        let (addr, seen) = spawn_scripted_server(vec![
+            (
+                "HTTP/1.1 301 Moved Permanently".to_string(),
+                vec![("Location".to_string(), "/a".to_string())],
+            ),
+            (
+                "HTTP/1.1 303 See Other".to_string(),
+                vec![("Location".to_string(), "/b".to_string())],
+            ),
+            (
+                "HTTP/1.1 304 Not Modified".to_string(),
+                vec![("Location".to_string(), "/c".to_string())],
+            ),
+        ])
+        .await;
+        let url = format!("http://{addr}/");
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .unwrap_err();
+        // 304 is NOT in Go isRedirect (301/302/303/307/308): the chain stops
+        // on the 304 and the check fails on it.
+        assert!(err.contains("304"), "{err}");
+        let heads = wait_seen(&seen, 3).await;
+        assert!(
+            heads[1].starts_with("GET /a HTTP/1.1\r\n"),
+            "{:?}",
+            heads[1]
+        );
+        assert!(
+            heads[2].starts_with("GET /b HTTP/1.1\r\n"),
+            "{:?}",
+            heads[2]
+        );
+        assert_eq!(heads.len(), 3); // no /c hop
+    }
+
+    #[tokio::test]
+    async fn http_probe_redirect_chain_over_10_fails() {
+        let mut responses = Vec::new();
+        for i in 0..11 {
+            responses.push((
+                "HTTP/1.1 302 Found".to_string(),
+                vec![("Location".to_string(), format!("/{i}"))],
+            ));
+        }
+        let (addr, seen) = spawn_scripted_server(responses).await;
+        let url = format!("http://{addr}/");
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .unwrap_err();
+        // Go http.Client: "stopped after 10 redirects".
+        assert!(err.contains("stopped after 10 redirects"), "{err}");
+        assert_eq!(wait_seen(&seen, 11).await.len(), 11);
+    }
+
+    #[tokio::test]
+    async fn http_probe_https_redirect_is_not_followed() {
+        let (addr, seen) = spawn_scripted_server(vec![(
+            "HTTP/1.1 302 Found".to_string(),
+            vec![("Location".to_string(), "https://example.com/x".to_string())],
+        )])
+        .await;
+        let url = format!("http://{addr}/");
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("not supported"), "{err}");
+        assert_eq!(wait_seen(&seen, 1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_probe_accepts_any_http_version_token() {
+        // Go ReadResponse accepts any HTTP/x.y version token; the old probe's
+        // "HTTP/1." prefix gate wrongly failed an "HTTP/2.0 200" response.
+        let (addr, _seen) =
+            spawn_scripted_server(vec![("HTTP/2.0 200 OK".to_string(), vec![])]).await;
+        let url = format!("http://{addr}/");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+
+        let (addr, _seen) =
+            spawn_scripted_server(vec![("HTTP/9.9 204 No Content".to_string(), vec![])]).await;
+        let url = format!("http://{addr}/");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+
+        // Malformed version token → failure, not a silent non-2xx verdict.
+        let (addr, _seen) = spawn_scripted_server(vec![("FOO 200 OK".to_string(), vec![])]).await;
+        let url = format!("http://{addr}/");
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("malformed status line"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn http_probe_sends_custom_headers_and_host_override() {
+        let (addr, seen) =
+            spawn_scripted_server(vec![("HTTP/1.1 200 OK".to_string(), vec![])]).await;
+        let headers = vec![
+            frp_core::config::HealthCheckHttpHeader {
+                name: "Host".to_string(),
+                value: "example.test".to_string(),
+            },
+            frp_core::config::HealthCheckHttpHeader {
+                name: "X-Check".to_string(),
+                value: "1".to_string(),
+            },
+        ];
+        let url = format!("http://{addr}/");
+        assert!(
+            run_http_check(&addr, &url, Duration::from_secs(5), &headers)
+                .await
+                .is_ok()
+        );
+        let heads = wait_seen(&seen, 1).await;
+        // User Host header replaces the derived one (Go monitor.header
+        // semantics); other headers pass through verbatim.
+        assert!(
+            heads[0].contains("\r\nHost: example.test\r\n"),
+            "{:?}",
+            heads[0]
+        );
+        assert!(heads[0].contains("\r\nX-Check: 1\r\n"), "{:?}", heads[0]);
+        // No duplicate Host header (the derived Host is skipped when a
+        // custom one is configured).
+        assert_eq!(heads[0].matches("\r\nHost:").count(), 1);
+    }
+
+    #[test]
+    fn local_addr_host_port_shapes() {
+        assert_eq!(
+            local_addr_host_port("127.0.0.1:8080"),
+            Some(("127.0.0.1".to_string(), 8080))
+        );
+        assert_eq!(
+            local_addr_host_port("[::1]:8080"),
+            Some(("::1".to_string(), 8080))
+        );
+        // Unbracketed IPv6: the last-colon split keeps the v6 segments.
+        assert_eq!(
+            local_addr_host_port("::1:8080"),
+            Some(("::1".to_string(), 8080))
+        );
+        assert_eq!(
+            local_addr_host_port("localhost:8080"),
+            Some(("localhost".to_string(), 8080))
+        );
+        // Garbage: no port, empty host, non-numeric port, bare v6 without a
+        // port (indistinguishable from a bad split) → None.
+        assert_eq!(local_addr_host_port(":8080"), None);
+        assert_eq!(local_addr_host_port("127.0.0.1"), None);
+        assert_eq!(local_addr_host_port("127.0.0.1:abc"), None);
+        assert_eq!(local_addr_host_port("::1"), None);
+        assert_eq!(local_addr_host_port(""), None);
+    }
+
+    #[test]
+    fn build_health_check_url_shapes() {
+        // The four finding-spec shapes. Literal IPv6 is bracketed exactly
+        // once; a path without a leading '/' gains one.
+        assert_eq!(
+            build_health_check_url("127.0.0.1:8080", ""),
+            "http://127.0.0.1:8080/"
+        );
+        assert_eq!(
+            build_health_check_url("[::1]:8080", "/x"),
+            "http://[::1]:8080/x"
+        );
+        // F4: the old split(':') produced "http://:/x" here.
+        assert_eq!(
+            build_health_check_url("::1:8080", "/x"),
+            "http://[::1]:8080/x"
+        );
+        assert_eq!(
+            build_health_check_url("localhost:8080", "ok"),
+            "http://localhost:8080/ok"
+        );
+        // Garbage falls back to 127.0.0.1:0 (never a malformed URL).
+        assert_eq!(
+            build_health_check_url("garbage", "/x"),
+            "http://127.0.0.1:0/x"
+        );
+        assert_eq!(build_health_check_url("::1", "/x"), "http://127.0.0.1:0/x");
     }
 }

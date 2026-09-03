@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, Notify};
 
 use super::config::KcpConfig;
 use super::protocol::{Error as KcpError, Kcp, KCP_WND_RCV};
-use super::socket::{chunk_pool_pop, CHUNK_POOL_CAP, KCP_SND_BACKLOG_THRESHOLD};
+use super::socket::{chunk_pool_pop, chunk_pool_push, CHUNK_POOL_CAP, KCP_SND_BACKLOG_THRESHOLD};
 use crate::kcp_compat::Fec;
 
 /// FEC wire header size (SEQID 4B + TYPE 2B) before the per-shard SIZE(2B)
@@ -120,6 +120,15 @@ pub struct KcpSession {
     /// real clock, so tests can simulate long silent gaps deterministically.
     fec_clock_override: Option<u64>,
     read_tx: mpsc::Sender<Vec<u8>>,
+    /// Read-side buffer pool (M4): shared with KcpWriter and the owning
+    /// KcpSocket/KcpStream via `with_chunk_pool`. `recv_and_push` pops a
+    /// pooled buffer for each delivered KCP message (mirroring how the send
+    /// side pops datagram buffers) and the stream returns the buffer once
+    /// fully consumed — the per-message `Vec::with_capacity` + drop churn
+    /// is gone. `KcpSession::new`'s private pool is never refilled, so
+    /// those sessions degrade to one fresh alloc per message, identical to
+    /// the pre-pool behavior.
+    pool: Arc<ArrayQueue<Vec<u8>>>,
     /// Driver-clock ms of the last successfully processed inbound packet
     /// (stamped by the KcpSocket driver on every input() success; 0 before
     /// the first). Feeds the accepted-session idle reaper (M11): a session
@@ -177,11 +186,13 @@ impl KcpSession {
         )
     }
 
-    /// Create a session whose KCP output datagrams are drawn from `chunk_pool`
-    /// (F3). The driver uses this for sessions on its socket, sharing the
+    /// Create a session whose KCP output datagrams AND delivered-message
+    /// buffers are drawn from `chunk_pool` (F3 send side; M4 read side).
+    /// The driver uses this for sessions on its socket, sharing the
     /// socket's `chunk_pool` so datagrams are recycled across ticks (sent
-    /// packets are pushed back by `send_udp_packet`/`drain_pending_udp`).
-    /// Callers without a shared pool use [`Self::new`].
+    /// packets are pushed back by `send_udp_packet`/`drain_pending_udp`)
+    /// and delivered messages are recycled once the owning `KcpStream`
+    /// fully consumes them. Callers without a shared pool use [`Self::new`].
     pub fn with_chunk_pool(
         conv: u32,
         peer_addr: std::net::SocketAddr,
@@ -201,7 +212,7 @@ impl KcpSession {
             None
         };
 
-        let writer = KcpWriter::new(chunk_pool);
+        let writer = KcpWriter::new(chunk_pool.clone());
         let mut kcp = if config.stream {
             Kcp::new_stream(conv, writer)
         } else {
@@ -235,6 +246,7 @@ impl KcpSession {
             fec_clock_base: std::time::Instant::now(),
             fec_clock_override: None,
             read_tx,
+            pool: chunk_pool,
             last_rx_ms: 0,
             shutdown: false,
             pending_read: None,
@@ -649,11 +661,24 @@ impl KcpSession {
                     // message owns the allocation. `size` is bounded by the
                     // reassembly window (`(KCP_WND_RCV-1) * mss`, see
                     // session.rs:364), so a hostile peer cannot inflate it.
-                    let mut data = Vec::with_capacity(size);
+                    //
+                    // Read-side pool (M4): the buffer is drawn from the
+                    // shared chunk pool (the same pool KcpWriter draws
+                    // output datagrams from, shared socket-wide) and the
+                    // stream returns it after full consumption — mirroring
+                    // the send side, delivered messages no longer cost a
+                    // fresh alloc each. A popped buffer can carry less
+                    // capacity than `size` (it was sized for an earlier
+                    // message), so reserve first — `set_len` below requires
+                    // capacity >= size. Best-effort: an empty pool (or a
+                    // KcpSession::new private pool, never refilled) just
+                    // allocates fresh, identical to pre-pool behavior.
+                    let mut data = chunk_pool_pop(&self.pool, size);
+                    data.reserve(size);
                     // SAFETY: kcp.recv below fills `[..size]` before
-                    // returning; on error the Vec is dropped and `u8` is
-                    // always-initialized, so the unwritten tail is never
-                    // observed.
+                    // returning; on error the Vec is returned to the pool
+                    // and `u8` is always-initialized, so the unwritten tail
+                    // is never observed.
                     #[allow(clippy::uninit_vec)] // sound: u8, filled before read or dropped
                     unsafe {
                         data.set_len(size)
@@ -697,7 +722,14 @@ impl KcpSession {
                                 }
                             }
                         }
-                        Err(e) => return Err(io::Error::other(e)),
+                        Err(e) => {
+                            // Return the unused pooled buffer before
+                            // failing (its bytes are never observed —
+                            // chunk_pool_push clears on return, so no stale
+                            // data can leak into a later message).
+                            chunk_pool_push(&self.pool, data);
+                            return Err(io::Error::other(e));
+                        }
                     }
                 }
                 Err(KcpError::RecvQueueEmpty) => return Ok(()),

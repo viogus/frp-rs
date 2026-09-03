@@ -96,10 +96,63 @@ async fn first_bindable(bind_addr: &str, candidates: impl IntoIterator<Item = u1
     None
 }
 
+/// Why a proxy port could not be allocated, mirroring Go frp v0.71.0's four
+/// distinct errors — server/ports/ports.go:22-27:
+///
+/// ```go
+/// var (
+///     ErrPortAlreadyUsed = errors.New("port already used")
+///     ErrPortNotAllowed  = errors.New("port not allowed")
+///     ErrPortUnAvailable = errors.New("port unavailable")
+///     ErrNoAvailablePort = errors.New("no available port")
+/// )
+/// ```
+///
+/// Go's `Manager.Acquire` (ports.go:110-144) maps every failure branch to
+/// exactly one of these, and the text travels verbatim to the client's
+/// NewProxyResp error. Rust used to collapse the distinct failures into a
+/// single "no available port" (P8): an explicit port inside the allow
+/// ranges that fails the OS bind probe → [`PortError::UnAvailable`]
+/// (ports.go:130-136 — in `freePorts` but `isPortAvailable` failed); an
+/// explicit port outside the ranges → [`PortError::AlreadyUsed`] when
+/// `usedPorts` already holds it, else [`PortError::NotAllowed`]
+/// (ports.go:137-142); random auto-assign exhaustion →
+/// [`PortError::NoAvailable`] (ports.go:125-127).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PortError {
+    /// Explicit port already marked used by another live proxy (Go
+    /// `usedPorts` hit).
+    AlreadyUsed,
+    /// Explicit port outside every configured allow_ports range.
+    NotAllowed,
+    /// Port passed the allow checks but the OS-level bind probe failed
+    /// (bound by another process / privileged port / OS family restriction).
+    UnAvailable,
+    /// Auto-assign (remote_port == 0) exhausted every candidate.
+    NoAvailable,
+}
+
+impl PortError {
+    /// Go frp v0.71.0 client-visible rejection text —
+    /// server/ports/ports.go:23-26, verbatim.
+    pub(crate) fn client_text(&self) -> String {
+        match self {
+            PortError::AlreadyUsed => "port already used",
+            PortError::NotAllowed => "port not allowed",
+            PortError::UnAvailable => "port unavailable",
+            PortError::NoAvailable => "no available port",
+        }
+        .to_string()
+    }
+}
+
 /// Allocate the remote port for a new proxy (Go frp `ports.Manager` compat):
 /// SUDP override, per-client reservations with 24h expiry, allow-ports range
 /// scans, and OS-level bind probes. Extracted from `handle_new_proxy`'s
 /// state machine — no `.await`-free parts remain in the parent.
+///
+/// Returns [`PortError`] with the Go-mapped failure reason (see its doc for
+/// the branch mapping).
 #[inline(never)]
 async fn allocate_proxy_port(
     state: &Arc<AppState>,
@@ -108,7 +161,7 @@ async fn allocate_proxy_port(
     is_udp_type: bool,
     is_sudp: bool,
     mut remote_port: u16,
-) -> Option<u16> {
+) -> Result<u16, PortError> {
     // When sudp_port is configured, force all SUDP proxies to use that port
     if is_sudp && state.sudp_port > 0 {
         if remote_port > 0 && remote_port != state.sudp_port {
@@ -122,7 +175,7 @@ async fn allocate_proxy_port(
     if !consumes_port {
         // http/https/tcpmux/stcp/xtcp: no allowPorts consumption. Keep the
         // configured remote_port (usually 0) for display only.
-        Some(remote_port)
+        Ok(remote_port)
     } else if is_udp_type {
         // UDP/SuDP port allocation: no TCP bind probe (UdpSocket::bind handles
         // OS-level validation later). Use dedicated used_udp_ports tracking
@@ -131,21 +184,22 @@ async fn allocate_proxy_port(
         if remote_port > 0 {
             if ports.contains(&remote_port) {
                 // Port already used by another UDP proxy. SUDP allows sharing,
-                // pure UDP does not.
+                // pure UDP does not — Go ErrPortAlreadyUsed for the pure case
+                // (the `usedPorts` hit at ports.go:138-140).
                 if is_sudp {
-                    Some(remote_port)
+                    Ok(remote_port)
                 } else {
-                    None
+                    Err(PortError::AlreadyUsed)
                 }
+            } else if !is_udp_port_bindable(&state.proxy_bind_addr, remote_port) {
+                // OS-level UDP bind probe failed (Go frp compat:
+                // Manager.isPortAvailable does net.ListenUDP for UDP
+                // netType) — an in-range explicit port that cannot bind is
+                // Go ErrPortUnAvailable (ports.go:130-136), NOT exhaustion.
+                Err(PortError::UnAvailable)
             } else {
-                // OS-level UDP bind probe before marking as used (Go frp compat:
-                // Manager.isPortAvailable does net.ListenUDP for UDP netType).
-                if !is_udp_port_bindable(&state.proxy_bind_addr, remote_port) {
-                    None
-                } else {
-                    ports.insert(remote_port);
-                    Some(remote_port)
-                }
+                ports.insert(remote_port);
+                Ok(remote_port)
             }
         } else {
             // 24h reservation: re-registration with the same proxy name reuses
@@ -191,7 +245,7 @@ async fn allocate_proxy_port(
                     );
                 }
             }
-            found
+            found.ok_or(PortError::NoAvailable)
         }
     } else {
         // TCP-type proxy (tcp): three-phase port allocation. The blocking OS
@@ -263,11 +317,33 @@ async fn allocate_proxy_port(
                 }
             }
         } else {
-            let candidates = {
-                let used = state.used_ports.read().await;
-                crate::proxy::pick_tcp_port_candidates(&used, remote_port, &allow_ports, 4096)
+            // P8: classify an explicit port's failure BEFORE probing. The
+            // candidate picker collapses "already used" and "outside the
+            // allow ranges" into one empty vec, and an in-range probe
+            // failure looked identical to auto-assign exhaustion — every
+            // reject then read "no available port". Go distinguishes them
+            // (ports.go:137-142): a used explicit port → ErrPortAlreadyUsed;
+            // a port outside every allow range → ErrPortNotAllowed.
+            let (used, allowed) = {
+                let used_ports = state.used_ports.read().await;
+                let allowed =
+                    allow_ports.is_empty() || allow_ports.iter().any(|r| r.contains(remote_port));
+                (used_ports.contains(&remote_port), allowed)
             };
-            first_bindable(&state.proxy_bind_addr, candidates).await
+            if used {
+                return Err(PortError::AlreadyUsed);
+            }
+            if !allowed {
+                return Err(PortError::NotAllowed);
+            }
+            // In-range, unmarked: the single candidate's OS probe decides
+            // between success and Go ErrPortUnAvailable (ports.go:130-136 —
+            // in `freePorts` but `isPortAvailable` failed) — an explicit
+            // port another process holds is NOT exhaustion.
+            match first_bindable(&state.proxy_bind_addr, std::iter::once(remote_port)).await {
+                Some(p) => Some(p),
+                None => return Err(PortError::UnAvailable),
+            }
         };
         // Commit under write lock; re-check to close the race with a
         // concurrent registration. On conflict (TOCTOU: two registrations
@@ -295,22 +371,25 @@ async fn allocate_proxy_port(
                     match retry {
                         Some(p2) => {
                             ports.insert(p2);
-                            Some(p2)
+                            Ok(p2)
                         }
                         None => {
                             tracing::warn!(
                                 ranges = ?allow_ports,
                                 "Port exhaustion after allocation race: no available ports",
                             );
-                            None
+                            Err(PortError::NoAvailable)
                         }
                     }
                 } else {
                     ports.insert(p);
-                    Some(p)
+                    Ok(p)
                 }
             }
-            None => None,
+            // Auto-assign (remote_port == 0) exhausted every candidate —
+            // Go ErrNoAvailablePort (ports.go:125-127). An explicit port
+            // never reaches here: its probe failure returned UnAvailable.
+            None => Err(PortError::NoAvailable),
         }
     }
 }
@@ -564,6 +643,54 @@ pub(crate) async fn release_udp_port_with_owner_check(
         return false;
     }
     state.used_udp_ports.write().await.remove(&port);
+    true
+}
+
+/// Whether a registered proxy consumed a per-client port-budget slot —
+/// the exact mirror of the registration increments (register_proxy_entry
+/// and the TCP group member path): only tcp/udp/sudp proxies with a real
+/// remote port count against `max_ports_per_client`. stcp/xtcp/http/
+/// https/tcpmux register with remote_port Some(0) and must never release
+/// a slot (audit finding 1 symmetry). Shared by the release helper below
+/// and the unregister_control sweep.
+fn proxy_consumes_client_port(info: &ProxyInfo) -> bool {
+    matches!(info.proxy_type.as_str(), "tcp" | "udp" | "sudp")
+        && info.remote_port.is_some_and(|p| p > 0)
+}
+
+/// Remove a proxy from the registry and, when THIS call actually performed
+/// the removal, release the derived counters the entry owned: the
+/// SNI-sniff gate count (`https_proxy_count`, an https entry) and the
+/// per-client port-budget slot (`client_ports_used` for tcp/udp/sudp
+/// entries). Returns whether the removal happened here.
+///
+/// Removal paths race — the dashboard delete API, the client CloseProxy
+/// handler and control-disconnect cleanup can all observe the same proxy
+/// before any of them removes it. Counters are released only by the path
+/// whose `remove()` returned true: the loser re-releasing them would
+/// double-decrement (S4) — `client_ports_used` drifts below the live
+/// proxy count and `max_ports_per_client` admits one extra proxy per
+/// double-release, and `https_proxy_count` would hit 0 while https
+/// proxies still exist, silently disabling SNI sniff.
+pub(crate) async fn remove_proxy_and_release_client_counts(
+    state: &Arc<AppState>,
+    info: &ProxyInfo,
+) -> bool {
+    if !state.proxy_manager.remove(&info.name).await {
+        return false;
+    }
+    if info.proxy_type == "https" {
+        state.dec_https_proxy_count();
+    }
+    if proxy_consumes_client_port(info) {
+        let mut port_counts = state.client_ports_used.write().await;
+        if let Some(count) = port_counts.get_mut(&info.run_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                port_counts.remove(&info.run_id);
+            }
+        }
+    }
     true
 }
 
@@ -1894,7 +2021,7 @@ pub(crate) async fn handle_new_proxy(
         allocate_proxy_port(state, &np, consumes_port, is_udp_type, is_sudp, remote_port).await;
 
     match allocated_port {
-        Some(mut port) => {
+        Ok(mut port) => {
             // Registration via the shared helper: the TCP auto-assign bind
             // retry (`bind_tcp_proxy_with_retry`) re-enters it on a fresh
             // port when the first bind lost the auto-assigned port to
@@ -2392,9 +2519,11 @@ pub(crate) async fn handle_new_proxy(
             // Success — all failure paths above returned false.
             return true;
         }
-        None => {
-            warn!(proxy_name = %np.proxy_name, "No available port for proxy '{}'", np.proxy_name);
-            reject_new_proxy(writer, &np.proxy_name, "no available port".into(), v2).await;
+        Err(pe) => {
+            // P8: the rejection carries the Go-mapped reason (ports.go:22-27)
+            // instead of collapsing every failure into "no available port".
+            warn!(proxy_name = %np.proxy_name, reason = %pe.client_text(), "Port allocation failed for proxy '{}': {}", np.proxy_name, pe.client_text());
+            reject_new_proxy(writer, &np.proxy_name, pe.client_text(), v2).await;
             return false;
         }
     }
@@ -2518,14 +2647,22 @@ async fn bind_tcp_proxy_with_retry(
                 );
                 rollback_tcp_bind_failure(state, run_id, *port, &np.proxy_name).await;
                 state.port_reservations.write().await.remove(&np.proxy_name);
-                let Some(p) = allocate_proxy_port(state, np, true, false, false, 0).await else {
-                    tracing::warn!(
-                        proxy_name = %np.proxy_name,
-                        "No available port for proxy '{}' after auto-assign bind retry",
-                        np.proxy_name,
-                    );
-                    reject_new_proxy(writer, &np.proxy_name, "no available port".into(), v2).await;
-                    return Err(());
+                // P8: this re-allocation is always auto-assign, so the
+                // Go-mapped reason is NoAvailable in practice — but the
+                // reject text comes from the error, not a hardcoded string.
+                let p = match allocate_proxy_port(state, np, true, false, false, 0).await {
+                    Ok(p) => p,
+                    Err(pe) => {
+                        tracing::warn!(
+                            proxy_name = %np.proxy_name,
+                            reason = %pe.client_text(),
+                            "No available port for proxy '{}' after auto-assign bind retry: {}",
+                            np.proxy_name,
+                            pe.client_text(),
+                        );
+                        reject_new_proxy(writer, &np.proxy_name, pe.client_text(), v2).await;
+                        return Err(());
+                    }
                 };
                 if let Err(e) = register_proxy_entry(state, np, run_id, control_id, p, false).await
                 {
@@ -2926,9 +3063,7 @@ pub(crate) async fn unregister_control(
         {
             continue;
         }
-        if matches!(p.proxy_type.as_str(), "tcp" | "udp" | "sudp")
-            && p.remote_port.is_some_and(|port| port > 0)
-        {
+        if proxy_consumes_client_port(p) {
             consumed += 1;
         }
     }
@@ -3000,6 +3135,8 @@ pub(crate) async fn unregister_control(
             state.tcpmux_manager.unregister(&p.name).await;
         }
         state.proxy_metrics.remove(&p.name).await;
+        #[cfg(feature = "dashboard")]
+        crate::metrics::prom::proxy_removed(&p.name).await;
     }
     #[cfg(feature = "vnet")]
     {
@@ -3684,7 +3821,8 @@ pub(crate) mod unregister_generation_tests {
         tokio::time::timeout(Duration::from_secs(5), alloc)
             .await
             .expect("allocator hung: lock-order deadlock")
-            .expect("allocator task panicked");
+            .expect("allocator task panicked")
+            .expect("allocator must succeed once the reservations lock is released");
         tokio::time::timeout(Duration::from_secs(5), unreg)
             .await
             .expect("cleanup hung: lock-order deadlock")
@@ -7039,5 +7177,165 @@ mod tcp_auto_bind_retry_tests {
             !used.contains(&requested),
             "the conflicted port must be released"
         );
+    }
+
+    /// P8 (audit round 2) regression tests: every port-allocation failure
+    /// must reach the client with the Go frp v0.71.0 branch-mapped text
+    /// (server/ports/ports.go:22-27) instead of collapsing into one
+    /// "no available port". Go's Acquire maps: an explicit port already
+    /// used → ErrPortAlreadyUsed; an explicit port outside every
+    /// allow_ports range → ErrPortNotAllowed; an in-range explicit port
+    /// whose OS bind probe fails → ErrPortUnAvailable; auto-assign
+    /// exhaustion → ErrNoAvailablePort.
+    mod port_error_text_tests {
+        use super::super::*;
+        use super::{auto_assign_tcp_np, CaptureWriter};
+
+        /// Drive the real handler: rejection text lands in the captured
+        /// NewProxyResp. Returns (accepted, response bytes as text).
+        async fn register_and_reject(state: &Arc<AppState>, np: msg::NewProxy) -> (bool, String) {
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut writer = CaptureWriter { buf: buf.clone() };
+            let (itx, _irx) = tokio::sync::mpsc::channel(8);
+            let mut listener_handles = std::collections::HashMap::new();
+            let mut udp_sockets = std::collections::HashMap::new();
+            let accepted = handle_new_proxy(
+                np,
+                "run1",
+                1,
+                state,
+                &mut writer,
+                &itx,
+                &mut listener_handles,
+                &mut udp_sockets,
+                false,
+            )
+            .await;
+            let resp = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+            (accepted, resp)
+        }
+
+        fn set_allow_ports(state: &Arc<AppState>, start: u16, end: u16) {
+            let mut reloadable = state.reloadable.write().unwrap();
+            reloadable.allow_ports = Arc::new(vec![frp_core::config::PortsRange {
+                start,
+                end,
+                single: 0,
+            }]);
+        }
+
+        /// Explicit TCP port already marked used by another live proxy →
+        /// Go ErrPortAlreadyUsed ("port already used"). Deterministic: the
+        /// used-mark is classified BEFORE the OS probe, so no real socket
+        /// is involved.
+        #[tokio::test]
+        async fn tcp_explicit_used_port_rejects_port_already_used() {
+            let state = super::super::unregister_generation_tests::test_state();
+            state.used_ports.write().await.insert(61200);
+            let mut np = auto_assign_tcp_np("p-used");
+            np.remote_port = Some(61200);
+            let (accepted, resp) = register_and_reject(&state, np).await;
+            assert!(!accepted, "an in-use explicit port must be rejected");
+            assert!(
+                resp.contains("port already used"),
+                "rejection must carry Go ErrPortAlreadyUsed text: {resp}"
+            );
+            assert!(
+                state.proxy_manager.get("p-used").await.is_none(),
+                "a rejected proxy must not be registered"
+            );
+        }
+
+        /// Explicit TCP port outside every configured allow_ports range →
+        /// Go ErrPortNotAllowed ("port not allowed").
+        #[tokio::test]
+        async fn tcp_explicit_outside_allow_rejects_port_not_allowed() {
+            let state = super::super::unregister_generation_tests::test_state();
+            set_allow_ports(&state, 61100, 61199);
+            let mut np = auto_assign_tcp_np("p-range");
+            np.remote_port = Some(62000); // above the 61100-61199 range
+            let (accepted, resp) = register_and_reject(&state, np).await;
+            assert!(!accepted, "an out-of-range explicit port must be rejected");
+            assert!(
+                resp.contains("port not allowed"),
+                "rejection must carry Go ErrPortNotAllowed text: {resp}"
+            );
+        }
+
+        /// Auto-assign (remote_port == 0) with zero candidates (the only
+        /// allow-listed port is marked used) → Go ErrNoAvailablePort
+        /// ("no available port"). Deterministic: an empty candidate list is
+        /// exhausted before any OS probe runs.
+        #[tokio::test]
+        async fn tcp_auto_assign_exhaustion_rejects_no_available_port() {
+            let state = super::super::unregister_generation_tests::test_state();
+            set_allow_ports(&state, 61150, 61150);
+            state.used_ports.write().await.insert(61150);
+            let np = auto_assign_tcp_np("p-exhaust");
+            let (accepted, resp) = register_and_reject(&state, np).await;
+            assert!(!accepted, "auto-assign exhaustion must be rejected");
+            assert!(
+                resp.contains("no available port"),
+                "exhaustion must carry Go ErrNoAvailablePort text: {resp}"
+            );
+        }
+
+        /// Explicit UDP port already used by another UDP proxy →
+        /// Go ErrPortAlreadyUsed (the usedPorts hit) — previously collapsed
+        /// into "no available port" like every other allocation failure.
+        #[tokio::test]
+        async fn udp_explicit_conflict_rejects_port_already_used() {
+            let state = super::super::unregister_generation_tests::test_state();
+            state.used_udp_ports.write().await.insert(61300);
+            let mut np = auto_assign_tcp_np("p-udp-used");
+            np.proxy_type = "udp".to_string();
+            np.remote_port = Some(61300);
+            let (accepted, resp) = register_and_reject(&state, np).await;
+            assert!(!accepted, "an in-use explicit UDP port must be rejected");
+            assert!(
+                resp.contains("port already used"),
+                "UDP conflict must carry Go ErrPortAlreadyUsed text: {resp}"
+            );
+        }
+
+        /// Explicit TCP port bound by another process (passes the allow
+        /// range + used-mark checks, fails the OS probe) → Go
+        /// ErrPortUnAvailable ("port unavailable").
+        #[tokio::test]
+        async fn tcp_explicit_os_bound_rejects_port_unavailable() {
+            let state = super::super::unregister_generation_tests::test_state();
+            // Real thief socket on 127.0.0.1 (test_state's proxy_bind_addr):
+            // the allocator's probe fails with EADDRINUSE.
+            let thief = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("thief bind");
+            let port = thief.local_addr().expect("thief addr").port();
+            let mut np = auto_assign_tcp_np("p-bound");
+            np.remote_port = Some(port as i32);
+            let (accepted, resp) = register_and_reject(&state, np).await;
+            drop(thief);
+            assert!(!accepted, "an OS-bound explicit port must be rejected");
+            assert!(
+                resp.contains("port unavailable"),
+                "probe failure must carry Go ErrPortUnAvailable text: {resp}"
+            );
+        }
+
+        /// Explicit UDP port bound by another process → Go
+        /// ErrPortUnAvailable ("port unavailable").
+        #[tokio::test]
+        async fn udp_explicit_os_bound_rejects_port_unavailable() {
+            let state = super::super::unregister_generation_tests::test_state();
+            let thief = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("thief bind");
+            let port = thief.local_addr().expect("thief addr").port();
+            let mut np = auto_assign_tcp_np("p-udp-bound");
+            np.proxy_type = "udp".to_string();
+            np.remote_port = Some(port as i32);
+            let (accepted, resp) = register_and_reject(&state, np).await;
+            drop(thief);
+            assert!(!accepted, "an OS-bound explicit UDP port must be rejected");
+            assert!(
+                resp.contains("port unavailable"),
+                "UDP probe failure must carry Go ErrPortUnAvailable text: {resp}"
+            );
+        }
     }
 }

@@ -370,37 +370,10 @@ impl KcpSocket {
                         }
                         self.session_created_at.remove(&key);
                     }
-                    // Accepted-session idle reaper (M11): reclaim sessions
-                    // whose stream was dropped (read channel closed) and that
-                    // saw no inbound for the grace period with nothing left to
-                    // send. Before this reaper, an accepted session whose
-                    // stream dropped could only be reclaimed by inbound
-                    // traffic or dead-link retransmission exhaustion — a
-                    // silent peer left it pinned forever, and the 30-60s
-                    // accept-handler deadlines made attacker-created sessions
-                    // recyclable only at the 1024-session cap. Live streams
-                    // are never reaped (channel open): the frp heartbeat
-                    // layer — including configs that never heartbeat — owns
-                    // that connection's lifetime, the transport does not
-                    // override it. The grace exceeds KCP_RTO_MAX (2s) so a
-                    // session mid-retransmission is never cut.
-                    for (key, session) in &mut self.sessions {
-                        if self.session_created_at.contains_key(key) {
-                            continue; // unaccepted — the 30s expiry above owns it
-                        }
-                        if !session.read_channel_closed() {
-                            continue; // live stream — frp-layer liveness owns the conn
-                        }
-                        if session.wait_snd() > 0 {
-                            continue; // undelivered data — mirror the dial self-exit gate
-                        }
-                        let idle_ms = now_ms.wrapping_sub(session.last_inbound_ms());
-                        if idle_ms > ACCEPTED_SESSION_REAP_GRACE_MS {
-                            tracing::debug!(conv = key.0, peer = %key.1, idle_ms, "KCP: reaping accepted idle session (stream dropped, no inbound)");
-                            self.to_remove.push(*key);
-                        }
-                    }
-                    self.drain_to_remove();
+                    // Accepted-session idle reaper (M11) — see
+                    // `reap_accepted_idle_sessions`; extracted into its own
+                    // method so the three guards are unit-testable.
+                    self.reap_accepted_idle_sessions(now_ms);
                     // Trim per-IP session-creation logs and drop empty keys so
                     // a many-IP flood cannot accumulate map entries after their
                     // rate window expires.
@@ -778,6 +751,42 @@ impl KcpSocket {
         }
     }
 
+    /// Accepted-session idle reaper (M11): reclaim sessions whose stream was
+    /// dropped (read channel closed) and that saw no inbound for the grace
+    /// period with nothing left to send. Before this reaper, an accepted
+    /// session whose stream dropped could only be reclaimed by inbound
+    /// traffic or dead-link retransmission exhaustion — a silent peer left
+    /// it pinned forever, and the 30-60s accept-handler deadlines made
+    /// attacker-created sessions recyclable only at the 1024-session cap.
+    /// Live streams are never reaped (channel open): the frp heartbeat
+    /// layer — including configs that never heartbeat — owns that
+    /// connection's lifetime, the transport does not override it. The grace
+    /// exceeds KCP_RTO_MAX (2s) so a session mid-retransmission is never
+    /// cut.
+    ///
+    /// Called from the tick arm with the driver clock. Extracted (round R6)
+    /// so the guards are unit-testable; the call site is byte-identical to
+    /// the original inline block.
+    fn reap_accepted_idle_sessions(&mut self, now_ms: u32) {
+        for (key, session) in &mut self.sessions {
+            if self.session_created_at.contains_key(key) {
+                continue; // unaccepted — the 30s expiry above owns it
+            }
+            if !session.read_channel_closed() {
+                continue; // live stream — frp-layer liveness owns the conn
+            }
+            if session.wait_snd() > 0 {
+                continue; // undelivered data — mirror the dial self-exit gate
+            }
+            let idle_ms = now_ms.wrapping_sub(session.last_inbound_ms());
+            if idle_ms > ACCEPTED_SESSION_REAP_GRACE_MS {
+                tracing::debug!(conv = key.0, peer = %key.1, idle_ms, "KCP: reaping accepted idle session (stream dropped, no inbound)");
+                self.to_remove.push(*key);
+            }
+        }
+        self.drain_to_remove();
+    }
+
     /// Remove the sessions queued on `to_remove` (marking them dead first
     /// so KcpStream::poll_write fails fast) and drop their index entries.
     /// Called from the tick arm after its scan and from the recv arm after
@@ -1033,5 +1042,218 @@ mod tests {
         while pool.pop().is_some() {}
         let c3 = chunk_pool_pop(&pool, 8192);
         assert!(c3.capacity() >= 8192);
+    }
+
+    /// Round R6: the accepted-session idle reaper (`reap_accepted_idle_sessions`,
+    /// extracted from the tick arm) had zero test coverage. Pin its three
+    /// guards on a wire-shaped accepted session (registered in the driver's
+    /// maps, NOT in `session_created_at`, backed by a real KcpStream):
+    /// 1. a live stream is never reaped no matter how idle (channel open),
+    /// 2. a closed-channel session survives inside the grace window,
+    /// 3. past the grace (idle > ACCEPTED_SESSION_REAP_GRACE_MS) it is
+    ///    removed from every index and marked dead (streams observe
+    ///    NotConnected instead of silently buffering).
+    #[tokio::test]
+    async fn accepted_session_reaper_guards_idle_and_live() {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (mut driver, _handle, _accept_rx) = KcpSocket::new(udp, KcpConfig::default());
+
+        let conv = 7u32;
+        let peer: SocketAddr = "203.0.113.9:4711".parse().unwrap();
+        let key = (conv, peer);
+
+        // Wire-shaped accepted session: the driver's wire path builds the
+        // session, shares the socket's chunk pool, and hands the read
+        // channel to a KcpStream; acceptance removes it from
+        // `session_created_at` (here: never inserted — the reaper treats
+        // that as accepted).
+        let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
+        let mut session = KcpSession::with_chunk_pool(
+            conv,
+            peer,
+            KcpConfig::default(),
+            read_tx,
+            driver.chunk_pool.clone(),
+        );
+        session.note_inbound(1000); // driver stamped the first inbound packet
+        let alive = session.alive_handle();
+        let (snd_backlog, snd_notify) = session.snd_backlog_handle();
+        let stream = KcpStream::new(
+            conv,
+            peer,
+            driver.write_tx.clone(),
+            read_rx,
+            driver.write_backlog.clone(),
+            driver.write_notify.clone(),
+            driver.chunk_pool.clone(),
+            snd_backlog,
+            snd_notify,
+            alive.clone(),
+            driver.alive_streams.clone(),
+        );
+        driver.sessions.insert(key, session);
+        driver.conv_index.insert(conv, peer);
+        driver.peer_addr_index.insert(peer, conv);
+
+        // Guard 1: live stream — idle far past the grace, channel open.
+        driver.reap_accepted_idle_sessions(1000 + ACCEPTED_SESSION_REAP_GRACE_MS + 60_000);
+        assert!(
+            driver.sessions.contains_key(&key),
+            "live stream must never be reaped, however idle"
+        );
+        assert!(alive.load(Ordering::Relaxed));
+
+        // Closing the read channel is what makes the session reapable:
+        // the single stream owned the channel's rx end for the connection
+        // lifetime, so a closed channel means the frp connection is gone.
+        drop(stream);
+        assert!(
+            driver.sessions.get(&key).unwrap().read_channel_closed(),
+            "dropping the stream must close the session's read channel"
+        );
+
+        // Guard 2: inside the grace window the closed session survives.
+        driver.reap_accepted_idle_sessions(1000 + ACCEPTED_SESSION_REAP_GRACE_MS - 1);
+        assert!(
+            driver.sessions.contains_key(&key),
+            "closed session must survive inside the grace window"
+        );
+
+        // Guard 3: past the grace it is reaped from every index and marked
+        // dead, so a KcpStream that somehow still holds a reference observes
+        // NotConnected instead of buffering forever.
+        driver.reap_accepted_idle_sessions(1000 + ACCEPTED_SESSION_REAP_GRACE_MS + 1);
+        assert!(
+            !driver.sessions.contains_key(&key),
+            "closed idle session must be reaped past the grace"
+        );
+        assert!(
+            !driver.conv_index.contains_key(&conv),
+            "reaped session must drop its conv index entry"
+        );
+        assert!(
+            !driver.peer_addr_index.contains_key(&peer),
+            "reaped session must drop its peer-addr index entry (no other session on that addr)"
+        );
+        assert!(
+            !alive.load(Ordering::Relaxed),
+            "reaped session must be marked dead so streams fail fast"
+        );
+
+        // The reap must not disturb the to_remove queue the recv arm may
+        // have filled (drain_to_remove contract).
+        assert!(driver.to_remove.is_empty());
+    }
+
+    /// Round M4: the receive side must recycle delivered-message buffers
+    /// through the shared chunk pool exactly like the send side —
+    /// `KcpSession::recv_and_push` pops a pooled buffer per delivered KCP
+    /// message and `KcpStream::poll_read` returns it once fully consumed.
+    /// Before the read-side pool landed, every delivered message allocated a
+    /// fresh Vec (dropped after the stream consumed it), so the shared pool
+    /// stayed empty regardless of traffic volume. Red on the pre-fix code:
+    /// the pool-length assertion below fails on the first message.
+    #[tokio::test(start_paused = true)]
+    async fn read_side_recycles_channel_buffers_through_chunk_pool() {
+        use tokio::io::AsyncReadExt;
+        use tokio::time::{timeout, Duration};
+
+        use super::super::config::KcpNoDelayConfig;
+
+        // Message-boundary mode: each send() is one KCP message = one
+        // channel item, so per-message byte-exactness is assertable.
+        let cfg = KcpConfig {
+            mtu: 1400,
+            wnd_size: (128, 128),
+            stream: false,
+            data_shards: 0,
+            parity_shards: 0,
+            nodelay: KcpNoDelayConfig {
+                nodelay: true,
+                interval: 10,
+                resend: 2,
+                nc: true,
+            },
+        };
+        let (tx1, _rx1) = mpsc::channel::<Vec<u8>>(16);
+        let mut sender = KcpSession::new(1, "127.0.0.1:9001".parse().unwrap(), cfg.clone(), tx1);
+
+        // Receiver shares an externally observable pool — the same shape as
+        // the driver path (session + stream share the socket's chunk_pool).
+        let pool = Arc::new(ArrayQueue::new(CHUNK_POOL_CAP));
+        let (tx2, rx2) = mpsc::channel::<Vec<u8>>(256);
+        let mut receiver = KcpSession::with_chunk_pool(
+            1,
+            "127.0.0.1:9000".parse().unwrap(),
+            cfg,
+            tx2,
+            pool.clone(),
+        );
+
+        // A real KcpStream over the receiver's read channel — the same
+        // construction KcpSocket::run uses for wire sessions.
+        let (snd_backlog, snd_notify) = receiver.snd_backlog_handle();
+        let (write_tx, _write_rx) = mpsc::channel(16);
+        let mut stream = KcpStream::new(
+            1,
+            "127.0.0.1:9000".parse().unwrap(),
+            write_tx,
+            rx2,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Notify::new()),
+            pool.clone(),
+            snd_backlog,
+            snd_notify,
+            receiver.alive_handle(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let msgs: [&[u8]; 3] = [b"alpha", b"bravo!", b"charlie-42"];
+        for (i, msg) in msgs.iter().enumerate() {
+            sender.send(msg).unwrap();
+
+            let mut now_ms = 0u32;
+            let mut got: Option<Vec<u8>> = None;
+            for _ in 0..300 {
+                now_ms += 10;
+                let packets = sender.update(now_ms).unwrap();
+                for pkt in &packets {
+                    receiver.input(pkt).unwrap();
+                }
+                receiver.recv_and_push().unwrap();
+                // ACK flush — output dropped (window is 128 wide; three tiny
+                // messages never depend on ACKs, mirroring the session
+                // roundtrip tests).
+                receiver.update(now_ms).unwrap();
+
+                let mut buf = [0u8; 128];
+                match timeout(Duration::from_millis(1), stream.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => {
+                        got = Some(buf[..n].to_vec());
+                        break;
+                    }
+                    Ok(Ok(_)) => panic!("read hit EOF while the read channel is open"),
+                    Ok(Err(e)) => panic!("stream read error: {e}"),
+                    Err(_) => {} // not delivered yet — drive more ticks
+                }
+            }
+            let data = got
+                .unwrap_or_else(|| panic!("message {i} was not delivered within the tick budget"));
+            assert!(
+                data.as_slice() == *msg,
+                "message {i}: recycled-buffer payload mismatch (got {:?}, want {:?})",
+                data,
+                msg
+            );
+
+            // After full consumption the buffer must be back in the shared
+            // pool. RED on the pre-fix code: recv_and_push allocated fresh
+            // and poll_read dropped the Vec after consuming it, so the pool
+            // stays empty no matter the traffic.
+            assert!(
+                !pool.is_empty(),
+                "message {i}: fully-consumed channel buffer was not recycled to the chunk pool"
+            );
+        }
     }
 }

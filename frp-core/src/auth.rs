@@ -1127,6 +1127,28 @@ mod oidc_impl {
         http: crate::http_client::HttpClient,
     }
 
+    /// Upper cap (seconds) for how long a fetched access token is cached.
+    /// 24h far exceeds any real OIDC access-token lifetime (minutes to
+    /// hours); Rust-only hardening — Go frp's oauth2 caches whatever the
+    /// IdP declares and its int64 `expires_in` decode rejects oversized
+    /// values, Rust's u64 parse accepts them.
+    const OIDC_EXPIRES_IN_CAP_SECS: u64 = 24 * 60 * 60;
+
+    /// Sanitize the IdP-declared `expires_in` (seconds) into a safe cache
+    /// window: keep the 60s edge-of-expiry refresh margin (floor at 0 — a
+    /// token that expires within the margin is simply not cached) and cap
+    /// the result at [`OIDC_EXPIRES_IN_CAP_SECS`]. The value feeds
+    /// `Instant::now() + Duration::from_secs(...)` when the fetched token is
+    /// cached (get_token), and std `Instant` PANICS when the add overflows —
+    /// under the release `panic=abort` profile a hostile/broken IdP
+    /// answering `expires_in: u64::MAX` would abort frpc on the next OIDC
+    /// login (audit finding S2). Capped, the worst case is a re-fetch every
+    /// 24h — harmless.
+    fn sanitize_expires_in(raw: u64) -> u64 {
+        // 60s refresh buffer (edge-of-expiry failures), then the cache cap.
+        raw.saturating_sub(60).min(OIDC_EXPIRES_IN_CAP_SECS)
+    }
+
     impl OidcClient {
         /// Create new OidcClient. If token_endpoint is empty, discovers from issuer.
         ///
@@ -1295,9 +1317,10 @@ mod oidc_impl {
             let expires_in_present = body.get("expires_in").and_then(|v| v.as_u64());
             match expires_in_present {
                 Some(secs) => {
-                    // Subtract 60s refresh buffer to avoid edge-of-expiry failures.
-                    let expires_in = secs.saturating_sub(60);
-                    Ok((token, expires_in))
+                    // Sanitize the IdP-controlled value before it reaches the
+                    // `Instant::now() + from_secs` cache write in get_token
+                    // (audit finding S2): 60s refresh buffer + 24h cap.
+                    Ok((token, sanitize_expires_in(secs)))
                 }
                 None => {
                     // Provider omitted expires_in: switch to non-caching mode.
@@ -1976,6 +1999,34 @@ mod oidc_impl {
             assert_eq!(t1, "tok-1");
             assert_eq!(t2, "tok-1");
             assert_eq!(endpoint.count(), 1, "second call must hit the cache");
+        }
+
+        #[test]
+        fn test_sanitize_expires_in() {
+            // 60s refresh margin floors the cache window: a token expiring
+            // within the margin (or already declared expired) is never
+            // cached — every get_token call refetches, exactly the margin's
+            // purpose of avoiding edge-of-expiry failures.
+            assert_eq!(sanitize_expires_in(0), 0);
+            assert_eq!(sanitize_expires_in(59), 0);
+            assert_eq!(sanitize_expires_in(60), 0);
+            // Normal provider lifetimes pass through, minus the margin.
+            assert_eq!(sanitize_expires_in(61), 1);
+            assert_eq!(sanitize_expires_in(300), 240);
+            assert_eq!(sanitize_expires_in(3600), 3540);
+            // Cap boundary: 24h + margin lands exactly on the cap; 24h alone
+            // passes through minus the margin (still under the cap).
+            assert_eq!(
+                sanitize_expires_in(OIDC_EXPIRES_IN_CAP_SECS + 60),
+                OIDC_EXPIRES_IN_CAP_SECS
+            );
+            assert_eq!(
+                sanitize_expires_in(OIDC_EXPIRES_IN_CAP_SECS),
+                OIDC_EXPIRES_IN_CAP_SECS - 60
+            );
+            // Hostile/broken IdP values are capped — the cached-token write
+            // `Instant::now() + from_secs(expires_in)` must never overflow.
+            assert_eq!(sanitize_expires_in(u64::MAX), OIDC_EXPIRES_IN_CAP_SECS);
         }
     }
 }

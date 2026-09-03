@@ -221,6 +221,61 @@ struct StatusResponse {
     pool_pending: i64,
 }
 
+/// Go `model.ServerInfoResp` (frp v0.71.0 `server/http/model/types.go:21-40`)
+/// — served on GET /api/serverinfo for Go-frp-shaped consumers (the Go
+/// dashboard frontend, scripts, tooling). Distinct from the Rust-native
+/// [`StatusResponse`] on GET /api/status (frp-rs dashboard UI payload).
+///
+/// Field order, JSON names and omitempty rules mirror the Go struct exactly:
+/// `allowPortsStr` is omitted when empty and `tlsForce` when false (Go
+/// `json:"allowPortsStr,omitempty"` / `json:"tlsForce,omitempty"`); every
+/// other key is always present, zero values included.
+#[derive(Serialize)]
+struct ServerInfoResp {
+    version: String,
+    #[serde(rename = "bindPort")]
+    bind_port: u16,
+    #[serde(rename = "vhostHTTPPort")]
+    vhost_http_port: u16,
+    #[serde(rename = "vhostHTTPSPort")]
+    vhost_https_port: u16,
+    #[serde(rename = "tcpmuxHTTPConnectPort")]
+    tcpmux_httpconnect_port: u16,
+    #[cfg(feature = "kcp")]
+    #[serde(rename = "kcpBindPort")]
+    kcp_bind_port: u16,
+    #[cfg(feature = "quic")]
+    #[serde(rename = "quicBindPort")]
+    quic_bind_port: u16,
+    #[serde(rename = "subdomainHost")]
+    subdomain_host: String,
+    #[serde(rename = "maxPoolCount")]
+    max_pool_count: i64,
+    #[serde(rename = "maxPortsPerClient")]
+    max_ports_per_client: i64,
+    #[serde(rename = "heartbeatTimeout")]
+    heartbeat_timeout: i64,
+    #[serde(rename = "allowPortsStr", skip_serializing_if = "String::is_empty")]
+    allow_ports_str: String,
+    #[serde(rename = "tlsForce", skip_serializing_if = "is_false")]
+    tls_force: bool,
+    #[serde(rename = "totalTrafficIn")]
+    total_traffic_in: i64,
+    #[serde(rename = "totalTrafficOut")]
+    total_traffic_out: i64,
+    #[serde(rename = "curConns")]
+    cur_conns: i64,
+    #[serde(rename = "clientCounts")]
+    client_counts: i64,
+    #[serde(rename = "proxyTypeCount")]
+    proxy_type_counts: HashMap<String, i64>,
+}
+
+/// `skip_serializing_if` helper mirroring Go's `json:"tlsForce,omitempty"`.
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 #[derive(Serialize)]
 struct ProxyEntry {
     name: String,
@@ -315,8 +370,9 @@ struct ClientDetail {
 
 // --- Handlers ---
 
-/// Build the shared status payload for `/api/status` and its Go-frp-compat
-/// alias `/api/serverinfo`.
+/// Build the Rust-native status payload for `/api/status` (consumed by the
+/// frp-rs dashboard page). The Go-frp-compat `/api/serverinfo` route serves
+/// the Go-shaped [`ServerInfoResp`] instead — see `build_serverinfo`.
 async fn build_status_response(state: &Arc<AppState>) -> StatusResponse {
     let uptime = state.dashboard_start.elapsed().as_secs();
     let client_count = state.run_id_to_ctl_tx.len();
@@ -350,9 +406,71 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusRespons
     Json(build_status_response(&state).await)
 }
 
-/// GET /api/serverinfo — Go frp compat alias for /api/status.
-async fn handle_serverinfo(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
-    Json(build_status_response(&state).await)
+/// Build the Go `model.ServerInfoResp` payload for GET /api/serverinfo.
+///
+/// Config fields mirror Go `buildServerInfoResp`
+/// (`server/http/controller.go:66`, reading `serverCfg`): frp-rs reads the
+/// immutable `ServerConfigSnapshot` — the same source as the v2
+/// `/api/v2/system/info` config section. Live counters mirror Go
+/// `mem.ServerStats` (`pkg/metrics/mem/server.go:141-158`): traffic totals
+/// are per-proxy today-bytes (`TrafficHistory[0]`; Go's `DateCounter.
+/// TodayCount()` — NOT lifetime totals), `curConns` / `clientCounts` are
+/// live gauges, `proxyTypeCount` is a per-type live count of registered
+/// proxies (Go `NewProxy`/`CloseProxy` counters; frp-rs counts the
+/// `proxy_manager` list the same way).
+///
+/// Known divergence (shared with `/api/v2/system/info`): proxy metrics are
+/// dropped when a proxy closes (`ProxyMetricsRegistry::remove`), so traffic
+/// from proxies closed earlier today is not carried in the totals the way
+/// Go's server-global counter carries it.
+async fn build_serverinfo(state: &Arc<AppState>) -> ServerInfoResp {
+    let snap = &state.server_config_snapshot;
+    let client_counts = state.run_id_to_ctl_tx.len() as i64;
+
+    let mut proxy_type_counts: HashMap<String, i64> = HashMap::new();
+    let mut total_traffic_in: i64 = 0;
+    let mut total_traffic_out: i64 = 0;
+    let mut cur_conns: i64 = 0;
+    for p in state.proxy_manager.list().await {
+        *proxy_type_counts.entry(p.proxy_type.clone()).or_insert(0) += 1;
+        if let Some(m) = state.proxy_metrics.get(&p.name).await {
+            let (tin, tout) = m.daily.snapshot();
+            total_traffic_in += tin[0] as i64;
+            total_traffic_out += tout[0] as i64;
+            cur_conns += m.snapshot().current_conns;
+        }
+    }
+
+    ServerInfoResp {
+        version: frp_core::VERSION.to_string(),
+        bind_port: snap.bind_port,
+        vhost_http_port: snap.vhost_http_port,
+        vhost_https_port: snap.vhost_https_port,
+        tcpmux_httpconnect_port: snap.tcpmux_httpconnect_port,
+        #[cfg(feature = "kcp")]
+        kcp_bind_port: snap.kcp_bind_port,
+        #[cfg(feature = "quic")]
+        quic_bind_port: snap.quic_bind_port,
+        subdomain_host: snap.subdomain_host.clone(),
+        max_pool_count: snap.max_pool_count,
+        max_ports_per_client: snap.max_ports_per_client,
+        heartbeat_timeout: snap.heartbeat_timeout,
+        allow_ports_str: snap.allow_ports_str.clone(),
+        tls_force: snap.tls_force,
+        total_traffic_in,
+        total_traffic_out,
+        cur_conns,
+        client_counts,
+        proxy_type_counts,
+    }
+}
+
+/// GET /api/serverinfo — Go frp v0.71.0 `model.ServerInfoResp` in camelCase
+/// (see `server/http/model/types.go:21-40`). Go-shaped consumers (the Go v1
+/// dashboard frontend, scripts, tooling) fetch these keys. The Rust-native
+/// frp-rs status payload stays on GET /api/status.
+async fn handle_serverinfo(State(state): State<Arc<AppState>>) -> Json<ServerInfoResp> {
+    Json(build_serverinfo(&state).await)
 }
 
 /// GET /api/proxies — list all proxies, optional ?type= filter.
@@ -845,18 +963,25 @@ async fn handle_store_proxy_create(
 /// Clean up server-side port allocation for a deleted proxy, mirroring the
 /// client CloseProxy path (`control/proxy.rs`): TCP group ports are only
 /// released for the last group member (the shared listener still owns the
-/// port otherwise), the group listener is stopped for the final member, and
-/// the per-client port count is decremented. The dashboard delete paths used
-/// to skip all three — leaking port quota (`max_ports_per_client`) and
+/// port otherwise) and the group listener is stopped for the final member.
+/// The dashboard delete paths used to skip these — leaking port quota and
 /// leaving zombie group listeners holding ports until frps restarts.
 ///
-/// Callers invoke this AFTER `proxy_manager.remove()` — M5 race-safe
-/// ordering: the group-last check then counts only surviving members (the
-/// deleted one is gone), so a dashboard delete racing a client CloseProxy
-/// cannot have both paths snapshot the pre-removal length and both skip the
-/// teardown. (For the same reason the SUDP owner-check below counts only the
-/// other live udp/sudp proxies — identical to the pre-removal semantics,
-/// which excluded the deleted proxy explicitly.)
+/// The per-client port-count decrement does NOT live here: it is released by
+/// `crate::control::remove_proxy_and_release_client_counts` (the caller's
+/// registry removal, gated on remove()'s result — S4). A dashboard delete
+/// racing a client CloseProxy can have both paths observe the same proxy
+/// before either removes it; only the path whose remove() returned true may
+/// release the counters, so both delete paths call the shared helper FIRST
+/// and invoke this mark-cleanup only on its success.
+///
+/// Callers invoke this AFTER the winning `proxy_manager.remove()` — M5
+/// race-safe ordering: the group-last check then counts only surviving
+/// members (the deleted one is gone), so a dashboard delete racing a client
+/// CloseProxy cannot have both paths snapshot the pre-removal length and
+/// both skip the teardown. (For the same reason the SUDP owner-check below
+/// counts only the other live udp/sudp proxies — identical to the
+/// pre-removal semantics, which excluded the deleted proxy explicitly.)
 async fn cleanup_deleted_proxy_port(state: &Arc<AppState>, proxy: &crate::proxy::ProxyInfo) {
     let is_tcp_group =
         proxy.proxy_type == "tcp" && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some();
@@ -875,23 +1000,6 @@ async fn cleanup_deleted_proxy_port(state: &Arc<AppState>, proxy: &crate::proxy:
             crate::control::release_udp_port_with_owner_check(state, port, &proxy.name).await;
         } else if !is_tcp_group || last_group_member {
             state.used_ports.write().await.remove(&port);
-        }
-        // Decrement per-client port count (matching Go frp's portsUsedNum).
-        // Only proxies that actually consumed a port were counted (audit
-        // finding 1 symmetry): http/https/tcpmux/stcp/xtcp delete with
-        // remote_port Some(0) and must not decrement — repeated deletes of
-        // non-consuming proxies would drive the shared budget counter down
-        // while live tcp/udp proxies still consume ports, letting the
-        // max_ports_per_client gate undercount.
-        if matches!(proxy.proxy_type.as_str(), "tcp" | "udp" | "sudp") && port > 0 {
-            let run_id = &proxy.run_id;
-            let mut port_counts = state.client_ports_used.write().await;
-            if let Some(count) = port_counts.get_mut(run_id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    port_counts.remove(run_id);
-                }
-            }
         }
     }
     // Stop the shared TCP group listener when the last member closes so it
@@ -951,21 +1059,24 @@ async fn handle_store_proxy_delete(
         state.tcpmux_manager.unregister(&name).await;
     }
     state.proxy_metrics.remove(&name).await;
-    // Decrement the SNI-sniff gate count only when the proxy was actually
-    // removed — the client CloseProxy path races this handler and both may
-    // observe the proxy before either removes it. A double decrement would
-    // leave https_proxy_count at 0 while https proxies still exist, silently
-    // disabling SNI sniff (HTTPS vhost routing) until the next lifecycle
-    // event.
-    if state.proxy_manager.remove(&name).await && proxy.proxy_type == "https" {
-        state.dec_https_proxy_count();
+    crate::metrics::prom::proxy_removed(&name).await;
+    // Remove the proxy and release the counters it owns (https SNI-sniff
+    // gate count, per-client port-budget slot) ONLY when this call actually
+    // performed the removal — the client CloseProxy handler races this path
+    // and both may observe the proxy before either removes it. A double
+    // release would decrement client_ports_used twice (S4: the budget drifts
+    // below the live count and max_ports_per_client admits extra proxies)
+    // and leave https_proxy_count at 0 while https proxies still exist,
+    // silently disabling SNI sniff (HTTPS vhost routing).
+    if crate::control::remove_proxy_and_release_client_counts(&state, &proxy).await {
+        // Clean up port marks AFTER the registry removal (TCP/UDP manager,
+        // TCP group last-member semantics — same lifecycle as the client
+        // CloseProxy path). M5: post-remove the group-last check counts only
+        // surviving members, so a delete racing a client CloseProxy cannot
+        // double-skip the shared-listener teardown. Skipped on a lost race:
+        // the path that actually removed the proxy ran its own cleanup.
+        cleanup_deleted_proxy_port(&state, &proxy).await;
     }
-    // Clean up port AFTER the registry removal (TCP/UDP manager, TCP group
-    // last-member semantics and per-client port quota — same lifecycle as
-    // the client CloseProxy path). M5: post-remove the group-last check
-    // counts only surviving members, so a delete racing a client CloseProxy
-    // cannot double-skip the shared-listener teardown.
-    cleanup_deleted_proxy_port(&state, &proxy).await;
     // Remove from store if present
     state.proxy_config_store.write().await.remove(&name);
 
@@ -1031,16 +1142,19 @@ async fn handle_proxies_delete(
                 state.tcpmux_manager.unregister(name).await;
             }
             state.proxy_metrics.remove(name).await;
-            // Decrement the SNI-sniff gate count only when the proxy was
-            // actually removed — CloseProxy / client disconnect race this
-            // bulk delete, and a double decrement would leave
+            crate::metrics::prom::proxy_removed(name).await;
+            // Remove the proxy and release the counters it owns (https
+            // SNI-sniff gate count, per-client port-budget slot) ONLY when
+            // this call actually performed the removal — CloseProxy / client
+            // disconnect race this bulk delete, and a double release would
+            // double-decrement client_ports_used (S4) and leave
             // https_proxy_count at 0 while https proxies still exist.
-            if state.proxy_manager.remove(name).await && proxy.proxy_type == "https" {
-                state.dec_https_proxy_count();
+            if crate::control::remove_proxy_and_release_client_counts(&state, &proxy).await {
+                // Port-mark cleanup AFTER the registry removal — same M5
+                // race-safe ordering as the single-delete path. Skipped on a
+                // lost race: the winner ran its own cleanup.
+                cleanup_deleted_proxy_port(&state, &proxy).await;
             }
-            // Port cleanup AFTER the registry removal — same M5 race-safe
-            // ordering as the single-delete path.
-            cleanup_deleted_proxy_port(&state, &proxy).await;
             state.proxy_config_store.write().await.remove(name);
             deleted.push(name.clone());
         }
@@ -2581,6 +2695,7 @@ mod v2 {
         for p in &all {
             if !state.run_id_to_ctl_tx.contains_key(&p.run_id) {
                 state.proxy_metrics.remove(&p.name).await;
+                crate::metrics::prom::proxy_removed(&p.name).await;
                 cleared += 1;
             }
         }
@@ -2706,6 +2821,111 @@ mod v2 {
                 Err(e) => e,
                 Ok(_) => panic!("{msg}"),
             }
+        }
+
+        /// GET /api/serverinfo serves the Go `model.ServerInfoResp` shape —
+        /// camelCase keys, all non-omitempty keys always present, zero
+        /// values included; `allowPortsStr`/`tlsForce` follow Go's
+        /// omitempty rules. The Rust-native keys stay on /api/status.
+        #[tokio::test]
+        async fn test_serverinfo_go_shape() {
+            let state = test_state();
+            let resp = handle_serverinfo(State(state.clone())).await;
+            let obj = serde_json::to_value(&resp.0).unwrap();
+            let obj = obj.as_object().unwrap();
+
+            // Full Go key set, correct camelCase names (types.go:21-40).
+            for key in [
+                "version",
+                "bindPort",
+                "vhostHTTPPort",
+                "vhostHTTPSPort",
+                "tcpmuxHTTPConnectPort",
+                "kcpBindPort",
+                "quicBindPort",
+                "subdomainHost",
+                "maxPoolCount",
+                "maxPortsPerClient",
+                "heartbeatTimeout",
+                "totalTrafficIn",
+                "totalTrafficOut",
+                "curConns",
+                "clientCounts",
+                "proxyTypeCount",
+            ] {
+                assert!(obj.contains_key(key), "missing Go key {key}");
+            }
+            // No Rust-native status keys may leak into the Go-shaped payload.
+            for key in ["uptime_secs", "client_count", "proxy_count", "pool_hits"] {
+                assert!(!obj.contains_key(key), "Rust-native key {key} leaked");
+            }
+            // Go omitempty: allowPortsStr empty and tlsForce false are absent
+            // on a default server.
+            assert!(
+                obj.get("allowPortsStr").is_none(),
+                "empty allowPortsStr must be omitted"
+            );
+            assert!(
+                obj.get("tlsForce").is_none(),
+                "false tlsForce must be omitted"
+            );
+
+            // Zero-value rules + defaults of the test_state config.
+            assert_eq!(obj["version"], frp_core::VERSION);
+            assert_eq!(obj["bindPort"], 7000, "default bind port");
+            assert_eq!(obj["vhostHTTPPort"], 0);
+            assert_eq!(obj["vhostHTTPSPort"], 0);
+            assert_eq!(obj["tcpmuxHTTPConnectPort"], 0);
+            assert_eq!(obj["subdomainHost"], "");
+            assert_eq!(obj["maxPoolCount"], 5, "transport max pool default");
+            assert_eq!(obj["heartbeatTimeout"], 90, "heartbeat timeout default");
+            assert_eq!(obj["clientCounts"], 0);
+            assert_eq!(obj["totalTrafficIn"], 0);
+            assert_eq!(obj["totalTrafficOut"], 0);
+            assert_eq!(obj["curConns"], 0);
+            assert_eq!(
+                obj["proxyTypeCount"].as_object().unwrap().len(),
+                0,
+                "no proxies registered"
+            );
+
+            // Live-state semantics: per-type counts from registered proxies,
+            // traffic totals = today bytes (Go DateCounter TodayCount),
+            // curConns = live open-connection gauge.
+            state
+                .proxy_manager
+                .register("run-1".into(), proxy_info("p1", "tcp"))
+                .await
+                .unwrap();
+            state
+                .proxy_manager
+                .register("run-2".into(), proxy_info("p2", "udp"))
+                .await
+                .unwrap();
+            let m1 = state.proxy_metrics.get_or_create("p1").await;
+            m1.record_traffic(1000, 2000);
+            m1.current_conns.fetch_add(3, Ordering::Relaxed);
+            let m2 = state.proxy_metrics.get_or_create("p2").await;
+            m2.record_traffic(3000, 4000);
+            m2.current_conns.fetch_add(1, Ordering::Relaxed);
+
+            let resp = handle_serverinfo(State(state)).await;
+            let obj = serde_json::to_value(&resp.0).unwrap();
+            let obj = obj.as_object().unwrap();
+            let types = obj["proxyTypeCount"].as_object().unwrap();
+            assert_eq!(types.len(), 2);
+            assert_eq!(types["tcp"], 1);
+            assert_eq!(types["udp"], 1);
+            assert_eq!(
+                obj["totalTrafficIn"], 4000,
+                "today-bytes sum across proxies"
+            );
+            assert_eq!(obj["totalTrafficOut"], 6000);
+            assert_eq!(obj["curConns"], 4);
+            assert_eq!(
+                obj["clientCounts"], 0,
+                "no control connections in test state"
+            );
         }
 
         #[tokio::test]
@@ -3260,14 +3480,17 @@ mod cleanup_deleted_proxy_port_tests {
     use super::*;
     use crate::control::proxy_ops::unregister_generation_tests::{proxy_info, test_state};
 
-    /// Finding-1 symmetry (review round 1): deleting a proxy that never
-    /// consumed a port (http/https/tcpmux/stcp/xtcp register with
-    /// remote_port Some(0)) must not decrement client_ports_used — the
-    /// increment side is gated on `tcp|udp|sudp && port > 0`, so the
-    /// dashboard delete must mirror it. Before the fix, repeated deletes of
-    /// non-consuming proxies drove the shared budget counter down while live
-    /// tcp/udp proxies still consumed ports, letting the max_ports_per_client
-    /// gate undercount.
+    /// Finding-1 symmetry (review round 1) + S4: the per-client count is
+    /// released by the shared removal helper (`remove_proxy_and_release_client_counts`),
+    /// NOT by `cleanup_deleted_proxy_port` — so this test drives the exact
+    /// handler sequence (helper gated on remove()'s result, then the
+    /// port-mark cleanup). Deleting a proxy that never consumed a port
+    /// (http/https/tcpmux/stcp/xtcp register with remote_port Some(0)) must
+    /// not decrement client_ports_used — the increment side is gated on
+    /// `tcp|udp|sudp && port > 0`, so the dashboard delete must mirror it.
+    /// Before the fix, repeated deletes of non-consuming proxies drove the
+    /// shared budget counter down while live tcp/udp proxies still consumed
+    /// ports, letting the max_ports_per_client gate undercount.
     #[tokio::test]
     async fn delete_non_port_consuming_proxy_keeps_client_count() {
         let state = test_state();
@@ -3284,8 +3507,18 @@ mod cleanup_deleted_proxy_port_tests {
             .await
             .insert("run-1".to_string(), 1);
 
-        // Deleting an http proxy (remote_port Some(0)) must not decrement.
+        // Deleting an http proxy (remote_port Some(0)) must not decrement —
+        // full handler sequence: registered first so the removal is real.
         let http = proxy_info("p-http", "http", "run-1", Some(0), 1);
+        state
+            .proxy_manager
+            .register("run-1".to_string(), http.clone())
+            .await
+            .unwrap();
+        assert!(
+            crate::control::remove_proxy_and_release_client_counts(&state, &http).await,
+            "first delete of a live proxy must perform the removal"
+        );
         cleanup_deleted_proxy_port(&state, &http).await;
         assert_eq!(
             state.client_ports_used.read().await.get("run-1"),
@@ -3294,10 +3527,87 @@ mod cleanup_deleted_proxy_port_tests {
         );
 
         // Deleting the tcp proxy returns the counter to zero and removes it.
+        assert!(
+            crate::control::remove_proxy_and_release_client_counts(&state, &tcp).await,
+            "tcp delete must perform the removal"
+        );
         cleanup_deleted_proxy_port(&state, &tcp).await;
         assert!(
             state.client_ports_used.read().await.get("run-1").is_none(),
             "deleting the last port-consuming proxy must clear the count"
+        );
+    }
+
+    /// S4 regression (audit round 2): the delete sequence must decrement
+    /// client_ports_used exactly once even when it runs twice against the
+    /// same proxy name. A dashboard delete racing the client CloseProxy
+    /// handler (or a concurrent duplicate delete request) has both paths
+    /// fetch the proxy before either removes it; the second path's remove()
+    /// then returns false. The old code decremented the budget slot inside
+    /// `cleanup_deleted_proxy_port` unconditionally, so the losing path
+    /// double-decremented: with two live tcp proxies (count == 2), deleting
+    /// proxy A twice drove the count to 0 while proxy B still consumed a
+    /// port — the budget drifted below the live count and
+    /// max_ports_per_client admitted one extra proxy per double-release.
+    /// The https SNI-sniff gate count is protected by the same gate (the
+    /// https decrement already ran behind remove()'s result).
+    #[tokio::test]
+    async fn double_delete_decrements_client_count_exactly_once() {
+        let state = test_state();
+        let a = proxy_info("p-a", "tcp", "run-1", Some(6001), 1);
+        let b = proxy_info("p-b", "tcp", "run-1", Some(6002), 1);
+        state
+            .proxy_manager
+            .register("run-1".to_string(), a.clone())
+            .await
+            .unwrap();
+        state
+            .proxy_manager
+            .register("run-1".to_string(), b.clone())
+            .await
+            .unwrap();
+        state
+            .client_ports_used
+            .write()
+            .await
+            .insert("run-1".to_string(), 2);
+
+        // First delete of p-a: the winning path. remove() returns true, the
+        // helper releases one slot, the port-mark cleanup runs.
+        assert!(
+            crate::control::remove_proxy_and_release_client_counts(&state, &a).await,
+            "first delete must perform the removal"
+        );
+        cleanup_deleted_proxy_port(&state, &a).await;
+        assert_eq!(
+            state.client_ports_used.read().await.get("run-1"),
+            Some(&1),
+            "first delete must release exactly one budget slot (p-b still live)"
+        );
+
+        // Second delete of p-a: the losing path of the race. remove()
+        // returns false, so the helper must release NOTHING — the old code
+        // decremented again here (1 -> 0) while p-b still consumed its port.
+        assert!(
+            !crate::control::remove_proxy_and_release_client_counts(&state, &a).await,
+            "second delete must NOT perform the removal"
+        );
+        cleanup_deleted_proxy_port(&state, &a).await;
+        assert_eq!(
+            state.client_ports_used.read().await.get("run-1"),
+            Some(&1),
+            "a lost race must not double-decrement the budget (S4)"
+        );
+
+        // Deleting the surviving proxy now clears the count.
+        assert!(
+            crate::control::remove_proxy_and_release_client_counts(&state, &b).await,
+            "deleting p-b must perform the removal"
+        );
+        cleanup_deleted_proxy_port(&state, &b).await;
+        assert!(
+            state.client_ports_used.read().await.get("run-1").is_none(),
+            "deleting the last live proxy must clear the count"
         );
     }
 

@@ -287,13 +287,16 @@ async fn run_udp_work_conn(
     udp_packet_codec: String,
     // M1 (audit round 3): read deadline for this work conn, mirroring Go
     // server/proxy/udp.go `workConnReaderFn` SetReadDeadline(60s). The
-    // client pings every 30s by default, so 60s of frame silence means the
-    // peer is dead or the conn is half-open — the bridge must end so the
-    // assign supervisor re-requests a replacement (Go udpWorker loop
-    // parity). Without it a silent half-open peer parked the reader
-    // forever, leaving the UDP proxy dead until control reconnect. The
-    // deadline applies per read (each completed frame — a Ping included —
-    // starts a fresh 60s), so an active conn is never reaped.
+    // client pings at a FIXED 30s (audit F1 — Go client/proxy/udp.go
+    // heartbeatFn hardcodes 30s; frp-rs used to wire dial_server_keepalive
+    // here, whose 7200s default let this 60s deadline kill idle conns), so
+    // 60s of frame silence means the peer is dead or the conn is
+    // half-open — the bridge must end so the assign supervisor re-requests
+    // a replacement (Go udpWorker loop parity). Without it a silent
+    // half-open peer parked the reader forever, leaving the UDP proxy dead
+    // until control reconnect. The deadline applies per read (each
+    // completed frame — a Ping included — starts a fresh 60s), so an
+    // active conn is never reaped.
     read_timeout: std::time::Duration,
 ) {
     // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
@@ -613,9 +616,10 @@ fn log_bridge_panic(proxy_name: &str, what: &str, p: Box<dyn std::any::Any + Sen
 
 /// Server-side UDP work-conn read deadline (Go server/proxy/udp.go
 /// `workConnReaderFn` SetReadDeadline(60s) parity, M1 audit round 3). The
-/// client pings its UDP work conn every 30s by default, so 60s without ANY
-/// frame — a Ping included — means the peer is gone or the conn is
-/// half-open.
+/// client pings at a FIXED 30s (audit F1 — Go client/proxy/udp.go
+/// heartbeatFn hardcodes 30s, no config knob; frp-rs matches), so 60s
+/// without ANY frame — a Ping included — means the peer is gone or the
+/// conn is half-open.
 const UDP_WORK_CONN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Re-request a UDP work conn after the previous one died (M1, audit

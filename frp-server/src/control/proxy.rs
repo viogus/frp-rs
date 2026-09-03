@@ -104,14 +104,19 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     // CloseProxy, or a dashboard delete racing this handler) would both
     // snapshot group_len before either removal and both skip, orphaning the
     // group listener and its port mark. The post-removal count is the true
-    // residual. Capture the member's remote port here (info is consumed by
-    // the block below).
+    // residual. Capture the member's remote port here.
     let tcp_group_port = info.as_ref().and_then(|i| {
         (i.proxy_type == "tcp" && i.group.as_deref().filter(|g| !g.is_empty()).is_some())
             .then_some(i.remote_port)
             .flatten()
     });
-    let is_https = if let Some(info) = info {
+    // The derived counters this proxy owns (https SNI-sniff gate count,
+    // per-client port-budget slot) are released by
+    // `remove_proxy_and_release_client_counts` after remove() succeeds
+    // below (S4) — the helper derives both from this pre-removal snapshot,
+    // so `info` is only borrowed (not consumed) by the cleanup block above
+    // and stays available for the removal call.
+    if let Some(info) = info.as_ref() {
         if let Some(port) = info.remote_port {
             // Clean up the appropriate port manager (TCP or UDP — Go frp compat).
             // For a TCP group member that is not the last member, the shared
@@ -132,19 +137,10 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
                 // the FINAL member only — see the post-remove block below
                 // (M5 race-safe ordering).
             }
-            // Decrement per-client port count (matching Go frp's portsUsedNum).
-            // Only proxies that actually consumed a port were counted
-            // (audit finding 1 symmetry): stcp/xtcp/http/https/tcpmux close
-            // with remote_port Some(0) and must not decrement.
-            if matches!(info.proxy_type.as_str(), "tcp" | "udp" | "sudp") && port > 0 {
-                let mut port_counts = ctx.state.client_ports_used.write().await;
-                if let Some(count) = port_counts.get_mut(&ctx.run_id) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        port_counts.remove(&ctx.run_id);
-                    }
-                }
-            }
+            // The per-client port-count decrement is NOT here: the slot is
+            // released by `remove_proxy_and_release_client_counts` after
+            // remove() succeeds below (S4 — a racing dashboard delete must
+            // not double-decrement).
         }
         // Clean up STCP sk_index (indexed by proxy_name)
         if let Some(key) = info.sk_index_key() {
@@ -194,28 +190,40 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
             ctx.state.tcpmux_manager.unregister(&cp.proxy_name).await;
         }
         ctx.state.proxy_metrics.remove(&cp.proxy_name).await;
+        #[cfg(feature = "dashboard")]
+        crate::metrics::prom::proxy_removed(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
         {
             ctx.state
                 .remove_proxy_vnet_routes_and_broadcast(&ctx.run_id, &cp.proxy_name)
                 .await;
         }
-        info.proxy_type == "https"
-    } else {
-        false
-    };
+    }
     // Stop the listener task
     if let Some(handle) = ctl.listener_handles.remove(&cp.proxy_name) {
         handle.abort();
     }
-    // Decrement the SNI-sniff gate count only when the proxy was actually
-    // removed. The dashboard delete path races this handler — both observe
-    // the proxy before either removes it, and a double decrement would leave
-    // https_proxy_count at 0 while https proxies still exist, silently
-    // disabling SNI sniff (HTTPS vhost routing) until the next lifecycle
-    // event. Gating on remove()'s result makes exactly one path decrement.
-    if ctx.state.proxy_manager.remove(&cp.proxy_name).await && is_https {
-        ctx.state.dec_https_proxy_count();
+    // Remove the proxy from the registry and release the counters it owns
+    // (https SNI-sniff gate count, per-client port-budget slot) ONLY when
+    // this call actually performed the removal. The dashboard delete path
+    // races this handler — both observe the proxy before either removes it
+    // — and a double release would decrement client_ports_used twice (S4:
+    // the budget drifts below the live count and max_ports_per_client
+    // admits extra proxies) and leave https_proxy_count at 0 while https
+    // proxies still exist, silently disabling SNI sniff (HTTPS vhost
+    // routing). Gating on remove()'s result makes exactly one path
+    // release; the port marks and shared group-listener teardown below are
+    // idempotent and run on every path (as before).
+    match info {
+        Some(i) => {
+            proxy_ops::remove_proxy_and_release_client_counts(&ctx.state, &i).await;
+        }
+        None => {
+            // `info` was None only if the proxy vanished between the
+            // ownership check and the fetch — remove() by name then reports
+            // false and releases nothing (there was nothing to release).
+            ctx.state.proxy_manager.remove(&cp.proxy_name).await;
+        }
     }
     // Stop the shared TCP group listener when the last member closes so it
     // doesn't linger as a zombie holding the group port (remove_group cancels

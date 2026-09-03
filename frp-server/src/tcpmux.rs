@@ -812,13 +812,20 @@ fn extract_proxy_auth(request: &str) -> Option<(String, String)> {
             .is_some_and(|p| p.eq_ignore_ascii_case("proxy-authorization:"))
     })?;
     // Safe: the match above proves bytes 0-19 are ASCII → byte 20 boundary.
+    // Outer whitespace is trimmed once (Go textproto readMIMEHeader strips
+    // the surrounding OWS of the header value before auth parsing).
     let value = auth_line[20..].trim();
     let encoded = if value
         .get(..6)
         .is_some_and(|p| p.eq_ignore_ascii_case("Basic "))
     {
-        // Safe: match proves bytes 0-5 ASCII → byte 6 is a boundary.
-        value[6..].trim()
+        // Safe: match proves bytes 0-5 ASCII → byte 6 is a boundary. The
+        // payload after "Basic " is passed to base64 VERBATIM — no interior
+        // trim (Go http.go:81-99 ParseBasicAuth decodes `auth[len(prefix):]`
+        // with StdEncoding, which rejects interior whitespace). "Basic  x"
+        // (double space) or "Basic \tx" must fail like Go, or a padded
+        // credential would authenticate where Go rejects it.
+        &value[6..]
     } else {
         return None;
     };
@@ -983,6 +990,56 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_proxy_auth_go_verbatim_payload_parity() {
+        // Go parity matrix (pkg/util/http/http.go:81-99 ParseBasicAuth +
+        // textproto header trimming): the header VALUE is trimmed of outer
+        // whitespace once, then the payload after "Basic " is passed to
+        // StdEncoding VERBATIM — interior whitespace is never trimmed, so
+        // "Basic  <token>" (double space) and "Basic \t<token>" must fail
+        // base64 decode exactly like Go. frp-rs's auth.go:81-97 sibling in
+        // vhost.rs already carries these pins; tcpmux's extract_proxy_auth
+        // was the unsynced copy.
+        let mut b64 = "dXNlcjpwYXNz"; // "user:pass"
+                                      // Single space: accepted.
+        let req = format!(
+            "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            b64
+        );
+        assert_eq!(
+            extract_proxy_auth(&req),
+            Some(("user".into(), "pass".into()))
+        );
+        // Double space after "Basic ": rejected.
+        let req =
+            "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic   dXNlcjpwYXNz\r\n\r\n";
+        assert_eq!(extract_proxy_auth(req), None);
+        // Tab after "Basic ": rejected.
+        let req =
+            "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic \tdXNlcjpwYXNz\r\n\r\n";
+        assert_eq!(extract_proxy_auth(req), None);
+        // Trailing OWS on the header line is trimmed BEFORE auth parsing
+        // (Go readMIMEHeader strips outer whitespace) — the payload itself
+        // is then verbatim single-space: accepted.
+        let req = "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz  \t\r\n\r\n";
+        assert_eq!(
+            extract_proxy_auth(req),
+            Some(("user".into(), "pass".into()))
+        );
+        // Empty payload after "Basic ": header OWS trims the value to
+        // "Basic", which fails the "Basic " prefix match — Go readMIMEHeader
+        // trims the same way before ParseBasicAuth, so both reject.
+        let req = "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic\r\n\r\n";
+        assert_eq!(extract_proxy_auth(req), None);
+        // b64 = "user:" (trailing-colon creds) — empty password is legal.
+        b64 = "dXNlcjo=";
+        let req = format!(
+            "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            b64
+        );
+        assert_eq!(extract_proxy_auth(&req), Some(("user".into(), "".into())));
+    }
+
+    #[test]
     fn test_extract_host_header_multibyte_utf8_no_panic() {
         // Regression for the round-16 A1 abort vector (this file's copy was
         // left unfixed): a header line of 4 multibyte chars is 8 bytes (>= 6)
@@ -999,6 +1056,115 @@ mod tests {
         // hostname instead of panicking.
         let req = "CONNECT /path HTTP/1.1\r\nHost: éééé\r\n\r\n";
         assert_eq!(extract_host_header(req), Some("éééé"));
+    }
+
+    #[tokio::test]
+    async fn test_read_http_headers_basic_and_multiline() {
+        // Simple single-header request: header_len is just past \r\n\r\n.
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        b.write_all(b"CONNECT x.example.com:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        let (header_len, total) = read_http_headers(&mut a, &mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..header_len],
+            b"CONNECT x.example.com:443 HTTP/1.1\r\n\r\n"
+        );
+        assert_eq!(total, header_len, "no pipelined bytes expected");
+
+        // Multi-header request: auth + host lines, terminator at the end.
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        b.write_all(
+            b"CONNECT x.example.com:443 HTTP/1.1\r\n\
+              Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\
+              Host: x.example.com:443\r\n\
+              \r\n",
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 4096];
+        let (header_len, total) = read_http_headers(&mut a, &mut buf).await.unwrap();
+        let head = String::from_utf8_lossy(&buf[..header_len]);
+        assert!(head.ends_with("\r\n\r\n"));
+        assert!(head.contains("Proxy-Authorization: Basic dXNlcjpwYXNz"));
+        assert!(head.contains("Host: x.example.com:443"));
+        assert_eq!(total, header_len);
+    }
+
+    #[tokio::test]
+    async fn test_read_http_headers_pipelined_tail_preserved() {
+        // M6 pin (round-3 finding): a CONNECT whose payload bytes ride in the
+        // same TCP segment as the header terminator must not lose them —
+        // read_http_headers returns header_len < total and the tail must
+        // survive verbatim for the caller's pre-read forwarding.
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        b.write_all(b"CONNECT x.example.com:443 HTTP/1.1\r\n\r\nPAYLOAD-123")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        let (header_len, total) = read_http_headers(&mut a, &mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..header_len],
+            b"CONNECT x.example.com:443 HTTP/1.1\r\n\r\n"
+        );
+        assert!(
+            total > header_len,
+            "pipelined tail must be counted: header {header_len} total {total}"
+        );
+        assert_eq!(
+            &buf[header_len..total],
+            b"PAYLOAD-123",
+            "pipelined tail bytes must survive byte-exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_http_headers_terminator_across_chunk_boundary() {
+        // The \r\n\r\n terminator may straddle two 512-byte chunk reads; the
+        // 3-byte overlap window must find it and the length must be exact.
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        // 510 filler bytes + a terminator starting at offset 510 (byte 510 is
+        // the first \r) + a tail past the terminator.
+        let mut input = Vec::new();
+        input.extend_from_slice(&b"A".repeat(510));
+        input.extend_from_slice(b"\r\n\r\n");
+        input.extend_from_slice(b"TAIL!");
+        b.write_all(&input).await.unwrap();
+        let mut buf = [0u8; 4096];
+        let (header_len, total) = read_http_headers(&mut a, &mut buf).await.unwrap();
+        assert_eq!(header_len, 510 + 4);
+        assert_eq!(total, 510 + 4 + 5);
+        assert_eq!(&buf[header_len..total], b"TAIL!");
+    }
+
+    #[tokio::test]
+    async fn test_read_http_headers_oversized_rejected() {
+        // A header block larger than the caller's buffer is an error, never a
+        // partial parse — the shared listener maps this to a silent close.
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        b.write_all(&b"X".repeat(100)).await.unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            read_http_headers(&mut a, &mut buf).await.unwrap_err(),
+            "headers too large"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_http_headers_eof_before_terminator() {
+        // Peer closed mid-headers (no terminator, no oversize): the reader
+        // reports the close instead of hanging.
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        b.write_all(b"CONNECT x.example.com:443 HTTP/1.1\r\nHost: x")
+            .await
+            .unwrap();
+        drop(b); // EOF
+        let mut buf = [0u8; 4096];
+        assert_eq!(
+            read_http_headers(&mut a, &mut buf).await.unwrap_err(),
+            "connection closed"
+        );
     }
 
     #[test]

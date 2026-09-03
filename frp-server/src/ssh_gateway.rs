@@ -22,7 +22,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use anyhow::anyhow;
-use frp_core::msg::{FrpMessage, NewProxy};
+use frp_core::msg::{FrpMessage, NewProxy, NewProxyResp};
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet};
 use tokio::sync::mpsc;
@@ -99,73 +99,279 @@ fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
 
     let mut i = 1;
     while i < parts.len() {
-        match parts[i].as_str() {
-            "--proxy_name" => args.proxy_name = take_value(&parts, &mut i),
-            "--remote_port" => {
-                args.remote_port = take_value(&parts, &mut i).parse().ok().unwrap_or(0);
-            }
-            "--local_ip" => args.local_ip = take_value(&parts, &mut i),
-            "--local_port" => {
-                args.local_port = take_value(&parts, &mut i).parse().ok().unwrap_or(0);
-            }
-            "--custom_domains" | "--custom_domain" => {
-                args.custom_domains = take_value(&parts, &mut i)
-                    .split(',')
-                    .filter(|d| !d.is_empty())
-                    .map(|d| d.trim().to_string())
-                    .collect();
-            }
-            "--subdomain" => args.subdomain = take_value(&parts, &mut i),
-            "--sk" => args.sk = take_value(&parts, &mut i),
-            "--multiplexer" => args.multiplexer = take_value(&parts, &mut i),
-            "--use_encryption" => {
-                args.use_encryption = matches!(take_value(&parts, &mut i).as_str(), "true" | "1");
-            }
-            "--use_compression" => {
-                args.use_compression = matches!(take_value(&parts, &mut i).as_str(), "true" | "1");
-            }
-            "--group" => args.group = take_value(&parts, &mut i),
-            "--group_key" => args.group_key = take_value(&parts, &mut i),
-            "--http_user" => args.http_user = take_value(&parts, &mut i),
-            "--http_pwd" => args.http_pwd = take_value(&parts, &mut i),
-            "--host_header_rewrite" => args.host_header_rewrite = take_value(&parts, &mut i),
-            "--locations" => {
-                args.locations = take_value(&parts, &mut i)
-                    .split(',')
-                    .filter(|d| !d.is_empty())
-                    .map(|d| d.trim().to_string())
-                    .collect();
-            }
-            "--bandwidth_limit" => args.bandwidth_limit = take_value(&parts, &mut i),
-            "--bandwidth_limit_mode" => args.bandwidth_limit_mode = take_value(&parts, &mut i),
-            other => {
-                // Skip unknown flags or positional args after type
-                if !other.starts_with("--") {
-                    // positional — ignore (already got the type)
-                }
-            }
+        let tok = parts[i].as_str();
+        if tok == "--" {
+            // pflag "--" terminator: everything after it is positional and
+            // ignored (no positional args are registered beyond the type).
+            break;
         }
+        i = if let Some(raw) = tok.strip_prefix("--") {
+            parse_long_flag(&mut args, raw, &parts, i)?
+        } else if tok.len() > 1 && tok.starts_with('-') {
+            parse_short_flags(&mut args, &tok[1..], &parts, i)?
+        } else {
+            // Non-flag positional token — ignored (the type was already
+            // parsed from parts[0]).
+            i
+        };
         i += 1;
+    }
+
+    if args.proxy_name.is_empty() {
+        // Go parity (pkg/ssh server.go): an SSH-mode proxy without an
+        // explicit name registers under a generated one. Registering the
+        // empty name (the old behavior) is unreadable in logs/dashboard and
+        // collides with every other unnamed registration.
+        args.proxy_name = default_proxy_name(&args.proxy_type);
     }
 
     Ok(args)
 }
 
-/// Take the value for a value-taking flag. The caller's `i` points at the
-/// flag token itself; the value, if present, sits at `i + 1`. A truncated flag
-/// (no value, or the next token is another `--flag`) yields an empty value and
-/// leaves `i` unchanged, so the loop's trailing `i += 1` advances to the next
-/// token and the following flag is parsed normally on the next iteration.
-fn take_value(parts: &[String], i: &mut usize) -> String {
-    match parts.get(*i + 1) {
-        Some(v) if !v.starts_with("--") => {
-            // Consumed: advance `i` to the value token; the loop's trailing
-            // `i += 1` then skips past it to the next token.
-            *i += 1;
-            v.clone()
-        }
-        _ => String::new(),
+/// Parse a single `--name` or `--name=value` long-flag token. `raw` is the
+/// text after the leading `--`. Returns the index of the last consumed token,
+/// so the caller's trailing `i += 1` skips past it (and its value token).
+fn parse_long_flag(
+    args: &mut ParsedProxyArgs,
+    raw: &str,
+    parts: &[String],
+    i: usize,
+) -> Result<usize, String> {
+    // pflag "bad flag syntax" cases: `--`, `--=x`, `---x`.
+    if raw.is_empty() || raw.starts_with('-') || raw.starts_with('=') {
+        return Err(format!("bad flag syntax: --{raw}"));
     }
+    let (name, inline_value) = match raw.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (raw, None),
+    };
+    let Some(canon) = canonical_flag_name(name) else {
+        if name == "help" {
+            // pflag: an unregistered `--help` prints the usage (ErrHelp).
+            return Err(ssh_gateway_usage());
+        }
+        return Err(format!("unknown flag: --{name}"));
+    };
+    match inline_value {
+        // `--flag=value`. An explicitly empty value IS applied (and can
+        // fail) — Go runs strconv on it too.
+        Some(value) => {
+            apply_flag_value(args, canon, value)?;
+            Ok(i)
+        }
+        None => {
+            // Value from the next token, unless that token is another flag.
+            // A truncated flag (no value, or a flag-like next token) leaves
+            // the field at its default — a deliberate divergence from
+            // Go/pflag, which consumes the next token as the value
+            // unconditionally (a `--proxy_name --sk` command would register
+            // a proxy literally named "--sk").
+            match parts.get(i + 1).filter(|v| !v.starts_with("--")) {
+                Some(value) => {
+                    apply_flag_value(args, canon, value)?;
+                    Ok(i + 1)
+                }
+                None => Ok(i),
+            }
+        }
+    }
+}
+
+/// Parse a run of shorthand flags (`-n`, `-n=web`, `-nweb`, `-n web`),
+/// mirroring pflag's cluster semantics: a value-taking shorthand consumes the
+/// rest of the cluster, or the next token. Returns the index of the last
+/// consumed token (see parse_long_flag).
+fn parse_short_flags(
+    args: &mut ParsedProxyArgs,
+    cluster: &str,
+    parts: &[String],
+    i: usize,
+) -> Result<usize, String> {
+    let Some(c) = cluster.chars().next() else {
+        return Ok(i);
+    };
+    let rest = &cluster[c.len_utf8()..];
+    let Some(canon) = short_flag_target(c) else {
+        if c == 'h' {
+            // pflag: an unregistered `-h` prints the usage (ErrHelp).
+            return Err(ssh_gateway_usage());
+        }
+        // pflag reports the full remaining cluster (`in -%s`), not just the
+        // remainder after the unknown letter (parseSingleShortArg).
+        return Err(format!("unknown shorthand flag: '{c}' in -{cluster}"));
+    };
+    if let Some(value) = rest.strip_prefix('=') {
+        // `-n=web`.
+        apply_flag_value(args, canon, value)?;
+        return Ok(i);
+    }
+    if !rest.is_empty() {
+        // `-nweb`: the rest of the cluster is the value.
+        apply_flag_value(args, canon, rest)?;
+        return Ok(i);
+    }
+    // `-n web`: value from the next token (flag-like tokens excluded — see
+    // parse_long_flag), or a truncated flag left at its default.
+    match parts.get(i + 1).filter(|v| !v.starts_with("--")) {
+        Some(value) => {
+            apply_flag_value(args, canon, value)?;
+            Ok(i + 1)
+        }
+        None => Ok(i),
+    }
+}
+
+/// Canonical (underscore) spelling of a registered long-flag name, if any.
+///
+/// `_` and `-` are treated as equivalent separators — the intent of Go's
+/// pflag `WordSepNormalizeFunc` (frp registers SSH-mode flags as
+/// `--proxy_name`; both spellings must parse). Go only folds the FIRST
+/// separator; folding every separator is a deliberate frp-rs simplification:
+/// no registered flag differs from its dash form by anything but separator
+/// placement, so both forms accept the same flag set.
+const FLAG_SPELLINGS: &[(&str, &str)] = &[
+    ("proxy_name", "proxy_name"),
+    ("remote_port", "remote_port"),
+    ("local_ip", "local_ip"),
+    ("local_port", "local_port"),
+    ("custom_domains", "custom_domains"),
+    ("custom_domain", "custom_domains"), // legacy alias
+    ("subdomain", "subdomain"),
+    ("sk", "sk"),
+    ("multiplexer", "multiplexer"),
+    ("use_encryption", "use_encryption"),
+    ("use_compression", "use_compression"),
+    ("group", "group"),
+    ("group_key", "group_key"),
+    ("http_user", "http_user"),
+    ("http_pwd", "http_pwd"),
+    ("host_header_rewrite", "host_header_rewrite"),
+    ("locations", "locations"),
+    ("bandwidth_limit", "bandwidth_limit"),
+    ("bandwidth_limit_mode", "bandwidth_limit_mode"),
+];
+
+fn canonical_flag_name(raw: &str) -> Option<&'static str> {
+    let folded = raw.replace('-', "_");
+    FLAG_SPELLINGS
+        .iter()
+        .find(|(spelling, _)| folded == **spelling)
+        .map(|(_, canonical)| *canonical)
+}
+
+/// Short-flag targets. Go frp registers only these shorthands in SSH mode
+/// (pkg/config/flags.go): `-n` proxy_name, `-r` remote_port, `-d`
+/// custom_domains.
+fn short_flag_target(c: char) -> Option<&'static str> {
+    match c {
+        'n' => Some("proxy_name"),
+        'r' => Some("remote_port"),
+        'd' => Some("custom_domains"),
+        _ => None,
+    }
+}
+
+/// Apply a parsed flag value to `args`. Value parse failures produce the
+/// pflag-shaped `invalid argument` error Go surfaces from FlagSet.Set (the
+/// tail is frp-rs wording — Go embeds strconv's message, which has no Rust
+/// equivalent).
+fn apply_flag_value(args: &mut ParsedProxyArgs, canon: &str, value: &str) -> Result<(), String> {
+    match canon {
+        "proxy_name" => args.proxy_name = value.to_string(),
+        "remote_port" => args.remote_port = parse_port_value(value, "-r, --remote_port")?,
+        "local_ip" => args.local_ip = value.to_string(),
+        "local_port" => args.local_port = parse_port_value(value, "--local_port")?,
+        "custom_domains" => args.custom_domains = split_csv(value),
+        "subdomain" => args.subdomain = value.to_string(),
+        "sk" => args.sk = value.to_string(),
+        "multiplexer" => args.multiplexer = value.to_string(),
+        "use_encryption" => args.use_encryption = matches!(value, "true" | "1"),
+        "use_compression" => args.use_compression = matches!(value, "true" | "1"),
+        "group" => args.group = value.to_string(),
+        "group_key" => args.group_key = value.to_string(),
+        "http_user" => args.http_user = value.to_string(),
+        "http_pwd" => args.http_pwd = value.to_string(),
+        "host_header_rewrite" => args.host_header_rewrite = value.to_string(),
+        "locations" => args.locations = split_csv(value),
+        "bandwidth_limit" => args.bandwidth_limit = value.to_string(),
+        "bandwidth_limit_mode" => args.bandwidth_limit_mode = value.to_string(),
+        other => {
+            // Defensive: every canonical name is handled above; a future
+            // table/arm drift must error, not silently no-op.
+            return Err(format!("internal error: unhandled flag {other}"));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a port value (`--remote_port` / `--local_port`, 0 = auto-assign).
+/// The pflag-shaped error carries the flag's canonical display name (Go
+/// formats shorthand flags as "-r, --remote_port").
+fn parse_port_value(value: &str, display: &str) -> Result<u16, String> {
+    value.parse::<u16>().map_err(|_| {
+        format!(
+            "invalid argument \"{value}\" for \"{display}\" flag: port must be an integer between 0 and 65535"
+        )
+    })
+}
+
+/// Split a comma-separated flag value, dropping empty entries.
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter(|d| !d.is_empty())
+        .map(|d| d.trim().to_string())
+        .collect()
+}
+
+/// Generate the default SSH-mode proxy name — Go parity: `sshtunnel-` +
+/// proxy type + RandIDWithLen(8) (pkg/util/util.go, random bytes as 8
+/// lowercase hex chars).
+fn default_proxy_name(proxy_type: &str) -> String {
+    use rand::TryRng;
+    let mut buf = [0u8; 4];
+    // SysRng (getrandom) failure is unreachable on supported platforms; a
+    // zero-filled name would still be valid and effectively unique.
+    let _ = rand::rngs::SysRng.try_fill_bytes(&mut buf);
+    format!("sshtunnel-{}-{}", proxy_type, frp_core::hex_encode(&buf))
+}
+
+/// Usage text for `--help` / `-h` and the empty command. Go frp writes the
+/// cobra command usage to the SSH client on ErrHelp and closes; this is the
+/// frp-rs equivalent listing the flags parse_ssh_args accepts.
+fn ssh_gateway_usage() -> String {
+    format!(
+        concat!(
+            "frp-rs SSH tunnel gateway\n",
+            "\n",
+            "Usage: ssh ... <proxy_type> [flags]\n",
+            "Example: ssh -R :9090:127.0.0.1:8080 v0@server -p 2200 tcp --proxy_name web\n",
+            "\n",
+            "Proxy types: {types}\n",
+            "\n",
+            "Flags:\n",
+            "  -n, --proxy_name string            proxy name (empty = auto: sshtunnel-<type>-<random>)\n",
+            "  -r, --remote_port uint16           server listen port, 0 = auto-assign\n",
+            "  -d, --custom_domains stringList    custom domains, comma-separated (http/https)\n",
+            "      --subdomain string             subdomain on the vhost server (http/https)\n",
+            "      --sk string                    secret key (stcp)\n",
+            "      --multiplexer string           multiplexer name (tcpmux)\n",
+            "      --local_ip string              local service IP\n",
+            "      --local_port uint16            local service port\n",
+            "      --use_encryption               enable encryption (\"true\" or \"1\")\n",
+            "      --use_compression              enable compression (\"true\" or \"1\")\n",
+            "      --group string                 group name\n",
+            "      --group_key string             group key\n",
+            "      --http_user string             HTTP basic-auth user (http/https)\n",
+            "      --http_pwd string              HTTP basic-auth password (http/https)\n",
+            "      --host_header_rewrite string   rewrite the Host header (http/https)\n",
+            "      --locations stringList         vhost locations, comma-separated (http/https)\n",
+            "      --bandwidth_limit string       bandwidth limit (e.g. 1MB)\n",
+            "      --bandwidth_limit_mode string  bandwidth limit mode: client or server\n",
+            "  -h, --help                         show this help and exit\n"
+        ),
+        types = VALID_PROXY_TYPES.join(", ")
+    )
 }
 
 const VALID_PROXY_TYPES: &[&str] = &["tcp", "http", "https", "stcp", "tcpmux"];
@@ -203,9 +409,8 @@ fn shell_split(cmd: &str) -> Vec<String> {
 ///
 /// handle_control() wraps its side in a CipherStream (AES-128-CFB).
 /// We spawn a background task that encrypts outgoing V1 frames (NewProxy)
-/// and decrypts incoming data to intercept ReqWorkConn messages.
-///
-/// Returns: (stream_for_handle_control, frame_tx, work_conn_rx)
+/// and decrypts incoming data to intercept ReqWorkConn messages and
+/// NewProxyResp messages (proxy registration results).
 pub struct VirtualControl;
 
 /// A request from the control handler to the SSH session to open a
@@ -221,6 +426,8 @@ impl VirtualControl {
     /// - `stream`: the AsyncRead+AsyncWrite stream to pass to handle_control()
     /// - `frame_tx`: sender for plain V1 frames from the SSH session
     /// - `work_conn_rx`: receiver for intercepted ReqWorkConn signals
+    /// - `proxy_resp_rx`: receiver for intercepted NewProxyResp messages
+    ///   (proxy registration results, reported to exec_request)
     /// - `phase2_ready`: resolves once LoginResp consumed + CipherStream ready
     pub fn channel(
         enc_key: [u8; 16],
@@ -228,11 +435,13 @@ impl VirtualControl {
         impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         mpsc::Sender<Vec<u8>>,
         mpsc::Receiver<WorkConnRequest>,
+        mpsc::Receiver<NewProxyResp>,
         tokio::sync::oneshot::Receiver<()>,
     ) {
         let (to_handler, from_ssh) = tokio::io::duplex(65536);
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
         let (work_tx, work_rx) = mpsc::channel::<WorkConnRequest>(16);
+        let (resp_tx, resp_rx) = mpsc::channel::<NewProxyResp>(16);
         let (phase2_tx, phase2_rx) = tokio::sync::oneshot::channel();
 
         // Spawn background task that bridges the duplex to the mpsc channels,
@@ -272,11 +481,15 @@ impl VirtualControl {
             let (mut enc_reader, mut enc_writer) = tokio::io::split(encrypted);
             let read_work_tx = work_tx;
 
-            // Read task: decrypt V1 frames with canonical parser, intercept ReqWorkConn
+            // Read task: decrypt V1 frames with canonical parser, intercept
+            // ReqWorkConn (→ WorkConnRequest, opens forwarded-tcpip work
+            // conns) and NewProxyResp (→ proxy_resp_rx, the exec_request
+            // registration wait).
+            let read_resp_tx = resp_tx;
             let read_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
                 loop {
                     match frp_core::protocol::read_v1_frame(&mut enc_reader).await {
-                        Ok((type_byte, _payload)) => {
+                        Ok((type_byte, payload)) => {
                             if type_byte == frp_core::msg::TYPE_REQ_WORK_CONN {
                                 tracing::debug!(
                                     "bridge: intercepted ReqWorkConn -> WorkConnRequest"
@@ -287,6 +500,22 @@ impl VirtualControl {
                                 let _ = read_work_tx.try_send(WorkConnRequest {
                                     proxy_name: String::new(),
                                 });
+                            } else if type_byte == frp_core::msg::TYPE_NEW_PROXY_RESP {
+                                // Registration result for an exec_request's
+                                // NewProxy. The frame payload is that
+                                // struct's JSON, so decode it directly;
+                                // unparseable frames are logged and dropped —
+                                // the exec wait then times out like Go's
+                                // waitProxyStatusReady.
+                                match serde_json::from_slice::<NewProxyResp>(&payload) {
+                                    Ok(resp) => {
+                                        let _ = read_resp_tx.try_send(resp);
+                                    }
+                                    Err(e) => tracing::debug!(
+                                        error = %e,
+                                        "bridge: unparseable NewProxyResp dropped"
+                                    ),
+                                }
                             }
                         }
                         Err(e) => {
@@ -308,7 +537,7 @@ impl VirtualControl {
             let _ = read_task.await;
         });
 
-        (to_handler, frame_tx, work_rx, phase2_rx)
+        (to_handler, frame_tx, work_rx, resp_rx, phase2_rx)
     }
 }
 
@@ -337,6 +566,11 @@ pub struct SshSession {
     pub ssh_handle: Option<russh::server::Handle>,
     /// V1 frame sender into the VirtualControl channel (→ control handler).
     frame_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// NewProxyResp receiver from the VirtualControl read task: exec_request
+    /// waits up to PROXY_REGISTER_WAIT on it for the registration result of
+    /// each NewProxy (Go frp's waitProxyStatusReady) and writes the
+    /// outcome — success banner or error text — to the SSH client.
+    proxy_resp_rx: Option<mpsc::Receiver<NewProxyResp>>,
     /// Server auth token for password authentication.
     server_token: String,
     /// Allowed public keys (loaded from authorized_keys file).
@@ -389,6 +623,7 @@ impl SshSession {
             registered_proxies: Vec::new(),
             ssh_handle: None,
             frame_tx: None,
+            proxy_resp_rx: None,
             server_token,
             authorized_keys,
             state,
@@ -615,8 +850,9 @@ impl Handler for SshSession {
         self.ssh_handle = Some(session.handle());
 
         let enc_key = frp_core::encryption::derive_key(&self.server_token);
-        let (vc, frame_tx, work_conn_rx, _phase2) = VirtualControl::channel(enc_key);
+        let (vc, frame_tx, work_conn_rx, proxy_resp_rx, _phase2) = VirtualControl::channel(enc_key);
         self.frame_tx = Some(frame_tx);
+        self.proxy_resp_rx = Some(proxy_resp_rx);
 
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -707,29 +943,56 @@ impl Handler for SshSession {
 
     async fn exec_request(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let cmd = std::str::from_utf8(data)
-            .map_err(|e| anyhow!("exec command is not valid UTF-8: {}", e))?
-            .trim()
-            .to_string();
+        let handle = session.handle();
+        let run_id = self.run_id.clone();
+
+        let cmd = match std::str::from_utf8(data) {
+            Ok(cmd) => cmd.trim().to_string(),
+            Err(e) => {
+                // Go parity: client-visible failures are written to the SSH
+                // client, then the connection closes (pkg/ssh/server.go
+                // writeToClient + return). Returning Err here would drop the
+                // text — see write_text_and_close.
+                write_text_and_close(
+                    &run_id,
+                    &handle,
+                    channel,
+                    format!("exec command is not valid UTF-8: {e}"),
+                )
+                .await;
+                return Ok(());
+            }
+        };
 
         if cmd.is_empty() {
-            return Err(anyhow!(
-                "empty command; usage: ssh ... <proxy_type> --proxy_name <name> [--remote_port <port>] ..."
-            ));
+            // Empty remote command: print the usage, then close (the Go
+            // ErrHelp path prints cmd.UsageString() and closes).
+            write_text_and_close(&run_id, &handle, channel, ssh_gateway_usage()).await;
+            return Ok(());
         }
 
         let args = match parse_ssh_args(&cmd) {
             Ok(args) => args,
             Err(e) => {
-                tracing::warn!(run_id = %self.run_id, error = %e, "SSH session {}: parse error: {}", self.run_id, e);
-                return Err(anyhow!("{}", e));
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "SSH session {}: parse error: {}",
+                    run_id,
+                    e
+                );
+                // `e` is either the usage text (--help/-h) or the parse
+                // error text (unknown flag, bad value, ...); Go writes
+                // whichever it is and closes.
+                write_text_and_close(&run_id, &handle, channel, e).await;
+                return Ok(());
             }
         };
-        log_exec_request(&self.run_id, &args);
+        log_exec_request(&run_id, &args);
 
         // Check per-client port limit (matching Go frp's GetUsedPortsNum logic).
         if self.state.max_ports_per_client > 0 {
@@ -738,43 +1001,140 @@ impl Handler for SshSession {
                 .client_ports_used
                 .read()
                 .await
-                .get(&self.run_id)
+                .get(&run_id)
                 .copied()
                 .unwrap_or(0);
             if used + 1 > self.state.max_ports_per_client {
-                return Err(anyhow!(
-                    "maximum number of ports ({}) reached for this client",
-                    self.state.max_ports_per_client
-                ));
+                write_text_and_close(
+                    &run_id,
+                    &handle,
+                    channel,
+                    format!(
+                        "maximum number of ports ({}) reached for this client",
+                        self.state.max_ports_per_client
+                    ),
+                )
+                .await;
+                return Ok(());
             }
         }
 
         // Register the proxy: build NewProxy V1 frame, send to control handler.
         // Port allocation happens inside handle_new_proxy (single owner of
         // used_ports) — pre-allocating here would double-book the port.
-        let v1_frame = build_v1_frame_from_args(&args, args.remote_port)?;
+        let v1_frame = match build_v1_frame_from_args(&args, args.remote_port) {
+            Ok(frame) => frame,
+            Err(e) => {
+                write_text_and_close(&run_id, &handle, channel, e.to_string()).await;
+                return Ok(());
+            }
+        };
 
-        self.frame_tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("SSH session control is not initialized"))?
-            .try_send(v1_frame)
-            .map_err(|_| anyhow!("virtual control channel closed"))?;
+        let Some(frame_tx) = self.frame_tx.as_ref() else {
+            // exec cannot run before auth_succeeded in practice; treat this
+            // as an internal breach and let the session die with an error.
+            return Err(anyhow!("SSH session control is not initialized"));
+        };
+        if frame_tx.try_send(v1_frame).is_err() {
+            // The virtual control handler exited (server-side cleanup); the
+            // session is being torn down anyway — report, then close.
+            write_text_and_close(
+                &run_id,
+                &handle,
+                channel,
+                "virtual control channel closed".to_string(),
+            )
+            .await;
+            return Ok(());
+        }
 
         let proxy_name = args.proxy_name.clone();
-        self.registered_proxies.push(proxy_name.clone());
+        let proxy_type = args.proxy_type.clone();
 
+        // Wait for the registration result — Go parity (waitProxyStatusReady,
+        // pkg/ssh/server.go): poll the proxy status for up to PROXY_REGISTER_WAIT
+        // and report Running → createSuccessInfo banner, StartErr/Closed → the
+        // server's error text verbatim, timeout → "wait proxy status ready
+        // timeout". Responses for earlier execs (impossible with sequential
+        // execs) are skipped against the same deadline.
+        let deadline = tokio::time::Instant::now() + PROXY_REGISTER_WAIT;
+        let resp_rx = self
+            .proxy_resp_rx
+            .as_mut()
+            .ok_or_else(|| anyhow!("SSH session control is not initialized"))?;
+        let resp = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let outcome = tokio::time::timeout(remaining, resp_rx.recv()).await;
+            match outcome {
+                Err(_elapsed) => {
+                    write_text_and_close(
+                        &run_id,
+                        &handle,
+                        channel,
+                        "wait proxy status ready timeout".to_string(),
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Ok(None) => {
+                    // Receiver dropped: the read task exited, so the control
+                    // handler is gone — same teardown path as a closed
+                    // frame_tx above.
+                    write_text_and_close(
+                        &run_id,
+                        &handle,
+                        channel,
+                        "virtual control channel closed".to_string(),
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Ok(Some(resp)) if resp.proxy_name == proxy_name => break resp,
+                // Stale response for an earlier exec — keep waiting on the
+                // remaining budget.
+                Ok(Some(_)) => {}
+            }
+        };
+
+        if let Some(err_text) = resp.error {
+            // Go parity: a failed registration reports the server's own
+            // error text (NewProxyResp.error ≈ Go WorkingStatus.Err), then
+            // closes. The proxy is NOT registered, so nothing is recorded.
+            tracing::warn!(
+                run_id = %run_id,
+                proxy_name = %proxy_name,
+                error = %err_text,
+                "SSH gateway: proxy '{}' registration failed: {}",
+                proxy_name,
+                err_text
+            );
+            write_text_and_close(&run_id, &handle, channel, err_text).await;
+            return Ok(());
+        }
+
+        // Success (Go createSuccessInfo, pkg/ssh/terminal.go): report the
+        // registration and KEEP the session open — the tunnel serves until
+        // the client disconnects (the banner's "Ctrl+C to quit").
+        let remote_addr = resp.remote_addr.as_deref().unwrap_or("");
+        let banner = format!(
+            "\nfrp (via SSH) (Ctrl+C to quit)\n\nUser: v0\nProxyName: {}\nType: {}\nRemoteAddress: {}\n",
+            resp.proxy_name, proxy_type, remote_addr
+        );
         tracing::info!(
             proxy_name = %proxy_name,
-            proxy_type = %args.proxy_type,
-            remote_port = %args.remote_port,
-            run_id = %self.run_id,
-            "SSH gateway: registered proxy '{}' type={} remote_port={} (run_id={})",
+            proxy_type = %proxy_type,
+            remote_addr = %remote_addr,
+            run_id = %run_id,
+            "SSH gateway: registered proxy '{}' type={} remote_addr='{}' (run_id={})",
             proxy_name,
-            args.proxy_type,
-            args.remote_port,
-            self.run_id
+            proxy_type,
+            remote_addr,
+            run_id
         );
-
+        self.registered_proxies.push(resp.proxy_name.clone());
+        // Best-effort: a closed channel means the client is already gone;
+        // the registered proxy is still cleaned up on session teardown.
+        let _ = handle.data(channel, banner.into_bytes()).await;
         Ok(())
     }
 
@@ -918,6 +1278,40 @@ impl Handler for SshSession {
         }
         Ok(())
     }
+}
+
+/// Write `text` to the exec channel, then disconnect the SSH session.
+/// Mirrors Go frp's writeToClient + close: parse errors, help text, and
+/// proxy-register failures reach the client exactly once, then the
+/// connection ends.
+///
+/// russh contract: exec_request must return Ok(()) afterwards — returning
+/// Err aborts the session run loop BEFORE the queued `data` message is
+/// flushed to the socket, silently dropping the text. `data()` and
+/// `disconnect()` go through the same Handle's FIFO sender, so the text is
+/// always written ahead of the DISCONNECT.
+async fn write_text_and_close(
+    run_id: &str,
+    handle: &russh::server::Handle,
+    channel: ChannelId,
+    text: String,
+) {
+    tracing::debug!(
+        run_id = %run_id,
+        bytes = text.len(),
+        "SSH gateway: writing {} bytes to client, then disconnecting",
+        text.len()
+    );
+    // Both sends are best-effort: the session may already be closing, and a
+    // stuck channel must not wedge the exec handler.
+    let _ = handle.data(channel, text.into_bytes()).await;
+    let _ = handle
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "ssh tunnel gateway: done".to_string(),
+            "en".to_string(),
+        )
+        .await;
 }
 
 /// Background task: receives WorkConnRequest signals from VirtualControl
@@ -1499,6 +1893,129 @@ mod tests {
         listener_task.abort();
     }
 
+    /// Authenticate a russh client against the test SSH listener.
+    async fn auth_test_client(addr: std::net::SocketAddr) -> russh::client::Handle<TestSshClient> {
+        let client_config = Arc::new(russh::client::Config::default());
+        let mut client = russh::client::connect(client_config, addr, TestSshClient)
+            .await
+            .unwrap();
+        let auth = client
+            .authenticate_password("v0", "test-token")
+            .await
+            .unwrap();
+        assert!(auth.success());
+        client
+    }
+
+    #[tokio::test]
+    async fn test_exec_parse_error_written_to_client_then_close() {
+        // P10 + P6: an exec parse error must reach the SSH client as text,
+        // then the session closes (Go writeToClient + close). Returning Err
+        // from exec_request would drop the text — the write is queued via
+        // Handle::data and flushed only after exec_request returns Ok.
+        let (addr, state, listener_task) =
+            start_test_ssh_listener(std::time::Duration::from_secs(2)).await;
+        let client = auth_test_client(addr).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel.exec(true, "tcp --bogus_flag value").await.unwrap();
+        let mut reader = channel.make_reader();
+        let mut text = String::new();
+        use tokio::io::AsyncReadExt;
+        // The session disconnects after the text, so the read ends at EOF.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_to_string(&mut text),
+        )
+        .await;
+        assert!(
+            text.contains("unknown flag: --bogus_flag"),
+            "parse error must be written to the client, got: {text:?}"
+        );
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.conn_semaphore.as_ref().unwrap().available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        listener_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_exec_success_writes_banner_and_keeps_session_open() {
+        // P6: a successful registration writes the Go createSuccessInfo
+        // banner ("Ctrl+C to quit") to the client and KEEPS the session
+        // open — the tunnel serves until the client leaves. (The old code
+        // wrote nothing and returned immediately.)
+        let (addr, state, listener_task) =
+            start_test_ssh_listener(std::time::Duration::from_secs(2)).await;
+        let client = auth_test_client(addr).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .exec(true, "tcp --proxy_name e2e-web --remote_port 0")
+            .await
+            .unwrap();
+        let mut reader = channel.make_reader();
+        let mut got = String::new();
+        let mut buf = [0u8; 256];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        use tokio::io::AsyncReadExt;
+        loop {
+            if got.contains("RemoteAddress: :") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "banner not received within 5s, got so far: {got:?}"
+            );
+            let n =
+                tokio::time::timeout(std::time::Duration::from_millis(500), reader.read(&mut buf))
+                    .await
+                    .expect("reading the exec channel must not stall")
+                    .unwrap();
+            if n == 0 {
+                panic!("exec channel closed before the banner arrived; got: {got:?}");
+            }
+            got.push_str(std::str::from_utf8(&buf[..n]).unwrap());
+        }
+        assert!(
+            got.contains("\nfrp (via SSH) (Ctrl+C to quit)\n"),
+            "{got:?}"
+        );
+        assert!(got.contains("User: v0\n"), "{got:?}");
+        assert!(got.contains("ProxyName: e2e-web\n"), "{got:?}");
+        assert!(got.contains("Type: tcp\n"), "{got:?}");
+
+        // The session stays open after the banner (no server disconnect).
+        assert!(
+            !client.is_closed(),
+            "session must stay open after the banner"
+        );
+        // Dropping the Handle does not close the connection — russh keeps
+        // the client task until an explicit disconnect (the integration-test
+        // idiom). Without it the server session never ends and the
+        // conn_semaphore permit below is never released.
+        client
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .ok();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.conn_semaphore.as_ref().unwrap().available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        listener_task.abort();
+    }
+
     #[tokio::test]
     async fn test_control_exit_terminates_session_and_releases_permit() {
         // Regression (M6): when the SSH virtual control handler exits — the
@@ -1624,9 +2141,42 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ssh_args_missing_name() {
+    fn test_parse_ssh_args_missing_name_gets_default_ssh_tunnel_name() {
+        // Go parity: an SSH-mode proxy without --proxy_name registers under
+        // `sshtunnel-{type}-{8 lowercase hex}` (pkg/ssh server.go), not the
+        // empty string.
         let args = parse_ssh_args("tcp --remote_port 9090").unwrap();
-        assert!(args.proxy_name.is_empty());
+        assert!(args.proxy_name.starts_with("sshtunnel-tcp-"));
+        let suffix = &args.proxy_name["sshtunnel-tcp-".len()..];
+        assert_eq!(suffix.len(), 8);
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "random suffix must be 8 lowercase hex chars, got: {suffix}"
+        );
+    }
+
+    #[test]
+    fn test_parse_ssh_args_default_name_per_type_and_explicit_override() {
+        for (cmd, prefix) in [
+            ("http --custom_domains a.example.com", "sshtunnel-http-"),
+            ("stcp", "sshtunnel-stcp-"),
+            ("tcpmux", "sshtunnel-tcpmux-"),
+        ] {
+            let args = parse_ssh_args(cmd).unwrap();
+            assert!(
+                args.proxy_name.starts_with(prefix),
+                "cmd {cmd:?} → {}",
+                args.proxy_name
+            );
+        }
+        // Explicit names still win (including the --proxy_name=value form).
+        let args = parse_ssh_args("tcp --proxy_name=web").unwrap();
+        assert_eq!(args.proxy_name, "web");
+        // And an explicitly empty name falls back to the default.
+        let args = parse_ssh_args("tcp --proxy_name=").unwrap();
+        assert!(args.proxy_name.starts_with("sshtunnel-tcp-"));
     }
 
     #[test]
@@ -1745,13 +2295,18 @@ mod tests {
         assert!(args.group_key.is_empty());
         assert!(args.http_pwd.is_empty());
 
-        // Flag immediately after the type, nothing else.
+        // Flag immediately after the type, nothing else — the truncated
+        // value is tolerated (see parse_long_flag) and the empty name gets
+        // the default.
         let args = parse_ssh_args("tcp --proxy_name").unwrap();
-        assert!(args.proxy_name.is_empty());
+        assert!(args.proxy_name.starts_with("sshtunnel-tcp-"));
     }
 
     #[test]
-    fn test_parse_ssh_args_invalid_ports_no_panic() {
+    fn test_parse_ssh_args_invalid_ports_rejected() {
+        // P10: Go parity — a value that fails to parse is an error written
+        // to the SSH client, not a silent fallback to 0/auto-assign (which
+        // could hand out an unintended random port).
         for bad in [
             "abc",
             "-1",
@@ -1763,18 +2318,33 @@ mod tests {
             "18446744073709551616", // overflows u64, let alone u16
         ] {
             let cmd = format!("tcp --proxy_name web --remote_port {bad}");
-            let args = parse_ssh_args(&cmd).unwrap();
-            assert_eq!(
-                args.remote_port, 0,
-                "invalid port value {bad:?} must default to 0 without panicking"
+            let err = parse_ssh_args(&cmd).unwrap_err();
+            let expected = format!("invalid argument \"{bad}\" for \"-r, --remote_port\" flag");
+            assert!(
+                err.contains(&expected),
+                "cmd {cmd:?} must be rejected with {expected:?}, got: {err}"
             );
         }
+        // An explicitly empty value is rejected too (Go runs strconv on it).
+        let err = parse_ssh_args("tcp --remote_port=").unwrap_err();
+        assert!(
+            err.contains("invalid argument \"\" for \"-r, --remote_port\" flag"),
+            "got: {err}"
+        );
+        // A truncated flag (no value at all) still tolerates → 0: the
+        // deliberate truncation divergence, pinned by
+        // test_parse_ssh_args_truncated_flags_no_panic.
+        let args = parse_ssh_args("tcp --proxy_name web --remote_port").unwrap();
+        assert_eq!(args.remote_port, 0);
     }
 
     #[test]
-    fn test_parse_ssh_args_invalid_local_port_no_panic() {
-        let args = parse_ssh_args("tcp --proxy_name web --local_port not-a-port").unwrap();
-        assert_eq!(args.local_port, 0);
+    fn test_parse_ssh_args_invalid_local_port_rejected() {
+        let err = parse_ssh_args("tcp --proxy_name web --local_port not-a-port").unwrap_err();
+        assert!(
+            err.contains("invalid argument \"not-a-port\" for \"--local_port\" flag"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1817,11 +2387,131 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ssh_args_unknown_flag_skipped_no_panic() {
+    fn test_parse_ssh_args_unknown_flag_rejected() {
+        // P10: unknown flags are rejected with pflag's text instead of being
+        // silently skipped — a typo'd flag used to register a proxy missing
+        // that setting, with no error anywhere.
+        let err = parse_ssh_args("tcp --bogus_flag value --proxy_name web").unwrap_err();
+        assert_eq!(err, "unknown flag: --bogus_flag");
+        // Dash-form unknowns keep their raw spelling in the message.
+        let err = parse_ssh_args("tcp --bogus-flag value").unwrap_err();
+        assert_eq!(err, "unknown flag: --bogus-flag");
+    }
+
+    #[test]
+    fn test_parse_ssh_args_unknown_shorthand_rejected() {
+        let err = parse_ssh_args("tcp -x").unwrap_err();
+        assert_eq!(err, "unknown shorthand flag: 'x' in -x");
+        // pflag reports the full remaining cluster, unknown char included
+        // (parseSingleShortArg: `in -%s` gets the unconsumed shorthands).
+        let err = parse_ssh_args("tcp -xn").unwrap_err();
+        assert_eq!(err, "unknown shorthand flag: 'x' in -xn");
+    }
+
+    #[test]
+    fn test_parse_ssh_args_flag_equals_value_forms() {
         let args =
-            parse_ssh_args("tcp --bogus_flag value --proxy_name web --remote_port 9090").unwrap();
+            parse_ssh_args("tcp --proxy_name=web --remote_port=9090 --custom_domains=a.com,b.com")
+                .unwrap();
         assert_eq!(args.proxy_name, "web");
         assert_eq!(args.remote_port, 9090);
+        assert_eq!(args.custom_domains, vec!["a.com", "b.com"]);
+        let args =
+            parse_ssh_args("http --proxy_name=blog --use_encryption=true --subdomain=sub").unwrap();
+        assert!(args.use_encryption);
+        assert_eq!(args.subdomain, "sub");
+        // The legacy --custom_domain alias works in both forms.
+        let args = parse_ssh_args("http --custom_domain=a.example.com").unwrap();
+        assert_eq!(args.custom_domains, vec!["a.example.com"]);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_dash_underscore_equivalence() {
+        // pflag WordSepNormalizeFunc intent: --proxy_name and --proxy-name
+        // are the same flag.
+        let a = parse_ssh_args("tcp --proxy_name web --remote_port 9090").unwrap();
+        let b = parse_ssh_args("tcp --proxy-name web --remote-port 9090").unwrap();
+        assert_eq!(a, b);
+        // The dash+`=` form is the same flag too (a includes --remote_port,
+        // so the comparison parse must too).
+        let c = parse_ssh_args("tcp --proxy-name=web --remote-port=9090").unwrap();
+        assert_eq!(c, a);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_shorthand_forms() {
+        // pflag shorthand value forms: `-n web`, `-n=web`, `-nweb`.
+        let a = parse_ssh_args("tcp -n web -r 9090").unwrap();
+        assert_eq!(a.proxy_name, "web");
+        assert_eq!(a.remote_port, 9090);
+        let b = parse_ssh_args("tcp -n=web -r=9090").unwrap();
+        assert_eq!(b, a);
+        let c = parse_ssh_args("tcp -nweb -r9090").unwrap();
+        assert_eq!(c, a);
+        // -d maps to custom_domains (Go shorthand).
+        let d = parse_ssh_args("http -d a.com,b.com").unwrap();
+        assert_eq!(d.custom_domains, vec!["a.com", "b.com"]);
+        // A truncated shorthand stays at its default (name → default name).
+        let e = parse_ssh_args("tcp -r").unwrap();
+        assert_eq!(e.remote_port, 0);
+        assert!(e.proxy_name.starts_with("sshtunnel-tcp-"));
+    }
+
+    #[test]
+    fn test_parse_ssh_args_help_returns_usage() {
+        // Go frp prints the command usage to the SSH client on ErrHelp
+        // (--help / -h) and closes — the frp-rs equivalent returns the usage
+        // text as the parse error.
+        for cmd in [
+            "tcp --help",
+            "tcp -h",
+            "http --proxy_name web --help",
+            "stcp -h",
+        ] {
+            let err = parse_ssh_args(cmd).unwrap_err();
+            assert!(
+                err.contains("Usage:"),
+                "cmd {cmd:?} must yield usage text, got: {err}"
+            );
+            assert!(err.contains("--proxy_name"), "cmd {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_ssh_args_bad_flag_syntax_rejected() {
+        // pflag "bad flag syntax": a flag name starting with '-' or '=' is a
+        // syntax error (`---x` names "-x"); a bare `--` is the terminator,
+        // not an error (asserted in test_parse_ssh_args_double_dash...).
+        for tok in ["---x", "--=x"] {
+            let err = parse_ssh_args(&format!("tcp {tok}")).unwrap_err();
+            assert_eq!(err, format!("bad flag syntax: {tok}"), "token {tok:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_ssh_args_double_dash_terminates_flags() {
+        // pflag `--`: everything after it is positional and ignored. A bare
+        // trailing `--` is legal (Go pflag terminates, no "bad flag syntax").
+        let args = parse_ssh_args("tcp --proxy_name web -- --remote_port 9090").unwrap();
+        assert_eq!(args.proxy_name, "web");
+        assert_eq!(args.remote_port, 0);
+        let args = parse_ssh_args("tcp --").unwrap();
+        assert!(args.proxy_name.starts_with("sshtunnel-tcp-"));
+    }
+
+    #[test]
+    fn test_parse_ssh_args_boolean_flags_unchanged() {
+        // Value-taking bools keep their legacy grammar ("true"/"1") and gain
+        // the = form.
+        let args = parse_ssh_args("tcp --use_encryption true --use_compression=1").unwrap();
+        assert!(args.use_encryption && args.use_compression);
+        let args = parse_ssh_args("tcp --use_encryption false").unwrap();
+        assert!(!args.use_encryption);
+        // A bare bool followed by another flag stays false (truncation
+        // tolerance — Go/pflag would swallow "--sk" as the bool's value).
+        let args = parse_ssh_args("tcp --use_encryption --sk s").unwrap();
+        assert!(!args.use_encryption);
+        assert_eq!(args.sk, "s");
     }
 
     #[test]
@@ -1879,6 +2569,10 @@ use tokio::net::TcpListener;
 const SSH_MAX_CONNECTIONS: usize = 128;
 const SSH_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 const SSH_DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long exec_request waits for the NewProxyResp of a registration —
+/// Go frp's waitProxyStatusReady poll budget (time.Second).
+const PROXY_REGISTER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 struct CloseableSshStream {
     stream: tokio::net::TcpStream,
@@ -2519,7 +3213,7 @@ mod virtual_ctrl_tests {
     async fn test_virtual_control_channel_creation() {
         // Verify VirtualControl::channel creates a working duplex + mpsc channels
         let enc_key = frp_core::encryption::derive_key("test-token");
-        let (mut vc, tx, _work_rx, phase2) = VirtualControl::channel(enc_key);
+        let (mut vc, tx, _work_rx, _resp_rx, phase2) = VirtualControl::channel(enc_key);
         // Feed LoginResp so the bg task transitions to encrypted mode
         feed_login_resp(&mut vc, phase2).await;
         // Channel should be alive — sending a frame should work
@@ -2532,7 +3226,7 @@ mod virtual_ctrl_tests {
         // it arrives on the other side (after encryption + decryption).
         use tokio::io::AsyncReadExt;
         let enc_key = frp_core::encryption::derive_key("test-key");
-        let (mut vc, tx, _work_rx, phase2) = VirtualControl::channel(enc_key);
+        let (mut vc, tx, _work_rx, _resp_rx, phase2) = VirtualControl::channel(enc_key);
 
         // Phase 1: feed plaintext LoginResp so the bg task starts encryption
         feed_login_resp(&mut vc, phase2).await;
@@ -2548,5 +3242,78 @@ mod virtual_ctrl_tests {
         let mut buf = [0u8; 4096];
         let n = vc.read(&mut buf).await.unwrap();
         assert!(n > 0, "should read data from encrypted channel");
+    }
+
+    #[tokio::test]
+    async fn test_virtual_control_routes_new_proxy_resp_to_session() {
+        // P6: NewProxyResp frames from the control handler must reach the
+        // session's resp receiver so exec_request can wait on registration
+        // (Go waitProxyStatusReady) — every non-ReqWorkConn frame used to be
+        // silently dropped, leaving exec_request blind to register failures.
+        use frp_core::cipher_stream::CipherStream;
+        use tokio::io::AsyncWriteExt;
+        let enc_key = frp_core::encryption::derive_key("test-token");
+        let (mut vc, tx, _work_rx, mut resp_rx, phase2) = VirtualControl::channel(enc_key);
+        feed_login_resp(&mut vc, phase2).await;
+
+        // Simulate the control handler's side: wrap our end of the duplex in
+        // a CipherStream (same key, same plaintext-first discipline) and
+        // write an encrypted NewProxyResp frame, exactly as handle_control's
+        // write_resp does after registering a proxy.
+        let mut control_side = CipherStream::new(vc, enc_key);
+        let msg = FrpMessage::NewProxyResp(NewProxyResp {
+            proxy_name: "web".into(),
+            remote_addr: Some(":9090".into()),
+            error: None,
+        });
+        let payload = serde_json::to_vec(&msg).unwrap();
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.push(frp_core::msg::TYPE_NEW_PROXY_RESP);
+        frame.extend_from_slice(&(payload.len() as i64).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        control_side.write_all(&frame).await.unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(1), resp_rx.recv())
+            .await
+            .expect("NewProxyResp must reach the session resp receiver")
+            .expect("resp channel must stay open");
+        assert_eq!(resp.proxy_name, "web");
+        assert_eq!(resp.remote_addr.as_deref(), Some(":9090"));
+        assert!(resp.error.is_none());
+
+        // The error arm flows too (a rejected registration reports the
+        // server's text verbatim).
+        let msg = FrpMessage::NewProxyResp(NewProxyResp {
+            proxy_name: "web".into(),
+            remote_addr: None,
+            error: Some("port already used".into()),
+        });
+        let payload = serde_json::to_vec(&msg).unwrap();
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.push(frp_core::msg::TYPE_NEW_PROXY_RESP);
+        frame.extend_from_slice(&(payload.len() as i64).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        control_side.write_all(&frame).await.unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(1), resp_rx.recv())
+            .await
+            .expect("second NewProxyResp must arrive")
+            .expect("resp channel must stay open");
+        assert_eq!(resp.proxy_name, "web");
+        assert_eq!(resp.error.as_deref(), Some("port already used"));
+
+        // ReqWorkConn interception still works alongside (regression guard
+        // for the load-bearing read-task behavior).
+        let (mut vc2, tx2, mut work_rx, _resp_rx2, phase2_2) = VirtualControl::channel(enc_key);
+        feed_login_resp(&mut vc2, phase2_2).await;
+        let mut control2 = CipherStream::new(vc2, enc_key);
+        let req_frame = vec![frp_core::msg::TYPE_REQ_WORK_CONN, 0, 0, 0, 0, 0, 0, 0, 0];
+        control2.write_all(&req_frame).await.unwrap();
+        let req = tokio::time::timeout(std::time::Duration::from_secs(1), work_rx.recv())
+            .await
+            .expect("ReqWorkConn must still be intercepted")
+            .expect("work channel must stay open");
+        assert!(req.proxy_name.is_empty());
+        let _ = tx;
+        let _ = tx2;
     }
 }

@@ -212,8 +212,10 @@ pub async fn sync_from_state(state: &AppState) {
             last_traffic.insert(key, (snap.bytes_in, snap.bytes_out));
         }
     }
-    // Stale proxy entries are left in last_traffic to be cleaned up on next
-    // scrape — their counters naturally stop incrementing.
+    // Proxies absent from this scrape leave no trace: their baselines were
+    // dropped at the removal sites (prom::proxy_removed, called alongside
+    // ProxyMetricsRegistry::remove), so a same-name re-register computes
+    // deltas from zero instead of stalling against the pre-removal total.
 
     for (pt, count) in &type_counts {
         PROXY_COUNTS.with_label_values(&[pt]).set(*count);
@@ -254,12 +256,41 @@ pub fn render_metrics_text() -> String {
     }
 }
 
+/// Drop the per-scrape delta baseline(s) for a removed proxy. Called at the
+/// proxy-removal sites alongside `ProxyMetricsRegistry::remove`.
+///
+/// E1 scope (verified against Go frp v0.71.0): the traffic COUNTER label
+/// children are intentionally KEPT — Go never deletes label values
+/// (`CloseProxy` only `Dec()`s the gauges, metrics/server.go RemoveProxy), so
+/// a same-name re-register (the normal client-reconnect path) must CONTINUE
+/// the cumulative counter rather than restart it at 0; deleting the child
+/// here would drop the Prometheus series on every reconnect. The stale
+/// `LAST_TRAFFIC` baseline is the actual defect: after a proxy is removed and
+/// re-registered under the same name, the old baseline suppresses deltas
+/// until the new registration's cumulative bytes overtake the pre-removal
+/// total — undercounting every byte the new registration carries.
+pub async fn proxy_removed(name: &str) {
+    LAST_TRAFFIC
+        .lock()
+        .await
+        .retain(|(proxy_name, _), _| proxy_name != name);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_all_metrics_registered() {
+    /// The metric statics (REGISTRY / PROXY_COUNTS* / TRAFFIC* /
+    /// LAST_TRAFFIC) are process-global, so tests that sync and render
+    /// concurrently would reset or observe each other's label children
+    /// (sync_from_state resets the gauge vecs on every scrape). Serialize
+    /// every test in this module behind one lock.
+    static PROM_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[tokio::test]
+    async fn test_all_metrics_registered() {
+        let _guard = PROM_TEST_LOCK.lock().await;
         register_all();
         // Verify that register_all() is idempotent (doesn't panic on second call).
         register_all();
@@ -268,8 +299,9 @@ mod tests {
         assert!(!text.is_empty(), "metrics text should not be empty");
     }
 
-    #[test]
-    fn test_render_text_format() {
+    #[tokio::test]
+    async fn test_render_text_format() {
+        let _guard = PROM_TEST_LOCK.lock().await;
         register_all();
         // Touch a gauge label so it appears in render output
         PROXY_COUNTS.with_label_values(&["__fmt_test"]).set(1);
@@ -303,8 +335,155 @@ mod tests {
         CONNECTION_COUNTS.reset();
     }
 
+    use crate::control::proxy_ops::unregister_generation_tests::{proxy_info, test_state};
+
+    /// Fabricate an AppState with one registered `tcp` proxy carrying
+    /// `in`/`out` cumulative bytes in its metrics registry entry.
+    async fn state_with_proxy(
+        name: &str,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> std::sync::Arc<AppState> {
+        let state = test_state();
+        state
+            .proxy_manager
+            .register("run-1".into(), proxy_info(name, "tcp", "run-1", None, 1))
+            .await
+            .expect("register proxy");
+        let m = state.proxy_metrics.get_or_create(name).await;
+        m.record_traffic(bytes_in, bytes_out);
+        state
+    }
+
+    /// T6: the /metrics data path — sync_from_state over a real AppState
+    /// (proxy_manager + ProxyMetricsRegistry) must populate the gauges and
+    /// feed the traffic counters the per-scrape deltas (monotonic totals in
+    /// the rendered text). None of the pre-existing prom tests exercised
+    /// sync_from_state; the delta logic was only hand-replayed.
+    #[tokio::test]
+    async fn test_sync_from_state_delta_and_render() {
+        let _guard = PROM_TEST_LOCK.lock().await;
+        register_all();
+        let state = test_state();
+        // Empty state: gauges render zeroed.
+        sync_from_state(&state).await;
+        let text = render_metrics_text();
+        assert!(
+            text.contains("frp_server_client_counts 0"),
+            "client gauge should render after an empty sync"
+        );
+
+        // Scrape 1: cumulative (100, 50) → deltas (100, 50).
+        let pname = "t6-sync-p1";
+        let state = state_with_proxy(pname, 100, 50).await;
+        sync_from_state(&state).await;
+        let text = render_metrics_text();
+        assert!(
+            text.contains(&format!(
+                "frp_server_traffic_in{{name=\"{pname}\",type=\"tcp\"}} 100"
+            )),
+            "scrape 1 traffic_in missing from render:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "frp_server_traffic_out{{name=\"{pname}\",type=\"tcp\"}} 50"
+            )),
+            "scrape 1 traffic_out missing from render:\n{text}"
+        );
+        // TextEncoder sorts label names alphabetically: {name=...,type=...}
+        // even though the vec declares ["type", "name"].
+        assert!(
+            text.contains(&format!(
+                "frp_server_proxy_counts_detailed{{name=\"{pname}\",type=\"tcp\"}} 1"
+            )),
+            "detailed gauge missing from render:\n{text}"
+        );
+        assert!(
+            text.contains("frp_server_proxy_counts{type=\"tcp\"} 1"),
+            "type gauge missing from render:\n{text}"
+        );
+
+        // Scrape 2: cumulative grows to (250, 120) → deltas (150, 70); the
+        // rendered counters must be the cumulative totals (monotonic).
+        state
+            .proxy_metrics
+            .get_or_create(pname)
+            .await
+            .record_traffic(150, 70);
+        sync_from_state(&state).await;
+        let text = render_metrics_text();
+        assert!(
+            text.contains(&format!(
+                "frp_server_traffic_in{{name=\"{pname}\",type=\"tcp\"}} 250"
+            )),
+            "scrape 2 traffic_in must accumulate to the cumulative total:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "frp_server_traffic_out{{name=\"{pname}\",type=\"tcp\"}} 120"
+            )),
+            "scrape 2 traffic_out must accumulate to the cumulative total:\n{text}"
+        );
+
+        // Cleanup this test's registry + baseline so parallel tests are not
+        // affected by the shared statics.
+        state.proxy_manager.remove(pname).await;
+        state.proxy_metrics.remove(pname).await;
+        proxy_removed(pname).await;
+    }
+
+    /// E1: after a proxy is removed and re-registered under the same name
+    /// (the normal client-reconnect path), the traffic counters must
+    /// CONTINUE accumulating — the delta machinery must not stall against
+    /// the pre-removal baseline. The removal sites call `proxy_removed` to
+    /// drop the stale baseline; the counter children themselves are kept
+    /// (Go v0.71.0 never deletes label values — CloseProxy only Dec()s the
+    /// gauges), so re-registration continues the same series.
+    #[tokio::test]
+    async fn test_sync_re_registered_proxy_continues_counter() {
+        let _guard = PROM_TEST_LOCK.lock().await;
+        register_all();
+        let pname = "t6-e1-rereg";
+        // Registration #1: cumulative 100 → rendered 100.
+        let state = state_with_proxy(pname, 100, 0).await;
+        sync_from_state(&state).await;
+        let text = render_metrics_text();
+        assert!(
+            text.contains(&format!(
+                "frp_server_traffic_in{{name=\"{pname}\",type=\"tcp\"}} 100"
+            )),
+            "registration #1 traffic must render:\n{text}"
+        );
+
+        // Proxy removed (mirrors the hook sequence at the CloseProxy /
+        // control-sweep / dashboard-delete / prune removal sites).
+        state.proxy_manager.remove(pname).await;
+        state.proxy_metrics.remove(pname).await;
+        proxy_removed(pname).await;
+
+        // Registration #2 (same name, fresh registry entry): cumulative 40
+        // from zero. With the stale baseline dropped, the delta is 40 and
+        // the counter continues to 140 — without `proxy_removed` the stale
+        // baseline (100) suppresses the delta and the counter stalls at 100.
+        let state = state_with_proxy(pname, 40, 0).await;
+        sync_from_state(&state).await;
+        let text = render_metrics_text();
+        assert!(
+            text.contains(&format!(
+                "frp_server_traffic_in{{name=\"{pname}\",type=\"tcp\"}} 140"
+            )),
+            "re-registered proxy must CONTINUE the cumulative counter (stale \
+             baseline suppressed the delta?):\n{text}"
+        );
+
+        state.proxy_manager.remove(pname).await;
+        state.proxy_metrics.remove(pname).await;
+        proxy_removed(pname).await;
+    }
+
     #[tokio::test]
     async fn test_delta_tracking_no_reset() {
+        let _guard = PROM_TEST_LOCK.lock().await;
         register_all();
 
         // Simulate two sequential scrapes:

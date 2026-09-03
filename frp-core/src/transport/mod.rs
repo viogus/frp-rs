@@ -51,6 +51,41 @@ pub const FRP_TLS_HEAD_BYTE: u8 = 0x17;
 /// Go frp v0.69.1 clients may send this directly without the 0x17 prefix.
 pub const FRP_TLS_DIRECT_BYTE: u8 = 0x16;
 
+/// Client-side TLS handshake bound.
+///
+/// Deliberate Rust-only hardening: Go frp's client TLS handshake is
+/// UNBOUNDED — golib's `DialContext` `WithTimeout` covers the TCP connect
+/// only (`net.Dialer` returns once the socket is connected; the rustls
+/// handshake then waits for ServerHello with no deadline, and a silent or
+/// half-open peer parks the task + fd until the OS TCP timeout, minutes
+/// later). The frp-rs server already bounds TLS *accept* at 30s
+/// (`POST_HANDSHAKE_READ_TIMEOUT` family in frp-server); this const brings
+/// the client dial side to the same family. Same precedent as the SSH
+/// gateway per-IP throttle: a Rust-only hardening over Go semantics.
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `TlsConnector::connect` bounded by `timeout`. Returns
+/// `io::ErrorKind::TimedOut` when the handshake does not complete in time
+/// (the underlying stream is dropped, closing the socket).
+#[cfg(feature = "tls")]
+async fn connect_tls_with_timeout<S>(
+    connector: &tokio_rustls::TlsConnector,
+    server_name: rustls::pki_types::ServerName<'static>,
+    stream: S,
+    timeout: Duration,
+) -> io::Result<tokio_rustls::client::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match tokio::time::timeout(timeout, connector.connect(server_name, stream)).await {
+        Ok(res) => res,
+        Err(_elapsed) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("TLS handshake did not complete within {timeout:?}"),
+        )),
+    }
+}
+
 /// Result of peeking the first byte on the main accept port.
 #[derive(Debug, PartialEq)]
 pub enum ConnectionType {
@@ -1528,9 +1563,14 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                             crate::Error::Transport(format!("invalid server name: {e}").into())
                         })?;
                     let peer_addr = peer;
-                    let tls = connector.connect(server_name, stream).await.map_err(|e| {
-                        crate::Error::Transport(format!("KCP TLS connect: {e}").into())
-                    })?;
+                    let tls = connect_tls_with_timeout(
+                        &connector,
+                        server_name,
+                        stream,
+                        TLS_HANDSHAKE_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("KCP TLS connect: {e}").into()))?;
                     return Ok(IoStream::Tls(
                         Box::new(tokio_rustls::TlsStream::Client(tls)),
                         peer_addr,
@@ -1625,10 +1665,14 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                             crate::Error::Transport(format!("invalid server name: {e}").into())
                         })?;
                     let peer_addr = peer;
-                    let tls = connector
-                        .connect(server_name, stream)
-                        .await
-                        .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}").into()))?;
+                    let tls = connect_tls_with_timeout(
+                        &connector,
+                        server_name,
+                        stream,
+                        TLS_HANDSHAKE_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}").into()))?;
                     Ok(IoStream::Tls(
                         Box::new(tokio_rustls::TlsStream::Client(tls)),
                         peer_addr,
@@ -1678,10 +1722,14 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         .map_err(|e| {
                             crate::Error::Transport(format!("invalid server name: {e}").into())
                         })?;
-                    let tls_stream = connector
-                        .connect(server_name, stream)
-                        .await
-                        .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}").into()))?;
+                    let tls_stream = connect_tls_with_timeout(
+                        &connector,
+                        server_name,
+                        stream,
+                        TLS_HANDSHAKE_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}").into()))?;
                     connect_ws_raw(
                         tls_stream,
                         &host,
@@ -2348,6 +2396,226 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Drive one SOCKS5 no-auth CONNECT handshake against the mock: read the
+    /// 3-byte greeting, accept no-auth, read the 10-byte IPv4 CONNECT request
+    /// (the tests always dial an IP target, so the request shape is fixed).
+    async fn socks5_noauth_connect_handshake(sock: &mut tokio::net::TcpStream) {
+        let mut greeting = [0u8; 3];
+        sock.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [0x05, 0x01, 0x00], "no-auth greeting");
+        sock.write_all(&[0x05, 0x00]).await.unwrap();
+        let mut req = [0u8; 10];
+        sock.read_exact(&mut req).await.unwrap();
+        assert_eq!(req[0], 0x05, "VER");
+        assert_eq!(req[1], 0x01, "CMD=CONNECT");
+        assert_eq!(req[3], 0x01, "ATYP=IPv4");
+    }
+
+    /// SOCKS5 reply parser, ATYP 0x03 (domain) with a tail: the bind address
+    /// continues past the 10-byte head, and the leftover must be drained
+    /// EXACTLY (len + 2 − 5 bytes) so tunnel bytes are never consumed as bind
+    /// address. Sentinel bytes after the tail must still be readable from the
+    /// returned stream. Reply-shape pin (R11).
+    #[tokio::test]
+    async fn test_socks5_reply_domain_atyp_drains_bind_tail_exactly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks5_noauth_connect_handshake(&mut sock).await;
+            // Reply: VER REP RSV ATYP(0x03) LEN + 11-byte name + 2-byte port.
+            // Only the first (4 + 1 + 5) = 10 bytes go in the head; the
+            // remaining 6 name bytes + 2 port bytes = 8 tail bytes follow
+            // (extra = (11 + 2) - 5 = 8).
+            let mut reply = vec![0x05, 0x00, 0x00, 0x03, 11];
+            reply.extend_from_slice(b"example.com");
+            reply.extend_from_slice(&[0x1f, 0x90]);
+            sock.write_all(&reply[..10]).await.unwrap();
+            // Tail + sentinel tunnel bytes (must NOT be drained as bind addr).
+            sock.write_all(&reply[10..]).await.unwrap();
+            sock.write_all(b"TUNNEL-BYTES-AFTER-TAIL").await.unwrap();
+            // Hold the tunnel open until the test drops the stream.
+            std::future::pending::<()>().await
+        });
+
+        let mut stream = connect_via_proxy(&format!("socks5://{addr}"), "127.0.0.1", 12345, 5, 0)
+            .await
+            .expect("domain ATYP bind reply must succeed");
+        let mut buf = vec![0u8; 128];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"TUNNEL-BYTES-AFTER-TAIL",
+            "bind tail drained exactly — sentinel tunnel bytes intact"
+        );
+        srv.abort();
+    }
+
+    /// SOCKS5 reply parser, ATYP 0x03 with a ZERO length: malformed per RFC
+    /// 1928 — the dial must fail with the malformed-address error.
+    #[tokio::test]
+    async fn test_socks5_reply_zero_len_domain_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks5_noauth_connect_handshake(&mut sock).await;
+            // len == 0 → (0, true): malformed.
+            sock.write_all(&[0x05, 0x00, 0x00, 0x03, 0x00, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            std::future::pending::<()>().await
+        });
+
+        let err = connect_via_proxy(&format!("socks5://{addr}"), "127.0.0.1", 12345, 5, 0)
+            .await
+            .expect_err("zero-length domain ATYP must be malformed");
+        assert!(
+            err.to_string().contains("malformed bind address ATYP 0x03"),
+            "unexpected error: {err}"
+        );
+        srv.abort();
+    }
+
+    /// SOCKS5 reply parser, unknown ATYP: rejected as malformed (RFC 1928
+    /// defines 0x01/0x03/0x04 only).
+    #[tokio::test]
+    async fn test_socks5_reply_unknown_atyp_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks5_noauth_connect_handshake(&mut sock).await;
+            sock.write_all(&[0x05, 0x00, 0x00, 0x05, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            std::future::pending::<()>().await
+        });
+
+        let err = connect_via_proxy(&format!("socks5://{addr}"), "127.0.0.1", 12345, 5, 0)
+            .await
+            .expect_err("unknown ATYP must be malformed");
+        assert!(
+            err.to_string().contains("malformed bind address ATYP 0x05"),
+            "unexpected error: {err}"
+        );
+        srv.abort();
+    }
+
+    /// SOCKS5 reply parser, ATYP 0x04 (IPv6): 12 extra bind bytes must be
+    /// drained and the dial succeeds — the parser's `extra = 12` arm.
+    #[tokio::test]
+    async fn test_socks5_reply_ipv6_bind_accepted_with_extra_drain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            socks5_noauth_connect_handshake(&mut sock).await;
+            // 16-byte IPv6 + 2 port: first 6 IP bytes sit in the 10-byte head.
+            let mut reply = vec![0x05, 0x00, 0x00, 0x04];
+            reply.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            reply.extend_from_slice(&[0x1f, 0x90]);
+            sock.write_all(&reply[..10]).await.unwrap();
+            sock.write_all(&reply[10..]).await.unwrap();
+            sock.write_all(b"V6-TUNNEL").await.unwrap();
+            std::future::pending::<()>().await
+        });
+
+        let mut stream = connect_via_proxy(&format!("socks5://{addr}"), "127.0.0.1", 12345, 5, 0)
+            .await
+            .expect("IPv6 bind reply must succeed");
+        let mut buf = vec![0u8; 128];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"V6-TUNNEL", "IPv6 tail drained exactly");
+        srv.abort();
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn tls_client_handshake_is_bounded_against_silent_acceptor() {
+        // Pin test for the client-side TLS handshake bound (Go frp leaves the
+        // client handshake unbounded — golib's DialContext WithTimeout covers
+        // the TCP connect only; frp-rs deliberately hardens, see
+        // TLS_HANDSHAKE_TIMEOUT).
+        //
+        // A TCP peer that accepts and never writes: no ServerHello, no alert,
+        // no FIN. The bare `connector.connect(...)` future parks until the OS
+        // TCP timeout (minutes); the bounded helper must give up after the
+        // injected duration with io::ErrorKind::TimedOut.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read the ClientHello (keeps the server receive window open, so
+            // the client never observes a reset), then stay silent forever.
+            // Holding the socket open means EOF can never end the handshake —
+            // only a timeout can.
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            std::future::pending::<()>().await
+        });
+
+        // Both connector builds write the SINGLE-slot CONNECTOR_CACHE;
+        // serialize against cache_behavior (tls.rs), whose delta assertions
+        // flake when a foreign build evicts its entry mid-test. The guard is
+        // scoped to this sync region only (no .await under it — clippy
+        // 1.96 `held across an await point`).
+        let _build_serial = crate::transport::tls::CONNECTOR_BUILD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let connector = build_tls_connector_skip_verify(None, None, None, true).unwrap();
+        let server_name = || rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        drop(_build_serial);
+
+        // Positive: the bounded helper returns TimedOut well under the
+        // injected 250ms deadline, not after the OS-level TCP timeout.
+        let started = std::time::Instant::now();
+        let err = connect_tls_with_timeout(
+            &connector,
+            server_name(),
+            tokio::net::TcpStream::connect(addr).await.unwrap(),
+            Duration::from_millis(250),
+        )
+        .await
+        .expect_err("silent TLS peer must time out");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "expected TimedOut, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "bounded handshake should give up promptly, took {elapsed:?}"
+        );
+
+        // Negative control: the UNBOUNDED path (what the three connector call
+        // sites did pre-fix — plain `connector.connect(...).await`) is
+        // genuinely stuck against the same silent peer. If this ever
+        // completes, the pin is not exercising the stall it claims to guard.
+        let unbounded = connector.connect(
+            server_name(),
+            tokio::net::TcpStream::connect(addr).await.unwrap(),
+        );
+        tokio::pin!(unbounded);
+        let hung = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(300)) => true,
+            res = &mut unbounded => {
+                panic!("bare connector.connect completed against a silent peer: {res:?}")
+            }
+        };
+        assert!(
+            hung,
+            "bare TLS connect must hang on a silent peer (proves the bound is load-bearing)"
+        );
+
+        acceptor.abort();
+    }
 
     #[tokio::test]
     async fn test_socks5_auth_required_without_credentials_returns_error() {

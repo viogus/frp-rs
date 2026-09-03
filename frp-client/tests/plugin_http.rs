@@ -1383,3 +1383,50 @@ async fn test_http_proxy_sanitizes_embedded_cr_in_header_line() {
         "raw CR must not reach the backend: {head}"
     );
 }
+/// R5 e2e: configured X-Forwarded-For + an inbound XFF from the client must
+/// produce EXACTLY ONE X-Forwarded-For line at the backend (Go Header.Set
+/// replace semantics). The no-peer http2http path pre-fix emitted the
+/// configured value twice plus the inbound chain (unit-pinned in
+/// plugin/mod.rs; this pins it on the wire).
+#[tokio::test]
+async fn test_http2http_single_xff_line_with_configured_value() {
+    let (backend_addr, rx) = start_capture_backend().await;
+
+    let mut cfg = plugin_cfg("http2http", backend_addr.to_string());
+    cfg.request_headers = HashMap::from([("X-Forwarded-For".to_string(), "cfg-value".to_string())]);
+
+    let handle = frp_client::plugin::start_http2http_plugin(&cfg)
+        .await
+        .expect("start http2http plugin");
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+    client
+        .write_all(
+            b"GET /xff HTTP/1.1\r\n\
+              Host: h.local\r\n\
+              X-Forwarded-For: 1.2.3.4\r\n\
+              \r\n",
+        )
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    client.read_to_end(&mut resp).await.unwrap();
+    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
+
+    let req = rx.await.expect("backend captured request");
+    let xff_count = req
+        .lines()
+        .filter(|l| l.to_ascii_lowercase().starts_with("x-forwarded-for:"))
+        .count();
+    assert_eq!(
+        xff_count, 1,
+        "exactly one X-Forwarded-For line must reach the backend, got {xff_count}: {req}"
+    );
+    assert!(
+        req.contains("X-Forwarded-For: cfg-value"),
+        "configured value must be the emitted line: {req}"
+    );
+    assert!(
+        !req.contains("1.2.3.4"),
+        "inbound chain must not leak alongside the configured value: {req}"
+    );
+}

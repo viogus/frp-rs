@@ -1116,4 +1116,210 @@ mod tests {
             "stale members must not yield Some((_, empty run_id)): {sel:?}"
         );
     }
+
+    // ── Group health tracking (Rust-only extension) ────────────────────
+    //
+    // The health machinery (MAX_CONSECUTIVE_FAILURES=3, HEALTH_COOLDOWN=30s,
+    // all-unhealthy fallback) is a Rust-only extension — Go frp's group
+    // package has NO health tracking — so the pins below exercise the pure
+    // selection logic through ProxyManager, with the cooldown expiry driven
+    // by the mocked tokio clock (start_paused), never real sleeps.
+
+    /// A member that hit MAX_CONSECUTIVE_FAILURES must never be selected
+    /// while a healthy member exists; once HEALTH_COOLDOWN (30s) elapses it
+    /// is eligible again. Round-robin counter is deterministic under the
+    /// paused clock, so the exact post-expiry sequence is asserted.
+    #[tokio::test(start_paused = true)]
+    async fn group_health_unhealthy_never_selected_until_cooldown_expiry() {
+        let mgr = ProxyManager::new();
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("a", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register a");
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("b", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register b");
+
+        // B fails 3× → Unhealthy. A has no health entry → always eligible.
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            mgr.report_backend_failure("b").await;
+        }
+
+        // While B is unhealthy the pool is [a] — every select returns a,
+        // even across four round-robin rounds.
+        for round in 0..4 {
+            assert_eq!(
+                mgr.select_group_backend("g", "").await.as_deref(),
+                Some("a"),
+                "round {round}: unhealthy member b must never be selected while a is healthy"
+            );
+        }
+
+        // Advance the mocked clock past HEALTH_COOLDOWN (30s) → B's entry
+        // is eligible again; the pool is [a, b] and the round-robin counter
+        // (4 selects so far) resumes at index 4 % 2 == 0 → a, then b.
+        tokio::time::sleep(HEALTH_COOLDOWN + Duration::from_secs(1)).await;
+        assert_eq!(
+            mgr.select_group_backend("g", "").await.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            mgr.select_group_backend("g", "").await.as_deref(),
+            Some("b"),
+            "cooldown-expired member b must be selectable again after 30s"
+        );
+
+        // The entry itself stays marked until a success or removal — the
+        // expiry only widens the pool, it does not clear last_failure.
+        assert_eq!(
+            mgr.group_health.read().await.get("b").map(|h| h.state),
+            Some(HealthState::Unhealthy)
+        );
+    }
+
+    /// A successful connection resets a member's health instantly — no
+    /// cooldown wait. B fails twice (still Healthy), then once more would
+    /// mark it Unhealthy — instead a success after the second failure must
+    /// clear the streak so the third failure restarts the count.
+    #[tokio::test(start_paused = true)]
+    async fn group_health_success_resets_failure_streak() {
+        let mgr = ProxyManager::new();
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("a", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register a");
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("b", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register b");
+
+        mgr.report_backend_failure("b").await;
+        mgr.report_backend_failure("b").await;
+        mgr.report_backend_success("b").await;
+        assert_eq!(
+            mgr.group_health.read().await.get("b").map(|h| h.state),
+            Some(HealthState::Healthy),
+            "a success must clear the failure streak immediately"
+        );
+
+        // Two fresh failures after the reset must NOT flip B unhealthy
+        // (count restarted at 0 — only the third would).
+        mgr.report_backend_failure("b").await;
+        mgr.report_backend_failure("b").await;
+        assert_eq!(
+            mgr.group_health.read().await.get("b").map(|h| h.state),
+            Some(HealthState::Healthy)
+        );
+
+        // With both members healthy the pool is [a, b]: round-robin from
+        // counter 0 → a then b.
+        assert_eq!(
+            mgr.select_group_backend("g", "").await.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            mgr.select_group_backend("g", "").await.as_deref(),
+            Some("b")
+        );
+    }
+
+    /// When EVERY member is unhealthy, the filter would empty the pool —
+    /// selection falls back to the full member list (best-effort routing,
+    /// so a degraded group still serves instead of 404ing every request).
+    #[tokio::test(start_paused = true)]
+    async fn group_health_all_unhealthy_falls_back_to_all_members() {
+        let mgr = ProxyManager::new();
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("a", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register a");
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("b", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register b");
+
+        for m in ["a", "b"] {
+            for _ in 0..MAX_CONSECUTIVE_FAILURES {
+                mgr.report_backend_failure(m).await;
+            }
+        }
+        // Both members are now Unhealthy — the fallback still yields both.
+        assert_eq!(
+            mgr.select_group_backend("g", "").await.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            mgr.select_group_backend("g", "").await.as_deref(),
+            Some("b")
+        );
+
+        // Fallback keeps working after the cooldown too (pool unchanged —
+        // both entries stay Unhealthy until a success/removal).
+        tokio::time::sleep(HEALTH_COOLDOWN + Duration::from_secs(1)).await;
+        assert!(
+            mgr.select_group_backend("g", "").await.is_some(),
+            "all-unhealthy group must keep serving (best-effort fallback)"
+        );
+    }
+
+    /// remove_backend_health must clear the tracking entry (called on proxy
+    /// removal); the fast path then resumes and no stale entry can re-mark
+    /// an unrelated re-registered member.
+    #[tokio::test]
+    async fn group_health_removal_clears_entry_and_fast_path() {
+        let mgr = ProxyManager::new();
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("a", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register a");
+        mgr.register(
+            "run-1".into(),
+            test_proxy_info("b", "run-1", Some("g".into())),
+        )
+        .await
+        .expect("register b");
+
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            mgr.report_backend_failure("b").await;
+        }
+        assert!(
+            mgr.health_tracking_active
+                .load(std::sync::atomic::Ordering::Acquire),
+            "failures must arm the tracking path"
+        );
+        mgr.remove_backend_health("b").await;
+        assert!(
+            mgr.group_health.read().await.is_empty(),
+            "removal must clear the health entry"
+        );
+        assert!(
+            !mgr.health_tracking_active
+                .load(std::sync::atomic::Ordering::Acquire),
+            "an empty health map must disarm the tracking fast path"
+        );
+        // Selection resumes the fast path: b (no entry) is eligible again.
+        assert_eq!(
+            mgr.select_group_backend("g", "").await.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            mgr.select_group_backend("g", "").await.as_deref(),
+            Some("b")
+        );
+    }
 }

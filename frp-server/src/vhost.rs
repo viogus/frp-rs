@@ -590,24 +590,38 @@ pub(crate) async fn write_http_error(
     }
 }
 
+/// Upper cap (seconds) applied by `clamp_vhost_timeout`. 24h is far beyond
+/// any real request-head / response-head bound (the value only clocks head
+/// reads); Rust-only hardening — Go frp has no comparable cap on
+/// VhostHTTPTimeout.
+const VHOST_TIMEOUT_CAP_SECS: u64 = 24 * 60 * 60;
+
+/// Go parity (pkg/util/vhost/http.go `NewHTTPReverseProxy`): a
+/// `vhost_http_timeout <= 0` value floors at 60s; positive values pass
+/// through unchanged. Shared by every vhost accept path (HTTP/1.1 head,
+/// h2c handshake, HTTPS SNI, h2c response-head).
+///
+/// Positive values are additionally capped at [`VHOST_TIMEOUT_CAP_SECS`]:
+/// the clamped value feeds `Instant::now() + Duration::from_secs(...)` at
+/// the deadline sites below (serve_vhost_request head deadline,
+/// serve_h2c_request handshake deadline), and std `Instant` PANICS when the
+/// add overflows — under the release `panic=abort` profile a hostile
+/// `vhost_http_timeout = u64::MAX` config would abort frps on the first
+/// vhost request, before any read is attempted (audit finding S1). The
+/// `tokio::time::timeout(duration)` call sites (HTTPS SNI, h2c/HTTP
+/// response head) cannot overflow — tokio's checked_add degrades a huge
+/// duration to a far-future deadline — but share the same clamp so the
+/// config has one bounded semantic everywhere.
+pub(crate) fn clamp_vhost_timeout(t: u64) -> u64 {
+    let floored = if t > 0 { t } else { 60 };
+    floored.min(VHOST_TIMEOUT_CAP_SECS)
+}
+
 /// Shared per-connection VHost handling: read the request head, extract Host
 /// header and path, apply Basic Auth and host_header_rewrite, then route the
 /// stream via InternalMsg::ProxyUserConn. `scheme` labels log lines
 /// ("HTTP"/"HTTPS"). `wrap` converts the (readable+writable) stream into the
 /// IoStream variant carried to the control handler.
-///
-/// Go parity (pkg/util/vhost/http.go `NewHTTPReverseProxy`): a
-/// `vhost_http_timeout <= 0` value floors at 60s; positive values pass
-/// through unchanged. Shared by every vhost accept path (HTTP/1.1 head,
-/// h2c handshake, HTTPS SNI, h2c response-head).
-pub(crate) fn clamp_vhost_timeout(t: u64) -> u64 {
-    if t > 0 {
-        t
-    } else {
-        60
-    }
-}
-
 async fn serve_vhost_request<S>(
     mut stream: S,
     peer: std::net::SocketAddr,
@@ -2318,12 +2332,25 @@ mod tests {
 
     #[test]
     fn test_clamp_vhost_timeout() {
-        // Go parity: `<= 0` floors at 60s; positive values pass through.
+        // Go parity: `<= 0` floors at 60s; positive values pass through up
+        // to the 24h cap. Above it (incl. u64::MAX from a hostile config)
+        // the value would overflow the `Instant::now() + from_secs` deadline
+        // add at serve_vhost_request / serve_h2c_request — an abort under
+        // the release `panic=abort` profile — so it clamps instead.
         assert_eq!(clamp_vhost_timeout(0), 60);
         assert_eq!(clamp_vhost_timeout(1), 1);
         assert_eq!(clamp_vhost_timeout(30), 30);
         assert_eq!(clamp_vhost_timeout(60), 60);
         assert_eq!(clamp_vhost_timeout(120), 120);
+        assert_eq!(
+            clamp_vhost_timeout(VHOST_TIMEOUT_CAP_SECS),
+            VHOST_TIMEOUT_CAP_SECS
+        );
+        assert_eq!(
+            clamp_vhost_timeout(VHOST_TIMEOUT_CAP_SECS + 1),
+            VHOST_TIMEOUT_CAP_SECS
+        );
+        assert_eq!(clamp_vhost_timeout(u64::MAX), VHOST_TIMEOUT_CAP_SECS);
     }
 
     #[test]

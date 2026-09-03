@@ -18,6 +18,15 @@ pub(crate) mod proxy_ops;
 #[cfg(feature = "dashboard")]
 pub(crate) use proxy_ops::release_udp_port_with_owner_check;
 
+// Re-export for the dashboard delete paths (single + bulk), which perform
+// their own registry removal: the helper releases the counters the entry
+// owned (https SNI-sniff gate count, per-client port-budget slot) only when
+// THIS call actually removed the proxy, so a delete racing the client
+// CloseProxy handler cannot double-decrement (S4). Gated on `dashboard`
+// like the SUDP re-export above.
+#[cfg(feature = "dashboard")]
+pub(crate) use proxy_ops::remove_proxy_and_release_client_counts;
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;

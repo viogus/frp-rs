@@ -83,7 +83,11 @@ async fn test_dashboard_status() {
     assert_eq!(json["proxy_count"].as_u64().unwrap(), 0);
 }
 
-/// GET /api/serverinfo is Go frp compat alias for /api/status
+/// GET /api/serverinfo serves the Go `model.ServerInfoResp` shape
+/// (frp v0.71.0 server/http/model/types.go:21-40): camelCase keys, all
+/// non-omitempty keys always present with zero values included, and
+/// `allowPortsStr`/`tlsForce` omitted per Go's omitempty tags. The
+/// Rust-native payload lives on /api/status (test_dashboard_status).
 #[tokio::test]
 async fn test_dashboard_serverinfo() {
     let bind_port = common::allocate_port();
@@ -100,7 +104,58 @@ async fn test_dashboard_serverinfo() {
     assert_eq!(resp.status(), 200);
 
     let json: serde_json::Value = resp.json().await.unwrap();
-    assert!(json.get("version").is_some());
+    // Full Go key set, correct camelCase names.
+    for key in [
+        "version",
+        "bindPort",
+        "vhostHTTPPort",
+        "vhostHTTPSPort",
+        "tcpmuxHTTPConnectPort",
+        "kcpBindPort",
+        "quicBindPort",
+        "subdomainHost",
+        "maxPoolCount",
+        "maxPortsPerClient",
+        "heartbeatTimeout",
+        "totalTrafficIn",
+        "totalTrafficOut",
+        "curConns",
+        "clientCounts",
+        "proxyTypeCount",
+    ] {
+        assert!(json.get(key).is_some(), "missing Go key {key}");
+    }
+    // No Rust-native /api/status keys may leak into the Go-shaped payload.
+    for key in ["uptime_secs", "client_count", "proxy_count", "pool_hits"] {
+        assert!(json.get(key).is_none(), "Rust-native key {key} leaked");
+    }
+    // Go omitempty on a default server: allowPortsStr empty, tlsForce false.
+    assert!(
+        json.get("allowPortsStr").is_none(),
+        "empty allowPortsStr must be omitted"
+    );
+    assert!(
+        json.get("tlsForce").is_none(),
+        "false tlsForce must be omitted"
+    );
+
+    // base_config leaves every listener off except bind_port.
+    assert_eq!(json["version"].as_str().unwrap(), frp_core::VERSION);
+    assert_eq!(json["bindPort"].as_u64().unwrap(), u64::from(bind_port));
+    assert_eq!(json["vhostHTTPPort"].as_u64().unwrap(), 0);
+    assert_eq!(json["vhostHTTPSPort"].as_u64().unwrap(), 0);
+    assert_eq!(json["tcpmuxHTTPConnectPort"].as_u64().unwrap(), 0);
+    assert_eq!(json["subdomainHost"].as_str().unwrap(), "");
+    // Live state on a fresh server: no clients, no proxies, no traffic.
+    assert_eq!(json["clientCounts"].as_u64().unwrap(), 0);
+    assert_eq!(json["totalTrafficIn"].as_u64().unwrap(), 0);
+    assert_eq!(json["totalTrafficOut"].as_u64().unwrap(), 0);
+    assert_eq!(json["curConns"].as_u64().unwrap(), 0);
+    assert_eq!(
+        json["proxyTypeCount"].as_object().unwrap().len(),
+        0,
+        "no proxies registered"
+    );
 }
 
 /// GET /api/proxies lists proxies (empty on fresh start)
@@ -441,7 +496,33 @@ password = "admin"
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "owner delete should succeed");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Poll (R12): the delete handler has responded, but the member removal
+    // lands asynchronously across the control path — wait for the proxy to
+    // be GONE from the API instead of a fixed sleep (slow CI used to miss
+    // the window and round-robin the request into the deleted owner).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let resp = client
+            .get(frps.dashboard_url("/api/proxies/grp-a"))
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 404 {
+            break;
+        }
+        assert_eq!(
+            resp.status(),
+            200,
+            "unexpected status while polling grp-a deletion"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "grp-a never disappeared from /api/proxies"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     // grp-b still serves: pool a work conn and request the vhost domain.
     let mut work = tokio::net::TcpStream::connect(addr)
@@ -517,13 +598,300 @@ password = "admin"
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "bulk delete should succeed");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Poll (R12): wait for grp-b to be gone from the API, then assert the
+    // route is dead with one request — polling the API first keeps the
+    // route check a single deterministic assertion instead of retrying
+    // requests into a live-but-draining dispatch.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let resp = client
+            .get(frps.dashboard_url("/api/proxies/grp-b"))
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 404 {
+            break;
+        }
+        assert_eq!(
+            resp.status(),
+            200,
+            "unexpected status while polling grp-b deletion"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "grp-b never disappeared from /api/proxies"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     let resp_body = http_get_vhost(vhost, "app.example.com").await;
     assert!(
         resp_body.contains("404"),
         "route should be removed after last member deleted: {resp_body:?}"
     );
+}
+
+/// R2: the dashboard proxy-delete paths must honor TCPMUX group route
+/// ownership exactly like the http-group sibling above:
+/// - deleting the route OWNER while other members remain keeps the shared
+///   tcpmux route alive (the remaining member keeps serving CONNECTs);
+/// - deleting the last member drops the shared route (CONNECTs get 404).
+///
+/// This is the dashboard entry point; the in-process CloseProxy e2e in
+/// tests/tcpmux_httpconnect.rs pins the same arms through the control
+/// path (handle_close_proxy shares the lifecycle code).
+#[tokio::test]
+async fn test_dashboard_delete_tcpmux_group_route_owner_semantics() {
+    use frp_core::msg::{FrpMessage, NewProxy};
+    use frp_core::protocol::{read_msg_v1, write_msg_v1};
+    use tokio::io::AsyncWriteExt;
+
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let tcpmux_port = common::allocate_port();
+    let cfg = format!(
+        r#"bind_addr = "127.0.0.1"
+bind_port = {bind_port}
+tcpmux_httpconnect_port = {tcpmux_port}
+
+[auth]
+method = "token"
+token = "test-token"
+
+[transport]
+tcp_mux = false
+
+[web_server]
+addr = "127.0.0.1"
+port = {dashboard_port}
+user = "admin"
+password = "admin"
+"#,
+        bind_port = bind_port,
+        dashboard_port = dashboard_port,
+        tcpmux_port = tcpmux_port,
+    );
+    let frps = FrpsHandle::start(&cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+    let tcpmux: std::net::SocketAddr = format!("127.0.0.1:{tcpmux_port}").parse().unwrap();
+    let client = auth_client();
+
+    fn tgrp_proxy(name: &str) -> NewProxy {
+        NewProxy {
+            proxy_name: name.into(),
+            proxy_type: "tcpmux".into(),
+            sk: None,
+            use_encryption: None,
+            use_compression: None,
+            group: Some("tgrp".into()),
+            group_key: Some("secret-key".into()),
+            local_str: Some("127.0.0.1:8080".into()),
+            remote_port: Some(0),
+            custom_domains: Some(vec!["tfan.example.com".into()]),
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: None,
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: Some("httpconnect".into()),
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        }
+    }
+
+    // Register two members: grp-t-a is the route owner (first).
+    let (mut ctl_a, resp_a) = common::login_with_test_token(addr).await.expect("login A");
+    let run_id_a_holder = resp_a.run_id.expect("run_id A");
+    {
+        write_msg_v1(
+            &mut ctl_a,
+            &FrpMessage::NewProxy(Box::new(tgrp_proxy("grp-t-a"))),
+        )
+        .await
+        .expect("send NewProxy A");
+        match read_msg_v1(&mut ctl_a).await.expect("NewProxyResp A") {
+            FrpMessage::NewProxyResp(ref r) => assert!(r.error.is_none(), "{:?}", r.error),
+            other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+        }
+    }
+    let (mut ctl_b, resp_b) = common::login_with_test_token(addr).await.expect("login B");
+    let run_id_b_holder = resp_b.run_id.expect("run_id B");
+    {
+        write_msg_v1(
+            &mut ctl_b,
+            &FrpMessage::NewProxy(Box::new(tgrp_proxy("grp-t-b"))),
+        )
+        .await
+        .expect("send NewProxy B");
+        match read_msg_v1(&mut ctl_b).await.expect("NewProxyResp B") {
+            FrpMessage::NewProxyResp(ref r) => assert!(r.error.is_none(), "{:?}", r.error),
+            other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+        }
+    }
+
+    let connect_req = b"CONNECT tfan.example.com:22 HTTP/1.1\r\nHost: tfan.example.com:22\r\n\r\n";
+
+    /// CONNECT to the tcpmux port; returns (status_text, stream).
+    async fn do_connect(
+        tcpmux: std::net::SocketAddr,
+        req: &[u8],
+    ) -> (String, tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut c = tokio::net::TcpStream::connect(tcpmux)
+            .await
+            .expect("connect to tcpmux port");
+        c.write_all(req).await.expect("send CONNECT");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 128];
+        while !buf.ends_with(b"\r\n\r\n") {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), c.read(&mut chunk))
+                .await
+                .expect("timeout reading the CONNECT response")
+                .expect("read CONNECT response");
+            assert!(n > 0, "EOF before the full CONNECT response: {buf:?}");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        (String::from_utf8_lossy(&buf).into_owned(), c)
+    }
+
+    /// Pool a work conn for a run_id and read the StartWorkConn proxy name.
+    async fn connect_and_read_member(
+        addr: std::net::SocketAddr,
+        tcpmux: std::net::SocketAddr,
+        run_id: &str,
+        req: &[u8],
+    ) -> String {
+        use frp_core::msg;
+        use frp_core::protocol::write_msg_v1;
+        let mut work = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("work conn");
+        write_msg_v1(
+            &mut work,
+            &FrpMessage::NewWorkConn(msg::NewWorkConn {
+                run_id: Some(run_id.to_string()),
+                timestamp: None,
+                privilege_key: None,
+            }),
+        )
+        .await
+        .expect("send NewWorkConn");
+        let (status, client) = do_connect(tcpmux, req).await;
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "expected 200, got: {status:?}"
+        );
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(3), read_msg_v1(&mut work))
+            .await
+            .expect("timeout waiting for StartWorkConn")
+            .expect("read StartWorkConn");
+        drop(client);
+        match msg {
+            FrpMessage::StartWorkConn(swc) => {
+                assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+                swc.proxy_name
+            }
+            other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+        }
+    }
+
+    // Sanity: both members are live before the delete — round-robin index
+    // starts at 0, so the first CONNECT lands on the owner grp-t-a. The work
+    // conn must be pooled under the DISPATCHED member's own control (the
+    // server pops the pooled conn of the chosen member's run_id), so pool it
+    // under run_id A for this round.
+    assert_eq!(
+        connect_and_read_member(addr, tcpmux, &run_id_a_holder, connect_req).await,
+        "grp-t-a",
+        "first CONNECT should be served by the route owner"
+    );
+
+    // Dashboard deletes the route OWNER (grp-t-a) while grp-t-b remains.
+    let resp = client
+        .delete(frps.dashboard_url("/api/store/proxy/grp-t-a"))
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "owner delete should succeed");
+
+    // Poll (R12): wait until the owner is gone from the API.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let resp = client
+            .get(frps.dashboard_url("/api/proxies/grp-t-a"))
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 404 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "grp-t-a never disappeared from /api/proxies"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // grp-t-b still serves CONNECTs on the shared route.
+    assert_eq!(
+        connect_and_read_member(addr, tcpmux, &run_id_b_holder, connect_req).await,
+        "grp-t-b",
+        "remaining member must serve after the owner was deleted"
+    );
+
+    // Bulk-delete the last member → the shared route must be dropped.
+    let resp = client
+        .delete(frps.dashboard_url("/api/proxies"))
+        .basic_auth("admin", Some("admin"))
+        .json(&serde_json::json!({ "proxies": ["grp-t-b"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "bulk delete should succeed");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let resp = client
+            .get(frps.dashboard_url("/api/proxies/grp-t-b"))
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 404 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "grp-t-b never disappeared from /api/proxies"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let (status, client) = do_connect(tcpmux, connect_req).await;
+    drop(client);
+    assert!(
+        status.starts_with("HTTP/1.1 404"),
+        "route should be removed after the last member was deleted, got: {status:?}"
+    );
+
+    drop(ctl_a);
+    drop(ctl_b);
 }
 
 /// Minimal HTTP GET to the vhost port; returns the raw response text.
