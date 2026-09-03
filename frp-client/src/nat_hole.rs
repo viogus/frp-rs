@@ -23,6 +23,19 @@ use frp_core::msg::{self, FrpMessage};
 
 use crate::service::Service;
 
+/// Hole-punch timeout for the XTCP provider from the server's
+/// NatHoleResp.detect_behavior.read_timeout_ms (Go nathole.go:248-250
+/// parity: <= 0 falls back to 5s; the field is i32, so an uncapped value
+/// could pin this provider's punch task for ~24.8 days — capped at
+/// MAX_HOLE_PUNCH_TIMEOUT_MS like the visitor side; Go's analyzer emits
+/// <= ~45s, so legitimate values never hit the cap). Audit R10: pinned.
+fn provider_punch_timeout_ms(read_timeout_ms: i32) -> u64 {
+    (read_timeout_ms.max(0) as u64).clamp(
+        frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS,
+        frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS,
+    )
+}
+
 impl Service {
     /// Handle a NatHoleClient message from the server (XTCP provider side).
     ///
@@ -477,29 +490,12 @@ impl Service {
         info!(proxy_name = %proxy_name, candidate_count = %candidate_addrs.len(), "XTCP provider '{}': received {} candidate addresses from server",
             proxy_name, candidate_addrs.len());
 
-        // Go frp v0.69.1 compat: use ReadTimeoutMs from the server's
-        // NatHoleResp.detect_behavior as the hole-punch timeout, not a
-        // hardcoded 5000ms. The server computes this as max(SendDelayMs) + 5000
-        // (+30000 if listen_random_ports) minus the side's own send_delay.
-        // Default to 5000ms if detect_behavior is not available. Go MakeHole
-        // floors the guard at 5s too: `timeout := 5*time.Second; if
-        // m.DetectBehavior.ReadTimeoutMs > 0 {...}` (pkg/nathole/nathole.go:
-        // 248-250) — a hostile/misbehaving server sending 0 (or a negative)
-        // must not make the punch fail instantly. Capped at
-        // MAX_HOLE_PUNCH_TIMEOUT_MS (60s) exactly like the visitor side
-        // (visitor.rs clamp_hp_timeout, audit round 6d/§7 asymmetry): the
-        // field is i32, so an uncapped value would let a hostile server pin
-        // this provider's punch task for ~24.8 days. Go's analyzer emits
-        // ReadTimeoutMs ≤ ~45s, so legitimate values never hit the cap.
+        // Go nathole.go:248-250 parity + hostile-server cap — see
+        // provider_punch_timeout_ms (audit R10).
         let hole_punch_timeout = resp
             .detect_behavior
             .as_ref()
-            .map(|db| {
-                (db.read_timeout_ms.max(0) as u64).clamp(
-                    frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS,
-                    frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS,
-                )
-            })
+            .map(|db| provider_punch_timeout_ms(db.read_timeout_ms))
             .unwrap_or(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS);
 
         // Spawn hole punch task (don't block control loop)
@@ -1015,5 +1011,48 @@ mod tests {
             .await
             .expect("proxy-token-bound hole punch did not abort after proxy deletion")
             .expect("hole punch task panicked");
+    }
+
+    /// Go nathole.go:248-250 parity + hostile-server cap for the
+    /// provider-side clamp (audit R10 pin; visitor-side clamp already
+    /// pinned in visitor.rs).
+    #[test]
+    fn provider_punch_timeout_ms_go_parity_and_hostile_cap() {
+        // Go nathole.go:248-250: ReadTimeoutMs <= 0 -> 5s fallback.
+        assert_eq!(
+            provider_punch_timeout_ms(0),
+            frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS
+        );
+        assert_eq!(
+            provider_punch_timeout_ms(-1),
+            frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS
+        );
+        assert_eq!(
+            provider_punch_timeout_ms(i32::MIN),
+            frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS
+        );
+        // Sub-5s positive values floor at the 5s guard.
+        assert_eq!(
+            provider_punch_timeout_ms(1),
+            frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS
+        );
+        assert_eq!(
+            provider_punch_timeout_ms(4_999),
+            frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS
+        );
+        // At the cap passes through.
+        assert_eq!(
+            provider_punch_timeout_ms(60_000),
+            frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS
+        );
+        // Hostile server values (i32 max ~24.8 days) cut to 60s.
+        assert_eq!(
+            provider_punch_timeout_ms(60_001),
+            frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS
+        );
+        assert_eq!(
+            provider_punch_timeout_ms(i32::MAX),
+            frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS
+        );
     }
 }

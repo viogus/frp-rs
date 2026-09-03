@@ -1923,23 +1923,32 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                             // wraps the conn and calls
                             // SetRemoteAddr(connInfo.SrcAddr); here the plugin
                             // accept handler looks the real addr up by this
-                            // dial's local ephemeral port.
+                            // dial's local ephemeral port. F5: the returned
+                            // guard removes the registry entry when this task's
+                            // scope ends — normal bridge end, early return, or
+                            // abort (dropping the future drops the guard);
+                            // the accept-handler take consumes the entry long
+                            // before then (the plugin accept fires once the
+                            // listener wakes, while the bridge below is still
+                            // running). The guard MUST bind at this arm scope:
+                            // audit R1 caught a nested binding whose Drop fired
+                            // nanoseconds after insert — the entry was removed
+                            // before the accept handler's 8×1ms plugin_peer_ip
+                            // retry could take it, so every tunneled request
+                            // fell back to X-Forwarded-For: 127.0.0.1.
+                            let mut _plugin_peer_guard: Option<crate::plugin::PluginPeerGuard> =
+                                None;
                             if matches!(info.plugin.as_str(), "https2http" | "https2https") {
                                 if let (Some(src), Some(src_port)) =
                                     (swc.src_addr.as_deref(), swc.src_port)
                                 {
                                     if let Ok(real_ip) = src.parse::<std::net::IpAddr>() {
                                         if let Ok(dialer_local) = local.local_addr() {
-                                            // F5: the returned guard removes the
-                                            // registry entry when this task's
-                                            // scope ends — normal bridge end,
-                                            // early return, or abort (dropping
-                                            // the future drops the guard).
-                                            let _plugin_peer_guard =
-                                                crate::plugin::register_plugin_peer(
+                                            _plugin_peer_guard =
+                                                Some(crate::plugin::register_plugin_peer(
                                                     dialer_local.port(),
                                                     std::net::SocketAddr::new(real_ip, src_port),
-                                                );
+                                                ));
                                         }
                                     }
                                 }
