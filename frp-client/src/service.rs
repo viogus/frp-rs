@@ -3757,16 +3757,15 @@ impl Service {
             let tx = health_tx.clone();
             let hc_url = if hc_type == "http" {
                 let url = p.health_check_url.clone();
-                if !url.is_empty() && !url.contains("://") {
-                    // Go frp compat: auto-construct URL as "http://{local_ip}:{local_port}/{path}"
-                    let host = la.split(':').next().unwrap_or("127.0.0.1");
-                    let port = la.split(':').nth(1).unwrap_or("0");
-                    let path = if url.starts_with('/') {
-                        url.clone()
-                    } else {
-                        format!("/{}", url)
-                    };
-                    format!("http://{}:{}{}", host, port, path)
+                if !url.contains("://") {
+                    // Go frp compat: auto-construct URL as
+                    // "http://{local_ip}:{local_port}/{path}" (Go
+                    // proxy_wrapper.go:125 JoinHostPort + health.go:68-76).
+                    // An empty path config means "/" (Go health.go:68-76
+                    // checks the bare address) — and build_health_check_url
+                    // brackets literal IPv6, where the old split(':') here
+                    // mangled unbracketed "::1:8080" into "http://:/path".
+                    crate::health::build_health_check_url(&la, &url)
                 } else {
                     url
                 }

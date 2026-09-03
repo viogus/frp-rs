@@ -278,6 +278,12 @@ pub(crate) struct WorkConnConfig {
     pub client_auth_scopes: Vec<String>,
     pub server_auth_scopes: Vec<String>,
     pub disable_custom_tls_first_byte: bool,
+    /// Dial-time TCP keepalive interval in seconds (socket-level, forwarded
+    /// to `DialOptions.keepalive_secs` → socket2 SO_KEEPALIVE). This is the
+    /// transport layer Go frp enables on control/work conns; it is NOT the
+    /// UDP work-conn application-level pinger, whose interval is the fixed
+    /// `UDP_WORK_CONN_PING_INTERVAL` (30s Go parity) and never reads this
+    /// field (audit F1).
     pub keepalive_secs: u64,
     pub bind_addr: Option<String>,
     pub proxy_url: String,
@@ -413,6 +419,19 @@ const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// liveness timestamps (kept in sync with `UDP_SESSION_IDLE_TIMEOUT`).
 const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = UDP_SESSION_IDLE_TIMEOUT.as_millis() as u64;
 
+/// Application-level keepalive Ping interval on UDP/SUDP work conns,
+/// FIXED at 30s (audit F1).
+///
+/// Go parity: client/proxy/udp.go heartbeatFn hardcodes 30s and is wired
+/// unconditionally — no config can change it (Go has no per-proxy
+/// transport keepalive knob for this; dial_server_keepalive in frp-rs is a
+/// socket-level SO_KEEPALIVE setting for the control/TCP dials and never
+/// reaches this pinger). The server side relies on it: server/proxy/udp.go
+/// workConnReaderFn sets a 60s per-read deadline on the UDP work conn, so a
+/// configurable (7200s default) interval killed idle conns after 60s — the
+/// Rust server's UDP_WORK_CONN_READ_TIMEOUT is the same 60s.
+const UDP_WORK_CONN_PING_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Current time as u64 epoch milliseconds. The timestamp is only a liveness
 /// signal (all sites use Relaxed stores/loads, no happens-before needed), so
 /// wall-clock rather than monotonic time is fine; saturates to 0 if the
@@ -481,7 +500,38 @@ impl UdpSessionTable {
             .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
             .collect()
     }
+
+    /// Total live sessions across all shards. Cold path — called only when
+    /// creating a NEW remote session, so the 8 lock acquisitions amortize
+    /// over the session's lifetime.
+    fn total_len(&self) -> usize {
+        self.lock_all().iter().map(|m| m.len()).sum()
+    }
+
+    /// True when the per-work-conn session cap is reached (audit F6).
+    fn at_session_cap(&self) -> bool {
+        self.total_len() >= UDP_SESSION_CAP
+    }
 }
+
+/// Per-work-conn cap on concurrent remote-visitor UDP sessions (audit F6).
+///
+/// Deliberate divergence from Go frp, which grows its session map
+/// unboundedly (pkg/proto/udp/udp.go — entries are only ever removed by
+/// the 30s idle reap). Each distinct remote source address costs a bound
+/// local socket (an fd + an ephemeral port), a spawned reader task, a
+/// writer-channel slot, and two map entries (sessions + reader mirror) —
+/// and remote_addr values on the wire are attacker-influenced, so a
+/// spoofing peer could otherwise pin an unbounded number of fds until the
+/// reap frees them. 1024 bounds that exposure at roughly the fd ceiling
+/// the kernel gives a default process while dwarfing any realistic
+/// concurrent-visitor count: a UDP proxy with 1024 ACTIVE remotes has
+/// saturated its local service long before the table becomes the limit.
+/// Refuse-new semantics: an unknown remote arriving at the cap has its
+/// datagram dropped (rate-limited warn); sessions that already exist keep
+/// working until their 30s idle reap frees a slot (Go removes nothing
+/// early either — a session Go would still serve, frp-rs still serves).
+const UDP_SESSION_CAP: usize = 1024;
 
 #[allow(clippy::too_many_arguments)]
 async fn run_udp_session(
@@ -583,6 +633,83 @@ async fn run_udp_session(
 ///   work-conn read loop   -> per-remote socket (keyed by UDPPacket.remote_addr)
 ///   per-remote socket     -> work-conn write loop (mpsc; single writer)
 ///   idle sessions         -> closed after UDP_SESSION_IDLE_TIMEOUT
+/// Resolve the UDP local-service target from its config `host:port` string
+/// (audit F2).
+///
+/// Go parity: the UDP proxy's Run() resolves local_ip via net.ResolveUDPAddr
+/// and rebinds with JoinHostPort (client/proxy/udp.go:62-65) — a full DNS
+/// lookup when local_ip is a hostname, a plain parse when it is an IP
+/// literal. frp-rs configs carry the already-joined `host:port` string:
+/// the fast path is a SocketAddr parse; on failure the LAST-colon split
+/// isolates a numeric port so UNBRACKETED IPv6 (`"::1:8080"`) and hostnames
+/// (`"db.internal:5300"`) both resolve. IP literals never hit DNS
+/// (tokio lookup_host parses them as IpAddr first — same as Go, which
+/// resolves IP literals without querying DNS).
+async fn resolve_udp_local_addr(local_addr_str: &str, proxy_name: &str) -> Option<SocketAddr> {
+    if let Ok(sa) = local_addr_str.parse::<SocketAddr>() {
+        return Some(sa);
+    }
+    let (host, port) = match local_addr_str.rsplit_once(':') {
+        Some(pair) => pair,
+        None => {
+            warn!(proxy_name = %proxy_name, local_addr = %local_addr_str,
+                "UDP work conn '{}': invalid local_addr '{}': no ':' separator", proxy_name, local_addr_str);
+            return None;
+        }
+    };
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        warn!(proxy_name = %proxy_name, local_addr = %local_addr_str,
+            "UDP work conn '{}': invalid local_addr '{}': malformed host or port", proxy_name, local_addr_str);
+        return None;
+    }
+    // The host half of a ':'-bearing string must itself be a valid IPv6
+    // literal (bare "::1" without a port splits into host ":" → rejected).
+    if host.contains(':') && host.parse::<IpAddr>().is_err() {
+        warn!(proxy_name = %proxy_name, local_addr = %local_addr_str,
+            "UDP work conn '{}': invalid local_addr '{}': malformed IPv6 host", proxy_name, local_addr_str);
+        return None;
+    }
+    let port: u16 = match port.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!(proxy_name = %proxy_name, local_addr = %local_addr_str,
+                "UDP work conn '{}': invalid local_addr '{}': port out of range", proxy_name, local_addr_str);
+            return None;
+        }
+    };
+    let host_owned = host.to_string();
+    // Bind the lookup iterator to a local: it borrows host_owned, and a
+    // tail-expression temporary would outlive the local (E0597).
+    let mut lookup = match tokio::net::lookup_host((host_owned.as_str(), port)).await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            warn!(proxy_name = %proxy_name, local_addr = %local_addr_str, error = %e,
+                "UDP work conn '{}': local_addr '{}' failed to resolve: {}", proxy_name, local_addr_str, e);
+            return None;
+        }
+    };
+    match lookup.next() {
+        Some(sa) => Some(sa),
+        None => {
+            warn!(proxy_name = %proxy_name, local_addr = %local_addr_str,
+                "UDP work conn '{}': local_addr '{}' resolved to no addresses", proxy_name, local_addr_str);
+            None
+        }
+    }
+}
+
+/// msg::UdpAddr for a resolved local SocketAddr — the value Go sends as
+/// UDPPacket.LocalAddr: the real bound socket's address (resolved, so a
+/// hostname local_ip arrives here already canonical — never the raw config
+/// string, which would fail UdpAddr::from_string for hostnames).
+fn udp_addr_of(sa: &SocketAddr) -> msg::UdpAddr {
+    msg::UdpAddr {
+        ip: sa.ip().to_string(),
+        port: sa.port(),
+        zone: String::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_udp_work_conn(
     work: IoStream,
@@ -595,9 +722,6 @@ async fn run_udp_work_conn(
     session_alive: Arc<AtomicBool>,
     udp_packet_size: usize,
     proxy_protocol_version: String,
-    // Application-level keepalive Ping interval in seconds (transport
-    // keepalive config; 0 = keep the built-in 30s default).
-    udp_keepalive_secs: u64,
     // Per-proxy SHARED bandwidth limiter (Go frp v0.71.0 `BaseProxy.limiter`
     // parity — one bucket covers both directions and all concurrent
     // connections). None when the server owns the limiting or no rate set.
@@ -608,11 +732,10 @@ async fn run_udp_work_conn(
     // When set on a V2 work conn, UDPPacket frames use the binary codec.
     udp_packet_codec: String,
 ) {
-    let local_addr = match local_addr_str.parse::<SocketAddr>() {
-        Ok(a) => a,
-        Err(e) => {
-            warn!(proxy_name = %proxy_name, local_addr = %local_addr_str, error = %e,
-                "UDP work conn '{}': invalid local_addr '{}': {}", proxy_name, local_addr_str, e);
+    let local_addr = match resolve_udp_local_addr(&local_addr_str, &proxy_name).await {
+        Some(a) => a,
+        None => {
+            // Already warned with the reason by the resolver.
             return;
         }
     };
@@ -667,7 +790,6 @@ async fn run_udp_work_conn(
     // ---- Reader: work conn -> per-remote sockets ----
     let pn_r = proxy_name.clone();
     let session_alive_r = session_alive.clone();
-    let local_addr_str_r = local_addr_str.clone();
     let mut reader_cancel = cancel_rx.clone();
     let reader_udp_codec = udp_packet_codec.clone();
     let reader_lim = bw_limiter.clone();
@@ -685,6 +807,8 @@ async fn run_udp_work_conn(
         // remote misses the shared map, re-creates the session, and replaces
         // the entry.
         let mut reader_socks: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
+        // F6: rate-limiter for the session-cap warning (one per 5s).
+        let mut last_cap_warn: Option<tokio::time::Instant> = None;
         // Reusable payload buffer for the V2 UDP read path (avoids a heap
         // alloc per UDP packet).
         let mut read_scratch: Vec<u8> = Vec::new();
@@ -759,6 +883,25 @@ async fn run_udp_work_conn(
                             let (sock, first_packet) = match entry {
                                 (Some(sock), first_packet) => (sock, first_packet),
                                 (None, _) => {
+                                    // F6: refuse NEW remotes once the
+                                    // per-work-conn session cap is reached.
+                                    // Unknown remotes drop their datagram
+                                    // (warn throttled to one per 5s); known
+                                    // remotes never reach this arm. A reaped
+                                    // session's slot is freed by the next
+                                    // create. See UDP_SESSION_CAP.
+                                    if sessions.at_session_cap() {
+                                        let now = tokio::time::Instant::now();
+                                        if last_cap_warn
+                                            .is_none_or(|t| now.duration_since(t) > Duration::from_secs(5))
+                                        {
+                                            warn!(proxy_name = %pn_r, cap = %UDP_SESSION_CAP, remote = %remote,
+                                                "UDP '{}': session cap {} reached; dropping datagram from new remote {}",
+                                                pn_r, UDP_SESSION_CAP, remote);
+                                            last_cap_warn = Some(now);
+                                        }
+                                        continue;
+                                    }
                                     let bind = SocketAddr::new(local_addr.ip(), 0);
                                     let sock = match UdpSocket::bind(bind).await {
                                         Ok(s) => s,
@@ -859,7 +1002,12 @@ async fn run_udp_work_conn(
                                 if let Ok(header) =
                                     frp_core::proxy_protocol::build_proxy_protocol_header(
                                         &remote.ip().to_string(),
-                                        local_addr_str_r.split(':').next().unwrap_or("127.0.0.1"),
+                                        // Local service address as an IP string.
+                                        // The old `split(':').next()` on the raw
+                                        // config string mis-split hostnames and
+                                        // IPv6 (F2): the resolved socket addr is
+                                        // always canonical.
+                                        &local_addr.ip().to_string(),
                                         remote.port(),
                                         local_addr.port(),
                                         &proxy_protocol_version,
@@ -943,13 +1091,13 @@ async fn run_udp_work_conn(
         // Each packet brings its own Vec by move (round-17 audit B); the slot
         // is (re)assigned before every use, so no initializer is needed.
         let mut payload: Vec<u8>;
-        // local_addr is loop-invariant (already parsed to a SocketAddr at
+        // local_addr is loop-invariant (already resolved to a SocketAddr at
         // startup); pre-build the UdpAddr once and move it in/out per packet
-        // instead of re-parsing the string every packet (audit D1-5). An
-        // invalid local_addr is a recoverable config error (warned at
-        // startup, run_udp_work_conn continues) — degrade to None (the old
-        // per-packet from_string would return None too), never panic.
-        let mut local_udp_addr: Option<msg::UdpAddr> = msg::UdpAddr::from_string(&local_addr_str);
+        // instead of re-formatting every packet (audit D1-5). The value is
+        // built from the RESOLVED socket addr (F2) — the raw config string
+        // would fail UdpAddr::from_string for hostnames and unbracketed
+        // IPv6, and Go sends the real bound address (resolved, canonical).
+        let mut local_udp_addr: Option<msg::UdpAddr> = Some(udp_addr_of(&local_addr));
         // Ping-pong scratch for the per-packet compress chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
         // Reused binary-codec wire buffer: type ID + encoded packet.
@@ -964,12 +1112,14 @@ async fn run_udp_work_conn(
         // not grow this unboundedly — clear on overflow (cheap fail-safe;
         // the cache is a perf aid, not state).
         let mut ip_cache: HashMap<SocketAddr, String> = HashMap::new();
-        let mut keepalive = tokio::time::interval(Duration::from_secs(if udp_keepalive_secs > 0 {
-            udp_keepalive_secs
-        } else {
-            // Config not set (0): keep the long-standing 30s default.
-            30
-        }));
+        // Application-level keepalive Ping, FIXED at 30s (audit F1): Go
+        // frp's UDP heartbeatFn hardcodes 30s with no config knob, and the
+        // server enforces a 60s per-read deadline on the work conn. This
+        // interval deliberately never reads any config (the old wiring to
+        // dial_server_keepalive — default 7200s — let idle UDP conns hit the
+        // server's 60s read deadline and die); dial_server_keepalive remains
+        // the socket-level TCP keepalive for the dial phase only.
+        let mut keepalive = tokio::time::interval(UDP_WORK_CONN_PING_INTERVAL);
         keepalive.tick().await;
         loop {
             tokio::select! {
@@ -1000,7 +1150,7 @@ async fn run_udp_work_conn(
                         local_addr: local_udp_addr.take().or_else(|| {
                             // Unreachable after the first packet (returned
                             // below); defensive fallback.
-                            msg::UdpAddr::from_string(&local_addr_str)
+                            Some(udp_addr_of(&local_addr))
                         }),
                         remote_addr: Some(msg::UdpAddr {
                             ip: match ip_cache.get(&remote) {
@@ -1751,7 +1901,6 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                         session_alive.clone(),
                         udp_packet_size,
                         info.proxy_protocol_version.clone(),
-                        cfg.keepalive_secs,
                         info.bandwidth_limiter.clone(),
                         udp_packet_codec.clone(),
                     )
@@ -1781,10 +1930,16 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                                 {
                                     if let Ok(real_ip) = src.parse::<std::net::IpAddr>() {
                                         if let Ok(dialer_local) = local.local_addr() {
-                                            crate::plugin::register_plugin_peer(
-                                                dialer_local.port(),
-                                                std::net::SocketAddr::new(real_ip, src_port),
-                                            );
+                                            // F5: the returned guard removes the
+                                            // registry entry when this task's
+                                            // scope ends — normal bridge end,
+                                            // early return, or abort (dropping
+                                            // the future drops the guard).
+                                            let _plugin_peer_guard =
+                                                crate::plugin::register_plugin_peer(
+                                                    dialer_local.port(),
+                                                    std::net::SocketAddr::new(real_ip, src_port),
+                                                );
                                         }
                                     }
                                 }
@@ -1904,6 +2059,106 @@ mod tests {
             "Go parity: 30s idle eviction (was 60s)"
         );
         assert_eq!(UDP_SESSION_IDLE_TIMEOUT_MS, 30_000);
+    }
+
+    /// F1 pin: the UDP work-conn keepalive pinger is FIXED at 30s — Go frp's
+    /// UDP heartbeatFn hardcodes 30s with no config knob
+    /// (client/proxy/udp.go:150-165), and the server's UDP work-conn read
+    /// deadline is 60s (server/proxy/udp.go:116-119), so a longer interval
+    /// lets the server kill an idle conn. The old wiring to
+    /// dial_server_keepalive (default 7200s) is gone; the constant IS the
+    /// parity contract — pin it so any change is deliberate.
+    #[test]
+    fn udp_work_conn_ping_interval_is_go_parity_fixed_30s() {
+        assert_eq!(
+            UDP_WORK_CONN_PING_INTERVAL,
+            Duration::from_secs(30),
+            "Go parity: fixed 30s heartbeat, no config knob"
+        );
+    }
+
+    /// F6 pin: the per-work-conn session cap sits in the audit-specified
+    /// 256..=1024 band and starts empty.
+    #[test]
+    fn udp_session_cap_bounds_table() {
+        assert!(
+            (256..=1024).contains(&UDP_SESSION_CAP),
+            "cap {} outside the specified 256..=1024 band",
+            UDP_SESSION_CAP
+        );
+        let table = UdpSessionTable::new();
+        assert_eq!(table.total_len(), 0);
+        assert!(!table.at_session_cap());
+    }
+
+    /// F6 pin: refuse-new semantics — at the cap, a table that frees one
+    /// slot (30s idle reap) admits new remotes again.
+    #[tokio::test]
+    async fn udp_session_cap_refuses_new_remotes_at_cap() {
+        let table = UdpSessionTable::new();
+        // One real socket is shared by every fake entry (1024 real binds
+        // would exhaust fds); the entries never send on it.
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let last_active = Arc::new(AtomicU64::new(now_epoch_ms()));
+        for i in 0..UDP_SESSION_CAP {
+            let remote = SocketAddr::from(([203, 0, 113, 1], 1000 + i as u16));
+            table.shard(&remote).insert(
+                remote,
+                UdpSession {
+                    socket: sock.clone(),
+                    last_active: last_active.clone(),
+                    first_packet: false,
+                },
+            );
+        }
+        assert!(table.at_session_cap());
+        assert_eq!(table.total_len(), UDP_SESSION_CAP);
+        // A session freed by the idle reap makes room again (the reader's
+        // create path checks at_session_cap before binding).
+        let victim = SocketAddr::from(([203, 0, 113, 1], 1000));
+        table.shard(&victim).remove(&victim);
+        assert_eq!(table.total_len(), UDP_SESSION_CAP - 1);
+        assert!(!table.at_session_cap());
+    }
+
+    /// F2 pin: the UDP local-service target resolver accepts every local_ip
+    /// shape — plain IP, bracketed IPv6, UNBRACKETED IPv6 (the old
+    /// parse::<SocketAddr> rejected it and killed the work conn), and
+    /// hostnames (Go net.ResolveUDPAddr parity). IP literals never hit DNS.
+    #[tokio::test]
+    async fn udp_resolve_local_addr_accepts_all_shapes() {
+        // Canonical IPv4: pure parse.
+        let sa = resolve_udp_local_addr("127.0.0.1:8080", "p").await.unwrap();
+        assert_eq!(sa, SocketAddr::from(([127, 0, 0, 1], 8080)));
+        // Bracketed IPv6: pure parse.
+        let sa = resolve_udp_local_addr("[::1]:8080", "p").await.unwrap();
+        assert_eq!(sa, SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 8080)));
+        // F2 headline: UNBRACKETED IPv6 — last-colon split keeps the v6
+        // segments in the host; literal parse, no DNS.
+        let sa = resolve_udp_local_addr("::1:8080", "p").await.unwrap();
+        assert_eq!(sa, SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 8080)));
+        // Hostname: DNS resolution (localhost resolves without a resolver).
+        let sa = resolve_udp_local_addr("localhost:9", "p").await.unwrap();
+        assert_eq!(sa.port(), 9);
+        assert!(sa.ip().is_loopback());
+    }
+
+    /// F2 pin: malformed local_addr shapes are rejected with a warn, not a
+    /// panic or a bogus bind.
+    #[tokio::test]
+    async fn udp_resolve_local_addr_rejects_garbage() {
+        assert!(resolve_udp_local_addr("", "p").await.is_none());
+        assert!(resolve_udp_local_addr("127.0.0.1", "p").await.is_none()); // no port
+        assert!(resolve_udp_local_addr("::1", "p").await.is_none()); // v6 without port
+        assert!(resolve_udp_local_addr("host:notaport", "p").await.is_none());
+        assert!(resolve_udp_local_addr(":8080", "p").await.is_none()); // empty host
+                                                                       // The resolved value is what the wire carries (Go sends the real
+                                                                       // bound address — never the raw config string).
+        let sa = SocketAddr::from(([127, 0, 0, 1], 8080));
+        let addr = udp_addr_of(&sa);
+        assert_eq!(addr.ip, "127.0.0.1");
+        assert_eq!(addr.port, 8080);
+        assert_eq!(addr.zone, "");
     }
 
     async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
@@ -2037,7 +2292,6 @@ mod tests {
             session_alive,
             65535,
             String::new(),
-            0,
             None,
             String::new(),
         ));
@@ -2073,7 +2327,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             65535,
             String::new(),
-            0,
             None,
             String::new(),
         ));
@@ -2121,7 +2374,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             65535,
             String::new(),
-            0,
             None,
             String::new(),
         ));
@@ -2184,7 +2436,6 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             65535,
             String::new(),
-            0,
             None,
             String::new(),
         ));

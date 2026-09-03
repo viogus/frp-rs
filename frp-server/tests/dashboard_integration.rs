@@ -83,7 +83,11 @@ async fn test_dashboard_status() {
     assert_eq!(json["proxy_count"].as_u64().unwrap(), 0);
 }
 
-/// GET /api/serverinfo is Go frp compat alias for /api/status
+/// GET /api/serverinfo serves the Go `model.ServerInfoResp` shape
+/// (frp v0.71.0 server/http/model/types.go:21-40): camelCase keys, all
+/// non-omitempty keys always present with zero values included, and
+/// `allowPortsStr`/`tlsForce` omitted per Go's omitempty tags. The
+/// Rust-native payload lives on /api/status (test_dashboard_status).
 #[tokio::test]
 async fn test_dashboard_serverinfo() {
     let bind_port = common::allocate_port();
@@ -100,7 +104,58 @@ async fn test_dashboard_serverinfo() {
     assert_eq!(resp.status(), 200);
 
     let json: serde_json::Value = resp.json().await.unwrap();
-    assert!(json.get("version").is_some());
+    // Full Go key set, correct camelCase names.
+    for key in [
+        "version",
+        "bindPort",
+        "vhostHTTPPort",
+        "vhostHTTPSPort",
+        "tcpmuxHTTPConnectPort",
+        "kcpBindPort",
+        "quicBindPort",
+        "subdomainHost",
+        "maxPoolCount",
+        "maxPortsPerClient",
+        "heartbeatTimeout",
+        "totalTrafficIn",
+        "totalTrafficOut",
+        "curConns",
+        "clientCounts",
+        "proxyTypeCount",
+    ] {
+        assert!(json.get(key).is_some(), "missing Go key {key}");
+    }
+    // No Rust-native /api/status keys may leak into the Go-shaped payload.
+    for key in ["uptime_secs", "client_count", "proxy_count", "pool_hits"] {
+        assert!(json.get(key).is_none(), "Rust-native key {key} leaked");
+    }
+    // Go omitempty on a default server: allowPortsStr empty, tlsForce false.
+    assert!(
+        json.get("allowPortsStr").is_none(),
+        "empty allowPortsStr must be omitted"
+    );
+    assert!(
+        json.get("tlsForce").is_none(),
+        "false tlsForce must be omitted"
+    );
+
+    // base_config leaves every listener off except bind_port.
+    assert_eq!(json["version"].as_str().unwrap(), frp_core::VERSION);
+    assert_eq!(json["bindPort"].as_u64().unwrap(), u64::from(bind_port));
+    assert_eq!(json["vhostHTTPPort"].as_u64().unwrap(), 0);
+    assert_eq!(json["vhostHTTPSPort"].as_u64().unwrap(), 0);
+    assert_eq!(json["tcpmuxHTTPConnectPort"].as_u64().unwrap(), 0);
+    assert_eq!(json["subdomainHost"].as_str().unwrap(), "");
+    // Live state on a fresh server: no clients, no proxies, no traffic.
+    assert_eq!(json["clientCounts"].as_u64().unwrap(), 0);
+    assert_eq!(json["totalTrafficIn"].as_u64().unwrap(), 0);
+    assert_eq!(json["totalTrafficOut"].as_u64().unwrap(), 0);
+    assert_eq!(json["curConns"].as_u64().unwrap(), 0);
+    assert_eq!(
+        json["proxyTypeCount"].as_object().unwrap().len(),
+        0,
+        "no proxies registered"
+    );
 }
 
 /// GET /api/proxies lists proxies (empty on fresh start)

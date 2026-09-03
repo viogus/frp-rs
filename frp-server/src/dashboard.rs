@@ -221,6 +221,61 @@ struct StatusResponse {
     pool_pending: i64,
 }
 
+/// Go `model.ServerInfoResp` (frp v0.71.0 `server/http/model/types.go:21-40`)
+/// — served on GET /api/serverinfo for Go-frp-shaped consumers (the Go
+/// dashboard frontend, scripts, tooling). Distinct from the Rust-native
+/// [`StatusResponse`] on GET /api/status (frp-rs dashboard UI payload).
+///
+/// Field order, JSON names and omitempty rules mirror the Go struct exactly:
+/// `allowPortsStr` is omitted when empty and `tlsForce` when false (Go
+/// `json:"allowPortsStr,omitempty"` / `json:"tlsForce,omitempty"`); every
+/// other key is always present, zero values included.
+#[derive(Serialize)]
+struct ServerInfoResp {
+    version: String,
+    #[serde(rename = "bindPort")]
+    bind_port: u16,
+    #[serde(rename = "vhostHTTPPort")]
+    vhost_http_port: u16,
+    #[serde(rename = "vhostHTTPSPort")]
+    vhost_https_port: u16,
+    #[serde(rename = "tcpmuxHTTPConnectPort")]
+    tcpmux_httpconnect_port: u16,
+    #[cfg(feature = "kcp")]
+    #[serde(rename = "kcpBindPort")]
+    kcp_bind_port: u16,
+    #[cfg(feature = "quic")]
+    #[serde(rename = "quicBindPort")]
+    quic_bind_port: u16,
+    #[serde(rename = "subdomainHost")]
+    subdomain_host: String,
+    #[serde(rename = "maxPoolCount")]
+    max_pool_count: i64,
+    #[serde(rename = "maxPortsPerClient")]
+    max_ports_per_client: i64,
+    #[serde(rename = "heartbeatTimeout")]
+    heartbeat_timeout: i64,
+    #[serde(rename = "allowPortsStr", skip_serializing_if = "String::is_empty")]
+    allow_ports_str: String,
+    #[serde(rename = "tlsForce", skip_serializing_if = "is_false")]
+    tls_force: bool,
+    #[serde(rename = "totalTrafficIn")]
+    total_traffic_in: i64,
+    #[serde(rename = "totalTrafficOut")]
+    total_traffic_out: i64,
+    #[serde(rename = "curConns")]
+    cur_conns: i64,
+    #[serde(rename = "clientCounts")]
+    client_counts: i64,
+    #[serde(rename = "proxyTypeCount")]
+    proxy_type_counts: HashMap<String, i64>,
+}
+
+/// `skip_serializing_if` helper mirroring Go's `json:"tlsForce,omitempty"`.
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 #[derive(Serialize)]
 struct ProxyEntry {
     name: String,
@@ -315,8 +370,9 @@ struct ClientDetail {
 
 // --- Handlers ---
 
-/// Build the shared status payload for `/api/status` and its Go-frp-compat
-/// alias `/api/serverinfo`.
+/// Build the Rust-native status payload for `/api/status` (consumed by the
+/// frp-rs dashboard page). The Go-frp-compat `/api/serverinfo` route serves
+/// the Go-shaped [`ServerInfoResp`] instead — see `build_serverinfo`.
 async fn build_status_response(state: &Arc<AppState>) -> StatusResponse {
     let uptime = state.dashboard_start.elapsed().as_secs();
     let client_count = state.run_id_to_ctl_tx.len();
@@ -350,9 +406,71 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusRespons
     Json(build_status_response(&state).await)
 }
 
-/// GET /api/serverinfo — Go frp compat alias for /api/status.
-async fn handle_serverinfo(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
-    Json(build_status_response(&state).await)
+/// Build the Go `model.ServerInfoResp` payload for GET /api/serverinfo.
+///
+/// Config fields mirror Go `buildServerInfoResp`
+/// (`server/http/controller.go:66`, reading `serverCfg`): frp-rs reads the
+/// immutable `ServerConfigSnapshot` — the same source as the v2
+/// `/api/v2/system/info` config section. Live counters mirror Go
+/// `mem.ServerStats` (`pkg/metrics/mem/server.go:141-158`): traffic totals
+/// are per-proxy today-bytes (`TrafficHistory[0]`; Go's `DateCounter.
+/// TodayCount()` — NOT lifetime totals), `curConns` / `clientCounts` are
+/// live gauges, `proxyTypeCount` is a per-type live count of registered
+/// proxies (Go `NewProxy`/`CloseProxy` counters; frp-rs counts the
+/// `proxy_manager` list the same way).
+///
+/// Known divergence (shared with `/api/v2/system/info`): proxy metrics are
+/// dropped when a proxy closes (`ProxyMetricsRegistry::remove`), so traffic
+/// from proxies closed earlier today is not carried in the totals the way
+/// Go's server-global counter carries it.
+async fn build_serverinfo(state: &Arc<AppState>) -> ServerInfoResp {
+    let snap = &state.server_config_snapshot;
+    let client_counts = state.run_id_to_ctl_tx.len() as i64;
+
+    let mut proxy_type_counts: HashMap<String, i64> = HashMap::new();
+    let mut total_traffic_in: i64 = 0;
+    let mut total_traffic_out: i64 = 0;
+    let mut cur_conns: i64 = 0;
+    for p in state.proxy_manager.list().await {
+        *proxy_type_counts.entry(p.proxy_type.clone()).or_insert(0) += 1;
+        if let Some(m) = state.proxy_metrics.get(&p.name).await {
+            let (tin, tout) = m.daily.snapshot();
+            total_traffic_in += tin[0] as i64;
+            total_traffic_out += tout[0] as i64;
+            cur_conns += m.snapshot().current_conns;
+        }
+    }
+
+    ServerInfoResp {
+        version: frp_core::VERSION.to_string(),
+        bind_port: snap.bind_port,
+        vhost_http_port: snap.vhost_http_port,
+        vhost_https_port: snap.vhost_https_port,
+        tcpmux_httpconnect_port: snap.tcpmux_httpconnect_port,
+        #[cfg(feature = "kcp")]
+        kcp_bind_port: snap.kcp_bind_port,
+        #[cfg(feature = "quic")]
+        quic_bind_port: snap.quic_bind_port,
+        subdomain_host: snap.subdomain_host.clone(),
+        max_pool_count: snap.max_pool_count,
+        max_ports_per_client: snap.max_ports_per_client,
+        heartbeat_timeout: snap.heartbeat_timeout,
+        allow_ports_str: snap.allow_ports_str.clone(),
+        tls_force: snap.tls_force,
+        total_traffic_in,
+        total_traffic_out,
+        cur_conns,
+        client_counts,
+        proxy_type_counts,
+    }
+}
+
+/// GET /api/serverinfo — Go frp v0.71.0 `model.ServerInfoResp` in camelCase
+/// (see `server/http/model/types.go:21-40`). Go-shaped consumers (the Go v1
+/// dashboard frontend, scripts, tooling) fetch these keys. The Rust-native
+/// frp-rs status payload stays on GET /api/status.
+async fn handle_serverinfo(State(state): State<Arc<AppState>>) -> Json<ServerInfoResp> {
+    Json(build_serverinfo(&state).await)
 }
 
 /// GET /api/proxies — list all proxies, optional ?type= filter.
@@ -2700,6 +2818,111 @@ mod v2 {
                 Err(e) => e,
                 Ok(_) => panic!("{msg}"),
             }
+        }
+
+        /// GET /api/serverinfo serves the Go `model.ServerInfoResp` shape —
+        /// camelCase keys, all non-omitempty keys always present, zero
+        /// values included; `allowPortsStr`/`tlsForce` follow Go's
+        /// omitempty rules. The Rust-native keys stay on /api/status.
+        #[tokio::test]
+        async fn test_serverinfo_go_shape() {
+            let state = test_state();
+            let resp = handle_serverinfo(State(state.clone())).await;
+            let obj = serde_json::to_value(&resp.0).unwrap();
+            let obj = obj.as_object().unwrap();
+
+            // Full Go key set, correct camelCase names (types.go:21-40).
+            for key in [
+                "version",
+                "bindPort",
+                "vhostHTTPPort",
+                "vhostHTTPSPort",
+                "tcpmuxHTTPConnectPort",
+                "kcpBindPort",
+                "quicBindPort",
+                "subdomainHost",
+                "maxPoolCount",
+                "maxPortsPerClient",
+                "heartbeatTimeout",
+                "totalTrafficIn",
+                "totalTrafficOut",
+                "curConns",
+                "clientCounts",
+                "proxyTypeCount",
+            ] {
+                assert!(obj.contains_key(key), "missing Go key {key}");
+            }
+            // No Rust-native status keys may leak into the Go-shaped payload.
+            for key in ["uptime_secs", "client_count", "proxy_count", "pool_hits"] {
+                assert!(!obj.contains_key(key), "Rust-native key {key} leaked");
+            }
+            // Go omitempty: allowPortsStr empty and tlsForce false are absent
+            // on a default server.
+            assert!(
+                obj.get("allowPortsStr").is_none(),
+                "empty allowPortsStr must be omitted"
+            );
+            assert!(
+                obj.get("tlsForce").is_none(),
+                "false tlsForce must be omitted"
+            );
+
+            // Zero-value rules + defaults of the test_state config.
+            assert_eq!(obj["version"], frp_core::VERSION);
+            assert_eq!(obj["bindPort"], 7000, "default bind port");
+            assert_eq!(obj["vhostHTTPPort"], 0);
+            assert_eq!(obj["vhostHTTPSPort"], 0);
+            assert_eq!(obj["tcpmuxHTTPConnectPort"], 0);
+            assert_eq!(obj["subdomainHost"], "");
+            assert_eq!(obj["maxPoolCount"], 5, "transport max pool default");
+            assert_eq!(obj["heartbeatTimeout"], 90, "heartbeat timeout default");
+            assert_eq!(obj["clientCounts"], 0);
+            assert_eq!(obj["totalTrafficIn"], 0);
+            assert_eq!(obj["totalTrafficOut"], 0);
+            assert_eq!(obj["curConns"], 0);
+            assert_eq!(
+                obj["proxyTypeCount"].as_object().unwrap().len(),
+                0,
+                "no proxies registered"
+            );
+
+            // Live-state semantics: per-type counts from registered proxies,
+            // traffic totals = today bytes (Go DateCounter TodayCount),
+            // curConns = live open-connection gauge.
+            state
+                .proxy_manager
+                .register("run-1".into(), proxy_info("p1", "tcp"))
+                .await
+                .unwrap();
+            state
+                .proxy_manager
+                .register("run-2".into(), proxy_info("p2", "udp"))
+                .await
+                .unwrap();
+            let m1 = state.proxy_metrics.get_or_create("p1").await;
+            m1.record_traffic(1000, 2000);
+            m1.current_conns.fetch_add(3, Ordering::Relaxed);
+            let m2 = state.proxy_metrics.get_or_create("p2").await;
+            m2.record_traffic(3000, 4000);
+            m2.current_conns.fetch_add(1, Ordering::Relaxed);
+
+            let resp = handle_serverinfo(State(state)).await;
+            let obj = serde_json::to_value(&resp.0).unwrap();
+            let obj = obj.as_object().unwrap();
+            let types = obj["proxyTypeCount"].as_object().unwrap();
+            assert_eq!(types.len(), 2);
+            assert_eq!(types["tcp"], 1);
+            assert_eq!(types["udp"], 1);
+            assert_eq!(
+                obj["totalTrafficIn"], 4000,
+                "today-bytes sum across proxies"
+            );
+            assert_eq!(obj["totalTrafficOut"], 6000);
+            assert_eq!(obj["curConns"], 4);
+            assert_eq!(
+                obj["clientCounts"], 0,
+                "no control connections in test state"
+            );
         }
 
         #[tokio::test]

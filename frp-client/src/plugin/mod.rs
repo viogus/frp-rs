@@ -87,15 +87,63 @@ fn real_tunnel_peer_map() -> &'static std::sync::Mutex<std::collections::HashMap
     REAL_TUNNEL_PEER.get_or_init(Default::default)
 }
 
+/// RAII handle for a REAL_TUNNEL_PEER entry (audit F5). The work-conn task
+/// holds it for as long as its bridged connection could still be consumed
+/// by the plugin's accept handler; the `Drop` removes the entry on EVERY
+/// exit path — normal bridge end, early return, and tokio abort (aborting
+/// the task drops its future, which drops the guard). Without it, entries
+/// survived their connection: a leaked registry entry keyed by an ephemeral
+/// port is stale forever, and when the OS later recycles that port for an
+/// UNRELATED dial the stale entry misattributes that connection's
+/// X-Forwarded-For (the take-once consume would fire on the wrong conn).
+pub(crate) struct PluginPeerGuard {
+    dialer_port: u16,
+    real_peer: SocketAddr,
+}
+
+impl Drop for PluginPeerGuard {
+    fn drop(&mut self) {
+        // Remove only when the entry is still the one THIS guard registered
+        // (newest-registration-wins): a guard from a superseded registration
+        // must not delete its successor's live entry.
+        let mut map = real_tunnel_peer_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.get(&self.dialer_port) == Some(&self.real_peer) {
+            map.remove(&self.dialer_port);
+        }
+    }
+}
+
 /// Register the real tunnel peer for one plugin connection, keyed by the
 /// work-conn dialer's local ephemeral port (kernel-assigned, unique per
 /// concurrent dial). Called right after the dial succeeds; the accept
-/// handler for that connection consumes the entry.
-pub(crate) fn register_plugin_peer(dialer_port: u16, real_peer: SocketAddr) {
+/// handler for that connection consumes the entry. Returns a guard whose
+/// Drop removes the entry (see PluginPeerGuard).
+pub(crate) fn register_plugin_peer(dialer_port: u16, real_peer: SocketAddr) -> PluginPeerGuard {
     real_tunnel_peer_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(dialer_port, real_peer);
+    PluginPeerGuard {
+        dialer_port,
+        real_peer,
+    }
+}
+
+/// Wholesale clear of every registry entry. Called by serve_plugin teardown
+/// (audit F5): the listener has just aborted and drained every handler that
+/// could consume entries, so any survivors are leaks from connections whose
+/// work-conn task ended abnormally WITHOUT its guard running (defense in
+/// depth — the guard covers the normal paths). Clearing is safe even if a
+/// handler is somehow still mid-flight: an entry cleared under it degrades
+/// that one connection to the loopback peer fallback, the status quo
+/// before the registry existed.
+pub(crate) fn clear_plugin_peers() {
+    real_tunnel_peer_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Resolve the real tunnel peer for an accepted plugin connection. The
@@ -196,6 +244,14 @@ where
         // port is never left half-served after the handle is dropped.
         handlers.abort_all();
         while handlers.join_next().await.is_some() {}
+        // Audit F5: every handler that could consume a REAL_TUNNEL_PEER
+        // entry is now gone, so sweep whatever the guards left behind
+        // (connections whose work-conn task died without dropping its
+        // guard). Entries are keyed by ephemeral ports that outlive this
+        // listener, so a survivor would misattribute X-Forwarded-For on
+        // port recycling. Benign worst case: an in-flight entry cleared
+        // here degrades that conn to the loopback peer fallback.
+        clear_plugin_peers();
     });
 
     Ok(PluginHandle {
@@ -1114,22 +1170,77 @@ mod tests {
     #[test]
     fn real_tunnel_peer_registry_take_once() {
         let dialer = SocketAddr::from(([127, 0, 0, 1], 44444));
-        // Take-once: the accept handler consumes the entry.
-        register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 7], 5555)));
+        // The guard keeps the entry alive for its registration's lifetime
+        // (F5). Take-once: the accept handler consumes the entry.
+        let _g1 = register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 7], 5555)));
         assert_eq!(
             plugin_peer_ip_now(dialer),
             std::net::IpAddr::V4("203.0.113.7".parse().unwrap())
         );
         assert_eq!(take_plugin_peer(dialer.port()), None);
         // Overwrite on dialer-port reuse (kernel ephemeral recycle).
-        register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 8], 5556)));
-        register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 9], 5557)));
+        let _g2 = register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 8], 5556)));
+        let _g3 = register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 9], 5557)));
         assert_eq!(
             plugin_peer_ip_now(dialer),
             std::net::IpAddr::V4("203.0.113.9".parse().unwrap())
         );
         // Unknown port → miss (health-check/stray dials fall back to peer.ip()).
         assert_eq!(take_plugin_peer(1), None);
+    }
+
+    /// F5 pin: a dropped guard removes its own registry entry, so every
+    /// work-conn exit path (normal end, early return, abort) cleans up.
+    #[test]
+    fn plugin_peer_guard_drop_removes_entry() {
+        let dialer = SocketAddr::from(([127, 0, 0, 1], 44445));
+        let real = SocketAddr::from(([203, 0, 113, 7], 5555));
+        let guard = register_plugin_peer(dialer.port(), real);
+        assert_eq!(take_plugin_peer(dialer.port()), Some(real));
+        // Consumed entries are gone; dropping the guard is a no-op.
+        drop(guard);
+        assert_eq!(take_plugin_peer(dialer.port()), None);
+
+        // Un-consumed entry: the guard drop removes it (the work-conn task
+        // ended before the accept handler ran).
+        let guard = register_plugin_peer(dialer.port(), real);
+        drop(guard);
+        assert_eq!(take_plugin_peer(dialer.port()), None);
+    }
+
+    /// F5 pin: a guard from a SUPERSEDED registration must not delete its
+    /// successor's live entry (newest-registration-wins on port recycle).
+    #[test]
+    fn plugin_peer_guard_drop_keeps_newer_entry() {
+        let dialer = SocketAddr::from(([127, 0, 0, 1], 44446));
+        let g2 = register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 8], 5556)));
+        let _g3 = register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 9], 5557)));
+        // g2's registration was overwritten: dropping g2 must NOT remove the
+        // live g3 entry.
+        drop(g2);
+        assert_eq!(
+            take_plugin_peer(dialer.port()),
+            Some(SocketAddr::from(([203, 0, 113, 9], 5557)))
+        );
+    }
+
+    /// F5 pin: serve_plugin teardown's wholesale clear empties the registry
+    /// (defense in depth for connections whose guard never ran).
+    #[test]
+    fn clear_plugin_peers_empties_registry() {
+        let dialer = SocketAddr::from(([127, 0, 0, 1], 44447));
+        let _g = register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 7], 5555)));
+        let _g2 = register_plugin_peer(44448, SocketAddr::from(([203, 0, 113, 7], 5556)));
+        clear_plugin_peers();
+        assert_eq!(take_plugin_peer(dialer.port()), None);
+        assert_eq!(take_plugin_peer(44448), None);
+        assert_eq!(
+            real_tunnel_peer_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            0
+        );
     }
 
     /// Sync resolution for the test above (plugin_peer_ip's retry loop would
