@@ -1034,10 +1034,16 @@ impl AsyncWrite for WsByteStream {
                         if *write_pos >= write_buf.len() {
                             // The frame is fully on the wire — consume the
                             // caller's re-polled buf directly (it is this
-                            // frame's payload).
+                            // frame's payload). Clamp the claim to the
+                            // current buffer (the drain_completed arm at
+                            // line ~925 does the same): a contract-violating
+                            // or interleaved writer re-polling with a
+                            // smaller buf must not be over-credited —
+                            // slicing &buf[n..] past the end would panic
+                            // under panic=abort.
                             *write_pos = 0;
                             *needs_flush = false;
-                            Poll::Ready(Ok(*pending_frame_payload_len))
+                            Poll::Ready(Ok((*pending_frame_payload_len).min(buf.len())))
                         } else {
                             cx.waker().wake_by_ref();
                             Poll::Pending

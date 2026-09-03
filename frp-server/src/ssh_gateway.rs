@@ -466,6 +466,22 @@ fn build_v1_frame_from_args(
     let type_byte = msg.v1_type_byte();
     let payload = serde_json::to_vec(&msg).map_err(|e| anyhow!("serialize NewProxy: {}", e))?;
 
+    // Pre-guard (audit finding 6e): write_v1_frame's 10 KiB length check
+    // does not run on this path — the frame is built by hand and shipped
+    // raw over frame_tx — and custom_domains/locations/local_str come from
+    // the peer's own `ssh -R` command line, bounded only by the ~32 KiB
+    // SSH channel window. An oversized frame would reach the local control
+    // handler's read_v1_frame and kill this SSH user's OWN virtual control
+    // with "invalid V1 msg length". Reject instead; the caller turns the
+    // error into an SSH failure reply scoped to that one session.
+    if payload.len() as i64 > frp_core::protocol::V1_MAX_MSG_LENGTH {
+        return Err(anyhow!(
+            "proxy config too large ({} bytes, max {}): shorten custom_domains/locations",
+            payload.len(),
+            frp_core::protocol::V1_MAX_MSG_LENGTH
+        ));
+    }
+
     let mut buf = Vec::with_capacity(9 + payload.len());
     buf.push(type_byte);
     buf.extend_from_slice(&(payload.len() as i64).to_be_bytes());
@@ -1818,6 +1834,35 @@ mod tests {
         assert!(args.custom_domains.is_empty());
         assert!(args.locations.is_empty());
         assert!(args.group.is_empty());
+    }
+
+    #[test]
+    fn build_v1_frame_rejects_oversized_proxy_config() {
+        // Audit finding 6e: a giant custom_domains entry (attacker's own
+        // `ssh -R` command line, bounded only by the ~32 KiB SSH channel
+        // window) used to build a >10 KiB V1 frame by hand, bypassing
+        // write_v1_frame's length check and killing the SSH user's own
+        // virtual control on read_v1_frame's "invalid V1 msg length".
+        let long_domain = format!("{}.example.com", "x".repeat(20_000));
+        let args = parse_ssh_args(&format!(
+            "http --proxy_name h --custom_domains {long_domain}"
+        ))
+        .expect("parse oversized domain");
+        let err = build_v1_frame_from_args(&args, 0)
+            .expect_err("oversized proxy config must be rejected before framing");
+        assert!(
+            err.to_string().contains("too large"),
+            "unexpected error: {err}"
+        );
+
+        // Control: a normal frame still builds and carries the V1 header
+        // (type byte + declared payload length must match the frame size).
+        let small = parse_ssh_args("tcp --proxy_name web --remote_port 9090").expect("parse small");
+        let frame = build_v1_frame_from_args(&small, 9090).expect("small frame builds");
+        assert_eq!(frame[0], frp_core::msg::TYPE_NEW_PROXY);
+        let declared = i64::from_be_bytes(frame[1..9].try_into().expect("9-byte header")) as usize;
+        assert!(declared <= frp_core::protocol::V1_MAX_MSG_LENGTH as usize);
+        assert_eq!(frame.len(), 9 + declared);
     }
 }
 

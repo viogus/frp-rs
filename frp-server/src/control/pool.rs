@@ -73,14 +73,6 @@ pub(crate) fn expire_pending_nat_hole_sids(
 /// Max work connections to pool beyond what the client requested (Go frp: poolCount + 10).
 pub(crate) const WORK_POOL_EXTRA: usize = 10;
 
-/// Absolute server-side ceiling on a client's requested pool count when
-/// `max_pool_count` is unset (0). Without it the client-controlled
-/// `pool_count` would make the server hold an unbounded number of pooled
-/// work-conn fds (audit fix). Generous next to Go frp's default
-/// `maxPoolCount = 5`; Go's own hard cap is effectively the same resource
-/// question left to the operator, so this only bounds the unconfigured case.
-pub(crate) const WORK_POOL_ABS_CEILING: usize = 512;
-
 // ---- Types ----
 
 /// A pooled work connection. (Idle expiry was removed 2026-08-09 — audit
@@ -140,6 +132,25 @@ pub(crate) struct PendingRequest {
 
 // ---- Helpers ----
 
+/// Push a pending request under the bounded-queue guard shared by the
+/// pool-miss and dead-conn-re-enqueue paths (audit finding 6c): cap the
+/// queue at `MAX_PENDING_REQUESTS` and evict the oldest entry — dropping
+/// that user's connection (HTTP-style backpressure) instead of holding
+/// live fds until the 10s expiry sweep. Without this, repeated
+/// dead-pooled-conn cycles (client closes a conn after pooling; the
+/// replenish ReqWorkConn races it) grew `pending_requests` unboundedly —
+/// a slow accumulation under churn, but unbounded all the same.
+fn push_pending_request(pending_requests: &mut VecDeque<PendingRequest>, req: PendingRequest) {
+    pending_requests.push_back(req);
+    if pending_requests.len() > MAX_PENDING_REQUESTS {
+        tracing::warn!(
+            pending = %pending_requests.len(),
+            "pending_requests queue full (>{MAX_PENDING_REQUESTS}), dropping oldest"
+        );
+        pending_requests.pop_front();
+    }
+}
+
 /// Assign `req` to a pooled work connection if one is available (pool hit),
 /// otherwise record a miss, send `ReqWorkConn`, and queue the request.
 /// Returns `Err(())` if the `ReqWorkConn` write failed — caller must break.
@@ -190,7 +201,7 @@ where
             // failing the user connection (audit fix).
             Err(req) => {
                 warn!(proxy_name = %req.proxy_name, "Pooled work conn died before StartWorkConn; re-enqueueing request for replacement");
-                pending_requests.push_back(*req);
+                push_pending_request(pending_requests, *req);
                 ctx.pool_stats
                     .pending_requests
                     .store(pending_requests.len() as i64, Ordering::Relaxed);
@@ -208,21 +219,13 @@ where
             warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
             return Err(());
         }
-        pending_requests.push_back(req);
-        // Bounded queue (audit round 5, MEDIUM): within the 10s expiry window
-        // a burst of user connections with no work conns available can pile
-        // up live sockets; cap the queue and evict the oldest entry instead
-        // (module-level MAX_PENDING_REQUESTS, shared with pending_udp /
-        // pending_nat_hole_sids). Dropping the socket closes the user's
-        // connection (HTTP-style backpressure) rather than holding the fd
-        // until expiry.
-        if pending_requests.len() > MAX_PENDING_REQUESTS {
-            tracing::warn!(
-                pending = %pending_requests.len(),
-                "pending_requests queue full (>{MAX_PENDING_REQUESTS}), dropping oldest"
-            );
-            pending_requests.pop_front();
-        }
+        // Bounded queue (audit round 5, MEDIUM + 6c): within the 10s expiry
+        // window a burst of user connections with no work conns available can
+        // pile up live sockets; cap the queue and evict the oldest entry
+        // instead (module-level MAX_PENDING_REQUESTS). Dropping the socket
+        // closes the user's connection (HTTP-style backpressure) rather than
+        // holding the fd until expiry.
+        push_pending_request(pending_requests, req);
         ctx.pool_stats
             .pending_requests
             .store(pending_requests.len() as i64, Ordering::Relaxed);
@@ -376,6 +379,9 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                 // Negotiated UDP packet codec from the V2 handshake
                 // (Go frp v0.71.0 binary-v1 or empty JSON fallback).
                 ctx.udp_packet_codec.clone(),
+                // M1 (audit round 3): control-loop channel for the bridge
+                // supervisor's replacement re-request after work-conn death.
+                ctx.internal_tx.clone(),
             )
             .await;
         } else {
@@ -798,6 +804,22 @@ pub(crate) async fn handle_udp_work_conn<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     proxy_name: String,
 ) -> Result<(), ()> {
+    // M1 (audit round 3) race guard: UdpNeedsWorkConn can now arrive from a
+    // bridge supervisor AFTER CloseProxy removed the proxy (bridge death
+    // and close crossed; the supervisor's cancel-token check lost the
+    // race). Sending ReqWorkConn for a dead proxy would make the client
+    // dial a work conn into nothing — assign_udp_work_conn would find no
+    // socket and drop it. The udp_sockets entry is removed synchronously
+    // with proxy close and inserted before NewProxyResp at registration,
+    // so its presence is the authoritative liveness check.
+    if !ctl.udp_sockets.contains_key(&proxy_name) {
+        debug!(
+            proxy_name = %proxy_name,
+            "UDP proxy '{}' no longer has a socket; dropping late work-conn request",
+            proxy_name
+        );
+        return Ok(());
+    }
     debug!(proxy_name = %proxy_name, "UDP proxy '{}' needs work connection", proxy_name);
     if let Err(e) = write_ctl_msg(
         writer,
@@ -1061,6 +1083,14 @@ mod tests {
     async fn pending_udp_queue_capped_with_oldest_eviction() {
         let state = test_state();
         let (mut ctx, mut ctl) = test_context(&state, "run-1");
+        // The M1 liveness guard drops requests for proxies without a live
+        // udp_sockets entry — register one per name so the cap path (not
+        // the guard) is what this test exercises.
+        for i in 0..(MAX_PENDING_REQUESTS + 50) {
+            let name = format!("udp-proxy-{i}");
+            let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            ctl.udp_sockets.insert(name.clone(), sock);
+        }
         let mut writer = Vec::new();
         for i in 0..(MAX_PENDING_REQUESTS + 50) {
             let res =

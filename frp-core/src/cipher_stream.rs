@@ -406,9 +406,13 @@ impl CipherWriterState {
         // A first-write (IV+data) buffer fully drained inside poll_flush:
         // first_write_data_len keeps the pending claim (see poll_flush). The
         // caller re-polls with the same buf — return the claim without
-        // re-encrypting (the CFB keystream already advanced past it).
+        // re-encrypting (the CFB keystream already advanced past it). The
+        // claim is clamped to the current buf (a contract-violating or
+        // interleaved writer re-polling with a smaller buffer must not be
+        // over-credited — slicing &buf[n..] past the end would panic under
+        // panic=abort).
         if this.first_write_data_len > 0 {
-            let data_len = this.first_write_data_len;
+            let data_len = this.first_write_data_len.min(buf.len());
             this.first_write_data_len = 0;
             return Poll::Ready(Ok(data_len));
         }

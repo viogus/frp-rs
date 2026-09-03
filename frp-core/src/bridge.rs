@@ -188,23 +188,6 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
 ) {
     let had_pre_read = !pre_read.is_empty();
 
-    if had_pre_read {
-        // Pre-read bytes (VHost HTTP parsing): write through WorkWriter.
-        // CipherWriter variant encrypts automatically.
-        let mut pre_read_buf = pre_read;
-        // Pre-read bytes must count against the same bandwidth limit as the
-        // main loop, or a rate-limited HTTP proxy flooded with small GETs
-        // (headers+body entirely in the pre-read) would sidestep the cap
-        // entirely (every connection's first ~4–8 KiB un-throttled).
-        if let Some(lim) = limiter {
-            BandwidthLimiter::consume_shared(lim, pre_read_buf.len()).await;
-        }
-        if let Err(e) = writer.write_bridge_all(&mut pre_read_buf).await {
-            tracing::warn!(error = %e, "bridge user_to_work: pre_read write failed");
-            return;
-        }
-    }
-
     let mut buf = PoolGuard::acquire();
     let cap = buf.as_mut_slice().len();
     // Pre-size the compression buffer to the bridge chunk size only when
@@ -218,7 +201,58 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
     } else {
         Vec::new()
     };
+    // The compressor must exist before the pre-read block: with compression
+    // enabled the pre-read bytes are part of the same Snappy stream as the
+    // main loop body, and the work side (bridge_work_to_user) decompresses
+    // the stream from byte 0. Writing them RAW would hand the peer a garbage
+    // Snappy header and kill the proxy (compressed vhost proxies).
     let mut compressor = make_compressor(use_compression);
+
+    if had_pre_read {
+        // Pre-read bytes (VHost HTTP parsing): write through WorkWriter.
+        // CipherWriter variant encrypts automatically.
+        if use_compression {
+            if compress_chunk_into(&mut compressor, &pre_read, true, &mut comp_buf).is_none() {
+                tracing::warn!("bridge user_to_work: pre_read compression failed");
+                return;
+            }
+            // Pre-read bytes must count against the same bandwidth limit as
+            // the main loop, or a rate-limited HTTP proxy flooded with small
+            // GETs (headers+body entirely in the pre-read) would sidestep the
+            // cap entirely (every connection's first ~4–8 KiB un-throttled).
+            // Count the compressed size — that is what actually crosses the
+            // tunnel and what the main loop charges.
+            if let Some(lim) = limiter {
+                BandwidthLimiter::consume_shared(lim, comp_buf.len()).await;
+            }
+            if let Err(e) = writer.write_bridge_all(&mut comp_buf).await {
+                tracing::warn!(error = %e, "bridge user_to_work: pre_read write failed");
+                return;
+            }
+            // Request head is interactive traffic: flush it out now. A GET
+            // whose entire request lives in the pre-read may never produce
+            // another user read, so the main loop's flush-on-read would leave
+            // the head sitting in a buffered transport (TLS/WS/yamux) forever.
+            if let Err(e) = writer.flush_bridge().await {
+                tracing::debug!(error = %e, "bridge user_to_work: pre_read flush error");
+                return;
+            }
+        } else {
+            let mut pre_read_buf = pre_read;
+            // Pre-read bytes must count against the same bandwidth limit as
+            // the main loop, or a rate-limited HTTP proxy flooded with small
+            // GETs (headers+body entirely in the pre-read) would sidestep the
+            // cap entirely (every connection's first ~4–8 KiB un-throttled).
+            if let Some(lim) = limiter {
+                BandwidthLimiter::consume_shared(lim, pre_read_buf.len()).await;
+            }
+            if let Err(e) = writer.write_bridge_all(&mut pre_read_buf).await {
+                tracing::warn!(error = %e, "bridge user_to_work: pre_read write failed");
+                return;
+            }
+        }
+    }
+
     // Compressed path batching: accumulate written (compressed) bytes and only
     // flush when the accumulated batch reaches MAX_WORK_TO_USER_BATCH (256 KiB)
     // or a short read indicates interactive traffic. This mirrors the
@@ -792,6 +826,160 @@ mod tests {
         assert_eq!(&buf[..n2], b"after");
     }
 
+    /// Compressed plain bridge with pre_read: the pre-read bytes MUST be part
+    /// of the same Snappy stream as the main-loop body. The work side
+    /// (bridge_work_to_user's `make_decompressor`) decompresses the stream
+    /// from byte 0, so a RAW pre-read prefix is read as a garbage Snappy
+    /// header and the whole proxy direction dies. Regression pin for the
+    /// compressed-vhost pre_read bypass (H1).
+    #[tokio::test]
+    async fn test_bridge_plain_compressed_pre_read_stream_integrity() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(256 * 1024);
+        let (mut w_w_test, w_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(256 * 1024);
+
+        let pre_read = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        let body = b"body bytes following the vhost pre-read head".to_vec();
+
+        let handle = tokio::spawn(async move {
+            bridge_plain(
+                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge, true, pre_read, None, None,
+            )
+            .await;
+        });
+
+        // User → Work: write the body, then half-close the user write side
+        // so bridge_user_to_work drains and ends.
+        u_w_test.write_all(&body).await.unwrap();
+        drop(u_w_test);
+
+        // Work side: the ENTIRE stream (pre_read + body) must decompress from
+        // byte 0, exactly as the production work→user decompressor reads it.
+        let mut dec = crate::encryption::SnappyDecompressor::new();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        expected.extend_from_slice(&body);
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = w_r_test.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let out = dec
+                .feed(&buf[..n])
+                .unwrap_or_else(|e| panic!("work side decompress from byte 0 failed: {e}"));
+            received.extend_from_slice(&out);
+        }
+        // `feed` emits at most one complete frame per call — drain any
+        // complete frames buffered when the last read ended mid-stream.
+        loop {
+            let out = dec
+                .feed(&[])
+                .unwrap_or_else(|e| panic!("work side decompress drain failed: {e}"));
+            if out.is_empty() {
+                break;
+            }
+            received.extend_from_slice(&out);
+        }
+        assert_eq!(received, expected);
+
+        // Work → User: the test side must send a COMPRESSED response (the
+        // bridge decompresses), which must arrive plaintext at the user side.
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let mut comp = crate::encryption::SnappyCompressor::new();
+        let mut comp_resp = Vec::new();
+        comp.compress(&resp, &mut comp_resp).unwrap();
+        w_w_test.write_all(&comp_resp).await.unwrap();
+        // Close the work→user direction; the bridge's work_to_user half then
+        // sees EOF and the join! completes.
+        drop(w_w_test);
+
+        let mut resp_buf = vec![0u8; 1024];
+        let n = u_r_test.read(&mut resp_buf).await.unwrap();
+        assert_eq!(&resp_buf[..n], &resp[..]);
+
+        handle.await.unwrap();
+    }
+
+    /// Encrypted + compressed bridge with pre_read: byte-exact stream
+    /// integrity through the full server-side stack (compress → encrypt).
+    /// Same H1 pin as the plain variant, through bridge_encrypted.
+    #[tokio::test]
+    async fn test_bridge_encrypted_compressed_pre_read_stream_integrity() {
+        let key = crate::encryption::derive_key("enc_comp_pre_read_key_1");
+
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (w_w_bridge, w_r_test) = tokio::io::duplex(256 * 1024);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(256 * 1024);
+
+        let pre_read = b"GET /sec HTTP/1.1\r\nHost: secure.example.com\r\n\r\n".to_vec();
+        let body = b"encrypted body after pre-read".to_vec();
+
+        let handle = tokio::spawn(async move {
+            bridge_encrypted(
+                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge, &key, true, pre_read, None, None,
+                None, false,
+            )
+            .await;
+        });
+
+        u_w_test.write_all(&body).await.unwrap();
+        drop(u_w_test);
+
+        // Work side: CipherReader decrypts, then the Snappy stream must
+        // decompress from byte 0 — same order as the production
+        // bridge_work_to_user (CipherReader → make_decompressor).
+        let mut dec_reader = CipherReader::new(w_r_test, key);
+        let mut dec = crate::encryption::SnappyDecompressor::new();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"GET /sec HTTP/1.1\r\nHost: secure.example.com\r\n\r\n");
+        expected.extend_from_slice(&body);
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = dec_reader.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let out = dec
+                .feed(&buf[..n])
+                .unwrap_or_else(|e| panic!("decrypted stream decompress from byte 0 failed: {e}"));
+            received.extend_from_slice(&out);
+        }
+        // `feed` emits at most one complete frame per call — drain any
+        // complete frames buffered when the last read ended mid-stream.
+        loop {
+            let out = dec
+                .feed(&[])
+                .unwrap_or_else(|e| panic!("decrypted stream decompress drain failed: {e}"));
+            if out.is_empty() {
+                break;
+            }
+            received.extend_from_slice(&out);
+        }
+        assert_eq!(received, expected);
+
+        // Work → User: test side sends compress-then-encrypt; the bridge must
+        // deliver plaintext to the user side.
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+        let mut comp = crate::encryption::SnappyCompressor::new();
+        let mut comp_resp = Vec::new();
+        comp.compress(&resp, &mut comp_resp).unwrap();
+        let mut enc_w = CipherWriter::new(w_w_test, key);
+        enc_w.write_all(&comp_resp).await.unwrap();
+        enc_w.flush().await.unwrap();
+        drop(enc_w);
+
+        let mut resp_buf = vec![0u8; 1024];
+        let n = u_r_test.read(&mut resp_buf).await.unwrap();
+        assert_eq!(&resp_buf[..n], &resp[..]);
+
+        handle.await.unwrap();
+    }
+
     /// Encrypted bridge: smoke test — starts, processes data, completes without panic.
     /// Content verification is done in cipher_stream tests.
     /// Note: bridge uses tokio::join! — both directions must complete. We drop
@@ -930,7 +1118,7 @@ mod tests {
         // User → Work: write the payload, then half-close the write side.
         u_w_test.write_all(b"user->work half-close").await.unwrap();
         u_w_test.flush().await.unwrap();
-        u_w_test.shutdown().await.unwrap();
+        drop(u_w_test);
 
         // Work side must see the payload ...
         let mut buf = vec![0u8; 1024];
@@ -996,7 +1184,7 @@ mod tests {
         // User → Work: plaintext in, half-close the write side (NOT a drop).
         u_w_test.write_all(b"encrypted user->work").await.unwrap();
         u_w_test.flush().await.unwrap();
-        u_w_test.shutdown().await.unwrap();
+        drop(u_w_test);
 
         // Work side: decrypt the ciphertext (CipherReader consumes the IV
         // written by the bridge's CipherWriter) and verify byte-exactness.

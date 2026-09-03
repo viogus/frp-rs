@@ -9,6 +9,16 @@ use crate::proxy_runtime::ProxyRuntimeInfo;
 
 /// Build a config snapshot string for reload change detection.
 /// Includes all fields that matter for proxy registration and plugin config.
+/// Deterministic map serialization for snapshot equality. std HashMap's
+/// Debug output iterates in per-instance random order, so two config
+/// objects with identical content would serialize differently and false-diff
+/// on EVERY reload (re-registering every proxy on each SIGUSR1). BTreeMap
+/// iterates in key order; serde_json serialization is therefore stable.
+fn sorted_map(m: &std::collections::HashMap<String, String>) -> String {
+    let sorted: std::collections::BTreeMap<&String, &String> = m.iter().collect();
+    serde_json::to_string(&sorted).unwrap_or_default()
+}
+
 pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
     // Sort and serialize key fields deterministically.
     // Hash secrets for change detection — never include plaintext secrets in
@@ -68,6 +78,25 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
         (
             "health_check_max_failed",
             p.health_check_max_failed.to_string(),
+        ),
+        // Round-19 audit M7: all NewProxy-wire fields must be covered or a
+        // reload that only edits them (headers, route_by_http_user, ...)
+        // silently no-ops — the proxy is never re-registered with the server.
+        // `enabled` is included for defense even though try_reload retains
+        // enabled-only proxies before diffing (a disabled proxy is dropped
+        // from the list and surfaces as removed); if a future path diffs
+        // unfiltered lists it must not slip through.
+        ("headers", sorted_map(&p.headers)),
+        ("response_headers", sorted_map(&p.response_headers)),
+        ("route_by_http_user", p.route_by_http_user.clone()),
+        ("allow_users", format!("{:?}", p.allow_users)),
+        ("annotations", sorted_map(&p.annotations)),
+        ("metas", sorted_map(&p.metas)),
+        ("http_password", hash_secret(&p.http_password)),
+        ("enabled", p.enabled.to_string()),
+        (
+            "disable_assisted_addrs",
+            p.disable_assisted_addrs.to_string(),
         ),
     ];
 
@@ -322,5 +351,71 @@ mod tests {
         let delta = do_reload(&map, &[], new_cfg, "user").await.unwrap();
         assert_eq!(delta.removed, vec!["p1"]);
         assert_eq!(delta.added, vec!["p2"]);
+    }
+
+    /// Round-19 audit M7 pin: the snapshot must cover every NewProxy-wire
+    /// field. Editing ONLY one of these in the config file and reloading
+    /// (SIGUSR1) must not silently no-op — do_reload's changed detection is
+    /// the snapshot, and try_reload only re-registers (sends NewProxy) and
+    /// restarts plugins for proxies whose snapshot differs.
+    #[test]
+    fn config_snapshot_covers_all_newproxy_wire_fields() {
+        fn differs(mut c: ProxyConfig, mutate: impl FnOnce(&mut ProxyConfig)) -> bool {
+            let base = config_snapshot(&c);
+            mutate(&mut c);
+            base != config_snapshot(&c)
+        }
+        let p = || proxy("p");
+        assert!(differs(p(), |c| {
+            c.headers.insert("h".into(), "1".into());
+        }));
+        assert!(differs(p(), |c| {
+            c.response_headers.insert("r".into(), "2".into());
+        }));
+        assert!(differs(p(), |c| c.route_by_http_user = "alice".into()));
+        assert!(differs(p(), |c| c.allow_users = vec!["alice".into()]));
+        assert!(differs(p(), |c| {
+            c.annotations.insert("a".into(), "b".into());
+        }));
+        assert!(differs(p(), |c| {
+            c.metas.insert("m".into(), "n".into());
+        }));
+        assert!(differs(p(), |c| c.http_password = "secret".into()));
+        // ProxyConfig::default() leaves enabled=false (default_true applies at
+        // deserialization), so flip it ON to prove the field participates.
+        assert!(differs(p(), |c| c.enabled = true));
+        assert!(differs(p(), |c| c.disable_assisted_addrs = true));
+        // And a proxy with none of them set still snapshots.
+        assert!(!config_snapshot(&p()).is_empty());
+    }
+
+    /// Round-19 audit M7 pin: map-typed fields must snapshot in key order,
+    /// not std HashMap's per-instance random iteration order — two config
+    /// objects with identical content (differing only in map insertion
+    /// order) must produce identical snapshots, or an untouched proxy would
+    /// false-diff and re-register on every reload.
+    #[test]
+    fn config_snapshot_is_order_independent_for_maps() {
+        let mut a = proxy("p");
+        let mut b = proxy("p");
+        for (k, v) in [("a", "1"), ("z", "2"), ("m", "3")] {
+            a.headers.insert(k.into(), v.into());
+            b.headers.insert(k.into(), v.into());
+        }
+        // Reverse b's insertion order (std HashMap iteration differs per
+        // instance, so without sorting this would false-diff).
+        let keys: Vec<String> = b.headers.keys().cloned().collect();
+        for k in keys.iter().rev() {
+            let v = b.headers.remove(k).unwrap();
+            b.headers.insert(k.clone(), v);
+        }
+        assert_eq!(a.headers.len(), b.headers.len());
+        assert_eq!(config_snapshot(&a), config_snapshot(&b));
+        // Same content, freshly parsed object → same snapshot.
+        let mut c = proxy("p");
+        c.headers.insert("m".into(), "3".into());
+        c.headers.insert("a".into(), "1".into());
+        c.headers.insert("z".into(), "2".into());
+        assert_eq!(config_snapshot(&a), config_snapshot(&c));
     }
 }

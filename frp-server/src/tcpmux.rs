@@ -21,6 +21,12 @@ pub struct TcpMuxRoute {
     /// username first, then fall back to the `""` bucket (Go
     /// `getExactOrAllUsersLocked`).
     pub route_by_http_user: String,
+    /// Load-balancing group name (Go frp group.TCPMuxGroup). Non-empty only
+    /// on the FIRST member's shared route: the lookup returns this route
+    /// for every member of the group, and the accept side fans the CONNECT
+    /// out to a group member round-robin via the group controller instead
+    /// of dispatching to the route's own proxy.
+    pub group: String,
 }
 
 /// Manages TCPMux routing table (domain + routeByHTTPUser → proxy).
@@ -68,6 +74,14 @@ impl TcpMuxManager {
     /// Previously the result was ignored and the last registration
     /// silently overwrote the first (audit finding 5), which meant closing
     /// the overwriting proxy deleted the live sibling's route.
+    ///
+    /// `group` is empty for plain proxies. A non-empty group marks the
+    /// FIRST member's shared route (M2: tcpmux group fan-out): the caller
+    /// registers the route only for the first member, and the route's
+    /// `group` field routes accept-side dispatch through the group
+    /// controller's round-robin member list. Joining members register no
+    /// route of their own — the shared route (and its wildcard_count) is
+    /// owned by the first member until the group empties.
     #[allow(clippy::too_many_arguments)] // mirrors VhostManager::register (same route tuple)
     pub async fn register(
         &self,
@@ -78,6 +92,7 @@ impl TcpMuxManager {
         http_pwd: &str,
         route_by_http_user: &str,
         _headers: &[(String, String)],
+        group: &str,
     ) -> Result<(), String> {
         let route = TcpMuxRoute {
             proxy_name: proxy_name.to_string(),
@@ -85,6 +100,7 @@ impl TcpMuxManager {
             http_user: http_user.to_string(),
             http_pwd: http_pwd.to_string(),
             route_by_http_user: route_by_http_user.to_string(),
+            group: group.to_string(),
         };
 
         let mut routes = self.routes.write().await;
@@ -333,15 +349,17 @@ pub async fn run_tcpmux_listener(
 
         tokio::spawn(async move {
             let _permit = permit;
-            // Read CONNECT line + headers (up to 4KB) with 10s timeout
+            // Read CONNECT line + headers (up to 4KB) with 10s timeout.
+            // (n, total): total can exceed n — bytes past \r\n\r\n that a
+            // single chunk read consumed (M6); they are forwarded below.
             let mut buf = [0u8; 4096];
-            let n = match tokio::time::timeout(
+            let (n, total) = match tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 read_http_headers(&mut stream, &mut buf),
             )
             .await
             {
-                Ok(Ok(n)) if n > 0 => n,
+                Ok(Ok((n, total))) if n > 0 => (n, total),
                 _ => return,
             };
 
@@ -463,12 +481,58 @@ pub async fn run_tcpmux_listener(
                 }
             }
 
+            // TCPMux group fan-out (Go frp v0.71.0 TCPMuxGroup: accepted
+            // conns on the shared route are delivered to ONE group member;
+            // frp-rs round-robins like its HTTP group path — Go's acceptCh
+            // is a member race). The lookup returned the FIRST member's
+            // shared route; pick the dispatch target from the group's live
+            // member list and fall back to the route owner when the chosen
+            // member raced away (vhost group precedent). Auth above already
+            // ran against the shared route — members are validated equal at
+            // join (register_member), so the credentials are group-wide.
+            let (dispatch_proxy_name, dispatch_run_id) = if route.group.is_empty() {
+                (route.proxy_name.clone(), route.run_id.clone())
+            } else {
+                match state.tcpmux_group_ctl.choose_endpoint(&route.group).await {
+                    Some(member) => match state.proxy_manager.get(&member).await {
+                        Some(info) => {
+                            debug!(
+                                host = %host, group = %route.group, member = %member,
+                                "TCPMux group '{}' -> member '{}'", route.group, member
+                            );
+                            (member, info.run_id.clone())
+                        }
+                        None => {
+                            // Member gone between choose and lookup — fall
+                            // back to the route's recorded proxy (first
+                            // member).
+                            warn!(
+                                group = %route.group, member = %member,
+                                "TCPMux: group member '{}' not registered, falling back to '{}'",
+                                route.group, route.proxy_name
+                            );
+                            (route.proxy_name.clone(), route.run_id.clone())
+                        }
+                    },
+                    None => {
+                        // Group has no members (all unregistered) — route the
+                        // conn to the first member anyway; the control
+                        // dispatch will fail cleanly if it is gone too.
+                        (route.proxy_name.clone(), route.run_id.clone())
+                    }
+                }
+            };
+
             // Send 200 only in non-passthrough mode (Go frp compat:
-            // tcpmux/httpconnect.go sendConnectResponse).
+            // tcpmux/httpconnect.go sendConnectResponse). pre_read carries
+            // every byte consumed past the header terminator: passthrough
+            // forwards the whole request INCLUDING the pipelined tail
+            // (Go's bufio Reader preserves buffered bytes past the request;
+            // the pre-fix buf[..n] silently dropped them — M6), and
+            // non-passthrough forwards the tail after the 200 so a client
+            // that pipelined tunnel data behind its CONNECT loses nothing.
             let pre_read = if state.tcp_mux_passthrough {
-                // Passthrough: forward the full CONNECT request bytes
-                // to the backend so it sees the original HTTP request.
-                buf[..n].to_vec()
+                buf[..total].to_vec()
             } else {
                 // Non-passthrough: send the 200 response.
                 if let Err(e) = stream
@@ -478,13 +542,13 @@ pub async fn run_tcpmux_listener(
                     debug!(peer = %peer, error = %e, "TCPMux: failed to write 200 to {}: {}", peer, e);
                     return;
                 }
-                Vec::new()
+                buf[n..total].to_vec()
             };
 
             // Forward to the control handler for work connection bridging.
             let internal_tx = state
                 .run_id_to_ctl_tx
-                .get(&route.run_id)
+                .get(&dispatch_run_id)
                 .map(|v| v.tx.clone());
 
             if let Some(ctl_tx) = internal_tx {
@@ -498,7 +562,7 @@ pub async fn run_tcpmux_listener(
                 match tokio::time::timeout(
                     crate::state::CTL_SEND_TIMEOUT,
                     ctl_tx.send(InternalMsg::ProxyUserConn {
-                        proxy_name: route.proxy_name.clone(),
+                        proxy_name: dispatch_proxy_name,
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
                         pre_read,
                         user_conn_permit: None,
@@ -540,11 +604,16 @@ pub async fn run_tcpmux_listener(
 }
 
 /// Read HTTP request headers up to \r\n\r\n delimiter.
-/// Returns the number of bytes read into buf.
+/// Returns (header_len, total_read): header_len is the position just past
+/// the terminator; total_read may be LARGER — a single `read` into the
+/// 512-byte chunk can consume pipelined bytes past the headers, and those
+/// bytes must survive (the caller forwards them as pre-read data; M6 —
+/// round-3 finding: they were dropped, corrupting any request that
+/// pipelined payload bytes in the same TCP segment as its CONNECT).
 async fn read_http_headers(
     stream: &mut (impl AsyncReadExt + Unpin),
     buf: &mut [u8],
-) -> Result<usize, String> {
+) -> Result<(usize, usize), String> {
     let mut total = 0usize;
     loop {
         if total >= buf.len() {
@@ -567,7 +636,7 @@ async fn read_http_headers(
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
         {
-            return Ok(search_start + pos + 4);
+            return Ok((search_start + pos + 4, total));
         }
     }
 }
@@ -590,7 +659,13 @@ async fn read_http_headers(
 /// registers brackets, so it is unroutable), or unbracketed multi-colon
 /// "::1:443". Then trim exactly one trailing dot (Go TrimSuffix — one dot
 /// only, so "example.com.." stays unroutable).
-fn canonicalize_host(host: &str, strict_port: bool) -> Option<&str> {
+/// Shared with vhost.rs request-line parsing (CONNECT authority-form and
+/// absolute-form request targets): Go `url.ParseRequestURI` enforces the
+/// strict rules on the REQUEST LINE (a "GET http://h:abc/" or a
+/// "CONNECT h:abc" is a 400 before routing; probes vs Go frp v0.71.0),
+/// while the Host HEADER stays lenient. vhost.rs imports this via
+/// `crate::tcpmux::canonicalize_host` (round-3 M4).
+pub(crate) fn canonicalize_host(host: &str, strict_port: bool) -> Option<&str> {
     let colons = host.bytes().filter(|b| *b == b':').count();
     let hostname = if colons == 1 {
         // host:port — strict mode requires the port to be empty or
@@ -990,9 +1065,18 @@ mod tests {
     async fn test_tcpmux_manager_register_lookup_unregister() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
-            .await
-            .expect("first registration must succeed");
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("first registration must succeed");
 
         // Exact match
         let r = mgr.lookup("a.example.com", "").await.unwrap();
@@ -1028,6 +1112,7 @@ mod tests {
                 "",
                 "",
                 &[],
+                "",
             )
             .await
             .expect_err("same-call duplicate domain must be rejected");
@@ -1039,9 +1124,18 @@ mod tests {
         // No partial state: nothing was registered, and the proxy is free to
         // re-register with a clean domain list.
         assert!(mgr.lookup("a.example.com", "").await.is_none());
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
-            .await
-            .expect("clean re-registration must succeed");
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("clean re-registration must succeed");
         let r = mgr.lookup("a.example.com", "").await.unwrap();
         assert_eq!(r.proxy_name, "p1");
 
@@ -1054,6 +1148,7 @@ mod tests {
             "",
             "",
             &[],
+            "",
         )
         .await
         .expect("distinct domains in one call must succeed");
@@ -1075,6 +1170,7 @@ mod tests {
             "",
             "",
             &[],
+            "",
         )
         .await
         .expect("registration must succeed");
@@ -1105,6 +1201,7 @@ mod tests {
                 "",
                 "",
                 &[],
+                "",
             )
             .await
             .expect_err("case-variant conflict must be rejected");
@@ -1131,6 +1228,7 @@ mod tests {
             "",
             "",
             &[],
+            "",
         )
         .await
         .expect("registration must succeed");
@@ -1150,9 +1248,18 @@ mod tests {
     async fn test_tcpmux_lookup_wildcard_leftmost_label() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["*.example.com".into()], "run-1", "", "", "", &[])
-            .await
-            .expect("registration must succeed");
+        mgr.register(
+            "p1",
+            &["*.example.com".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("registration must succeed");
 
         // Any host under the wildcard matches.
         assert!(mgr
@@ -1187,10 +1294,11 @@ mod tests {
             "p1",
             "team-a",
             &[],
+            "",
         )
         .await
         .expect("p1 registration must succeed");
-        mgr.register("p2", &["example.com".into()], "run-2", "", "", "", &[])
+        mgr.register("p2", &["example.com".into()], "run-2", "", "", "", &[], "")
             .await
             .expect("p2 registration must succeed (different rubu bucket)");
 
@@ -1205,6 +1313,7 @@ mod tests {
                 "",
                 "team-a",
                 &[],
+                "",
             )
             .await
             .expect_err("same (domain, rubu) claim must conflict");
@@ -1230,7 +1339,7 @@ mod tests {
     #[tokio::test]
     async fn test_tcpmux_lookup_wildcard_catch_all() {
         let mgr = TcpMuxManager::new();
-        mgr.register("p1", &["*".into()], "run-1", "", "", "", &[])
+        mgr.register("p1", &["*".into()], "run-1", "", "", "", &[], "")
             .await
             .expect("catch-all registration must succeed");
 
@@ -1253,12 +1362,30 @@ mod tests {
     async fn test_tcpmux_lookup_exact_beats_wildcard() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
-            .await
-            .expect("exact registration must succeed");
-        mgr.register("p2", &["*.example.com".into()], "run-2", "", "", "", &[])
-            .await
-            .expect("wildcard registration must succeed");
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("exact registration must succeed");
+        mgr.register(
+            "p2",
+            &["*.example.com".into()],
+            "run-2",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("wildcard registration must succeed");
 
         // Exact match wins; the wildcard catches everything else under the
         // domain, including deeper hosts (leftmost-label walk).
@@ -1283,7 +1410,7 @@ mod tests {
     #[tokio::test]
     async fn test_tcpmux_lookup_trailing_dot() {
         let mgr = TcpMuxManager::new();
-        mgr.register("p1", &["example.com".into()], "run-1", "", "", "", &[])
+        mgr.register("p1", &["example.com".into()], "run-1", "", "", "", &[], "")
             .await
             .expect("registration must succeed");
 
@@ -1307,12 +1434,30 @@ mod tests {
     async fn test_tcpmux_manager_conflict_rejects_second_proxy() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
-            .await
-            .expect("first registration must succeed");
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("first registration must succeed");
 
         let err = mgr
-            .register("p2", &["a.example.com".into()], "run-2", "", "", "", &[])
+            .register(
+                "p2",
+                &["a.example.com".into()],
+                "run-2",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
             .await
             .expect_err("conflicting domain must be rejected");
         assert!(
@@ -1327,9 +1472,18 @@ mod tests {
             .is_some_and(|r| r.proxy_name == "p1"));
 
         // Same-name re-registration is idempotent (allowed).
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
-            .await
-            .expect("same-proxy re-registration must succeed");
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("same-proxy re-registration must succeed");
         assert!(mgr
             .lookup("a.example.com", "")
             .await
@@ -1343,9 +1497,18 @@ mod tests {
     async fn test_tcpmux_unregister_keeps_foreign_route() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
-            .await
-            .expect("registration must succeed");
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("registration must succeed");
 
         // Simulate the pre-fix last-writer-wins state: the route now belongs
         // to p2, and p2's by_proxy entry also lists the domain.
@@ -1362,6 +1525,7 @@ mod tests {
                         http_user: String::new(),
                         http_pwd: String::new(),
                         route_by_http_user: String::new(),
+                        group: String::new(),
                     },
                 );
             mgr.by_proxy
@@ -1399,6 +1563,7 @@ mod tests {
             "",
             "",
             &[],
+            "",
         )
         .await
         .expect("registration must succeed");
@@ -1413,6 +1578,7 @@ mod tests {
             "",
             "",
             &[],
+            "",
         )
         .await
         .expect("idempotent re-registration must succeed");
@@ -1426,9 +1592,18 @@ mod tests {
 
         // Shrunken re-registration (server reload drops the wildcard):
         // the route and its count must leave the map.
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", "", &[])
-            .await
-            .expect("shrunken re-registration must succeed");
+        mgr.register(
+            "p1",
+            &["a.example.com".into()],
+            "run-1",
+            "",
+            "",
+            "",
+            &[],
+            "",
+        )
+        .await
+        .expect("shrunken re-registration must succeed");
         assert_eq!(mgr.wildcard_count.load(Ordering::Relaxed), 0);
         assert!(mgr.lookup("x.wild.example.com", "").await.is_none());
 
@@ -1447,6 +1622,7 @@ mod tests {
             "",
             "",
             &[],
+            "",
         )
         .await
         .expect("registration must succeed");
@@ -1463,6 +1639,7 @@ mod tests {
                         http_user: String::new(),
                         http_pwd: String::new(),
                         route_by_http_user: String::new(),
+                        group: String::new(),
                     },
                 );
         }

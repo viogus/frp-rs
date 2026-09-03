@@ -76,6 +76,10 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
             enable_h2,
         ),
         |tcp, peer, (target, rewrite, headers, acceptor, _host, _port, _enable_h2)| async move {
+            // M9: peer.ip() is always 127.0.0.1 (the plugin listener is
+            // loopback); the real tunnel peer comes from StartWorkConn via
+            // the work-conn registry (Go http_common.go:116-117).
+            let real_peer = super::plugin_peer_ip(peer).await;
             match acceptor.accept(tcp).await {
                 Ok(tls) => {
                     #[cfg(feature = "http2http")]
@@ -87,15 +91,16 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
                                 host: _host,
                                 port: _port,
                             };
-                            serve_h2_connection(tls, target, rewrite, headers, backend).await;
+                            serve_h2_connection(tls, target, rewrite, headers, backend, real_peer)
+                                .await;
                         } else if let Err(e) =
-                            handle_conn(tls, &target, &rewrite, &headers, peer.ip()).await
+                            handle_conn(tls, &target, &rewrite, &headers, real_peer).await
                         {
                             debug!(%peer, error = %e, "https2http: {peer} error: {e}");
                         }
                     }
                     #[cfg(not(feature = "http2http"))]
-                    if let Err(e) = handle_conn(tls, &target, &rewrite, &headers, peer.ip()).await {
+                    if let Err(e) = handle_conn(tls, &target, &rewrite, &headers, real_peer).await {
                         debug!(%peer, error = %e, "https2http: {peer} error: {e}");
                     }
                 }

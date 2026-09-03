@@ -1232,10 +1232,10 @@ async fn register_https_vhost(
         .await;
         return false;
     }
-    // Enable the SNI-sniff gate in the accept loop: at least one
-    // HTTPS proxy can be routed via ClientHello SNI. Decremented
-    // on unregister/close (unregister_control, handle_close_proxy,
-    // dashboard proxy delete).
+    // Account this non-group HTTPS proxy's SNI routes (group proxies return
+    // above without incrementing — audit round 6d asymmetry, documented on
+    // the field). Decremented on unregister/close (unregister_control,
+    // handle_close_proxy, dashboard proxy delete).
     state.https_proxy_count.fetch_add(1, Ordering::Relaxed);
     info!(
         proxy_name = %np.proxy_name, domains = ?domains, "VHost SNI routes registered for HTTPS proxy '{}': domains={:?}",
@@ -1922,9 +1922,106 @@ pub(crate) async fn handle_new_proxy(
                 if let Some(ref subnet) = np.advertise_subnet {
                     if !subnet.is_empty() {
                         let vn = np.virtual_net.clone().unwrap_or_default();
-                        let key = (vn, subnet.clone());
-                        let mut routes = state.vnet_routes.write().await;
-                        routes.insert(key, (run_id.to_string(), np.proxy_name.clone()));
+                        // Guard the route insert exactly like the
+                        // VnetRouteAdvertise path (audit finding 5): the
+                        // old insert was unconditional — no hijack-prefix
+                        // rejection, no per-client cap, no liveness-gated
+                        // owner-conflict refusal — and silently overwrote
+                        // a live owner's (virtual_net, subnet) route,
+                        // redirecting the displaced proxy's visitor
+                        // packets here (vnet_visitor_route_target_run_id).
+                        // The registering proxy itself IS the membership
+                        // (proxy_type == "vnet" in `vn`), so no
+                        // membership check applies on this path.
+                        let mut rejection: Option<String> = None;
+                        {
+                            let mut routes = state.vnet_routes.write().await;
+                            let key = (vn.clone(), subnet.clone());
+                            if super::nathole::is_route_hijack_prefix(subnet) {
+                                // Defense-in-depth (hijack-prefix MED):
+                                // reject default / near-default prefixes
+                                // before they reach peers' kernel routing
+                                // tables. A vnet proxy whose advertise
+                                // subnet would inject a default-route
+                                // equivalent must not register at all.
+                                rejection = Some(format!(
+                                    "vnet proxy '{}' rejected: advertise subnet '{subnet}' is a hijack prefix (default /0 or its /1 split)",
+                                    np.proxy_name
+                                ));
+                            } else {
+                                // Route-count cap (round 10 HIGH): reject
+                                // new keys once this run_id owns the cap.
+                                // Re-registering an already-owned key stays
+                                // allowed (normal update — reload keeps the
+                                // run_id). Mirror the advertise path.
+                                if !routes.contains_key(&key) {
+                                    let owned =
+                                        routes.iter().filter(|(_, (rid, _))| rid == run_id).count();
+                                    if owned >= super::nathole::MAX_VNET_ROUTES_PER_CLIENT {
+                                        rejection = Some(format!(
+                                            "vnet proxy '{}' rejected: per-client route cap ({}) reached",
+                                            np.proxy_name,
+                                            super::nathole::MAX_VNET_ROUTES_PER_CLIENT
+                                        ));
+                                    }
+                                }
+                                if rejection.is_none() {
+                                    if let Some((owner_run_id, owner_proxy)) = routes.get(&key) {
+                                        if owner_run_id != run_id {
+                                            // Liveness check mirrors the
+                                            // advertise path: a route is
+                                            // only "owned" while its
+                                            // owner's control connection is
+                                            // alive. A dead owner (crashed
+                                            // client that restarted with a
+                                            // fresh run_id) must not block
+                                            // reclaiming its stale route.
+                                            let owner_alive = state
+                                                .run_id_to_ctl_tx
+                                                .contains_key(owner_run_id.as_str());
+                                            if owner_alive {
+                                                rejection = Some(format!(
+                                                    "vnet proxy '{}' rejected: subnet '{subnet}' in virtual_net '{vn}' already owned by live run_id {owner_run_id} (proxy '{owner_proxy}')",
+                                                    np.proxy_name
+                                                ));
+                                            } else {
+                                                warn!(
+                                                    proxy_name = %np.proxy_name,
+                                                    virtual_net = %vn,
+                                                    subnet = %subnet,
+                                                    owner_run_id = %owner_run_id,
+                                                    owner_proxy = %owner_proxy,
+                                                    "vnet proxy route: taking over subnet from dead run_id"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                if rejection.is_none() {
+                                    routes.insert(key, (run_id.to_string(), np.proxy_name.clone()));
+                                }
+                            }
+                        }
+                        if let Some(rejection) = rejection {
+                            // Roll back the proxy registration done above
+                            // (mirror the vhost/tcpmux conflict rejections).
+                            // vnet proxies never consume a port, so the
+                            // port rollback is a no-op.
+                            rollback_vhost_conflict(state, run_id, port, false).await;
+                            state.proxy_manager.remove(&np.proxy_name).await;
+                            reject_new_proxy(
+                                writer,
+                                &np.proxy_name,
+                                err_msg(
+                                    state.detailed_errors_to_client,
+                                    rejection,
+                                    "vnet route config conflict",
+                                ),
+                                v2,
+                            )
+                            .await;
+                            return false;
+                        }
                         info!(
                             proxy_name = %np.proxy_name,
                             subnet = %subnet,
@@ -2064,7 +2161,132 @@ pub(crate) async fn handle_new_proxy(
                 }
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
-                if let Err(conflict) = state
+                let headers: Vec<(String, String)> =
+                    np.headers.clone().unwrap_or_default().into_iter().collect();
+
+                // TCPMux load-balancing group (Go frp v0.71.0
+                // group.TCPMuxGroupController + server/proxy/tcpmux.go
+                // httpConnectListen): when LoadBalancer.Group is set the
+                // Listen goes through the group controller — the FIRST
+                // member creates the group and registers the shared muxer
+                // route; later members are validated against it (params
+                // equal → "group params invalid" ErrGroupParamsInvalid,
+                // group_key equal → "group auth failed" ErrGroupAuthFailed,
+                // both verbatim, Go check order) and join the fan-out.
+                // M2 audit fix: second members were previously rejected as
+                // plain route conflicts, silently disabling the documented
+                // multi-client load-balanced tcpmux feature.
+                //
+                // Go's TCPMuxGroup stores ONE (domain, rubu, user, pwd) per
+                // group name — a same-group proxy whose second domain
+                // differs from the first member's is rejected with
+                // ErrGroupParamsInvalid. Mirrored up front like the HTTP
+                // group path ("http group proxies must configure exactly
+                // one custom_domain and one location"), instead of failing
+                // mid-registration.
+                let group_name = np.group.as_deref().unwrap_or("");
+                if !group_name.is_empty() {
+                    if domains.len() != 1 {
+                        rollback_vhost_conflict(state, run_id, port, false).await;
+                        state.proxy_manager.remove(&np.proxy_name).await;
+                        reject_new_proxy(
+                            writer,
+                            &np.proxy_name,
+                            err_msg(
+                                state.detailed_errors_to_client,
+                                "tcpmux group proxies must configure exactly one custom_domain (Go frp TCPMuxGroup semantics)".into(),
+                                "tcpmux group params invalid",
+                            ),
+                            v2,
+                        )
+                        .await;
+                        return false;
+                    }
+                    let domain = &domains[0];
+                    match state
+                        .tcpmux_group_ctl
+                        .register_member(
+                            group_name,
+                            np.group_key.as_deref().unwrap_or(""),
+                            domain,
+                            np.route_by_http_user.as_deref().unwrap_or(""),
+                            http_user,
+                            http_pwd,
+                            &np.proxy_name,
+                        )
+                        .await
+                    {
+                        Ok((_group, is_first)) => {
+                            // Only the first member registers the shared
+                            // tcpmux route (tagged with the group name);
+                            // later members just joined the member list.
+                            if is_first {
+                                if let Err(conflict) = state
+                                    .tcpmux_manager
+                                    .register(
+                                        &np.proxy_name,
+                                        &domains,
+                                        run_id,
+                                        http_user,
+                                        http_pwd,
+                                        // Round 6 (A2): route_by_http_user is
+                                        // the second tcpmux routing dimension
+                                        // (Go RouteConfig) — CONNECT lookups
+                                        // match the request user's bucket
+                                        // first.
+                                        np.route_by_http_user.as_deref().unwrap_or(""),
+                                        &headers,
+                                        group_name,
+                                    )
+                                    .await
+                                {
+                                    state
+                                        .tcpmux_group_ctl
+                                        .unregister_member(group_name, &np.proxy_name)
+                                        .await;
+                                    rollback_vhost_conflict(state, run_id, port, false).await;
+                                    state.proxy_manager.remove(&np.proxy_name).await;
+                                    reject_new_proxy(
+                                        writer,
+                                        &np.proxy_name,
+                                        err_msg(
+                                            state.detailed_errors_to_client,
+                                            conflict,
+                                            "tcpmux route config conflict",
+                                        ),
+                                        v2,
+                                    )
+                                    .await;
+                                    return false;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // e is the verbatim Go rejection ("group params
+                            // invalid" / "group auth failed").
+                            rollback_vhost_conflict(state, run_id, port, false).await;
+                            state.proxy_manager.remove(&np.proxy_name).await;
+                            reject_new_proxy(
+                                writer,
+                                &np.proxy_name,
+                                err_msg(
+                                    state.detailed_errors_to_client,
+                                    e,
+                                    "tcpmux group registration failed",
+                                ),
+                                v2,
+                            )
+                            .await;
+                            return false;
+                        }
+                    }
+                    info!(
+                        proxy_name = %np.proxy_name, group = %group_name, domain = %domain,
+                        rubu = %np.route_by_http_user.as_deref().unwrap_or(""),
+                        "TCPMux proxy '{}' registered in group '{}' (route {})",
+                        np.proxy_name, group_name, domain
+                    );
+                } else if let Err(conflict) = state
                     .tcpmux_manager
                     .register(
                         &np.proxy_name,
@@ -2076,11 +2298,8 @@ pub(crate) async fn handle_new_proxy(
                         // tcpmux routing dimension (Go RouteConfig) — CONNECT
                         // lookups match the request user's bucket first.
                         np.route_by_http_user.as_deref().unwrap_or(""),
-                        &np.headers
-                            .clone()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .collect::<Vec<(String, String)>>(),
+                        &headers,
+                        "",
                     )
                     .await
                 {
@@ -2102,10 +2321,12 @@ pub(crate) async fn handle_new_proxy(
                     .await;
                     return false;
                 }
-                info!(
-                    proxy_name = %np.proxy_name, domains = ?domains, "TCPMux routes registered for '{}': domains={:?}",
-                    np.proxy_name, domains
-                );
+                if group_name.is_empty() {
+                    info!(
+                        proxy_name = %np.proxy_name, domains = ?domains, "TCPMux routes registered for '{}': domains={:?}",
+                        np.proxy_name, domains
+                    );
+                }
             }
 
             let mut udp_resp_signals = match setup_proxy_listeners(
@@ -2760,7 +2981,24 @@ pub(crate) async fn unregister_control(
         } else {
             state.vhost_manager.unregister(&p.name).await;
         }
-        state.tcpmux_manager.unregister(&p.name).await;
+        // TCPMux group members share one route (owned by the FIRST member):
+        // remove from the group first; only drop the route when the group
+        // empties — the owner's name keys it, so unregistering with a later
+        // member's name would leak it (M2, mirrors the HTTP group branch).
+        let is_tcpmux_group =
+            p.proxy_type == "tcpmux" && p.group.as_deref().filter(|g| !g.is_empty()).is_some();
+        if is_tcpmux_group {
+            let gname = p.group.as_deref().unwrap_or_default();
+            if let Some(owner) = state
+                .tcpmux_group_ctl
+                .unregister_member(gname, &p.name)
+                .await
+            {
+                state.tcpmux_manager.unregister(&owner).await;
+            }
+        } else {
+            state.tcpmux_manager.unregister(&p.name).await;
+        }
         state.proxy_metrics.remove(&p.name).await;
     }
     #[cfg(feature = "vnet")]
@@ -3889,6 +4127,388 @@ pub(crate) mod unregister_generation_tests {
             state.client_ports_used.read().await.get("run-1").is_none(),
             "per-client count must be cleared when the last control leaves"
         );
+    }
+
+    /// M2: tcpmux load-balancing group (Go frp v0.71.0 group.TCPMuxGroup).
+    /// A second client with the SAME group + group_key + routing params
+    /// joins the group instead of hitting the route conflict — the shared
+    /// route stays keyed on the first member, and accepted conns fan out
+    /// round-robin across members.
+    #[tokio::test]
+    async fn tcpmux_group_second_member_joins_shared_route() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        insert_control(&state, "run-2", 2).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // First member (client run-1) creates the group and registers the
+        // shared route, tagged with the group name.
+        let mut np1 = new_proxy("mux-a", "tcpmux");
+        np1.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np1.group = Some("web".to_string());
+        np1.group_key = Some("gk".to_string());
+        np1.http_user = Some("alice".to_string());
+        np1.http_pwd = Some("secret".to_string());
+        let mut writer1 = Vec::new();
+        let ok = handle_new_proxy(
+            np1,
+            "run-1",
+            1,
+            &state,
+            &mut writer1,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "first group member must register");
+        let route = state
+            .tcpmux_manager
+            .lookup("a.example.com", "alice")
+            .await
+            .expect("shared route must be registered");
+        assert_eq!(route.proxy_name, "mux-a", "route keys on the first member");
+        assert_eq!(route.group, "web", "shared route must carry the group");
+
+        // Second member (client run-2), identical group/group_key/params:
+        // joins the member list — no route conflict, no own route.
+        let mut np2 = new_proxy("mux-b", "tcpmux");
+        np2.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np2.group = Some("web".to_string());
+        np2.group_key = Some("gk".to_string());
+        np2.http_user = Some("alice".to_string());
+        np2.http_pwd = Some("secret".to_string());
+        let mut writer2 = Vec::new();
+        let ok = handle_new_proxy(
+            np2,
+            "run-2",
+            2,
+            &state,
+            &mut writer2,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "matching second member must join the group");
+        assert!(
+            state.proxy_manager.get("mux-b").await.is_some(),
+            "joined member must be registered"
+        );
+        assert!(
+            !String::from_utf8_lossy(&writer2).contains("conflict"),
+            "second member must NOT be rejected as a route conflict: {}",
+            String::from_utf8_lossy(&writer2)
+        );
+
+        // Round-robin fan-out: accepted conns alternate members.
+        assert_eq!(
+            state
+                .tcpmux_group_ctl
+                .choose_endpoint("web")
+                .await
+                .as_deref(),
+            Some("mux-a")
+        );
+        assert_eq!(
+            state
+                .tcpmux_group_ctl
+                .choose_endpoint("web")
+                .await
+                .as_deref(),
+            Some("mux-b")
+        );
+
+        // Both members' routes auth against the SHARED route (validated
+        // equal at join) — the first member's credentials gate the group.
+        assert_eq!(route.http_user, "alice");
+    }
+
+    /// Register a tcpmux proxy through `handle_new_proxy`, returning
+    /// (accepted, response_text) for rejection-text assertions.
+    async fn register_tcpmux_group_member(
+        state: &Arc<AppState>,
+        itx: &mpsc::Sender<InternalMsg>,
+        handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+        udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+        np: msg::NewProxy,
+        run_id: &str,
+        ctl_id: u64,
+    ) -> (bool, String) {
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            run_id,
+            ctl_id,
+            state,
+            &mut writer,
+            itx,
+            handles,
+            udp_sockets,
+            false,
+        )
+        .await;
+        (ok, String::from_utf8_lossy(&writer).to_string())
+    }
+
+    /// M2: same group but mismatched routing params or group_key rejects
+    /// with the Go-verbatim errors ("group params invalid" /
+    /// "group auth failed"), rolled back without touching the group.
+    #[tokio::test]
+    async fn tcpmux_group_mismatch_rejected_with_go_errors() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        insert_control(&state, "run-2", 2).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+        // First member with http auth.
+        let mut np1 = new_proxy("mux-a", "tcpmux");
+        np1.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np1.group = Some("web".to_string());
+        np1.group_key = Some("gk".to_string());
+        np1.http_user = Some("alice".to_string());
+        np1.http_pwd = Some("secret".to_string());
+        let (ok, _) = register_tcpmux_group_member(
+            &state,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            np1,
+            "run-1",
+            1,
+        )
+        .await;
+        assert!(ok, "first member must register");
+
+        // Password mismatch → Go ErrGroupParamsInvalid text.
+        let mut np2 = new_proxy("mux-b", "tcpmux");
+        np2.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np2.group = Some("web".to_string());
+        np2.group_key = Some("gk".to_string());
+        np2.http_user = Some("alice".to_string());
+        np2.http_pwd = Some("wrong".to_string());
+        let (ok, text) = register_tcpmux_group_member(
+            &state,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            np2,
+            "run-2",
+            2,
+        )
+        .await;
+        assert!(!ok, "params mismatch must reject");
+        assert!(
+            text.contains("group params invalid"),
+            "rejection must carry the Go text: {text}"
+        );
+        assert!(
+            state.proxy_manager.get("mux-b").await.is_none(),
+            "rejected member must be rolled back"
+        );
+
+        // Group_key mismatch → Go ErrGroupAuthFailed text.
+        let mut np3 = new_proxy("mux-c", "tcpmux");
+        np3.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np3.group = Some("web".to_string());
+        np3.group_key = Some("WRONG".to_string());
+        np3.http_user = Some("alice".to_string());
+        np3.http_pwd = Some("secret".to_string());
+        let (ok, text) = register_tcpmux_group_member(
+            &state,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            np3,
+            "run-2",
+            2,
+        )
+        .await;
+        assert!(!ok, "group_key mismatch must reject");
+        assert!(
+            text.contains("group auth failed"),
+            "rejection must carry the Go text: {text}"
+        );
+
+        // The group survives both rejections — the original member keeps
+        // serving.
+        assert_eq!(
+            state
+                .tcpmux_group_ctl
+                .choose_endpoint("web")
+                .await
+                .as_deref(),
+            Some("mux-a")
+        );
+    }
+
+    /// M2: Go's TCPMuxGroup stores ONE (domain, rubu, user, pwd) per group
+    /// name — a grouped proxy with a second, different domain fails with
+    /// ErrGroupParamsInvalid. frp-rs mirrors the HTTP group path and
+    /// rejects up front (Go parity quirk: multi-domain group proxies are
+    /// not supported server-side).
+    #[tokio::test]
+    async fn tcpmux_group_multi_domain_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("mux-multi", "tcpmux");
+        np.custom_domains = Some(vec![
+            "a.example.com".to_string(),
+            "b.example.com".to_string(),
+        ]);
+        np.group = Some("web".to_string());
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            "run-1",
+            1,
+            &state,
+            &mut writer,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(!ok, "multi-domain group proxy must be rejected");
+        let text = String::from_utf8_lossy(&writer);
+        assert!(
+            text.contains("exactly one custom_domain"),
+            "rejection must explain the constraint: {text}"
+        );
+        assert!(
+            state
+                .tcpmux_manager
+                .lookup("a.example.com", "")
+                .await
+                .is_none(),
+            "rejected registration must leave no route"
+        );
+    }
+
+    /// M2: group members and plain proxies cannot share a (domain, rubu)
+    /// route — Go routes grouped and plain proxies through the same muxer,
+    /// where the second registration is a Routers.Add conflict. The
+    /// existing conflict rejection must hold in both orderings.
+    #[tokio::test]
+    async fn tcpmux_group_vs_plain_route_conflict() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        insert_control(&state, "run-2", 2).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // Group member registers first (shared route under mux-a).
+        let mut np1 = new_proxy("mux-a", "tcpmux");
+        np1.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np1.group = Some("web".to_string());
+        np1.group_key = Some("gk".to_string());
+        let mut writer1 = Vec::new();
+        assert!(
+            handle_new_proxy(
+                np1,
+                "run-1",
+                1,
+                &state,
+                &mut writer1,
+                &itx,
+                &mut handles,
+                &mut udp_sockets,
+                false,
+            )
+            .await
+        );
+        // Plain proxy claims the same domain → route conflict.
+        let mut np2 = new_proxy("mux-b", "tcpmux");
+        np2.custom_domains = Some(vec!["a.example.com".to_string()]);
+        let mut writer2 = Vec::new();
+        assert!(
+            !handle_new_proxy(
+                np2,
+                "run-2",
+                2,
+                &state,
+                &mut writer2,
+                &itx,
+                &mut handles,
+                &mut udp_sockets,
+                false,
+            )
+            .await,
+            "plain proxy must not displace a group's shared route"
+        );
+        let text2 = String::from_utf8_lossy(&writer2);
+        assert!(text2.contains("conflict"), "must surface conflict: {text2}");
+
+        // Reverse: plain proxy first (run-3), then a group member on the
+        // same domain with a DIFFERENT group name — the grouped register
+        // is a route conflict too (its group differs from the owner's).
+        insert_control(&state, "run-3", 3).await;
+        insert_control(&state, "run-4", 4).await;
+        let mut np3 = new_proxy("mux-c", "tcpmux");
+        np3.custom_domains = Some(vec!["b.example.com".to_string()]);
+        let mut writer3 = Vec::new();
+        assert!(
+            handle_new_proxy(
+                np3,
+                "run-3",
+                3,
+                &state,
+                &mut writer3,
+                &itx,
+                &mut handles,
+                &mut udp_sockets,
+                false,
+            )
+            .await
+        );
+        let mut np4 = new_proxy("mux-d", "tcpmux");
+        np4.custom_domains = Some(vec!["b.example.com".to_string()]);
+        np4.group = Some("other".to_string());
+        let mut writer4 = Vec::new();
+        assert!(
+            !handle_new_proxy(
+                np4,
+                "run-4",
+                4,
+                &state,
+                &mut writer4,
+                &itx,
+                &mut handles,
+                &mut udp_sockets,
+                false,
+            )
+            .await,
+            "different group cannot displace a plain route"
+        );
+        let text4 = String::from_utf8_lossy(&writer4);
+        assert!(text4.contains("conflict"), "must surface conflict: {text4}");
     }
 
     /// Audit finding 5 regression: a tcpmux proxy claiming a domain already
@@ -5781,6 +6401,211 @@ pub(crate) mod unregister_generation_tests {
             state2.proxy_manager.get("m2").await.is_some(),
             "tcpmux with default multiplexer must register"
         );
+    }
+
+    /// Register a vnet proxy through the full handle_new_proxy path.
+    /// Returns (ok, NewProxyResp bytes as lossy string).
+    #[cfg(feature = "vnet")]
+    async fn register_vnet_proxy(
+        state: &Arc<AppState>,
+        itx: &mpsc::Sender<InternalMsg>,
+        handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+        udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+        np: msg::NewProxy,
+        run_id: &str,
+        ctl_id: u64,
+    ) -> (bool, String) {
+        let mut writer = Vec::new();
+        let ok = handle_new_proxy(
+            np,
+            run_id,
+            ctl_id,
+            state,
+            &mut writer,
+            itx,
+            handles,
+            udp_sockets,
+            false,
+        )
+        .await;
+        (ok, String::from_utf8_lossy(&writer).to_string())
+    }
+
+    /// M2-adjacent audit finding 5: the NewProxy vnet_routes insert was
+    /// unconditional — a hijack advertise subnet (0.0.0.0/0) registered
+    /// instead of being refused like the VnetRouteAdvertise path refuses
+    /// it. The proxy registration must roll back and the client must get
+    /// an explicit rejection.
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn vnet_proxy_hijack_prefix_rejected_and_rolled_back() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // 0.0.0.0/0 would inject a default route into peers' kernels.
+        let mut np = new_proxy("vp-hijack", "vnet");
+        np.virtual_net = Some("vnet-1".to_string());
+        np.advertise_subnet = Some("0.0.0.0/0".to_string());
+        let (ok, resp) =
+            register_vnet_proxy(&state, &itx, &mut handles, &mut udp_sockets, np, "run-1", 1).await;
+        assert!(!ok, "hijack-prefix vnet proxy must be rejected: {resp}");
+        assert!(
+            resp.contains("hijack prefix"),
+            "rejection must name the hijack prefix: {resp}"
+        );
+        assert!(
+            state.proxy_manager.get("vp-hijack").await.is_none(),
+            "rejected proxy must be rolled back out of the registry"
+        );
+        assert!(
+            state.vnet_routes.read().await.is_empty(),
+            "no route may be inserted for a rejected hijack proxy"
+        );
+    }
+
+    /// Audit finding 5: the per-client route cap (64) must also gate the
+    /// NewProxy path, not just VnetRouteAdvertise. Re-registering an
+    /// already-owned key stays allowed (reload keeps the run_id).
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn vnet_proxy_route_cap_blocks_new_keys_allows_own_update() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        {
+            let mut routes = state.vnet_routes.write().await;
+            for i in 0..crate::control::nathole::MAX_VNET_ROUTES_PER_CLIENT {
+                routes.insert(
+                    ("vnet-1".to_string(), format!("10.{i}.0.0/16")),
+                    ("run-1".to_string(), format!("filler-{i}")),
+                );
+            }
+        }
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // New key at the cap → rejected.
+        let mut np = new_proxy("vp-over", "vnet");
+        np.virtual_net = Some("vnet-1".to_string());
+        np.advertise_subnet = Some("10.200.0.0/16".to_string());
+        let (ok, resp) =
+            register_vnet_proxy(&state, &itx, &mut handles, &mut udp_sockets, np, "run-1", 1).await;
+        assert!(!ok, "over-cap vnet proxy must be rejected: {resp}");
+        assert!(
+            resp.contains("route cap"),
+            "rejection must name the per-client cap: {resp}"
+        );
+        assert!(state.proxy_manager.get("vp-over").await.is_none());
+
+        // Same run_id re-registering an already-owned key (reload) → allowed.
+        let mut np = new_proxy("vp-update", "vnet");
+        np.virtual_net = Some("vnet-1".to_string());
+        np.advertise_subnet = Some("10.0.0.0/16".to_string());
+        let (ok, resp) =
+            register_vnet_proxy(&state, &itx, &mut handles, &mut udp_sockets, np, "run-1", 1).await;
+        assert!(ok, "own-key re-registration must be allowed: {resp}");
+        let routes = state.vnet_routes.read().await;
+        assert_eq!(
+            routes.get(&("vnet-1".to_string(), "10.0.0.0/16".to_string())),
+            Some(&("run-1".to_string(), "vp-update".to_string())),
+            "own-key update must replace the route value"
+        );
+        drop(routes);
+    }
+
+    /// Audit finding 5: a live owner's (virtual_net, subnet) route must not
+    /// be silently overwritten by another run_id's vnet proxy — the
+    /// displaced proxy's visitor packets would be redirected here. The
+    /// second registration is rejected and the original route survives.
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn vnet_proxy_live_owner_conflict_rejected() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        insert_control(&state, "run-2", 2).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // First owner registers its route.
+        let mut np = new_proxy("vp-a", "vnet");
+        np.virtual_net = Some("vnet-1".to_string());
+        np.advertise_subnet = Some("10.7.0.0/24".to_string());
+        let (ok, resp) =
+            register_vnet_proxy(&state, &itx, &mut handles, &mut udp_sockets, np, "run-1", 1).await;
+        assert!(ok, "first owner must register: {resp}");
+
+        // Second run_id, same subnet → rejected, route untouched.
+        let mut np = new_proxy("vp-b", "vnet");
+        np.virtual_net = Some("vnet-1".to_string());
+        np.advertise_subnet = Some("10.7.0.0/24".to_string());
+        let (ok, resp) =
+            register_vnet_proxy(&state, &itx, &mut handles, &mut udp_sockets, np, "run-2", 2).await;
+        assert!(!ok, "live-owner conflict must be rejected: {resp}");
+        assert!(
+            resp.contains("already owned by live run_id"),
+            "rejection must name the live owner: {resp}"
+        );
+        assert!(state.proxy_manager.get("vp-b").await.is_none());
+        let routes = state.vnet_routes.read().await;
+        assert_eq!(
+            routes.get(&("vnet-1".to_string(), "10.7.0.0/24".to_string())),
+            Some(&("run-1".to_string(), "vp-a".to_string())),
+            "the original owner's route must survive the rejected takeover"
+        );
+        drop(routes);
+    }
+
+    /// Audit finding 5: a DEAD owner's route is reclaimable — a crashed
+    /// client that restarted with a fresh run_id must not be blocked from
+    /// re-advertising its subnet (mirror of the advertise-path liveness
+    /// check).
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn vnet_proxy_takes_over_dead_owner_route() {
+        let state = test_state();
+        // run-1 is NOT in run_id_to_ctl_tx — its control is dead.
+        state.vnet_routes.write().await.insert(
+            ("vnet-1".to_string(), "10.7.0.0/24".to_string()),
+            ("run-1".to_string(), "ghost".to_string()),
+        );
+        insert_control(&state, "run-2", 2).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np = new_proxy("vp-b", "vnet");
+        np.virtual_net = Some("vnet-1".to_string());
+        np.advertise_subnet = Some("10.7.0.0/24".to_string());
+        let (ok, resp) =
+            register_vnet_proxy(&state, &itx, &mut handles, &mut udp_sockets, np, "run-2", 2).await;
+        assert!(ok, "dead-owner takeover must be allowed: {resp}");
+        let routes = state.vnet_routes.read().await;
+        assert_eq!(
+            routes.get(&("vnet-1".to_string(), "10.7.0.0/24".to_string())),
+            Some(&("run-2".to_string(), "vp-b".to_string())),
+            "the fresh run_id must own the reclaimed route"
+        );
+        drop(routes);
     }
 }
 

@@ -631,6 +631,150 @@ impl HttpGroupController {
     }
 }
 
+/// A TCPMux load-balancing group (Go frp v0.71.0 `group.TCPMuxGroup`): the
+/// FIRST member to register creates the group and (through the caller) the
+/// shared tcpmux route; subsequent members only join the member list after
+/// the group_key and routing params (domain/routeByHTTPUser/httpUser/
+/// httpPassword) match the first member's — Go `TCPMuxGroup.HTTPConnectListen`
+/// returns `ErrGroupParamsInvalid` on param mismatch and `ErrGroupAuthFailed`
+/// on group_key mismatch (both verbatim, in Go's check order: params first).
+/// Accepted CONNECTs fan out to members round-robin (`choose_endpoint`).
+///
+/// Go parity note: Go's group stores ONE (domain, routeByHTTPUser, user,
+/// password) route per group name, so a same-group proxy whose second
+/// domain differs from the first member's is rejected with
+/// ErrGroupParamsInvalid — the caller enforces `domains.len() == 1` up
+/// front (same as the HTTP group path).
+#[derive(Debug)]
+pub(crate) struct TcpMuxGroup {
+    group_key: String,
+    domain: String,
+    route_by_http_user: String,
+    http_user: String,
+    http_pwd: String,
+    /// Member proxy names, in registration order (round-robin).
+    members: RwLock<Vec<String>>,
+    /// Round-robin cursor (Go `atomic.Uint64` index).
+    index: AtomicU64,
+    /// The FIRST member to register — it owns the shared tcpmux route
+    /// (tcpmux_manager's by_proxy index keys on this name). When the group
+    /// empties, the route must be unregistered with THIS name, not the
+    /// last member that happened to leave.
+    route_owner: String,
+}
+
+pub(crate) struct TcpMuxGroupController {
+    groups: RwLock<HashMap<String, Arc<TcpMuxGroup>>>,
+}
+
+impl TcpMuxGroupController {
+    pub fn new() -> Self {
+        Self {
+            groups: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a group member. The FIRST member creates the group (the
+    /// caller then registers the shared tcpmux route); subsequent members
+    /// are validated against the existing group (Go TCPMuxGroup
+    /// HTTPConnectListen): routing params must be identical
+    /// (`ErrGroupParamsInvalid` "group params invalid") and group_key must
+    /// match (`ErrGroupAuthFailed` "group auth failed") — both texts
+    /// verbatim, checked in Go's order.
+    /// Returns `(group, is_first_member)` on success, Err(String) on
+    /// mismatch/repeat. The caller registers the shared tcpmux route only
+    /// for the first member.
+    /// Lock ordering: `groups` write lock is always acquired BEFORE any
+    /// `members` lock (never the reverse), so nested awaits cannot deadlock.
+    #[allow(clippy::too_many_arguments)] // mirrors HttpGroupController::register_member
+    pub async fn register_member(
+        &self,
+        group: &str,
+        group_key: &str,
+        domain: &str,
+        route_by_http_user: &str,
+        http_user: &str,
+        http_pwd: &str,
+        proxy_name: &str,
+    ) -> Result<(Arc<TcpMuxGroup>, bool), String> {
+        let mut groups = self.groups.write().await;
+        if let Some(g) = groups.get(group) {
+            // Existing group: validate routing params first, then the
+            // group_key — Go TCPMuxGroup.HTTPConnectListen check order
+            // (group/tcpmux.go: params → ErrGroupParamsInvalid, then key →
+            // ErrGroupAuthFailed). domain/route_by_http_user equality is
+            // structural here (the caller routes one domain through one
+            // bucket), but checked anyway so the guard stands alone.
+            if g.domain != domain
+                || g.route_by_http_user != route_by_http_user
+                || g.http_user != http_user
+                || g.http_pwd != http_pwd
+            {
+                return Err("group params invalid".to_string());
+            }
+            if g.group_key != group_key {
+                return Err("group auth failed".to_string());
+            }
+            let mut members = g.members.write().await;
+            if members.iter().any(|m| m == proxy_name) {
+                return Err(format!(
+                    "proxy [{}] is already a member of tcpmux group [{}]",
+                    proxy_name, group
+                ));
+            }
+            members.push(proxy_name.to_string());
+            return Ok((g.clone(), false));
+        }
+        let g = Arc::new(TcpMuxGroup {
+            group_key: group_key.to_string(),
+            domain: domain.to_string(),
+            route_by_http_user: route_by_http_user.to_string(),
+            http_user: http_user.to_string(),
+            http_pwd: http_pwd.to_string(),
+            members: RwLock::new(vec![proxy_name.to_string()]),
+            index: AtomicU64::new(0),
+            route_owner: proxy_name.to_string(),
+        });
+        groups.insert(group.to_string(), g.clone());
+        Ok((g, true))
+    }
+
+    /// Remove a member. Returns `Some(route_owner)` when the group became
+    /// empty — the caller must then drop the shared tcpmux route using the
+    /// OWNER's name (the first member registered it) and the group is
+    /// removed. Returns `None` when the group still has members or did not
+    /// exist.
+    pub async fn unregister_member(&self, group: &str, proxy_name: &str) -> Option<String> {
+        let mut groups = self.groups.write().await;
+        let g = groups.get(group)?;
+        let empty = {
+            let mut members = g.members.write().await;
+            members.retain(|m| m != proxy_name);
+            members.is_empty()
+        };
+        if empty {
+            let owner = g.route_owner.clone();
+            groups.remove(group);
+            Some(owner)
+        } else {
+            None
+        }
+    }
+
+    /// Round-robin pick a member proxy name (Go TCPMuxGroup fan-out).
+    /// Returns None when the group has no members.
+    pub async fn choose_endpoint(&self, group: &str) -> Option<String> {
+        let groups = self.groups.read().await;
+        let g = groups.get(group)?;
+        let members = g.members.read().await;
+        if members.is_empty() {
+            return None;
+        }
+        let idx = g.index.fetch_add(1, AtomicOrdering::Relaxed) as usize % members.len();
+        Some(members[idx].clone())
+    }
+}
+
 // ---------------------------------------------------------------
 // Replay-detection table (login timestamp → run_ids)
 // ---------------------------------------------------------------
@@ -830,11 +974,15 @@ pub struct AppState {
     pub run_mu_map: Arc<std::sync::Mutex<HashMap<String, Arc<RunMuEntry>>>>,
     pub proxy_bind_addr: String,
     pub vhost_manager: Arc<VhostManager>,
-    /// Number of HTTPS proxies with registered SNI routes. The main accept
-    /// loop gates the ClientHello SNI peek on this: when zero, the sniff
-    /// (2x4KiB allocs + 4KiB blocking pre-read + parse + vhost lookup on
-    /// every TLS connection) is skipped entirely. Incremented on https
-    /// registration, decremented on unregister/close.
+    /// Accounting counter for HTTPS proxies with registered SNI routes.
+    /// NOTE (audit round 6d): the main-port SNI sniff it used to gate was
+    /// removed in round 13 (Go reads only the 0x17/0x16 TLS marker on the
+    /// main port; https SNI routing lives on vhost_https_port), so no
+    /// production reader remains — the counter is retained for tests.
+    /// Kept monotone-asymmetric by design: https GROUP members return
+    /// before the increment yet are decremented on removal (saturating,
+    /// see `dec_https_proxy_count`), so it can sit at 0 while https
+    /// proxies exist.
     pub https_proxy_count: AtomicUsize,
     pub vhost_http_port: u16,
     pub xtcp: XtcpState,
@@ -861,6 +1009,11 @@ pub struct AppState {
     /// server/group/http.go). Groups of http/https proxies share one vhost
     /// route; requests are dispatched round-robin across members.
     pub(crate) http_group_ctl: HttpGroupController,
+    /// TCPMux load-balancing groups (Go frp group.TCPMuxGroupController):
+    /// multi-client tcpmux proxies sharing one domain route, fanned out
+    /// round-robin. Members register through `register_member`; accepted
+    /// CONNECTs pick a member via `choose_endpoint` at dispatch time.
+    pub(crate) tcpmux_group_ctl: TcpMuxGroupController,
     pub vhost_http_timeout: u64,
     pub user_conn_timeout: u64,
     pub tcp_mux_passthrough: bool,
@@ -1054,6 +1207,7 @@ impl AppState {
             sudp_port,
             tcp_group_ctl: TcpGroupCtl::new(),
             http_group_ctl: HttpGroupController::new(),
+            tcpmux_group_ctl: TcpMuxGroupController::new(),
             vhost_http_timeout,
             user_conn_timeout,
             tcp_mux_passthrough,
@@ -1222,11 +1376,13 @@ impl AppState {
         (entry.mu.clone(), guard)
     }
 
-    /// Decrement the SNI-sniff gate count (`https_proxy_count`), saturating
-    /// at zero. The dashboard delete path and the client CloseProxy path can
-    /// race — both observe the proxy before either removes it — and a plain
-    /// fetch_sub would underflow to `usize::MAX`, permanently enabling the
-    /// SNI-sniff gate (perf-only, no correctness impact).
+    /// Decrement `https_proxy_count`, saturating at zero. The dashboard
+    /// delete path and the client CloseProxy path can race — both observe
+    /// the proxy before either removes it — and a plain fetch_sub would
+    /// underflow to `usize::MAX`. The saturating form also absorbs the
+    /// round-6d group asymmetry: https GROUP members never increment yet
+    /// are decremented on removal, so the counter must not go negative
+    /// (accounting-only today; no production reader).
     pub fn dec_https_proxy_count(&self) {
         let mut cur = self.https_proxy_count.load(AtomicOrdering::Relaxed);
         while cur > 0 {
@@ -2006,5 +2162,120 @@ mod tests {
                 .check_login_throttle(std::net::SocketAddr::from((untracked, 103)))
                 .await
         );
+    }
+    // M2: tcpmux group fan-out (Go frp v0.71.0 group.TCPMuxGroup). Second
+    // members join after Go-order validation (params → "group params
+    // invalid", key → "group auth failed", both verbatim); the route owner
+    // is the first member and surfaces only when the group empties;
+    // choose_endpoint round-robins.
+    #[tokio::test]
+    async fn tcpmux_group_controller_join_validation_and_round_robin() {
+        let ctl = TcpMuxGroupController::new();
+
+        // First member creates the group.
+        let (g, first) = ctl
+            .register_member(
+                "web",
+                "k1",
+                "tunnel.example.com",
+                "",
+                "user",
+                "pwd",
+                "mux-a",
+            )
+            .await
+            .expect("first member must create the group");
+        assert!(first);
+        assert_eq!(g.route_owner, "mux-a");
+
+        // Second member, identical params + key → joins.
+        let (_, first) = ctl
+            .register_member(
+                "web",
+                "k1",
+                "tunnel.example.com",
+                "",
+                "user",
+                "pwd",
+                "mux-b",
+            )
+            .await
+            .expect("matching second member must join");
+        assert!(!first);
+
+        // Round-robin: 3 picks alternate mux-a, mux-b, mux-a.
+        assert_eq!(ctl.choose_endpoint("web").await.as_deref(), Some("mux-a"));
+        assert_eq!(ctl.choose_endpoint("web").await.as_deref(), Some("mux-b"));
+        assert_eq!(ctl.choose_endpoint("web").await.as_deref(), Some("mux-a"));
+
+        // Go ErrGroupParamsInvalid: params checked BEFORE the key — a
+        // user/pwd mismatch rejects verbatim even with the right key.
+        let err = ctl
+            .register_member(
+                "web",
+                "k1",
+                "tunnel.example.com",
+                "",
+                "user",
+                "OTHER",
+                "mux-c",
+            )
+            .await
+            .expect_err("password mismatch must reject");
+        assert_eq!(err, "group params invalid");
+        let err = ctl
+            .register_member("web", "k1", "other.example.com", "", "user", "pwd", "mux-c")
+            .await
+            .expect_err("domain mismatch must reject");
+        assert_eq!(err, "group params invalid");
+        // Go ErrGroupAuthFailed: same params, wrong key.
+        let err = ctl
+            .register_member(
+                "web",
+                "WRONG",
+                "tunnel.example.com",
+                "",
+                "user",
+                "pwd",
+                "mux-c",
+            )
+            .await
+            .expect_err("group_key mismatch must reject");
+        assert_eq!(err, "group auth failed");
+        // Duplicate member.
+        let err = ctl
+            .register_member(
+                "web",
+                "k1",
+                "tunnel.example.com",
+                "",
+                "user",
+                "pwd",
+                "mux-b",
+            )
+            .await
+            .expect_err("duplicate member must reject");
+        assert!(err.contains("already a member"), "err: {err}");
+
+        // Member close (non-owner): group survives, owner still registered.
+        assert_eq!(
+            ctl.unregister_member("web", "mux-b").await,
+            None,
+            "group with a remaining member must not return the owner"
+        );
+        assert_eq!(
+            ctl.choose_endpoint("web").await.as_deref(),
+            Some("mux-a"),
+            "surviving owner keeps serving"
+        );
+
+        // Owner close empties the group → owner surfaces for route removal,
+        // and the group is gone (choose_endpoint → None).
+        assert_eq!(
+            ctl.unregister_member("web", "mux-a").await.as_deref(),
+            Some("mux-a"),
+            "emptying the group must surface the route owner"
+        );
+        assert_eq!(ctl.choose_endpoint("web").await, None);
     }
 }

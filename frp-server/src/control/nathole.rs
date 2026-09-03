@@ -957,7 +957,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
 /// with a local TUN then runs an `ip route add` subprocess for the fake
 /// subnet (K advertisements × M peers = K×M fork/execs and attacker-chosen
 /// subnets injected into peers' kernel routing tables).
-const MAX_VNET_ROUTES_PER_CLIENT: usize = 64;
+pub(crate) const MAX_VNET_ROUTES_PER_CLIENT: usize = 64;
 
 /// Reject default-route / near-default hijack prefixes before they reach
 /// peers' kernel routing tables (via `ip route add` targeting the tun
@@ -973,7 +973,7 @@ const MAX_VNET_ROUTES_PER_CLIENT: usize = 64;
 /// itself is validated here as defense-in-depth (the client-side
 /// `valid_cidr` also rejects these prefixes).
 #[cfg(feature = "vnet")]
-fn is_route_hijack_prefix(subnet: &str) -> bool {
+pub(crate) fn is_route_hijack_prefix(subnet: &str) -> bool {
     let Some((_ip, prefix)) = subnet.split_once('/') else {
         return false;
     };

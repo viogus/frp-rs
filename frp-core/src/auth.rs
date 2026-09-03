@@ -442,6 +442,15 @@ mod oidc_impl {
         /// A jti seen with a different subject is rejected; the same jti with
         /// the same subject is allowed (frpc reconnects reuse the cached token).
         seen_jtis: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
+        /// Unix-seconds timestamp of the last full expired-entry sweep of
+        /// `seen_jtis` (audit round 3, LOW). A full `retain` is O(entries) —
+        /// up to `MAX_SEEN_JTIS` — so sweeping on every replay check would
+        /// burn CPU per cheap rejection under a multi-IP replay flood
+        /// against a large live table. The sweep is gated to once per 60s;
+        /// expired entries between sweeps are harmless (replay semantics
+        /// read the subject match identically and memory stays bounded by
+        /// the cap eviction, which removes soonest-expiring entries first).
+        last_replay_sweep: std::sync::atomic::AtomicI64,
         /// Background JWKS refresh task (started via `start_background_refresh`),
         /// aborted via `stop_background_refresh` (audit round 5, LOW 2.4).
         refresh_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -561,6 +570,7 @@ mod oidc_impl {
                 skip_audience,
                 http,
                 seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
+                last_replay_sweep: std::sync::atomic::AtomicI64::new(0),
                 refresh_task: std::sync::Mutex::new(None),
                 last_forced_refresh: std::sync::Mutex::new(None),
             };
@@ -941,8 +951,21 @@ mod oidc_impl {
             };
 
             let mut seen = self.seen_jtis.lock().unwrap_or_else(|e| e.into_inner());
-            // Lazy pruning of expired entries prevents unbounded growth.
-            seen.retain(|_, (_, d)| *d > now);
+            // Lazy pruning of expired entries prevents unbounded growth. The
+            // full-table sweep is O(entries) — at most once per 60s (audit
+            // round 3, LOW): a replay flood of cheap rejections must not pay
+            // a 100k-entry retain on every login. Entries that expire between
+            // sweeps are harmless — the subject match below reads them
+            // identically, and the size cap bounds memory regardless.
+            if now.saturating_sub(
+                self.last_replay_sweep
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ) > 60
+            {
+                self.last_replay_sweep
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
+                seen.retain(|_, (_, d)| *d > now);
+            }
 
             match seen.get(jti) {
                 Some((stored_subject, _)) if stored_subject == subject => Ok(()),
@@ -994,7 +1017,19 @@ mod oidc_impl {
                 .unwrap_or_default()
                 .as_secs() as i64;
             let mut seen = self.seen_jtis.lock().unwrap_or_else(|e| e.into_inner());
-            seen.retain(|_, (_, d)| *d > now);
+            // Same 60s-gated sweep as `check_replay` (audit round 3, LOW) —
+            // this pre-check runs on every OIDC login BEFORE verification,
+            // so it is the flood-reachable hot path; an ungated O(entries)
+            // retain here would burn CPU per cheap replay rejection.
+            if now.saturating_sub(
+                self.last_replay_sweep
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ) > 60
+            {
+                self.last_replay_sweep
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
+                seen.retain(|_, (_, d)| *d > now);
+            }
             matches!(seen.get(jti), Some((stored, _)) if stored != subject)
         }
 
@@ -1397,6 +1432,7 @@ mod oidc_impl {
                     .build()
                     .expect("test HTTP client"),
                 seen_jtis: std::sync::Mutex::new(std::collections::HashMap::new()),
+                last_replay_sweep: std::sync::atomic::AtomicI64::new(0),
                 refresh_task: std::sync::Mutex::new(None),
                 last_forced_refresh: std::sync::Mutex::new(None),
             }

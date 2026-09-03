@@ -85,6 +85,22 @@ const MAX_SESSIONS: usize = 1024;
 /// are cleaned up by the tick loop.
 const UNACCEPTED_SESSION_TIMEOUT_MS: u32 = 30_000; // 30 seconds
 
+/// Idle grace for the accepted-session reaper (M11): a session whose read
+/// channel has closed (its KcpStream was dropped — the frp conn it served
+/// ended or its handler's bounded read deadline fired) AND which has seen no
+/// inbound packet for this window AND has nothing left to send is removed by
+/// the tick arm. Live sessions are untouched — a KcpStream holds the read
+/// channel open for the connection's whole lifetime, so the frp layer's own
+/// liveness machinery (heartbeats, yamux keepalive) decides when a conn is
+/// dead, not this transport timer (a client with a long heartbeat interval
+/// keeps its stream open indefinitely — never reaped). The grace exceeds the
+/// KCP retransmission ceiling (RTO max 2s), so a peer that is still alive and
+/// merely retransmitting re-stamps the session and survives. Together with
+/// the ~30s bounded reads of the accept-side handlers this keeps a crafted-
+/// session flood's steady-state footprint well under MAX_SESSIONS, so the
+/// KCP listener recovers after the flood ends instead of wedging forever.
+const ACCEPTED_SESSION_REAP_GRACE_MS: u32 = 5_000; // 5 seconds
+
 /// Session-creation rate window (ms). Bursts of brand-new sessions are
 /// limited per window so a UDP packet flood cannot fill the 256-entry
 /// accept queue (or the session table) faster than legitimate handshakes.
@@ -354,6 +370,37 @@ impl KcpSocket {
                         }
                         self.session_created_at.remove(&key);
                     }
+                    // Accepted-session idle reaper (M11): reclaim sessions
+                    // whose stream was dropped (read channel closed) and that
+                    // saw no inbound for the grace period with nothing left to
+                    // send. Before this reaper, an accepted session whose
+                    // stream dropped could only be reclaimed by inbound
+                    // traffic or dead-link retransmission exhaustion — a
+                    // silent peer left it pinned forever, and the 30-60s
+                    // accept-handler deadlines made attacker-created sessions
+                    // recyclable only at the 1024-session cap. Live streams
+                    // are never reaped (channel open): the frp heartbeat
+                    // layer — including configs that never heartbeat — owns
+                    // that connection's lifetime, the transport does not
+                    // override it. The grace exceeds KCP_RTO_MAX (2s) so a
+                    // session mid-retransmission is never cut.
+                    for (key, session) in &mut self.sessions {
+                        if self.session_created_at.contains_key(key) {
+                            continue; // unaccepted — the 30s expiry above owns it
+                        }
+                        if !session.read_channel_closed() {
+                            continue; // live stream — frp-layer liveness owns the conn
+                        }
+                        if session.wait_snd() > 0 {
+                            continue; // undelivered data — mirror the dial self-exit gate
+                        }
+                        let idle_ms = now_ms.wrapping_sub(session.last_inbound_ms());
+                        if idle_ms > ACCEPTED_SESSION_REAP_GRACE_MS {
+                            tracing::debug!(conv = key.0, peer = %key.1, idle_ms, "KCP: reaping accepted idle session (stream dropped, no inbound)");
+                            self.to_remove.push(*key);
+                        }
+                    }
+                    self.drain_to_remove();
                     // Trim per-IP session-creation logs and drop empty keys so
                     // a many-IP flood cannot accumulate map entries after their
                     // rate window expires.
@@ -378,9 +425,11 @@ impl KcpSocket {
                     // the listen path (KcpListener keeps the handle, and
                     // must keep accepting new wire sessions forever). The
                     // stream counter is the authoritative liveness signal:
-                    // the sessions map can lag a dropped stream (an idle
-                    // session's closed read channel is only noticed when
-                    // data arrives) and must not gate exit. No grace period
+                    // the sessions map can lag a dropped stream (the
+                    // accepted-session reaper above reclaims idle
+                    // closed-channel sessions within the 5s grace, and the
+                    // dial path registers no accepted sessions at all) and
+                    // must not gate exit. No grace period
                     // is needed — register_tx cannot close before the dial
                     // stream exists (KcpStream::new increments before
                     // dial_kcp returns), so this condition is never
@@ -513,6 +562,11 @@ impl KcpSocket {
                                 if let Err(e) = session.input(data) {
                                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");
                                 } else {
+                                    // Any inbound activity disproves idleness:
+                                    // stamp for the accepted-session reaper
+                                    // (M11) before delivering the data.
+                                    let now_ms = self.start.elapsed().as_millis() as u32;
+                                    session.note_inbound(now_ms);
                                     // Deliver received data to the stream
                                     // immediately instead of waiting for the
                                     // next 10ms tick (Go kcp-go reads on
@@ -546,6 +600,14 @@ impl KcpSocket {
                                             tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback recv push error");
                                             self.to_remove.push(fk);
                                         }
+                                        // No reaper stamp here (M11): the
+                                        // fallback sees parity shards whose
+                                        // conv is not in the packet, and a
+                                        // parity-only flood from a reused
+                                        // peer addr must not keep a dead
+                                        // session alive. Real data frames
+                                        // always resolve via the direct
+                                        // lookup above, which stamps.
                                     }
                                 } else if key.0 != 0 {
                                     // New peer — validate packet before admission.
@@ -628,6 +690,11 @@ impl KcpSocket {
                                         tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
                                         continue;
                                     }
+                                    // Baseline the reaper clock (M11) at the
+                                    // admission packet — an accepted session
+                                    // that never receives more data is idle
+                                    // from its creation instant.
+                                    session.note_inbound(now_ms);
                                     // Share the session's send-queue backlog counter with the
                                     // stream so poll_write can gate on a stalled peer (window 0)
                                     // instead of letting snd_queue grow without bound.

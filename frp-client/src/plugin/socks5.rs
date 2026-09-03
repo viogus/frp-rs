@@ -84,7 +84,14 @@ async fn handle_socks5_conn(
         .map_err(|e| format!("read methods: {e}"))?;
     let methods = &buf[..nmethods];
 
-    let use_auth = user.is_some() && pass.is_some();
+    // Go parity (pkg/plugin/client/socks5.go:44-46): auth is armed by
+    // OR — `Username != "" || Password != ""` — so a PARTIAL config
+    // (username without password, or vice versa) must still enforce
+    // credentials instead of silently falling back to NO_AUTH (audit
+    // finding M8: AND here made the tunnel fail open). The empty half is
+    // enforced as the literal empty string, matching Go's
+    // StaticCredentials(map[string]string{user: pass}).
+    let use_auth = user.is_some() || pass.is_some();
 
     let chosen_method = if use_auth && methods.contains(&AUTH_USER_PASS) {
         AUTH_USER_PASS
@@ -105,12 +112,10 @@ async fn handle_socks5_conn(
 
     // Step 2: Username/password auth (if selected)
     if chosen_method == AUTH_USER_PASS {
-        let u = user
-            .as_deref()
-            .expect("AUTH_USER_PASS chosen only when user is Some");
-        let p = pass
-            .as_deref()
-            .expect("AUTH_USER_PASS chosen only when pass is Some");
+        // Partial config reaches here with one empty half (OR-arm, Go
+        // parity) — compare against the literal empty string.
+        let u = user.as_deref().unwrap_or("");
+        let p = pass.as_deref().unwrap_or("");
 
         tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..2]))
             .await
@@ -456,6 +461,132 @@ mod tests {
         assert_eq!(reply[1], AUTH_NO_AUTH, "expected no-auth method");
 
         // Close to let server finish
+        drop(client);
+        server.await.unwrap();
+    }
+
+    /// M8 pins: PARTIAL auth config (username only) must NOT fall back to
+    /// NO_AUTH (Go OR-arm) — a client offering only no-auth is rejected.
+    #[tokio::test]
+    async fn test_socks5_partial_username_rejects_no_auth_offer() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_socks5_conn(stream, Some("alice".to_string()), None).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Greeting: only NO_AUTH offered. Config has a username (no
+        // password) — server must not accept the anonymous method.
+        client
+            .write_all(&[SOCKS5_VERSION, 1, AUTH_NO_AUTH])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], SOCKS5_VERSION);
+        assert_eq!(
+            reply[1], AUTH_NO_ACCEPTABLE,
+            "partial auth config must not accept NO_AUTH"
+        );
+        drop(client);
+        server.await.unwrap();
+    }
+
+    /// M8 pins: username-only config enforces USER_PASS with the empty
+    /// password (Go StaticCredentials {user: ""}) — correct credentials
+    /// pass and reach the request phase.
+    #[tokio::test]
+    async fn test_socks5_username_only_enforces_empty_password() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Username-only config: "alice" must authenticate with the
+            // empty password. After auth the handler reads the CONNECT
+            // request; client closes → handler exits, error expected.
+            let _ = handle_socks5_conn(stream, Some("alice".to_string()), None).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, 1, AUTH_USER_PASS])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], AUTH_USER_PASS, "USER_PASS must be chosen");
+
+        // USERPASS: version 1, user "alice" (5), empty password (0).
+        let mut auth = vec![USERPASS_VERSION, 5];
+        auth.extend_from_slice(b"alice");
+        auth.push(0);
+        client.write_all(&auth).await.unwrap();
+        let mut auth_reply = [0u8; 2];
+        client.read_exact(&mut auth_reply).await.unwrap();
+        assert_eq!(
+            auth_reply,
+            [USERPASS_VERSION, USERPASS_OK],
+            "alice + empty password must authenticate against username-only config"
+        );
+
+        drop(client);
+        server.await.unwrap();
+    }
+
+    /// M8 pins: username-only config rejects a non-empty password.
+    #[tokio::test]
+    async fn test_socks5_username_only_rejects_nonempty_password() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_socks5_conn(stream, Some("alice".to_string()), None).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, 1, AUTH_USER_PASS])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], AUTH_USER_PASS);
+
+        // Wrong password: "alice" + "x" → USERPASS_FAIL.
+        let mut auth = vec![USERPASS_VERSION, 5];
+        auth.extend_from_slice(b"alice");
+        auth.extend_from_slice(&[1, b'x']);
+        client.write_all(&auth).await.unwrap();
+        let mut auth_reply = [0u8; 2];
+        client.read_exact(&mut auth_reply).await.unwrap();
+        assert_eq!(
+            auth_reply,
+            [USERPASS_VERSION, USERPASS_FAIL],
+            "non-empty password must fail against username-only config"
+        );
         drop(client);
         server.await.unwrap();
     }

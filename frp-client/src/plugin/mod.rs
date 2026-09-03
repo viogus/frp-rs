@@ -66,6 +66,59 @@ impl Drop for PluginHandle {
     }
 }
 
+/// Real tunnel-peer registry for the http-family plugins (Go parity:
+/// `http_common.go:116-117` — `SetRemoteAddr(connInfo.SrcAddr)` when
+/// `useSourceRemoteAddr`, which only the https2http/https2https variants set).
+///
+/// `serve_plugin` binds 127.0.0.1:0, so every plugin accept sees the frpc
+/// work-conn dialer — `peer.ip()` is always 127.0.0.1 and an X-Forwarded-For
+/// appended from it would lie about the tunnel peer (audit finding M9). The
+/// real address lives only in StartWorkConn (`src_addr`/`src_port`), parsed by
+/// the work-conn side; it registers it here keyed by its local ephemeral
+/// port, and the plugin accept handler for that conn takes it once.
+/// http2http/http2https never register or consult this — Go does not call
+/// SetXForwarded there. Lookup miss (health-check or stray dial) falls back
+/// to the loopback peer, which is today's behavior.
+static REAL_TUNNEL_PEER: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u16, SocketAddr>>,
+> = std::sync::OnceLock::new();
+
+fn real_tunnel_peer_map() -> &'static std::sync::Mutex<std::collections::HashMap<u16, SocketAddr>> {
+    REAL_TUNNEL_PEER.get_or_init(Default::default)
+}
+
+/// Register the real tunnel peer for one plugin connection, keyed by the
+/// work-conn dialer's local ephemeral port (kernel-assigned, unique per
+/// concurrent dial). Called right after the dial succeeds; the accept
+/// handler for that connection consumes the entry.
+pub(crate) fn register_plugin_peer(dialer_port: u16, real_peer: SocketAddr) {
+    real_tunnel_peer_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dialer_port, real_peer);
+}
+
+/// Resolve the real tunnel peer for an accepted plugin connection. The
+/// dialer registers a few microseconds after `connect()` returns, so an
+/// accept handler that wins the scheduling race retries briefly before
+/// falling back to the loopback peer (status quo behavior).
+fn take_plugin_peer(dialer_port: u16) -> Option<SocketAddr> {
+    real_tunnel_peer_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&dialer_port)
+}
+
+pub(crate) async fn plugin_peer_ip(peer: SocketAddr) -> std::net::IpAddr {
+    for _ in 0..8 {
+        if let Some(real) = take_plugin_peer(peer.port()) {
+            return real.ip();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    peer.ip()
+}
+
 /// Shared plugin server skeleton — handles bind, shutdown channel, accept
 /// loop, and `PluginHandle` construction. All 8 plugin `start_*` functions
 /// delegate to this.
@@ -1054,6 +1107,38 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M9 pin: the real-tunnel-peer registry is take-once per dialer port,
+    /// newest registration wins on port reuse (a stale entry from an earlier
+    /// conn must not shadow the current dial), and unknown ports miss.
+    #[test]
+    fn real_tunnel_peer_registry_take_once() {
+        let dialer = SocketAddr::from(([127, 0, 0, 1], 44444));
+        // Take-once: the accept handler consumes the entry.
+        register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 7], 5555)));
+        assert_eq!(
+            plugin_peer_ip_now(dialer),
+            std::net::IpAddr::V4("203.0.113.7".parse().unwrap())
+        );
+        assert_eq!(take_plugin_peer(dialer.port()), None);
+        // Overwrite on dialer-port reuse (kernel ephemeral recycle).
+        register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 8], 5556)));
+        register_plugin_peer(dialer.port(), SocketAddr::from(([203, 0, 113, 9], 5557)));
+        assert_eq!(
+            plugin_peer_ip_now(dialer),
+            std::net::IpAddr::V4("203.0.113.9".parse().unwrap())
+        );
+        // Unknown port → miss (health-check/stray dials fall back to peer.ip()).
+        assert_eq!(take_plugin_peer(1), None);
+    }
+
+    /// Sync resolution for the test above (plugin_peer_ip's retry loop would
+    /// add 8 ms per miss; here the entry always exists on the first attempt).
+    fn plugin_peer_ip_now(peer: SocketAddr) -> std::net::IpAddr {
+        take_plugin_peer(peer.port())
+            .map(|a| a.ip())
+            .unwrap_or(peer.ip())
+    }
 
     /// Fake AsyncRead for BodyReader tests: serves a fixed byte blob in
     /// fixed-size chunks, counting the bytes handed out in a shared counter

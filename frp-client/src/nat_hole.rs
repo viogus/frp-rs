@@ -485,13 +485,20 @@ impl Service {
         // floors the guard at 5s too: `timeout := 5*time.Second; if
         // m.DetectBehavior.ReadTimeoutMs > 0 {...}` (pkg/nathole/nathole.go:
         // 248-250) — a hostile/misbehaving server sending 0 (or a negative)
-        // must not make the punch fail instantly.
+        // must not make the punch fail instantly. Capped at
+        // MAX_HOLE_PUNCH_TIMEOUT_MS (60s) exactly like the visitor side
+        // (visitor.rs clamp_hp_timeout, audit round 6d/§7 asymmetry): the
+        // field is i32, so an uncapped value would let a hostile server pin
+        // this provider's punch task for ~24.8 days. Go's analyzer emits
+        // ReadTimeoutMs ≤ ~45s, so legitimate values never hit the cap.
         let hole_punch_timeout = resp
             .detect_behavior
             .as_ref()
             .map(|db| {
-                (db.read_timeout_ms.max(0) as u64)
-                    .max(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS)
+                (db.read_timeout_ms.max(0) as u64).clamp(
+                    frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS,
+                    frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS,
+                )
             })
             .unwrap_or(frp_core::xtcp_p2p::DEFAULT_HOLE_PUNCH_TIMEOUT_MS);
 
