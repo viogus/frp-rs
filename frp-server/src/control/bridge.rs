@@ -106,11 +106,16 @@ struct ResponseHeaderInjector<R> {
     buffer: Vec<u8>,
     buffer_offset: usize,
     /// True once the `\r\n\r\n` terminator was seen and the configured
-    /// headers were injected (or the inner stream hit EOF). Until this is
-    /// true, `poll_read` never emits bytes to the caller: emission before the
-    /// boundary is known would corrupt the stream for headers spanning
+    /// headers were injected. Until this is true (or the inner stream hit
+    /// EOF), `poll_read` never emits bytes to the caller: emission before
+    /// the boundary is known would corrupt the stream for headers spanning
     /// multiple internal reads.
     injected: bool,
+    /// True once the inner stream hit EOF before the terminator — the
+    /// buffered partial header is served (no injection), then EOF.
+    eof: bool,
+    /// True once every buffered byte is served and no further buffering is
+    /// possible — the rest of the response passes through raw.
     complete: bool,
     /// Persistent read buffer to avoid per-poll_read allocation.
     read_buf: [u8; 4096],
@@ -128,6 +133,7 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
             buffer: Vec::new(),
             buffer_offset: 0,
             injected: false,
+            eof: false,
             complete: false,
             read_buf: [0u8; 4096],
         }
@@ -140,90 +146,123 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if self.complete {
-            let this = self.as_mut().get_mut();
+        let this = self.as_mut().get_mut();
+
+        // Everything buffered has been served and injection is settled
+        // (headers injected, or EOF cut the response short) — the rest of
+        // the response passes through untouched.
+        if this.complete {
             return Pin::new(&mut this.inner).poll_read(cx, buf);
         }
 
-        let this = self.as_mut().get_mut();
-
-        // Drain any buffered (injected) bytes to the caller before reading
-        // more from `inner`. This is what keeps the injected header TAIL
-        // from being dropped: `complete` is only ever raised once the buffer
-        // is fully consumed (see the end of this function), never at the
-        // point injection happens — so a caller with a small `ReadBuf` gets
-        // every injected byte across subsequent polls.
+        // Serve buffered bytes — only ever POST-injection (the head with
+        // the injected headers appended) or post-EOF (a truncated response:
+        // emit the partial header bytes, inject nothing). M3: the old code
+        // served pre-boundary fragments to the caller, so a header spanning
+        // several internal reads (e.g. a big Set-Cookie set over 4 KiB)
+        // leaked out fragment-first and the configured headers were never
+        // injected — the drain path even raised `complete` before the
+        // boundary existed, silently disabling injection for the rest of
+        // the response.
         if this.buffer_offset < this.buffer.len() {
+            debug_assert!(this.injected || this.eof);
             let remaining = this.buffer.len() - this.buffer_offset;
             let to_copy = remaining.min(buf.remaining());
             buf.put_slice(&this.buffer[this.buffer_offset..this.buffer_offset + to_copy]);
             this.buffer_offset += to_copy;
             if this.buffer_offset >= this.buffer.len() {
+                // The injected head (or truncated tail) is fully out; the
+                // remainder of the response is raw pass-through.
                 this.complete = true;
             }
             return Poll::Ready(Ok(()));
         }
 
-        // Buffer is fully consumed and we have not injected yet — we must
-        // gather MORE of the response header before emitting: injection must
-        // happen before any body byte is handed to the caller, and the
-        // `\r\n\r\n` terminator may span several internal reads (a header
-        // bigger than one 4 KiB buffer, e.g. a large cookie/Set-Cookie set).
-        // Emitting bytes before the boundary is known would corrupt the
-        // stream, so we only ever serve from `buffer` once the boundary has
-        // been found (or EOF reached).
-        let mut temp_buf = ReadBuf::new(&mut this.read_buf);
-        match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
-            Poll::Ready(Ok(())) => {
-                let n = temp_buf.filled().len();
-                if n == 0 {
-                    // EOF: no more header bytes will arrive; emit what we
-                    // buffered (no injection) and pass through from here.
-                    this.complete = true;
-                    return Poll::Ready(Ok(()));
+        // No buffered bytes left. If EOF already cut the header short,
+        // signal EOF now (the buffer was drained above).
+        if this.eof {
+            this.complete = true;
+            return Poll::Ready(Ok(()));
+        }
+
+        // Buffer empty and the boundary is not found yet — gather more of
+        // the response header from the backend. Bytes are held (never
+        // served) until `\r\n\r\n` is found or the backend closes.
+        loop {
+            let mut temp_buf = ReadBuf::new(&mut this.read_buf);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = temp_buf.filled().len();
+                    if n == 0 {
+                        // EOF before the terminator: no configured headers
+                        // are injected; the partial bytes (if any) are
+                        // served below (returning Ready-with-0 here would
+                        // read as EOF and drop them — callers treat a
+                        // zero-byte Ready as end-of-stream). Empty buffer →
+                        // real EOF right away.
+                        this.eof = true;
+                        if this.buffer.is_empty() {
+                            this.complete = true;
+                            return Poll::Ready(Ok(()));
+                        }
+                        break;
+                    }
+                    // Guard against memory exhaustion from backends that
+                    // never send \r\n\r\n.
+                    if this.buffer.len() + n > 65536 {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "response header exceeds 64KB limit",
+                        )));
+                    }
+                    this.buffer.extend_from_slice(&this.read_buf[..n]);
+                    // The boundary may span internal reads — the search
+                    // covers the whole buffer.
+                    if let Some(pos) = this.buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let mut injected = Vec::with_capacity(this.buffer.len() + 512);
+                        injected.extend_from_slice(&this.buffer[..pos]);
+                        for (k, v) in &this.headers {
+                            // Sanitize header names/values to prevent HTTP
+                            // header injection.
+                            let safe_k: String =
+                                k.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                            let safe_v: String =
+                                v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                            injected.extend_from_slice(
+                                format!("{}: {}\r\n", safe_k, safe_v).as_bytes(),
+                            );
+                        }
+                        injected.extend_from_slice(&this.buffer[pos..]);
+                        this.buffer = injected;
+                        this.injected = true;
+                        break;
+                    }
+                    // Still a partial header — withhold it from the caller
+                    // (injection happens at the boundary) and keep pulling
+                    // while the inner stream is ready. Returning Pending
+                    // straight after a Ready inner read would park the
+                    // caller with no registered waker (a Ready poll does
+                    // not register one) — deadlock; the loop below only
+                    // returns Pending once the inner poll itself went
+                    // Pending, so its waker is set.
                 }
-                // Guard against memory exhaustion from backends that never
-                // send \r\n\r\n.
-                if this.buffer.len() + n > 65536 {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "response header exceeds 64KB limit",
-                    )));
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    // Data will arrive later; that inner poll registered
+                    // the waker — park until then.
+                    return Poll::Pending;
                 }
-                this.buffer.extend_from_slice(&this.read_buf[..n]);
-            }
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => {
-                // Nothing buffered and inner not ready: park until data.
-                return Poll::Pending;
             }
         }
 
-        // Header buffer only grows up to the boundary; look for it.
-        if !this.injected {
-            if let Some(pos) = this.buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-                let mut injected = Vec::with_capacity(this.buffer.len() + 512);
-                injected.extend_from_slice(&this.buffer[..pos]);
-                for (k, v) in &this.headers {
-                    // Sanitize header names/values to prevent HTTP header injection.
-                    let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
-                    let safe_v: String = v.chars().filter(|&c| c != '\r' && c != '\n').collect();
-                    injected.extend_from_slice(format!("{}: {}\r\n", safe_k, safe_v).as_bytes());
-                }
-                injected.extend_from_slice(&this.buffer[pos..]);
-                this.buffer = injected;
-                this.injected = true;
-            }
-        }
-
-        // Serve whatever is now in the buffer (available since the boundary
-        // exists or will be drained). If not all fits in the caller's
-        // `ReadBuf`, `complete` stays false and the tail is served next poll.
+        // Boundary found (and headers injected) in this poll: serve what
+        // fits; the tail goes out on subsequent polls and `complete` is
+        // raised only once the buffer is fully drained.
         let remaining = this.buffer.len() - this.buffer_offset;
         let to_copy = remaining.min(buf.remaining());
         buf.put_slice(&this.buffer[this.buffer_offset..this.buffer_offset + to_copy]);
         this.buffer_offset += to_copy;
-        if this.injected && this.buffer_offset >= this.buffer.len() {
+        if this.buffer_offset >= this.buffer.len() {
             this.complete = true;
         }
 
@@ -246,6 +285,16 @@ async fn run_udp_work_conn(
     // Negotiated UDPPacket codec (`"binary-v1"` or empty). When set, UDP
     // packets on this V2 work conn use the binary codec (Go frp v0.71.0).
     udp_packet_codec: String,
+    // M1 (audit round 3): read deadline for this work conn, mirroring Go
+    // server/proxy/udp.go `workConnReaderFn` SetReadDeadline(60s). The
+    // client pings every 30s by default, so 60s of frame silence means the
+    // peer is dead or the conn is half-open — the bridge must end so the
+    // assign supervisor re-requests a replacement (Go udpWorker loop
+    // parity). Without it a silent half-open peer parked the reader
+    // forever, leaving the UDP proxy dead until control reconnect. The
+    // deadline applies per read (each completed frame — a Ping included —
+    // starts a fresh 60s), so an active conn is never reaped.
+    read_timeout: std::time::Duration,
 ) {
     // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
     // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
@@ -308,10 +357,26 @@ async fn run_udp_work_conn(
                     continue;
                 }
                 result = async {
-                    if v2 {
-                        read_msg_v2_with_udp_codec(&mut w_r, udp_codec_opt, &mut scratch).await
-                    } else {
-                        read_msg_v1(&mut w_r).await
+                    match tokio::time::timeout(read_timeout, async {
+                        if v2 {
+                            read_msg_v2_with_udp_codec(&mut w_r, udp_codec_opt, &mut scratch).await
+                        } else {
+                            read_msg_v1(&mut w_r).await
+                        }
+                    })
+                    .await
+                    {
+                        Ok(r) => r,
+                        // M1: 60s of frame silence (Go udp.go read-deadline
+                        // parity) = dead/half-open peer. Folds into the Err
+                        // arm below: log + break, and the supervisor
+                        // re-requests a replacement work conn.
+                        Err(_) => Err(frp_core::Error::Protocol(
+                            format!(
+                                "UDP work conn read deadline ({read_timeout:?}) expired with no frame from the client"
+                            )
+                            .into(),
+                        )),
                     }
                 } => result,
             };
@@ -546,6 +611,42 @@ fn log_bridge_panic(proxy_name: &str, what: &str, p: Box<dyn std::any::Any + Sen
     );
 }
 
+/// Server-side UDP work-conn read deadline (Go server/proxy/udp.go
+/// `workConnReaderFn` SetReadDeadline(60s) parity, M1 audit round 3). The
+/// client pings its UDP work conn every 30s by default, so 60s without ANY
+/// frame — a Ping included — means the peer is gone or the conn is
+/// half-open.
+const UDP_WORK_CONN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Re-request a UDP work conn after the previous one died (M1, audit
+/// round 3). Mirrors Go's udpWorker replacement loop
+/// (server/proxy/udp.go:184-243): a UDP proxy needs one live work conn
+/// for its lifetime, and work-conn death must not strand it until control
+/// reconnect. The cancel guard lives at the call site — a proxy close or
+/// control teardown must not re-request. The existence guard in
+/// `handle_udp_work_conn` closes the remaining cancel-vs-send race (a
+/// close that lands between the guard check here and the internal send).
+async fn request_udp_work_conn_replacement(
+    internal_tx: &tokio::sync::mpsc::Sender<crate::state::InternalMsg>,
+    proxy_name: &str,
+    reason: &str,
+) {
+    if let Err(e) = internal_tx
+        .send(crate::state::InternalMsg::UdpNeedsWorkConn {
+            proxy_name: proxy_name.to_string(),
+        })
+        .await
+    {
+        debug!(
+            proxy_name = %proxy_name,
+            error = %e,
+            "UDP work-conn re-request after {reason} failed for '{}': {}",
+            proxy_name,
+            e
+        );
+    }
+}
+
 /// Assign a work connection to a UDP proxy for bidirectional data forwarding.
 /// Matches Go frp v0.69.1 behavior: sends StartWorkConn, then bridges
 /// UDP socket ↔ work connection via UDPPacket messages.
@@ -562,11 +663,17 @@ pub(crate) async fn assign_udp_work_conn(
     bw_limiter: Option<frp_core::bandwidth::SharedBandwidthLimiter>,
     cancel: tokio_util::sync::CancellationToken,
     udp_packet_codec: String,
+    // M1 (audit round 3): internal channel back to the control loop — used
+    // to re-request a replacement work conn when this one dies.
+    internal_tx: tokio::sync::mpsc::Sender<crate::state::InternalMsg>,
 ) {
     let mut work_conn = work_conn;
     let sock = match udp_sockets.get(proxy_name) {
         Some(s) => s.clone(),
         None => {
+            // Proxy closed between the pending_udp enqueue and this work
+            // conn's arrival (CloseProxy removed the socket) — nothing to
+            // assign to, and no re-request: the proxy is gone.
             warn!(proxy_name = %proxy_name, "UDP socket not found for proxy '{}'", proxy_name);
             return;
         }
@@ -597,15 +704,29 @@ pub(crate) async fn assign_udp_work_conn(
     if v2 {
         if let Err(e) = work_conn.write_v2_frame(&swc).await {
             warn!(proxy_name = %proxy_name, error = %e, "Failed to send StartWorkConn (V2) for UDP '{}': {}", proxy_name, e);
+            // M1: the fresh work conn died before the bridge could start
+            // and the pending_udp entry was already consumed — re-request
+            // so the proxy is not stranded.
+            request_udp_work_conn_replacement(
+                &internal_tx,
+                &proxy_name,
+                "StartWorkConn (V2) write failure",
+            )
+            .await;
             return;
         }
     } else if let Err(e) = work_conn.write_v1_frame(&swc).await {
         warn!(proxy_name = %proxy_name, error = %e, "Failed to send StartWorkConn for UDP '{}': {}", proxy_name, e);
+        // M1: same as the V2 branch above.
+        request_udp_work_conn_replacement(&internal_tx, &proxy_name, "StartWorkConn write failure")
+            .await;
         return;
     }
     debug!(proxy_name = %proxy_name, "UDP work conn assigned to '{}', starting bridge supervisor", proxy_name);
 
     let log_proxy_name = proxy_name.clone();
+    let bridge_cancel = cancel.clone();
+    let req_tx = internal_tx;
     tokio::spawn(async move {
         // Await the bridge's JoinHandle instead of dropping it: if the task
         // panics, JoinError carries the panic payload (audit round 5, MEDIUM).
@@ -621,13 +742,25 @@ pub(crate) async fn assign_udp_work_conn(
             v2,
             udp_packet_size,
             bw_limiter,
-            cancel,
+            bridge_cancel,
             udp_packet_codec,
+            UDP_WORK_CONN_READ_TIMEOUT,
         ));
         if let Err(e) = handle.await {
             if e.is_panic() {
                 log_bridge_panic(&log_proxy_name, "UDP bridge", e.into_panic());
             }
+        }
+        // M1 (audit round 3): work-conn death (EOF / read error / 60s
+        // frame silence) must not strand the UDP proxy until control
+        // reconnect — Go's udpWorker loop replaces the conn
+        // (server/proxy/udp.go:184-243). Re-request a replacement unless
+        // the exit was a cancellation (proxy closed or control teardown:
+        // the socket entry is gone, and a ReqWorkConn would dial a work
+        // conn into nothing). The existence guard in handle_udp_work_conn
+        // closes the remaining cancel-vs-send race.
+        if !cancel.is_cancelled() {
+            request_udp_work_conn_replacement(&req_tx, &log_proxy_name, "work-conn death").await;
         }
     });
 }
@@ -1697,6 +1830,9 @@ mod tests {
             None,
             tokio_util::sync::CancellationToken::new(),
             String::new(),
+            // M1: keep the 60s production read deadline; these tests end
+            // the bridge via EOF/cancel, not frame silence.
+            UDP_WORK_CONN_READ_TIMEOUT,
         ));
         drop(peer);
 
@@ -1736,6 +1872,9 @@ mod tests {
             None,
             tokio_util::sync::CancellationToken::new(),
             String::new(),
+            // M1: keep the 60s production read deadline; these tests end
+            // the bridge via EOF/cancel, not frame silence.
+            UDP_WORK_CONN_READ_TIMEOUT,
         ));
         sender.send_to(b"force-write", socket_addr).await.unwrap();
 
@@ -1769,6 +1908,9 @@ mod tests {
             None,
             tokio_util::sync::CancellationToken::new(),
             String::new(),
+            // M1: keep the 60s production read deadline; these tests end
+            // the bridge via EOF/cancel, not frame silence.
+            UDP_WORK_CONN_READ_TIMEOUT,
         ));
 
         peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
@@ -1837,6 +1979,9 @@ mod tests {
             None,
             bridge_cancel,
             String::new(),
+            // M1: keep the 60s production read deadline; the cancel arm
+            // below ends this bridge, not frame silence.
+            UDP_WORK_CONN_READ_TIMEOUT,
         ));
 
         // Let both bridge tasks reach their blocking points.
@@ -1847,6 +1992,156 @@ mod tests {
             .await
             .expect("cancel must terminate the half-open UDP bridge task")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_work_reader_silence_reaps_half_open_conn() {
+        // M1: Go server/proxy/udp.go read-deadline parity. A peer that
+        // stays open but silent (no frames at all — a Ping included) must
+        // be reaped after the read deadline; before the fix the reader was
+        // parked on read_msg forever (dead UDP proxy until control
+        // reconnect). Short deadline (150ms) pins the reap path without a
+        // 60s test.
+        let (work, peer) = tcp_pair().await;
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let retained_socket = socket.clone();
+
+        let bridge = tokio::spawn(run_udp_work_conn(
+            IoStream::Tcp(work),
+            socket,
+            "udp-test".to_string(),
+            None,
+            false,
+            [0u8; 16],
+            false,
+            1500,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            String::new(),
+            std::time::Duration::from_millis(150),
+        ));
+        // Keep `peer` alive and silent: no EOF, no frames.
+        std::mem::forget(peer);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), bridge)
+            .await
+            .expect("frame silence must end the UDP bridge after the read deadline")
+            .unwrap();
+
+        // The reaped bridge must not consume a later datagram (writer was
+        // cancelled, not left draining).
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(b"after-stop", retained_socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut buf = [0; 32];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            retained_socket.recv_from(&mut buf),
+        )
+        .await
+        .expect("stopped writer must not consume a later datagram")
+        .unwrap();
+        assert_eq!(&buf[..n], b"after-stop");
+    }
+
+    #[tokio::test]
+    async fn udp_work_conn_death_requests_replacement() {
+        // M1: a UDP work-conn death (EOF here; read error / 60s silence
+        // follow the same break path) must re-request a replacement
+        // through the control loop — Go udpWorker replacement-loop parity.
+        // Before the fix UdpNeedsWorkConn was sent exactly once at
+        // registration and a dead work conn stranded the UDP proxy until
+        // control reconnect.
+        let (work, peer) = tcp_pair().await;
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut udp_sockets = std::collections::HashMap::new();
+        udp_sockets.insert("udp-test".to_string(), socket.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::state::InternalMsg>(16);
+
+        let assign = tokio::spawn(async move {
+            assign_udp_work_conn(
+                IoStream::Tcp(work),
+                "udp-test",
+                &udp_sockets,
+                None,
+                false,
+                [0u8; 16],
+                false,
+                1500,
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                String::new(),
+                tx,
+            )
+            .await
+        });
+        // Let assign write StartWorkConn and spawn the bridge, then kill the
+        // peer so the bridge read sees EOF.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(peer);
+        assign.await.unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("work-conn death must re-request a replacement")
+            .expect("channel closed");
+        match msg {
+            crate::state::InternalMsg::UdpNeedsWorkConn { proxy_name } => {
+                assert_eq!(proxy_name, "udp-test");
+            }
+            other => panic!("expected UdpNeedsWorkConn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_work_conn_cancel_suppresses_replacement_request() {
+        // M1: an exit caused by cancellation (proxy closed / control
+        // teardown) must NOT re-request — the udp_sockets entry is gone and
+        // a ReqWorkConn would dial a work conn into nothing. Half-open
+        // bridge cancelled mid-flight; the channel must stay empty.
+        let (work, peer) = tcp_pair().await;
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut udp_sockets = std::collections::HashMap::new();
+        udp_sockets.insert("udp-test".to_string(), socket.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::state::InternalMsg>(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_in = cancel.clone();
+
+        let assign = tokio::spawn(async move {
+            assign_udp_work_conn(
+                IoStream::Tcp(work),
+                "udp-test",
+                &udp_sockets,
+                None,
+                false,
+                [0u8; 16],
+                false,
+                1500,
+                None,
+                cancel_in,
+                String::new(),
+                tx,
+            )
+            .await
+        });
+        // Let the bridge park on the half-open read, then cancel it (the
+        // 60s production read deadline keeps the natural-death path out of
+        // this test's window). Keep `peer` alive so no EOF races the cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+        assign.await.unwrap();
+        std::mem::forget(peer);
+
+        match tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            // Supervisors finished (tx dropped) without sending — correct.
+            Ok(None) => {}
+            Ok(Some(other)) => {
+                panic!("cancel-based bridge exit must not re-request a replacement, got {other:?}")
+            }
+            Err(_elapsed) => panic!("supervisor still alive 300ms after cancel"),
+        }
     }
 
     #[tokio::test]

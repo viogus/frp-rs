@@ -1,3 +1,4 @@
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------
@@ -258,6 +259,16 @@ where
     D: serde::Deserializer<'de>,
 {
     let v = usize::deserialize(d)?;
+    // Explicit 0 rejected at load (audit round 3, LOW): the bridge allocates
+    // `vec![0u8; udp_packet_size]` recv buffers, and a zero-length recvfrom
+    // makes the kernel discard every datagram — silent total UDP proxy loss
+    // from an operator typo. Go frp accepts 0 and breaks the same way;
+    // fail-fast is the deliberate divergence (poolCount precedent).
+    if v == 0 {
+        return Err(D::Error::custom(
+            "udp_packet_size must be > 0 (0 would discard every UDP datagram)",
+        ));
+    }
     Ok(v.min(MAX_UDP_PACKET_SIZE))
 }
 
@@ -1083,6 +1094,19 @@ mod udp_packet_size_tests {
         assert_eq!(cfg.udp_packet_size, 65507);
         let cfg = parse(serde_json::json!({ "bind_port": 7000 }));
         assert_eq!(cfg.udp_packet_size, 1500, "server default 1500 pinned");
+        // Zero → rejected at load (round 3): a zero-length recv buffer makes
+        // the kernel discard every datagram — silent total UDP proxy loss.
+        // (The field is usize, so negatives fail deserialization on their
+        // own before this check.)
+        let err = serde_json::from_value::<ServerConfig>(serde_json::json!({
+            "bind_port": 7000,
+            "udp_packet_size": 0
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("udp_packet_size must be > 0"),
+            "unexpected error: {err}"
+        );
         // Non-integer still fails deserialization.
         assert!(serde_json::from_value::<ServerConfig>(serde_json::json!({
             "bind_port": 7000,

@@ -705,6 +705,14 @@ pub async fn run_admin_server(
 // --- Helpers ---
 
 /// Sensitive keys that should be redacted from config responses.
+///
+/// Includes the camelCase serde aliases (audit finding M10): /api/config
+/// serves the raw file parsed as TOML, preserving the user's original key
+/// spelling — a Go-style config (`secretKey = ...`, `httpPwd = ...`,
+/// `groupKey = ...`, `oidcClientSecret = ...`, `passwd = ...`) used to
+/// round-trip its secrets unredacted. Each alias below mirrors a real
+/// `#[serde(alias = ...)]` on a credential-bearing field in
+/// ProxyConfig/PluginConfig/AuthConfig.
 const SENSITIVE_KEYS: &[&str] = &[
     "token",
     "auth_token",
@@ -717,6 +725,14 @@ const SENSITIVE_KEYS: &[&str] = &[
     "user",
     "password",
     "secret_key",
+    // camelCase Go-style spellings (serde aliases of the fields above).
+    "secretKey",
+    "httpUser",
+    "httpPwd",
+    "httpPassword",
+    "groupKey",
+    "oidcClientSecret",
+    "passwd",
 ];
 
 /// Recursively redact sensitive values in TOML, returning a copy with
@@ -781,6 +797,62 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request};
     use tower::ServiceExt;
+
+    #[test]
+    fn redact_sensitive_toml_covers_camelcase_go_spellings() {
+        // M10 pin: /api/config serves the raw config file preserving the
+        // user's key spelling — Go-style camelCase keys must redact like
+        // their snake_case twins. Build the TOML through the same
+        // parse→redact→serialize path as handle_get_config.
+        let raw = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+auth.token = "auth-secret-token"
+oidcClientSecret = "oidc-secret"
+
+[[proxies]]
+name = "web"
+type = "http"
+localPort = 8080
+secretKey = "stcp-secret"
+httpUser = "alice"
+httpPwd = "http-secret"
+httpPassword = "http-secret-2"
+groupKey = "grp-secret"
+
+[[proxies]]
+name = "plug"
+type = "tcp"
+localPort = 8081
+[proxies.plugin]
+type = "socks5"
+user = "socks-user"
+passwd = "socks-pass"
+"#;
+        let value: toml::Value = toml::from_str(raw).unwrap();
+        let redacted = redact_sensitive(value);
+        let out = toml::to_string(&redacted).unwrap();
+        for secret in [
+            "auth-secret-token",
+            "oidc-secret",
+            "stcp-secret",
+            "http-secret",
+            "http-secret-2",
+            "grp-secret",
+            "socks-pass",
+        ] {
+            assert!(
+                !out.contains(secret),
+                "camelCase/alias secret leaked into redacted config: {secret}"
+            );
+        }
+        // The username is masked too ("user" key), but the plaintext must
+        // never survive in any form — check no raw value round-tripped.
+        assert!(!out.contains("socks-user"));
+        // Non-secret camelCase keys must survive redaction intact.
+        assert!(out.contains("serverAddr"));
+        assert!(out.contains("localPort"));
+    }
 
     fn test_state() -> (AdminState, mpsc::Receiver<ReloadRequest>) {
         let path =

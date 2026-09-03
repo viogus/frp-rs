@@ -53,6 +53,7 @@ pub(crate) async fn serve_h2_connection<S>(
     host_rewrite: String,
     request_headers: HashMap<String, String>,
     backend: Backend,
+    real_peer: std::net::IpAddr,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -100,6 +101,7 @@ pub(crate) async fn serve_h2_connection<S>(
                         &host_rewrite,
                         &request_headers,
                         backend,
+                        real_peer,
                     )
                     .await
                     {
@@ -137,6 +139,7 @@ async fn handle_stream(
     host_rewrite: &str,
     request_headers: &HashMap<String, String>,
     backend: Backend,
+    real_peer: std::net::IpAddr,
 ) -> Result<(), h2::Error> {
     let has_content_length = request.headers().contains_key("content-length");
     // Declared Content-Length for the request body. The h2 crate validates
@@ -148,7 +151,13 @@ async fn handle_stream(
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok());
-    let head = build_http1_request_head(&request, host_rewrite, request_headers);
+    let head = build_http1_request_head(
+        &request,
+        host_rewrite,
+        request_headers,
+        real_peer,
+        request.body().is_end_stream(),
+    );
 
     // A refused/unreachable backend answers 502 (Go ReverseProxy ErrorHandler).
     let remote = match connect_backend(&backend).await {
@@ -292,10 +301,16 @@ fn is_hop_by_hop(name: &str) -> bool {
 /// with the same name is replaced) and `host_header_rewrite` applied. A body
 /// without Content-Length is forwarded with `Transfer-Encoding: chunked` (Go
 /// http.Transport behavior for unknown-length bodies).
-fn build_http1_request_head(
-    request: &http::Request<RecvStream>,
+///
+/// Generic over the body so tests can drive it with a body-less request
+/// (h2's `RecvStream` has no public constructor); `body_end_stream` is the
+/// h2 end-stream flag the caller reads off the real stream.
+fn build_http1_request_head<B>(
+    request: &http::Request<B>,
     host_rewrite: &str,
     request_headers: &HashMap<String, String>,
+    real_peer: std::net::IpAddr,
+    body_end_stream: bool,
 ) -> Vec<u8> {
     let mut head = Vec::with_capacity(512);
     head.extend_from_slice(request.method().as_str().as_bytes());
@@ -308,6 +323,27 @@ fn build_http1_request_head(
     head.extend_from_slice(target.as_bytes());
     head.extend_from_slice(b" HTTP/1.1\r\n");
 
+    // M9 (Go https2http.go:44-46 parity): the plugin appends the REAL tunnel
+    // peer as X-Forwarded-For (SetXForwarded runs on every request, h1 and h2
+    // alike). A configured x-forwarded-for request header replaces the whole
+    // chain (Go Header.Set runs after SetXForwarded), so the append is
+    // skipped when one is configured; otherwise the client's own chain is
+    // preserved and the peer appended, exactly like the h1 path in
+    // read_request_and_build_forward.
+    let configured_xff = request_headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("x-forwarded-for"));
+    let client_xff: Vec<String> = if configured_xff {
+        Vec::new()
+    } else {
+        request
+            .headers()
+            .iter()
+            .filter(|(name, _)| name.as_str().eq_ignore_ascii_case("x-forwarded-for"))
+            .filter_map(|(_, value)| value.to_str().ok().map(|s| s.to_string()))
+            .collect()
+    };
+
     let has_content_length = request.headers().contains_key("content-length");
     for (name, value) in request.headers() {
         let n = name.as_str();
@@ -316,6 +352,11 @@ fn build_http1_request_head(
         }
         // Skip headers that request_headers will override (Go Header.Set).
         if request_headers.keys().any(|k| k.eq_ignore_ascii_case(n)) {
+            continue;
+        }
+        // X-Forwarded-For is re-emitted canonically below with the tunnel
+        // peer appended (Go SetXForwarded semantics).
+        if !configured_xff && n.eq_ignore_ascii_case("x-forwarded-for") {
             continue;
         }
         // Guard against HTTP header injection via h2 header values — Go's
@@ -354,8 +395,23 @@ fn build_http1_request_head(
         head.extend_from_slice(v.as_bytes());
         head.extend_from_slice(b"\r\n");
     }
+    // Append the real tunnel peer to the client's X-Forwarded-For chain (Go
+    // SetXForwarded: `strings.Join(prior, ", ") + ", " + clientIP`). Skipped
+    // when a configured x-forwarded-for replaced the chain above.
+    if !configured_xff {
+        let mut xff = client_xff.join(", ");
+        if xff.is_empty() {
+            xff = real_peer.to_string();
+        } else {
+            xff.push_str(", ");
+            xff.push_str(&real_peer.to_string());
+        }
+        head.extend_from_slice(b"X-Forwarded-For: ");
+        head.extend_from_slice(xff.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
     if !has_content_length {
-        if request.body().is_end_stream() {
+        if body_end_stream {
             head.extend_from_slice(b"Content-Length: 0\r\n");
         } else {
             head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
@@ -777,7 +833,8 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_chunk, parse_response_head};
+    use super::{build_http1_request_head, cap_chunk, parse_response_head};
+    use std::collections::HashMap;
 
     #[test]
     fn parse_response_head_parses_normal_head() {
@@ -856,5 +913,88 @@ mod tests {
         // chunk is forwarded whole and `None` propagates.
         assert_eq!(cap_chunk(7, None), (None, 7));
         assert_eq!(cap_chunk(0, None), (None, 0));
+    }
+
+    // -- M9: X-Forwarded-For appends the REAL tunnel peer (Go https2http.go
+    //    SetXForwarded semantics: client chain preserved, peer appended;
+    //    configured request_headers replaces the whole chain).
+
+    fn build_req(xff: Option<&[&str]>) -> http::Request<bytes::Bytes> {
+        let mut b = http::Request::builder()
+            .method("GET")
+            .uri("http://backend.example.com/path")
+            .header("user-agent", "test");
+        if let Some(values) = xff {
+            for v in values {
+                b = b.header("x-forwarded-for", *v);
+            }
+        }
+        b.body(bytes::Bytes::new()).expect("valid request")
+    }
+
+    fn head_lines(head: &[u8]) -> String {
+        String::from_utf8_lossy(head).to_string()
+    }
+
+    fn real_ip() -> std::net::IpAddr {
+        "198.51.100.23".parse().unwrap()
+    }
+
+    #[test]
+    fn h2_head_appends_real_peer_when_no_client_xff() {
+        let head = head_lines(&build_http1_request_head(
+            &build_req(None),
+            "",
+            &HashMap::new(),
+            real_ip(),
+            true,
+        ));
+        assert!(
+            head.contains("X-Forwarded-For: 198.51.100.23\r\n"),
+            "real tunnel peer must be appended, head:\n{head}"
+        );
+        assert_eq!(head.matches("X-Forwarded-For").count(), 1);
+    }
+
+    #[test]
+    fn h2_head_preserves_client_chain_and_appends_real_peer() {
+        let head = head_lines(&build_http1_request_head(
+            &build_req(Some(&["203.0.113.9", "10.0.0.4"])),
+            "",
+            &HashMap::new(),
+            real_ip(),
+            true,
+        ));
+        // Go SetXForwarded: strings.Join(prior, ", ") + ", " + clientIP.
+        assert!(
+            head.contains("X-Forwarded-For: 203.0.113.9, 10.0.0.4, 198.51.100.23\r\n"),
+            "client chain preserved and real peer appended, head:\n{head}"
+        );
+        assert_eq!(head.matches("X-Forwarded-For").count(), 1);
+    }
+
+    #[test]
+    fn h2_head_configured_xff_replaces_chain_and_peer() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Forwarded-For".to_string(), "192.0.2.1".to_string());
+        let head = head_lines(&build_http1_request_head(
+            &build_req(Some(&["203.0.113.9"])),
+            "",
+            &headers,
+            real_ip(),
+            true,
+        ));
+        // Go order: SetXForwarded appends, then rewriteHTTPPluginRequest's
+        // Header.Set replaces the whole value — only the configured one
+        // survives, and the real peer must NOT be appended.
+        assert!(
+            head.contains("X-Forwarded-For: 192.0.2.1\r\n"),
+            "configured x-forwarded-for must replace the chain, head:\n{head}"
+        );
+        assert_eq!(head.matches("X-Forwarded-For").count(), 1);
+        assert!(
+            !head.contains("198.51.100.23"),
+            "peer must not leak: {head}"
+        );
     }
 }

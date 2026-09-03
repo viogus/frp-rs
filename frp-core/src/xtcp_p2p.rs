@@ -275,6 +275,13 @@ pub async fn punch_udp_hole(
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
 ) -> Result<SocketAddr, String> {
+    // Internal backstop (audit round 6d/§7): the caller's timeout feeds the
+    // recv_from deadline directly and NOT all callers clamp — the provider
+    // session path reaches this with an unclamped server value when
+    // detect_behavior is omitted. Cap it like wait_detect_on_any does
+    // (MAX_HOLE_PUNCH_TIMEOUT_MS = 60s) so a hostile server cannot pin the
+    // task + UDP socket for ~24.8 days (`timeout_ms` is an arbitrary u64).
+    let timeout_ms = timeout_ms.min(MAX_HOLE_PUNCH_TIMEOUT_MS);
     if candidates.is_empty() {
         return Err("no candidate addresses".into());
     }
@@ -395,6 +402,9 @@ async fn recv_second_attempt(
     key: Option<&[u8; 16]>,
     peers: &[SocketAddr],
 ) -> Result<SocketAddr, String> {
+    // Same internal backstop as `punch_udp_hole` (callers may pass the
+    // caller's original, unclamped value on the retry paths).
+    let timeout_ms = timeout_ms.min(MAX_HOLE_PUNCH_TIMEOUT_MS);
     let mut buf = [0u8; 1024];
     let deadline2 = tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms),
@@ -1456,6 +1466,24 @@ async fn send_sid_probe(
 /// 264-287). The old sequential 50 ms-per-socket scan took 257×50 ms ≈ 12.8s
 /// per pass with `listen_random_ports` at its cap — longer than the whole 5s
 /// detect budget — so a reply on the last socket was never seen in time.
+/// One receive future for `wait_detect_on_any`: owns its receive buffer
+/// so concurrent recv futures never share a mutable borrow. Returned
+/// boxed so select_all can poll it (async blocks are !Unpin). Kept as a
+/// helper so a fired socket's slot can be re-armed without duplicating
+/// the block (finding 5: one fresh future per stray datagram, not a full
+/// rebuild of every socket's future).
+type DetectRecvFut<'a> =
+    futures_util::future::BoxFuture<'a, (usize, std::io::Result<(usize, SocketAddr)>, [u8; 1024])>;
+
+fn detect_recv_fut<'a>(s: &'a UdpSocket, idx: usize) -> DetectRecvFut<'a> {
+    async move {
+        let mut buf = [0u8; 1024];
+        let r = s.recv_from(&mut buf).await;
+        (idx, r, buf)
+    }
+    .boxed()
+}
+
 async fn wait_detect_on_any(
     sockets: &[&UdpSocket],
     peers: &[SocketAddr],
@@ -1465,6 +1493,20 @@ async fn wait_detect_on_any(
     key: Option<&[u8; 16]>,
 ) -> Result<(usize, SocketAddr), String> {
     let start = std::time::Instant::now();
+    // One future per socket, each owning its receive buffer. The vec is
+    // built ONCE and only the fired socket's slot is re-armed per round
+    // (finding 5): select_all consumes the vec but returns the losers, so
+    // a non-matching datagram replaces one future instead of rebuilding
+    // all of them (STUN + up to MAX_LISTEN_RANDOM_PORTS extra listeners,
+    // each holding a 1 KiB buffer — ~257 allocations per stray packet).
+    // select_all polls in vec order and stops at the first Ready future,
+    // so a second socket that also received data in the same round wins
+    // on the next round — wire semantics unchanged.
+    let mut futures: Vec<_> = sockets
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| detect_recv_fut(s, idx))
+        .collect();
     loop {
         let remaining_ms = timeout_ms.saturating_sub(start.elapsed().as_millis() as u64);
         if remaining_ms == 0 {
@@ -1473,29 +1515,20 @@ async fn wait_detect_on_any(
                 timeout_ms
             ));
         }
-        // One future per socket, each owning its receive buffer (a shared
-        // buffer cannot be mutably borrowed by concurrent recv futures).
-        // Boxed so select_all can poll them (async blocks are !Unpin).
-        let futures: Vec<_> = sockets
-            .iter()
-            .enumerate()
-            .map(|(idx, s)| {
-                let s = *s;
-                async move {
-                    let mut buf = [0u8; 1024];
-                    let r = s.recv_from(&mut buf).await;
-                    (idx, r, buf)
-                }
-                .boxed()
-            })
-            .collect();
         let (idx, r, buf) = match tokio::time::timeout(
             std::time::Duration::from_millis(remaining_ms),
             futures_util::future::select_all(futures),
         )
         .await
         {
-            Ok((winner, _, _)) => winner,
+            Ok(((idx, r, buf), _pos, rest)) => {
+                // Winner consumed: put a fresh future for its socket back
+                // into the pool for the next round.
+                let mut rest = rest;
+                rest.push(detect_recv_fut(sockets[idx], idx));
+                futures = rest;
+                (idx, r, buf)
+            }
             Err(_elapsed) => {
                 return Err(format!(
                     "wait detect message timeout after {}ms",
@@ -1579,8 +1612,11 @@ pub async fn punch_udp_hole_makehole_owned(
     // side's own send_delay, so it is normally positive; fall back to 5s
     // when the server sent 0 or negative (Go keeps 5s in that case). Also
     // capped at MAX_HOLE_PUNCH_TIMEOUT_MS — a hostile server must not be
-    // able to stretch the detect wait to ~24.8 days (the caller caps too;
-    // this is the punch's own invariant).
+    // able to stretch the detect wait to ~24.8 days. NOTE (audit round
+    // 6d/§7): "the caller caps too" was FALSE for the provider caller —
+    // nat_hole.rs floored only, no ceiling — so this punch-internal cap
+    // (not the caller) is the invariant that bounds the wait; the visitor
+    // caller additionally clamps before calling.
     let timeout_ms = if timeout_ms > 0 {
         timeout_ms.min(MAX_HOLE_PUNCH_TIMEOUT_MS)
     } else {

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +31,12 @@ pub(crate) struct HealthCheckConfig {
     pub max_failed: u32,
     pub health_tx: mpsc::Sender<HealthEvent>,
     pub cancel: Arc<AtomicBool>,
+    /// Monotonic session-generation counter, bumped once per successful
+    /// control login. A monitor re-arms itself (fresh "unregistered" state)
+    /// whenever the value changes, so the proxy re-registers on the new
+    /// session's first healthy probe — Go frp parity: each control.Run()
+    /// builds a fresh health.Monitor with statusOK=false (H2).
+    pub session_gen: Arc<AtomicU64>,
 }
 
 /// Run a health check for a proxy.
@@ -53,6 +59,7 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
         max_failed,
         health_tx,
         cancel,
+        session_gen,
     } = config;
     info!(check_type = %check_type, proxy_name = %proxy_name, local_addr = %local_addr, interval = ?interval, timeout = ?timeout, "Health check ({}) started for '{}' -> {} (interval: {:?}, timeout: {:?})",
         check_type, proxy_name, local_addr, interval, timeout);
@@ -61,6 +68,18 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
     // State transitions are tracked by was_failed/statusOK; the counter
     // counts only the CURRENT failure streak.
     let mut state = HealthState::new();
+
+    // Monitors are long-lived across control sessions; the service bumps
+    // `session_gen` after every successful login. On a change the session
+    // started afresh — the server holds NO registrations for this proxy yet
+    // (register_proxies skips health-checked proxies by design) — so the
+    // monitor returns to the pristine "never registered, never failed"
+    // state. Its next successful probe then emits Recover and the proxy is
+    // re-registered on the new session (Go parity: a fresh control.Run()
+    // builds a fresh Monitor with statusOK=false). Without this, a proxy
+    // that stayed healthy across a reconnect was never re-registered and
+    // stayed dead until a real failure+recovery cycle (H2).
+    let mut seen_gen = session_gen.load(Ordering::Relaxed);
 
     // Go frp v0.70.1 compat: add 500ms startup delay before the first check.
     // This prevents a thundering herd of health checks when many proxies
@@ -72,6 +91,16 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
         if cancel.load(Ordering::Relaxed) {
             info!(proxy_name = %proxy_name, "Health check cancelled for '{}'", proxy_name);
             return;
+        }
+
+        // Re-arm on a control-session boundary (see `seen_gen` above). The
+        // new state keeps `was_healthy=false`, so Close cannot fire before
+        // this session's first successful probe — exactly a fresh Go Monitor.
+        let gen = session_gen.load(Ordering::Relaxed);
+        if gen != seen_gen {
+            debug!(proxy_name = %proxy_name, session_gen = gen, "Health check: control session changed, re-arming registration state for '{}'", proxy_name);
+            state = HealthState::new();
+            seen_gen = gen;
         }
 
         // Run check first, then sleep (Go frp compat: check happens immediately on start,

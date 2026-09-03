@@ -849,19 +849,29 @@ async fn handle_store_proxy_create(
 /// the per-client port count is decremented. The dashboard delete paths used
 /// to skip all three — leaking port quota (`max_ports_per_client`) and
 /// leaving zombie group listeners holding ports until frps restarts.
+///
+/// Callers invoke this AFTER `proxy_manager.remove()` — M5 race-safe
+/// ordering: the group-last check then counts only surviving members (the
+/// deleted one is gone), so a dashboard delete racing a client CloseProxy
+/// cannot have both paths snapshot the pre-removal length and both skip the
+/// teardown. (For the same reason the SUDP owner-check below counts only the
+/// other live udp/sudp proxies — identical to the pre-removal semantics,
+/// which excluded the deleted proxy explicitly.)
 async fn cleanup_deleted_proxy_port(state: &Arc<AppState>, proxy: &crate::proxy::ProxyInfo) {
     let is_tcp_group =
         proxy.proxy_type == "tcp" && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some();
     let group_name = proxy.group.clone().unwrap_or_default();
-    let last_group_member = is_tcp_group && state.proxy_manager.group_len(&group_name).await <= 1;
+    // The proxy was already removed by the caller: <= 1 surviving member
+    // means this deletion emptied the group — stop the shared listener and
+    // release the group port mark.
+    let last_group_member = is_tcp_group && state.proxy_manager.group_len(&group_name).await == 0;
     if let Some(port) = proxy.remote_port {
         if proxy.proxy_type == "udp" || proxy.proxy_type == "sudp" {
             // SUDP proxies can share one server port (frp-rs extension):
             // only release the mark when no OTHER live udp/sudp proxy still
             // holds the bound socket — otherwise the next SUDP registration's
             // OS bind probe fails with EADDRINUSE (audit finding 2, mirroring
-            // handle_close_proxy). The deleted proxy is still in the registry
-            // here, so it is excluded from the owner count.
+            // handle_close_proxy).
             crate::control::release_udp_port_with_owner_check(state, port, &proxy.name).await;
         } else if !is_tcp_group || last_group_member {
             state.used_ports.write().await.remove(&port);
@@ -906,9 +916,6 @@ async fn handle_store_proxy_delete(
 
     let run_id = proxy.run_id.clone();
 
-    // Clean up port (TCP/UDP manager, TCP group last-member semantics and
-    // per-client port quota — same lifecycle as the client CloseProxy path).
-    cleanup_deleted_proxy_port(&state, &proxy).await;
     // Clean up sk_index (indexed by proxy_name)
     if let Some(key) = proxy.sk_index_key() {
         state.xtcp.sk_index.remove(key);
@@ -929,7 +936,20 @@ async fn handle_store_proxy_delete(
     } else {
         state.vhost_manager.unregister(&name).await;
     }
-    state.tcpmux_manager.unregister(&name).await;
+    // TCPMux group members share one route (owned by the FIRST member):
+    // remove from the group first; only drop the route when the group
+    // empties (M2, mirrors the HTTP group branch above).
+    if proxy.proxy_type == "tcpmux" && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some() {
+        if let Some(owner) = state
+            .tcpmux_group_ctl
+            .unregister_member(proxy.group.as_deref().unwrap_or_default(), &proxy.name)
+            .await
+        {
+            state.tcpmux_manager.unregister(&owner).await;
+        }
+    } else {
+        state.tcpmux_manager.unregister(&name).await;
+    }
     state.proxy_metrics.remove(&name).await;
     // Decrement the SNI-sniff gate count only when the proxy was actually
     // removed — the client CloseProxy path races this handler and both may
@@ -940,6 +960,12 @@ async fn handle_store_proxy_delete(
     if state.proxy_manager.remove(&name).await && proxy.proxy_type == "https" {
         state.dec_https_proxy_count();
     }
+    // Clean up port AFTER the registry removal (TCP/UDP manager, TCP group
+    // last-member semantics and per-client port quota — same lifecycle as
+    // the client CloseProxy path). M5: post-remove the group-last check
+    // counts only surviving members, so a delete racing a client CloseProxy
+    // cannot double-skip the shared-listener teardown.
+    cleanup_deleted_proxy_port(&state, &proxy).await;
     // Remove from store if present
     state.proxy_config_store.write().await.remove(&name);
 
@@ -972,9 +998,6 @@ async fn handle_proxies_delete(
     let mut deleted = Vec::new();
     for name in &body.proxies {
         if let Some(proxy) = state.proxy_manager.get(name).await {
-            // Clean up port (TCP/UDP manager, TCP group last-member semantics
-            // and per-client port quota — same lifecycle as CloseProxy).
-            cleanup_deleted_proxy_port(&state, &proxy).await;
             if let Some(key) = proxy.sk_index_key() {
                 state.xtcp.sk_index.remove(key);
             }
@@ -991,7 +1014,22 @@ async fn handle_proxies_delete(
             } else {
                 state.vhost_manager.unregister(name).await;
             }
-            state.tcpmux_manager.unregister(name).await;
+            // TCPMux group members share one route (owned by the FIRST
+            // member): remove from the group first; only drop the route
+            // when the group empties (M2).
+            if proxy.proxy_type == "tcpmux"
+                && proxy.group.as_deref().filter(|g| !g.is_empty()).is_some()
+            {
+                if let Some(owner) = state
+                    .tcpmux_group_ctl
+                    .unregister_member(proxy.group.as_deref().unwrap_or_default(), &proxy.name)
+                    .await
+                {
+                    state.tcpmux_manager.unregister(&owner).await;
+                }
+            } else {
+                state.tcpmux_manager.unregister(name).await;
+            }
             state.proxy_metrics.remove(name).await;
             // Decrement the SNI-sniff gate count only when the proxy was
             // actually removed — CloseProxy / client disconnect race this
@@ -1000,6 +1038,9 @@ async fn handle_proxies_delete(
             if state.proxy_manager.remove(name).await && proxy.proxy_type == "https" {
                 state.dec_https_proxy_count();
             }
+            // Port cleanup AFTER the registry removal — same M5 race-safe
+            // ordering as the single-delete path.
+            cleanup_deleted_proxy_port(&state, &proxy).await;
             state.proxy_config_store.write().await.remove(name);
             deleted.push(name.clone());
         }

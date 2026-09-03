@@ -639,4 +639,170 @@ transport.tcp_mux = false
         stop_tcp_echo_server(echo_h_handle, echo_h_tx);
         stop_tcp_echo_server(echo_h2_handle, echo_h2_tx);
     }
+
+    /// H2 regression: a health-checked proxy that stays HEALTHY across a
+    /// control-session boundary (frps restart) must re-register on the new
+    /// session. Health probes watch the LOCAL service, so an frps outage does
+    /// not fail them: the monitor never enters the failed state, no Close
+    /// fires, and — without the session-generation re-arm (Go parity: each
+    /// control.Run() builds a fresh health.Monitor with statusOK=false) — no
+    /// Recover fires either. register_proxies skips health-checked proxies by
+    /// design (Go: a health=1 proxy registers via its first healthy probe), so
+    /// with the bug the remote port stayed closed forever after any frps
+    /// restart while the local service was healthy.
+    ///
+    /// Timeline: first probe registers (Recover) → frps SIGKILLed → remote
+    /// port closes with the server → local echo stays up, probes stay OK →
+    /// frps restarted on the same port → frpc reconnects in-process (same
+    /// monitor task, no proxy phase reset) → session generation bumps → the
+    /// monitor re-arms to the pristine state → its next OK probe emits
+    /// Recover → NewProxy re-registers the proxy → the remote port reopens.
+    #[tokio::test]
+    async fn test_health_proxy_re_registers_after_frps_restart() {
+        // Skip if binaries not built.
+        let frps_bin = workspace_bin("frps");
+        let frpc_bin = workspace_bin("frpc");
+        if !frps_bin.exists() || !frpc_bin.exists() {
+            eprintln!(
+                "Skipping: binaries not found ({}, {}) — build with: cargo build -p frps -p frpc",
+                frps_bin.display(),
+                frpc_bin.display(),
+            );
+            return;
+        }
+
+        let bind_port = allocate_port();
+        let local_h = allocate_port();
+        let remote_h = allocate_port();
+        let token = "test-health-restart-token";
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let frps_config_path = dir.path().join("frps.toml");
+        let frpc_config_path = dir.path().join("frpc.toml");
+
+        // ---- Step 1: local echo server (health probes watch THIS, so an
+        // frps outage never fails them) ----
+        let (echo_h_handle, echo_h_tx) = start_tcp_echo_server(local_h);
+        assert!(wait_for_port(local_h, 5), "echo server did not start");
+
+        // ---- Step 2: frps + frpc configs ----
+        let frps_config = format!(
+            r#"
+bind_addr = "127.0.0.1"
+bind_port = {bind_port}
+
+[auth]
+method = "token"
+token = "{token}"
+
+[transport]
+tcp_mux = false
+"#,
+            bind_port = bind_port,
+            token = token,
+        );
+        std::fs::write(&frps_config_path, &frps_config).unwrap();
+
+        // Explicit 1s interval is honored (only 0 defaults to 10s — Go
+        // parity: defaults substitute only on <= 0), keeping the test fast.
+        let frpc_config = format!(
+            r#"
+server_addr = "127.0.0.1"
+server_port = {bind_port}
+auth.token = "{token}"
+transport.tls.enable = false
+transport.tcp_mux = false
+
+[[proxies]]
+name = "tcp-h"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = {local_h}
+remote_port = {remote_h}
+health_check_type = "tcp"
+health_check_interval_seconds = 1
+health_check_timeout_seconds = 1
+health_check_max_failed = 1
+"#,
+            bind_port = bind_port,
+            token = token,
+            local_h = local_h,
+            remote_h = remote_h,
+        );
+        std::fs::write(&frpc_config_path, &frpc_config).unwrap();
+
+        // ---- Step 3: start frps + frpc; the proxy registers via the first
+        // healthy probe (Recover with the pristine was_failed=true state) ----
+        let mut frps = Command::new(&frps_bin)
+            .arg("-c")
+            .arg(&frps_config_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to start frps");
+        assert!(wait_for_port(bind_port, 10), "frps did not start");
+
+        let mut frpc = Command::new(&frpc_bin)
+            .arg("-c")
+            .arg(&frpc_config_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to start frpc");
+
+        assert!(
+            wait_for_port(remote_h, 15),
+            "health-checked proxy never became ready on first session"
+        );
+        let echo_result = tcp_echo(remote_h, b"hello-h-session-1", 5);
+        assert!(
+            echo_result.is_ok(),
+            "proxy should work before restart: {:?}",
+            echo_result.err()
+        );
+        assert_eq!(echo_result.unwrap(), b"hello-h-session-1".to_vec());
+
+        // ---- Step 4: kill frps; the remote port dies with the server while
+        // the local echo stays up (probes keep succeeding) ----
+        let _ = frps.kill();
+        let _ = frps.wait();
+        assert!(
+            wait_for_port_closed(remote_h, 10),
+            "remote port should close when frps dies"
+        );
+
+        // ---- Step 5: restart frps on the same port; frpc reconnects
+        // in-process and the monitor task survives the session boundary ----
+        let mut frps = Command::new(&frps_bin)
+            .arg("-c")
+            .arg(&frps_config_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to restart frps");
+        assert!(wait_for_port(bind_port, 10), "frps did not restart");
+
+        // The proxy must re-register on the NEW session via the monitor's
+        // first healthy probe. With the H2 bug no event ever fires (the
+        // monitor is healthy — was_failed=false — and register_proxies skips
+        // health-checked proxies), so the remote port never reopens.
+        assert!(
+            wait_for_port(remote_h, 20),
+            "health-checked proxy never re-registered after frps restart (H2)"
+        );
+        let echo_result = tcp_echo(remote_h, b"hello-h-session-2", 5);
+        assert!(
+            echo_result.is_ok(),
+            "re-registered proxy should work: {:?}",
+            echo_result.err()
+        );
+        assert_eq!(echo_result.unwrap(), b"hello-h-session-2".to_vec());
+
+        // Cleanup
+        let _ = frpc.kill();
+        let _ = frps.kill();
+        let _ = frpc.wait();
+        let _ = frps.wait();
+        stop_tcp_echo_server(echo_h_handle, echo_h_tx);
+    }
 }

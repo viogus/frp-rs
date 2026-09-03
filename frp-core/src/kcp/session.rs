@@ -120,6 +120,12 @@ pub struct KcpSession {
     /// real clock, so tests can simulate long silent gaps deterministically.
     fec_clock_override: Option<u64>,
     read_tx: mpsc::Sender<Vec<u8>>,
+    /// Driver-clock ms of the last successfully processed inbound packet
+    /// (stamped by the KcpSocket driver on every input() success; 0 before
+    /// the first). Feeds the accepted-session idle reaper (M11): a session
+    /// whose read channel has closed and which stays silent past
+    /// ACCEPTED_SESSION_REAP_GRACE_MS is removed by the tick arm.
+    last_rx_ms: u32,
     shutdown: bool,
     /// Frame that couldn't be delivered to the read channel on the previous
     /// tick because the channel was full. Must be flushed before consuming
@@ -229,6 +235,7 @@ impl KcpSession {
             fec_clock_base: std::time::Instant::now(),
             fec_clock_override: None,
             read_tx,
+            last_rx_ms: 0,
             shutdown: false,
             pending_read: None,
             pending_shards: Vec::new(),
@@ -708,6 +715,28 @@ impl KcpSession {
     /// the driver. KcpStream uses this to detect a dead session.
     pub fn alive_handle(&self) -> Arc<AtomicBool> {
         self.alive.clone()
+    }
+
+    /// Stamp the driver-clock time of the last successfully processed
+    /// inbound packet (M11 idle reaper feed). Called by the KcpSocket driver
+    /// on every input() success, including the first packet at creation.
+    pub fn note_inbound(&mut self, driver_clock_ms: u32) {
+        self.last_rx_ms = driver_clock_ms;
+    }
+
+    /// Driver-clock ms of the last inbound packet (0 before the first).
+    pub fn last_inbound_ms(&self) -> u32 {
+        self.last_rx_ms
+    }
+
+    /// Whether every receiver of this session's read channel has been
+    /// dropped — i.e. no live KcpStream serves this session (M11). The
+    /// session's single stream owns the channel's rx end for the whole
+    /// connection lifetime, so a closed channel means the frp connection
+    /// this session carried has ended and nothing will ever consume its
+    /// data again; the session is dead weight.
+    pub fn read_channel_closed(&self) -> bool {
+        self.read_tx.is_closed()
     }
 
     /// Mark the session as dead -- called by KcpSocket when removing.

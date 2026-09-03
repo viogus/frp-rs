@@ -31,7 +31,7 @@ use frp_core::mux::IncomingStreams;
 use crate::lock::RwLockExt;
 use crate::state::{AppState, ControlTx, InternalMsg, PoolStats, ReplayCheck};
 
-use super::pool::{PendingRequest, PoolEntry, WORK_POOL_ABS_CEILING, WORK_POOL_EXTRA};
+use super::pool::{PendingRequest, PoolEntry, WORK_POOL_EXTRA};
 use super::proxy_ops::{err_msg, unregister_control};
 use super::{write_ctl_msg, ControlContext, ControlState};
 
@@ -105,18 +105,21 @@ pub(crate) fn authenticated_user(
 }
 
 /// Clamp the client's requested pool_count against the server-side
-/// `max_pool_count`, and against the absolute ceiling `WORK_POOL_ABS_CEILING`
-/// when `max_pool_count` is unset (0) — the client must not be able to make
-/// the server pool an unbounded number of work conns (audit fix). Go frp
-/// treats poolCount < 1 as 1.
+/// `max_pool_count`. An unset (0) `max_pool_count` is the Go default 5
+/// (Go `util.EmptyOr` parity, pkg/config/v1/server.go:186 — Go has no
+/// "uncapped" mode; a negative value was already rejected in
+/// `authenticate` with the Go control.go:440 error). Go frp treats
+/// poolCount < 1 as 1.
 fn capped_pool_count(pool_count: Option<i32>, max_pool_count: i64) -> usize {
     let raw = pool_count.unwrap_or(1).max(1) as i64;
-    let capped = if max_pool_count > 0 {
-        raw.min(max_pool_count)
+    // Negative max_pool_count is rejected at login before this runs; only
+    // 0 (→ Go default 5) and positive values reach the min.
+    let max = if max_pool_count > 0 {
+        max_pool_count
     } else {
-        raw.min(WORK_POOL_ABS_CEILING as i64)
+        5
     };
-    capped.max(1) as usize
+    raw.min(max).max(1) as usize
 }
 
 pub(crate) async fn remove_oidc_subject_generation(
@@ -429,7 +432,13 @@ async fn verify_login_auth(
                     auth_cfg.authentication_timeout,
                 ) {
                     warn!(peer = ?peer, error = %e, "Login timestamp outside acceptable window: {}", e);
-                    send_login_error(stream, e, v2).await;
+                    // Freshness rejections consume a throttle slot like every
+                    // other pre-auth failure (finding 6b): an attacker
+                    // replaying captured (ts, md5) pairs with a stale clock
+                    // would otherwise fail here forever without ever
+                    // advancing toward the per-IP throttle.
+                    let throttled = throttled_login_error(state, peer).await;
+                    send_login_error(stream, throttled.unwrap_or(e), v2).await;
                     return Err(());
                 }
                 // Use client-provided run_id for duplicate detection.
@@ -845,6 +854,24 @@ pub(crate) async fn authenticate(
             .await;
             return Err(());
         }
+    }
+
+    // Server-side negative max_pool_count: Go NewControl parity
+    // (server/control.go:440-445) — the check runs immediately after the
+    // client poolCount check and rejects the login with the Go error text.
+    // Go's Complete() only EmptyOrs 0 → 5 and leaves negatives to fail
+    // every login; frp-rs used to treat a negative like 0 (uncapped, 512
+    // ceiling) instead of surfacing the operator config error.
+    let max_pool = state.server_config_snapshot.max_pool_count;
+    if max_pool < 0 {
+        warn!(peer = ?peer, max_pool_count = %max_pool, "Login rejected: negative server max_pool_count {}", max_pool);
+        send_login_error(
+            stream,
+            format!("invalid max pool count {max_pool}: must be non-negative"),
+            v2,
+        )
+        .await;
+        return Err(());
     }
 
     let reloadable = state.reloadable.read_ok().clone();
@@ -1675,15 +1702,16 @@ mod send_login_error_deadline_tests {
 #[cfg(test)]
 mod pool_count_tests {
     use super::capped_pool_count;
-    use crate::control::pool::WORK_POOL_ABS_CEILING;
 
     #[test]
-    fn unset_max_pool_count_clamps_to_absolute_ceiling() {
-        // max_pool_count = 0 (unset): the client's pool_count must not be
-        // able to make the server pool unbounded work conns (audit fix).
-        assert_eq!(capped_pool_count(Some(100_000), 0), WORK_POOL_ABS_CEILING);
-        assert_eq!(capped_pool_count(Some(65_000), 0), WORK_POOL_ABS_CEILING);
-        // Below the ceiling: honored as requested.
+    fn unset_max_pool_count_uses_go_empty_or_default() {
+        // max_pool_count = 0 (unset): Go util.EmptyOr parity
+        // (pkg/config/v1/server.go:186) — unset is the Go default 5, NOT
+        // uncapped. The old "0 = no server cap" (512 absolute ceiling)
+        // pooled up to 512 work conns per client where a Go server pools 5.
+        assert_eq!(capped_pool_count(Some(100_000), 0), 5);
+        assert_eq!(capped_pool_count(Some(65_000), 0), 5);
+        // Below the default: honored as requested.
         assert_eq!(capped_pool_count(Some(5), 0), 5);
         assert_eq!(capped_pool_count(None, 0), 1);
         // Go frp treats poolCount < 1 as 1.
@@ -1695,7 +1723,8 @@ mod pool_count_tests {
         assert_eq!(capped_pool_count(Some(100_000), 50), 50);
         assert_eq!(capped_pool_count(Some(5), 50), 5);
         assert_eq!(capped_pool_count(None, 50), 1);
-        // The configured cap still applies above the absolute ceiling.
+        // An explicitly configured cap above 5 is honored (Go same — the
+        // EmptyOr default only applies to unset).
         assert_eq!(capped_pool_count(Some(100_000), 10_000), 10_000);
     }
 }

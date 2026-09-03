@@ -1,3 +1,4 @@
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 use super::server::{
@@ -21,7 +22,18 @@ where
     D: serde::Deserializer<'de>,
 {
     let v = i64::deserialize(d)?;
-    Ok(v.clamp(0, MAX_UDP_PACKET_SIZE))
+    // Explicit 0 (or negative) rejected at load (audit round 3, LOW): the
+    // work-conn recv loop would otherwise truncate every inbound datagram to
+    // 1 byte (`vec![0u8; udp_packet_size.max(1)]`) and forward the corrupted
+    // remainder — Go frp's zero-length buffer discards instead, so the
+    // failure modes would diverge silently. Fail-fast at load (poolCount
+    // precedent) beats either runtime behavior.
+    if v <= 0 {
+        return Err(D::Error::custom(
+            "udp_packet_size must be > 0 (0 would truncate every UDP datagram)",
+        ));
+    }
+    Ok(v.min(MAX_UDP_PACKET_SIZE))
 }
 
 fn default_visitor_bind_addr() -> String {
@@ -811,7 +823,7 @@ mod tests {
     use super::clamp_udp_packet_size;
     use serde::Deserialize;
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     struct Wrapper {
         #[serde(deserialize_with = "clamp_udp_packet_size")]
         v: i64,
@@ -831,9 +843,15 @@ mod tests {
         // In-range values pass through untouched.
         assert_eq!(parse(r#"{"v": 2048}"#), 2048);
         assert_eq!(parse(r#"{"v": 1500}"#), 1500);
-        // Negative / zero → clamped to 0 (runtime use-sites floor at 1).
-        assert_eq!(parse(r#"{"v": -5}"#), 0);
-        assert_eq!(parse(r#"{"v": 0}"#), 0);
+        // Zero / negative → rejected at load (round 3): a zero-length recv
+        // buffer would truncate every datagram to 1 byte at runtime.
+        for bad in [r#"{"v": 0}"#, r#"{"v": -5}"#] {
+            let err = serde_json::from_str::<Wrapper>(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("udp_packet_size must be > 0"),
+                "unexpected error: {err}"
+            );
+        }
         // Non-integer still fails deserialization.
         assert!(serde_json::from_str::<Wrapper>(r#"{"v": "big"}"#).is_err());
     }

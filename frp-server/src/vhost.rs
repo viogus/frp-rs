@@ -6,6 +6,10 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
 use crate::service::{AppState, InternalMsg};
+// Strict request-line authority canonicalization (Go url.ParseRequestURI
+// semantics — digit gate on non-empty ports, mis-brackets → 400). Shared
+// with tcpmux.rs, which owns it (round-3 M4).
+use crate::tcpmux::canonicalize_host;
 
 /// HTTP/2 cleartext (h2c) vhost handling — see `vhost_h2c.rs`.
 /// Only compiled when the `http-proxy` feature is enabled (audit round 5:
@@ -41,7 +45,7 @@ pub struct VhostRoute {
     /// v0.71.0 HTTPGroup): requests are dispatched round-robin across the
     /// group's members instead of always to `proxy_name`. The route is
     /// created by the group's first member; `proxy_name`/`run_id` carry the
-    /// first member's identity for fallback (e.g. route_by_http_user miss).
+    /// first member's identity as fallback.
     pub group: Arc<str>,
     /// Location prefixes for this proxy (empty = host-only routing).
     pub locations: Vec<String>,
@@ -50,8 +54,12 @@ pub struct VhostRoute {
     /// HTTP Basic Auth credentials (empty = no auth).
     pub http_user: Arc<str>,
     pub http_pwd: Arc<str>,
-    /// Per-user routing: extract username from Authorization header and route
-    /// to proxy `{route_by_http_user}.{username}` (Go frp compat).
+    /// Per-user routing bucket key (Go frp compat): the router registers
+    /// this proxy under the (domain, route_by_http_user) bucket, and a
+    /// request whose Basic-Auth username equals the bucket value matches —
+    /// the bucket lookup IS the per-user routing. No proxy-name synthesis
+    /// exists in Go (audit round 3, M12 — the old
+    /// `{route_by_http_user}.{username}` global lookup was removed).
     pub route_by_http_user: Arc<str>,
     /// Request headers to inject before forwarding (Go frp compat:
     /// requestHeaders). Set semantics — override same-name headers.
@@ -611,13 +619,16 @@ async fn serve_vhost_request<S>(
 {
     // Read the first 4096 bytes to extract Host header (with configured timeout).
     let timeout_secs = clamp_vhost_timeout(state.vhost_http_timeout);
+    // Single absolute deadline for the ENTIRE head across all phases (audit
+    // round 3, LOW): the initial read, the h2-preface completion, and the
+    // HTTP/1.1 head completion used to each get a FRESH window, letting a
+    // drip client ("P" → slow garbage preface → slow head) park the task for
+    // up to 3× vhost_http_timeout. One deadline from first-byte attempt
+    // matches Go's http.Server ReadTimeout (one window covers the whole
+    // request head).
+    let head_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut buf = [0u8; 4096];
-    let n = match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        stream.read(&mut buf),
-    )
-    .await
-    {
+    let n = match tokio::time::timeout_at(head_deadline, stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => n,
         _ => return,
     };
@@ -641,19 +652,18 @@ async fn serve_vhost_request<S>(
             // preface before committing to the h2 path. A truncated HTTP/1.1
             // request (e.g. "POST …" cut to "P") falls back to the HTTP/1.1
             // parser (Go's bufio-based h2 server matches the exact line).
-            // Single absolute deadline for the whole preface completion
-            // (same idiom as the HTTP/1.1 head at handle_http1_request): a
-            // slow-drip client sending one byte per read window would
-            // otherwise stretch the completion loop to 23 × timeout (a
-            // sub-1s-per-byte drip would never trip a per-read timeout and
-            // would park the task + fd + permit for minutes). The full
-            // preface must arrive within vhost_http_timeout.
-            let preface_deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+            // The preface completion shares the single head deadline from
+            // serve_vhost_request entry (audit round 3): a slow-drip client
+            // sending one byte per read window would otherwise stretch the
+            // completion loop to 23 × timeout AND then re-open a fresh head
+            // window on the HTTP/1.1 fallback (a sub-1s-per-byte drip would
+            // never trip a per-read timeout and would park the task + fd +
+            // permit for up to 3 × vhost_http_timeout). The full preface
+            // must arrive within vhost_http_timeout of the first byte.
             let mut prefix_len = n;
             while prefix_len < vhost_h2c::H2_PREFACE.len() {
                 let m = match tokio::time::timeout_at(
-                    preface_deadline,
+                    head_deadline,
                     stream.read(&mut buf[prefix_len..vhost_h2c::H2_PREFACE.len()]),
                 )
                 .await
@@ -679,11 +689,12 @@ async fn serve_vhost_request<S>(
                 peer,
                 scheme,
                 wrap,
+                head_deadline,
             )
             .await;
         }
     }
-    return handle_http1_request(stream, pre_read, state, peer, scheme, wrap).await;
+    return handle_http1_request(stream, pre_read, state, peer, scheme, wrap, head_deadline).await;
 }
 
 /// HTTP/1.1 vhost path: finish reading the request head (up to 4096 bytes or
@@ -696,17 +707,18 @@ async fn handle_http1_request<S>(
     peer: std::net::SocketAddr,
     scheme: &str,
     wrap: impl FnOnce(S) -> frp_core::transport::IoStream,
+    head_deadline: tokio::time::Instant,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     // The vhost listener's single read may be short (e.g. an h2c-misdetected
     // HTTP/1.1 request): keep reading until the head terminator or the cap.
-    let timeout_secs = clamp_vhost_timeout(state.vhost_http_timeout);
-    // Single absolute deadline for the whole head (audit fix): a slow-drip
-    // client sending one byte per read window would otherwise stretch the
-    // head read to 4096 × timeout. The whole head must arrive within
-    // vhost_http_timeout, matching Go frp's connReadTimeout semantics.
-    let head_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // The deadline is the ONE absolute window threaded from
+    // serve_vhost_request entry (audit round 3) — a slow-drip client would
+    // otherwise stretch the head read to 4096 × timeout, and re-opening a
+    // fresh window here would stack on top of the preface phase. The whole
+    // head must arrive within vhost_http_timeout of the first byte,
+    // matching Go frp's connReadTimeout semantics.
     while pre_read.len() < 4096 && !pre_read.windows(4).any(|w| w == b"\r\n\r\n") {
         let mut buf = [0u8; 4096];
         let m = match tokio::time::timeout_at(head_deadline, stream.read(&mut buf)).await {
@@ -1051,37 +1063,13 @@ pub(crate) async fn resolve_vhost_request(
         }
     };
 
-    // Per-user routing (Go frp compat): when route_by_http_user is set,
-    // extract the Basic Auth username and look up proxy
-    // `{route_by_http_user}.{username}` in the proxy manager.
-    let (target_proxy_name, target_run_id) = if !route.route_by_http_user.is_empty() {
-        if let Some((username, _password)) = http_auth {
-            let user_proxy = format!("{}.{}", route.route_by_http_user, username);
-            debug!(
-                host = %host, route_by_http_user = %route.route_by_http_user,
-                username = %username, user_proxy = %user_proxy,
-                "{} VHost: trying user-based routing to '{}'", scheme, user_proxy
-            );
-            if let Some(user_info) = state.proxy_manager.get(&user_proxy).await {
-                (user_proxy, user_info.run_id.clone())
-            } else {
-                // User-specific proxy not found — fall through to
-                // the route's own proxy (matching Go frp behavior
-                // when the target proxy doesn't exist).
-                debug!(
-                    user_proxy = %user_proxy,
-                    "{} VHost: user-based proxy '{}' not found, falling back to '{}'",
-                    scheme, user_proxy, group_proxy_name
-                );
-                (group_proxy_name, group_run_id)
-            }
-        } else {
-            // No Authorization header — fall through to route's proxy.
-            (group_proxy_name, group_run_id)
-        }
-    } else {
-        (group_proxy_name, group_run_id)
-    };
+    // The route's own member (or group-chosen member above) IS the per-user
+    // target: the bucket lookup in lookup_combined already matched on the
+    // request's Basic-Auth username (Go router semantics — route_by_http_user
+    // is a registration-side bucket key, never a proxy-name prefix). The old
+    // synthesized `{route_by_http_user}.{username}` global proxy lookup was a
+    // cross-tenant hijack (any registered proxy could impersonate the
+    // redirect target) and is removed (audit round 3, M12).
 
     // Apply host_header_rewrite if configured
     let request_head = if !route.host_header_rewrite.is_empty() {
@@ -1102,8 +1090,8 @@ pub(crate) async fn resolve_vhost_request(
         inject_vhost_request_headers(request_head, peer, raw_host, route.headers.as_slice());
 
     Ok(VhostForward {
-        proxy_name: target_proxy_name,
-        run_id: target_run_id,
+        proxy_name: group_proxy_name,
+        run_id: group_run_id,
         request_head,
     })
 }
@@ -1414,7 +1402,7 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
         return RequestLine::BadRequest;
     }
     let mut parts = first_line.splitn(3, ' ');
-    let _method = parts.next().unwrap_or("");
+    let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     let version = parts.next().unwrap_or("HTTP/0.9"); // Go: len(parts)<3 → HTTP/0.9
 
@@ -1430,6 +1418,60 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
     // http1ServerSupportsRequest: only major 1 passes (PRI excluded).
     if version.as_bytes()[5] != b'1' {
         return RequestLine::VersionNotSupported;
+    }
+
+    // CONNECT authority-form (RFC 7230 §5.3.3 — Go net/http readRequest
+    // `justAuthority`): Go prefixes the target with "http://" and runs
+    // url.ParseRequestURI, so req.Host = req.URL.Host = the request-line
+    // authority (any Host header is IGNORED for routing; probe vs Go
+    // v0.71.0: a CONNECT with a mismatched Host header still reached the
+    // authority's own proxy), req.URL.Path is the URL path — "" for a bare
+    // "host:port" target, so a plain CONNECT must never match a
+    // location-scoped route (probe: CONNECT to a locations-only host was
+    // 404), and the auth shape is proxy-form — checkRouteAuthByRequest
+    // sees URL.Host != "" and reads Proxy-Authorization only, answering
+    // 407 + Proxy-Authenticate (probes: 407 with or without an
+    // Authorization header; the right Proxy-Authorization creds tunnel).
+    // The method gate is case-sensitive: a lowercase "connect" is not
+    // justAuthority, Go parses its scheme-looking target as a URL whose
+    // host is empty and 404s on the "" route — frp-rs routes the Host
+    // header instead (accepted divergence on a garbage line: routing on
+    // the Host header reaches only proxies the client could reach with a
+    // valid request anyway).
+    if method == "CONNECT" && !target.starts_with('/') {
+        // Authority runs to the first '/', '?' or '#' (url.ParseRequestURI).
+        let (authority, url_path) = match target.find(['/', '?', '#']) {
+            Some(i) => (&target[..i], &target[i..]),
+            None => (target, ""),
+        };
+        if authority.is_empty() {
+            // "http://" + "" parses with URL.Host == "" (probe: an empty
+            // CONNECT target was a 404 route-miss, never a 400): req.Host
+            // falls back to the Host header and the request takes
+            // origin-form semantics — the same fallback as "GET http://"
+            // on an auth host (probe: 401 + WWW-Authenticate, not 407).
+            return RequestLine::Ok {
+                host: extract_host_header(request),
+                path: split_path_and_query(url_path),
+                absolute_form: false,
+            };
+        }
+        // url.ParseRequestURI rejects a malformed authority BEFORE routing:
+        // a non-empty non-digit port ("host:abc", "[::1]:80:90") or a
+        // broken bracket pair ("[::1]x]:8080") is a 400 (probes: all 400
+        // Bad Request). An empty port is legal ("host:" → "host"). This is
+        // tcpmux's strict canonicalize_host — vhost's own
+        // canonicalize_authority is the LENIENT Host-header variant (Go
+        // routes "Host: example.com:abc"; the request line alone carries
+        // url.ParseRequestURI's digit gate).
+        let Some(host) = canonicalize_host(authority, true) else {
+            return RequestLine::BadRequest;
+        };
+        return RequestLine::Ok {
+            host: Some(host),
+            path: split_path_and_query(url_path),
+            absolute_form: true,
+        };
     }
 
     // Absolute-form: "GET http://host[:port]/path?query HTTP/1.1".
@@ -1448,13 +1490,38 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
             None => (rest, ""),
         };
         if authority.is_empty() {
-            // Go url.ParseRequestURI errors on a missing host → 400.
-            return RequestLine::BadRequest;
+            // Go url.ParseRequestURI("http://") and "http:///x" SUCCEED
+            // with URL.Host == "" (probes vs Go v0.71.0: "GET http://" and
+            // "GET http:///x" on an auth host answered 401 +
+            // WWW-Authenticate — the origin shape, never 400, never 407):
+            // req.Host falls back to the Host header, the request takes
+            // origin-form semantics, and the path is the URL's path. The
+            // old unconditional BadRequest here was wrong.
+            return RequestLine::Ok {
+                host: extract_host_header(request),
+                path: {
+                    let path = split_path_and_query(url_path);
+                    if path.is_empty() {
+                        "/"
+                    } else {
+                        path
+                    }
+                },
+                absolute_form: false,
+            };
         }
+        // The same url.ParseRequestURI gate as CONNECT: a non-digit port
+        // or mis-bracketed authority is a 400 (probes), an empty port is
+        // legal. The pre-fix code canonicalized leniently and returned an
+        // unroutable "" host — wrong: ParseRequestURI rejects before
+        // CanonicalHost ever sees the value.
+        let Some(host) = canonicalize_host(authority, true) else {
+            return RequestLine::BadRequest;
+        };
         let path = split_path_and_query(url_path);
         let path = if path.is_empty() { "/" } else { path };
         return RequestLine::Ok {
-            host: Some(canonicalize_authority(authority)),
+            host: Some(host),
             path,
             absolute_form: true,
         };
@@ -1779,13 +1846,15 @@ pub(crate) fn count_host_headers(request: &str) -> usize {
 /// SplitHostPort ERRORS → "" (unroutable), never the bare "::1". Portless
 /// values are used as-is — "example.com", or "[::1]" which stays bracketed
 /// (unroutable, nothing registers brackets).
-pub(crate) fn canonicalize_authority(value: &str) -> &str {
+fn canonicalize_authority(value: &str) -> &str {
     let colons = value.bytes().filter(|b| *b == b':').count();
     let hostname = if colons == 1 {
         // host:port — SplitHostPort never validates the port digits
         // (Go frp routes "Host: example.com:abc" to example.com); the
-        // digit gate exists only on the CONNECT request line, where
-        // url.ParseRequestURI enforces it (validOptionalPort). An EMPTY
+        // digit gate exists only on the REQUEST LINE (CONNECT
+        // authority-form and absolute-form targets), where
+        // url.ParseRequestURI enforces it (validOptionalPort) — handled
+        // by tcpmux's strict canonicalize_host, imported above. An EMPTY
         // port part ("example.com:") is legal — Go slices `port =
         // hostport[i+1:]` unconditionally and its own test suite pins
         // {"golang.org:", "golang.org", ""} — CanonicalHost routes the
@@ -1830,9 +1899,13 @@ pub(crate) fn canonicalize_authority(value: &str) -> &str {
 /// here ("example.com:8080" keeps its port, "ExAmPlE.com." keeps its dot).
 fn extract_raw_request_host(request: &str, is_absolute_form: bool) -> &str {
     if is_absolute_form {
-        // First-line request target "scheme://authority[/…]" — authority
-        // ends at the first '/', '?' or '#' (Go url.ParseRequestURI). Same
-        // scheme detection as parse_vhost_request_line.
+        // First-line request target — Go req.Host = req.URL.Host, used
+        // verbatim (port and case preserved). Absolute-form GETs carry
+        // "scheme://authority[/…]" (authority ends at the first '/', '?'
+        // or '#' — url.ParseRequestURI); a bare CONNECT authority has no
+        // scheme, so the target itself is the authority, truncated at the
+        // same delimiters (round-3 M4: previously the no-scheme fallback
+        // returned "", losing the port from X-Forwarded-Host).
         let target = request
             .lines()
             .next()
@@ -1842,10 +1915,9 @@ fn extract_raw_request_host(request: &str, is_absolute_form: bool) -> &str {
             .unwrap_or("");
         let rest = target
             .strip_prefix("http://")
-            .or_else(|| target.strip_prefix("https://"));
-        return rest
-            .and_then(|r| r.split(['/', '?', '#']).next())
-            .unwrap_or("");
+            .or_else(|| target.strip_prefix("https://"))
+            .unwrap_or(target);
+        return rest.split(['/', '?', '#']).next().unwrap_or("");
     }
     for line in request.lines() {
         if line.len() < 5 {
@@ -2391,15 +2463,36 @@ mod tests {
             panic!("expected Ok");
         };
         assert_eq!(path, "/");
-        // Malformed absolute URL (empty authority) → 400.
-        assert_eq!(
-            parse_vhost_request_line("GET http:///x HTTP/1.1\r\nHost: x\r\n\r\n"),
-            RequestLine::BadRequest
-        );
-        assert_eq!(
-            parse_vhost_request_line("GET http:// HTTP/1.1\r\nHost: x\r\n\r\n"),
-            RequestLine::BadRequest
-        );
+        // M4 (empirical probes vs Go frp v0.71.0): url.ParseRequestURI
+        // ACCEPTS an empty authority — "http://" and "http:///x" both
+        // parse with URL.Host == "" → req.Host falls back to the Host
+        // header and the request takes origin-form semantics ("GET http://"
+        // on an auth host answered 401 + WWW-Authenticate, never 400,
+        // never 407). The old unconditional BadRequest pins were wrong.
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line("GET http:///x HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("x")); // Host header fallback
+        assert_eq!(path, "/x"); // the URL's own path
+        assert!(!absolute_form, "origin-form semantics");
+        let RequestLine::Ok { path, .. } =
+            parse_vhost_request_line("GET http:// HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(path, "/");
+        // Empty authority with NO Host header → host None (caller 400s —
+        // Go readRequest "missing required Host header").
+        let RequestLine::Ok { host, .. } = parse_vhost_request_line("GET http:// HTTP/1.1\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, None);
         // Bracketed IPv6 authority.
         let RequestLine::Ok { host, .. } =
             parse_vhost_request_line("GET https://[::1]:8080/ HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -2407,16 +2500,154 @@ mod tests {
             panic!("expected Ok");
         };
         assert_eq!(host, Some("::1"));
-        // A5: mis-bracketed authority — Go SplitHostPort errors ("missing
-        // port in address": the ']' is not immediately before the last
-        // colon, net/ipsock.go) → CanonicalHost "" (unroutable), never the
-        // bare "::1" nor the raw literal.
+        // M4 (probes): url.ParseRequestURI rejects a malformed authority
+        // BEFORE routing — mis-brackets and non-digit ports are 400s.
+        assert_eq!(
+            parse_vhost_request_line("GET http://[::1]x]:8080/ HTTP/1.1\r\nHost: x\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        assert_eq!(
+            parse_vhost_request_line("GET http://a.example.com:abc/ HTTP/1.1\r\nHost: x\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        assert_eq!(
+            parse_vhost_request_line("GET http://[::1]:80:90/ HTTP/1.1\r\nHost: x\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        // Empty port stays legal (probe: routed, not 400).
         let RequestLine::Ok { host, .. } =
-            parse_vhost_request_line("GET http://[::1]x]:8080/ HTTP/1.1\r\nHost: x\r\n\r\n")
+            parse_vhost_request_line("GET http://a.example.com: HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("a.example.com"));
+    }
+
+    #[test]
+    fn test_parse_vhost_request_line_connect_authority_form() {
+        // M4 (empirical probe matrix vs Go frp v0.71.0, rows 04-19):
+        // a CONNECT with a non-"/" target is authority-form (Go readRequest
+        // justAuthority → "http://" + target → ParseRequestURI) — req.Host
+        // = the request-line authority, Host header IGNORED.
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line("CONNECT a.example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("a.example.com")); // port stripped
+        assert_eq!(path, ""); // Go req.URL.Path — plain CONNECTs must not
+                              // match location-scoped routes (probe: 404)
+        assert!(absolute_form, "proxy-form auth + authority routing");
+        // A mismatched Host header is ignored entirely (probe 14: the
+        // authority's own proxy was reached).
+        let RequestLine::Ok { host, .. } = parse_vhost_request_line(
+            "CONNECT a.example.com:443 HTTP/1.1\r\nHost: evil.example.com\r\n\r\n",
+        ) else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("a.example.com"));
+        // Portless and empty-port authorities are legal (probes 06/07).
+        for target in [
+            "CONNECT a.example.com HTTP/1.1",
+            "CONNECT a.example.com: HTTP/1.1",
+        ] {
+            let line = format!("{target}\r\nHost: x\r\n\r\n");
+            let RequestLine::Ok { host, path, .. } = parse_vhost_request_line(&line) else {
+                panic!("expected Ok for {target}");
+            };
+            assert_eq!(host, Some("a.example.com"));
+            assert_eq!(path, "");
+        }
+        // url.ParseRequestURI 400-gates (probes 05/18/29): non-digit port,
+        // mis-brackets, extra colon after the bracket.
+        for target in [
+            "CONNECT a.example.com:abc HTTP/1.1",
+            "CONNECT [::1]x]:8080 HTTP/1.1",
+            "CONNECT [::1]:80:90 HTTP/1.1",
+        ] {
+            assert_eq!(
+                parse_vhost_request_line(&format!("{target}\r\nHost: x\r\n\r\n")),
+                RequestLine::BadRequest,
+                "{target} must 400"
+            );
+        }
+        // Colon-only authority ":443" → SplitHostPort host "" → routes
+        // nothing (probe 26: 404; Go URL.Host ":443" is non-empty so the
+        // request stays authority-form).
+        let RequestLine::Ok {
+            host,
+            absolute_form,
+            ..
+        } = parse_vhost_request_line("CONNECT :443 HTTP/1.1\r\nHost: a.example.com\r\n\r\n")
         else {
             panic!("expected Ok");
         };
         assert_eq!(host, Some(""));
+        assert!(absolute_form);
+        // Bracketed IPv6 parses to the bare address (probe 19: parse Ok,
+        // no route for "::1" → 404).
+        let RequestLine::Ok { host, .. } =
+            parse_vhost_request_line("CONNECT [::1]:8080 HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("::1"));
+        // Empty target → origin-form fallback on the Host header (probe 16:
+        // 404 route-miss — "http://" parses with URL.Host "" → req.Host =
+        // Host header; never a 400).
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line("CONNECT  HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("x"));
+        assert_eq!(path, "");
+        assert!(!absolute_form);
+        // Scheme-bearing target: Go url.Parse sees scheme "http" then an
+        // authority of "http:" (the second scheme's colon) — the route key
+        // is the garbage host "http" and no route matches → 404 (probe 17).
+        let RequestLine::Ok { host, path, .. } =
+            parse_vhost_request_line("CONNECT http://a.example.com/ HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("http"));
+        assert_eq!(path, "//a.example.com/");
+        // Lowercase "connect" is NOT authority-form (Go method gate is
+        // case-sensitive — probe 15: 404): stays origin-form, routing on
+        // the Host header. Accepted divergence on a garbage line.
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line(
+            "connect a.example.com:443 HTTP/1.1\r\nHost: a.example.com\r\n\r\n",
+        )
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("a.example.com"));
+        assert_eq!(path, "a.example.com:443");
+        assert!(!absolute_form);
+        // Path-form CONNECT stays origin-form (Go justAuthority requires
+        // a non-"/" target).
+        let RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } = parse_vhost_request_line("CONNECT /tunnel HTTP/1.1\r\nHost: a.example.com\r\n\r\n")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(host, Some("a.example.com"));
+        assert_eq!(path, "/tunnel");
+        assert!(!absolute_form);
     }
 
     #[test]

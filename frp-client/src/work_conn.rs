@@ -1767,6 +1767,28 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                         .await
                     {
                         Ok(mut local) => {
+                            // M9 (Go http_common.go:116-117 parity): hand the
+                            // https2http/https2https plugins the real tunnel
+                            // peer — their listener is loopback, so without
+                            // this X-Forwarded-For would carry 127.0.0.1. Go
+                            // wraps the conn and calls
+                            // SetRemoteAddr(connInfo.SrcAddr); here the plugin
+                            // accept handler looks the real addr up by this
+                            // dial's local ephemeral port.
+                            if matches!(info.plugin.as_str(), "https2http" | "https2https") {
+                                if let (Some(src), Some(src_port)) =
+                                    (swc.src_addr.as_deref(), swc.src_port)
+                                {
+                                    if let Ok(real_ip) = src.parse::<std::net::IpAddr>() {
+                                        if let Ok(dialer_local) = local.local_addr() {
+                                            crate::plugin::register_plugin_peer(
+                                                dialer_local.port(),
+                                                std::net::SocketAddr::new(real_ip, src_port),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             // Write PROXY protocol header if configured. Go
                             // parity (client/proxy/proxy.go:183-197,210,
                             // f6688e2): the header is only emitted when the

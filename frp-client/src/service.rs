@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 #[cfg(all(feature = "vnet", test))]
 use tokio::sync::watch;
@@ -427,6 +427,11 @@ pub struct Service {
     /// the CloseProxy handler looks up. Set to true on CloseProxy/CloseProxyResp;
     /// entry removed in try_reload.
     health_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Monotonic control-session generation for health monitors (H2): bumped
+    /// once per successful login; monitors re-arm to the pristine
+    /// "unregistered" state on change so a healthy proxy re-registers on the
+    /// new session's first probe (Go parity: fresh Monitor per control.Run()).
+    health_session_gen: Arc<AtomicU64>,
     /// Per-proxy cancellation tokens for provider-side XTCP P2P bridge tasks.
     /// Keyed by the WIRE proxy name ({user}.{name}) like health_cancels.
     /// Lazily created at the nat_hole call sites; cancelled on CloseProxy and
@@ -859,6 +864,7 @@ impl Service {
             visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
             visitor_reload_needed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             health_cancels: Arc::new(Mutex::new(HashMap::new())),
+            health_session_gen: Arc::new(AtomicU64::new(0)),
             p2p_bridge_tokens: Arc::new(Mutex::new(HashMap::new())),
             health_proxy_configs,
             health_tx,
@@ -957,6 +963,7 @@ impl Service {
             &startup_proxies,
             &self.health_tx,
             &health_cancels,
+            &self.health_session_gen,
         )
         .await;
 
@@ -1124,6 +1131,17 @@ impl Service {
                 prev_yamux = ctx.yamux.clone();
             }
             previous_run_id = ctx.run_id.clone();
+
+            // Session boundary for the long-lived health monitors (H2): this
+            // login started a NEW control session whose server holds no proxy
+            // registrations yet. Bump the generation so monitors re-arm and
+            // re-register their proxies on the first healthy probe of this
+            // session (Go parity: a fresh control.Run() builds a fresh
+            // Monitor with statusOK=false). Monitors observe the change on
+            // their next tick, so the bump must precede the registration
+            // phase — a Recover sent before this point would ride the dead
+            // previous session's writer.
+            self.health_session_gen.fetch_add(1, Ordering::Relaxed);
 
             // Phase 4: pipelined NewProxy/NewVisitorConn registration + the
             // registration response read loop (2s visitor grace +
@@ -3633,6 +3651,7 @@ impl Service {
         proxies: &[frp_core::config::ProxyConfig],
         health_tx: &mpsc::Sender<HealthEvent>,
         health_cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+        session_gen: &Arc<AtomicU64>,
     ) {
         for p in proxies {
             let wn = wire_proxy_name(user, &p.name);
@@ -3698,6 +3717,7 @@ impl Service {
                 let mut cancels = health_cancels.lock().await;
                 cancels.insert(pn.clone(), cancel.clone());
             }
+            let session_gen = session_gen.clone();
             tokio::spawn(async move {
                 crate::health::run_health_check(crate::health::HealthCheckConfig {
                     proxy_name: pn,
@@ -3710,6 +3730,7 @@ impl Service {
                     max_failed,
                     health_tx: tx,
                     cancel,
+                    session_gen,
                 })
                 .await;
             });
@@ -4266,8 +4287,14 @@ impl Service {
                 // pre-reload user at this point (refreshed in Step 7 below).
                 // Keying the health tasks with the old user would desync them
                 // from the wire names registered above.
-                self.spawn_health_checks(&user, &hc_proxies, &self.health_tx, &self.health_cancels)
-                    .await;
+                self.spawn_health_checks(
+                    &user,
+                    &hc_proxies,
+                    &self.health_tx,
+                    &self.health_cancels,
+                    &self.health_session_gen,
+                )
+                .await;
             }
         }
 

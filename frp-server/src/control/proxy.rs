@@ -86,12 +86,31 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         (i.proxy_type == "http" || i.proxy_type == "https")
             && i.group.as_deref().filter(|g| !g.is_empty()).is_some()
     });
+    // TCPMux group member (Go frp v0.71.0 TCPMuxGroup): shares one tcpmux
+    // route with the other members — close removes it from the group and
+    // only drops the shared route (owned by the FIRST member) when the
+    // group empties. Mirrors the HTTP group lifecycle (M2 audit fix: the
+    // previous unconditional route unregister would delete the shared
+    // route while sibling members were still live).
+    let is_tcpmux_group_member = info.as_ref().is_some_and(|i| {
+        i.proxy_type == "tcpmux" && i.group.as_deref().filter(|g| !g.is_empty()).is_some()
+    });
     let group_name = info
         .as_ref()
         .and_then(|i| i.group.clone())
         .unwrap_or_default();
-    let last_group_member =
-        is_tcp_group && ctx.state.proxy_manager.group_len(&group_name).await <= 1;
+    // M5: the "last member" decision for the shared group port + listener is
+    // made AFTER remove() below — two concurrent close paths (a second
+    // CloseProxy, or a dashboard delete racing this handler) would both
+    // snapshot group_len before either removal and both skip, orphaning the
+    // group listener and its port mark. The post-removal count is the true
+    // residual. Capture the member's remote port here (info is consumed by
+    // the block below).
+    let tcp_group_port = info.as_ref().and_then(|i| {
+        (i.proxy_type == "tcp" && i.group.as_deref().filter(|g| !g.is_empty()).is_some())
+            .then_some(i.remote_port)
+            .flatten()
+    });
     let is_https = if let Some(info) = info {
         if let Some(port) = info.remote_port {
             // Clean up the appropriate port manager (TCP or UDP — Go frp compat).
@@ -107,8 +126,11 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
                 // the registry here, so it is excluded from the owner count.
                 proxy_ops::release_udp_port_with_owner_check(&ctx.state, port, &cp.proxy_name)
                     .await;
-            } else if !is_tcp_group || last_group_member {
+            } else if !is_tcp_group {
                 ctx.state.used_ports.write().await.remove(&port);
+                // TCP group ports are released with the shared listener for
+                // the FINAL member only — see the post-remove block below
+                // (M5 race-safe ordering).
             }
             // Decrement per-client port count (matching Go frp's portsUsedNum).
             // Only proxies that actually consumed a port were counted
@@ -153,7 +175,24 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         // NewProxy B with A's domain) would be rejected with "tcpmux route
         // conflict". Mirrors the unregister_control sweep (proxy_ops.rs)
         // and dashboard delete path; no-op for non-tcpmux proxies.
-        ctx.state.tcpmux_manager.unregister(&cp.proxy_name).await;
+        //
+        // TCPMux group members: remove from the group first; the shared
+        // route is keyed on the FIRST member's name, so drop it with the
+        // owner only when the group empties (M2).
+        if is_tcpmux_group_member {
+            let fresh = ctx.state.proxy_manager.get(&cp.proxy_name).await;
+            let gname = fresh.and_then(|i| i.group.clone()).unwrap_or_default();
+            if let Some(owner) = ctx
+                .state
+                .tcpmux_group_ctl
+                .unregister_member(&gname, &cp.proxy_name)
+                .await
+            {
+                ctx.state.tcpmux_manager.unregister(&owner).await;
+            }
+        } else {
+            ctx.state.tcpmux_manager.unregister(&cp.proxy_name).await;
+        }
         ctx.state.proxy_metrics.remove(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
         {
@@ -181,7 +220,18 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     // Stop the shared TCP group listener when the last member closes so it
     // doesn't linger as a zombie holding the group port (remove_group cancels
     // the listener's token — same shutdown signal as `unregister_control`).
-    if last_group_member {
+    // M5: the membership check runs AFTER remove() above — concurrent close
+    // paths (a second CloseProxy, or a dashboard delete racing this handler)
+    // would both snapshot group_len before either removal and both skip,
+    // orphaning the listener + port mark. The post-removal count is the true
+    // residual; remove_group is idempotent, and the member's port mark is
+    // released here with the listener (non-group TCP ports are released
+    // above). A member re-registering between the check and the cancel
+    // re-creates the group listener on registration — self-healing.
+    if is_tcp_group && ctx.state.proxy_manager.group_len(&group_name).await == 0 {
+        if let Some(port) = tcp_group_port {
+            ctx.state.used_ports.write().await.remove(&port);
+        }
         ctx.state.tcp_group_ctl.remove_group(&group_name).await;
         info!(
             proxy_name = %cp.proxy_name,

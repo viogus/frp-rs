@@ -1275,13 +1275,35 @@ pub(crate) async fn connect_via_proxy(
             // resp[4..10] already contains first 6 bytes of bind address.
             // IPv4: 4(IP)+2(port)=6 → all already in resp[4..10] → extra=0.
             // IPv6: 16(IP)+2(port)=18 → 6 in resp[4..10] → extra=12.
-            let extra = match resp[3] {
-                0x01 => 0,
-                0x04 => 12,
-                _ => 0,
+            // Domain (ATYP 0x03): resp[4] = name length, then name + 2 port
+            // bytes; resp[5..10] already holds up to 5 of those, so a bind
+            // reply with a domain address must not leave its tail in the
+            // stream (it would be parsed as FRP frame bytes and desync the
+            // tunnel). Length 0 would be malformed per RFC 1928.
+            let (extra, bad_len) = match resp[3] {
+                0x01 => (0, false),
+                0x04 => (12, false),
+                0x03 => {
+                    let len = resp[4] as usize;
+                    if len == 0 {
+                        (0, true)
+                    } else {
+                        ((len + 2).saturating_sub(5), false)
+                    }
+                }
+                _ => (0, true),
             };
+            if bad_len {
+                return Err(crate::Error::Transport(
+                    format!(
+                        "SOCKS5 connect: malformed bind address ATYP 0x{:02x}",
+                        resp[3]
+                    )
+                    .into(),
+                ));
+            }
             if extra > 0 {
-                let mut extra_buf = vec![0u8; extra as usize];
+                let mut extra_buf = vec![0u8; extra];
                 timeout(
                     Duration::from_secs(dial_timeout_secs),
                     stream.read_exact(&mut extra_buf),
