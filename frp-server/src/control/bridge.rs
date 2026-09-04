@@ -14,8 +14,8 @@ use frp_core::encryption::derive_key;
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{
-    read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v1, write_msg_v2_with_udp_codec,
-    write_v2_frame_raw, V2_FRAME_TYPE_MESSAGE,
+    read_msg_v1, read_msg_v2_udp_binary_socket, read_msg_v2_with_udp_codec, write_msg_v1,
+    write_msg_v2_with_udp_codec, write_v2_frame_raw, UdpBinaryRead, V2_FRAME_TYPE_MESSAGE,
 };
 use frp_core::snappy_stream::{SnappyStreamReader, SnappyStreamWriter};
 use frp_core::transport::{split_work_conn_halves, IoStream};
@@ -370,9 +370,20 @@ async fn run_udp_work_conn(
                 result = async {
                     match tokio::time::timeout(read_timeout, async {
                         if v2 {
-                            read_msg_v2_with_udp_codec(&mut w_r, udp_codec_opt, &mut scratch).await
+                            if udp_codec_opt.is_some() {
+                                // Binary UDP codec negotiated (Go v0.71.0):
+                                // type-19 frames decode to native SocketAddr
+                                // form, skipping the per-packet String alloc +
+                                // reparse that the message path performs
+                                // (audit LOW: decode formats then re-parses).
+                                read_msg_v2_udp_binary_socket(&mut w_r, &mut scratch).await
+                            } else {
+                                read_msg_v2_with_udp_codec(&mut w_r, udp_codec_opt, &mut scratch)
+                                    .await
+                                    .map(UdpBinaryRead::Message)
+                            }
                         } else {
-                            read_msg_v1(&mut w_r).await
+                            read_msg_v1(&mut w_r).await.map(UdpBinaryRead::Message)
                         }
                     })
                     .await
@@ -392,7 +403,22 @@ async fn run_udp_work_conn(
                 } => result,
             };
             match result {
-                Ok(FrpMessage::UDPPacket(up)) => {
+                // Native-address form (binary codec): the destination is
+                // already a SocketAddr — send directly, no text round trip.
+                Ok(UdpBinaryRead::Socket(pkt)) => {
+                    if let Some(lim) = reader_lim.as_ref() {
+                        frp_core::bandwidth::BandwidthLimiter::consume_shared(
+                            lim,
+                            pkt.content.len(),
+                        )
+                        .await;
+                    }
+                    if let Err(e) = sock_reader.send_to(&pkt.content, pkt.remote_addr).await {
+                        debug!(proxy_name = %reader_name, error = %e,
+                            "UDP send_to failed for '{}': {}", reader_name, e);
+                    }
+                }
+                Ok(UdpBinaryRead::Message(FrpMessage::UDPPacket(up))) => {
                     // Rate-limit only bytes actually forwarded. Counting a
                     // dropped (malformed, no remote_addr) packet against the
                     // budget without delivering it would silently bill the
@@ -430,8 +456,9 @@ async fn run_udp_work_conn(
                         );
                     }
                 }
-                Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => continue,
-                Ok(other) => {
+                Ok(UdpBinaryRead::Message(FrpMessage::Ping(_)))
+                | Ok(UdpBinaryRead::Message(FrpMessage::Pong(_))) => continue,
+                Ok(UdpBinaryRead::Message(other)) => {
                     debug!(proxy_name = %reader_name, msg_type = %other.v1_type_byte(),
                         "UDP work conn for '{}': unexpected msg 0x{:02x}", reader_name, other.v1_type_byte());
                 }

@@ -20,8 +20,9 @@ use frp_core::metrics::ProxyMetricsRegistry;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
 use frp_core::protocol::{
-    read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v1, write_msg_v2,
-    write_msg_v2_with_udp_codec, write_v2_frame_raw, V2_FRAME_TYPE_MESSAGE,
+    read_msg_v1, read_msg_v2_udp_binary_socket, read_msg_v2_with_udp_codec, write_msg_v1,
+    write_msg_v2, write_msg_v2_with_udp_codec, write_v2_frame_raw, UdpBinaryRead,
+    V2_FRAME_TYPE_MESSAGE,
 };
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
@@ -533,6 +534,14 @@ impl UdpSessionTable {
 /// early either — a session Go would still serve, frp-rs still serves).
 const UDP_SESSION_CAP: usize = 1024;
 
+/// Bounded wait for the writer to return the buffer of the packet it is
+/// still encoding (P1). Under a reply burst the session recv loop can outrun
+/// the writer by one packet; a miss is a scheduling race, not a lost
+/// steady-state buffer — this window reuses it instead of allocating a fresh
+/// Vec per datagram. Absent/oversized spares still fall through to the alloc
+/// after at most this delay.
+const UDP_SPARE_RETURN_WAIT: Duration = Duration::from_millis(1);
+
 #[allow(clippy::too_many_arguments)]
 async fn run_udp_session(
     socket: Arc<UdpSocket>,
@@ -580,7 +589,25 @@ async fn run_udp_session(
                                 spare.extend_from_slice(&buf[..n]);
                                 spare
                             }
-                            _ => buf[..n].to_vec(),
+                            // No usable spare waiting: the writer returns a
+                            // buffer only after wire-encoding the packet that
+                            // carried it, so under a reply burst this miss is
+                            // a race with the writer — wait out a bounded
+                            // scheduling quantum for its return before paying
+                            // a fresh per-datagram alloc. Oversized/absent
+                            // spares fall straight through.
+                            _ => match tokio::time::timeout(UDP_SPARE_RETURN_WAIT, ret_rx.recv())
+                                .await
+                            {
+                                Ok(Some(mut spare))
+                                    if spare.capacity() >= udp_packet_size.max(1) =>
+                                {
+                                    spare.clear();
+                                    spare.extend_from_slice(&buf[..n]);
+                                    spare
+                                }
+                                _ => buf[..n].to_vec(),
+                            },
                         };
                         if tx.send((remote, payload, ret_tx.clone())).await.is_err() {
                             break;
@@ -827,34 +854,56 @@ async fn run_udp_work_conn(
                     if changed.is_err() || *reader_cancel.borrow() { break; }
                 }
                 result = async {
-                    if v2 {
-                        let codec_opt = if reader_udp_codec.is_empty() {
-                            None
-                        } else {
-                            Some(reader_udp_codec.as_str())
-                        };
-                        read_msg_v2_with_udp_codec(&mut w_r, codec_opt, &mut read_scratch).await
+                    if v2 && !reader_udp_codec.is_empty() {
+                        // Binary UDP codec negotiated (Go v0.71.0): type-19
+                        // frames decode to native SocketAddr form, skipping
+                        // the per-packet String alloc + reparse the message
+                        // path performs (audit LOW: decode formats then
+                        // re-parses).
+                        read_msg_v2_udp_binary_socket(&mut w_r, &mut read_scratch).await
+                    } else if v2 {
+                        read_msg_v2_with_udp_codec(&mut w_r, None, &mut read_scratch)
+                            .await
+                            .map(UdpBinaryRead::Message)
                     } else {
-                        read_msg_v1(&mut w_r).await
+                        read_msg_v1(&mut w_r).await.map(UdpBinaryRead::Message)
                     }
                 } => {
                     match result {
-                        Ok(FrpMessage::UDPPacket(up)) => {
-                            let remote = match up.remote_addr {
-                                Some(ref ra) => match ra.ip.parse::<IpAddr>() {
-                                    Ok(ip) => SocketAddr::new(ip, ra.port),
-                                    Err(_) => {
-                                        warn!(ip = %ra.ip, port = ra.port,
-                                            "UDP packet: unparseable remote IP, dropping");
-                                        continue;
-                                    }
-                                },
-                                None => {
-                                    debug!(proxy_name = %pn_r, "UDP packet without remote_addr; dropping");
+                        Ok(rd) => {
+                            // Normalize both read forms to a (remote, payload)
+                            // pair; the session machinery below is form-agnostic.
+                            let (remote, mut payload) = match rd {
+                                // Native-address form: destination is already a
+                                // SocketAddr, no text round trip.
+                                UdpBinaryRead::Socket(pkt) => {
+                                    (pkt.remote_addr, pkt.content)
+                                }
+                                UdpBinaryRead::Message(FrpMessage::UDPPacket(up)) => {
+                                    let remote = match up.remote_addr {
+                                        Some(ref ra) => match ra.ip.parse::<IpAddr>() {
+                                            Ok(ip) => SocketAddr::new(ip, ra.port),
+                                            Err(_) => {
+                                                warn!(ip = %ra.ip, port = ra.port,
+                                                    "UDP packet: unparseable remote IP, dropping");
+                                                continue;
+                                            }
+                                        },
+                                        None => {
+                                            debug!(proxy_name = %pn_r, "UDP packet without remote_addr; dropping");
+                                            continue;
+                                        }
+                                    };
+                                    (remote, up.content)
+                                }
+                                UdpBinaryRead::Message(FrpMessage::Ping(_))
+                                | UdpBinaryRead::Message(FrpMessage::Pong(_)) => continue,
+                                UdpBinaryRead::Message(other) => {
+                                    debug!(proxy_name = %pn_r, v1_type = ?other.v1_type_byte(),
+                                        "UDP work conn '{}': unexpected msg 0x{:02x}", pn_r, other.v1_type_byte());
                                     continue;
                                 }
                             };
-                            let mut payload = up.content;
                             // Per-packet decompression only (compression stays
                             // per-packet for UDP; stream-level encryption was
                             // already applied by the CipherReader above).
@@ -1053,11 +1102,6 @@ async fn run_udp_work_conn(
                                 debug!(proxy_name = %pn_r, error = %e, local = %local_addr,
                                     "UDP '{}' send to local failed, dropping packet: {}", pn_r, e);
                             }
-                        }
-                        Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => continue,
-                        Ok(other) => {
-                            debug!(proxy_name = %pn_r, v1_type = ?other.v1_type_byte(),
-                                "UDP work conn '{}': unexpected msg 0x{:02x}", pn_r, other.v1_type_byte());
                         }
                         Err(e) => {
                             debug!(proxy_name = %pn_r, error = %e,

@@ -1860,7 +1860,17 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
                         match pkt {
                             Some(up) => {
                                 if let Some(ref ra) = up.remote_addr {
-                                    if let Ok(addr) = format!("{}:{}", ra.ip, ra.port).parse::<std::net::SocketAddr>() {
+                                    // Zero-alloc parse (audit: the old
+                                    // per-packet format!("{}:{}") + re-parse
+                                    // chain also DROPPED bare-v6 addresses —
+                                    // std SocketAddr parse needs brackets; the
+                                    // helper parses them natively, delivering
+                                    // v6 SUDP replies like Go (which resolves
+                                    // the ip string via net.ResolveUDPAddr).
+                                    // A zone-bearing ip string stays
+                                    // unparseable (warn+drop, as before).
+                                    if let Some(addr) = frp_core::udp_binary::udp_addr_to_socket(ra)
+                                    {
                                         if let Err(e) = socket_r.send_to(&up.content, addr).await {
                                             debug!(visitor_name = %name_r, remote = %addr, error = %e, "SUDP visitor '{}': send_to local client {} failed: {}", name_r, addr, e);
                                         }

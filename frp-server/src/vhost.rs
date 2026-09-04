@@ -815,7 +815,7 @@ async fn handle_http1_request<S>(
     // with the CONNECT method — Go's gate is the method alone (justAuthority
     // only changes how the target parses).
     let is_connect = request_text
-        .splitn(3, ' ')
+        .split(' ')
         .next()
         .is_some_and(|m| m == "CONNECT");
     // RFC 7230 §5.4: a request with more than one Host header is invalid.
