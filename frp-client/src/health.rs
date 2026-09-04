@@ -445,10 +445,11 @@ struct HttpProbeResponse {
     location: Option<String>,
 }
 
-/// Parse the response head. The version gate mirrors Go's ReadResponse:
-/// any `HTTP/<major>.<minor>` version token is accepted ("HTTP/2.0 200 OK"
-/// passes), the status code must be a numeric token, and a non-numeric code
-/// is a failure (Go Atoi parity), never a non-2xx verdict.
+/// Parse the response head. The version gate mirrors Go's ReadResponse
+/// (ParseHTTPVersion exact-match: "HTTP/2.0 200 OK" passes, "HTTP/9.9" and
+/// "HTTP/1.10" fail), the status code must be a 3-digit token (len-3 gate
+/// BEFORE conversion, Go response.go), and a malformed line is a failure
+/// (Go parity), never a non-2xx verdict.
 fn parse_http_response_head(head: &str) -> Result<HttpProbeResponse, String> {
     if head.is_empty() {
         return Err("empty response".into());
@@ -464,24 +465,23 @@ fn parse_http_response_head(head: &str) -> Result<HttpProbeResponse, String> {
     })
 }
 
-/// Parse the status code out of a status line: `HTTP/<digits>.<digits> SP
-/// <code>...`. The version token must be exactly HTTP/major.minor (Go
-/// ParseHTTPVersion), the code token all digits (Go Atoi — leading zeros
-/// like "0200" are accepted, exactly like Atoi returning 200).
+/// Parse the status code out of a status line — Go `http.ReadResponse`
+/// strictness (what http.DefaultClient's transport applies, so Go frp's
+/// health check sees exactly this): the version token must be one of
+/// `HTTP/1.0|1.1|2.0|3.0` (ParseHTTPVersion exact-match switch, not a
+/// digit-shape check), and the code token exactly 3 ASCII digits — checked
+/// BEFORE conversion (`response.go`: `len(statusCode) != 3` → malformed, so
+/// "0200" is a parse error, never Atoi's 200), multi-space between version
+/// and code tolerated (TrimLeft).
 fn parse_status_code(line: &str) -> Option<u16> {
     let line = line.trim_end_matches('\r');
-    let rest = line.strip_prefix("HTTP/")?;
-    let (version, tail) = rest.split_once(' ')?;
-    let (major, minor) = version.split_once('.')?;
-    if major.is_empty()
-        || minor.is_empty()
-        || !major.bytes().all(|b| b.is_ascii_digit())
-        || !minor.bytes().all(|b| b.is_ascii_digit())
-    {
+    let mut parts = line.split(' ');
+    let version = parts.next()?;
+    if !frp_core::textproto::is_valid_http_version(version) {
         return None;
     }
-    let code_token = tail.trim_start().split(' ').next().unwrap_or("");
-    if code_token.is_empty() || !code_token.bytes().all(|b| b.is_ascii_digit()) {
+    let code_token = parts.find(|p| !p.is_empty())?;
+    if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     code_token.parse::<u16>().ok()
@@ -1036,22 +1036,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_probe_accepts_any_http_version_token() {
-        // Go ReadResponse accepts any HTTP/x.y version token; the old probe's
-        // "HTTP/1." prefix gate wrongly failed an "HTTP/2.0 200" response.
+    async fn http_probe_version_token_matches_go_parse_http_version() {
+        // Go ReadResponse → ParseHTTPVersion is an exact-match switch: only
+        // HTTP/1.0, HTTP/1.1, HTTP/2.0 and HTTP/3.0 parse (round-3 review —
+        // a prior round's "any HTTP/x.y" reading was false parity). Both
+        // known-good version tokens the probe can legitimately meet pass...
         let (addr, _seen) =
             spawn_scripted_server(vec![("HTTP/2.0 200 OK".to_string(), vec![])]).await;
         let url = format!("http://{addr}/");
         assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
             .await
             .is_ok());
-
         let (addr, _seen) =
-            spawn_scripted_server(vec![("HTTP/9.9 204 No Content".to_string(), vec![])]).await;
+            spawn_scripted_server(vec![("HTTP/3.0 200 OK".to_string(), vec![])]).await;
         let url = format!("http://{addr}/");
         assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
             .await
             .is_ok());
+
+        // ...and out-of-switch versions fail like Go ("HTTP/9.9" / "HTTP/1.10"
+        // parse to a nil proto → ReadResponse error), never a silent 2xx.
+        for bad in ["HTTP/9.9 204 No Content", "HTTP/1.10 204 No Content"] {
+            let (addr, _seen) = spawn_scripted_server(vec![(bad.to_string(), vec![])]).await;
+            let url = format!("http://{addr}/");
+            let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+                .await
+                .unwrap_err();
+            assert!(err.contains("malformed status line"), "{err}");
+        }
 
         // Malformed version token → failure, not a silent non-2xx verdict.
         let (addr, _seen) = spawn_scripted_server(vec![("FOO 200 OK".to_string(), vec![])]).await;
@@ -1485,15 +1497,23 @@ mod tests {
 
     #[test]
     fn parse_status_line_gates() {
-        // Go ReadResponse/Atoi parity: any HTTP/x.y version, all-digit
-        // codes (leading zeros accepted, Atoi-style), non-numeric codes
-        // and malformed versions fail.
+        // Go ReadResponse parity (round-3 review): ParseHTTPVersion is an
+        // exact-match switch (1.0/1.1/2.0/3.0 only — "HTTP/9.9" and
+        // "HTTP/1.10" are malformed), the code is gated to exactly 3 digits
+        // BEFORE conversion ("0200" is malformed, never Atoi's 200), and
+        // multi-space between version and code is tolerated (TrimLeft).
         assert_eq!(parse_status_code("HTTP/1.1 200 OK"), Some(200));
         assert_eq!(parse_status_code("HTTP/2.0 200 OK"), Some(200));
-        assert_eq!(parse_status_code("HTTP/1.1 0200 OK"), Some(200));
+        assert_eq!(parse_status_code("HTTP/3.0 200 OK"), Some(200));
+        assert_eq!(parse_status_code("HTTP/1.1  200 OK"), Some(200));
         assert_eq!(parse_status_code("HTTP/1.1 200"), Some(200));
+        assert_eq!(parse_status_code("HTTP/1.1 0200 OK"), None);
+        assert_eq!(parse_status_code("HTTP/1.1 1200 OK"), None);
+        assert_eq!(parse_status_code("HTTP/9.9 200 OK"), None);
+        assert_eq!(parse_status_code("HTTP/1.10 200 OK"), None);
         assert_eq!(parse_status_code("HTTP/1 200 OK"), None);
         assert_eq!(parse_status_code("HTTP/1.1 20A OK"), None);
+        assert_eq!(parse_status_code("HTTP/1.1 20"), None);
         assert_eq!(parse_status_code("FOO 200 OK"), None);
         assert_eq!(parse_status_code(""), None);
     }

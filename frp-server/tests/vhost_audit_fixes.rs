@@ -1032,11 +1032,16 @@ async fn test_vhost_connect_mixed_eol_head_routed_canonical_crlf() {
 
 /// Audit-r7 FIX 5 guard (Go dedicated-listener semantics): a CONNECT to an
 /// http_user-protected vhost route WITHOUT credentials must answer a SINGLE
-/// bare 407 Proxy Authentication Required (realm "Restricted") — NO
-/// preceding 200. The successHook 200-then-407 order belongs to the tcpmux
-/// shared listener only; the vhost HTTP dedicated listener 407s directly.
+/// 407 — NO preceding 200. The successHook 200-then-407 order belongs to
+/// the tcpmux shared listener only; the vhost HTTP dedicated listener 407s
+/// directly. Shape = Go `checkRouteAuthByRequest` + `http.Error` render
+/// (pkg/util/vhost/http.go:272-274): fixed fields Content-Length: 30 /
+/// Content-Type: text/plain; charset=utf-8 / Proxy-Authenticate (realm
+/// "Restricted") / X-Content-Type-Options: nosniff + the StatusText body
+/// with Go's trailing '\n' (round-3 review — the old bare 3-line 407
+/// matched neither the fixed shape nor Go's fields).
 #[tokio::test]
-async fn test_vhost_connect_auth_route_no_creds_single_bare_407() {
+async fn test_vhost_connect_auth_route_no_creds_single_407_http_error_shape() {
     let (addr, vhost_addr, cfg) = vhost_pair();
     let (_handle, _) = start_test_server(cfg).await;
 
@@ -1067,9 +1072,13 @@ async fn test_vhost_connect_auth_route_no_creds_single_bare_407() {
     assert_eq!(
         bytes,
         b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+          Content-Length: 30\r\n\
+          Content-Type: text/plain; charset=utf-8\r\n\
           Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\
-          \r\n",
-        "vhost CONNECT auth failure must be a single bare 407 (no preceding 200), got: {}",
+          X-Content-Type-Options: nosniff\r\n\
+          \r\n\
+          Proxy Authentication Required\n",
+        "vhost CONNECT auth failure must be a single 407 http.Error render (no preceding 200), got: {}",
         String::from_utf8_lossy(&bytes)
     );
     drop(client);

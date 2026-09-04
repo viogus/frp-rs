@@ -829,8 +829,20 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
     }
     let status_line = std::str::from_utf8(status_line).ok()?;
     let mut parts = status_line.split_whitespace();
-    parts.next()?; // HTTP/1.1
-    let status: u16 = parts.next()?.parse().ok()?;
+    // Go http.ReadResponse gates (response.go — round-3 review): the
+    // version token must be one of ParseHTTPVersion's exact-match set and
+    // the code token exactly 3 digits BEFORE conversion, so "HTTP/9.9 200"
+    // / "HTTP/1.1 0200 OK" / "FOO 200 OK" are all malformed → 502, never
+    // forwarded.
+    let version = parts.next()?;
+    if !frp_core::textproto::is_valid_http_version(version) {
+        return None;
+    }
+    let code_token = parts.next()?;
+    if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let status: u16 = code_token.parse().ok()?;
 
     let mut headers = Vec::new();
     // Header lines run from after the status line to head_end (which includes

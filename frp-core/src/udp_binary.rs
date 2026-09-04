@@ -684,6 +684,89 @@ mod tests {
         assert_eq!(out.remote_addr.as_ref().unwrap().zone, "接口");
     }
 
+    /// Exact wire bytes for the zero-alloc encode (audit round 3 finding
+    /// C-LOW-1: the P1 refactor landed no byte-equivalence pins). Go-parity
+    /// rules pinned here: IPv4-mapped IPv6 ("::ffff:a.b.c.d") normalizes to
+    /// family 4 with the dotted-quad octets (Go `net.IP.To4()` in
+    /// `validateBinaryUDPAddr`); zones carry a 1-byte length and arbitrary
+    /// UTF-8 bytes; the `SocketAddr` form must be byte-identical to the
+    /// message form. Layout: flags, [local], remote, payloadLen (2B BE),
+    /// payload.
+    #[test]
+    fn encode_exact_wire_bytes_pin() {
+        // (a) v4 local + remote, message form.
+        let mut expected: Vec<u8> = vec![0x03]; // flags: local | remote
+        expected.extend_from_slice(&[4, 127, 0, 0, 1, 0xCF, 0x09, 0]); // 127.0.0.1:53001
+        expected.extend_from_slice(&[4, 10, 0, 0, 2, 0, 53, 0]); // 10.0.0.2:53
+        expected.extend_from_slice(&[0, 5]); // len 5
+        expected.extend_from_slice(b"hello");
+        assert_eq!(
+            encode_udp_packet_binary(&sample_packet()).unwrap(),
+            expected
+        );
+
+        // (b) IPv4-mapped IPv6 remote — family 4 + dotted-quad octets, NOT
+        // family 6 (Go To4 parity). Empty payload.
+        let mapped = UDPPacket {
+            content: vec![],
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "::ffff:192.168.0.1".into(),
+                port: 53,
+                zone: String::new(),
+            }),
+        };
+        let expected: Vec<u8> = vec![0x02, 4, 192, 168, 0, 1, 0, 53, 0, 0, 0];
+        assert_eq!(encode_udp_packet_binary(&mapped).unwrap(), expected);
+
+        // (c) zoned v6 — 16 octets, port BE, zone-length byte then raw zone
+        // bytes; non-ASCII zone (接口 = 6 UTF-8 bytes) pins the byte count.
+        let zoned = UDPPacket {
+            content: vec![],
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "fe80::1".into(),
+                port: 8080,
+                zone: "接口".into(),
+            }),
+        };
+        let mut expected: Vec<u8> = vec![0x02, 6];
+        expected.extend_from_slice(&[
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // fe80::1
+        ]);
+        expected.extend_from_slice(&[0x1F, 0x90]); // port 8080
+        expected.extend_from_slice(&[6]); // zone length
+        expected.extend_from_slice("接口".as_bytes());
+        expected.extend_from_slice(&[0, 0]); // empty payload
+        assert_eq!(encode_udp_packet_binary(&zoned).unwrap(), expected);
+
+        // (d) SocketAddr form is byte-identical to the message form for the
+        // same address (v4, plain v6, and mapped-v6 → family 4).
+        let plain_v4: std::net::SocketAddr = "10.0.0.2:53".parse().unwrap();
+        let expected = vec![0x02, 4, 10, 0, 0, 2, 0, 53, 0, 0, 2, b'h', b'i'];
+        let mut out = Vec::new();
+        encode_udp_packet_binary_socket_addr(b"hi", None, &plain_v4, &mut out).unwrap();
+        assert_eq!(out, expected);
+
+        let plain_v6: std::net::SocketAddr = "[fe80::1]:8080".parse().unwrap();
+        let mut expected: Vec<u8> = vec![0x02, 6];
+        expected.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        expected.extend_from_slice(&[0x1F, 0x90, 0, 0, 0]); // port, empty zone, len 0
+        let mut out = Vec::new();
+        encode_udp_packet_binary_socket_addr(b"", None, &plain_v6, &mut out).unwrap();
+        assert_eq!(out, expected);
+
+        let mapped_v6 = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "::ffff:192.168.0.1".parse().unwrap(),
+            53,
+            0,
+            0,
+        ));
+        let mut out = Vec::new();
+        encode_udp_packet_binary_socket_addr(b"", None, &mapped_v6, &mut out).unwrap();
+        assert_eq!(out, vec![0x02, 4, 192, 168, 0, 1, 0, 53, 0, 0, 0]);
+    }
+
     #[test]
     fn empty_local_addr_ok_remote_required() {
         let pkt = UDPPacket {

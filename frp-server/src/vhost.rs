@@ -615,6 +615,39 @@ pub(crate) async fn write_not_found_response(
     }
 }
 
+/// Write the Go `http.Error` auth-fail render (pkg/util/vhost/http.go
+/// ServeHTTP: `rw.Header().Set(...); http.Error(rw, http.StatusText(code),
+/// code)` → Content-Type: text/plain; charset=utf-8 + X-Content-Type-Options:
+/// nosniff + Content-Length + the StatusText body with a trailing '\n').
+/// The fixed fields match Go; the Date header Go's http.Server layer adds
+/// to the live render is omitted in this raw write, and header order is
+/// fixed (Content-Length first) rather than Go's writer order — the same
+/// scoping the NotFoundResponse arms document (shape parity of the
+/// frp-rs-built response, not a live-server byte capture).
+async fn write_http_error_auth_response(
+    stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    status_line: &str,
+    auth_header: &str,
+    body: &str,
+) {
+    let head = format!(
+        "HTTP/1.1 {status_line}\r\n\
+         Content-Length: {}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         {auth_header}\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         \r\n",
+        body.len()
+    );
+    if let Err(e) = stream.write_all(head.as_bytes()).await {
+        tracing::debug!(error = %e, "failed to write auth error response header");
+        return;
+    }
+    if let Err(e) = stream.write_all(body.as_bytes()).await {
+        tracing::debug!(error = %e, "failed to write auth error response body");
+    }
+}
+
 /// Upper cap (seconds) applied by `clamp_vhost_timeout`. 24h is far beyond
 /// any real client-head bound — the value only ever clocks client-side head
 /// reads / handshakes plus the h2c backend response-head read; Rust-only
@@ -982,33 +1015,49 @@ async fn handle_http1_request<S>(
                 }
             } else {
                 warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control handler gone", scheme, host, path);
-                // Go parity: connectHandler's CreateConnection failure path
-                // (pkg/util/vhost/http.go:262) writes the 404 NotFoundResponse
-                // — the proxy's control connection disappearing mid-request
-                // surfaces exactly like a route miss. NotFoundResponse()
-                // (pkg/util/vhost/resource.go) re-reads custom404Page on
-                // EVERY call, so this arm serves the configured page too —
-                // not just the builtin body.
+                // Go parity: a CONNECT whose control died surfaces in
+                // connectHandler's CreateConnection failure path
+                // (pkg/util/vhost/http.go:262), which writes the raw
+                // NotFoundResponse — byte-identical here (581B + close). A
+                // GET whose control died goes through the reverse-proxy
+                // ErrorHandler instead (http.go:128-137, a net/http
+                // server-layer render with Date etc.); both arms serve the
+                // same 404 status/body in frp-rs, with the NotFound arm's
+                // documented fixed-shape scoping (no server-layer headers).
+                // NotFoundResponse() (pkg/util/vhost/resource.go) re-reads
+                // custom404Page on EVERY call, so this arm serves the
+                // configured page too — not just the builtin body.
                 write_not_found_response(&mut stream, &state.custom_404_page).await;
             }
         }
         Err(VhostResolveError::Unauthorized { proxy_form: true }) => {
-            // Absolute-form request → Go checkRouteAuthByRequest 407 +
-            // Proxy-Authenticate (http.go:272-277 — realm "Restricted").
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
-                )
-                .await;
+            // Absolute-form request → Go checkRouteAuthByRequest answers
+            // 407 + Proxy-Authenticate, realm "Restricted"
+            // (pkg/util/vhost/http.go:272-274), rendered by http.Error —
+            // body = http.StatusText(407) + "\n" ("Proxy Authentication
+            // Required\n", 30 bytes). The bare 3-line 407 (no body, no
+            // Content-Length) this arm used to write diverged (round-3
+            // review).
+            write_http_error_auth_response(
+                &mut stream,
+                "407 Proxy Authentication Required",
+                "Proxy-Authenticate: Basic realm=\"Restricted\"",
+                "Proxy Authentication Required\n",
+            )
+            .await;
         }
         Err(VhostResolveError::Unauthorized { proxy_form: false }) => {
-            // Go http.Error 401 + WWW-Authenticate, realm "Restricted"
-            // (http.go:272-277 — Go frp's realm is NOT the old "frp").
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
-                )
-                .await;
+            // Origin-form → Go http.Error 401 + WWW-Authenticate, realm
+            // "Restricted" (http.go:275-277 — Go frp's realm is NOT the old
+            // "frp"), body = http.StatusText(401) + "\n" ("Unauthorized\n",
+            // 12 bytes).
+            write_http_error_auth_response(
+                &mut stream,
+                "401 Unauthorized",
+                "WWW-Authenticate: Basic realm=\"Restricted\"",
+                "Unauthorized\n",
+            )
+            .await;
         }
         Err(VhostResolveError::NotFound) => {
             // Go parity: the vhost GET path answers Go's NotFoundResponse

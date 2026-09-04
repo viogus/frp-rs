@@ -1419,26 +1419,7 @@ fn parse_connect_status_line(line: &str) -> bool {
         // Go: Atoi must succeed and golib requires StatusCode == 200.
         return false;
     }
-    parse_http_version(proto)
-}
-
-/// Mirror Go net/http `ParseHTTPVersion` (request.go:817-842): the proto
-/// must be "HTTP/" followed by exactly major "." minor — one ASCII digit
-/// each, nothing else. "HTTP/1.1", "HTTP/1.0", "HTTP/2.0" pass; "FOO",
-/// "HTTP/1", "HTTP/1.1.1", "HTTP/1x" fail.
-fn parse_http_version(vers: &str) -> bool {
-    let rest = match vers.strip_prefix("HTTP/") {
-        Some(rest) => rest,
-        None => return false,
-    };
-    let (major, minor) = match rest.split_once('.') {
-        Some(pair) => pair,
-        None => return false,
-    };
-    major.len() == 1
-        && minor.len() == 1
-        && major.as_bytes()[0].is_ascii_digit()
-        && minor.as_bytes()[0].is_ascii_digit()
+    crate::textproto::is_valid_http_version(proto)
 }
 
 /// Parse a proxy URL into (scheme, auth, host, port).

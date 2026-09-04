@@ -524,8 +524,20 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
     }
     let status_line = std::str::from_utf8(status_line).ok()?;
     let mut parts = status_line.split_whitespace();
-    parts.next()?; // HTTP/1.1
-    let status: u16 = parts.next()?.parse().ok()?;
+    // Go http.ReadResponse gates (response.go — round-3 review): the
+    // version token must be one of ParseHTTPVersion's exact-match set and
+    // the code token exactly 3 digits BEFORE conversion, so "HTTP/9.9 200"
+    // / "HTTP/1.1 0200 OK" / "FOO 200 OK" are all malformed → 502, never
+    // forwarded.
+    let version = parts.next()?;
+    if !frp_core::textproto::is_valid_http_version(version) {
+        return None;
+    }
+    let code_token = parts.next()?;
+    if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let status: u16 = code_token.parse().ok()?;
 
     let mut headers = Vec::new();
     // Header lines run from after the status line to head_end (which includes
@@ -900,13 +912,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_head_accepts_any_u16_status_but_builder_rejects_invalid() {
-        // 1000 is outside the valid HTTP status range (100..=999): the parser
-        // accepts any u16, but http's builder rejects it — production code
-        // maps that rejection to Err (h2::Error) instead of panicking.
-        let head = b"HTTP/1.1 1000 Weird\r\n\r\n";
-        let parsed = parse_response_head(head).expect("1000 parses as a u16 status");
-        assert_eq!(parsed.status, 1000);
+    fn parse_response_head_status_token_is_exactly_three_digits() {
+        // Go http.ReadResponse checks the status-code token length == 3
+        // BEFORE strconv.Atoi (net/http/response.go): a 4-digit token —
+        // "1000" (out of u16 range is irrelevant) or "0200" (leading zero) —
+        // is a malformed response, never a status. Round-3 review: the old
+        // "accepts any u16" behavior was false parity. 100..=999 is the
+        // complete valid range (builder rejects only < 100 / > 999).
+        assert!(parse_response_head(b"HTTP/1.1 1000 Weird\r\n\r\n").is_none());
+        assert!(parse_response_head(b"HTTP/1.1 0200 OK\r\n\r\n").is_none());
+        let parsed = parse_response_head(b"HTTP/1.1 999 Weird\r\n\r\n").expect("999 is 3 digits");
+        assert_eq!(parsed.status, 999);
 
         // Locks in the fix contract: production code maps the builder error to
         // Err (h2::Error) instead of panicking with expect. If someone reverts

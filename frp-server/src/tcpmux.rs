@@ -482,8 +482,10 @@ pub async fn run_tcpmux_listener(
                         host, http_user, peer
                     );
                     // Go parity: the route-miss answer is NotFoundResponse
-                    // (pkg/util/http/http.go), the same 404 the vhost GET
-                    // path serves; custom_404_page replaces the builtin body.
+                    // (pkg/util/vhost/resource.go — where the type lives;
+                    // pkg/util/http/http.go only imports it), the same 404
+                    // the vhost GET path serves; custom_404_page replaces
+                    // the builtin body.
                     crate::vhost::write_not_found_response(&mut stream, &state.custom_404_page)
                         .await;
                     return;
@@ -662,9 +664,10 @@ pub async fn run_tcpmux_listener(
                     host
                 );
                 // Go parity: connectHandler's CreateConnection failure path
-                // (pkg/util/tcpmux/httpconnect.go) writes NotFoundResponse —
-                // the tunnel target vanishing mid-CONNECT surfaces like a
-                // route miss, not the old bare 502.
+                // (pkg/util/tcpmux/httpconnect.go) writes NotFoundResponse
+                // (the type lives in pkg/util/vhost/resource.go) — the
+                // tunnel target vanishing mid-CONNECT surfaces like a route
+                // miss, not the old bare 502.
                 crate::vhost::write_not_found_response(&mut stream, &state.custom_404_page).await;
             }
         });

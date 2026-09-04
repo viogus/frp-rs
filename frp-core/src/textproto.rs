@@ -120,9 +120,23 @@ pub fn canonicalize_head_crlf(pre_read: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// Go net/http `ParseHTTPVersion` — an exact-match switch on the version
+/// token (net/http/request.go): only `HTTP/1.0`, `HTTP/1.1`, `HTTP/2.0` and
+/// `HTTP/3.0` parse; every other shape is malformed — multi-digit versions
+/// (`HTTP/1.10`), digit lookalikes (`HTTP/9.9`), missing suffix (`HTTP/1`),
+/// garbage (`FOO`). The pre-round-7 approximation (single ASCII digit each
+/// side of the dot) accepted `HTTP/9.9`, which Go's `http.ReadResponse`
+/// rejects before any status handling (audit round 7, round-3 review
+/// finding). Callers: the CONNECT proxy status gate, the health
+/// response-head parse, and both h2 backend-head parses (server h2c + the
+/// client https2http plugin).
+pub fn is_valid_http_version(vers: &str) -> bool {
+    matches!(vers, "HTTP/1.0" | "HTTP/1.1" | "HTTP/2.0" | "HTTP/3.0")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_eol_crlf, head_end};
+    use super::{canonicalize_eol_crlf, head_end, is_valid_http_version};
 
     /// Build a head from header lines (each gets one `\n`) plus a blank
     /// line (the `\r\n`/`\n` terminator) and optional body bytes past it;
@@ -292,6 +306,30 @@ mod tests {
         // \r\r\n line keeps its payload \r; CRLF head stays identity.
         let input = b"X: y\r\r\n\r\n".to_vec();
         assert_eq!(canonicalize_head_crlf(input.clone()), input);
+    }
+
+    #[test]
+    fn is_valid_http_version_go_parse_http_version_switch() {
+        // Go ParseHTTPVersion is an exact-match switch — these parse.
+        for ok in ["HTTP/1.0", "HTTP/1.1", "HTTP/2.0", "HTTP/3.0"] {
+            assert!(is_valid_http_version(ok), "{ok} must pass");
+        }
+        // The single-digit approximation accepted these; Go rejects them.
+        for bad in [
+            "HTTP/9.9",
+            "HTTP/0.0",
+            "HTTP/1.10",
+            "HTTP/10.0",
+            "HTTP/1",
+            "HTTP/1.",
+            "FOO",
+            "HTTP",
+            "http/1.1",
+            "HTTP/1.1 ",
+            "HTTP/01.1",
+        ] {
+            assert!(!is_valid_http_version(bad), "{bad} must fail");
+        }
     }
 
     #[test]

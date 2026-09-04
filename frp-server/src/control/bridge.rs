@@ -236,6 +236,20 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         } else {
                             end - 1
                         };
+                        // Go http.ReadResponse rejects a head whose FIRST
+                        // line is empty (the head starting with its own
+                        // blank line means no status line exists) — such a
+                        // backend answer is malformed, and splicing
+                        // configured headers in front of it would
+                        // manufacture a plausible response out of garbage.
+                        // Fail the read like Go's reverse proxy would
+                        // (round-3 review finding).
+                        if blank_start == 0 {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "backend response head has no status line",
+                            )));
+                        }
                         let mut injected = Vec::with_capacity(this.buffer.len() + 512);
                         injected.extend_from_slice(&this.buffer[..blank_start]);
                         for (k, v) in &this.headers {
@@ -2432,5 +2446,33 @@ mod tests {
             expected,
             "LF-only head must terminate at the blank line with the header injected"
         );
+    }
+
+    #[tokio::test]
+    async fn injector_empty_first_line_is_rejected_not_prepended() {
+        // Go http.ReadResponse rejects a head with no status line (the head
+        // starting with its own blank line) — the old splice prepended the
+        // configured headers to the garbage and forwarded it as a plausible
+        // 200-ish response (round-3 review finding).
+        use tokio::io::AsyncWriteExt;
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+
+        for garbage in [
+            "\r\nHTTP/1.1 200 OK\r\n\r\nbody",
+            "\nHTTP/1.1 200 OK\n\nbody",
+        ] {
+            let (mut w, r) = tokio::io::duplex(64 * 1024);
+            let mut injector = ResponseHeaderInjector::new(r, headers.clone());
+            w.write_all(garbage.as_bytes()).await.expect("write");
+            w.shutdown().await.expect("shutdown");
+            drop(w);
+            let mut buf = Vec::new();
+            let res = tokio::io::AsyncReadExt::read_to_end(&mut injector, &mut buf).await;
+            assert!(
+                res.is_err(),
+                "an empty first line must error, not forward: {garbage:?}"
+            );
+        }
     }
 }
