@@ -1490,3 +1490,136 @@ async fn test_http_proxy_auth_fail_wire_arms() {
         "plain arm (Go ServeHTTP), got: {text:?}"
     );
 }
+
+/// Successful CONNECT through the http_proxy plugin: the FIRST bytes the
+/// user socket receives must be byte-exactly `HTTP/1.1 200 OK\r\n\r\n` —
+/// Go frp answers CONNECT with reason phrase "200 OK" (http_proxy.go:188
+/// `resp.Status = "200 OK"`), not the conventional "200 Connection
+/// Established" — and only tunneled backend bytes may follow it. T10 pin:
+/// the phrase precedes the tunnel data on the wire.
+#[tokio::test]
+async fn test_http_proxy_connect_success_phrase_exact() {
+    // Echo backend: whatever the tunnel carries in arrives back out, so the
+    // test can prove relay data flows AFTER the phrase.
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let mut buf = [0u8; 64];
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if conn.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+    client
+        .write_all(
+            format!("CONNECT {backend_addr} HTTP/1.1\r\nHost: {backend_addr}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let phrase = b"HTTP/1.1 200 OK\r\n\r\n";
+    // TCP may deliver the phrase in pieces — accumulate until it is whole.
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 64];
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while got.len() < phrase.len() {
+            let n = client.read(&mut chunk).await.expect("read");
+            assert!(n > 0, "plugin closed before the CONNECT success phrase");
+            got.extend_from_slice(&chunk[..n]);
+        }
+    })
+    .await
+    .expect("CONNECT success phrase never arrived");
+    assert!(
+        got.starts_with(phrase),
+        "first bytes must be byte-exactly the Go \"200 OK\" phrase, got: {:?}",
+        String::from_utf8_lossy(&got)
+    );
+    assert!(
+        !got[phrase.len()..].starts_with(b"HTTP/1.1"),
+        "nothing may precede the phrase on the wire: {:?}",
+        String::from_utf8_lossy(&got)
+    );
+
+    // Tunnel is live: a round trip through the CONNECT tunnel must echo.
+    client.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_exact(&mut echoed),
+    )
+    .await
+    .expect("tunneled round trip never completed")
+    .expect("read_exact");
+    assert_eq!(&echoed, b"ping", "echo backend via CONNECT tunnel");
+}
+
+/// http_proxy auth-fail arm must close the connection after the 407 (T8):
+/// the handler writes its response and returns, so the dropped socket ends
+/// the conn — a client that receives the 407 and then stays silent (never
+/// closes, never sends again) must observe EOF on its own. An unbounded
+/// read-after-response would park the task + fd on that silent client (Go
+/// http.Server closes too — write-and-close). The read_to_end in the
+/// wire-arm test above would HANG CI rather than assert on a regression;
+/// this pin puts an explicit deadline on the EOF.
+#[tokio::test]
+async fn test_http_proxy_auth_fail_closes_conn_promptly() {
+    let mut cfg = plugin_cfg("http_proxy", "127.0.0.1:1".into());
+    cfg.http_user = "u1".into();
+    cfg.http_password = "p1".into();
+    let handle = frp_client::plugin::start_http_proxy(&cfg)
+        .await
+        .expect("start http_proxy plugin");
+
+    // CONNECT + wrong creds (base64("u1:zz") = dTE6eno=): read the 407,
+    // then stay silent without closing the socket.
+    let mut c = TcpStream::connect(handle.local_addr).await.unwrap();
+    c.write_all(
+        b"CONNECT example.com:443 HTTP/1.1\r\n\
+          Host: example.com:443\r\n\
+          Proxy-Authorization: Basic dTE6eno=\r\n\
+          \r\n",
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        c.read_to_end(&mut resp),
+    )
+    .await
+    .expect("plugin must close the conn after the 407 — no read-after-response may park on a silent client")
+    .expect("read_to_end");
+    assert!(
+        resp.starts_with(b"HTTP/1.1 407 Not authorized\r\n"),
+        "got: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+}
