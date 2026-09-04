@@ -1752,18 +1752,15 @@ fn inject_vhost_request_headers(
     let mut existing_xff: Vec<u8> = Vec::new();
     // Precompute override prefixes once (case-insensitive ASCII set semantics):
     // `format!("{}:", ...)` + `to_lowercase()` per header line per request is
-    // wasted allocation — header names are ASCII. `config_names` also gates
-    // the auto-emitted X-Forwarded-* lines below (Go Set-replaces them).
-    let mut config_names: Vec<Vec<u8>> = Vec::with_capacity(request_headers.len());
+    // wasted allocation — header names are ASCII, and the trailing ':' is the
+    // line-compare boundary itself. The same Vec gates the auto-emitted
+    // X-Forwarded-* lines below (Go Set-replaces them); stripping the ':'
+    // yields the bare name for those comparisons.
     let mut override_prefixes: Vec<Vec<u8>> = Vec::with_capacity(request_headers.len());
     for (k, _) in request_headers {
-        let name = k.as_bytes().to_ascii_lowercase();
-        override_prefixes.push({
-            let mut p = name.clone();
-            p.push(b':');
-            p
-        });
-        config_names.push(name);
+        let mut p = k.as_bytes().to_ascii_lowercase();
+        p.push(b':');
+        override_prefixes.push(p);
     }
     for line in head.split_inclusive(|&b| b == b'\n') {
         let trimmed = line
@@ -1816,15 +1813,15 @@ fn inject_vhost_request_headers(
     // x-forwarded-for / x-forwarded-host / x-forwarded-proto suppresses the
     // auto line and ships the configured value alone (single header, config
     // wins — never two lines, never an append).
-    let overrides_xff = config_names
+    let overrides_xff = override_prefixes
         .iter()
-        .any(|n| n.as_slice() == b"x-forwarded-for");
-    let overrides_xfh = config_names
+        .any(|p| &p[..p.len() - 1] == b"x-forwarded-for");
+    let overrides_xfh = override_prefixes
         .iter()
-        .any(|n| n.as_slice() == b"x-forwarded-host");
-    let overrides_xfp = config_names
+        .any(|p| &p[..p.len() - 1] == b"x-forwarded-host");
+    let overrides_xfp = override_prefixes
         .iter()
-        .any(|n| n.as_slice() == b"x-forwarded-proto");
+        .any(|p| &p[..p.len() - 1] == b"x-forwarded-proto");
     // X-Forwarded-For: append peer (Go ReverseProxy appends to prior value).
     if !overrides_xff {
         let mut xff = existing_xff;
