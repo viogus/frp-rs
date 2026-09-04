@@ -714,6 +714,13 @@ async fn serve_vhost_request<S>(
 /// HTTP/1.1 vhost path: finish reading the request head (up to 4096 bytes or
 /// the \r\n\r\n terminator), extract Host/path/auth, resolve the route, and
 /// forward the stream via InternalMsg::ProxyUserConn.
+///
+/// The 4096-byte head cap is a deliberate hardening divergence from Go frp
+/// (http.Server defaultMaxHeaderBytes = 1 MiB — a hostile client can send a
+/// ~1 MiB head per request slot); the h2c surface is capped at 4096 the same
+/// way while Go's h2 default is 16 MiB. Policy split-surface rationale lives
+/// in CLAUDE.md (round-13/14 hardening rows). A head that fills the cap
+/// without its terminator gets a 431 below, never a truncated forward.
 async fn handle_http1_request<S>(
     mut stream: S,
     mut pre_read: Vec<u8>,
