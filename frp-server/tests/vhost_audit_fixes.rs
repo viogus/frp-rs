@@ -15,7 +15,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
+use common::{
+    allocate_port, login_with_test_token, read_until_eof, start_test_server, test_auth_cfg,
+    GO_404_NOT_FOUND_RESPONSE,
+};
 use frp_core::config::ServerConfig;
 use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
@@ -836,4 +839,233 @@ async fn test_vhost_response_headers_injected_end_to_end() {
     );
     drop(client);
     drop(_provider);
+}
+
+// ---------------------------------------------------------------
+// Audit-r7: Go NotFoundResponse parity + textproto EOL heads
+// ---------------------------------------------------------------
+
+/// Audit-r7 FIX 3: an HTTP GET whose Host matches no registered vhost route
+/// is answered with Go frp's NotFoundResponse byte-exact — the 92-byte head
+/// (Content-Length: 489, Content-Type: text/html, Server: frp/0.71.0) plus
+/// the 489-byte builtin HTML body = 581 bytes, then close. The old Rust
+/// answer (a bare 404 with `Content-Length: 0`, no body) diverged.
+#[tokio::test]
+async fn test_vhost_get_route_miss_go_not_found_response() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    // Register a proxy so the vhost router is live; query an UNKNOWN host.
+    let (_provider, _run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "known-only",
+            vec!["known.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: missing.example.com\r\n\r\n")
+        .await
+        .expect("send request");
+
+    let bytes = read_until_eof(&mut client).await;
+    assert_eq!(
+        bytes,
+        GO_404_NOT_FOUND_RESPONSE.as_bytes(),
+        "expected the Go NotFoundResponse (581 bytes), got: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    drop(client);
+}
+
+/// Audit-r7 FIX 1/2: a GET whose head uses bare-LF header lines with a CRLF
+/// blank line is legal Go textproto — it must be routed promptly (the old
+/// `\r\n\r\n`-window scan never terminated: the head only stalled until the
+/// read deadline) and forwarded re-encoded CRLF (Go net/http Request.Write
+/// parity — the injected X-Forwarded-* chain must not sit behind bare-LF
+/// lines).
+#[tokio::test]
+async fn test_vhost_get_bare_lf_head_routed_canonical_crlf() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "lf-get",
+            vec!["lfget.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    // LF-only header lines + CRLF blank line: contains neither \r\n\r\n nor
+    // \n\n (the textproto head_end helper's motivating shape).
+    client
+        .write_all(b"GET / HTTP/1.1\nHost: lfget.example.com\n\r\n")
+        .await
+        .expect("send bare-LF request");
+
+    // The request must be dispatched promptly (3s — the old window scan
+    // stalled until the ~60s head deadline).
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_msg_v1(&mut work_conn),
+    )
+    .await
+    .expect("timeout: the bare-LF head never terminated")
+    .expect("read StartWorkConn")
+    {
+        FrpMessage::StartWorkConn(swc) => {
+            assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+    let head = read_forwarded_head(&mut work_conn).await;
+    assert_eq!(
+        head,
+        b"GET / HTTP/1.1\r\n\
+          Host: lfget.example.com\r\n\
+          X-Forwarded-For: 127.0.0.1\r\n\
+          X-Forwarded-Host: lfget.example.com\r\n\
+          X-Forwarded-Proto: http\r\n\
+          \r\n",
+        "the mixed-EOL head must be re-encoded CRLF (Go Request.Write parity), got: {}",
+        String::from_utf8_lossy(&head)
+    );
+    drop(client);
+}
+
+/// Audit-r7 FIX 1/2: a CONNECT whose request line is LF-terminated while its
+/// Host line + blank are CRLF (mixed EOL) is legal Go textproto — it must
+/// route (bypassing host_header_rewrite / X-Forwarded-* like every CONNECT)
+/// with the head re-encoded CRLF at the backend.
+#[tokio::test]
+async fn test_vhost_connect_mixed_eol_head_routed_canonical_crlf() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    // Configure rewrite + injection on the route: the CONNECT must bypass
+    // both (Go connectHandler forwards req.Write RAW) yet still be
+    // canonicalized to CRLF.
+    let mut np = http_proxy(
+        "tunnel-conn",
+        vec!["tunnel-mix.example.com".into()],
+        None,
+        None,
+    );
+    np.host_header_rewrite = Some("backend.internal".into());
+    np.headers = Some(std::collections::HashMap::from([(
+        "X-Injected".to_string(),
+        "no".to_string(),
+    )]));
+    let (_provider, run_id) = register_proxy(addr, FrpMessage::NewProxy(Box::new(np))).await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(
+            b"CONNECT tunnel-mix.example.com:443 HTTP/1.1\n\
+              Host: tunnel-mix.example.com:443\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send mixed-EOL CONNECT");
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_msg_v1(&mut work_conn),
+    )
+    .await
+    .expect("timeout: the mixed-EOL CONNECT never terminated")
+    .expect("read StartWorkConn")
+    {
+        FrpMessage::StartWorkConn(swc) => {
+            assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+    let head = read_forwarded_head(&mut work_conn).await;
+    assert_eq!(
+        head,
+        b"CONNECT tunnel-mix.example.com:443 HTTP/1.1\r\n\
+          Host: tunnel-mix.example.com:443\r\n\
+          \r\n",
+        "CONNECT must bypass rewrite/injection but re-encode the head CRLF, got: {}",
+        String::from_utf8_lossy(&head)
+    );
+    // No line ending may be a bare LF: every '\n' must be preceded by '\r'.
+    // (A "\nH" window check would false-positive on the canonical "\r\nH" —
+    // the discriminator is the byte before the '\n'.)
+    let mut prev_cr = false;
+    let bare_lf = head.iter().any(|&b| {
+        let bare = b == b'\n' && !prev_cr;
+        prev_cr = b == b'\r';
+        bare
+    });
+    assert!(
+        !bare_lf,
+        "no bare-LF line may survive the re-encode: {}",
+        String::from_utf8_lossy(&head)
+    );
+    drop(client);
+}
+
+/// Audit-r7 FIX 5 guard (Go dedicated-listener semantics): a CONNECT to an
+/// http_user-protected vhost route WITHOUT credentials must answer a SINGLE
+/// bare 407 Proxy Authentication Required (realm "Restricted") — NO
+/// preceding 200. The successHook 200-then-407 order belongs to the tcpmux
+/// shared listener only; the vhost HTTP dedicated listener 407s directly.
+#[tokio::test]
+async fn test_vhost_connect_auth_route_no_creds_single_bare_407() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, _run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "auth-conn",
+            vec!["auconn.example.com".into()],
+            Some("user"),
+            Some("pass"),
+        ))),
+    )
+    .await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(
+            b"CONNECT auconn.example.com:443 HTTP/1.1\r\n\
+              Host: auconn.example.com:443\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send CONNECT without credentials");
+
+    let bytes = read_until_eof(&mut client).await;
+    assert_eq!(
+        bytes,
+        b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+          Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\
+          \r\n",
+        "vhost CONNECT auth failure must be a single bare 407 (no preceding 200), got: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    drop(client);
 }

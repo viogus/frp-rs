@@ -353,8 +353,9 @@ pub async fn run_tcpmux_listener(
             // vhostReadWriteTimeout (service.go:65/199: 30s, NOT the 10s
             // that this read used — a slow-loris client on a heavily loaded
             // box could outlast 10s on a legitimate dial). (n, total): total
-            // can exceed n — bytes past \r\n\r\n that a single chunk read
-            // consumed (M6); they are forwarded below.
+            // can exceed n — bytes past the head terminator (any EOL
+            // convention) that a single chunk read consumed (M6); they are
+            // forwarded below.
             let mut buf = [0u8; 4096];
             let (n, total) = match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
@@ -363,6 +364,32 @@ pub async fn run_tcpmux_listener(
             .await
             {
                 Ok(Ok((n, total))) if n > 0 => (n, total),
+                Ok(Err(ReadHttpHeadersError::TooLarge)) => {
+                    // 431 — a DELIBERATE hardening divergence from Go: Go's
+                    // http.ReadRequest (pkg/util/tcpmux/httpconnect.go) has
+                    // no header cap, so Go frp would tunnel a client whose
+                    // head overran the buffer as-is. frp-rs caps the head at
+                    // 4096 bytes (the h2c/vhost split-surface policy) and
+                    // answers oversized heads with 431 instead of silently
+                    // closing — an oversized head that answered nothing
+                    // would read as a dead proxy to a well-behaved client
+                    // that merely pipelined a large chunk.
+                    if let Err(e) = stream
+                        .write_all(
+                            b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                    {
+                        tracing::debug!(error = %e, peer = %peer, "failed to write HTTP 431 response");
+                    }
+                    return;
+                }
+                Ok(Err(ReadHttpHeadersError::Read(e))) => {
+                    tracing::debug!(error = %e, peer = %peer, "TCPMux: read error on CONNECT head from {}", peer);
+                    return;
+                }
+                // EOF mid-head and the 30s timeout close with zero bytes (Go
+                // http.ReadRequest failure path — probe vs Go v0.71.0).
                 _ => return,
             };
 
@@ -434,13 +461,19 @@ pub async fn run_tcpmux_listener(
                 target, host, peer
             );
 
+            // Parse Proxy-Authorization ONCE (audit round 7, F5): the same
+            // credentials feed the route-by-user lookup below, the auth
+            // check after the 200, and — for passthrough mode — nothing
+            // else (passthrough forwards the head RAW). Two parse sites
+            // could not diverge in practice (request_text is immutable), but
+            // a single parse keeps the routing user and the checked
+            // credentials provably identical.
+            let proxy_auth = extract_proxy_auth(&request_text);
             // Look up route (A2: the request's Proxy-Authorization username
             // is the second routing dimension — Go `getExactOrAllUsersLocked`
             // tries the exact user bucket, then the "" all-users bucket).
-            let http_user = extract_proxy_auth(&request_text)
-                .map(|(u, _)| u)
-                .unwrap_or_default();
-            let route = match state.tcpmux_manager.lookup(&host, &http_user).await {
+            let http_user = proxy_auth.as_ref().map(|(u, _)| u.as_str()).unwrap_or("");
+            let route = match state.tcpmux_manager.lookup(&host, http_user).await {
                 Some(r) => r,
                 None => {
                     warn!(
@@ -448,12 +481,11 @@ pub async fn run_tcpmux_listener(
                         "TCPMux: no route for host '{}' (http_user '{}') from {}",
                         host, http_user, peer
                     );
-                    crate::vhost::write_http_error(
-                        &mut stream,
-                        "HTTP/1.1 404 Not Found",
-                        &state.custom_404_page,
-                    )
-                    .await;
+                    // Go parity: the route-miss answer is NotFoundResponse
+                    // (pkg/util/http/http.go), the same 404 the vhost GET
+                    // path serves; custom_404_page replaces the builtin body.
+                    crate::vhost::write_not_found_response(&mut stream, &state.custom_404_page)
+                        .await;
                     return;
                 }
             };
@@ -466,9 +498,13 @@ pub async fn run_tcpmux_listener(
             // "200 OK" (http.go OkResponse) — the old "200 Connection
             // Established" diverged. Passthrough mode sends NO 200 at all
             // (httpconnect.go sendConnectResponse: `if muxer.passthrough {
-            // return nil }`). pre_read carries every byte consumed past the
-            // header terminator: passthrough forwards the whole request
-            // INCLUDING the pipelined tail — Go parity (httpconnect.go
+            // return nil }`).
+            //
+            // pre_read is built AFTER the auth gate: the 407 path must not
+            // allocate a forward buffer it will never send. When it is
+            // built, it carries every byte consumed past the header
+            // terminator: passthrough forwards the whole request INCLUDING
+            // the pipelined tail — Go parity (httpconnect.go
             // getHostFromHTTPConnect hands the passthrough path a
             // SharedConn whose io.TeeReader replays the read-ahead; the
             // pre-fix buf[..n] silently dropped them — M6). The
@@ -476,25 +512,24 @@ pub async fn run_tcpmux_listener(
             // improvement, not parity: Go returns the RAW conn there and
             // abandons the tee buffer, dropping pipelined tunnel data
             // behind the CONNECT.
-            let pre_read = if state.tcp_mux_passthrough {
-                buf[..total].to_vec()
-            } else {
+            let passthrough = state.tcp_mux_passthrough;
+            if !passthrough {
                 if let Err(e) = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await {
                     debug!(peer = %peer, error = %e, "TCPMux: failed to write 200 to {}: {}", peer, e);
                     return;
                 }
-                buf[n..total].to_vec()
-            };
+            }
 
-            // Check Proxy-Authorization if configured — AFTER the 200 (Go
-            // order; the successHook write above ran first). 407 body = Go
-            // ProxyUnauthorizedResponse (util/http/http.go): realm
-            // "Restricted", NOT "frp".
+            // Check Proxy-Authorization if configured — AFTER the 200 in
+            // non-passthrough mode (Go order; the successHook write above
+            // ran first). 407 body = Go ProxyUnauthorizedResponse
+            // (util/http/http.go): realm "Restricted", NOT "frp".
             if !route.http_user.is_empty() {
-                let auth_ok = extract_proxy_auth(&request_text)
+                let auth_ok = proxy_auth
+                    .as_ref()
                     .map(|(u, p)| {
-                        crate::constant_time_eq_str(&u, &route.http_user)
-                            && crate::constant_time_eq_str(&p, &route.http_pwd)
+                        crate::constant_time_eq_str(u, &route.http_user)
+                            && crate::constant_time_eq_str(p, &route.http_pwd)
                     })
                     .unwrap_or(false);
                 if !auth_ok {
@@ -510,6 +545,19 @@ pub async fn run_tcpmux_listener(
                     return;
                 }
             }
+
+            // Passthrough mode forwards the CONNECT head itself, so it must
+            // go out the way Go net/http would re-serialize it — CRLF line
+            // endings (the read loop accepts bare-LF/mixed-EOL heads under
+            // textproto semantics; the backend sees the canonical form, and
+            // the tail stays byte-verbatim). Non-passthrough forwards only
+            // the pipelined tail: the head was consumed by the proxy, which
+            // already spoke its 200.
+            let pre_read = if passthrough {
+                frp_core::textproto::canonicalize_head_crlf(buf[..total].to_vec())
+            } else {
+                buf[n..total].to_vec()
+            };
 
             // TCPMux group fan-out (Go frp v0.71.0 TCPMuxGroup: accepted
             // conns on the shared route are delivered to ONE group member;
@@ -596,9 +644,11 @@ pub async fn run_tcpmux_listener(
                     "TCPMux: route for '{}' found but control handler gone",
                     host
                 );
-                if let Err(e) = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await {
-                    tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
-                }
+                // Go parity: connectHandler's CreateConnection failure path
+                // (pkg/util/tcpmux/httpconnect.go) writes NotFoundResponse —
+                // the tunnel target vanishing mid-CONNECT surfaces like a
+                // route miss, not the old bare 502.
+                crate::vhost::write_not_found_response(&mut stream, &state.custom_404_page).await;
             }
         });
             }
@@ -611,9 +661,29 @@ pub async fn run_tcpmux_listener(
     Ok(())
 }
 
-/// Read HTTP request headers up to \r\n\r\n delimiter.
-/// Returns (header_len, total_read): header_len is the position just past
-/// the terminator; total_read may be LARGER — a single `read` into the
+/// Why the CONNECT head read stopped. Errors other than [`TooLarge`] close
+/// the conn silently — Go's `http.ReadRequest` failure path (vhost handle
+/// `_ = c.Close()`, probe vs Go v0.71.0: zero bytes on EOF mid-head, read
+/// errors, and the 30s read timeout alike).
+#[derive(Debug)]
+enum ReadHttpHeadersError {
+    /// The 4096-byte cap filled without a blank line — the caller answers
+    /// 431. Distinguishable from the silent-close errors because a client
+    /// that answered with a huge but WELL-FORMED head still deserves an
+    /// answer (and a truncated head must never be tunnelled).
+    TooLarge,
+    /// EOF before the head completed (connection closed mid-head).
+    Closed,
+    /// Transport error.
+    Read(String),
+}
+
+/// Read HTTP request headers up to the blank line that ends them (Go
+/// textproto semantics via `frp_core::textproto::head_end` — bare-LF and
+/// mixed line endings are legal, so the strict `\r\n\r\n` window scan would
+/// read bare-LF heads all the way to the cap and reject them).
+/// Returns (head_end, total_read): head_end is the position just past the
+/// terminator; total_read may be LARGER — a single `read` into the
 /// 512-byte chunk can consume pipelined bytes past the headers, and those
 /// bytes must survive (the caller forwards them as pre-read data; M6 —
 /// round-3 finding: they were dropped, corrupting any request that
@@ -621,30 +691,28 @@ pub async fn run_tcpmux_listener(
 async fn read_http_headers(
     stream: &mut (impl AsyncReadExt + Unpin),
     buf: &mut [u8],
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize), ReadHttpHeadersError> {
     let mut total = 0usize;
     loop {
         if total >= buf.len() {
-            return Err("headers too large".into());
+            return Err(ReadHttpHeadersError::TooLarge);
         }
         // Read in chunks instead of byte-by-byte.
         let chunk_end = (total + 512).min(buf.len());
         let n = stream
             .read(&mut buf[total..chunk_end])
             .await
-            .map_err(|e| format!("read: {e}"))?;
+            .map_err(|e| ReadHttpHeadersError::Read(e.to_string()))?;
         if n == 0 {
-            return Err("connection closed".into());
+            return Err(ReadHttpHeadersError::Closed);
         }
         total += n;
-        // Search for \r\n\r\n terminator in the newly read data
-        // plus a 3-byte overlap from the previous chunk tail.
-        let search_start = if total >= n + 3 { total - n - 3 } else { 0 };
-        if let Some(pos) = buf[search_start..total]
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-        {
-            return Ok((search_start + pos + 4, total));
+        // The head ends at the first blank line under textproto semantics;
+        // bytes past it (pipelined tail in the same segment) stay in the
+        // buffer for the caller. A single pass over the accumulated bytes
+        // per chunk is O(4096) worst case — no window-overlap bookkeeping.
+        if let Some(end) = frp_core::textproto::head_end(&buf[..total]) {
+            return Ok((end, total));
         }
     }
 }
@@ -1153,15 +1221,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_http_headers_oversized_rejected() {
-        // A header block larger than the caller's buffer is an error, never a
-        // partial parse — the shared listener maps this to a silent close.
+        // A header block larger than the caller's buffer errors with
+        // TooLarge — distinguishable from every silent-close error so the
+        // shared listener can answer 431 (the head was complete, just
+        // oversized) instead of closing with zero bytes.
         let (mut a, mut b) = tokio::io::duplex(1024);
         b.write_all(&b"X".repeat(100)).await.unwrap();
         let mut buf = [0u8; 64];
-        assert_eq!(
+        assert!(matches!(
             read_http_headers(&mut a, &mut buf).await.unwrap_err(),
-            "headers too large"
-        );
+            ReadHttpHeadersError::TooLarge
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_read_http_headers_bare_lf_and_mixed_eol_terminate() {
+        // Audit round 7: the head ends at the first blank line under Go
+        // textproto semantics — LF-only and mixed-EOL heads are legal and
+        // must NOT be read to the cap. The old strict \r\n\r\n window scan
+        // rejected every one of these shapes as oversized.
+        for head in [
+            &b"CONNECT x.example.com:443 HTTP/1.1\nHost: x.example.com:443\n\n"[..],
+            &b"CONNECT x.example.com:443 HTTP/1.1\nHost: x.example.com:443\r\n\r\n"[..],
+            &b"CONNECT x.example.com:443 HTTP/1.1\r\nHost: x.example.com:443\r\n\n"[..],
+        ] {
+            let (mut a, mut b) = tokio::io::duplex(1024);
+            b.write_all(head).await.unwrap();
+            let mut buf = [0u8; 4096];
+            let (header_len, total) = read_http_headers(&mut a, &mut buf).await.unwrap();
+            assert_eq!(
+                header_len,
+                head.len(),
+                "head: {:?}",
+                String::from_utf8_lossy(head)
+            );
+            assert_eq!(total, header_len);
+        }
     }
 
     #[tokio::test]
@@ -1174,10 +1269,10 @@ mod tests {
             .unwrap();
         drop(b); // EOF
         let mut buf = [0u8; 4096];
-        assert_eq!(
+        assert!(matches!(
             read_http_headers(&mut a, &mut buf).await.unwrap_err(),
-            "connection closed"
-        );
+            ReadHttpHeadersError::Closed
+        ));
     }
 
     #[test]

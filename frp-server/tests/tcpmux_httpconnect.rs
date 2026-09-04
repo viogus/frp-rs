@@ -1,5 +1,6 @@
 //! TCPMux HTTP-CONNECT listener e2e coverage (wave-3 round): oversized-header
-//! silent close (T2), pipelined-payload byte-exact forwarding (R4),
+//! 431 answer (T2, reworked audit-r7 FIX 4 — the old silent close diverged
+//! from the vhost 431 shape), pipelined-payload byte-exact forwarding (R4),
 //! Proxy-Authorization verbatim-payload parity (T12), and HTTP-group fan-out
 //! semantics (R2). Helpers are file-local by integration-test convention.
 
@@ -49,14 +50,17 @@ fn tcpmux_proxy(name: &str, domains: Vec<String>, local: &str) -> NewProxy {
     }
 }
 
-/// Read raw bytes until the header terminator (`\r\n\r\n`) is in the buffer
-/// (or the peer closes). Loopback reads of small responses can arrive split.
+/// Read one complete HTTP response: the head (through its first `\r\n\r\n`)
+/// plus, when the head declares a `Content-Length`, exactly that many body
+/// bytes — the audit-r7 Go-shape 404 carries the 489-byte builtin HTML, so a
+/// head-only stop would return before the response is complete. Loopback
+/// reads of small responses can arrive split.
 async fn read_full_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 128];
-    loop {
-        if buf.ends_with(b"\r\n\r\n") {
-            return buf;
+    let head_end = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p + 4;
         }
         let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut chunk))
             .await
@@ -68,7 +72,26 @@ async fn read_full_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
             String::from_utf8_lossy(&buf)
         );
         buf.extend_from_slice(&chunk[..n]);
+    };
+    // Head-only responses (200, 407, the CL:0 431) declare no body and return
+    // as before. A body-carrying response (the 404) must be read to the byte
+    // the server declared.
+    let head = std::str::from_utf8(&buf[..head_end]).expect("response head is ASCII");
+    let body_len = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length:"))
+        .map(|v| v.trim().parse::<usize>().expect("numeric Content-Length"))
+        .unwrap_or(0);
+    let have = buf.len() - head_end;
+    if body_len > have {
+        let mut rest = vec![0u8; body_len - have];
+        stream
+            .read_exact(&mut rest)
+            .await
+            .expect("read the declared response body");
+        buf.extend_from_slice(&rest);
     }
+    buf
 }
 
 /// Register a proxy and return the NewProxyResp error (None = accepted).
@@ -102,28 +125,6 @@ async fn open_work_conn(addr: SocketAddr, run_id: &str) -> tokio::net::TcpStream
     .await
     .expect("send NewWorkConn");
     work
-}
-
-/// Assert the server closed a connection SILENTLY: the read yields EOF (0
-/// bytes) or RST — the drop-with-unread-inbound-data case on loopback —
-/// and never any HTTP response bytes.
-async fn expect_silent_close(stream: &mut tokio::net::TcpStream, what: &str) {
-    let mut buf = [0u8; 1024];
-    let r = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf))
-        .await
-        .unwrap_or_else(|_| {
-            panic!("server must close the oversized connection within 3s ({what})")
-        });
-    match r {
-        Ok(0) => {}
-        Ok(n) => panic!(
-            "{what} must be closed silently (got {} bytes: {:?})",
-            n,
-            String::from_utf8_lossy(&buf[..n])
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        Err(e) => panic!("{what}: read error: {e}"),
-    }
 }
 
 /// Send one CONNECT to the tcpmux listener and read the full status response.
@@ -160,12 +161,18 @@ async fn read_start_work_conn(work: &mut tokio::net::TcpStream, what: &str) -> S
     }
 }
 
-/// T2: a CONNECT whose header block exceeds the 4 KiB shared-listener buffer
-/// must be closed SILENTLY — no 4xx/200 status bytes, no route dispatch —
-/// whether or not the block contains a terminator (an oversized block is never
-/// parsed, so the terminator position is irrelevant).
+/// T2 rework (audit-r7 FIX 4): a CONNECT whose header block exceeds the
+/// 4 KiB shared-listener buffer answers `431 Request Header Fields Too
+/// Large` (Content-Length: 0, Connection: close) then closes — never a
+/// silent close, which leaves the client hanging and is indistinguishable
+/// from a network drop. Deliberate hardening divergence from Go frp,
+/// documented at the call site: Go's httpconnect runs
+/// `http.ReadRequest` with no header cap and would TUNNEL an oversized
+/// block. Whether the block contains a terminator is irrelevant — the
+/// head is never parsed past the cap, and the oversized CONNECT never
+/// reaches dispatch.
 #[tokio::test]
-async fn test_tcpmux_oversized_headers_silent_close() {
+async fn test_tcpmux_oversized_headers_431() {
     let bind_port = allocate_port();
     let tcpmux_port = allocate_port();
     let cfg = ServerConfig {
@@ -196,6 +203,37 @@ async fn test_tcpmux_oversized_headers_silent_close() {
     // the server must not send StartWorkConn or any bytes on it.
     let mut work = open_work_conn(addr, &run_id).await;
 
+    async fn expect_431(client: &mut tokio::net::TcpStream, what: &str) {
+        let response = read_full_response(client).await;
+        assert_eq!(
+            response,
+            b"HTTP/1.1 431 Request Header Fields Too Large\r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\r\n",
+            "{what}: expected the 431 response, got: {:?}",
+            String::from_utf8_lossy(&response)
+        );
+        // Connection: close — the server must close after the 431. Whether
+        // the close surfaces as clean EOF (FIN) or a reset error depends on
+        // kernel buffering: the unread remainder of the oversized block sits
+        // in the server's receive queue when it closes, so Linux answers with
+        // RST, and a read that already consumed the 431 sees the reset on the
+        // NEXT read. Both mean the connection is dead; the pin is that
+        // nothing follows the 431.
+        let mut tail = [0u8; 64];
+        let r = tokio::time::timeout(std::time::Duration::from_secs(3), client.read(&mut tail))
+            .await
+            .unwrap_or_else(|_| panic!("server must close after the 431 ({what})"));
+        match r {
+            Ok(0) => {} // clean FIN
+            Ok(n) => panic!(
+                "unexpected bytes after the 431 ({what}): {:?}",
+                String::from_utf8_lossy(&tail[..n])
+            ),
+            Err(_e) => {} // RST — close after unread inbound data
+        }
+    }
+
     // Shape (a): 4608 bytes of headers, no terminator at all.
     let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
         .await
@@ -206,7 +244,7 @@ async fn test_tcpmux_oversized_headers_silent_close() {
         .write_all(&block)
         .await
         .expect("write oversized block");
-    expect_silent_close(&mut client, "terminator-less oversized block").await;
+    expect_431(&mut client, "terminator-less oversized block").await;
 
     // Shape (b): a COMPLETE request whose header block (4100 bytes) exceeds
     // the 4 KiB buffer — terminator present but past the cap.
@@ -220,7 +258,7 @@ async fn test_tcpmux_oversized_headers_silent_close() {
         .write_all(&block)
         .await
         .expect("write oversized block");
-    expect_silent_close(&mut client2, "terminated-but-oversized block").await;
+    expect_431(&mut client2, "terminated-but-oversized block").await;
 
     // Neither oversized CONNECT reached dispatch: the pooled work conn must
     // stay silent — no StartWorkConn, no forwarded bytes, conn still pooled.
@@ -229,7 +267,7 @@ async fn test_tcpmux_oversized_headers_silent_close() {
     let r =
         tokio::time::timeout(std::time::Duration::from_millis(400), work.read(&mut check)).await;
     match r {
-        Err(_elapsed) => {} // silent — exactly what an oversized block must produce
+        Err(_elapsed) => {} // silent — the 431 arm never dispatches
         Ok(Ok(0)) => panic!("pooled work conn hit EOF — it must stay pooled"),
         Ok(Ok(n)) => panic!(
             "oversized CONNECT was dispatched! work conn got {} bytes: {:?}",
