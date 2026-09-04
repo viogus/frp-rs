@@ -846,10 +846,15 @@ async fn test_vhost_response_headers_injected_end_to_end() {
 // ---------------------------------------------------------------
 
 /// Audit-r7 FIX 3: an HTTP GET whose Host matches no registered vhost route
-/// is answered with Go frp's NotFoundResponse byte-exact — the 92-byte head
+/// is answered with frp-rs's fixed-shape NotFoundResponse — the raw Go
+/// `NotFoundResponse` (pkg/util/http/http.go) written direct: a 92-byte head
 /// (Content-Length: 489, Content-Type: text/html, Server: frp/0.71.0) plus
 /// the 489-byte builtin HTML body = 581 bytes, then close. The old Rust
-/// answer (a bare 404 with `Content-Length: 0`, no body) diverged.
+/// answer (a bare 404 with `Content-Length: 0`, no body) diverged. Note:
+/// this pins the pre-built fixed shape, not a live Go byte capture — Go's
+/// own GET route-miss additionally passes through net/http's server layer
+/// (Date header etc.), which this raw write omits by design (same as the
+/// CONNECT path).
 #[tokio::test]
 async fn test_vhost_get_route_miss_go_not_found_response() {
     let (addr, vhost_addr, cfg) = vhost_pair();

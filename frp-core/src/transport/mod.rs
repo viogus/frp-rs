@@ -1110,7 +1110,13 @@ pub(crate) async fn connect_via_proxy(
                 ));
             }
 
-            // Read remaining headers until \r\n\r\n with per-line and total limits
+            // Read remaining headers until the first blank line with
+            // per-line and total limits. Blank = textproto.ReadLine empty:
+            // a line of "\r\n" OR bare "\n" (one trailing \r stripped) ends
+            // the head — the loop must not mistake a bare-LF blank for a
+            // header line, or tunneled bytes get consumed as headers until
+            // the caps (Go http.ReadResponse, which this loop mirrors,
+            // accepts both shapes).
             loop {
                 let mut line_buf = Vec::new();
                 timeout(
@@ -1135,7 +1141,7 @@ pub(crate) async fn connect_via_proxy(
                     ));
                 }
 
-                if line_buf == b"\r\n" || line_buf.is_empty() {
+                if line_buf == b"\r\n" || line_buf == b"\n" || line_buf.is_empty() {
                     break;
                 }
             }
@@ -2739,6 +2745,52 @@ mod tests {
         proxy_reply("HTTP/1.1 200 OK")
             .await
             .expect("a genuine 200 must be accepted");
+    }
+
+    /// Audit round 7 (S1 family): a bare-LF CONNECT 200 head (`\n`-only
+    /// blank line) is legal under Go textproto.ReadLine — the blank is a
+    /// line of "\n" with nothing to strip, exactly like "\r\n" — and Go's
+    /// http.ReadResponse accepts it. The header loop must break there and
+    /// hand the read-ahead tunnel bytes back through BufferedRead; the old
+    /// "\r\n"-only blank check consumed the tunnel's first message as
+    /// "headers" and dropped it at EOF. RED on the old check.
+    #[tokio::test]
+    async fn test_http_connect_accepts_lf_only_response_head() {
+        use tokio::io::AsyncBufReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut sock = tokio::io::BufReader::new(sock);
+            let mut req = Vec::new();
+            sock.read_until(b'\n', &mut req).await.unwrap();
+            assert!(
+                req.starts_with(b"CONNECT "),
+                "expected CONNECT, got: {req:?}"
+            );
+            // LF-only 200 head + the tunnel's first message in ONE write —
+            // the read-ahead capture must replay it after the head parse.
+            sock.write_all(b"HTTP/1.1 200 OK\n\nTUNNEL-FIRST-BYTES\r\n")
+                .await
+                .unwrap();
+            // Dropping the socket closes the tunnel (FIN) once the test reads.
+        });
+
+        let mut stream = connect_via_proxy(&format!("http://{addr}"), "127.0.0.1", 80, 5, 0)
+            .await
+            .expect("LF-only 200 head must be accepted");
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("timed out waiting for tunnel bytes")
+            .expect("read tunnel bytes");
+        assert_eq!(
+            &buf[..n],
+            b"TUNNEL-FIRST-BYTES\r\n",
+            "the tunnel's first message must survive the LF-head read, got: {}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+        srv.await.unwrap();
     }
 
     /// Go parity matrix for [`parse_connect_status_line`] — the exact

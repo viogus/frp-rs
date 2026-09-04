@@ -299,12 +299,17 @@ async fn test_tcpmux_connect_lf_only_head_gets_200_and_tunnel() {
 }
 
 /// Audit-r7 EOL fix (passthrough): with `tcpMuxPassthrough`, the server
-/// forwards the WHOLE CONNECT — head included — and Go net/http would
-/// re-serialize the parsed head CRLF (Request.Write parity). A bare-LF head
-/// must therefore arrive at the backend re-encoded CRLF, byte-exact, with
-/// the old strict-window scan never having terminated in the first place.
+/// forwards the WHOLE CONNECT — head included — RAW (Go parity:
+/// httpconnect.go hands the backend a SharedConn whose TeeReader replays
+/// the client's exact wire bytes; frps "won't do any update on traffic",
+/// server.go TCPMuxPassthrough doc). The net/http CRLF re-serialization
+/// exists only on the vhost connectHandler path, never the tcpmux path —
+/// the earlier round-7 canonicalization was a mis-citation and was
+/// reverted. A bare-LF head must arrive at the backend byte-verbatim
+/// (LF kept), with the textproto-lenient head read having terminated at
+/// the LF blank line.
 #[tokio::test]
-async fn test_tcpmux_connect_lf_head_passthrough_canonical_crlf() {
+async fn test_tcpmux_connect_lf_head_passthrough_raw_bytes() {
     let bind_port = allocate_port();
     let tcpmux_port = allocate_port();
 
@@ -376,7 +381,7 @@ async fn test_tcpmux_connect_lf_head_passthrough_canonical_crlf() {
         Ok(Err(e)) => panic!("client read error: {e}"),
     }
 
-    // Backend: StartWorkConn, then the head re-encoded CRLF byte-exact.
+    // Backend: StartWorkConn, then the head forwarded byte-verbatim.
     match read_msg_v1(&mut work_conn)
         .await
         .expect("read StartWorkConn on work conn")
@@ -390,7 +395,7 @@ async fn test_tcpmux_connect_lf_head_passthrough_canonical_crlf() {
     let mut forwarded = Vec::new();
     let mut chunk = [0u8; 256];
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !forwarded.windows(4).any(|w| w == b"\r\n\r\n") {
+        while !frp_core::textproto::head_end(&forwarded).is_some() {
             let m = work_conn
                 .read(&mut chunk)
                 .await
@@ -403,8 +408,8 @@ async fn test_tcpmux_connect_lf_head_passthrough_canonical_crlf() {
     .expect("timeout waiting for the forwarded CONNECT head");
     assert_eq!(
         forwarded,
-        b"CONNECT lfpass.example.com:443 HTTP/1.1\r\nHost: lfpass.example.com:443\r\n\r\n",
-        "the LF head must be re-encoded CRLF (Go Request.Write parity), got: {}",
+        b"CONNECT lfpass.example.com:443 HTTP/1.1\nHost: lfpass.example.com:443\n\n",
+        "the LF head must be forwarded RAW (Go SharedConn replay, no net/http re-serialization on the tcpmux path), got: {}",
         String::from_utf8_lossy(&forwarded)
     );
 

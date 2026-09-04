@@ -500,6 +500,14 @@ pub async fn run_tcpmux_listener(
             // (httpconnect.go sendConnectResponse: `if muxer.passthrough {
             // return nil }`).
             //
+            // Wire bytes match Go Response.Write on a raw conn (no
+            // http.Server layer, no Date): OkResponse has an empty header
+            // map and nil Body, so net/http writes the status line then
+            // "Content-Length: 0" (transfer.go — nil body + ContentLength 0
+            // + bodyAllowedForStatus → shouldSendContentLength) then the
+            // blank line. The 407 carries its map headers first, then the
+            // same CL:0.
+            //
             // pre_read is built AFTER the auth gate: the 407 path must not
             // allocate a forward buffer it will never send. When it is
             // built, it carries every byte consumed past the header
@@ -514,7 +522,10 @@ pub async fn run_tcpmux_listener(
             // behind the CONNECT.
             let passthrough = state.tcp_mux_passthrough;
             if !passthrough {
-                if let Err(e) = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await {
+                if let Err(e) = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                {
                     debug!(peer = %peer, error = %e, "TCPMux: failed to write 200 to {}: {}", peer, e);
                     return;
                 }
@@ -536,7 +547,8 @@ pub async fn run_tcpmux_listener(
                     if let Err(e) = stream
                         .write_all(
                             b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                          Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
+                          Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\
+                          Content-Length: 0\r\n\r\n",
                         )
                         .await
                     {
@@ -546,15 +558,20 @@ pub async fn run_tcpmux_listener(
                 }
             }
 
-            // Passthrough mode forwards the CONNECT head itself, so it must
-            // go out the way Go net/http would re-serialize it — CRLF line
-            // endings (the read loop accepts bare-LF/mixed-EOL heads under
-            // textproto semantics; the backend sees the canonical form, and
-            // the tail stays byte-verbatim). Non-passthrough forwards only
-            // the pipelined tail: the head was consumed by the proxy, which
+            // Passthrough mode forwards the CONNECT head itself RAW — Go
+            // parity (httpconnect.go: `outConn = sc`, the SharedConn
+            // TeeReader replays the client's exact wire bytes; frps
+            // "won't do any update on traffic", server.go TCPMuxPassthrough
+            // doc). The net/http CRLF re-serialization (Request.Write) that
+            // the vhost connectHandler applies is NOT part of the tcpmux
+            // path — canonicalizing here would rewrite a bare-LF head the
+            // Go frps forwards byte-verbatim. The head read loop stays
+            // textproto-lenient (that only affects WHERE the head ends, not
+            // what is forwarded). Non-passthrough forwards only the
+            // pipelined tail: the head was consumed by the proxy, which
             // already spoke its 200.
             let pre_read = if passthrough {
-                frp_core::textproto::canonicalize_head_crlf(buf[..total].to_vec())
+                buf[..total].to_vec()
             } else {
                 buf[n..total].to_vec()
             };

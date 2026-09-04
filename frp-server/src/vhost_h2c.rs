@@ -1365,11 +1365,17 @@ mod tests {
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.body_offset, head.len() - 4);
         assert_eq!(
-            header_value(&parsed.headers, "x-a").unwrap().to_str().unwrap(),
+            header_value(&parsed.headers, "x-a")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "1"
         );
         assert_eq!(
-            header_value(&parsed.headers, "x-b").unwrap().to_str().unwrap(),
+            header_value(&parsed.headers, "x-b")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "2"
         );
         // CRLF status line + LF-only blank line (the pre-fix \r\n\r\n scan
@@ -1379,7 +1385,10 @@ mod tests {
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.body_offset, head.len() - 4);
         assert_eq!(
-            header_value(&parsed.headers, "x-c").unwrap().to_str().unwrap(),
+            header_value(&parsed.headers, "x-c")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "3"
         );
     }

@@ -985,8 +985,11 @@ async fn handle_http1_request<S>(
                 // Go parity: connectHandler's CreateConnection failure path
                 // (pkg/util/vhost/http.go:262) writes the 404 NotFoundResponse
                 // — the proxy's control connection disappearing mid-request
-                // surfaces exactly like a route miss.
-                write_not_found_response(&mut stream, "").await;
+                // surfaces exactly like a route miss. NotFoundResponse()
+                // (pkg/util/vhost/resource.go) re-reads custom404Page on
+                // EVERY call, so this arm serves the configured page too —
+                // not just the builtin body.
+                write_not_found_response(&mut stream, &state.custom_404_page).await;
             }
         }
         Err(VhostResolveError::Unauthorized { proxy_form: true }) => {

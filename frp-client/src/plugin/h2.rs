@@ -568,7 +568,18 @@ fn header_value<'a>(
 fn parse_hex(b: &[u8]) -> std::io::Result<usize> {
     let s = std::str::from_utf8(b)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
-    usize::from_str_radix(s.trim(), 16)
+    let s = s.trim();
+    // Go parseHexUint (net/http/transfer.go) accepts ONLY 0-9a-fA-F — a
+    // leading '+' is "invalid byte in chunk length". Rust's from_str_radix
+    // accepts "+5" for any radix; reject the '+' explicitly ('-' already
+    // fails from_str_radix for radix 16). Twin of frp-server vhost_h2c.rs.
+    if s.starts_with('+') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad chunk size",
+        ));
+    }
+    usize::from_str_radix(s, 16)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))
 }
 
@@ -851,8 +862,23 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_http1_request_head, cap_chunk, header_value, parse_response_head};
+    use super::{
+        build_http1_request_head, cap_chunk, header_value, parse_hex, parse_response_head,
+    };
     use std::collections::HashMap;
+
+    #[test]
+    fn parse_hex_rejects_go_invalid_chunk_sizes() {
+        assert_eq!(parse_hex(b"1a").unwrap(), 26);
+        assert_eq!(parse_hex(b" 1A ").unwrap(), 26); // whitespace trimmed
+        assert!(parse_hex(b"").is_err());
+        assert!(parse_hex(b"zz").is_err());
+        assert!(parse_hex(b"-1").is_err());
+        // Go parseHexUint accepts ONLY 0-9a-fA-F — "+5" is an invalid byte
+        // in a chunk length even though Rust's from_str_radix would accept
+        // the leading '+' for radix 16 (server twin vhost_h2c.rs:1294).
+        assert!(parse_hex(b"+5").is_err());
+    }
 
     #[test]
     fn parse_response_head_parses_normal_head() {

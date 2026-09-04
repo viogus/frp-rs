@@ -245,6 +245,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                                 k.chars().filter(|&c| c != '\r' && c != '\n').collect();
                             let safe_v: String =
                                 v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                            // Configured headers always go out CRLF (Go
+                            // net/http renders every response header CRLF,
+                            // whatever the backend wrote) — a backend
+                            // LF-only head intentionally ends up mixed-EOL;
+                            // the injected lines remain parseable and the
+                            // trailing blank keeps the backend's own EOL.
                             injected.extend_from_slice(
                                 format!("{}: {}\r\n", safe_k, safe_v).as_bytes(),
                             );

@@ -1207,7 +1207,7 @@ async fn run_udp_work_conn(
                     // to the String round trip: same To4() mapped-v4
                     // normalization, same empty zone) instead of building the
                     // message struct — the per-packet ip_cache clone and the
-                    // re-parse inside addr_to_binary are gone on this path.
+                    // re-parse inside the String round trip are gone on this path.
                     let binary_codec =
                         v2 && udp_packet_codec == frp_core::udp_binary::UDP_PACKET_CODEC_BINARY;
                     if let Some(lim) = writer_lim.as_ref() {
