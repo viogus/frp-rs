@@ -907,7 +907,13 @@ mod tests {
 
     #[test]
     fn test_allocate_port_multi_explicit_in_ranges() {
-        // An explicit port within a configured allow_ports range must be accepted
+        // An explicit port within a configured allow_ports range must be accepted.
+        // The probed port lives in the 24000 block (below the Linux ephemeral
+        // range 32768-60999) like every fixed port in this module — the earlier
+        // form probed 35000 inside the ephemeral zone, where a concurrent
+        // test's transient `:0` bind could be handed the same port and the
+        // probe failed (CI regression twice on 2026-09-04, PR #294 rerun and
+        // the docs-only #296 run — same assertion, two independent reds).
         let mut used = std::collections::HashSet::new();
         let ranges = [
             frp_core::config::PortsRange {
@@ -916,20 +922,20 @@ mod tests {
                 single: 0,
             },
             frp_core::config::PortsRange {
-                start: 30000,
-                end: 40000,
+                start: 24020,
+                end: 24050,
                 single: 0,
             },
         ];
-        let result = allocate_port_multi(&mut used, 35000, &ranges, "127.0.0.1");
+        let result = allocate_port_multi(&mut used, 24035, &ranges, "127.0.0.1");
         assert_eq!(
             result,
-            Some(35000),
+            Some(24035),
             "explicit port within allow_ports range must be accepted"
         );
         // Verify it's now in used_ports
         assert!(
-            used.contains(&35000),
+            used.contains(&24035),
             "allocated port must be in used_ports"
         );
     }
