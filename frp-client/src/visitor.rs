@@ -1034,9 +1034,15 @@ async fn run_virtual_net_tunnel_io(
     };
     let mut packet_reader = crate::work_conn::TunnelPacketReader::new(server_r, use_compression);
     let mut packet_writer = if use_encryption {
-        crate::work_conn::TunnelPacketWriter::Encrypted(frp_core::cipher_stream::CipherWriter::new(
-            server_w, key,
-        ))
+        // Audit B2: OS-RNG failure (IV generation) ends this tunnel setup
+        // instead of aborting the process.
+        match frp_core::cipher_stream::CipherWriter::new(server_w, key) {
+            Ok(w) => crate::work_conn::TunnelPacketWriter::Encrypted(w),
+            Err(e) => {
+                warn!(visitor_name = %name, error = %e, "virtual_net visitor tunnel IV generation failed: {}", e);
+                return;
+            }
+        }
     } else {
         crate::work_conn::TunnelPacketWriter::Plain(server_w)
     };
@@ -2214,13 +2220,29 @@ async fn run_sudp_worker(
     };
     let mut srv_w: BoxedWriteHalf = if use_compression {
         let inner: BoxedWriteHalf = if let Some(key) = enc_key {
-            Box::new(frp_core::cipher_stream::CipherWriter::new(srv_w, key))
+            // Audit B2: OS-RNG failure (IV generation) ends this worker
+            // instead of aborting the process.
+            match frp_core::cipher_stream::CipherWriter::new(srv_w, key) {
+                Ok(w) => Box::new(w),
+                Err(e) => {
+                    warn!(visitor_name = %visitor_name, error = %e, "sudp visitor: IV generation failed");
+                    return;
+                }
+            }
         } else {
             srv_w
         };
         Box::new(frp_core::snappy_stream::SnappyStreamWriter::new(inner))
     } else if let Some(key) = enc_key {
-        Box::new(frp_core::cipher_stream::CipherWriter::new(srv_w, key))
+        // Audit B2: OS-RNG failure (IV generation) ends this worker
+        // instead of aborting the process.
+        match frp_core::cipher_stream::CipherWriter::new(srv_w, key) {
+            Ok(w) => Box::new(w),
+            Err(e) => {
+                warn!(visitor_name = %visitor_name, error = %e, "sudp visitor: IV generation failed");
+                return;
+            }
+        }
     } else {
         srv_w
     };

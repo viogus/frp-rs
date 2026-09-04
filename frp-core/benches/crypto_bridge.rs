@@ -88,7 +88,7 @@ fn bench_cipher_stream(c: &mut Criterion) {
                     let plain = plaintext.clone();
                     let h = tokio::spawn(async move {
                         use frp_core::cipher_stream::CipherWriter;
-                        let mut w = CipherWriter::new(tx, key);
+                        let mut w = CipherWriter::new(tx, key).expect("rng");
                         AsyncWriteExt::write_all(&mut w, &plain).await.unwrap();
                         AsyncWriteExt::flush(&mut w).await.unwrap();
                     });
@@ -106,7 +106,7 @@ fn bench_cipher_stream(c: &mut Criterion) {
             let (tx, mut rx) = tokio::io::duplex(size + 64);
             let h = tokio::spawn(async move {
                 use frp_core::cipher_stream::CipherWriter;
-                let mut w = CipherWriter::new(tx, key);
+                let mut w = CipherWriter::new(tx, key).expect("rng");
                 AsyncWriteExt::write_all(&mut w, &plaintext).await.unwrap();
                 AsyncWriteExt::flush(&mut w).await.unwrap();
             });

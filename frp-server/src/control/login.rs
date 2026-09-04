@@ -1259,10 +1259,19 @@ pub(crate) async fn authenticate(
         // integrity protection).
         info!(peer = ?peer, run_id = %run_id, "Wrapping control stream in CipherStream (AES-128-CFB)");
         let enc_key = encryption::derive_key(&reloadable.auth_cfg.token);
-        let cipher = frp_core::cipher_stream::CipherStream::new(
+        // Audit B2: OS-RNG failure (IV generation) tears the control down
+        // like the AEAD arm above instead of aborting the process.
+        let cipher = match frp_core::cipher_stream::CipherStream::new(
             CountingIoStream::new(stream, raw.clone()),
             enc_key,
-        );
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(peer = ?peer, error = %e, "Failed to create CipherStream for {:?}: {}", peer, e);
+                unregister_control(&state, &run_id, control_id, false, false).await;
+                return Err(());
+            }
+        };
         // ReqWorkConn pre-warming is done AFTER the if/else block below,
         // so BOTH V1 and V2+AEAD paths benefit from pre-warmed work conns.
         let (r, w) = tokio::io::split(cipher);

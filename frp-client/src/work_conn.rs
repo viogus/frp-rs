@@ -21,7 +21,7 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
 use frp_core::protocol::{
     read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v1, write_msg_v2,
-    write_msg_v2_with_udp_codec,
+    write_msg_v2_with_udp_codec, write_v2_frame_raw, V2_FRAME_TYPE_MESSAGE,
 };
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
@@ -763,7 +763,15 @@ async fn run_udp_work_conn(
         w_r
     };
     let mut w_w: BoxedWriteHalf = if use_enc {
-        Box::new(CipherWriter::new(w_w, enc_key)) as BoxedWriteHalf
+        // Audit B2: OS-RNG failure (IV generation) ends this tunnel setup
+        // instead of aborting the process.
+        match CipherWriter::new(w_w, enc_key) {
+            Ok(w) => Box::new(w) as BoxedWriteHalf,
+            Err(e) => {
+                warn!(error = %e, "vnet tunnel: IV generation failed");
+                return;
+            }
+        }
     } else {
         w_w
     };
@@ -1110,7 +1118,9 @@ async fn run_udp_work_conn(
         // Bounded: distinct remotes mirror the reader-side session map
         // (idle-swept), but a hostile flood of distinct source addrs must
         // not grow this unboundedly — clear on overflow (cheap fail-safe;
-        // the cache is a perf aid, not state).
+        // the cache is a perf aid, not state). V1 JSON frames and V2
+        // JSON-fallback frames only: the V2 binary-codec path encodes the
+        // remote straight from the SocketAddr (audit B1), no String needed.
         let mut ip_cache: HashMap<SocketAddr, String> = HashMap::new();
         // Application-level keepalive Ping, FIXED at 30s (audit F1): Go
         // frp's UDP heartbeatFn hardcodes 30s with no config knob, and the
@@ -1145,64 +1155,128 @@ async fn run_udp_work_conn(
                     // Each reply is tagged with its own remote — no shared
                     // last_remote, so concurrent remotes never cross wires.
                     let pkt_len = payload.len();
-                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                        content: std::mem::take(&mut payload),
-                        local_addr: local_udp_addr.take().or_else(|| {
-                            // Unreachable after the first packet (returned
-                            // below); defensive fallback.
-                            Some(udp_addr_of(&local_addr))
-                        }),
-                        remote_addr: Some(msg::UdpAddr {
-                            ip: match ip_cache.get(&remote) {
-                                Some(s) => s.clone(),
-                                None => {
-                                    let s = remote.ip().to_string();
-                                    if ip_cache.len() >= 256 {
-                                        ip_cache.clear();
-                                    }
-                                    ip_cache.insert(remote, s.clone());
-                                    s
-                                }
-                            },
-                            port: remote.port(),
-                            zone: String::new(),
-                        }),
-                    });
+                    // Audit B1: on the V2 binary-codec path the remote is a
+                    // parsed SocketAddr here while the codec wants family /
+                    // port / zone bytes — the msg::UdpAddr String form exists
+                    // only for the V1 JSON codec. Direct-encode from the
+                    // SocketAddr via the frp-core shared helper (byte-identical
+                    // to the String round trip: same To4() mapped-v4
+                    // normalization, same empty zone) instead of building the
+                    // message struct — the per-packet ip_cache clone and the
+                    // re-parse inside addr_to_binary are gone on this path.
+                    let binary_codec =
+                        v2 && udp_packet_codec == frp_core::udp_binary::UDP_PACKET_CODEC_BINARY;
                     if let Some(lim) = writer_lim.as_ref() {
                         // Limiter counts the (compressed) payload the tunnel
                         // actually carries.
                         frp_core::bandwidth::BandwidthLimiter::consume_shared(lim, pkt_len).await;
                     }
-                    let result = if v2 {
-                        let codec_opt = if udp_packet_codec.is_empty() {
-                            None
-                        } else {
-                            Some(udp_packet_codec.as_str())
-                        };
-                        write_msg_v2_with_udp_codec(
-                            &mut w_w,
-                            &pkt,
-                            codec_opt,
-                            false,
-                            &mut wire_scratch,
-                        )
-                        .await
+                    let result = if binary_codec {
+                        // Mirrors the binary arm of
+                        // write_msg_v2_with_udp_codec: type ID + codec body
+                        // share one scratch buffer, then one frame write and
+                        // a flush (CipherWriter must flush to emit its IV).
+                        wire_scratch.clear();
+                        wire_scratch
+                            .extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
+                        let result =
+                            match frp_core::udp_binary::encode_udp_packet_binary_socket_addr(
+                                &payload,
+                                local_udp_addr.as_ref(),
+                                &remote,
+                                &mut wire_scratch,
+                            ) {
+                                Err(e) => Err(frp_core::Error::Protocol(format!(
+                                    "encode binary UDP packet: {e}"
+                                )
+                                .into())),
+                                Ok(()) => {
+                                    match write_v2_frame_raw(
+                                        &mut w_w,
+                                        V2_FRAME_TYPE_MESSAGE,
+                                        0,
+                                        &wire_scratch,
+                                    )
+                                    .await
+                                    {
+                                        Err(e) => Err(e),
+                                        Ok(()) => w_w.flush().await.map_err(|e| {
+                                            frp_core::Error::Protocol(format!(
+                                                "flush after binary UDP packet: {e}"
+                                            )
+                                            .into())
+                                        }),
+                                    }
+                                }
+                            };
+                        // Hand the content buffer back to the session (P1) —
+                        // see the JSON arm's comment below. local_udp_addr is
+                        // never taken on this path, so it stays invariant.
+                        let _ = ret_tx.try_send(payload);
+                        result
                     } else {
-                        write_msg_v1(&mut w_w, &pkt).await
+                        // V1 JSON frame, or V2 without the binary codec
+                        // negotiated (JSON fallback): the message needs the
+                        // msg::UdpAddr String form of the remote.
+                        let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+                            content: std::mem::take(&mut payload),
+                            local_addr: local_udp_addr.take().or_else(|| {
+                                // Unreachable after the first packet (returned
+                                // below); defensive fallback.
+                                Some(udp_addr_of(&local_addr))
+                            }),
+                            remote_addr: Some(msg::UdpAddr {
+                                ip: match ip_cache.get(&remote) {
+                                    Some(s) => s.clone(),
+                                    None => {
+                                        let s = remote.ip().to_string();
+                                        if ip_cache.len() >= 256 {
+                                            ip_cache.clear();
+                                        }
+                                        ip_cache.insert(remote, s.clone());
+                                        s
+                                    }
+                                },
+                                port: remote.port(),
+                                zone: String::new(),
+                            }),
+                        });
+                        let result = if v2 {
+                            // The codec cannot be binary-v1 here (that arm is
+                            // above); any other negotiated codec name — or
+                            // none — falls through to the JSON writer.
+                            let codec_opt = if udp_packet_codec.is_empty() {
+                                None
+                            } else {
+                                Some(udp_packet_codec.as_str())
+                            };
+                            write_msg_v2_with_udp_codec(
+                                &mut w_w,
+                                &pkt,
+                                codec_opt,
+                                false,
+                                &mut wire_scratch,
+                            )
+                            .await
+                        } else {
+                            write_msg_v1(&mut w_w, &pkt).await
+                        };
+                        // Return the invariant UdpAddr for the next packet and
+                        // hand the content buffer back to the session (P1) —
+                        // it becomes the session's next recv target. try_send:
+                        // a closed/full return channel just drops the buffer
+                        // (the spare is an optimization, and the session
+                        // already re-allocated if no spare arrived). Note the
+                        // returned Vec may be the writer's compress scratch
+                        // after a swap — either way it is a live allocation
+                        // the session can recv into, so no allocation is
+                        // lost.
+                        if let FrpMessage::UDPPacket(p) = pkt {
+                            local_udp_addr = p.local_addr;
+                            let _ = ret_tx.try_send(p.content);
+                        }
+                        result
                     };
-                    // Return the invariant UdpAddr for the next packet and
-                    // hand the content buffer back to the session (P1) — it
-                    // becomes the session's next recv target. try_send: a
-                    // closed/full return channel just drops the buffer (the
-                    // spare is an optimization, and the session already
-                    // re-allocated if no spare arrived). Note the returned
-                    // Vec may be the writer's compress scratch after a
-                    // swap — either way it is a live allocation the session
-                    // can recv into, so no allocation is lost.
-                    if let FrpMessage::UDPPacket(p) = pkt {
-                        local_udp_addr = p.local_addr;
-                        let _ = ret_tx.try_send(p.content);
-                    }
                     if let Err(e) = result {
                         debug!(proxy_name = %pn_w, error = %e,
                             "UDP '{}' send to work conn failed: {}", pn_w, e);
@@ -1293,7 +1367,15 @@ async fn run_virtual_net_plugin_work_conn(
     };
     let mut packet_reader = TunnelPacketReader::new(work_r, use_compression);
     let mut packet_writer = if use_encryption {
-        TunnelPacketWriter::Encrypted(CipherWriter::new(work_w, enc_key))
+        // Audit B2: OS-RNG failure (IV generation) ends this tunnel setup
+        // instead of aborting the process.
+        match CipherWriter::new(work_w, enc_key) {
+            Ok(w) => TunnelPacketWriter::Encrypted(w),
+            Err(e) => {
+                warn!(error = %e, "vnet tunnel: IV generation failed");
+                return;
+            }
+        }
     } else {
         TunnelPacketWriter::Plain(work_w)
     };

@@ -1078,7 +1078,8 @@ mod partial_read_tests {
         // LoginResp (Go parity — no config flag gates it), so the frame
         // must go out encrypted: wrap the client half and write through it.
         let client_key = frp_core::encryption::derive_key("test-token");
-        let mut client = frp_core::cipher_stream::CipherStream::new(client, client_key);
+        let mut client =
+            frp_core::cipher_stream::CipherStream::new(client, client_key).expect("rng");
 
         // NewProxy frame with a large headers map so the frame exceeds the
         // duplex capacity. stcp needs no listener — registration alone is
@@ -1527,7 +1528,7 @@ mod idle_reap_tests {
         // Client-side cipher: the server wraps the control stream in
         // CipherStream with derive_key("test-token") after LoginResp; the
         // peer must encrypt with the same key so the decrypted bytes parse.
-        let mut cw = CipherWriter::new(client, derive_key("test-token"));
+        let mut cw = CipherWriter::new(client, derive_key("test-token")).expect("rng");
 
         // Build one valid V1 Ping frame (type byte + 8-byte BE length +
         // JSON payload) by hand. Writing it through the cipher in TWO

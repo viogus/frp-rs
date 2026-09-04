@@ -233,13 +233,15 @@ pub fn select_aead_algorithm(client_algorithms: &[Cow<'static, str>]) -> Option<
 impl ClientHello {
     /// Build a ClientHello with crypto capabilities.
     /// Generates 32 random bytes for client_random.
-    pub fn new(transport: &'static str, tls: bool, tcp_mux: bool) -> Self {
+    pub fn new(transport: &'static str, tls: bool, tcp_mux: bool) -> Result<Self, crate::Error> {
+        // Audit B2: OS-RNG failure surfaces as an error (this handshake is
+        // already in a Result context) instead of aborting the process.
         let mut client_random = vec![0u8; CRYPTO_RANDOM_SIZE];
         rand::rngs::SysRng
             .try_fill_bytes(&mut client_random)
-            .expect("SysRng failure");
+            .map_err(|e| crate::Error::Protocol(format!("SysRng failure: {e}").into()))?;
 
-        Self {
+        Ok(Self {
             bootstrap: BootstrapInfo {
                 transport: transport.into(),
                 tls,
@@ -257,7 +259,7 @@ impl ClientHello {
                     client_random: Some(client_random),
                 },
             },
-        }
+        })
     }
 
     /// Build a ClientHello without crypto (for Rust↔Rust V2 without AEAD).
@@ -413,7 +415,7 @@ pub async fn v2_handshake_client_send_hello(
     with_crypto: bool,
 ) -> Result<Vec<u8>, crate::Error> {
     let hello = if with_crypto {
-        ClientHello::new(transport, tls, tcp_mux)
+        ClientHello::new(transport, tls, tcp_mux)?
     } else {
         ClientHello::new_without_crypto(transport, tls, tcp_mux)
     };
@@ -452,7 +454,7 @@ pub async fn v2_handshake_client_recv_hello(
     // mismatch. In that case, the client must cache the original
     // ClientHello struct or the algorithm list used during send.
     let hello = if with_crypto {
-        ClientHello::new(transport, tls, tcp_mux)
+        ClientHello::new(transport, tls, tcp_mux)?
     } else {
         ClientHello::new_without_crypto(transport, tls, tcp_mux)
     };
@@ -710,9 +712,12 @@ pub async fn v2_handshake_server(
                 }
 
                 let mut server_random = vec![0u8; CRYPTO_RANDOM_SIZE];
+                // Audit B2: OS-RNG failure propagates as a handshake error
+                // (whole-process abort was the alternative under
+                // panic=abort).
                 rand::rngs::SysRng
                     .try_fill_bytes(&mut server_random)
-                    .expect("SysRng failure");
+                    .map_err(|e| crate::Error::Protocol(format!("SysRng failure: {e}").into()))?;
                 // Negotiate the UDPPacket codec: mirror Go frp v0.71.0
                 // NewServerHello (selectUDPPacketCodec over client's offers).
                 let udp_codec =
@@ -833,7 +838,7 @@ mod tests {
 
     #[test]
     fn client_hello_advertises_binary_udp_codec() {
-        let hello = ClientHello::new("tcp", false, true);
+        let hello = ClientHello::new("tcp", false, true).unwrap();
         assert_eq!(
             hello.capabilities.message.udp_packet_codecs,
             vec![std::borrow::Cow::Borrowed(
@@ -907,7 +912,7 @@ mod tests {
 
         let client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut client_io = IoStream::Tcp(client);
-        let mut hello = ClientHello::new("tcp", false, true);
+        let mut hello = ClientHello::new("tcp", false, true).unwrap();
         hello.capabilities.crypto.algorithms = vec![Cow::Borrowed("unsupported-alg")];
         let hello_json = serde_json::to_vec(&hello).unwrap();
         client_io

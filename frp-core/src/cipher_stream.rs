@@ -316,11 +316,15 @@ struct CipherWriterState {
 }
 
 impl CipherWriterState {
-    fn new(key: [u8; 16]) -> Self {
+    /// `io::Result` rather than an infallible constructor (audit B2): the
+    /// IV must come from the OS CSPRNG, and a failure there must surface as
+    /// a per-connection error instead of aborting the process under
+    /// `panic = "abort"`. Same pattern as `crypto::generate_random` /
+    /// `encryption::encrypt_into`.
+    fn new(key: [u8; 16]) -> io::Result<Self> {
         let mut write_iv = [0u8; 16];
-        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut write_iv)
-            .expect("SysRng failure");
-        Self {
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut write_iv)?;
+        Ok(Self {
             key,
             cfb: None,
             write_iv,
@@ -331,7 +335,7 @@ impl CipherWriterState {
             encrypted_buf: None,
             encrypted_write_pos: 0,
             scratch: Vec::new(),
-        }
+        })
     }
 
     /// Send the random IV to the peer. Must be called once before
@@ -680,11 +684,11 @@ pub struct CipherWriter<W: AsyncWrite + Unpin> {
 }
 
 impl<W: AsyncWrite + Unpin> CipherWriter<W> {
-    pub fn new(inner: W, key: [u8; 16]) -> Self {
-        Self {
+    pub fn new(inner: W, key: [u8; 16]) -> io::Result<Self> {
+        Ok(Self {
             inner,
-            state: CipherWriterState::new(key),
-        }
+            state: CipherWriterState::new(key)?,
+        })
     }
 
     /// Encrypt `data` in-place (CFB) and write to the underlying transport.
@@ -740,15 +744,15 @@ pub struct CipherStream<S: AsyncRead + AsyncWrite + Unpin> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> CipherStream<S> {
-    pub fn new(inner: S, key: [u8; 16]) -> Self {
-        Self {
+    pub fn new(inner: S, key: [u8; 16]) -> io::Result<Self> {
+        Ok(Self {
             inner,
             read_key: key,
             read_cfb: None,
             iv_read: 0,
             iv_buf: [0u8; 16],
-            write_state: CipherWriterState::new(key),
-        }
+            write_state: CipherWriterState::new(key)?,
+        })
     }
 }
 
@@ -884,7 +888,7 @@ mod tests {
     #[tokio::test]
     async fn round_trip() {
         let (client, server) = duplex(128 * 1024);
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         let mut reader = CipherReader::new(server, TEST_KEY);
 
         let data = b"hello world round trip test data";
@@ -899,7 +903,7 @@ mod tests {
     #[tokio::test]
     async fn empty_payload() {
         let (client, server) = duplex(1024);
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         let mut reader = CipherReader::new(server, TEST_KEY);
 
         writer.write_all(b"X").await.unwrap();
@@ -913,7 +917,7 @@ mod tests {
     #[tokio::test]
     async fn corrupted_ciphertext() {
         let (a1, mut b1) = duplex(64 * 1024);
-        let mut writer = CipherWriter::new(a1, TEST_KEY);
+        let mut writer = CipherWriter::new(a1, TEST_KEY).expect("rng");
         let data = b"secret message to be corrupted";
         writer.write_all(data).await.unwrap();
         writer.shutdown().await.unwrap();
@@ -945,7 +949,7 @@ mod tests {
     #[tokio::test]
     async fn large_payload() {
         let (client, server) = duplex(256 * 1024);
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         let mut reader = CipherReader::new(server, TEST_KEY);
 
         let data = vec![0x5Au8; 70 * 1024]; // > 64KB
@@ -965,8 +969,8 @@ mod tests {
     #[tokio::test]
     async fn cipher_stream_round_trip() {
         let (c1, c2) = duplex(128 * 1024);
-        let mut cs1 = CipherStream::new(c1, TEST_KEY);
-        let mut cs2 = CipherStream::new(c2, TEST_KEY);
+        let mut cs1 = CipherStream::new(c1, TEST_KEY).expect("rng");
+        let mut cs2 = CipherStream::new(c2, TEST_KEY).expect("rng");
 
         let data = b"CipherStream bidirectional round trip";
 
@@ -986,7 +990,7 @@ mod tests {
     #[tokio::test]
     async fn flush_before_write_sends_iv() {
         let (client, server) = duplex(128 * 1024);
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         let mut reader = CipherReader::new(server, TEST_KEY);
 
         // Flush before any write — should eagerly generate and send IV.
@@ -1008,7 +1012,7 @@ mod tests {
     async fn flush_drains_partial_first_write() {
         // Duplex with small buffer to force partial writes of IV+data.
         let (client, server) = duplex(128); // small enough to split IV+data across writes
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         let mut reader = CipherReader::new(server, TEST_KEY);
 
         let data = vec![0xA1u8; 1024]; // will be split across multiple writes
@@ -1031,8 +1035,8 @@ mod tests {
     #[tokio::test]
     async fn cipher_stream_flush_before_write() {
         let (c1, c2) = duplex(128 * 1024);
-        let mut cs1 = CipherStream::new(c1, TEST_KEY);
-        let mut cs2 = CipherStream::new(c2, TEST_KEY);
+        let mut cs1 = CipherStream::new(c1, TEST_KEY).expect("rng");
+        let mut cs2 = CipherStream::new(c2, TEST_KEY).expect("rng");
 
         // Flush before any write.
         cs1.flush().await.unwrap();
@@ -1052,7 +1056,7 @@ mod tests {
     async fn partial_second_write_no_corruption() {
         // Buffer of 64 bytes forces partial writes: IV=16, encrypted data > 64-16=48.
         let (client, server) = duplex(64);
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         let mut reader = CipherReader::new(server, TEST_KEY);
 
         // First write: exercises first_write_buf (IV + 200 bytes = 216 > 64)
@@ -1091,8 +1095,8 @@ mod tests {
     #[tokio::test]
     async fn cipher_stream_partial_second_write_no_corruption() {
         let (c1, c2) = duplex(64);
-        let mut cs1 = CipherStream::new(c1, TEST_KEY);
-        let mut cs2 = CipherStream::new(c2, TEST_KEY);
+        let mut cs1 = CipherStream::new(c1, TEST_KEY).expect("rng");
+        let mut cs2 = CipherStream::new(c2, TEST_KEY).expect("rng");
 
         let first = vec![0xC3u8; 200];
         let second = vec![0xD4u8; 200];
@@ -1277,7 +1281,7 @@ mod tests {
     #[tokio::test]
     async fn cipher_reader_zero_copy_small_chunks() {
         let (client, server) = duplex(64 * 1024);
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         let mut reader = CipherReader::new(server, TEST_KEY);
 
         // Varied (non-uniform) plaintext so any byte-reorder/CFB-offset bug in
@@ -1315,7 +1319,7 @@ mod tests {
     #[tokio::test]
     async fn cipher_reader_zero_copy_partial_fill() {
         let (client, server) = duplex(64 * 1024);
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         let mut reader = CipherReader::new(server, TEST_KEY);
 
         let total = 8192usize;
@@ -1357,7 +1361,7 @@ mod tests {
         // Write IV only, then close — CipherReader should see 0 bytes from
         // the inner reader on the first decrypt call.
         let (client, server) = duplex(1024);
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         // Flush sends IV, then drop the writer closes the stream.
         writer.flush().await.unwrap();
         drop(writer);
@@ -1394,7 +1398,7 @@ mod tests {
         client.write_all(&[0xCDu8; 5]).await.unwrap();
         drop(client);
 
-        let mut stream = CipherStream::new(server, TEST_KEY);
+        let mut stream = CipherStream::new(server, TEST_KEY).expect("rng");
         let mut buf = [0u8; 64];
         let err = stream.read(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
@@ -1409,7 +1413,7 @@ mod tests {
     #[tokio::test]
     async fn cipher_writer_scratch_reuse_roundtrip() {
         let (client, server) = duplex(128 * 1024);
-        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut writer = CipherWriter::new(client, TEST_KEY).expect("rng");
         let mut reader = CipherReader::new(server, TEST_KEY);
 
         let chunks: &[&[u8]] = &[
@@ -1439,7 +1443,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (client, server) = tokio::io::duplex(4096);
         let key = [0xABu8; 16];
-        let mut writer = CipherWriter::new(client, key);
+        let mut writer = CipherWriter::new(client, key).expect("rng");
         let mut reader = CipherReader::new(server, key);
 
         let mut plaintext = b"hello world encrypted in-place".to_vec();

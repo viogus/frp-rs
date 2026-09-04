@@ -426,13 +426,21 @@ async fn handle_visitor_conn(
     };
     let s_w: BoxedWriteHalf = if use_compression {
         let inner: BoxedWriteHalf = if let Some(key) = enc_key {
-            Box::new(frp_core::cipher_stream::CipherWriter::new(s_w, key))
+            // Audit B2: OS-RNG failure (IV generation) is a conn error.
+            Box::new(
+                frp_core::cipher_stream::CipherWriter::new(s_w, key)
+                    .map_err(|e| format!("CipherWriter::new: {e}"))?,
+            )
         } else {
             s_w
         };
         Box::new(frp_core::snappy_stream::SnappyStreamWriter::new(inner))
     } else if let Some(key) = enc_key {
-        Box::new(frp_core::cipher_stream::CipherWriter::new(s_w, key))
+        // Audit B2: OS-RNG failure (IV generation) is a conn error.
+        Box::new(
+            frp_core::cipher_stream::CipherWriter::new(s_w, key)
+                .map_err(|e| format!("CipherWriter::new: {e}"))?,
+        )
     } else {
         s_w
     };

@@ -323,7 +323,15 @@ async fn run_udp_work_conn(
         w_r
     };
     let mut w_w: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = if use_enc {
-        Box::new(CipherWriter::new(w_w, enc_key))
+        // Audit B2: OS-RNG failure (IV generation) ends this work conn
+        // instead of aborting the process.
+        match CipherWriter::new(w_w, enc_key) {
+            Ok(w) => Box::new(w),
+            Err(e) => {
+                tracing::warn!(error = %e, "udp work conn: IV generation failed");
+                return;
+            }
+        }
     } else {
         w_w
     };
@@ -873,7 +881,8 @@ fn split_user_side(
     let (u_r, u_w): UserBridgeHalves = if let Some(key) = visitor_enc_key {
         (
             Box::new(CipherReader::new(u_r, key)),
-            Box::new(CipherWriter::new(u_w, key)),
+            // Audit B2: IV-generation failure is an error, not an abort.
+            Box::new(CipherWriter::new(u_w, key).map_err(|_| "OS random generator failed")?),
         )
     } else {
         (u_r, u_w)
@@ -1413,7 +1422,15 @@ async fn run_sudp_message_bridge(
         w_r
     };
     let mut w_w: frp_core::transport::BoxedWriteHalf = if req.use_encryption {
-        Box::new(CipherWriter::new(w_w, encryption_key))
+        // Audit B2: OS-RNG failure (IV generation) ends this bridge instead
+        // of aborting the process.
+        match CipherWriter::new(w_w, encryption_key) {
+            Ok(w) => Box::new(w),
+            Err(e) => {
+                tracing::warn!(error = %e, "udp bridge: IV generation failed");
+                return;
+            }
+        }
     } else {
         w_w
     };
