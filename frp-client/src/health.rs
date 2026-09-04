@@ -407,7 +407,13 @@ async fn read_http_response_head(stream: &mut tokio::net::TcpStream) -> Result<S
             return Err("head truncated: EOF before blank line".into());
         }
         head.extend_from_slice(&buf[..n]);
-        if head.ends_with(b"\r\n\r\n") {
+        // Terminate at the FIRST blank line (either line-ending convention —
+        // Go net/textproto ReadLine strips a preceding \r and accepts a lone
+        // \n), truncating any body bytes that shared the read window. Go
+        // http.ReadResponse likewise stops at the blank line with the body
+        // unread, so head+body in one segment is UP in Go and must be here.
+        if let Some(end) = head_terminator(&head) {
+            head.truncate(end);
             break;
         }
         if head.len() >= MAX_HEALTH_RESPONSE_HEAD {
@@ -424,6 +430,24 @@ async fn read_http_response_head(stream: &mut tokio::net::TcpStream) -> Result<S
         }
     }
     Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// End index (exclusive) of the first blank line in `head` — the CRLFCRLF
+/// terminator, or the LF-only equivalent (`...\n\n`) Go's textproto reader
+/// tolerates. The two patterns cannot overlap (`\r\n\r\n` never contains a
+/// consecutive `\n`), so the minimum end over both is the first blank line.
+fn head_terminator(head: &[u8]) -> Option<usize> {
+    let crlf = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4);
+    let lf = head.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 struct HttpProbeResponse {
@@ -1309,6 +1333,59 @@ mod tests {
             err.contains("cap without terminator"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn http_probe_head_and_body_in_one_segment_succeeds() {
+        // Real backends flush head + body in one segment (Go net/http,
+        // nginx, hyper single writev). The reader must stop at the FIRST
+        // blank line — Go http.ReadResponse reads the head only, body
+        // unread — and never require the stream to end at the terminator
+        // (body bytes after it would otherwise read to EOF and DOWN a
+        // healthy 2xx). Regression pin for the round-3 review BLOCKER.
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let (addr, _handle) = spawn_raw_server(Some(raw)).await;
+        let url = format!("http://{addr}/healthz");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_probe_lf_only_head_succeeds() {
+        // Minimal/embedded HTTP/1.0-era servers may end lines with a lone
+        // \n. Go net/textproto ReadLine accepts it (strips only a preceding
+        // \r), so the blank line terminates the head there too — UP, not
+        // "truncated".
+        let raw = b"HTTP/1.1 200 OK\nContent-Length: 0\n\n".to_vec();
+        let (addr, _handle) = spawn_raw_server(Some(raw)).await;
+        let url = format!("http://{addr}/healthz");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn head_terminator_positions() {
+        // CRLFCRLF: ends at the fourth byte of the match.
+        assert_eq!(
+            head_terminator(b"HTTP/1.1 200 OK\r\n\r\n"),
+            Some(b"HTTP/1.1 200 OK\r\n\r\n".len())
+        );
+        // LF-only blank line.
+        assert_eq!(head_terminator(b"OK\n\n"), Some(4));
+        // Terminator mid-stream (body follows): first terminator wins, body
+        // bytes never extend the head.
+        assert_eq!(
+            head_terminator(b"OK\r\n\r\nbody"),
+            Some(6),
+            "head+body window must cut at the first blank line"
+        );
+        // A CRLFCRLF embeds \n\n at i+2 with the same end index; the LF
+        // search must not terminate early at position 2 of the CRLF pair.
+        assert_eq!(head_terminator(b"a\r\nb\r\n\r\n"), Some(8));
+        // No terminator.
+        assert_eq!(head_terminator(b"HTTP/1.1 200 OK\r\nx"), None);
     }
 
     // ---- GAP8 (round-6 audit): URL/authority parse helpers had zero

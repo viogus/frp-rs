@@ -400,14 +400,18 @@ pub async fn run_tcpmux_listener(
             // Route on the request-line authority (CONNECT target) — Go
             // net/http fills req.Host from req.URL.Host and ignores the
             // Host header for CONNECT (RFC 7230 §5.3; see
-            // `extract_route_host`). 400 only when both are absent.
+            // `extract_route_host`). An unroutable line — 2-token shapes,
+            // a malformed version token, a non-numeric authority port —
+            // is a net/http ReadRequest error in Go, and readHTTPConnectRequest
+            // errors reach vhost handle as a silent ZERO-byte close (probe
+            // vs Go v0.71.0: "CONNECT HTTP/1.1", "CONNECT host:22",
+            // "CONNECT h:22 GARBAGE", and "connect h:22 HTTP/1.1" all
+            // answer nothing). The old code wrote "400 Bad Request" — not
+            // Go bytes (round-3 review 2a).
             let host = match extract_route_host(&request_text) {
                 Some(h) => h.to_string(),
                 None => {
                     warn!(peer = %peer, "TCPMux: no Host header or CONNECT target from {}", peer);
-                    if let Err(e) = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await {
-                        tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
-                    }
                     return;
                 }
             };
@@ -464,11 +468,14 @@ pub async fn run_tcpmux_listener(
             // (httpconnect.go sendConnectResponse: `if muxer.passthrough {
             // return nil }`). pre_read carries every byte consumed past the
             // header terminator: passthrough forwards the whole request
-            // INCLUDING the pipelined tail (Go's bufio Reader preserves
-            // buffered bytes past the request; the pre-fix buf[..n] silently
-            // dropped them — M6), and non-passthrough forwards the tail
-            // after the 200 so a client that pipelined tunnel data behind
-            // its CONNECT loses nothing.
+            // INCLUDING the pipelined tail — Go parity (httpconnect.go
+            // getHostFromHTTPConnect hands the passthrough path a
+            // SharedConn whose io.TeeReader replays the read-ahead; the
+            // pre-fix buf[..n] silently dropped them — M6). The
+            // non-passthrough tail-forward after the 200 is a frp-rs
+            // improvement, not parity: Go returns the RAW conn there and
+            // abandons the tee buffer, dropping pipelined tunnel data
+            // behind the CONNECT.
             let pre_read = if state.tcp_mux_passthrough {
                 buf[..total].to_vec()
             } else {
@@ -752,12 +759,13 @@ fn extract_route_host(request: &str) -> Option<&str> {
     // (SplitN(line, " ", 3)): "METHOD TARGET VERSION". A 2-part line
     // (versionless, or "CONNECT HTTP/1.1" — the version string in the
     // target slot) errors the whole ReadRequest regardless of any Host
-    // header → 400. Tab-separated versions merge into the target token
-    // and fail the authority parse below (Go's space-only split makes the
+    // header → the caller closes silently (zero bytes, probe vs Go
+    // v0.71.0). Tab-separated versions merge into the target token and
+    // fail the authority parse below (Go's space-only split makes the
     // whole line malformed). The version must be the exact 8-char shape
     // "HTTP/X.Y" (ParseHTTPVersion; "HTTP/2.0" is accepted, "HTTP/1.10"
     // rejected — see is_valid_version) — "HTTP/2", "garbage", and 4-token
-    // lines (version + trailing junk) all error in Go.
+    // lines (version + trailing junk) all error in Go the same way.
     let mut parts = first_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -786,12 +794,13 @@ fn extract_route_host(request: &str) -> Option<&str> {
 
 /// Go net/http ParseHTTPVersion (Go 1.25): exactly 8 chars "HTTP/X.Y"
 /// with single-digit major and minor. "HTTP/1.10" (9 chars), "HTTP/1.x",
-/// and "HTTP/11.0" all fail the shape → malformed → caller replies 400.
-/// NOTE: "HTTP/2.0" parses fine and is accepted — tcpmux uses
-/// http.ReadRequest (client-side parse), which has NO ProtoMajor gate
-/// (the 505 gate is http.Server-specific and does not apply here; the
-/// vhost path has its own, see vhost.rs A7). The round-5 comment claiming
-/// "major 1" was wrong, verified against Go 1.25.0 stdlib source.
+/// and "HTTP/11.0" all fail the shape → malformed → the caller closes
+/// silently (zero bytes, probe vs Go v0.71.0). NOTE: "HTTP/2.0" parses
+/// fine and is accepted — tcpmux uses http.ReadRequest (client-side
+/// parse), which has NO ProtoMajor gate (the 505 gate is http.Server-
+/// specific and does not apply here; the vhost path has its own, see
+/// vhost.rs A7). The round-5 comment claiming "major 1" was wrong,
+/// verified against Go 1.25.0 stdlib source.
 fn is_valid_version(version: &str) -> bool {
     if version.len() != 8 || !version.starts_with("HTTP/") {
         return false;
@@ -902,9 +911,11 @@ mod tests {
 
     #[test]
     fn test_extract_route_host_missing_both() {
-        // Neither a Host header nor a request-line target: 400 stays. The
+        // Neither a Host header nor a request-line target: no route. The
         // "CONNECT HTTP/1.1" line has no authority either — the second
-        // token is the HTTP version, which must not be routed on.
+        // token is the HTTP version, which must not be routed on. The
+        // caller's None arm closes silently (Go ReadRequest error class,
+        // probe vs Go v0.71.0: zero bytes).
         let req = "CONNECT HTTP/1.1\r\n\r\n";
         assert_eq!(extract_route_host(req), None);
         assert_eq!(extract_route_host(""), None);
@@ -919,7 +930,8 @@ mod tests {
             Some("example.com")
         );
         // Non-numeric port on the request line: url.ParseRequestURI's
-        // validOptionalPort rejects it → Go ReadRequest 400s.
+        // validOptionalPort rejects it → Go ReadRequest error → the
+        // caller closes silently (zero bytes, probe vs Go v0.71.0).
         assert_eq!(
             extract_route_host("CONNECT example.com:abc HTTP/1.1\r\n\r\n"),
             None
@@ -931,7 +943,7 @@ mod tests {
             Some("example.com")
         );
         // Versionless request line: Go parseRequestLine needs 3 parts and
-        // errors → 400, no routing on the Host header either.
+        // errors → silent close, no routing on the Host header either.
         let req = "CONNECT example.com:443\r\nHost: other.net\r\n\r\n";
         assert_eq!(extract_route_host(req), None);
         // Version content is validated (parseProtoVersion: major 1,

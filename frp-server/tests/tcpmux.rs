@@ -176,28 +176,6 @@ async fn test_tcpmux_unknown_domain_returns_404() {
     drop(provider);
 }
 
-/// Read raw bytes until the header terminator (`\r\n\r\n`) is in the buffer
-/// (or the peer closes). Loopback reads of small responses can arrive split.
-async fn read_full_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 128];
-    loop {
-        if buf.ends_with(b"\r\n\r\n") {
-            return buf;
-        }
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut chunk))
-            .await
-            .expect("timeout waiting for the HTTP error response")
-            .expect("read HTTP error response");
-        assert!(
-            n > 0,
-            "EOF before the full response (got {:?})",
-            String::from_utf8_lossy(&buf)
-        );
-        buf.extend_from_slice(&chunk[..n]);
-    }
-}
-
 /// Listener-level gate: a raw socket that sends a NON-CONNECT request line
 /// is a readHTTPConnectRequest error in Go (`req.Method != "CONNECT"`,
 /// case-sensitive like httpconnect.go) → vhost handle `_ = c.Close()` — the
@@ -247,10 +225,12 @@ async fn test_tcpmux_get_request_line_rejected_silent_close() {
 }
 
 /// CONNECT without a routable host — a 2-part request line with the version
-/// in the target slot ("CONNECT HTTP/1.1") — must get the exact Go-parity
-/// 400 status bytes (extract_route_host returns None → 400).
+/// in the target slot ("CONNECT HTTP/1.1") — is a net/http ReadRequest
+/// error in Go (parseRequestLine needs 3 tokens), so readHTTPConnectRequest
+/// errors and the vhost handle closes with ZERO bytes (probe vs Go v0.71.0;
+/// the old Rust "400 Bad Request" answer diverged — round-3 review 2a).
 #[tokio::test]
-async fn test_tcpmux_connect_without_host_rejected_400() {
+async fn test_tcpmux_connect_without_host_closes_silently() {
     let bind_port = allocate_port();
     let tcpmux_port = allocate_port();
 
@@ -272,10 +252,16 @@ async fn test_tcpmux_connect_without_host_rejected_400() {
         .await
         .expect("send CONNECT without host");
 
-    let response = read_full_response(&mut client).await;
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .expect("timeout waiting for close")
+        .expect("read after malformed CONNECT");
     assert_eq!(
-        String::from_utf8_lossy(&response),
-        "HTTP/1.1 400 Bad Request\r\n\r\n"
+        n,
+        0,
+        "malformed CONNECT must close with zero bytes (got {:?})",
+        String::from_utf8_lossy(&buf[..n])
     );
     drop(client);
 }

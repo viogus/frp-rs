@@ -246,8 +246,11 @@ async fn handle_connect(mut client: TcpStream, target: &str) -> Result<(), Strin
     };
     frp_core::transport::set_nodelay(&remote);
 
-    // Tell client connection established
-    let resp = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+    // Tell client connection established. Phrase parity: Go frp writes
+    // "HTTP/1.1 200 OK" on CONNECT success (pkg/plugin/client/http_proxy.go
+    // httpProxy.go:188 `resp.Status = "200 OK"`) — not the conventional
+    // "200 Connection Established".
+    let resp = b"HTTP/1.1 200 OK\r\n\r\n";
     client
         .write_all(resp)
         .await
