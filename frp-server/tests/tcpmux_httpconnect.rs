@@ -320,7 +320,9 @@ async fn test_tcpmux_connect_pipelined_payload_byte_exact() {
 /// must fail auth. With no route_by_http_user configured the proxy registers
 /// under the "" all-users bucket (Go getExactOrAllUsersLocked), so the parse
 /// failure still MATCHES the route and then fails the per-proxy http_user
-/// check → fail-closed 407 Proxy-Authenticate (never 200, never a bypass).
+/// check. The response is Go successHook-before-checkAuth order (vhost.go
+/// handle): the matched route's 200 OK lands first, THEN the fail-closed
+/// 407 Proxy-Authenticate, then close — never a tunnel, never a bypass.
 /// The 404 lookup-miss arm is covered by the route_by_http_user variant in
 /// the route_user dashboard/control tests. Trailing OWS on the header line
 /// is still stripped first (readMIMEHeader parity) → accepted.
@@ -361,7 +363,10 @@ async fn test_tcpmux_proxy_auth_interior_space_rejected_407() {
     assert!(response.starts_with("HTTP/1.1 200"), "got: {response:?}");
 
     // Double space after "Basic ": base64 decode must fail like Go
-    // StdEncoding → the route's http_user check fails → 407 (fail-closed).
+    // StdEncoding → the route's http_user check fails → 407 (fail-closed),
+    // but AFTER the matched route's successHook 200 (Go write-order —
+    // vhost.go handle: successHook runs before checkAuth). Assert both
+    // statuses on the same conn, in Go order.
     let (_, response) = send_connect(
         tcpmux_addr,
         b"CONNECT auth-strict.example.com:443 HTTP/1.1\r\n\
@@ -370,9 +375,11 @@ async fn test_tcpmux_proxy_auth_interior_space_rejected_407() {
           \r\n",
     )
     .await;
+    let ok_pos = response.find("HTTP/1.1 200 OK");
+    let auth_pos = response.find("HTTP/1.1 407 Proxy Authentication Required");
     assert!(
-        response.starts_with("HTTP/1.1 407"),
-        "double-space credentials must be rejected (Go ParseBasicAuth), got: {response:?}"
+        ok_pos.is_some_and(|p| auth_pos.is_some_and(|a| p < a)),
+        "double-space credentials must be rejected: 200 (successHook) then 407, got: {response:?}"
     );
 
     // Trailing OWS on the header line: stripped before auth parsing
