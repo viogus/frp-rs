@@ -349,12 +349,15 @@ pub async fn run_tcpmux_listener(
 
         tokio::spawn(async move {
             let _permit = permit;
-            // Read CONNECT line + headers (up to 4KB) with 10s timeout.
-            // (n, total): total can exceed n — bytes past \r\n\r\n that a
-            // single chunk read consumed (M6); they are forwarded below.
+            // Read CONNECT line + headers (up to 4KB) under Go's fixed
+            // vhostReadWriteTimeout (service.go:65/199: 30s, NOT the 10s
+            // that this read used — a slow-loris client on a heavily loaded
+            // box could outlast 10s on a legitimate dial). (n, total): total
+            // can exceed n — bytes past \r\n\r\n that a single chunk read
+            // consumed (M6); they are forwarded below.
             let mut buf = [0u8; 4096];
             let (n, total) = match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(30),
                 read_http_headers(&mut stream, &mut buf),
             )
             .await
@@ -366,16 +369,13 @@ pub async fn run_tcpmux_listener(
             let request_text = String::from_utf8_lossy(&buf[..n]);
 
             // Parse CONNECT line: CONNECT host:port HTTP/1.1
-            let first_line = match request_text.lines().next() {
-                Some(line) => line,
-                None => {
-                    // Client disconnected or sent garbage — write failure is
-                    // expected and there is no recovery path.
-                    if let Err(e) = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await {
-                        tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
-                    }
-                    return;
-                }
+            let Some(first_line) = request_text.lines().next() else {
+                // No first line = a Go http.ReadRequest error
+                // (readHTTPConnectRequest → vhost handle `_ = c.Close()`):
+                // the conn closes with ZERO bytes (probe vs Go v0.71.0) —
+                // the old code answered 400.
+                tracing::debug!(peer = %peer, "TCPMux: empty request from {}", peer);
+                return;
             };
 
             let mut parts = first_line.split_whitespace();
@@ -385,19 +385,15 @@ pub async fn run_tcpmux_listener(
             // Case-sensitive like Go: httpconnect.go's `req.Method !=
             // "CONNECT"` (and justAuthority, which only treats an exact
             // "CONNECT" as authority-form — a lowercase "connect" has no
-            // URL host and errors).
+            // URL host and errors). A non-CONNECT method is a readHTTPConnectRequest
+            // error in Go → silent close, zero bytes (probe vs Go v0.71.0:
+            // no 405 on the wire — the old code wrote one).
             if method != "CONNECT" {
                 warn!(
                     method = %method, peer = %peer,
                     "TCPMux: expected CONNECT, got {} from {}",
                     method, peer
                 );
-                if let Err(e) = stream
-                    .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
-                    .await
-                {
-                    tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
-                }
                 return;
             }
 
@@ -416,16 +412,15 @@ pub async fn run_tcpmux_listener(
                 }
             };
 
-            // Go net/http readRequest: `len(req.Header["Host"]) > 1` →
-            // 400 "too many Host headers" (RFC 7230 §5.4). Applies even
-            // when the CONNECT authority ignores the header for routing —
-            // the duplicate check runs before any routing (round 6, LOW
-            // A9; counting semantics shared with the vhost path).
+            // Go net/http readRequest: `len(req.Header["Host"]) > 1` is a
+            // "too many Host headers" error (RFC 7230 §5.4) — which reaches
+            // readHTTPConnectRequest as an err → vhost handle closes with
+            // ZERO bytes (probe vs Go v0.71.0). Applies even when the
+            // CONNECT authority ignores the header for routing — the
+            // duplicate check runs before any routing (round 6, LOW A9;
+            // counting semantics shared with the vhost path).
             if crate::vhost::count_host_headers(&request_text) > 1 {
                 warn!(peer = %peer, "TCPMux: too many Host headers from {}", peer);
-                if let Err(e) = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await {
-                    tracing::debug!(error = %e, peer = %peer, "failed to write HTTP error response");
-                }
                 return;
             }
 
@@ -459,7 +454,35 @@ pub async fn run_tcpmux_listener(
                 }
             };
 
-            // Check Proxy-Authorization if configured
+            // Go successHook-before-checkAuth order (vhost.go handle
+            // 192-209): the 200 OK is written on the route BEFORE the
+            // Proxy-Authorization check — an unauthorized client receives
+            // "200 OK" then the 407, both on the same conn, before close
+            // (probe vs Go v0.71.0). Reason phrase is Go's canonical
+            // "200 OK" (http.go OkResponse) — the old "200 Connection
+            // Established" diverged. Passthrough mode sends NO 200 at all
+            // (httpconnect.go sendConnectResponse: `if muxer.passthrough {
+            // return nil }`). pre_read carries every byte consumed past the
+            // header terminator: passthrough forwards the whole request
+            // INCLUDING the pipelined tail (Go's bufio Reader preserves
+            // buffered bytes past the request; the pre-fix buf[..n] silently
+            // dropped them — M6), and non-passthrough forwards the tail
+            // after the 200 so a client that pipelined tunnel data behind
+            // its CONNECT loses nothing.
+            let pre_read = if state.tcp_mux_passthrough {
+                buf[..total].to_vec()
+            } else {
+                if let Err(e) = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await {
+                    debug!(peer = %peer, error = %e, "TCPMux: failed to write 200 to {}: {}", peer, e);
+                    return;
+                }
+                buf[n..total].to_vec()
+            };
+
+            // Check Proxy-Authorization if configured — AFTER the 200 (Go
+            // order; the successHook write above ran first). 407 body = Go
+            // ProxyUnauthorizedResponse (util/http/http.go): realm
+            // "Restricted", NOT "frp".
             if !route.http_user.is_empty() {
                 let auth_ok = extract_proxy_auth(&request_text)
                     .map(|(u, p)| {
@@ -471,7 +494,7 @@ pub async fn run_tcpmux_listener(
                     if let Err(e) = stream
                         .write_all(
                             b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                          Proxy-Authenticate: Basic realm=\"frp\"\r\n\r\n",
+                          Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
                         )
                         .await
                     {
@@ -521,28 +544,6 @@ pub async fn run_tcpmux_listener(
                         (route.proxy_name.clone(), route.run_id.clone())
                     }
                 }
-            };
-
-            // Send 200 only in non-passthrough mode (Go frp compat:
-            // tcpmux/httpconnect.go sendConnectResponse). pre_read carries
-            // every byte consumed past the header terminator: passthrough
-            // forwards the whole request INCLUDING the pipelined tail
-            // (Go's bufio Reader preserves buffered bytes past the request;
-            // the pre-fix buf[..n] silently dropped them — M6), and
-            // non-passthrough forwards the tail after the 200 so a client
-            // that pipelined tunnel data behind its CONNECT loses nothing.
-            let pre_read = if state.tcp_mux_passthrough {
-                buf[..total].to_vec()
-            } else {
-                // Non-passthrough: send the 200 response.
-                if let Err(e) = stream
-                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .await
-                {
-                    debug!(peer = %peer, error = %e, "TCPMux: failed to write 200 to {}: {}", peer, e);
-                    return;
-                }
-                buf[n..total].to_vec()
             };
 
             // Forward to the control handler for work connection bridging.

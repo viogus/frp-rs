@@ -806,6 +806,18 @@ async fn handle_http1_request<S>(
             return;
         }
     };
+    // Go ServeHTTP (pkg/util/vhost/http.go:282-285): a request whose METHOD
+    // is CONNECT is handed to connectHandler, which forwards the head RAW —
+    // the Rewrite hook (X-Forwarded-*) and rc.Headers (requestHeaders) never
+    // run, and no host rewrite applies. Case-sensitive method gate (Go
+    // http.MethodConnect): lowercase "connect" takes the normal proxy path.
+    // Covers both authority-form CONNECT and an origin-form request line
+    // with the CONNECT method — Go's gate is the method alone (justAuthority
+    // only changes how the target parses).
+    let is_connect = request_text
+        .splitn(3, ' ')
+        .next()
+        .is_some_and(|m| m == "CONNECT");
     // RFC 7230 §5.4: a request with more than one Host header is invalid.
     // Go's net/http server (which Go frp uses for vhost routing) rejects
     // such requests with 400; forwarding duplicates verbatim would let a
@@ -872,6 +884,7 @@ async fn handle_http1_request<S>(
         peer,
         scheme,
         is_absolute_form,
+        is_connect,
     )
     .await
     {
@@ -921,17 +934,19 @@ async fn handle_http1_request<S>(
         }
         Err(VhostResolveError::Unauthorized { proxy_form: true }) => {
             // Absolute-form request → Go checkRouteAuthByRequest 407 +
-            // Proxy-Authenticate.
+            // Proxy-Authenticate (http.go:272-277 — realm "Restricted").
             let _ = stream
                 .write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"frp\"\r\n\r\n",
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
                 )
                 .await;
         }
         Err(VhostResolveError::Unauthorized { proxy_form: false }) => {
+            // Go http.Error 401 + WWW-Authenticate, realm "Restricted"
+            // (http.go:272-277 — Go frp's realm is NOT the old "frp").
             let _ = stream
                 .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n",
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
                 )
                 .await;
         }
@@ -991,6 +1006,7 @@ pub(crate) async fn resolve_vhost_request(
     peer: std::net::SocketAddr,
     scheme: &str,
     is_absolute_form: bool,
+    is_connect: bool,
 ) -> Result<VhostForward, VhostResolveError> {
     // Routing username: the caller's routing-only BasicAuth fallback
     // (Go getRequestRouteUser) takes precedence when present; otherwise the
@@ -1085,8 +1101,13 @@ pub(crate) async fn resolve_vhost_request(
     // cross-tenant hijack (any registered proxy could impersonate the
     // redirect target) and is removed (audit round 3, M12).
 
-    // Apply host_header_rewrite if configured
-    let request_head = if !route.host_header_rewrite.is_empty() {
+    // Host rewrite + forwarded-header injection apply only to non-CONNECT
+    // requests: Go's ServeHTTP routes CONNECT to connectHandler, which writes
+    // `req.Write(remote)` RAW (http.go:282-285) — no host rewrite, no
+    // SetXForwarded, no rc.Headers. Auth still gates above: checkRouteAuthByRequest
+    // runs BEFORE the method gate, so a CONNECT to an auth-protected route is
+    // still 407/401 before any byte is forwarded.
+    let request_head = if !is_connect && !route.host_header_rewrite.is_empty() {
         rewrite_host_header(request_head, &route.host_header_rewrite)
     } else {
         request_head
@@ -1100,8 +1121,11 @@ pub(crate) async fn resolve_vhost_request(
     // HTTP path; the HTTPS vhost muxer is SNI passthrough and never
     // injects), then requestHeaders (Set semantics — user-configured
     // overrides win, exactly like Go's rc.Headers loop after SetXForwarded).
-    let request_head =
-        inject_vhost_request_headers(request_head, peer, raw_host, route.headers.as_slice());
+    let request_head = if is_connect {
+        request_head
+    } else {
+        inject_vhost_request_headers(request_head, peer, raw_host, route.headers.as_slice())
+    };
 
     Ok(VhostForward {
         proxy_name: group_proxy_name,
@@ -1225,12 +1249,16 @@ pub async fn run_vhost_https_listener(
 
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let timeout_secs = clamp_vhost_timeout(state.vhost_http_timeout);
                     // Read the TLS ClientHello (SNI lives in the first
-                    // record; 4096 bytes comfortably covers it).
+                    // record; 4096 bytes comfortably covers it). Deadline is
+                    // Go's FIXED vhostReadWriteTimeout (service.go:65/342 —
+                    // the HTTPS Muxer is constructed with it), immune to the
+                    // user's vhost_http_timeout: the old config-derived
+                    // clamp made the SNI read window stretch to the 24h cap
+                    // under a hostile timeout setting.
                     let mut buf = [0u8; 4096];
                     let n = match tokio::time::timeout(
-                        std::time::Duration::from_secs(timeout_secs),
+                        std::time::Duration::from_secs(30),
                         read_client_hello_prefix(&mut stream, &mut buf),
                     )
                     .await
@@ -1653,15 +1681,19 @@ fn inject_vhost_request_headers(
     let mut existing_xff: Vec<u8> = Vec::new();
     // Precompute override prefixes once (case-insensitive ASCII set semantics):
     // `format!("{}:", ...)` + `to_lowercase()` per header line per request is
-    // wasted allocation — header names are ASCII.
-    let override_prefixes: Vec<Vec<u8>> = request_headers
-        .iter()
-        .map(|(k, _)| {
-            let mut p = k.as_bytes().to_ascii_lowercase();
+    // wasted allocation — header names are ASCII. `config_names` also gates
+    // the auto-emitted X-Forwarded-* lines below (Go Set-replaces them).
+    let mut config_names: Vec<Vec<u8>> = Vec::with_capacity(request_headers.len());
+    let mut override_prefixes: Vec<Vec<u8>> = Vec::with_capacity(request_headers.len());
+    for (k, _) in request_headers {
+        let name = k.as_bytes().to_ascii_lowercase();
+        override_prefixes.push({
+            let mut p = name.clone();
             p.push(b':');
             p
-        })
-        .collect();
+        });
+        config_names.push(name);
+    }
     for line in head.split_inclusive(|&b| b == b'\n') {
         let trimmed = line
             .strip_suffix(b"\n")
@@ -1706,17 +1738,35 @@ fn inject_vhost_request_headers(
     for line in &lines {
         out.extend_from_slice(line);
     }
+    // Go Rewrite-hook order (pkg/util/vhost/http.go:59-87): SetXForwarded
+    // emits the auto X-Forwarded-* lines FIRST, then the rc.Headers loop
+    // applies each configured requestHeader with `req.Header.Set` — Set
+    // REPLACES the value SetXForwarded just wrote, so a requestHeader named
+    // x-forwarded-for / x-forwarded-host / x-forwarded-proto suppresses the
+    // auto line and ships the configured value alone (single header, config
+    // wins — never two lines, never an append).
+    let overrides_xff = config_names
+        .iter()
+        .any(|n| n.as_slice() == b"x-forwarded-for");
+    let overrides_xfh = config_names
+        .iter()
+        .any(|n| n.as_slice() == b"x-forwarded-host");
+    let overrides_xfp = config_names
+        .iter()
+        .any(|n| n.as_slice() == b"x-forwarded-proto");
     // X-Forwarded-For: append peer (Go ReverseProxy appends to prior value).
-    let mut xff = existing_xff;
-    xff.extend_from_slice(peer.ip().to_string().as_bytes());
-    out.extend_from_slice(b"X-Forwarded-For: ");
-    out.extend_from_slice(&xff);
-    out.extend_from_slice(b"\r\n");
+    if !overrides_xff {
+        let mut xff = existing_xff;
+        xff.extend_from_slice(peer.ip().to_string().as_bytes());
+        out.extend_from_slice(b"X-Forwarded-For: ");
+        out.extend_from_slice(&xff);
+        out.extend_from_slice(b"\r\n");
+    }
     // X-Forwarded-Host: inbound Host as received (Go SetXForwarded:
     // `r.In.Host != ""` guard, pre-rewrite value). Emitted AFTER XFF, both
     // before the configured headers, which may override them (Go `Header.Set`
     // semantics — the rc.Headers loop runs after SetXForwarded).
-    if !x_forwarded_host.is_empty() {
+    if !overrides_xfh && !x_forwarded_host.is_empty() {
         out.extend_from_slice(b"X-Forwarded-Host: ");
         out.extend_from_slice(x_forwarded_host.as_bytes());
         out.extend_from_slice(b"\r\n");
@@ -1725,7 +1775,9 @@ fn inject_vhost_request_headers(
     // injector only ever runs on the plain-HTTP vhost path (HTTP/1.1 + h2c);
     // the HTTPS vhost muxer is SNI passthrough with no HTTP layer to inject
     // into, so "https" is unreachable here.
-    out.extend_from_slice(b"X-Forwarded-Proto: http\r\n");
+    if !overrides_xfp {
+        out.extend_from_slice(b"X-Forwarded-Proto: http\r\n");
+    }
     // Configured request headers. Sanitize names/values against CR/LF to
     // prevent HTTP header injection / request smuggling — same filter as the
     // response-header path in bridge.rs and the Host rewrite above. A header
@@ -3991,6 +4043,7 @@ mod tests {
                     peer,
                     "HTTP",
                     false, // origin-form request
+                    false, // non-CONNECT request
                 )
                 .await
             }
@@ -4028,7 +4081,8 @@ mod tests {
                     head,
                     peer,
                     "HTTP",
-                    true, // absolute-form request
+                    true,  // absolute-form request
+                    false, // non-CONNECT request
                 )
                 .await
             }
@@ -4055,6 +4109,7 @@ mod tests {
                     peer,
                     "HTTP",
                     true,
+                    false, // non-CONNECT request
                 )
                 .await
             }
@@ -4114,6 +4169,7 @@ mod tests {
             std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
             "HTTP",
             false,
+            false, // non-CONNECT request
         )
         .await
         .expect("member-gone fallback must forward");
@@ -4159,6 +4215,7 @@ mod tests {
             std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
             "HTTP",
             false,
+            false, // non-CONNECT request
         )
         .await
         .expect("no-member fallback must forward");
@@ -4250,5 +4307,79 @@ mod tests {
             text.contains("X-Forwarded-Proto: https\r\n"),
             "configured requestHeader must override: {text:?}"
         );
+    }
+
+    /// A requestHeader named x-forwarded-for REPLACES the auto line entirely
+    /// (Go Rewrite hook order: SetXForwarded runs first, then the rc.Headers
+    /// loop does `req.Header.Set` — single header, config value alone, never
+    /// the auto peer chain, never two lines). The old code emitted the auto
+    /// line AND appended the config verbatim — the dup survived the
+    /// `contains` assertions above.
+    #[test]
+    fn inject_config_xff_replaces_auto_line() {
+        let head =
+            b"GET / HTTP/1.1\r\nHost: app.example.com\r\nX-Forwarded-For: 203.0.113.1\r\n\r\nbody"
+                .to_vec();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
+        let overrides = [(
+            "X-Forwarded-For".to_string(),
+            "edge.example.net".to_string(),
+        )];
+        let out = inject_vhost_request_headers(head, peer, "app.example.com", &overrides);
+        let text = String::from_utf8(out).unwrap();
+        let xff_count = text.matches("X-Forwarded-For:").count();
+        assert_eq!(xff_count, 1, "XFF must appear exactly once: {text:?}");
+        assert!(
+            text.contains("X-Forwarded-For: edge.example.net\r\n"),
+            "config value alone, no peer chain: {text:?}"
+        );
+        assert!(
+            !text.contains("203.0.113.1") && !text.contains("192.0.2.55"),
+            "inbound value and peer must not survive an override: {text:?}"
+        );
+        assert!(
+            text.ends_with("\r\n\r\nbody"),
+            "body must survive: {text:?}"
+        );
+    }
+
+    /// x-forwarded-host / x-forwarded-proto overrides (mixed case in config
+    /// names — case-insensitive Set semantics) suppress the auto lines: one
+    /// line each, config value wins. XFF stays auto (not overridden).
+    #[test]
+    fn inject_config_xfh_xfp_replace_auto_lines() {
+        let head = b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n".to_vec();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
+        let overrides = [
+            (
+                "x-forwarded-host".to_string(),
+                "cfg.example.com".to_string(),
+            ),
+            ("X-Forwarded-Proto".to_string(), "https".to_string()),
+        ];
+        let out = inject_vhost_request_headers(head, peer, "h.example.com", &overrides);
+        let text = String::from_utf8(out).unwrap();
+        // Header names are case-insensitive on the wire; the config loop
+        // emits the configured name verbatim (lowercase here), so count
+        // case-insensitively.
+        let lower = text.to_ascii_lowercase();
+        let xfh_count = lower.matches("x-forwarded-host:").count();
+        assert_eq!(xfh_count, 1, "XFH must appear exactly once: {text:?}");
+        assert!(
+            lower.contains("x-forwarded-host: cfg.example.com\r\n"),
+            "config XFH wins, auto inbound-host line gone: {text:?}"
+        );
+        let xfp_count = lower.matches("x-forwarded-proto:").count();
+        assert_eq!(xfp_count, 1, "XFP must appear exactly once: {text:?}");
+        assert!(
+            text.contains("X-Forwarded-Proto: https\r\n"),
+            "config XFP wins, auto http line gone: {text:?}"
+        );
+        assert!(
+            !text.contains("h.example.com"),
+            "auto XFH from the inbound host must not emit under override: {text:?}"
+        );
+        // Unoverridden auto line still emits (peer-only XFF).
+        assert!(text.contains("X-Forwarded-For: 192.0.2.55\r\n"), "{text:?}");
     }
 }

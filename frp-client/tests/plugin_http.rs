@@ -1430,3 +1430,63 @@ async fn test_http2http_single_xff_line_with_configured_value() {
         "inbound chain must not leak alongside the configured value: {req}"
     );
 }
+
+/// http_proxy plugin auth-failure wire arms, probe-verified byte-for-byte
+/// against Go frp v0.71.0:
+/// - CONNECT fails (handleConnectReq → getBadResponse): status TEXT
+///   "Not authorized" (Go's custom Status, not the standard reason) +
+///   `Connection: close` + `Proxy-Authenticate: Basic` (no realm).
+/// - plain-request fails (net/http ServeHTTP): standard status text, no
+///   Connection header, same bare Basic. (Go keeps the conn reusable; the
+///   frp-rs plugin serves one request per tunnel conn and closes after.)
+#[tokio::test]
+async fn test_http_proxy_auth_fail_wire_arms() {
+    let mut cfg = plugin_cfg("http_proxy", "127.0.0.1:1".into());
+    cfg.http_user = "u1".into();
+    cfg.http_password = "p1".into();
+    let handle = frp_client::plugin::start_http_proxy(&cfg)
+        .await
+        .expect("start http_proxy plugin");
+
+    // CONNECT + wrong creds (base64("u1:zz") = dTE6eno=).
+    let mut c = TcpStream::connect(handle.local_addr).await.unwrap();
+    c.write_all(
+        b"CONNECT example.com:443 HTTP/1.1\r\n\
+          Host: example.com:443\r\n\
+          Proxy-Authorization: Basic dTE6eno=\r\n\
+          \r\n",
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    c.read_to_end(&mut resp).await.unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 407 Not authorized\r\n")
+            && text.contains("Connection: close\r\n")
+            && text.contains("Proxy-Authenticate: Basic\r\n")
+            && !text.contains("realm"),
+        "CONNECT arm (Go getBadResponse), got: {text:?}"
+    );
+
+    // Plain GET + wrong creds: standard status text, no Connection header.
+    let mut c = TcpStream::connect(handle.local_addr).await.unwrap();
+    c.write_all(
+        b"GET http://example.com/ HTTP/1.1\r\n\
+          Host: example.com\r\n\
+          Proxy-Authorization: Basic dTE6eno=\r\n\
+          \r\n",
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    c.read_to_end(&mut resp).await.unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 407 Proxy Authentication Required\r\n")
+            && text.contains("Proxy-Authenticate: Basic\r\n")
+            && !text.contains("Connection:")
+            && !text.contains("realm"),
+        "plain arm (Go ServeHTTP), got: {text:?}"
+    );
+}

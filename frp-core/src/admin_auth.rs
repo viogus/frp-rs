@@ -26,7 +26,9 @@ struct AuthState {
 /// startup so the operator is not left believing auth is enforced. Only when
 /// BOTH are non-empty is auth enforced — requests without a valid
 /// `Authorization: Basic <base64(user:pass)>` header receive
-/// 401 with `WWW-Authenticate: Basic realm="frp"`.
+/// 401 with `WWW-Authenticate: Basic realm="Restricted"` (Go frp's
+/// `NewHTTPAuthMiddleware`, pkg/util/net/http.go:56 — the same middleware
+/// guards the frps dashboard web server).
 ///
 /// **Security note:** Basic Auth transmits credentials in plaintext
 /// (base64 is NOT encryption). Use a reverse proxy with TLS termination
@@ -98,7 +100,7 @@ where
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 return (
                     StatusCode::UNAUTHORIZED,
-                    [("www-authenticate", "Basic realm=\"frp\"")],
+                    [("www-authenticate", "Basic realm=\"Restricted\"")],
                     "Unauthorized",
                 )
                     .into_response();
@@ -194,6 +196,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Realm pins the Go frp middleware twin (pkg/util/net/http.go:56).
+        assert_eq!(
+            resp.headers()["www-authenticate"],
+            "Basic realm=\"Restricted\""
+        );
     }
 
     #[tokio::test]

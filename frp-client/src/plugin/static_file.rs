@@ -120,9 +120,17 @@ async fn handle_static_file_conn(
     if !auth.check(&authorization) {
         // Go frp compat: 200ms delay to slow brute-force attacks.
         sleep(Duration::from_millis(200)).await;
+        // Go frp static_file.go wraps NewHTTPAuthMiddleware
+        // (pkg/util/net/http.go:45-59): realm "Restricted" + http.Error →
+        // text/plain body "Unauthorized\n", nosniff, no Connection header.
+        // (Probe-verified against Go v0.71.0; Go also adds net/http's Date.)
         let resp = b"HTTP/1.1 401 Unauthorized\r\n\
-                       WWW-Authenticate: Basic realm=\"frp\"\r\n\
-                       Content-Length: 0\r\nConnection: close\r\n\r\n";
+                       Content-Length: 13\r\n\
+                       Content-Type: text/plain; charset=utf-8\r\n\
+                       WWW-Authenticate: Basic realm=\"Restricted\"\r\n\
+                       X-Content-Type-Options: nosniff\r\n\
+                       \r\n\
+                       Unauthorized\n";
         if let Err(e) = client.write_all(resp).await {
             tracing::debug!(error = %e, "plugin relay error: {}", e);
         }

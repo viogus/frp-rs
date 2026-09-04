@@ -380,36 +380,18 @@ impl Service {
 }
 
 /// Simple base64 decode (no external dep needed for this).
+/// Strict base64 → UTF-8, Go `base64.StdEncoding` semantics (length % 4,
+/// padding placement, no whitespace/unknown-char tolerance).
+///
+/// The old hand-rolled decoder TRIMMED its input and skipped unknown bytes:
+/// "Basic  dTE6cDE=" decoded where Go's DecodeString rejects the leading
+/// space (delay-classification divergence), and its padding flush emitted a
+/// spurious trailing NUL byte whenever the payload length was not a
+/// multiple of 3 ("u1:p1" decoded to "u1:p1\0", so every valid credential
+/// of that shape failed the compare).
 pub(super) fn base64_decode(input: &str) -> Result<String, ()> {
-    let input = input.trim();
-    let mut buf = Vec::new();
-    let mut accum = 0u32;
-    let mut bits = 0u32;
-    for &b in input.as_bytes() {
-        let val = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => {
-                // padding — finish
-                if bits >= 2 {
-                    buf.push((accum >> (bits - 2)) as u8);
-                }
-                break;
-            }
-            _ => continue, // skip whitespace
-        };
-        accum = (accum << 6) | (val as u32);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            buf.push((accum >> bits) as u8);
-            accum &= (1 << bits) - 1;
-        }
-    }
-    String::from_utf8(buf).map_err(|_| ())
+    let bytes = frp_core::base64::decode(input).map_err(|_| ())?;
+    String::from_utf8(bytes).map_err(|_| ())
 }
 
 pub(super) fn split_host_port(s: &str) -> (&str, u16) {
@@ -1474,9 +1456,16 @@ mod tests {
 
     #[test]
     fn test_base64_decode() {
-        // "test:pass" = dGVzdDpwYXNz
+        // "test:pass" = dGVzdDpwYXNz (payload length a multiple of 3)
         let result = base64_decode("dGVzdDpwYXNz").unwrap();
         assert_eq!(result, "test:pass");
+        // Padded payload whose length is NOT a multiple of 3: the leftover
+        // bits before '=' are zero-fill. The old decoder emitted them as a
+        // spurious trailing NUL byte ("u1:p1\0") — the auth compare then
+        // rejected every valid credential of that shape. RED on the old
+        // `bits >= 2` flush at padding.
+        let result = base64_decode("dTE6cDE=").unwrap();
+        assert_eq!(result, "u1:p1");
     }
 
     #[test]
