@@ -76,7 +76,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # integration-test bins (see common::allocate_port). Already a workspace dep
 # pulled in transitively by frp-core — only the direct test reference is new.
 libc.workspace = true
-tracing-subscriber.workspace = true
+# env-filter kept for the ssh_gateway test harness (uses with_env_filter);
+# dev-only, never compiled into the frps release binary.
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 reqwest = { workspace = true, features = ["json"] }

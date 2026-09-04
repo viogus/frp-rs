@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 #[cfg(unix)]
 use tokio::signal;
-use tracing_subscriber::EnvFilter;
 
 use frp_client::service::Service;
 use frp_core::cli::{
@@ -576,11 +575,7 @@ async fn run_single_proxy(
     token: Option<&str>,
     proxy: ProxyConfig,
 ) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    logging::init_console_logger();
 
     let cfg = build_single_proxy_config(server_addr, server_port, token, proxy);
     tracing::info!(version = %frp_core::VERSION, "frpc (Rust) v{} starting single proxy...", frp_core::VERSION);
@@ -605,11 +600,7 @@ async fn run_single_proxy(
 }
 
 async fn run_verify(config_path: &str, strict_config: bool) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    logging::init_console_logger();
 
     // Go frp v0.70.1: `frpc verify` honors the persistent strictConfigMode
     // root flag (cmd/frpc/sub/verify.go) — with --strict-config=false, unknown

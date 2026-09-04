@@ -5,8 +5,9 @@
 //! `frps/src/main.rs` and `frpc/src/main.rs`.
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 
 pub fn resolve_log_level(
     cli_level: Option<String>,
@@ -163,6 +164,40 @@ fn spawn_daily_log_cleanup(dir: PathBuf, log_name: String, max_days: i32) {
     });
 }
 
+/// Build a [`Targets`] filter from the `RUST_LOG` env var, falling back to a
+/// bare `default_level` when the variable is unset or unparseable.
+///
+/// Replaces `EnvFilter::try_from_default_env()` so the `env-filter` feature —
+/// and with it the `matchers` + `regex-automata` + `regex-syntax` chain
+/// (~131 KiB per release binary) — can be dropped. `Targets::from_str` parses
+/// each directive with the *same* `StaticDirective` parser `EnvFilter` uses for
+/// its non-regex directives, so target matching is byte-for-byte identical.
+///
+/// Supported `RUST_LOG` syntax (the non-regex subset of `EnvFilter`):
+///   - bare level: `debug`, `info`, `warn`, `error`, `trace`, `off`
+///   - `target=level`: `frp_core=debug`, `rustls=trace`
+///   - bare target (no `=`): `frp_core` → that target at `trace`
+///   - field-name lists: `target[{field}]=level` (name presence, no regex)
+///   - comma-separated list of the above
+///
+/// Unsupported (present in `EnvFilter`, unused by frp-rs, and the source of
+/// the regex dependency): `target[span{field=value}]=level` field *value*
+/// matchers, `target::*=level` glob suffixes, `-target` exclusions, numeric
+/// levels. A `RUST_LOG` containing any of these fails `Targets::from_str` and
+/// falls back to `default_level` (the same all-or-nothing behavior EnvFilter
+/// applies to a malformed directive).
+pub fn filter_from_env(default_level: &str) -> Targets {
+    let fallback = || Targets::new().with_default(parse_level(default_level));
+    match std::env::var("RUST_LOG") {
+        Ok(raw) => raw.trim().parse::<Targets>().unwrap_or_else(|_| fallback()),
+        Err(_) => fallback(),
+    }
+}
+
+fn parse_level(s: &str) -> LevelFilter {
+    LevelFilter::from_str(s).unwrap_or(LevelFilter::INFO)
+}
+
 pub fn init_tracing(
     level: &str,
     file: Option<String>,
@@ -171,7 +206,11 @@ pub fn init_tracing(
     ansi: bool,
     default_log_name: &str,
 ) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    let filter = filter_from_env(level);
     if let Some(path) = file {
         let dir = Path::new(&path).parent().unwrap_or(Path::new("."));
         let log_name = Path::new(&path)
@@ -181,17 +220,23 @@ pub fn init_tracing(
             .into_owned();
         let file_appender = tracing_appender::rolling::daily(dir, &log_name);
         if format == "json" {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_ansi(ansi)
-                .json()
-                .with_writer(file_appender)
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(ansi)
+                        .json()
+                        .with_writer(file_appender)
+                        .with_filter(filter),
+                )
                 .init();
         } else {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_ansi(ansi)
-                .with_writer(file_appender)
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(ansi)
+                        .with_writer(file_appender)
+                        .with_filter(filter),
+                )
                 .init();
         }
         // Startup cleanup + daily cleanup run after the subscriber is live so
@@ -201,17 +246,35 @@ pub fn init_tracing(
             spawn_daily_log_cleanup(dir.to_path_buf(), log_name, max_days);
         }
     } else if format == "json" {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(ansi)
-            .json()
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(ansi)
+                    .json()
+                    .with_filter(filter),
+            )
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(ansi)
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(ansi)
+                    .with_filter(filter),
+            )
             .init();
     }
+}
+
+/// Initialize a console (stdout) logger using the `RUST_LOG` filter with a
+/// default of `info`. Used by the frpc `verify` and single-proxy subcommands,
+/// which run standalone and need a subscriber before any config is loaded.
+pub fn init_console_logger() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(filter_from_env("info")))
+        .init();
 }
 
 #[cfg(feature = "otel")]
@@ -241,12 +304,12 @@ pub fn init_tracing_otel(
     } else {
         (None, None)
     };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    // Layer order (innermost → outermost): Registry ← OTel Layer ← EnvFilter ← Fmt Layer
+    let filter = filter_from_env(level);
+    // Layer order (innermost → outermost): Registry ← OTel Layer ← filter ← Fmt Layer
     // OpenTelemetryLayer requires direct Registry, so it must be applied first.
     // fmt::layer() must be constructed inline per branch: dyn Layer is fixed
     // to a single Subscriber type parameter and cannot compose with the
-    // Layered<EnvFilter, ...> chain.
+    // Layered<Targets, ...> chain.
     if let Some(path) = file {
         let dir = Path::new(&path).parent().unwrap_or(Path::new("."));
         let log_name = Path::new(&path)
@@ -465,5 +528,57 @@ mod tests {
         assert!(dir.join("frps.log.2019-01-01").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_level_maps_known_and_unknown() {
+        assert_eq!(parse_level("debug"), LevelFilter::DEBUG);
+        assert_eq!(parse_level("trace"), LevelFilter::TRACE);
+        assert_eq!(parse_level("off"), LevelFilter::OFF);
+        // Unknown → INFO (the safe default).
+        assert_eq!(parse_level("bogus"), LevelFilter::INFO);
+        // tracing-core maps "" → ERROR (a `LevelFilter::from_str` quirk); never
+        // hit in practice — config always supplies a real level.
+        assert_eq!(parse_level(""), LevelFilter::ERROR);
+    }
+
+    #[test]
+    fn targets_from_str_matches_env_filter_static_subset() {
+        use tracing::Level;
+
+        // Bare level sets the global default.
+        let t: Targets = "info,frp_core=debug".parse().unwrap();
+        assert!(t.would_enable("anything", &Level::INFO));
+        assert!(t.would_enable("anything", &Level::ERROR));
+        assert!(!t.would_enable("anything", &Level::DEBUG));
+
+        // `target=level` enables that target at that level and below (prefix
+        // match — `frp_core::x` is a child of `frp_core`).
+        assert!(t.would_enable("frp_core", &Level::DEBUG));
+        assert!(t.would_enable("frp_core", &Level::INFO));
+        assert!(!t.would_enable("frp_core", &Level::TRACE));
+        assert!(t.would_enable("frp_core::submodule", &Level::DEBUG));
+
+        // A bare target (no `=`) is enabled at trace.
+        let t: Targets = "rustls".parse().unwrap();
+        assert!(t.would_enable("rustls", &Level::TRACE));
+        assert!(t.would_enable("rustls", &Level::ERROR));
+        // With no default, unrelated targets are off.
+        assert!(!t.would_enable("other", &Level::ERROR));
+
+        // Multiple directives: more specific target wins over the default.
+        let t: Targets = "warn,frp_core=trace".parse().unwrap();
+        assert!(!t.would_enable("other", &Level::INFO));
+        assert!(t.would_enable("other", &Level::WARN));
+        assert!(t.would_enable("frp_core", &Level::TRACE));
+    }
+
+    #[test]
+    fn targets_from_str_rejects_malformed() {
+        // A bad level token fails the whole parse (all-or-nothing, EnvFilter
+        // parity) — `filter_from_env` falls back to the default level.
+        assert!("frp_core=bogus".parse::<Targets>().is_err());
+        // Too many `=` in a single directive.
+        assert!("a=b=c".parse::<Targets>().is_err());
     }
 }

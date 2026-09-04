@@ -6,7 +6,9 @@ license = "MIT"
 
 [dev-dependencies]
 frp-server = { path = "../frp-server" }
-tracing-subscriber.workspace = true
+# env-filter kept for the common test harness (uses with_env_filter);
+# dev-only, never compiled into the frpc release binary.
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 md-5.workspace = true
 tower = "0.5"
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
