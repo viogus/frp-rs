@@ -2035,9 +2035,14 @@ pub async fn accept_websocket_from_peeked(
     let mut read_more = false;
     let extra: Vec<u8> = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         loop {
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let tail = buf.split_off(pos + 4);
-                buf.truncate(pos + 4);
+            // Go textproto.ReadLine semantics (textproto::head_end): the head
+            // ends at the FIRST blank line under '\n' line ends with ONE
+            // optional trailing '\r' stripped — LF-only/mixed-EOL heads are
+            // legal and terminate here, not at the 64 KiB cap. CRLF heads
+            // land at the same byte as the old "\r\n\r\n" window scan.
+            if let Some(end) = crate::textproto::head_end(&buf) {
+                let tail = buf.split_off(end);
+                buf.truncate(end);
                 return Ok::<_, crate::Error>(tail);
             }
             read_more = true;
@@ -2974,6 +2979,74 @@ mod tests {
             resp.extend_from_slice(rdata);
         }
         resp
+    }
+
+    /// accept_websocket_from_peeked must end the upgrade head at the first
+    /// blank line under Go textproto.ReadLine semantics (line ends at the
+    /// next '\n', ONE trailing '\r' stripped) — the old strict "\r\n\r\n"
+    /// window scan read a legal LF-only head to EOF ("connection closed
+    /// during headers"), where Go gorilla upgrades fine. LF-only case is RED
+    /// on the old scan; the CRLF control case pins the byte-identical
+    /// terminator on the common path (head_end end == old pos + 4). S1.
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn accept_websocket_from_peeked_accepts_lf_only_head() {
+        use sha1::{Digest, Sha1};
+
+        let key = "dGhlIHNhbXBsZSBub25jZQ=="; // RFC 6455 §1.3 sample key
+        let mut hasher = Sha1::new();
+        hasher.update(key.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let accept = base64_encode(&hasher.finalize());
+        let expected_resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        );
+
+        // The head travels as `peeked` (pre-read bytes), so nothing is
+        // written to the socket; closing the client write half makes the
+        // OLD strict-CRLF scan fail fast on EOF instead of blocking.
+        async fn run_case(head: Vec<u8>, expected_resp: &[u8]) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let (server, _) = listener.accept().await.unwrap();
+                accept_websocket_from_peeked(head, IoStream::Tcp(server))
+                    .await
+                    .expect("upgrade head must terminate and upgrade");
+            });
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client.shutdown().await.unwrap(); // write half only; read stays open
+            let mut resp = vec![0u8; expected_resp.len()];
+            // Timeout so a pre-fix regression (server errors out, no 101 is
+            // ever written) fails fast instead of hanging the test.
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut resp))
+                .await
+                .expect("timed out waiting for the 101 response")
+                .unwrap();
+            assert_eq!(&resp, expected_resp, "101 response must be byte-exact");
+            srv.await.unwrap();
+        }
+
+        // LF-only head — legal per textproto.ReadLine, rejected pre-fix.
+        run_case(
+            b"GET /~!frp HTTP/1.1\nHost: 127.0.0.1\nUpgrade: websocket\n\
+              Connection: Upgrade\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\n\
+              Sec-WebSocket-Version: 13\n\n"
+                .to_vec(),
+            expected_resp.as_bytes(),
+        )
+        .await;
+
+        // Control: CRLF head — the common path, byte-identical terminator.
+        run_case(
+            b"GET /~!frp HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n"
+                .to_vec(),
+            expected_resp.as_bytes(),
+        )
+        .await;
     }
 }
 
