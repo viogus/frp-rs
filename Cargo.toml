@@ -28,7 +28,7 @@ toml = "0.8"
 anyhow = { version = "1", default-features = false, features = ["std"] }
 tracing = "0.1"
 thiserror = "2"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["json"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
 sha1 = "0.10"
