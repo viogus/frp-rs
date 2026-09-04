@@ -477,7 +477,16 @@ impl VirtualControl {
 
             // ---- Phase 2: wrap in CipherStream, split for concurrent r/w ----
             let _ = phase2_tx.send(());
-            let encrypted = frp_core::cipher_stream::CipherStream::new(Box::new(from_ssh), enc_key);
+            // Audit B2: OS-RNG failure (IV generation) drops the SSH session
+            // like the read failure above instead of aborting the process.
+            let encrypted =
+                match frp_core::cipher_stream::CipherStream::new(Box::new(from_ssh), enc_key) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ssh session: IV generation failed");
+                        return;
+                    }
+                };
             let (mut enc_reader, mut enc_writer) = tokio::io::split(encrypted);
             let read_work_tx = work_tx;
 
@@ -3260,7 +3269,7 @@ mod virtual_ctrl_tests {
         // a CipherStream (same key, same plaintext-first discipline) and
         // write an encrypted NewProxyResp frame, exactly as handle_control's
         // write_resp does after registering a proxy.
-        let mut control_side = CipherStream::new(vc, enc_key);
+        let mut control_side = CipherStream::new(vc, enc_key).expect("rng");
         let msg = FrpMessage::NewProxyResp(NewProxyResp {
             proxy_name: "web".into(),
             remote_addr: Some(":9090".into()),
@@ -3305,7 +3314,7 @@ mod virtual_ctrl_tests {
         // for the load-bearing read-task behavior).
         let (mut vc2, tx2, mut work_rx, _resp_rx2, phase2_2) = VirtualControl::channel(enc_key);
         feed_login_resp(&mut vc2, phase2_2).await;
-        let mut control2 = CipherStream::new(vc2, enc_key);
+        let mut control2 = CipherStream::new(vc2, enc_key).expect("rng");
         let req_frame = vec![frp_core::msg::TYPE_REQ_WORK_CONN, 0, 0, 0, 0, 0, 0, 0, 0];
         control2.write_all(&req_frame).await.unwrap();
         let req = tokio::time::timeout(std::time::Duration::from_secs(1), work_rx.recv())

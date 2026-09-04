@@ -617,6 +617,53 @@ pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
     }
 }
 
+/// Read a V2 frame's 2-byte message type ID and body into the caller's
+/// `scratch` (shared by [`read_msg_v2_with_udp_codec`] and
+/// [`read_msg_v2_udp_binary_socket`]).
+///
+/// The codec body lands at the start of `scratch`: the binary UDP decoders
+/// then hand `scratch`'s buffer to the packet content Vec (zero copy, zero
+/// alloc), and the callers refill `scratch` from the global pool when a
+/// decoder took it. All callers wrap the read half in a BufReader, so the
+/// extra `read_exact` is a buffer hit, not a syscall.
+async fn read_v2_message_body<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    payload_len: usize,
+    scratch: &mut Vec<u8>,
+) -> Result<u16, crate::Error> {
+    // Read the payload into the caller-supplied scratch (this path is UDP
+    // data-plane only; the buffer-pool fast path of read_msg_v2 is not worth
+    // duplicating here since UDP payloads are typically small). The caller
+    // holds `scratch` outside its message loop and reuses it across frames,
+    // avoiding a heap allocation per UDP packet.
+    let mut type_id_buf = [0u8; 2];
+    reader
+        .read_exact(&mut type_id_buf)
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+    let type_id = u16::from_be_bytes(type_id_buf);
+    let body_len = payload_len - 2;
+    scratch.clear();
+    scratch.reserve(body_len);
+    // Set the length without the `resize`-style zero-fill: `read_exact`
+    // below immediately overwrites the entire buffer, so the memset would be
+    // pure waste on the per-UDP-packet hot path (audit #14d).
+    // SAFETY: the region is written in full by `read_exact` on the next line
+    // *before* any element is read; tokio::io::AsyncReadExt then reads into
+    // the exact length we just set. `#[allow(clippy::uninit_vec)]` silences
+    // clippy's uninit_vec lint (flags the reserve→set_len shape), which is
+    // precisely the intentional use here.
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        scratch.set_len(body_len);
+    }
+    reader
+        .read_exact(scratch.as_mut_slice())
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+    Ok(type_id)
+}
+
 /// Read a V2 message on a connection where a UDP packet binary codec may be
 /// negotiated (Go frp v0.71.0). When `udp_packet_codec` is `Some("binary-v1")`,
 /// a frame with type ID 19 (`V2_TYPE_UDP_PACKET_BINARY`) is decoded with the
@@ -645,43 +692,7 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
         ));
     }
 
-    // Read the payload into the caller-supplied scratch (this path is UDP
-    // data-plane only; the buffer-pool fast path of read_msg_v2 is not worth
-    // duplicating here since UDP payloads are typically small). The caller
-    // holds `scratch` outside its message loop and reuses it across frames,
-    // avoiding a heap allocation per UDP packet.
-    //
-    // The 2-byte type ID is read into a stack array so the codec body lands
-    // at the start of `scratch`: the binary UDP decoder then hands
-    // `scratch`'s buffer to the packet content Vec (zero copy, zero alloc),
-    // and this function refills `scratch` from the global pool for the next
-    // read. All callers wrap the read half in a BufReader, so the extra
-    // read_exact is a buffer hit, not a syscall.
-    let mut type_id_buf = [0u8; 2];
-    reader
-        .read_exact(&mut type_id_buf)
-        .await
-        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
-    let type_id = u16::from_be_bytes(type_id_buf);
-    let body_len = payload_len - 2;
-    scratch.clear();
-    scratch.reserve(body_len);
-    // Set the length without the `resize`-style zero-fill: `read_exact`
-    // below immediately overwrites the entire buffer, so the memset would be
-    // pure waste on the per-UDP-packet hot path (audit #14d).
-    // SAFETY: the region is written in full by `read_exact` on the next line
-    // *before* any element is read; tokio::io::AsyncReadExt then reads into
-    // the exact length we just set. `#[allow(clippy::uninit_vec)]` silences
-    // clippy's uninit_vec lint (flags the reserve→set_len shape), which is
-    // precisely the intentional use here.
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        scratch.set_len(body_len);
-    }
-    reader
-        .read_exact(scratch.as_mut_slice())
-        .await
-        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+    let type_id = read_v2_message_body(reader, payload_len, scratch).await?;
 
     let binary = udp_packet_codec == Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY);
     if type_id == msg::V2_TYPE_UDP_PACKET_BINARY {
@@ -717,6 +728,89 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
         ));
     }
     deserialize_v2(type_id, scratch)
+}
+
+/// A frame read on a binary-UDP-codec data plane
+/// ([`read_msg_v2_udp_binary_socket`]).
+#[derive(Debug)]
+pub enum UdpBinaryRead {
+    /// Type-19 frame decoded to native addresses — neither address was
+    /// formatted to a String (audit: the terminal consumers re-parsed the
+    /// formatted text per datagram).
+    Socket(crate::udp_binary::SocketUdpPacket),
+    /// Any other frame JSON-decoded, or a type-19 frame whose address carries
+    /// a family-6 *zone* (not representable in a
+    /// [`std::net::SocketAddr`] — std has a numeric scope id, not an
+    /// interface name) that fell back to the message-form decoder.
+    Message(FrpMessage),
+}
+
+/// Read a V2 message frame on a binary-UDP-codec data plane
+/// (callers gate on `udp_packet_codec == Some("binary-v1")`). A type-19
+/// frame decodes to [`UdpBinaryRead::Socket`] when both addresses are
+/// zone-less — the zero-alloc decode of
+/// [`decode_udp_packet_binary_socket_owned`](crate::udp_binary::decode_udp_packet_binary_socket_owned),
+/// no per-packet String alloc. A zoned type-19 frame falls back to the
+/// message-form decode of the same buffer (`UdpBinaryRead::Message`), which
+/// every consumer of [`read_msg_v2_with_udp_codec`] already handles.
+pub async fn read_msg_v2_udp_binary_socket<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    scratch: &mut Vec<u8>,
+) -> Result<UdpBinaryRead, crate::Error> {
+    let (frame_type, _flags, payload_len) = read_v2_frame_header(reader).await?;
+    if frame_type != V2_FRAME_TYPE_MESSAGE {
+        return Err(crate::Error::Protocol(
+            format!(
+                "unexpected V2 frame type: {frame_type}, expected {} (Message)",
+                V2_FRAME_TYPE_MESSAGE
+            )
+            .into(),
+        ));
+    }
+    if payload_len < 2 {
+        return Err(crate::Error::Protocol(
+            "V2 message payload too short".into(),
+        ));
+    }
+    let type_id = read_v2_message_body(reader, payload_len, scratch).await?;
+    match type_id {
+        msg::V2_TYPE_UDP_PACKET_BINARY => {
+            match crate::udp_binary::decode_udp_packet_binary_socket_owned(scratch).map_err(
+                |e| crate::Error::Protocol(format!("decode binary UDP packet: {e}").into()),
+            )? {
+                Some(packet) => {
+                    // Large datagram (≥ BUFFER_SIZE): the decoder moved the
+                    // buffer into the packet's content Vec (same ownership
+                    // semantics as the message-form decoder, round-7 M2) —
+                    // refill from the pool for the next read.
+                    if scratch.is_empty() {
+                        *scratch = crate::buffer_pool::BUFFER_POOL.acquire();
+                    }
+                    Ok(UdpBinaryRead::Socket(packet))
+                }
+                None => {
+                    // Zoned family-6 address (a Go peer with a link-local
+                    // service): re-decode the untouched buffer to the
+                    // message form, which carries the zone as text.
+                    let packet = crate::udp_binary::decode_udp_packet_binary_owned(scratch)
+                        .map_err(|e| {
+                            crate::Error::Protocol(format!("decode binary UDP packet: {e}").into())
+                        })?;
+                    if scratch.is_empty() {
+                        *scratch = crate::buffer_pool::BUFFER_POOL.acquire();
+                    }
+                    Ok(UdpBinaryRead::Message(FrpMessage::UDPPacket(packet)))
+                }
+            }
+        }
+        msg::V2_TYPE_UDP_PACKET => {
+            // Go: received JSON UDP packet after binary codec negotiation.
+            Err(crate::Error::Protocol(
+                "received JSON UDP packet after binary codec negotiation".into(),
+            ))
+        }
+        _ => deserialize_v2(type_id, scratch).map(UdpBinaryRead::Message),
+    }
 }
 
 /// Write a V2 message frame, using the binary UDP packet codec for
@@ -2295,6 +2389,119 @@ mod tests {
                 err.to_string().contains("without negotiated codec"),
                 "unexpected error: {err}"
             );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn udp_binary_socket_read_returns_native_socket() {
+            // A binary-codec frame read through the socket reader comes back
+            // as UdpBinaryRead::Socket with a native SocketAddr — no String
+            // round trip on the read side.
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+            let pkt = FrpMessage::UDPPacket(sample_udp_packet());
+            write_msg_v2_with_udp_codec(
+                &mut w,
+                &pkt,
+                Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+                false,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+            let mut scratch = Vec::new();
+            match read_msg_v2_udp_binary_socket(&mut r, &mut scratch)
+                .await
+                .unwrap()
+            {
+                UdpBinaryRead::Socket(pkt) => {
+                    assert_eq!(pkt.content, b"hello udp");
+                    assert_eq!(pkt.remote_addr, "10.1.2.3:9999".parse().unwrap());
+                    assert!(pkt.local_addr.is_none());
+                }
+                other => panic!("expected Socket form, got {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn udp_binary_socket_read_zoned_frame_falls_back_to_message() {
+            // A family-6 zone cannot live in a SocketAddr (std has a numeric
+            // scope id, not an interface name): the reader re-decodes the
+            // same buffer to the message form, which carries the zone.
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+            let mut body = Vec::new();
+            body.extend_from_slice(&crate::msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
+            body.push(0x02); // no local_addr
+                             // fe80::1, family 6
+            body.extend_from_slice(&[0x06, 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            body.extend_from_slice(&9u16.to_be_bytes());
+            body.push(4); // zoneLen
+            body.extend_from_slice(b"eth0");
+            body.extend_from_slice(&3u16.to_be_bytes());
+            body.extend_from_slice(b"abc");
+            write_v2_frame_raw(&mut w, V2_FRAME_TYPE_MESSAGE, 0, &body)
+                .await
+                .unwrap();
+            let mut scratch = Vec::new();
+            match read_msg_v2_udp_binary_socket(&mut r, &mut scratch)
+                .await
+                .unwrap()
+            {
+                UdpBinaryRead::Message(FrpMessage::UDPPacket(up)) => {
+                    assert_eq!(up.content, b"abc");
+                    let ra = up.remote_addr.unwrap();
+                    assert_eq!(ra.ip, "fe80::1");
+                    assert_eq!(ra.port, 9);
+                    assert_eq!(ra.zone, "eth0");
+                }
+                other => panic!("expected Message fallback, got {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn udp_binary_socket_read_plain_v4_keeps_scratch() {
+            // Small zone-less packet: the payload is copied out and the
+            // caller's scratch stays intact for the next read (pool-free
+            // steady state).
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+            let pkt = FrpMessage::UDPPacket(sample_udp_packet());
+            write_msg_v2_with_udp_codec(
+                &mut w,
+                &pkt,
+                Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY),
+                false,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+            let mut scratch = Vec::new();
+            let got = read_msg_v2_udp_binary_socket(&mut r, &mut scratch)
+                .await
+                .unwrap();
+            assert!(matches!(got, UdpBinaryRead::Socket(_)));
+            assert!(!scratch.is_empty(), "small packet must not consume scratch");
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn udp_binary_socket_read_json_after_binary_rejected() {
+            // The socket reader enforces the same Go parity as the message
+            // reader: a JSON UDPPacket (type 13) on a binary-codec plane is
+            // a protocol error.
+            let (client, server) = duplex(8192);
+            let mut w = client;
+            let mut r = server;
+            let pkt = FrpMessage::UDPPacket(sample_udp_packet());
+            write_msg_v2_with_udp_codec(&mut w, &pkt, None, false, &mut Vec::new())
+                .await
+                .unwrap();
+            let err = read_msg_v2_udp_binary_socket(&mut r, &mut Vec::new())
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("JSON UDP packet after binary"));
         }
     }
 }

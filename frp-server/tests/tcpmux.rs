@@ -176,34 +176,13 @@ async fn test_tcpmux_unknown_domain_returns_404() {
     drop(provider);
 }
 
-/// Read raw bytes until the header terminator (`\r\n\r\n`) is in the buffer
-/// (or the peer closes). Loopback reads of small responses can arrive split.
-async fn read_full_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 128];
-    loop {
-        if buf.ends_with(b"\r\n\r\n") {
-            return buf;
-        }
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut chunk))
-            .await
-            .expect("timeout waiting for the HTTP error response")
-            .expect("read HTTP error response");
-        assert!(
-            n > 0,
-            "EOF before the full response (got {:?})",
-            String::from_utf8_lossy(&buf)
-        );
-        buf.extend_from_slice(&chunk[..n]);
-    }
-}
-
-/// Listener-level gates: a raw socket that sends a NON-CONNECT request line
-/// must get the exact Go-parity 405 status bytes (tcpmux.rs method gate —
-/// case-sensitive like Go httpconnect.go's `req.Method != "CONNECT"`), and
-/// the connection must never reach route lookup.
+/// Listener-level gate: a raw socket that sends a NON-CONNECT request line
+/// is a readHTTPConnectRequest error in Go (`req.Method != "CONNECT"`,
+/// case-sensitive like httpconnect.go) → vhost handle `_ = c.Close()` — the
+/// conn closes with ZERO bytes (probe vs Go v0.71.0: no 405 on the wire —
+/// the old Rust answer diverged), and the request never reaches route lookup.
 #[tokio::test]
-async fn test_tcpmux_get_request_line_rejected_405() {
+async fn test_tcpmux_get_request_line_rejected_silent_close() {
     let bind_port = allocate_port();
     let tcpmux_port = allocate_port();
 
@@ -217,7 +196,7 @@ async fn test_tcpmux_get_request_line_rejected_405() {
     let (_handle, _) = start_test_server(cfg).await;
     let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
 
-    // No proxy registration needed: the 405 gate fires before routing.
+    // No proxy registration needed: the gate fires before routing.
     let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
         .await
         .expect("connect to tcpmux port");
@@ -230,19 +209,28 @@ async fn test_tcpmux_get_request_line_rejected_405() {
         .await
         .expect("send GET request line");
 
-    let response = read_full_response(&mut client).await;
+    // Zero bytes must arrive before EOF — the Go-parity silent close.
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .expect("timeout waiting for close")
+        .expect("read after GET");
     assert_eq!(
-        String::from_utf8_lossy(&response),
-        "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
+        n,
+        0,
+        "non-CONNECT must close with zero bytes (got {:?})",
+        String::from_utf8_lossy(&buf[..n])
     );
     drop(client);
 }
 
 /// CONNECT without a routable host — a 2-part request line with the version
-/// in the target slot ("CONNECT HTTP/1.1") — must get the exact Go-parity
-/// 400 status bytes (extract_route_host returns None → 400).
+/// in the target slot ("CONNECT HTTP/1.1") — is a net/http ReadRequest
+/// error in Go (parseRequestLine needs 3 tokens), so readHTTPConnectRequest
+/// errors and the vhost handle closes with ZERO bytes (probe vs Go v0.71.0;
+/// the old Rust "400 Bad Request" answer diverged — round-3 review 2a).
 #[tokio::test]
-async fn test_tcpmux_connect_without_host_rejected_400() {
+async fn test_tcpmux_connect_without_host_closes_silently() {
     let bind_port = allocate_port();
     let tcpmux_port = allocate_port();
 
@@ -264,19 +252,27 @@ async fn test_tcpmux_connect_without_host_rejected_400() {
         .await
         .expect("send CONNECT without host");
 
-    let response = read_full_response(&mut client).await;
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .expect("timeout waiting for close")
+        .expect("read after malformed CONNECT");
     assert_eq!(
-        String::from_utf8_lossy(&response),
-        "HTTP/1.1 400 Bad Request\r\n\r\n"
+        n,
+        0,
+        "malformed CONNECT must close with zero bytes (got {:?})",
+        String::from_utf8_lossy(&buf[..n])
     );
     drop(client);
 }
 
-/// Duplicate Host headers must be rejected with the exact Go-parity 400
-/// status bytes (RFC 7230 §5.4 — the duplicate check runs before routing,
-/// even though the CONNECT authority is authoritative for routing).
+/// Duplicate Host headers: Go net/http readRequest errors ("too many Host
+/// headers", RFC 7230 §5.4) → readHTTPConnectRequest err → vhost handle
+/// `_ = c.Close()` — silent close, ZERO bytes (probe vs Go v0.71.0; the old
+/// Rust 400 answer diverged). Runs before routing, even though the CONNECT
+/// authority is authoritative for routing.
 #[tokio::test]
-async fn test_tcpmux_duplicate_host_headers_rejected_400() {
+async fn test_tcpmux_duplicate_host_headers_rejected_silent_close() {
     let bind_port = allocate_port();
     let tcpmux_port = allocate_port();
 
@@ -303,10 +299,16 @@ async fn test_tcpmux_duplicate_host_headers_rejected_400() {
         .await
         .expect("send CONNECT with duplicate Host headers");
 
-    let response = read_full_response(&mut client).await;
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .expect("timeout waiting for close")
+        .expect("read after dup-Host CONNECT");
     assert_eq!(
-        String::from_utf8_lossy(&response),
-        "HTTP/1.1 400 Bad Request\r\n\r\n"
+        n,
+        0,
+        "dup-Host CONNECT must close with zero bytes (got {:?})",
+        String::from_utf8_lossy(&buf[..n])
     );
     drop(client);
 }
@@ -344,7 +346,10 @@ async fn test_tcpmux_proxy_auth() {
         .expect("send NewProxy");
     let _ = read_msg_v1(&mut provider).await.expect("read NewProxyResp");
 
-    // Test 1: Without auth → 407
+    // Test 1: Without auth → Go successHook-before-checkAuth order
+    // (vhost.go handle:192-209): "200 OK" first, then the 407 — both on the
+    // same conn, then close (probe vs Go v0.71.0). 407 realm is
+    // "Restricted" (Go ProxyUnauthorizedResponse).
     {
         let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
             .await
@@ -357,15 +362,31 @@ async fn test_tcpmux_proxy_auth() {
             )
             .await
             .expect("send CONNECT");
-        let mut response = [0u8; 512];
-        let n = client.read(&mut response).await.expect("read response");
-        let text = String::from_utf8_lossy(&response[..n]);
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+                .await
+                .expect("timeout waiting for the auth response + close")
+                .expect("read auth response");
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        let text = String::from_utf8_lossy(&bytes);
         assert!(
-            text.starts_with("HTTP/1.1 407"),
-            "expected 407 without auth, got: {}",
+            text.starts_with("HTTP/1.1 200 OK\r\n"),
+            "the 200 OK success hook must precede the 407 (Go order): {}",
             text
         );
-        println!("Auth required: 407 received");
+        assert!(
+            text.contains("HTTP/1.1 407 Proxy Authentication Required\r\n")
+                && text.contains("Basic realm=\"Restricted\""),
+            "expected the Go-parity 407 + Restricted realm after the 200, got: {}",
+            text
+        );
+        println!("Auth required: 200 OK then 407 received (Go parity)");
     }
 
     // Test 2: With correct auth → 200 (admin:secret = YWRtaW46c2VjcmV0)

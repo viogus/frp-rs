@@ -113,8 +113,18 @@ async fn test_static_file_plugin_auth() {
         .expect("start static_file plugin");
 
     // No credentials → 401 (server adds a 200ms anti-brute-force delay).
-    let (status, _) = http_get(handle.local_addr, "/", None).await;
+    // Wire parity probe vs Go v0.71.0 (pkg/util/net/http.go:45-59
+    // NewHTTPAuthMiddleware): realm "Restricted", text/plain body
+    // "Unauthorized\n" (http.Error), no Connection header.
+    let (status, body) = http_get(handle.local_addr, "/", None).await;
     assert_eq!(status, 401, "missing auth must be rejected");
+    assert!(
+        body.starts_with("HTTP/1.1 401 Unauthorized\r\n")
+            && body.contains("WWW-Authenticate: Basic realm=\"Restricted\"\r\n")
+            && body.contains("Content-Type: text/plain; charset=utf-8\r\n")
+            && body.ends_with("\r\n\r\nUnauthorized\n"),
+        "Go-parity 401 wire, got: {body:?}"
+    );
 
     // Correct credentials → 200.
     let (status, body) = http_get(handle.local_addr, "/", Some(("admin", "s3cret"))).await;

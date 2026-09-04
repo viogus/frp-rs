@@ -516,7 +516,7 @@ async fn test_h2c_401_without_credentials_origin_form() {
     assert_eq!(response.status().as_u16(), 401);
     assert_eq!(
         response.headers()["www-authenticate"].to_str().unwrap(),
-        "Basic realm=\"frp\""
+        "Basic realm=\"Restricted\""
     );
     let body = read_h2_body(response.into_body()).await;
     assert!(body.is_empty());

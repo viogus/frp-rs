@@ -15,6 +15,7 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 fn http_proxy(
     name: &str,
     domains: Vec<String>,
+    rewrite_host: Option<String>,
     headers: Option<std::collections::HashMap<String, String>>,
 ) -> NewProxy {
     NewProxy {
@@ -32,7 +33,7 @@ fn http_proxy(
         locations: None,
         http_user: None,
         http_pwd: None,
-        host_header_rewrite: None,
+        host_header_rewrite: rewrite_host,
         headers,
         response_headers: None,
         route_by_http_user: None,
@@ -73,6 +74,7 @@ async fn test_vhost_http_injects_xff_and_request_headers() {
     let np = FrpMessage::NewProxy(Box::new(http_proxy(
         "http-test",
         vec!["app.example.com".into()],
+        None,
         Some(std::collections::HashMap::from([
             ("X-Injected".to_string(), "from-frps".to_string()),
             ("X-Override".to_string(), "new".to_string()),
@@ -163,6 +165,136 @@ async fn test_vhost_http_injects_xff_and_request_headers() {
     );
 
     println!("HTTP vhost header injection verified");
+    drop(client);
+    drop(provider);
+}
+
+/// Go parity (pkg/util/vhost/http.go:282-285): a CONNECT request is handed
+/// to connectHandler, which writes `req.Write(remote)` RAW — no
+/// host_header_rewrite, no X-Forwarded-* injection, no requestHeaders, even
+/// when all three are configured on the routed proxy. Auth still gates the
+/// route, but a routed CONNECT reaches the backend byte-identical.
+#[tokio::test]
+async fn test_vhost_http_connect_forwards_raw() {
+    let bind_port = allocate_port();
+    let vhost_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        vhost_http_port: vhost_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+    let vhost_addr: SocketAddr = format!("127.0.0.1:{}", vhost_port).parse().unwrap();
+
+    // Provider registers an HTTP proxy that would rewrite + inject on a
+    // normal GET — the CONNECT must bypass all of it.
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
+    let run_id = resp.run_id.expect("run_id");
+    let np = FrpMessage::NewProxy(Box::new(http_proxy(
+        "connect-test",
+        vec!["tunnel.example.com".into()],
+        Some("backend.internal".into()),
+        Some(std::collections::HashMap::from([
+            (
+                "X-Forwarded-For".to_string(),
+                "edge.example.net".to_string(),
+            ),
+            ("X-Override".to_string(), "new".to_string()),
+        ])),
+    )));
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
+    match read_msg_v1(&mut provider).await.expect("NewProxyResp") {
+        FrpMessage::NewProxyResp(ref r) => {
+            assert!(r.error.is_none(), "registration failed: {:?}", r.error);
+        }
+        other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+    }
+
+    // Pool a work conn.
+    let mut work_conn = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("work conn");
+    write_msg_v1(
+        &mut work_conn,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+
+    // Client sends a CONNECT with a mismatched Host header — Go routes on
+    // the request-line authority alone; the Host header is forwarded
+    // verbatim (no rewrite, no injection).
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(
+            b"CONNECT tunnel.example.com:443 HTTP/1.1\r\n\
+              Host: tunnel.example.com\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send CONNECT");
+
+    // Backend receives StartWorkConn then the raw forwarded head.
+    match read_msg_v1(&mut work_conn).await.expect("StartWorkConn") {
+        FrpMessage::StartWorkConn(swc) => {
+            assert_eq!(swc.proxy_name, "connect-test");
+            assert!(swc.error.is_none(), "{:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+
+    let mut forwarded = Vec::new();
+    let mut chunk = [0u8; 1024];
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let n = work_conn.read(&mut chunk).await.expect("read forwarded");
+            if n == 0 {
+                break;
+            }
+            forwarded.extend_from_slice(&chunk[..n]);
+            if forwarded.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for forwarded CONNECT");
+
+    let text = String::from_utf8_lossy(&forwarded);
+    assert!(
+        text.starts_with("CONNECT tunnel.example.com:443 HTTP/1.1\r\n"),
+        "request line must be forwarded verbatim: {text}"
+    );
+    assert!(
+        text.contains("Host: tunnel.example.com\r\n"),
+        "original Host must survive (no host_header_rewrite on CONNECT): {text}"
+    );
+    assert!(
+        !text.contains("backend.internal"),
+        "host_header_rewrite must not apply to CONNECT: {text}"
+    );
+    assert!(
+        !text.contains("X-Forwarded"),
+        "no X-Forwarded-* injection on CONNECT: {text}"
+    );
+    assert!(
+        !text.contains("X-Override"),
+        "requestHeaders must not apply to CONNECT: {text}"
+    );
+
+    println!("HTTP vhost CONNECT forwarded raw");
     drop(client);
     drop(provider);
 }

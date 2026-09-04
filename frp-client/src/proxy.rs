@@ -171,7 +171,11 @@ pub async fn connect_local_with_dns(
 ) -> Result<TcpStream, frp_core::Error> {
     connect_local_with_resolver(
         addr,
-        std::time::Duration::from_secs(5),
+        // Go parity: libnet.Dial(..., WithTimeout(10*time.Second)) at
+        // client/proxy/proxy.go:231 — the local backend gets 10s, not 5s
+        // (a busy backend on a slow box could exceed 5s on a legit dial;
+        // the old budget raced Go's own client behavior).
+        std::time::Duration::from_secs(10),
         |query| async move {
             match dns_server.filter(|d| !d.is_empty()) {
                 Some(dns) => {

@@ -177,12 +177,14 @@ const CTL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// completed a frame within `CONTROL_IDLE_TIMEOUT`. A fresh read that has
 /// consumed nothing is indistinguishable from a heartbeat-disabled client and
 /// is deliberately left alone — Go frp parity, since Go under tcpMux performs
-/// no app-level reap at all (yamux keepalive bounds fully-silent peers via
-/// `MAX_IDLE_KEEPALIVE_TICKS`; only a peer that pongs keepalive while
-/// stalling a control frame can pin resources — exactly the case this arm
-/// closes). Only active when the heartbeat watchdog is off
-/// (`heartbeat_timeout <= 0`), so the normal `heartbeat_timeout > 0` path is
-/// untouched.
+/// no app-level reap at all (audit B3 scope note: `MAX_IDLE_KEEPALIVE_TICKS`
+/// bounds only peers whose yamux driver stops answering session pings; a peer
+/// whose driver keeps ponging — automatic at the mux layer, no app data
+/// needed — while its control stream never sends a byte is NOT reaped here
+/// or in Go. This arm closes the subset it can: a peer that started a frame
+/// and stalled mid-body, where the consumed bytes prove liveness). Only
+/// active when the heartbeat watchdog is off (`heartbeat_timeout <= 0`), so
+/// the normal `heartbeat_timeout > 0` path is untouched.
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Deadline for yamux-stream reads in the control select loop (round 10
@@ -1078,7 +1080,8 @@ mod partial_read_tests {
         // LoginResp (Go parity — no config flag gates it), so the frame
         // must go out encrypted: wrap the client half and write through it.
         let client_key = frp_core::encryption::derive_key("test-token");
-        let mut client = frp_core::cipher_stream::CipherStream::new(client, client_key);
+        let mut client =
+            frp_core::cipher_stream::CipherStream::new(client, client_key).expect("rng");
 
         // NewProxy frame with a large headers map so the frame exceeds the
         // duplex capacity. stcp needs no listener — registration alone is
@@ -1527,7 +1530,7 @@ mod idle_reap_tests {
         // Client-side cipher: the server wraps the control stream in
         // CipherStream with derive_key("test-token") after LoginResp; the
         // peer must encrypt with the same key so the decrypted bytes parse.
-        let mut cw = CipherWriter::new(client, derive_key("test-token"));
+        let mut cw = CipherWriter::new(client, derive_key("test-token")).expect("rng");
 
         // Build one valid V1 Ping frame (type byte + 8-byte BE length +
         // JSON payload) by hand. Writing it through the cipher in TWO

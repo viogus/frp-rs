@@ -575,7 +575,14 @@ pub async fn bridge_encrypted(
     read_is_decrypted: bool,
 ) {
     tracing::debug!(use_compression, "bridge_encrypted: starting");
-    let mut enc_work_w = CipherWriter::new(work_w, *key);
+    // Audit B2: OS-RNG failure surfaces as an error, not a process abort.
+    let mut enc_work_w = match CipherWriter::new(work_w, *key) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "bridge_encrypted: IV generation failed");
+            return;
+        }
+    };
 
     // Eagerly flush the IV to unblock the peer's CipherReader.
     // Without this, when both sides use CipherWriter/CipherReader pairs,
@@ -968,7 +975,7 @@ mod tests {
         let mut comp = crate::encryption::SnappyCompressor::new();
         let mut comp_resp = Vec::new();
         comp.compress(&resp, &mut comp_resp).unwrap();
-        let mut enc_w = CipherWriter::new(w_w_test, key);
+        let mut enc_w = CipherWriter::new(w_w_test, key).expect("rng");
         enc_w.write_all(&comp_resp).await.unwrap();
         enc_w.flush().await.unwrap();
         drop(enc_w);
@@ -1202,7 +1209,7 @@ mod tests {
 
         // Work → User: encrypt on the test side; the bridge decrypts and
         // delivers plaintext to the user side.
-        let mut enc_w_w_test = CipherWriter::new(w_w_test, key);
+        let mut enc_w_w_test = CipherWriter::new(w_w_test, key).expect("rng");
         enc_w_w_test
             .write_all(b"encrypted work->user")
             .await
@@ -1636,7 +1643,7 @@ mod tests {
         let (work_duplex_w, work_duplex_r) = tokio::io::duplex(65536);
         let (u_w_sink, mut u_r_test) = tokio::io::duplex(65536);
 
-        let enc_writer = CipherWriter::new(work_duplex_w, key);
+        let enc_writer = CipherWriter::new(work_duplex_w, key).expect("rng");
         let enc_reader = CipherReader::new(work_duplex_r, key);
 
         let u2w = tokio::spawn(async move {

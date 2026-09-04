@@ -107,7 +107,8 @@ mod tests {
     /// consumed.
     fn buffered_read_with(buf: Vec<u8>, pos: usize) -> Box<BufferedReadTransport> {
         let (duplex, _peer) = tokio::io::duplex(1024);
-        let inner: Box<dyn Transport> = Box::new(CipherStream::new(duplex, [0u8; 16]));
+        let inner: Box<dyn Transport> =
+            Box::new(CipherStream::new(duplex, [0u8; 16]).expect("rng"));
         Box::new(BufferedReadTransport::new(buf, pos, inner))
     }
 

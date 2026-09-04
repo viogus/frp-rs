@@ -274,6 +274,12 @@ async fn handle_stream(
         // Go checkRouteAuthByRequest's `req.URL.Host != ""` gate — decides
         // the 407-vs-401 response shape on auth failure below.
         is_absolute_form,
+        // CONNECT (RFC 7540 §8.3, :method CONNECT) forwards raw like the
+        // HTTP/1.1 connectHandler — no host rewrite, no forwarded-header
+        // injection (Go http.go:282-285; the h2 layer is the same
+        // ServeHTTP). http::Method equality is the byte-exact "CONNECT"
+        // gate (Go http.MethodConnect).
+        request.method() == http::Method::CONNECT,
     )
     .await
     {
@@ -284,7 +290,7 @@ async fn handle_stream(
             return send_h2_error(
                 &mut respond,
                 407,
-                &[("proxy-authenticate", "Basic realm=\"frp\"")],
+                &[("proxy-authenticate", "Basic realm=\"Restricted\"")],
                 Bytes::new(),
             )
             .await;
@@ -295,7 +301,7 @@ async fn handle_stream(
             return send_h2_error(
                 &mut respond,
                 401,
-                &[("www-authenticate", "Basic realm=\"frp\"")],
+                &[("www-authenticate", "Basic realm=\"Restricted\"")],
                 Bytes::new(),
             )
             .await;

@@ -29,6 +29,18 @@ pub struct HttpProxyAuth {
     password: Option<String>,
 }
 
+/// Result of the http_proxy basic-auth check.
+///
+/// Go frp http_proxy.go `Auth()` semantics: a header that fails to parse
+/// into a user:pass pair rejects instantly; only a decoded pair that fails
+/// the constant-time compare triggers the 200 ms anti-brute-force delay (the
+/// sleep sits inside `Auth()` at the compare, below the shape failures).
+pub enum AuthVerdict {
+    Accept,
+    RejectInstant,
+    RejectDelayed,
+}
+
 impl HttpProxyAuth {
     pub fn from_config(cfg: &PluginConfig) -> Self {
         let user = if cfg.http_user.is_empty() {
@@ -44,14 +56,20 @@ impl HttpProxyAuth {
         Self { user, password }
     }
 
+    /// static_file (Go `NewHTTPAuthMiddleware` → net/http `r.BasicAuth()`):
+    /// case-insensitive `Basic ` prefix gate (Go Issue 22736 does
+    /// ascii.EqualFold on the prefix), then decode + compare. The middleware
+    /// sleeps on EVERY reject when credentials are configured, so this bool
+    /// shape (used by static_file.rs, which owns its delay) is enough.
     pub fn check(&self, header: &str) -> bool {
         match (self.user.as_deref(), self.password.as_deref()) {
             // No auth configured — accept all connections
             (None, None) => true,
             // Both configured — require both to match
             (Some(expected_user), Some(expected_pass)) => {
-                if let Some(credentials) = header.strip_prefix("Basic ") {
-                    if let Ok(decoded) = base64_decode(credentials) {
+                let b = header.as_bytes();
+                if b.len() >= 6 && b[..6].eq_ignore_ascii_case(b"basic ") {
+                    if let Ok(decoded) = base64_decode(&header[6..]) {
                         if let Some((user, pass)) = decoded.split_once(':') {
                             // Constant-time comparison (parity with
                             // control/admin/SSH auth): the short-circuit `==`
@@ -70,6 +88,38 @@ impl HttpProxyAuth {
             // Partially configured (only user or only password) — reject all.
             // This is a config error; logging happens once at config load.
             (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+
+    /// http_proxy plugin (`http_proxy.go` `Auth()`): Go splits the header on
+    /// the FIRST space and decodes the payload WITHOUT checking the scheme
+    /// token — `SplitN(header, " ", 2)` never compares `s[0]` against
+    /// "Basic". Shape failures (no space, undecodable payload, no `:` in the
+    /// pair) return `RejectInstant`; a compare failure returns
+    /// `RejectDelayed` (Go sleeps 200 ms exactly there).
+    pub fn classify_proxy_auth(&self, header: &str) -> AuthVerdict {
+        match (self.user.as_deref(), self.password.as_deref()) {
+            (None, None) => AuthVerdict::Accept,
+            (Some(expected_user), Some(expected_pass)) => {
+                let Some((_scheme, payload)) = header.split_once(' ') else {
+                    return AuthVerdict::RejectInstant;
+                };
+                let Ok(decoded) = base64_decode(payload) else {
+                    return AuthVerdict::RejectInstant;
+                };
+                let Some((user, pass)) = decoded.split_once(':') else {
+                    return AuthVerdict::RejectInstant;
+                };
+                let user_ok = frp_core::auth::constant_time_eq_str(user, expected_user);
+                let pass_ok = frp_core::auth::constant_time_eq_str(pass, expected_pass);
+                if user_ok & pass_ok {
+                    AuthVerdict::Accept
+                } else {
+                    AuthVerdict::RejectDelayed
+                }
+            }
+            // Partially configured — config error at load; reject instantly.
+            (Some(_), None) | (None, Some(_)) => AuthVerdict::RejectInstant,
         }
     }
 }
@@ -128,23 +178,44 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
         }
     }
 
-    // Check auth
-    if !auth.check(&proxy_auth) {
-        // Go frp compat: 200ms delay to slow brute-force attacks.
-        sleep(Duration::from_millis(200)).await;
-        let resp = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                       Proxy-Authenticate: Basic realm=\"frp\"\r\n\
-                       Content-Length: 0\r\n\r\n";
-        if let Err(e) = client.write_all(resp).await {
-            tracing::debug!(error = %e, "plugin relay error: {}", e);
+    // Check auth. Response arms verified byte-for-byte against Go v0.71.0
+    // (probe): CONNECT failures go through handleConnectReq →
+    // getBadResponse — status TEXT "Not authorized" (Go's custom Status
+    // field, not the standard reason) + `Connection: close`; plain-request
+    // failures go through net/http ServeHTTP — standard status text, no
+    // Connection header (Go keeps the conn reusable; frp-rs serves one
+    // request per tunnel conn and closes after — response bytes identical).
+    // Both arms send `Proxy-Authenticate: Basic` with no realm. Go's `Date`
+    // header comes from net/http and is omitted here like every other
+    // frp-rs manual response writer.
+    let is_connect = method.eq_ignore_ascii_case("CONNECT");
+    match auth.classify_proxy_auth(&proxy_auth) {
+        AuthVerdict::Accept => {}
+        verdict => {
+            if matches!(verdict, AuthVerdict::RejectDelayed) {
+                // Go frp http_proxy.go Auth(): 200ms delay only when a
+                // decoded user:pass pair fails the compare (shape failures
+                // answer instantly — no sleep below the early returns).
+                sleep(Duration::from_millis(200)).await;
+            }
+            let resp: &'static [u8] = if is_connect {
+                b"HTTP/1.1 407 Not authorized\r\nConnection: close\r\n\
+                  Proxy-Authenticate: Basic\r\nContent-Length: 0\r\n\r\n"
+            } else {
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                  Proxy-Authenticate: Basic\r\nContent-Length: 0\r\n\r\n"
+            };
+            if let Err(e) = client.write_all(resp).await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
+            return Err("auth failed".into());
         }
-        return Err("auth failed".into());
     }
 
     // Case-insensitive CONNECT match: Go frp http_proxy.go uses
     // strings.EqualFold(string(firstBytes), http.MethodConnect) — a
     // lowercase "connect" is accepted.
-    if method.eq_ignore_ascii_case("CONNECT") {
+    if is_connect {
         handle_connect(client, url).await
     } else {
         handle_http_forward(client, &buf, method, url).await
@@ -175,8 +246,11 @@ async fn handle_connect(mut client: TcpStream, target: &str) -> Result<(), Strin
     };
     frp_core::transport::set_nodelay(&remote);
 
-    // Tell client connection established
-    let resp = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+    // Tell client connection established. Phrase parity: Go frp writes
+    // "HTTP/1.1 200 OK" on CONNECT success (pkg/plugin/client/http_proxy.go
+    // httpProxy.go:188 `resp.Status = "200 OK"`) — not the conventional
+    // "200 Connection Established".
+    let resp = b"HTTP/1.1 200 OK\r\n\r\n";
     client
         .write_all(resp)
         .await
@@ -354,5 +428,110 @@ mod tests {
         assert_eq!(host, "example.com");
         assert_eq!(port, 80);
         assert_eq!(path, "/");
+    }
+
+    fn auth(user: &str, pass: &str) -> HttpProxyAuth {
+        HttpProxyAuth {
+            user: Some(user.into()),
+            password: Some(pass.into()),
+        }
+    }
+
+    fn b64(s: &str) -> String {
+        frp_core::base64::encode(s.as_bytes())
+    }
+
+    fn basic(u: &str, p: &str) -> String {
+        format!("Basic {}", b64(&format!("{u}:{p}")))
+    }
+
+    /// Go http_proxy.go `Auth()` verdict matrix (source + probe-verified):
+    /// shape failures reject INSTANTLY; only a decoded pair failing the
+    /// compare delays 200 ms; the scheme token is never inspected (SplitN
+    /// decodes `s[1]` unconditionally — "Bearer <b64>" with valid creds is
+    /// ACCEPTED by Go frp).
+    #[test]
+    fn test_classify_proxy_auth_go_verdict_matrix() {
+        let a = auth("u1", "p1");
+        // Valid creds — accepted with the canonical Basic scheme.
+        assert!(matches!(
+            a.classify_proxy_auth(&basic("u1", "p1")),
+            AuthVerdict::Accept
+        ));
+        // Go ignores the scheme token entirely: a Bearer-spelled header with
+        // valid creds passes (http_proxy.go Auth() never checks s[0]).
+        assert!(matches!(
+            a.classify_proxy_auth(&format!("Bearer {}", b64("u1:p1"))),
+            AuthVerdict::Accept
+        ));
+        // Wrong creds — the only DELAYED verdict (Go's 200ms sleep sits in
+        // Auth() after the shape gates, at the compare).
+        assert!(matches!(
+            a.classify_proxy_auth(&basic("u1", "zz")),
+            AuthVerdict::RejectDelayed
+        ));
+        // Shape failures — instant (Go returns before the sleep line).
+        assert!(matches!(
+            a.classify_proxy_auth(""),
+            AuthVerdict::RejectInstant
+        )); // no header
+        assert!(matches!(
+            a.classify_proxy_auth("Basic"),
+            AuthVerdict::RejectInstant
+        )); // no space -> SplitN len 1
+        assert!(matches!(
+            a.classify_proxy_auth(&format!("Basic {}", b64("no-colon"))),
+            AuthVerdict::RejectInstant // decoded pair has no colon
+        ));
+        assert!(matches!(
+            a.classify_proxy_auth("Basic notbase64!!!"),
+            AuthVerdict::RejectInstant // undecodable payload
+        ));
+        assert!(matches!(
+            a.classify_proxy_auth("Basic  dTE6cDE="),
+            AuthVerdict::RejectInstant // double space -> payload has a leading space, decode fails
+        ));
+        // Unconfigured accepts everything; partial config is a load-time
+        // error -> reject.
+        assert!(matches!(
+            HttpProxyAuth {
+                user: None,
+                password: None
+            }
+            .classify_proxy_auth(""),
+            AuthVerdict::Accept
+        ));
+        assert!(matches!(
+            HttpProxyAuth {
+                user: Some("u".into()),
+                password: None
+            }
+            .classify_proxy_auth(""),
+            AuthVerdict::RejectInstant
+        ));
+    }
+
+    /// static_file middleware parity: the `Basic ` prefix gate is
+    /// case-insensitive (Go net/http parseBasicAuth, Issue 22736:
+    /// ascii.EqualFold on the prefix) — lowercase "basic " must pass the
+    /// shape check and reach the credential compare.
+    #[test]
+    fn test_check_static_file_basic_prefix_case_insensitive() {
+        let a = auth("admin", "s3cret");
+        let lower = format!("basic {}", b64("admin:s3cret"));
+        assert!(
+            a.check(&lower),
+            "Go EqualFold prefix: lowercase basic accepted"
+        );
+        assert!(
+            a.check(&basic("admin", "s3cret")),
+            "canonical form accepted"
+        );
+        assert!(!a.check(&basic("admin", "wrong")), "wrong creds rejected");
+        // No prefix at all -> reject (std BasicAuth requires the scheme).
+        assert!(
+            !a.check(&b64("admin:s3cret")),
+            "scheme-less header rejected"
+        );
     }
 }

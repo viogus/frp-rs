@@ -470,7 +470,7 @@ mod tests {
         let expected = payload.clone();
 
         let write_handle = tokio::spawn(async move {
-            let cipher_w = crate::cipher_stream::CipherWriter::new(client, TEST_KEY);
+            let cipher_w = crate::cipher_stream::CipherWriter::new(client, TEST_KEY).expect("rng");
             let mut w = SnappyStreamWriter::new(cipher_w);
             w.write_all(&payload).await.unwrap();
             w.flush().await.unwrap();

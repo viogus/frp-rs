@@ -214,7 +214,7 @@ pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     /// remote input (junk bytes after a proxy CONNECT response), so callers
     /// must propagate the error rather than unwrap.
     fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> io::Result<Box<dyn Transport>> {
-        Ok(Box::new(CipherStream::new(self, key)))
+        Ok(Box::new(CipherStream::new(self, key)?))
     }
 
     /// Split the transport into owned boxed read and write halves.

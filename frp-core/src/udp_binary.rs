@@ -116,7 +116,34 @@ fn put_addr(buf: &mut Vec<u8>, addr: &BinaryUdpAddr) {
     buf.extend_from_slice(addr.zone.as_bytes());
 }
 
-fn read_addr(body: &[u8], offset: usize) -> Result<(UdpAddr, usize), String> {
+/// Raw decoded fields of one `binaryUDPAddr`, before any `String` formatting.
+///
+/// Split out of the original `read_addr` (audit B4): the hot terminal UDP
+/// readers decode straight to native [`std::net::SocketAddr`] and must not
+/// pay a per-datagram `ip` `String` alloc + re-parse that only message-form
+/// consumers (V1/JSON, the SUDP message relay) need. All wire-strictness
+/// checks (and their error strings) live here, shared by both forms.
+#[derive(Clone, Copy)]
+struct AddrParts<'a> {
+    family: u8,
+    /// 4 (family 4) or 16 (family 6) bytes, unvalidated content.
+    ip: &'a [u8],
+    port: u16,
+    /// Zone bytes, unvalidated UTF-8 (validated only when formatted).
+    zone: &'a [u8],
+    /// Offset of the family byte (error-message prefix).
+    offset: usize,
+    /// One past the last zone byte.
+    end: usize,
+}
+
+impl AddrParts<'_> {
+    fn is_zoned(&self) -> bool {
+        self.family == 6 && !self.zone.is_empty()
+    }
+}
+
+fn parse_addr_parts(body: &[u8], offset: usize) -> Result<AddrParts<'_>, String> {
     let err = |msg: String| format!("UDP binary address at offset {offset}: {msg}");
     if body.len() - offset < 4 {
         return Err(err("truncated address header".into()));
@@ -137,26 +164,85 @@ fn read_addr(body: &[u8], offset: usize) -> Result<(UdpAddr, usize), String> {
     if body.len() - offset < 4 + ip_len + zone_len {
         return Err(err("truncated zone".into()));
     }
-    let zone = std::str::from_utf8(&body[ip_start + ip_len + 3..ip_start + ip_len + 3 + zone_len])
+    let zone = &body[ip_start + ip_len + 3..ip_start + ip_len + 3 + zone_len];
+    Ok(AddrParts {
+        family,
+        ip,
+        port,
+        zone,
+        offset,
+        end: offset + 3 + ip_len + zone_len + 1,
+    })
+}
+
+/// Address-level semantic checks in the original `read_addr` order: the
+/// zone bytes must be valid UTF-8, and an IPv4 address must not carry a
+/// zone. Run inline during the header parse so a malformed address errors
+/// BEFORE the later payload-length checks — the pre-refactor message
+/// ordering (pin: `malformed_decode_branch_errors`).
+fn validate_addr_parts(p: &AddrParts<'_>) -> Result<(), String> {
+    let err = |msg: String| format!("UDP binary address at offset {}: {msg}", p.offset);
+    if let Err(e) = std::str::from_utf8(p.zone) {
+        return Err(err(format!("invalid zone UTF-8: {e}")));
+    }
+    if p.family == 4 && !p.zone.is_empty() {
+        return Err(err("IPv4 zone is forbidden".into()));
+    }
+    Ok(())
+}
+
+/// Format parsed address parts back to the message-form [`UdpAddr`] used by
+/// the V1/JSON path and the SUDP message relay. Errors (text and order
+/// within one address) match the original `read_addr`.
+fn addr_parts_to_udp(p: &AddrParts<'_>) -> Result<UdpAddr, String> {
+    let err = |msg: String| format!("UDP binary address at offset {}: {msg}", p.offset);
+    let zone = std::str::from_utf8(p.zone)
         .map_err(|e| err(format!("invalid zone UTF-8: {e}")))?
         .to_string();
-    let ip = match family {
+    let ip = match p.family {
         4 => {
             if !zone.is_empty() {
                 return Err(err("IPv4 zone is forbidden".into()));
             }
-            format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+            format!("{}.{}.{}.{}", p.ip[0], p.ip[1], p.ip[2], p.ip[3])
         }
         6 => {
-            let octets: [u8; 16] = ip.try_into().expect("16-byte IPv6 slice");
+            let octets: [u8; 16] = p.ip.try_into().expect("16-byte IPv6 slice");
             std::net::Ipv6Addr::from(octets).to_string()
         }
         _ => unreachable!("family validated above"),
     };
-    Ok((
-        UdpAddr { ip, port, zone },
-        offset + 3 + ip_len + zone_len + 1,
-    ))
+    Ok(UdpAddr {
+        ip,
+        port: p.port,
+        zone,
+    })
+}
+
+/// Native-address conversion of parsed parts: infallible for plain
+/// addresses (IPv4 octets and unzoned IPv6 octets always parse).
+fn addr_parts_to_socket(p: &AddrParts<'_>) -> std::net::SocketAddr {
+    match p.family {
+        4 => {
+            let octets: [u8; 4] = p.ip.try_into().expect("4-byte IPv4 slice");
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)),
+                p.port,
+            )
+        }
+        6 => {
+            let octets: [u8; 16] = p.ip.try_into().expect("16-byte IPv6 slice");
+            // flowinfo/scope 0 — the wire form has neither (Go decode of a
+            // zone-less address likewise yields a zero-scope UDPAddr).
+            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(octets),
+                p.port,
+                0,
+                0,
+            ))
+        }
+        _ => unreachable!("family validated above"),
+    }
 }
 
 /// Convenience wrapper: encode into a fresh Vec.
@@ -315,30 +401,85 @@ pub fn decode_udp_packet_binary(body: &[u8]) -> Result<UDPPacket, String> {
 /// checks, same error strings). When the buffer was taken (empty on return),
 /// the caller should refill for the next read (the V2 UDP read path
 /// re-acquires from `frp_core::buffer_pool::BUFFER_POOL`).
+///
+/// Message-form decode: the addresses come out as [`UdpAddr`] `String`s for
+/// consumers that re-serialize the message (V1/JSON path, the SUDP message
+/// relay). Terminal readers that only send the datagram on should use
+/// [`decode_udp_packet_binary_socket_owned`] instead (audit B4).
 pub fn decode_udp_packet_binary_owned(body: &mut Vec<u8>) -> Result<UDPPacket, String> {
     let h = parse_udp_packet_header(body)?;
-    // Steady-state path (review finding M2): copy the payload out and keep
-    // `body` in the caller's loop — the buffer pool is untouched, zero alloc
-    // per packet. Only for large datagrams (payload ≥ the 32 KiB pool buffer,
-    // where the copy would double the packet cost) is the buffer moved into
-    // the packet; that buffer then never returns to the pool, so the pool
-    // drains at most one buffer per large datagram — acceptable, they are
-    // the rare case (UDP payloads are typically ≤ 1.5 KiB MTU-sized).
-    let content = if h.payload_len < *crate::buffer_pool::BUFFER_SIZE {
-        body[h.payload_offset..h.payload_offset + h.payload_len].to_vec()
-    } else {
-        // The trailing-bytes check guarantees `payload_offset + payload_len
-        // == body.len()`, so the payload is exactly the buffer tail: move it
-        // to the front and truncate — one in-place memmove, zero allocation.
-        body.copy_within(h.payload_offset.., 0);
-        body.truncate(h.payload_len);
-        std::mem::take(body)
-    };
+    let content = take_or_copy_payload(body, h.payload_len, h.payload_offset);
     Ok(UDPPacket {
         content,
         local_addr: h.local_addr,
         remote_addr: Some(h.remote_addr),
     })
+}
+
+/// Native-address decode of an owned binary codec body (audit B4, the
+/// read-side mirror of [`encode_udp_packet_binary_socket_addr`]): same wire
+/// parse and payload semantics as [`decode_udp_packet_binary_owned`], but
+/// addresses decode straight to [`std::net::SocketAddr`] — no per-datagram
+/// `ip` `String` alloc + re-parse. Go decodes the binary codec to
+/// `net.UDPAddr` with no intermediate text; this form matches.
+///
+/// A [`std::net::SocketAddr`] cannot carry an IPv6 scope *zone* (std has a
+/// numeric scope id, not an interface name), so a body whose address has a
+/// zone returns `Ok(None)` — the caller falls back to
+/// [`decode_udp_packet_binary_owned`] on the same buffer (rare path: the
+/// Rust encode side never writes zones; only a Go peer with a link-local
+/// service would). An IPv4 address with a zone is malformed in both
+/// decoders (same error text). On error the buffer is left untouched.
+pub fn decode_udp_packet_binary_socket_owned(
+    body: &mut Vec<u8>,
+) -> Result<Option<SocketUdpPacket>, String> {
+    // Malformed-address checks (utf8 zone, IPv4-with-zone) already ran
+    // inline in the parts parse with the original error ordering. What
+    // remains: a family-6 zone is representable in the message form but not
+    // natively — fall back to it (the caller re-decodes the same buffer).
+    let h = parse_udp_packet_header_parts(body)?;
+    if h.local_addr.as_ref().is_some_and(AddrParts::is_zoned) || h.remote_addr.is_zoned() {
+        return Ok(None);
+    }
+    let local_addr = h.local_addr.as_ref().map(addr_parts_to_socket);
+    let remote_addr = addr_parts_to_socket(&h.remote_addr);
+    // Drop `h` (borrows `body`) before the payload extraction mutates it.
+    let (payload_len, payload_offset) = (h.payload_len, h.payload_offset);
+    let content = take_or_copy_payload(body, payload_len, payload_offset);
+    Ok(Some(SocketUdpPacket {
+        content,
+        local_addr,
+        remote_addr,
+    }))
+}
+
+/// UDP packet decoded to native-address form by
+/// [`decode_udp_packet_binary_socket_owned`].
+#[derive(Debug)]
+pub struct SocketUdpPacket {
+    /// UDP payload (ownership semantics of
+    /// [`decode_udp_packet_binary_owned`]: payloads ≥ the pool buffer take
+    /// the caller's buffer, which is left empty — refill before the next
+    /// read).
+    pub content: Vec<u8>,
+    /// Decoded local address when flagged. No current terminal reader uses
+    /// it (the proxy's own bound address is loop-invariant config), kept
+    /// for symmetry with the wire flags.
+    pub local_addr: Option<std::net::SocketAddr>,
+    pub remote_addr: std::net::SocketAddr,
+}
+
+/// Parse a decoded message-form address into a native [`std::net::SocketAddr`]
+/// without allocating.
+///
+/// Audit B4: replaces the per-datagram `format!("ip:port")` + re-parse on the
+/// V1/JSON inbound arms (where the text form is inherent to the message) and
+/// the SUDP visitor's inbound reader task. An IPv6 scope *zone* (which
+/// [`std::net::SocketAddr`] cannot express) is ignored, matching the
+/// callers' original behavior of sending scope-less.
+pub fn udp_addr_to_socket(addr: &UdpAddr) -> Option<std::net::SocketAddr> {
+    let ip: std::net::IpAddr = addr.ip.parse().ok()?;
+    Some(std::net::SocketAddr::new(ip, addr.port))
 }
 
 /// Parsed header of a binary codec body (everything before the payload).
@@ -350,9 +491,21 @@ struct DecodedHeader {
     payload_offset: usize,
 }
 
+/// Raw (unformatted) parsed header; the socket-form decode consumes this
+/// and never formats the addresses.
+struct DecodedHeaderParts<'a> {
+    local_addr: Option<AddrParts<'a>>,
+    remote_addr: AddrParts<'a>,
+    payload_len: usize,
+    payload_offset: usize,
+}
+
 /// Shared body parser: flags, optional local addr, required remote addr,
 /// payload length — all strictness checks and error strings live here.
-fn parse_udp_packet_header(body: &[u8]) -> Result<DecodedHeader, String> {
+/// Addresses stay in raw wire form (no `String` formatting); their
+/// semantic checks (utf8 zone, IPv4-with-zone) run inline in the original
+/// per-address error order (`validate_addr_parts`).
+fn parse_udp_packet_header_parts(body: &[u8]) -> Result<DecodedHeaderParts<'_>, String> {
     if body.len() < 3 {
         return Err(format!("UDP packet body too short: {}", body.len()));
     }
@@ -372,14 +525,16 @@ fn parse_udp_packet_header(body: &[u8]) -> Result<DecodedHeader, String> {
     }
     let mut offset = 1usize;
     let local_addr = if flags & UDP_PACKET_FLAG_LOCAL_ADDR != 0 {
-        let (a, o) = read_addr(body, offset)?;
-        offset = o;
+        let a = parse_addr_parts(body, offset)?;
+        validate_addr_parts(&a)?;
+        offset = a.end;
         Some(a)
     } else {
         None
     };
-    let (remote_addr, o) = read_addr(body, offset)?;
-    offset = o;
+    let remote_addr = parse_addr_parts(body, offset)?;
+    validate_addr_parts(&remote_addr)?;
+    offset = remote_addr.end;
     if body.len() - offset < 2 {
         return Err("truncated UDP payload length".into());
     }
@@ -402,12 +557,48 @@ fn parse_udp_packet_header(body: &[u8]) -> Result<DecodedHeader, String> {
             remaining - payload_len
         ));
     }
-    Ok(DecodedHeader {
+    Ok(DecodedHeaderParts {
         local_addr,
         remote_addr,
         payload_len,
         payload_offset: offset,
     })
+}
+
+/// Message-form header parse (addresses formatted to [`UdpAddr`] strings).
+fn parse_udp_packet_header(body: &[u8]) -> Result<DecodedHeader, String> {
+    let h = parse_udp_packet_header_parts(body)?;
+    let local_addr = h.local_addr.as_ref().map(addr_parts_to_udp).transpose()?;
+    let remote_addr = addr_parts_to_udp(&h.remote_addr)?;
+    Ok(DecodedHeader {
+        local_addr,
+        remote_addr,
+        payload_len: h.payload_len,
+        payload_offset: h.payload_offset,
+    })
+}
+
+/// Copy-or-take the payload out of a decoded body.
+///
+/// Steady-state path (review finding M2): copy the payload out and keep
+/// `body` in the caller's loop — no per-packet 32 KiB pool-buffer churn
+/// (one small payload copy remains; large datagrams move the buffer into
+/// the packet instead of copying). Only for payloads ≥ the pool buffer is
+/// the buffer moved into the packet; that buffer then never returns to the
+/// pool, so the pool drains at most one buffer per large datagram —
+/// acceptable, they are the rare case (UDP payloads are typically ≤
+/// 1.5 KiB MTU-sized).
+fn take_or_copy_payload(body: &mut Vec<u8>, payload_len: usize, payload_offset: usize) -> Vec<u8> {
+    if payload_len < *crate::buffer_pool::BUFFER_SIZE {
+        body[payload_offset..payload_offset + payload_len].to_vec()
+    } else {
+        // The trailing-bytes check guarantees `payload_offset + payload_len
+        // == body.len()`, so the payload is exactly the buffer tail: move it
+        // to the front and truncate — one in-place memmove, zero allocation.
+        body.copy_within(payload_offset.., 0);
+        body.truncate(payload_len);
+        std::mem::take(body)
+    }
 }
 
 #[cfg(test)]
@@ -830,5 +1021,240 @@ mod tests {
             "re-encode must normalize the mapped address to family 4"
         );
         assert_eq!(&re[2..6], &[192, 0, 2, 1]);
+    }
+
+    // --- Audit B4: native-SocketAddr decode ---
+
+    fn socket_sample_body() -> Vec<u8> {
+        // Both addresses present, encoded by the direct-SocketAddr encoder so
+        // the socket decode runs against real wire bytes.
+        let mut body = Vec::new();
+        encode_udp_packet_binary_socket_addr(
+            b"hello",
+            Some(&UdpAddr {
+                ip: "127.0.0.1".into(),
+                port: 53001,
+                zone: String::new(),
+            }),
+            &"10.0.0.2:53".parse().unwrap(),
+            &mut body,
+        )
+        .unwrap();
+        body
+    }
+
+    #[test]
+    fn socket_decode_matches_message_decode() {
+        // Byte-parity invariant: the native decode must produce the same
+        // address the message-form decode yields (after its String re-parse).
+        let body = socket_sample_body();
+        let msg = decode_udp_packet_binary(&body).unwrap();
+        let mut owned = body.clone();
+        let sock = decode_udp_packet_binary_socket_owned(&mut owned)
+            .unwrap()
+            .expect("plain addresses decode natively");
+        assert_eq!(sock.content, msg.content);
+        let msg_remote =
+            udp_addr_to_socket(msg.remote_addr.as_ref().unwrap()).expect("msg remote parses");
+        assert_eq!(sock.remote_addr, msg_remote);
+        let msg_local = msg.local_addr.as_ref().and_then(udp_addr_to_socket);
+        assert_eq!(sock.local_addr, msg_local);
+        assert_eq!(
+            owned, body,
+            "small payload must leave the caller's buffer intact"
+        );
+    }
+
+    #[test]
+    fn socket_decode_v6_addresses_match_message_decode() {
+        for remote in ["[::1]:8080", "[2001:db8::1]:12345"] {
+            let remote: std::net::SocketAddr = remote.parse().unwrap();
+            let mut body = Vec::new();
+            encode_udp_packet_binary_socket_addr(b"ping", None, &remote, &mut body).unwrap();
+            let msg = decode_udp_packet_binary(&body).unwrap();
+            let mut owned = body.clone();
+            let sock = decode_udp_packet_binary_socket_owned(&mut owned)
+                .unwrap()
+                .expect("zone-less v6 decodes natively");
+            assert_eq!(sock.remote_addr, remote, "v6 decode must be exact");
+            assert_eq!(
+                sock.remote_addr,
+                udp_addr_to_socket(msg.remote_addr.as_ref().unwrap()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn socket_decode_mapped_v6_comes_back_family_4() {
+        // The direct-SocketAddr encoder applies Go's To4() normalization, so
+        // a mapped-v6 remote goes on the wire as family 4 and the native
+        // decode returns a plain V4 socket — encode/decode symmetry.
+        let remote: std::net::SocketAddr = "[::ffff:192.0.2.1]:53".parse().unwrap();
+        let mut body = Vec::new();
+        encode_udp_packet_binary_socket_addr(b"ping", None, &remote, &mut body).unwrap();
+        let mut owned = body.clone();
+        let sock = decode_udp_packet_binary_socket_owned(&mut owned)
+            .unwrap()
+            .expect("family-4 wire decodes natively");
+        assert_eq!(sock.remote_addr, "192.0.2.1:53".parse().unwrap());
+        // Family-6 wire form (Go decode parity — a foreign encoder can emit
+        // it) stays mapped, matching the message decoder's String form.
+        let mut mapped = vec![
+            0x02, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1,
+        ];
+        mapped.extend_from_slice(&53u16.to_be_bytes());
+        mapped.push(0); // zoneLen
+        mapped.extend_from_slice(&4u16.to_be_bytes());
+        mapped.extend_from_slice(b"ping");
+        let sock = decode_udp_packet_binary_socket_owned(&mut mapped.clone())
+            .unwrap()
+            .expect("family-6 mapped decodes natively");
+        match sock.remote_addr {
+            std::net::SocketAddr::V6(v6) => {
+                assert!(v6.ip().to_ipv4().is_some(), "mapped address stays mapped");
+                assert_eq!(v6.port(), 53);
+            }
+            _ => panic!("family-6 wire must decode to a V6 socket"),
+        }
+    }
+
+    #[test]
+    fn socket_decode_zone_returns_none_and_leaves_buffer_for_fallback() {
+        // A family-6 zone is representable in the message form but not as a
+        // SocketAddr: the native decode yields None and must not consume the
+        // buffer — the caller falls back to the message-form decode.
+        let pkt = UDPPacket {
+            content: b"hello".to_vec(),
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "fe80::1".into(),
+                port: 9,
+                zone: "eth0".into(),
+            }),
+        };
+        let body = encode_udp_packet_binary(&pkt).unwrap();
+        let mut owned = body.clone();
+        assert!(
+            decode_udp_packet_binary_socket_owned(&mut owned)
+                .unwrap()
+                .is_none(),
+            "zoned address must fall back to the message-form decode"
+        );
+        assert_eq!(owned, body, "None must leave the buffer untouched");
+        let msg = decode_udp_packet_binary_owned(&mut owned).unwrap();
+        assert_eq!(msg.content, pkt.content);
+        let ra = msg.remote_addr.as_ref().unwrap();
+        assert_eq!(ra.ip, "fe80::1");
+        assert_eq!(ra.zone, "eth0", "fallback keeps the zone string");
+    }
+
+    #[test]
+    fn socket_decode_ipv4_zone_is_forbidden_like_message_decode() {
+        // family 4 with a non-empty zone: malformed in both decoders with
+        // identical error text.
+        let mut body = vec![0x02, 0x04, 192, 0, 2, 1];
+        body.extend_from_slice(&53u16.to_be_bytes());
+        body.push(1);
+        body.push(b'x');
+        body.extend_from_slice(&4u16.to_be_bytes());
+        body.extend_from_slice(b"ping");
+        let msg_err = decode_udp_packet_binary(&body).unwrap_err();
+        let mut owned = body.clone();
+        let sock_err = decode_udp_packet_binary_socket_owned(&mut owned).unwrap_err();
+        assert_eq!(sock_err, msg_err);
+        assert_eq!(owned, body, "failed decode must not consume the buffer");
+    }
+
+    #[test]
+    fn socket_decode_error_parity_with_message_decode() {
+        // Every malformed-body error must read identically from both
+        // decoders (they share the parts parser).
+        let mut bodies: Vec<Vec<u8>> = vec![
+            vec![],                             // body too short
+            vec![0x02],                         // address header truncated
+            vec![0x04],                         // reserved flags
+            vec![0x00],                         // missing remote address
+            vec![0x06, 0x02],                   // invalid address family
+            vec![0x02, 0x06],                   // truncated v6 address
+            vec![0x02, 0x04, 1, 2, 3],          // truncated v4 address
+            vec![0x02, 0x03, 0x02, 0x01, 0x00], // invalid family (inside addr)
+        ];
+        // Full v4 address then a truncated payload-length field.
+        let mut tail = vec![0x02, 0x04, 192, 0, 2, 1];
+        tail.extend_from_slice(&53u16.to_be_bytes());
+        tail.push(0);
+        tail.push(0x00);
+        bodies.push(tail);
+        // Full header + payload-length declaring more than the body holds.
+        let mut tail = vec![0x02, 0x04, 192, 0, 2, 1];
+        tail.extend_from_slice(&53u16.to_be_bytes());
+        tail.push(0);
+        tail.extend_from_slice(&10u16.to_be_bytes());
+        tail.extend_from_slice(b"hi");
+        bodies.push(tail);
+        for body in bodies {
+            let msg_err = decode_udp_packet_binary(&body).unwrap_err();
+            let mut owned = body.clone();
+            let sock_err = decode_udp_packet_binary_socket_owned(&mut owned).unwrap_err();
+            assert_eq!(sock_err, msg_err, "error text must match for body {body:?}");
+        }
+    }
+
+    #[test]
+    fn socket_decode_large_payload_consumes_buffer() {
+        let big_len = *crate::buffer_pool::BUFFER_SIZE;
+        let mut body = Vec::new();
+        encode_udp_packet_binary_socket_addr(
+            &vec![0xabu8; big_len],
+            None,
+            &"[::1]:8080".parse().unwrap(),
+            &mut body,
+        )
+        .unwrap();
+        let mut owned = body.clone();
+        let out = decode_udp_packet_binary_socket_owned(&mut owned)
+            .unwrap()
+            .expect("large plain datagram decodes natively");
+        assert_eq!(out.content, vec![0xabu8; big_len]);
+        assert_eq!(out.remote_addr, "[::1]:8080".parse().unwrap());
+        assert!(out.local_addr.is_none());
+        assert!(owned.is_empty(), "large payload must consume the buffer");
+    }
+
+    #[test]
+    fn udp_addr_to_socket_parses_plain_addresses() {
+        // Message-form parse helper for the SUDP visitor path: replaces the
+        // old per-datagram format!("ip:port") + re-parse chain, which dropped
+        // bare-v6 addresses (std SocketAddr parse needs brackets) — the
+        // helper parses them natively, a benign v6-delivery fix (Go parity:
+        // Go resolves the ip string via net.ResolveUDPAddr, v6 included).
+        let mk = |ip: &str, port: u16, zone: &str| UdpAddr {
+            ip: ip.into(),
+            port,
+            zone: zone.into(),
+        };
+        for (ip, port) in [
+            ("127.0.0.1", 53001u16),
+            ("10.0.0.2", 53),
+            ("::1", 8080),
+            ("2001:db8::1", 12345),
+            ("::ffff:192.0.2.1", 53),
+        ] {
+            let a = mk(ip, port, "");
+            let got = udp_addr_to_socket(&a).expect("plain address parses");
+            assert_eq!(got.ip().to_string(), ip, "addr {ip}:{port}");
+            assert_eq!(got.port(), port, "addr {ip}:{port}");
+        }
+        // The zone field never enters the address string (same as the old
+        // format!("{}:{}", ip, port) chain) — a zoned v6 with a plain ip
+        // parses with the zone dropped.
+        assert_eq!(
+            udp_addr_to_socket(&mk("fe80::1", 9, "eth0")),
+            Some("[fe80::1]:9".parse().unwrap())
+        );
+        // An embedded %zone in the ip string is unparseable by IpAddr.
+        assert_eq!(udp_addr_to_socket(&mk("fe80::1%eth0", 9, "")), None);
+        assert_eq!(udp_addr_to_socket(&mk("", 53, "")), None);
+        assert_eq!(udp_addr_to_socket(&mk("not-an-ip", 53, "")), None);
     }
 }
