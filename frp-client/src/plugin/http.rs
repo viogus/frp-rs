@@ -125,10 +125,14 @@ impl HttpProxyAuth {
 }
 
 async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> Result<(), String> {
-    // Read headers in chunks until \r\n\r\n. Stop at the FIRST \r\n\r\n
-    // anywhere in the buffer (not only at its end): with a request body the
-    // head terminator is followed by body bytes, and reading past it would
-    // swallow the body into the "headers" until the 64 KiB cap.
+    // Read the request head in chunks. Head end follows Go textproto
+    // semantics (the engine behind http.ReadRequest): each line ends at the
+    // next '\n' with ONE trailing '\r' stripped, and the first empty line
+    // ends the head — so LF-only and mixed-EOL heads are legal, not just
+    // \r\n\r\n. Stop at the first empty line anywhere in the buffer (not
+    // only at its end): with a request body the head terminator is followed
+    // by body bytes, and reading past it would swallow the body into the
+    // "headers" until the 64 KiB cap.
     // Go parity: http.Server ReadHeaderTimeout (60s) — one absolute deadline
     // over the whole header read, so a slowloris "trickle" cannot park the
     // task + fd + plugin listener slot indefinitely.
@@ -144,7 +148,7 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
                 return Err("connection closed".into());
             }
             buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            if frp_core::textproto::head_end(&buf).is_some() {
                 break;
             }
             if buf.len() > 65536 {
@@ -284,12 +288,11 @@ async fn handle_http_forward(
         .map_err(|e| format!("connect to {host}:{port}: {e}"))?;
     frp_core::transport::set_nodelay(&remote);
 
-    // Split buffer on first \r\n\r\n to separate headers from any pre-read body data.
-    let header_end = raw_headers
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(raw_headers.len());
+    // Split the head from any pre-read body data at the first empty line
+    // (Go textproto semantics — the same helper the read loop above used,
+    // so the split lands exactly where the loop stopped; for CRLF input the
+    // index is byte-identical to the old \r\n\r\n scan).
+    let header_end = frp_core::textproto::head_end(raw_headers).unwrap_or(raw_headers.len());
     let header_bytes = &raw_headers[..header_end];
     let body_bytes = &raw_headers[header_end..];
 

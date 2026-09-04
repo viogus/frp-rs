@@ -92,6 +92,7 @@ pub mod stun {
     }
 }
 pub mod system;
+pub mod textproto;
 pub mod transport;
 pub mod udp_binary;
 pub mod unsafe_features;

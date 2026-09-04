@@ -1110,7 +1110,13 @@ pub(crate) async fn connect_via_proxy(
                 ));
             }
 
-            // Read remaining headers until \r\n\r\n with per-line and total limits
+            // Read remaining headers until the first blank line with
+            // per-line and total limits. Blank = textproto.ReadLine empty:
+            // a line of "\r\n" OR bare "\n" (one trailing \r stripped) ends
+            // the head — the loop must not mistake a bare-LF blank for a
+            // header line, or tunneled bytes get consumed as headers until
+            // the caps (Go http.ReadResponse, which this loop mirrors,
+            // accepts both shapes).
             loop {
                 let mut line_buf = Vec::new();
                 timeout(
@@ -1135,7 +1141,7 @@ pub(crate) async fn connect_via_proxy(
                     ));
                 }
 
-                if line_buf == b"\r\n" || line_buf.is_empty() {
+                if line_buf == b"\r\n" || line_buf == b"\n" || line_buf.is_empty() {
                     break;
                 }
             }
@@ -1413,26 +1419,7 @@ fn parse_connect_status_line(line: &str) -> bool {
         // Go: Atoi must succeed and golib requires StatusCode == 200.
         return false;
     }
-    parse_http_version(proto)
-}
-
-/// Mirror Go net/http `ParseHTTPVersion` (request.go:817-842): the proto
-/// must be "HTTP/" followed by exactly major "." minor — one ASCII digit
-/// each, nothing else. "HTTP/1.1", "HTTP/1.0", "HTTP/2.0" pass; "FOO",
-/// "HTTP/1", "HTTP/1.1.1", "HTTP/1x" fail.
-fn parse_http_version(vers: &str) -> bool {
-    let rest = match vers.strip_prefix("HTTP/") {
-        Some(rest) => rest,
-        None => return false,
-    };
-    let (major, minor) = match rest.split_once('.') {
-        Some(pair) => pair,
-        None => return false,
-    };
-    major.len() == 1
-        && minor.len() == 1
-        && major.as_bytes()[0].is_ascii_digit()
-        && minor.as_bytes()[0].is_ascii_digit()
+    crate::textproto::is_valid_http_version(proto)
 }
 
 /// Parse a proxy URL into (scheme, auth, host, port).
@@ -2035,9 +2022,14 @@ pub async fn accept_websocket_from_peeked(
     let mut read_more = false;
     let extra: Vec<u8> = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         loop {
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let tail = buf.split_off(pos + 4);
-                buf.truncate(pos + 4);
+            // Go textproto.ReadLine semantics (textproto::head_end): the head
+            // ends at the FIRST blank line under '\n' line ends with ONE
+            // optional trailing '\r' stripped — LF-only/mixed-EOL heads are
+            // legal and terminate here, not at the 64 KiB cap. CRLF heads
+            // land at the same byte as the old "\r\n\r\n" window scan.
+            if let Some(end) = crate::textproto::head_end(&buf) {
+                let tail = buf.split_off(end);
+                buf.truncate(end);
                 return Ok::<_, crate::Error>(tail);
             }
             read_more = true;
@@ -2736,6 +2728,52 @@ mod tests {
             .expect("a genuine 200 must be accepted");
     }
 
+    /// Audit round 7 (S1 family): a bare-LF CONNECT 200 head (`\n`-only
+    /// blank line) is legal under Go textproto.ReadLine — the blank is a
+    /// line of "\n" with nothing to strip, exactly like "\r\n" — and Go's
+    /// http.ReadResponse accepts it. The header loop must break there and
+    /// hand the read-ahead tunnel bytes back through BufferedRead; the old
+    /// "\r\n"-only blank check consumed the tunnel's first message as
+    /// "headers" and dropped it at EOF. RED on the old check.
+    #[tokio::test]
+    async fn test_http_connect_accepts_lf_only_response_head() {
+        use tokio::io::AsyncBufReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut sock = tokio::io::BufReader::new(sock);
+            let mut req = Vec::new();
+            sock.read_until(b'\n', &mut req).await.unwrap();
+            assert!(
+                req.starts_with(b"CONNECT "),
+                "expected CONNECT, got: {req:?}"
+            );
+            // LF-only 200 head + the tunnel's first message in ONE write —
+            // the read-ahead capture must replay it after the head parse.
+            sock.write_all(b"HTTP/1.1 200 OK\n\nTUNNEL-FIRST-BYTES\r\n")
+                .await
+                .unwrap();
+            // Dropping the socket closes the tunnel (FIN) once the test reads.
+        });
+
+        let mut stream = connect_via_proxy(&format!("http://{addr}"), "127.0.0.1", 80, 5, 0)
+            .await
+            .expect("LF-only 200 head must be accepted");
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("timed out waiting for tunnel bytes")
+            .expect("read tunnel bytes");
+        assert_eq!(
+            &buf[..n],
+            b"TUNNEL-FIRST-BYTES\r\n",
+            "the tunnel's first message must survive the LF-head read, got: {}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+        srv.await.unwrap();
+    }
+
     /// Go parity matrix for [`parse_connect_status_line`] — the exact
     /// status-line semantics of golib `httpProxyAfterHook` →
     /// `http.ReadResponse` (net/http/response.go:168-184): textproto.ReadLine
@@ -2974,6 +3012,74 @@ mod tests {
             resp.extend_from_slice(rdata);
         }
         resp
+    }
+
+    /// accept_websocket_from_peeked must end the upgrade head at the first
+    /// blank line under Go textproto.ReadLine semantics (line ends at the
+    /// next '\n', ONE trailing '\r' stripped) — the old strict "\r\n\r\n"
+    /// window scan read a legal LF-only head to EOF ("connection closed
+    /// during headers"), where Go gorilla upgrades fine. LF-only case is RED
+    /// on the old scan; the CRLF control case pins the byte-identical
+    /// terminator on the common path (head_end end == old pos + 4). S1.
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn accept_websocket_from_peeked_accepts_lf_only_head() {
+        use sha1::{Digest, Sha1};
+
+        let key = "dGhlIHNhbXBsZSBub25jZQ=="; // RFC 6455 §1.3 sample key
+        let mut hasher = Sha1::new();
+        hasher.update(key.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let accept = base64_encode(&hasher.finalize());
+        let expected_resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        );
+
+        // The head travels as `peeked` (pre-read bytes), so nothing is
+        // written to the socket; closing the client write half makes the
+        // OLD strict-CRLF scan fail fast on EOF instead of blocking.
+        async fn run_case(head: Vec<u8>, expected_resp: &[u8]) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let (server, _) = listener.accept().await.unwrap();
+                accept_websocket_from_peeked(head, IoStream::Tcp(server))
+                    .await
+                    .expect("upgrade head must terminate and upgrade");
+            });
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client.shutdown().await.unwrap(); // write half only; read stays open
+            let mut resp = vec![0u8; expected_resp.len()];
+            // Timeout so a pre-fix regression (server errors out, no 101 is
+            // ever written) fails fast instead of hanging the test.
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut resp))
+                .await
+                .expect("timed out waiting for the 101 response")
+                .unwrap();
+            assert_eq!(&resp, expected_resp, "101 response must be byte-exact");
+            srv.await.unwrap();
+        }
+
+        // LF-only head — legal per textproto.ReadLine, rejected pre-fix.
+        run_case(
+            b"GET /~!frp HTTP/1.1\nHost: 127.0.0.1\nUpgrade: websocket\n\
+              Connection: Upgrade\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\n\
+              Sec-WebSocket-Version: 13\n\n"
+                .to_vec(),
+            expected_resp.as_bytes(),
+        )
+        .await;
+
+        // Control: CRLF head — the common path, byte-identical terminator.
+        run_case(
+            b"GET /~!frp HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n"
+                .to_vec(),
+            expected_resp.as_bytes(),
+        )
+        .await;
     }
 }
 

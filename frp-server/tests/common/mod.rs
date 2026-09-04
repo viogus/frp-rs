@@ -13,6 +13,62 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 use frp_server::service::Service;
 
+/// Go frp v0.71.0 `NotFoundResponse` (pkg/util/http/http.go) — the exact
+/// 404 answer frps writes on a vhost/tcpmux route miss (and control-gone)
+/// when no `custom_404_page` is configured. Probe-verified byte-exact vs
+/// the Go v0.71.0 binary: 92-byte head + 489-byte body = 581 bytes total.
+/// The response is written raw — Go's stdlib http.Server-layer headers
+/// (Date, charset) are absent on frp's own responses.
+#[allow(dead_code)] // used by the tcpmux and vhost_audit_fixes bins only
+pub const GO_404_NOT_FOUND_RESPONSE: &str = concat!(
+    "HTTP/1.1 404 Not Found\r\n",
+    "Content-Length: 489\r\n",
+    "Content-Type: text/html\r\n",
+    "Server: frp/0.71.0\r\n",
+    "\r\n",
+    "<!DOCTYPE html>\n",
+    "<html>\n",
+    "<head>\n",
+    "<title>Not Found</title>\n",
+    "<style>\n",
+    "    body {\n",
+    "        width: 35em;\n",
+    "        margin: 0 auto;\n",
+    "        font-family: Tahoma, Verdana, Arial, sans-serif;\n",
+    "    }\n",
+    "</style>\n",
+    "</head>\n",
+    "<body>\n",
+    "<h1>The page you requested was not found.</h1>\n",
+    "<p>Sorry, the page you are looking for is currently unavailable.<br/>\n",
+    "Please try again later.</p>\n",
+    "<p>The server is powered by <a href=\"https://github.com/fatedier/frp\">frp</a>.</p>\n",
+    "<p><em>Faithfully yours, frp.</em></p>\n",
+    "</body>\n",
+    "</html>\n",
+);
+
+/// Read from a client stream until EOF. frp-rs error responses (404/407/431)
+/// are followed by the server dropping the conn, so EOF is the reliable
+/// end-of-response marker for byte-exact assertions. Each read is bounded —
+/// a peer that never closes fails the test fast instead of hanging it.
+#[allow(dead_code)] // used by the tcpmux and vhost_audit_fixes bins only
+pub async fn read_until_eof(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+            .await
+            .expect("timeout waiting for EOF after the response")
+            .expect("read response bytes");
+        if n == 0 {
+            return out;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
 /// Ports already handed out by this process. Parallel tests must never
 /// receive the same port twice — the probe-then-drop window in
 /// allocate_port would otherwise let a second test grab the port before

@@ -385,13 +385,16 @@ async fn probe_http_hop(
 /// Read the response head (status line + headers) into a bounded buffer.
 ///
 /// Verdict-shape parity with Go's `http.ReadResponse` (which health.go's
-/// `DefaultClient.Do` uses): a head only yields a verdict once its CRLFCRLF
-/// terminator has been read. EOF before the terminator is a truncated head
-/// (Go net/textproto maps it to `io.ErrUnexpectedEOF`), and a head that
-/// fills `MAX_HEALTH_RESPONSE_HEAD` without a terminator is a cap hit —
-/// both FAIL the check. ("Connection: close" servers still send the blank
-/// line; only peers that die mid-head omit it.) Never reads past the head —
-/// the body is not drained (see run_http_check).
+/// `DefaultClient.Do` uses): a head only yields a verdict once its blank
+/// line has been read under textproto.ReadLine semantics — any mix of
+/// `\r\n` and bare-`\n` line endings is legal, and the first line empty
+/// after stripping one trailing `\r` ends the head (see
+/// `frp_core::textproto::head_end`). EOF before the blank line is a
+/// truncated head (Go net/textproto maps it to `io.ErrUnexpectedEOF`), and
+/// a head that fills `MAX_HEALTH_RESPONSE_HEAD` without a blank line is a
+/// cap hit — both FAIL the check. ("Connection: close" servers still send
+/// the blank line; only peers that die mid-head omit it.) Never reads past
+/// the head — the body is not drained (see run_http_check).
 async fn read_http_response_head(stream: &mut tokio::net::TcpStream) -> Result<String, String> {
     let mut head = Vec::with_capacity(1024);
     let mut buf = [0u8; 1024];
@@ -407,12 +410,16 @@ async fn read_http_response_head(stream: &mut tokio::net::TcpStream) -> Result<S
             return Err("head truncated: EOF before blank line".into());
         }
         head.extend_from_slice(&buf[..n]);
-        // Terminate at the FIRST blank line (either line-ending convention —
-        // Go net/textproto ReadLine strips a preceding \r and accepts a lone
-        // \n), truncating any body bytes that shared the read window. Go
+        // Terminate at the FIRST blank line under Go textproto.ReadLine
+        // semantics (frp_core::textproto::head_end): each line ends at the
+        // next `\n` with ONE trailing `\r` stripped, so bare-LF header
+        // lines and CRLF lines may mix freely, and the head ends at the
+        // first line empty under that rule (a CRLF blank after LF lines —
+        // `...\n\r\n` — terminates just like `\r\n\r\n` or `\n\n`). Body
+        // bytes sharing the read window are truncated away. Go
         // http.ReadResponse likewise stops at the blank line with the body
         // unread, so head+body in one segment is UP in Go and must be here.
-        if let Some(end) = head_terminator(&head) {
+        if let Some(end) = frp_core::textproto::head_end(&head) {
             head.truncate(end);
             break;
         }
@@ -432,34 +439,17 @@ async fn read_http_response_head(stream: &mut tokio::net::TcpStream) -> Result<S
     Ok(String::from_utf8_lossy(&head).into_owned())
 }
 
-/// End index (exclusive) of the first blank line in `head` — the CRLFCRLF
-/// terminator, or the LF-only equivalent (`...\n\n`) Go's textproto reader
-/// tolerates. The two patterns cannot overlap (`\r\n\r\n` never contains a
-/// consecutive `\n`), so the minimum end over both is the first blank line.
-fn head_terminator(head: &[u8]) -> Option<usize> {
-    let crlf = head
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4);
-    let lf = head.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
-    match (crlf, lf) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
 struct HttpProbeResponse {
     status: u16,
     status_line: String,
     location: Option<String>,
 }
 
-/// Parse the response head. The version gate mirrors Go's ReadResponse:
-/// any `HTTP/<major>.<minor>` version token is accepted ("HTTP/2.0 200 OK"
-/// passes), the status code must be a numeric token, and a non-numeric code
-/// is a failure (Go Atoi parity), never a non-2xx verdict.
+/// Parse the response head. The version gate mirrors Go's ReadResponse
+/// (ParseHTTPVersion exact-match: "HTTP/2.0 200 OK" passes, "HTTP/9.9" and
+/// "HTTP/1.10" fail), the status code must be a 3-digit token (len-3 gate
+/// BEFORE conversion, Go response.go), and a malformed line is a failure
+/// (Go parity), never a non-2xx verdict.
 fn parse_http_response_head(head: &str) -> Result<HttpProbeResponse, String> {
     if head.is_empty() {
         return Err("empty response".into());
@@ -475,24 +465,23 @@ fn parse_http_response_head(head: &str) -> Result<HttpProbeResponse, String> {
     })
 }
 
-/// Parse the status code out of a status line: `HTTP/<digits>.<digits> SP
-/// <code>...`. The version token must be exactly HTTP/major.minor (Go
-/// ParseHTTPVersion), the code token all digits (Go Atoi — leading zeros
-/// like "0200" are accepted, exactly like Atoi returning 200).
+/// Parse the status code out of a status line — Go `http.ReadResponse`
+/// strictness (what http.DefaultClient's transport applies, so Go frp's
+/// health check sees exactly this): the version token must be one of
+/// `HTTP/1.0|1.1|2.0|3.0` (ParseHTTPVersion exact-match switch, not a
+/// digit-shape check), and the code token exactly 3 ASCII digits — checked
+/// BEFORE conversion (`response.go`: `len(statusCode) != 3` → malformed, so
+/// "0200" is a parse error, never Atoi's 200), multi-space between version
+/// and code tolerated (TrimLeft).
 fn parse_status_code(line: &str) -> Option<u16> {
     let line = line.trim_end_matches('\r');
-    let rest = line.strip_prefix("HTTP/")?;
-    let (version, tail) = rest.split_once(' ')?;
-    let (major, minor) = version.split_once('.')?;
-    if major.is_empty()
-        || minor.is_empty()
-        || !major.bytes().all(|b| b.is_ascii_digit())
-        || !minor.bytes().all(|b| b.is_ascii_digit())
-    {
+    let mut parts = line.split(' ');
+    let version = parts.next()?;
+    if !frp_core::textproto::is_valid_http_version(version) {
         return None;
     }
-    let code_token = tail.trim_start().split(' ').next().unwrap_or("");
-    if code_token.is_empty() || !code_token.bytes().all(|b| b.is_ascii_digit()) {
+    let code_token = parts.find(|p| !p.is_empty())?;
+    if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     code_token.parse::<u16>().ok()
@@ -1047,22 +1036,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_probe_accepts_any_http_version_token() {
-        // Go ReadResponse accepts any HTTP/x.y version token; the old probe's
-        // "HTTP/1." prefix gate wrongly failed an "HTTP/2.0 200" response.
+    async fn http_probe_version_token_matches_go_parse_http_version() {
+        // Go ReadResponse → ParseHTTPVersion is an exact-match switch: only
+        // HTTP/1.0, HTTP/1.1, HTTP/2.0 and HTTP/3.0 parse (round-3 review —
+        // a prior round's "any HTTP/x.y" reading was false parity). Both
+        // known-good version tokens the probe can legitimately meet pass...
         let (addr, _seen) =
             spawn_scripted_server(vec![("HTTP/2.0 200 OK".to_string(), vec![])]).await;
         let url = format!("http://{addr}/");
         assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
             .await
             .is_ok());
-
         let (addr, _seen) =
-            spawn_scripted_server(vec![("HTTP/9.9 204 No Content".to_string(), vec![])]).await;
+            spawn_scripted_server(vec![("HTTP/3.0 200 OK".to_string(), vec![])]).await;
         let url = format!("http://{addr}/");
         assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
             .await
             .is_ok());
+
+        // ...and out-of-switch versions fail like Go ("HTTP/9.9" / "HTTP/1.10"
+        // parse to a nil proto → ReadResponse error), never a silent 2xx.
+        for bad in ["HTTP/9.9 204 No Content", "HTTP/1.10 204 No Content"] {
+            let (addr, _seen) = spawn_scripted_server(vec![(bad.to_string(), vec![])]).await;
+            let url = format!("http://{addr}/");
+            let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+                .await
+                .unwrap_err();
+            assert!(err.contains("malformed status line"), "{err}");
+        }
 
         // Malformed version token → failure, not a silent non-2xx verdict.
         let (addr, _seen) = spawn_scripted_server(vec![("FOO 200 OK".to_string(), vec![])]).await;
@@ -1357,7 +1358,25 @@ mod tests {
         // \n. Go net/textproto ReadLine accepts it (strips only a preceding
         // \r), so the blank line terminates the head there too — UP, not
         // "truncated".
-        let raw = b"HTTP/1.1 200 OK\nContent-Length: 0\n\n".to_vec();
+        let raw = b"HTTP/1.1 200 OK\nContent-Length: 5\n\n".to_vec();
+        let (addr, _handle) = spawn_raw_server(Some(raw)).await;
+        let url = format!("http://{addr}/healthz");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_probe_mixed_eol_head_succeeds() {
+        // Audit round 7 (S1): Go textproto.ReadLine strips ONE trailing \r
+        // per line and accepts a lone \n, so a head whose header lines end
+        // in bare \n may still terminate with a CRLF blank line — the mixed
+        // shape `...\n\r\n` contains neither the \r\n\r\n nor the \n\n
+        // window the old terminator scan matched. A server sending this
+        // shape therefore never yielded a verdict: the head read ran on
+        // until EOF ("head truncated") and DOWNed a healthy 2xx that Go
+        // verdicts UP. Regression pin for the round-7 head_end fix.
+        let raw = b"HTTP/1.1 200 OK\nContent-Length: 5\n\r\n".to_vec();
         let (addr, _handle) = spawn_raw_server(Some(raw)).await;
         let url = format!("http://{addr}/healthz");
         assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
@@ -1366,26 +1385,29 @@ mod tests {
     }
 
     #[test]
-    fn head_terminator_positions() {
-        // CRLFCRLF: ends at the fourth byte of the match.
-        assert_eq!(
-            head_terminator(b"HTTP/1.1 200 OK\r\n\r\n"),
-            Some(b"HTTP/1.1 200 OK\r\n\r\n".len())
-        );
-        // LF-only blank line.
-        assert_eq!(head_terminator(b"OK\n\n"), Some(4));
-        // Terminator mid-stream (body follows): first terminator wins, body
-        // bytes never extend the head.
-        assert_eq!(
-            head_terminator(b"OK\r\n\r\nbody"),
-            Some(6),
-            "head+body window must cut at the first blank line"
-        );
-        // A CRLFCRLF embeds \n\n at i+2 with the same end index; the LF
-        // search must not terminate early at position 2 of the CRLF pair.
-        assert_eq!(head_terminator(b"a\r\nb\r\n\r\n"), Some(8));
-        // No terminator.
-        assert_eq!(head_terminator(b"HTTP/1.1 200 OK\r\nx"), None);
+    fn mixed_eol_head_ends_at_blank_line() {
+        // The local head_terminator (round-7 S1 replacement) is gone — the
+        // read path now uses frp_core::textproto::head_end (unit-tested in
+        // frp-core). This pin keeps the health-specific shapes at the
+        // helper level: mixed LF/CRLF lines terminate at the blank line,
+        // and bytes past it are not part of the head.
+        let cases: &[(&[u8], Option<usize>)] = &[
+            (b"HTTP/1.1 200 OK\r\n\r\n", Some(19)),
+            (b"OK\n\n", Some(4)),
+            // The round-7 missed shape: LF header lines + CRLF blank.
+            (b"HTTP/1.1 200 OK\nContent-Length: 5\n\r\n", Some(36)),
+            (b"OK\r\n\r\nbody", Some(6)),
+            (b"a\r\nb\r\n\r\n", Some(8)),
+            (b"HTTP/1.1 200 OK\r\nx", None), // no blank line yet
+        ];
+        for (head, want) in cases {
+            assert_eq!(
+                frp_core::textproto::head_end(head),
+                *want,
+                "head: {:?}",
+                String::from_utf8_lossy(head)
+            );
+        }
     }
 
     // ---- GAP8 (round-6 audit): URL/authority parse helpers had zero
@@ -1475,15 +1497,23 @@ mod tests {
 
     #[test]
     fn parse_status_line_gates() {
-        // Go ReadResponse/Atoi parity: any HTTP/x.y version, all-digit
-        // codes (leading zeros accepted, Atoi-style), non-numeric codes
-        // and malformed versions fail.
+        // Go ReadResponse parity (round-3 review): ParseHTTPVersion is an
+        // exact-match switch (1.0/1.1/2.0/3.0 only — "HTTP/9.9" and
+        // "HTTP/1.10" are malformed), the code is gated to exactly 3 digits
+        // BEFORE conversion ("0200" is malformed, never Atoi's 200), and
+        // multi-space between version and code is tolerated (TrimLeft).
         assert_eq!(parse_status_code("HTTP/1.1 200 OK"), Some(200));
         assert_eq!(parse_status_code("HTTP/2.0 200 OK"), Some(200));
-        assert_eq!(parse_status_code("HTTP/1.1 0200 OK"), Some(200));
+        assert_eq!(parse_status_code("HTTP/3.0 200 OK"), Some(200));
+        assert_eq!(parse_status_code("HTTP/1.1  200 OK"), Some(200));
         assert_eq!(parse_status_code("HTTP/1.1 200"), Some(200));
+        assert_eq!(parse_status_code("HTTP/1.1 0200 OK"), None);
+        assert_eq!(parse_status_code("HTTP/1.1 1200 OK"), None);
+        assert_eq!(parse_status_code("HTTP/9.9 200 OK"), None);
+        assert_eq!(parse_status_code("HTTP/1.10 200 OK"), None);
         assert_eq!(parse_status_code("HTTP/1 200 OK"), None);
         assert_eq!(parse_status_code("HTTP/1.1 20A OK"), None);
+        assert_eq!(parse_status_code("HTTP/1.1 20"), None);
         assert_eq!(parse_status_code("FOO 200 OK"), None);
         assert_eq!(parse_status_code(""), None);
     }

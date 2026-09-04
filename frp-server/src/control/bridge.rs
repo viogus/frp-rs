@@ -105,13 +105,14 @@ struct ResponseHeaderInjector<R> {
     headers: std::collections::HashMap<String, String>,
     buffer: Vec<u8>,
     buffer_offset: usize,
-    /// True once the `\r\n\r\n` terminator was seen and the configured
-    /// headers were injected. Until this is true (or the inner stream hit
-    /// EOF), `poll_read` never emits bytes to the caller: emission before
-    /// the boundary is known would corrupt the stream for headers spanning
-    /// multiple internal reads.
+    /// True once the response head ended — the first blank line under Go
+    /// `textproto.ReadLine` rules (CRLF, bare-LF, or mixed line endings)
+    /// was seen — and the configured headers were injected. Until this is
+    /// true (or the inner stream hit EOF), `poll_read` never emits bytes
+    /// to the caller: emission before the head end is known would corrupt
+    /// the stream for headers spanning multiple internal reads.
     injected: bool,
-    /// True once the inner stream hit EOF before the terminator — the
+    /// True once the inner stream hit EOF before the head ended — the
     /// buffered partial header is served (no injection), then EOF.
     eof: bool,
     /// True once every buffered byte is served and no further buffering is
@@ -185,9 +186,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
             return Poll::Ready(Ok(()));
         }
 
-        // Buffer empty and the boundary is not found yet — gather more of
-        // the response header from the backend. Bytes are held (never
-        // served) until `\r\n\r\n` is found or the backend closes.
+        // Buffer empty and the head has not ended yet — gather more of the
+        // response header from the backend. Bytes are held (never served)
+        // until the first blank line ends the head (Go `textproto.ReadLine`
+        // semantics: CRLF, bare-LF, or mixed line endings all legal) or the
+        // backend closes.
         loop {
             let mut temp_buf = ReadBuf::new(&mut this.read_buf);
             match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
@@ -208,7 +211,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         break;
                     }
                     // Guard against memory exhaustion from backends that
-                    // never send \r\n\r\n.
+                    // never terminate the head with a blank line (the cap
+                    // still bounds a backend that sends no blank line at
+                    // all, whatever EOL convention it uses).
                     if this.buffer.len() + n > 65536 {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -216,11 +221,37 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         )));
                     }
                     this.buffer.extend_from_slice(&this.read_buf[..n]);
-                    // The boundary may span internal reads — the search
+                    // The head end may span internal reads — the search
                     // covers the whole buffer.
-                    if let Some(pos) = this.buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    if let Some(end) = frp_core::textproto::head_end(&this.buffer) {
+                        // `end` is past the terminating blank line. The
+                        // blank line itself is exactly "\n" or "\r\n" (a
+                        // line textproto deemed empty keeps at most one
+                        // trailing "\r") and stays attached to the head:
+                        // the configured headers must go out BEFORE it —
+                        // bytes after the blank line are the backend's
+                        // entity body and pass verbatim.
+                        let blank_start = if end >= 2 && this.buffer[end - 2] == b'\r' {
+                            end - 2
+                        } else {
+                            end - 1
+                        };
+                        // Go http.ReadResponse rejects a head whose FIRST
+                        // line is empty (the head starting with its own
+                        // blank line means no status line exists) — such a
+                        // backend answer is malformed, and splicing
+                        // configured headers in front of it would
+                        // manufacture a plausible response out of garbage.
+                        // Fail the read like Go's reverse proxy would
+                        // (round-3 review finding).
+                        if blank_start == 0 {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "backend response head has no status line",
+                            )));
+                        }
                         let mut injected = Vec::with_capacity(this.buffer.len() + 512);
-                        injected.extend_from_slice(&this.buffer[..pos]);
+                        injected.extend_from_slice(&this.buffer[..blank_start]);
                         for (k, v) in &this.headers {
                             // Sanitize header names/values to prevent HTTP
                             // header injection.
@@ -228,11 +259,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                                 k.chars().filter(|&c| c != '\r' && c != '\n').collect();
                             let safe_v: String =
                                 v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                            // Configured headers always go out CRLF (Go
+                            // net/http renders every response header CRLF,
+                            // whatever the backend wrote) — a backend
+                            // LF-only head intentionally ends up mixed-EOL;
+                            // the injected lines remain parseable and the
+                            // trailing blank keeps the backend's own EOL.
                             injected.extend_from_slice(
                                 format!("{}: {}\r\n", safe_k, safe_v).as_bytes(),
                             );
                         }
-                        injected.extend_from_slice(&this.buffer[pos..]);
+                        injected.extend_from_slice(&this.buffer[blank_start..]);
                         this.buffer = injected;
                         this.injected = true;
                         break;
@@ -2374,5 +2411,68 @@ mod tests {
 
         let out = injector_read_all(&mut injector).await;
         assert_eq!(&out, b"no-header-terminator-here");
+    }
+
+    /// Audit round 7 (S1 family): a backend response head with bare-LF line
+    /// endings is legal under Go textproto.ReadLine semantics (each line
+    /// ends at the next `\n`, ONE trailing `\r` is stripped, the head ends
+    /// at the first empty line) but contains no `\r\n\r\n` window. The old
+    /// strict-CRLF scan never found a boundary: injection was skipped and
+    /// the head read on until EOF. RED on the old scan — the fix must
+    /// terminate the gather at the LF blank line, emit the configured
+    /// header as a REAL header line BEFORE the head/body blank line (bytes
+    /// past it are the backend's body and pass verbatim), and keep the
+    /// body intact after it.
+    #[tokio::test]
+    async fn injector_lf_only_head_injects_at_blank_line() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+
+        let response = "HTTP/1.1 200 OK\nContent-Type: text/plain\n\nhello";
+        inner_w.write_all(response.as_bytes()).await.expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        // Byte-exact pin: head lines verbatim (LF kept), the injected
+        // header line CRLF-terminated BEFORE the backend's blank line, the
+        // blank line itself and the body verbatim after it.
+        let expected = b"HTTP/1.1 200 OK\nContent-Type: text/plain\nX-Injected: yes\r\n\nhello";
+        assert_eq!(
+            &out[..],
+            expected,
+            "LF-only head must terminate at the blank line with the header injected"
+        );
+    }
+
+    #[tokio::test]
+    async fn injector_empty_first_line_is_rejected_not_prepended() {
+        // Go http.ReadResponse rejects a head with no status line (the head
+        // starting with its own blank line) — the old splice prepended the
+        // configured headers to the garbage and forwarded it as a plausible
+        // 200-ish response (round-3 review finding).
+        use tokio::io::AsyncWriteExt;
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+
+        for garbage in [
+            "\r\nHTTP/1.1 200 OK\r\n\r\nbody",
+            "\nHTTP/1.1 200 OK\n\nbody",
+        ] {
+            let (mut w, r) = tokio::io::duplex(64 * 1024);
+            let mut injector = ResponseHeaderInjector::new(r, headers.clone());
+            w.write_all(garbage.as_bytes()).await.expect("write");
+            w.shutdown().await.expect("shutdown");
+            drop(w);
+            let mut buf = Vec::new();
+            let res = tokio::io::AsyncReadExt::read_to_end(&mut injector, &mut buf).await;
+            assert!(
+                res.is_err(),
+                "an empty first line must error, not forward: {garbage:?}"
+            );
+        }
     }
 }

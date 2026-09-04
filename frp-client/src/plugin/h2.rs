@@ -451,13 +451,18 @@ async fn send_h2_error(
     Ok(())
 }
 
-/// Read bytes until the end of the HTTP/1.1 response head (`\r\n\r\n`),
-/// returning head + any body bytes that arrived with it.
+/// Read bytes until the end of the HTTP/1.1 response head, returning head +
+/// any body bytes that arrived with it.
+///
+/// Head end follows Go `textproto` semantics (the engine behind
+/// `http.ReadResponse`): each line ends at the next `\n` with ONE trailing
+/// `\r` stripped, and the first empty line ends the head — so LF-only and
+/// mixed-EOL backends are legal, not just `\r\n\r\n`.
 async fn read_until_head(r: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        if frp_core::textproto::head_end(&buf).is_some() {
             return Ok(buf);
         }
         // Guard against a malicious backend with unbounded headers.
@@ -505,16 +510,47 @@ fn trim_ascii_ws(mut b: &[u8]) -> &[u8] {
 }
 
 fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
-    let head_end = head.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    // Head end under Go textproto semantics (same helper as read_until_head),
+    // so LF-only / mixed-EOL backends parse instead of falling through to the
+    // caller's malformed-head 502.
+    let head_end = frp_core::textproto::head_end(head)?;
     let head_bytes = &head[..head_end];
-    let first_crlf = head_bytes.windows(2).position(|w| w == b"\r\n")?;
-    let status_line = std::str::from_utf8(&head_bytes[..first_crlf]).ok()?;
-    let mut parts = status_line.split_whitespace();
-    parts.next()?; // HTTP/1.1
-    let status: u16 = parts.next()?.parse().ok()?;
+    // Status line = first line under the same textproto rule: up to the next
+    // `\n`, ONE trailing `\r` stripped.
+    let first_nl = head_bytes.iter().position(|&b| b == b'\n')?;
+    let mut status_line = &head_bytes[..first_nl];
+    if status_line.last() == Some(&b'\r') {
+        status_line = &status_line[..status_line.len() - 1];
+    }
+    let status_line = std::str::from_utf8(status_line).ok()?;
+    // Go http.ReadResponse splits the status line at the FIRST literal
+    // space (strings.Cut, response.go) — a tab-separated
+    // "HTTP/1.1\t200 OK" keeps the tab inside the version token and fails
+    // ParseHTTPVersion below. split(' ') + empty-skip mirrors that
+    // (multi-space between version and code stays legal, like Go's
+    // TrimLeft).
+    let mut parts = status_line.split(' ');
+    // Go http.ReadResponse gates (response.go — round-3 review): the
+    // version token must be one of ParseHTTPVersion's exact-match set and
+    // the code token exactly 3 digits BEFORE conversion, so "HTTP/9.9 200"
+    // / "HTTP/1.1 0200 OK" / "FOO 200 OK" are all malformed → 502, never
+    // forwarded.
+    let version = parts.next()?;
+    if !frp_core::textproto::is_valid_http_version(version) {
+        return None;
+    }
+    let code_token = parts.find(|p| !p.is_empty())?;
+    if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let status: u16 = code_token.parse().ok()?;
 
     let mut headers = Vec::new();
-    for line in head_bytes[first_crlf + 2..head_end - 2].split(|&b| b == b'\n') {
+    // Header lines run from after the status line to head_end (which includes
+    // the terminating blank line); splitting on '\n' with a single trailing
+    // '\r' strip makes the final blank line split into an empty entry that
+    // the empty check below skips — uniform for CRLF and LF heads alike.
+    for line in head_bytes[first_nl + 1..head_end].split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let line = trim_ascii_ws(line);
         if line.is_empty() {
@@ -550,7 +586,18 @@ fn header_value<'a>(
 fn parse_hex(b: &[u8]) -> std::io::Result<usize> {
     let s = std::str::from_utf8(b)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
-    usize::from_str_radix(s.trim(), 16)
+    let s = s.trim();
+    // Go parseHexUint (net/http/transfer.go) accepts ONLY 0-9a-fA-F — a
+    // leading '+' is "invalid byte in chunk length". Rust's from_str_radix
+    // accepts "+5" for any radix; reject the '+' explicitly ('-' already
+    // fails from_str_radix for radix 16). Twin of frp-server vhost_h2c.rs.
+    if s.starts_with('+') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad chunk size",
+        ));
+    }
+    usize::from_str_radix(s, 16)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))
 }
 
@@ -833,8 +880,23 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_http1_request_head, cap_chunk, parse_response_head};
+    use super::{
+        build_http1_request_head, cap_chunk, header_value, parse_hex, parse_response_head,
+    };
     use std::collections::HashMap;
+
+    #[test]
+    fn parse_hex_rejects_go_invalid_chunk_sizes() {
+        assert_eq!(parse_hex(b"1a").unwrap(), 26);
+        assert_eq!(parse_hex(b" 1A ").unwrap(), 26); // whitespace trimmed
+        assert!(parse_hex(b"").is_err());
+        assert!(parse_hex(b"zz").is_err());
+        assert!(parse_hex(b"-1").is_err());
+        // Go parseHexUint accepts ONLY 0-9a-fA-F — "+5" is an invalid byte
+        // in a chunk length even though Rust's from_str_radix would accept
+        // the leading '+' for radix 16 (server twin vhost_h2c.rs:1294).
+        assert!(parse_hex(b"+5").is_err());
+    }
 
     #[test]
     fn parse_response_head_parses_normal_head() {
@@ -856,13 +918,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_head_accepts_any_u16_status_but_builder_rejects_invalid() {
-        // 1000 is outside the valid HTTP status range (100..=999): the parser
-        // accepts any u16, but http's builder rejects it — production code
-        // maps that rejection to Err (h2::Error) instead of panicking.
-        let head = b"HTTP/1.1 1000 Weird\r\n\r\n";
-        let parsed = parse_response_head(head).expect("1000 parses as a u16 status");
-        assert_eq!(parsed.status, 1000);
+    fn parse_response_head_status_token_is_exactly_three_digits() {
+        // Go http.ReadResponse checks the status-code token length == 3
+        // BEFORE strconv.Atoi (net/http/response.go): a 4-digit token —
+        // "1000" (out of u16 range is irrelevant) or "0200" (leading zero) —
+        // is a malformed response, never a status. Round-3 review: the old
+        // "accepts any u16" behavior was false parity. 100..=999 is the
+        // complete valid range (builder rejects only < 100 / > 999).
+        assert!(parse_response_head(b"HTTP/1.1 1000 Weird\r\n\r\n").is_none());
+        assert!(parse_response_head(b"HTTP/1.1 0200 OK\r\n\r\n").is_none());
+        let parsed = parse_response_head(b"HTTP/1.1 999 Weird\r\n\r\n").expect("999 is 3 digits");
+        assert_eq!(parsed.status, 999);
 
         // Locks in the fix contract: production code maps the builder error to
         // Err (h2::Error) instead of panicking with expect. If someone reverts
@@ -879,6 +945,14 @@ mod tests {
         // No "\r\n\r\n" terminator and an empty head both yield None.
         assert!(parse_response_head(b"garbage\r\n\r\n").is_none());
         assert!(parse_response_head(b"").is_none());
+        // Tab-separated status line → None: Go strings.Cut splits at the
+        // first literal space, so the tab stays inside the version token and
+        // ParseHTTPVersion rejects it (split_whitespace used to accept and
+        // forward such heads — round-7 review NIT).
+        assert!(parse_response_head(b"HTTP/1.1\t200 OK\r\n\r\n").is_none());
+        // Multi-space between version and code stays legal (Go TrimLeft).
+        let parsed = parse_response_head(b"HTTP/1.1  200 OK\r\n\r\n").expect("multi-space parses");
+        assert_eq!(parsed.status, 200);
     }
 
     #[test]
@@ -995,6 +1069,70 @@ mod tests {
         assert!(
             !head.contains("198.51.100.23"),
             "peer must not leak: {head}"
+        );
+    }
+
+    /// Audit round-7 S1 pin (mirrors the frp-server vhost_h2c
+    /// test_parse_response_head_textproto_eol shapes): response heads whose
+    /// EOLs are not CRLF throughout still parse. RED pre-fix: the strict
+    /// \r\n\r\n + \r\n scans returned None for every shape below (LF-only,
+    /// mixed, and CRLF-lines + LF-blank).
+    #[test]
+    fn parse_response_head_textproto_eol() {
+        // LF-only backend response head.
+        let head = b"HTTP/1.1 200 OK\nContent-Type: text/plain\nContent-Length: 11\n\nbody";
+        let parsed = parse_response_head(head).expect("LF-only head parses");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(
+            parsed.body_offset,
+            head.len() - 4,
+            "body starts after the LF blank line"
+        );
+        assert_eq!(
+            header_value(&parsed.headers, "content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/plain"
+        );
+        assert_eq!(
+            header_value(&parsed.headers, "content-length")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "11"
+        );
+        // Mixed EOLs in one head: LF status line + CRLF headers + LF blank.
+        let head = b"HTTP/1.1 200 OK\nX-A: 1\r\nX-B: 2\n\nbody";
+        let parsed = parse_response_head(head).expect("mixed-EOL head parses");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body_offset, head.len() - 4);
+        assert_eq!(
+            header_value(&parsed.headers, "x-a")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            header_value(&parsed.headers, "x-b")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "2"
+        );
+        // CRLF status line + LF-only blank line (contains neither \r\n\r\n
+        // nor the \r\n-scanned blank the pre-fix arithmetic expected).
+        let head = b"HTTP/1.1 200 OK\r\nX-C: 3\n\nbody";
+        let parsed = parse_response_head(head).expect("CRLF lines + LF blank parses");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body_offset, head.len() - 4);
+        assert_eq!(
+            header_value(&parsed.headers, "x-c")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "3"
         );
     }
 }

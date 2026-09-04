@@ -757,7 +757,10 @@ password = "admin"
         c.write_all(req).await.expect("send CONNECT");
         let mut buf = Vec::new();
         let mut chunk = [0u8; 128];
-        while !buf.ends_with(b"\r\n\r\n") {
+        // Stop at the head terminator wherever it appears: rejections now
+        // carry Go's NotFoundResponse body (Content-Length + 489-byte HTML
+        // page) after the head, so the head does not end the buffer.
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
             let n = tokio::time::timeout(std::time::Duration::from_secs(2), c.read(&mut chunk))
                 .await
                 .expect("timeout reading the CONNECT response")

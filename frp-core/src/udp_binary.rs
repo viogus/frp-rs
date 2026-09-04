@@ -36,21 +36,51 @@ const UDP_PACKET_VALID_FLAGS: u8 = UDP_PACKET_FLAG_LOCAL_ADDR | UDP_PACKET_FLAG_
 /// Codec name advertised/selected during the V2 handshake (Go: wire.UDPPacketCodecBinary).
 pub const UDP_PACKET_CODEC_BINARY: &str = "binary-v1";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BinaryUdpAddr {
+/// Stack-only pre-encoded form of one `binaryUDPAddr` — the zero-allocation
+/// replacement for the former `BinaryUdpAddr` (Vec ip + String zone)
+/// intermediates, which cost one Vec and one String heap alloc per address
+/// per datagram (audit P1). The ip octets sit in a fixed 16-byte array and
+/// the zone is borrowed from the source [`UdpAddr`], so nothing is cloned or
+/// heap-allocated anywhere in the encode chain; the wire bytes are pushed
+/// straight from here into the caller's output buffer.
+#[derive(Clone, Copy, Debug)]
+struct EncAddr<'a> {
     family: u8,
-    ip: Vec<u8>,
+    /// 4 (family 4) or 16 (family 6) octets, at the front of the array.
+    ip: [u8; 16],
+    ip_len: usize,
     port: u16,
-    zone: String,
+    /// Zone bytes; empty for family 4 and for every
+    /// [`std::net::SocketAddr`] source (std has no zone names).
+    zone: &'a str,
 }
 
-impl BinaryUdpAddr {
+impl EncAddr<'_> {
     fn len(&self) -> usize {
-        1 + self.ip.len() + 2 + 1 + self.zone.len()
+        1 + self.ip_len + 2 + 1 + self.zone.len()
     }
 }
 
-fn addr_to_binary(addr: &UdpAddr) -> Result<BinaryUdpAddr, String> {
+/// Build a pre-encoded address from parsed octets and a borrowed zone. The
+/// octets are copied into the fixed stack array — no heap allocation.
+fn enc_from_octets<'a>(family: u8, octets: &[u8], port: u16, zone: &'a str) -> EncAddr<'a> {
+    debug_assert!(matches!((family, octets.len()), (4, 4) | (6, 16)));
+    let mut ip = [0u8; 16];
+    ip[..octets.len()].copy_from_slice(octets);
+    EncAddr {
+        family,
+        ip,
+        ip_len: octets.len(),
+        port,
+        zone,
+    }
+}
+
+/// Validate a message-form [`UdpAddr`] into its pre-encoded form (audit P1:
+/// the former `addr_to_binary` built a Vec ip + String zone per address;
+/// this parses the ip String in place and borrows the zone — no heap
+/// allocation). Error strings and Go-parity rules are unchanged.
+fn udp_addr_to_enc(addr: &UdpAddr) -> Result<EncAddr<'_>, String> {
     if addr.port == 0 && addr.ip.is_empty() {
         // Zero-valued UdpAddr (e.g. a default-constructed placeholder) has no
         // valid encoding; treat as error rather than emitting garbage.
@@ -65,12 +95,7 @@ fn addr_to_binary(addr: &UdpAddr) -> Result<BinaryUdpAddr, String> {
             if !addr.zone.is_empty() {
                 return Err("IPv4 zone is forbidden".into());
             }
-            Ok(BinaryUdpAddr {
-                family: 4,
-                ip: v4.octets().to_vec(),
-                port: addr.port,
-                zone: String::new(),
-            })
+            Ok(enc_from_octets(4, &v4.octets(), addr.port, ""))
         }
         std::net::IpAddr::V6(v6) => {
             // Go frp's validateBinaryUDPAddr applies net.IP.To4() first: an
@@ -82,12 +107,7 @@ fn addr_to_binary(addr: &UdpAddr) -> Result<BinaryUdpAddr, String> {
                 if !addr.zone.is_empty() {
                     return Err("IPv4 zone is forbidden".into());
                 }
-                return Ok(BinaryUdpAddr {
-                    family: 4,
-                    ip: v4.octets().to_vec(),
-                    port: addr.port,
-                    zone: String::new(),
-                });
+                return Ok(enc_from_octets(4, &v4.octets(), addr.port, ""));
             }
             if addr.zone.len() > 255 {
                 return Err("zone exceeds 255 bytes".into());
@@ -98,22 +118,21 @@ fn addr_to_binary(addr: &UdpAddr) -> Result<BinaryUdpAddr, String> {
             // construction and no check is needed: non-ASCII valid-UTF-8 zones
             // (e.g. "接口") encode exactly as Go does (review finding W1). The
             // byte-length cap above matches Go's `len(addr.Zone) > 255`.
-            Ok(BinaryUdpAddr {
-                family: 6,
-                ip: v6.octets().to_vec(),
-                port: addr.port,
-                zone: addr.zone.clone(),
-            })
+            Ok(enc_from_octets(6, &v6.octets(), addr.port, &addr.zone))
         }
     }
 }
 
-fn put_addr(buf: &mut Vec<u8>, addr: &BinaryUdpAddr) {
-    buf.push(addr.family);
-    buf.extend_from_slice(&addr.ip);
-    buf.extend_from_slice(&addr.port.to_be_bytes());
-    buf.push(addr.zone.len() as u8);
-    buf.extend_from_slice(addr.zone.as_bytes());
+/// Append one pre-encoded address: family byte, ip octets, port (2B BE),
+/// zone-length byte, zone bytes — the same wire bytes the former
+/// `put_addr`/`BinaryUdpAddr` pair produced, now pushed straight from the
+/// source octets and the borrowed zone.
+fn put_enc_addr(out: &mut Vec<u8>, addr: &EncAddr<'_>) {
+    out.push(addr.family);
+    out.extend_from_slice(&addr.ip[..addr.ip_len]);
+    out.extend_from_slice(&addr.port.to_be_bytes());
+    out.push(addr.zone.len() as u8);
+    out.extend_from_slice(addr.zone.as_bytes());
 }
 
 /// Raw decoded fields of one `binaryUDPAddr`, before any `String` formatting.
@@ -269,8 +288,12 @@ pub fn encode_udp_packet_binary_into(packet: &UDPPacket, out: &mut Vec<u8>) -> R
             packet.content.len()
         ));
     }
-    let local_b = packet.local_addr.as_ref().map(addr_to_binary).transpose()?;
-    let remote_b = addr_to_binary(remote)?;
+    let local_b = packet
+        .local_addr
+        .as_ref()
+        .map(udp_addr_to_enc)
+        .transpose()?;
+    let remote_b = udp_addr_to_enc(remote)?;
     encode_body(&packet.content, local_b.as_ref(), &remote_b, out)
 }
 
@@ -278,11 +301,15 @@ pub fn encode_udp_packet_binary_into(packet: &UDPPacket, out: &mut Vec<u8>) -> R
 /// the binary codec body, appending after any existing content of `out`.
 ///
 /// Equivalent to [`encode_udp_packet_binary_into`] with `remote_addr` built
-/// from `remote.ip().to_string()`, but skips that per-packet String alloc and
-/// the re-parse in [`addr_to_binary`]: the caller (frp-server UDP bridge
+/// from `remote.ip().to_string()`, but the caller (frp-server UDP bridge
 /// writer) already holds a parsed `SocketAddr` on the V2 binary path, where
 /// the String form exists only for the V1 JSON codec. Output is byte-identical
 /// to the string round trip.
+///
+/// Zero heap allocations per datagram (audit P1): the remote is pre-encoded
+/// straight from its octets and neither address ever builds a Vec/String
+/// intermediate. The message-form `local` (loop-invariant in the callers) is
+/// parsed in place and its zone, if any, is borrowed — nothing cloned.
 pub fn encode_udp_packet_binary_socket_addr(
     content: &[u8],
     local: Option<&UdpAddr>,
@@ -295,8 +322,8 @@ pub fn encode_udp_packet_binary_socket_addr(
             content.len()
         ));
     }
-    let local_b = local.map(addr_to_binary).transpose()?;
-    let remote_b = socket_addr_to_binary(remote);
+    let local_b = local.map(udp_addr_to_enc).transpose()?;
+    let remote_b = socket_addr_to_enc(remote);
     encode_body(content, local_b.as_ref(), &remote_b, out)
 }
 
@@ -306,8 +333,8 @@ pub fn encode_udp_packet_binary_socket_addr(
 /// matches the callers' original ordering.
 fn encode_body(
     content: &[u8],
-    local: Option<&BinaryUdpAddr>,
-    remote: &BinaryUdpAddr,
+    local: Option<&EncAddr<'_>>,
+    remote: &EncAddr<'_>,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
     let mut flags = UDP_PACKET_FLAG_REMOTE_ADDR;
@@ -332,47 +359,33 @@ fn encode_body(
     out.reserve(body_len);
     out.push(flags);
     if let Some(l) = local {
-        put_addr(out, l);
+        put_enc_addr(out, l);
     }
-    put_addr(out, remote);
+    put_enc_addr(out, remote);
     out.extend_from_slice(&(content.len() as u16).to_be_bytes());
     out.extend_from_slice(content);
     debug_assert_eq!(out.len() - start, body_len);
     Ok(())
 }
 
-/// Convert a parsed `SocketAddr` to its binaryUDPAddr form without the
-/// `ip.to_string()` + re-parse round trip. A `SocketAddr` is always valid
-/// (no error paths — no empty IP, no zone), and `SocketAddrV6`'s scope id
-/// is never rendered by `Ipv6Addr::to_string()`, so the resulting bytes are
-/// exactly what [`addr_to_binary`] would produce for the string form.
-fn socket_addr_to_binary(addr: &std::net::SocketAddr) -> BinaryUdpAddr {
+/// Pre-encode a parsed `SocketAddr` without any allocation (audit P1: the
+/// former `socket_addr_to_binary` built a Vec ip + String zone per address).
+/// Infallible — a `SocketAddr` is always valid (no error paths — no empty
+/// IP, no zone), and `SocketAddrV6`'s scope id is never rendered by
+/// `Ipv6Addr::to_string()`, so the resulting bytes are exactly what
+/// [`udp_addr_to_enc`] would produce for the string form.
+fn socket_addr_to_enc(addr: &std::net::SocketAddr) -> EncAddr<'static> {
     match addr {
-        std::net::SocketAddr::V4(v4) => BinaryUdpAddr {
-            family: 4,
-            ip: v4.ip().octets().to_vec(),
-            port: v4.port(),
-            zone: String::new(),
-        },
+        std::net::SocketAddr::V4(v4) => enc_from_octets(4, &v4.ip().octets(), v4.port(), ""),
         std::net::SocketAddr::V6(v6) => {
-            // Same To4() normalization as [`addr_to_binary`]: a dual-stack
+            // Same To4() normalization as [`udp_addr_to_enc`]: a dual-stack
             // socket recv of an IPv4 peer yields an IPv4-mapped address,
             // which must go on the wire as family 4 (Go parity, review
             // finding C1).
             if let Some(v4) = v6.ip().to_ipv4_mapped() {
-                BinaryUdpAddr {
-                    family: 4,
-                    ip: v4.octets().to_vec(),
-                    port: v6.port(),
-                    zone: String::new(),
-                }
+                enc_from_octets(4, &v4.octets(), v6.port(), "")
             } else {
-                BinaryUdpAddr {
-                    family: 6,
-                    ip: v6.ip().octets().to_vec(),
-                    port: v6.port(),
-                    zone: String::new(),
-                }
+                enc_from_octets(6, &v6.ip().octets(), v6.port(), "")
             }
         }
     }
@@ -669,6 +682,89 @@ mod tests {
         assert_eq!(out.remote_addr.as_ref().unwrap().ip, "fe80::1");
         assert_eq!(out.remote_addr.as_ref().unwrap().port, 8080);
         assert_eq!(out.remote_addr.as_ref().unwrap().zone, "接口");
+    }
+
+    /// Exact wire bytes for the zero-alloc encode (audit round 3 finding
+    /// C-LOW-1: the P1 refactor landed no byte-equivalence pins). Go-parity
+    /// rules pinned here: IPv4-mapped IPv6 ("::ffff:a.b.c.d") normalizes to
+    /// family 4 with the dotted-quad octets (Go `net.IP.To4()` in
+    /// `validateBinaryUDPAddr`); zones carry a 1-byte length and arbitrary
+    /// UTF-8 bytes; the `SocketAddr` form must be byte-identical to the
+    /// message form. Layout: flags, [local], remote, payloadLen (2B BE),
+    /// payload.
+    #[test]
+    fn encode_exact_wire_bytes_pin() {
+        // (a) v4 local + remote, message form.
+        let mut expected: Vec<u8> = vec![0x03]; // flags: local | remote
+        expected.extend_from_slice(&[4, 127, 0, 0, 1, 0xCF, 0x09, 0]); // 127.0.0.1:53001
+        expected.extend_from_slice(&[4, 10, 0, 0, 2, 0, 53, 0]); // 10.0.0.2:53
+        expected.extend_from_slice(&[0, 5]); // len 5
+        expected.extend_from_slice(b"hello");
+        assert_eq!(
+            encode_udp_packet_binary(&sample_packet()).unwrap(),
+            expected
+        );
+
+        // (b) IPv4-mapped IPv6 remote — family 4 + dotted-quad octets, NOT
+        // family 6 (Go To4 parity). Empty payload.
+        let mapped = UDPPacket {
+            content: vec![],
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "::ffff:192.168.0.1".into(),
+                port: 53,
+                zone: String::new(),
+            }),
+        };
+        let expected: Vec<u8> = vec![0x02, 4, 192, 168, 0, 1, 0, 53, 0, 0, 0];
+        assert_eq!(encode_udp_packet_binary(&mapped).unwrap(), expected);
+
+        // (c) zoned v6 — 16 octets, port BE, zone-length byte then raw zone
+        // bytes; non-ASCII zone (接口 = 6 UTF-8 bytes) pins the byte count.
+        let zoned = UDPPacket {
+            content: vec![],
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "fe80::1".into(),
+                port: 8080,
+                zone: "接口".into(),
+            }),
+        };
+        let mut expected: Vec<u8> = vec![0x02, 6];
+        expected.extend_from_slice(&[
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // fe80::1
+        ]);
+        expected.extend_from_slice(&[0x1F, 0x90]); // port 8080
+        expected.extend_from_slice(&[6]); // zone length
+        expected.extend_from_slice("接口".as_bytes());
+        expected.extend_from_slice(&[0, 0]); // empty payload
+        assert_eq!(encode_udp_packet_binary(&zoned).unwrap(), expected);
+
+        // (d) SocketAddr form is byte-identical to the message form for the
+        // same address (v4, plain v6, and mapped-v6 → family 4).
+        let plain_v4: std::net::SocketAddr = "10.0.0.2:53".parse().unwrap();
+        let expected = vec![0x02, 4, 10, 0, 0, 2, 0, 53, 0, 0, 2, b'h', b'i'];
+        let mut out = Vec::new();
+        encode_udp_packet_binary_socket_addr(b"hi", None, &plain_v4, &mut out).unwrap();
+        assert_eq!(out, expected);
+
+        let plain_v6: std::net::SocketAddr = "[fe80::1]:8080".parse().unwrap();
+        let mut expected: Vec<u8> = vec![0x02, 6];
+        expected.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        expected.extend_from_slice(&[0x1F, 0x90, 0, 0, 0]); // port, empty zone, len 0
+        let mut out = Vec::new();
+        encode_udp_packet_binary_socket_addr(b"", None, &plain_v6, &mut out).unwrap();
+        assert_eq!(out, expected);
+
+        let mapped_v6 = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "::ffff:192.168.0.1".parse().unwrap(),
+            53,
+            0,
+            0,
+        ));
+        let mut out = Vec::new();
+        encode_udp_packet_binary_socket_addr(b"", None, &mapped_v6, &mut out).unwrap();
+        assert_eq!(out, vec![0x02, 4, 192, 168, 0, 1, 0, 53, 0, 0, 0]);
     }
 
     #[test]

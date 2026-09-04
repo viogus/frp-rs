@@ -3,7 +3,10 @@ mod common;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
+use common::{
+    allocate_port, login_with_test_token, read_until_eof, start_test_server, test_auth_cfg,
+    GO_404_NOT_FOUND_RESPONSE,
+};
 use frp_core::config::ServerConfig;
 use frp_core::msg::{FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
@@ -118,7 +121,10 @@ async fn test_tcpmux_connect_routing() {
     drop(provider);
 }
 
-/// TCPMux: CONNECT to unknown domain returns 404.
+/// TCPMux: CONNECT to unknown domain returns Go's NotFoundResponse
+/// byte-exact — the 92-byte head + 489-byte HTML body = 581 bytes, then
+/// close (probe vs Go frp v0.71.0; no custom_404_page configured). The
+/// old Rust answer (404 with `Content-Length: 0`, no body) diverged.
 #[tokio::test]
 async fn test_tcpmux_unknown_domain_returns_404() {
     let bind_port = allocate_port();
@@ -162,16 +168,251 @@ async fn test_tcpmux_unknown_domain_returns_404() {
         .await
         .expect("send CONNECT");
 
-    let mut response = [0u8; 512];
-    let n = client.read(&mut response).await.expect("read response");
-    let response_text = String::from_utf8_lossy(&response[..n]);
-    assert!(
-        response_text.starts_with("HTTP/1.1 404"),
-        "expected 404 for unknown domain, got: {}",
-        response_text
+    let bytes = read_until_eof(&mut client).await;
+    assert_eq!(
+        bytes,
+        GO_404_NOT_FOUND_RESPONSE.as_bytes(),
+        "expected the Go NotFoundResponse (581 bytes), got: {}",
+        String::from_utf8_lossy(&bytes)
     );
 
-    println!("TCPMux unknown domain 404 verified");
+    println!("TCPMux unknown domain Go-parity 404 verified");
+    drop(client);
+    drop(provider);
+}
+
+/// Audit-r7 EOL fix (shared listener, non-passthrough): a CONNECT whose
+/// head uses bare-LF line endings (legal Go textproto — ReadLine splits on
+/// `\n` and strips one optional `\r`) must be routed and answered. The old
+/// `\r\n\r\n`-window scan never saw the terminator and stalled the shared
+/// listener until its 30s read timeout (silent close).
+///
+/// Non-passthrough semantics: the proxy consumes the head and answers 200;
+/// the tunnel then carries the client's tunneled bytes (the CONNECT head
+/// itself is NOT forwarded to the local service — the byte-exact head
+/// forward is passthrough mode's job, covered by the passthrough test).
+#[tokio::test]
+async fn test_tcpmux_connect_lf_only_head_gets_200_and_tunnel() {
+    let bind_port = allocate_port();
+    let tcpmux_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        tcpmux_httpconnect_port: tcpmux_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+    let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
+
+    // Provider registers a tcpmux proxy and pools a work conn.
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
+    let run_id = resp.run_id.expect("provider should get run_id");
+    let np = FrpMessage::NewProxy(Box::new(tcpmux_proxy(
+        "tcpmux-lf",
+        vec!["lf.example.com".into()],
+        "127.0.0.1:22",
+    )));
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
+    let _ = read_msg_v1(&mut provider).await.expect("read NewProxyResp");
+    let mut work_conn = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("work conn connect");
+    write_msg_v1(
+        &mut work_conn,
+        &FrpMessage::NewWorkConn(frp_core::msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+
+    // LF-only head: every line ends \n, blank line is a bare \n.
+    let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
+        .await
+        .expect("connect to tcpmux port");
+    client
+        .write_all(
+            b"CONNECT lf.example.com:443 HTTP/1.1\n\
+              Host: lf.example.com:443\n\
+              \n",
+        )
+        .await
+        .expect("send LF-only CONNECT");
+
+    // The 200 must arrive promptly (the old terminator scan stalled ~30s).
+    let mut response = [0u8; 256];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.read(&mut response),
+    )
+    .await
+    .expect("timeout waiting for the 200 — the LF head never terminated")
+    .expect("read response");
+    let text = String::from_utf8_lossy(&response[..n]);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "expected 200 for the LF-only CONNECT, got: {text}"
+    );
+
+    // Backend: StartWorkConn for the route.
+    match read_msg_v1(&mut work_conn)
+        .await
+        .expect("read StartWorkConn on work conn")
+    {
+        FrpMessage::StartWorkConn(swc) => {
+            assert_eq!(swc.proxy_name, "tcpmux-lf");
+            assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got: {:?}", other.v1_type_byte()),
+    }
+
+    // The tunnel is live: bytes the client sends after the 200 arrive at
+    // the backend byte-exact (the CONNECT head was consumed by the proxy).
+    client
+        .write_all(b"SSH-PROTO-ECHO\r\n")
+        .await
+        .expect("send tunneled bytes");
+    let mut echoed = [0u8; 64];
+    let m = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        work_conn.read(&mut echoed),
+    )
+    .await
+    .expect("timeout waiting for tunneled bytes")
+    .expect("read tunneled bytes");
+    assert_eq!(
+        &echoed[..m],
+        b"SSH-PROTO-ECHO\r\n",
+        "the tunnel must carry post-200 bytes byte-exact, got: {}",
+        String::from_utf8_lossy(&echoed[..m])
+    );
+
+    drop(client);
+    drop(provider);
+}
+
+/// Audit-r7 EOL fix (passthrough): with `tcpMuxPassthrough`, the server
+/// forwards the WHOLE CONNECT — head included — RAW (Go parity:
+/// httpconnect.go hands the backend a SharedConn whose TeeReader replays
+/// the client's exact wire bytes; frps "won't do any update on traffic",
+/// server.go TCPMuxPassthrough doc). The net/http CRLF re-serialization
+/// exists only on the vhost connectHandler path, never the tcpmux path —
+/// the earlier round-7 canonicalization was a mis-citation and was
+/// reverted. A bare-LF head must arrive at the backend byte-verbatim
+/// (LF kept), with the textproto-lenient head read having terminated at
+/// the LF blank line.
+#[tokio::test]
+async fn test_tcpmux_connect_lf_head_passthrough_raw_bytes() {
+    let bind_port = allocate_port();
+    let tcpmux_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        tcpmux_httpconnect_port: tcpmux_port,
+        tcp_mux_passthrough: true,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+    let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
+
+    // Provider registers a tcpmux proxy and pools a work conn.
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
+    let run_id = resp.run_id.expect("provider should get run_id");
+    let np = FrpMessage::NewProxy(Box::new(tcpmux_proxy(
+        "tcpmux-lf-pass",
+        vec!["lfpass.example.com".into()],
+        "127.0.0.1:22",
+    )));
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
+    let _ = read_msg_v1(&mut provider).await.expect("read NewProxyResp");
+    let mut work_conn = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("work conn connect");
+    write_msg_v1(
+        &mut work_conn,
+        &FrpMessage::NewWorkConn(frp_core::msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+
+    let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
+        .await
+        .expect("connect to tcpmux port");
+    client
+        .write_all(
+            b"CONNECT lfpass.example.com:443 HTTP/1.1\n\
+              Host: lfpass.example.com:443\n\
+              \n",
+        )
+        .await
+        .expect("send LF-only CONNECT");
+
+    // No 200 in passthrough mode (the CRLF passthrough test pins that rule
+    // with a longer negative window; a short one guards this test's shape).
+    let mut response = [0u8; 64];
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        client.read(&mut response),
+    )
+    .await
+    {
+        Err(_) => {}
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!(
+            "passthrough mode must not answer the LF CONNECT, got: {}",
+            String::from_utf8_lossy(&response[..n])
+        ),
+        Ok(Err(e)) => panic!("client read error: {e}"),
+    }
+
+    // Backend: StartWorkConn, then the head forwarded byte-verbatim.
+    match read_msg_v1(&mut work_conn)
+        .await
+        .expect("read StartWorkConn on work conn")
+    {
+        FrpMessage::StartWorkConn(swc) => {
+            assert_eq!(swc.proxy_name, "tcpmux-lf-pass");
+            assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got: {:?}", other.v1_type_byte()),
+    }
+    let mut forwarded = Vec::new();
+    let mut chunk = [0u8; 256];
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !frp_core::textproto::head_end(&forwarded).is_some() {
+            let m = work_conn
+                .read(&mut chunk)
+                .await
+                .expect("read forwarded bytes");
+            assert!(m > 0, "EOF before the forwarded head");
+            forwarded.extend_from_slice(&chunk[..m]);
+        }
+    })
+    .await
+    .expect("timeout waiting for the forwarded CONNECT head");
+    assert_eq!(
+        forwarded,
+        b"CONNECT lfpass.example.com:443 HTTP/1.1\nHost: lfpass.example.com:443\n\n",
+        "the LF head must be forwarded RAW (Go SharedConn replay, no net/http re-serialization on the tcpmux path), got: {}",
+        String::from_utf8_lossy(&forwarded)
+    );
+
     drop(client);
     drop(provider);
 }

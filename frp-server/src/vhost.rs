@@ -551,55 +551,126 @@ impl VhostManager {
         self.lookup_wildcard(domain, path, http_user, scheme).await
     }
 }
-/// Write an HTTP error response, optionally with a custom body.
-/// If custom_body is non-empty, it is used as the response body
-/// with Content-Type: text/html.
-pub(crate) async fn write_http_error(
+/// Go frp v0.71.0 `NotFoundResponse` builtin body (pkg/util/http/http.go)
+/// — served when no `custom_404_page` is configured. 489 bytes; with the
+/// 92-byte head written by [`write_not_found_response`] the full answer is
+/// 581 bytes (probe vs Go v0.71.0).
+pub const GO_404_NOT_FOUND_BODY: &str = concat!(
+    "<!DOCTYPE html>\n",
+    "<html>\n",
+    "<head>\n",
+    "<title>Not Found</title>\n",
+    "<style>\n",
+    "    body {\n",
+    "        width: 35em;\n",
+    "        margin: 0 auto;\n",
+    "        font-family: Tahoma, Verdana, Arial, sans-serif;\n",
+    "    }\n",
+    "</style>\n",
+    "</head>\n",
+    "<body>\n",
+    "<h1>The page you requested was not found.</h1>\n",
+    "<p>Sorry, the page you are looking for is currently unavailable.<br/>\n",
+    "Please try again later.</p>\n",
+    "<p>The server is powered by <a href=\"https://github.com/fatedier/frp\">frp</a>.</p>\n",
+    "<p><em>Faithfully yours, frp.</em></p>\n",
+    "</body>\n",
+    "</html>\n",
+);
+
+/// Write Go frp's `NotFoundResponse` (pkg/util/http/http.go) — the 404
+/// answer on a vhost/tcpmux route miss and on a control-gone (Go
+/// connectHandler's CreateConnection error path answers the same 404, not
+/// a 502). Head order is fixed (Content-Length, Content-Type, Server) and
+/// matches the Go literal byte-for-byte; `custom_body` (custom_404_page)
+/// replaces the builtin HTML when non-empty, with Content-Length tracking
+/// the custom body. Go's stdlib http.Server-layer additions (Date,
+/// Connection: close, charset) that http.Error-based handlers would emit
+/// are absent from frp's own pre-built response — the vhost GET path
+/// writes NotFoundResponse raw, like the CONNECT path.
+pub(crate) async fn write_not_found_response(
     stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
-    status_line: &str,
     custom_body: &str,
 ) {
+    let body: &[u8] = if custom_body.is_empty() {
+        GO_404_NOT_FOUND_BODY.as_bytes()
+    } else {
+        custom_body.as_bytes()
+    };
     // Write failures here mean the client disconnected before receiving the
     // error response — there is no recovery path, so we silently drop them.
     // They are still logged at debug so a hung client that never reads the
     // error response remains observable in traces (audit-round4 H5).
-    if custom_body.is_empty() {
-        if let Err(e) = stream
-            .write_all(format!("{status_line}\r\nContent-Length: 0\r\n\r\n").as_bytes())
-            .await
-        {
-            tracing::debug!(error = %e, "failed to write HTTP error response");
-        }
-    } else {
-        let body = custom_body.as_bytes();
-        if let Err(e) = stream
-            .write_all(
-                format!(
-                    "{status_line}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .await
-        {
-            tracing::debug!(error = %e, "failed to write HTTP error response header");
-        }
-        if let Err(e) = stream.write_all(body).await {
-            tracing::debug!(error = %e, "failed to write HTTP error response body");
-        }
+    let head = format!(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nContent-Type: text/html\r\nServer: frp/{}\r\n\r\n",
+        body.len(),
+        frp_core::VERSION
+    );
+    if let Err(e) = stream.write_all(head.as_bytes()).await {
+        tracing::debug!(error = %e, "failed to write HTTP error response header");
+        return;
+    }
+    if let Err(e) = stream.write_all(body).await {
+        tracing::debug!(error = %e, "failed to write HTTP error response body");
+    }
+}
+
+/// Write the Go `http.Error` auth-fail render (pkg/util/vhost/http.go
+/// ServeHTTP: `rw.Header().Set(...); http.Error(rw, http.StatusText(code),
+/// code)` → Content-Type: text/plain; charset=utf-8 + X-Content-Type-Options:
+/// nosniff + Content-Length + the StatusText body with a trailing '\n').
+/// The fixed fields match Go; the Date header Go's http.Server layer adds
+/// to the live render is omitted in this raw write, and header order is
+/// fixed (Content-Length first) rather than Go's writer order — the same
+/// scoping the NotFoundResponse arms document (shape parity of the
+/// frp-rs-built response, not a live-server byte capture).
+async fn write_http_error_auth_response(
+    stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    status_line: &str,
+    auth_header: &str,
+    body: &str,
+) {
+    let head = format!(
+        "HTTP/1.1 {status_line}\r\n\
+         Content-Length: {}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         {auth_header}\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         \r\n",
+        body.len()
+    );
+    if let Err(e) = stream.write_all(head.as_bytes()).await {
+        tracing::debug!(error = %e, "failed to write auth error response header");
+        return;
+    }
+    if let Err(e) = stream.write_all(body.as_bytes()).await {
+        tracing::debug!(error = %e, "failed to write auth error response body");
     }
 }
 
 /// Upper cap (seconds) applied by `clamp_vhost_timeout`. 24h is far beyond
-/// any real request-head / response-head bound (the value only clocks head
-/// reads); Rust-only hardening — Go frp has no comparable cap on
-/// VhostHTTPTimeout.
+/// any real client-head bound — the value only ever clocks client-side head
+/// reads / handshakes plus the h2c backend response-head read; Rust-only
+/// hardening — Go frp has no comparable cap on VhostHTTPTimeout.
 const VHOST_TIMEOUT_CAP_SECS: u64 = 24 * 60 * 60;
 
-/// Go parity (pkg/util/vhost/http.go `NewHTTPReverseProxy`): a
-/// `vhost_http_timeout <= 0` value floors at 60s; positive values pass
-/// through unchanged. Shared by every vhost accept path (HTTP/1.1 head,
-/// h2c handshake, HTTPS SNI, h2c response-head).
+/// `vhost_http_timeout` normalization shared by every vhost accept path
+/// (HTTP/1.1 head, h2c handshake, HTTPS SNI, h2c response-head): a
+/// `<= 0` value floors at 60s (Go parity for the floor), positive values
+/// pass through unchanged.
+///
+/// Role divergence from Go frp (documented, audit-r7): in Go, `vhost_http_timeout`
+/// feeds ONLY the backend response-head wait — `ResponseHeaderTimeoutS` in
+/// pkg/util/vhost/http.go `NewHTTPReverseProxy`, floored at 60s, a slow
+/// backend head answers 504 — while the client-side head window is a
+/// HARDCODED `ReadHeaderTimeout: 60 * time.Second` http.Server literal in
+/// server/service.go that the config never reaches. frp-rs has one config
+/// and spends it on the client-head window instead (the plain HTTP/1.1
+/// bridge is raw forward with no backend response-head wait — Go's CONNECT
+/// path has none either). The h2c frontend is the exception on both sides:
+/// its backend response-head translation read (vhost_h2c.rs) IS clocked by
+/// this config and answers 504 on expiry, the exact mirror of Go's
+/// ResponseHeaderTimeoutS semantics for that path.
 ///
 /// Positive values are additionally capped at [`VHOST_TIMEOUT_CAP_SECS`]:
 /// the clamped value feeds `Instant::now() + Duration::from_secs(...)` at
@@ -637,9 +708,11 @@ async fn serve_vhost_request<S>(
     // round 3, LOW): the initial read, the h2-preface completion, and the
     // HTTP/1.1 head completion used to each get a FRESH window, letting a
     // drip client ("P" → slow garbage preface → slow head) park the task for
-    // up to 3× vhost_http_timeout. One deadline from first-byte attempt
-    // matches Go's http.Server ReadTimeout (one window covers the whole
-    // request head).
+    // up to 3× vhost_http_timeout. One window covering the whole head also
+    // matches Go's vhost http.Server, which hardcodes
+    // `ReadHeaderTimeout: 60 * time.Second` (server/service.go literal —
+    // the config never reaches it; see clamp_vhost_timeout for the full
+    // role divergence).
     let head_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut buf = [0u8; 4096];
     let n = match tokio::time::timeout_at(head_deadline, stream.read(&mut buf)).await {
@@ -712,8 +785,9 @@ async fn serve_vhost_request<S>(
 }
 
 /// HTTP/1.1 vhost path: finish reading the request head (up to 4096 bytes or
-/// the \r\n\r\n terminator), extract Host/path/auth, resolve the route, and
-/// forward the stream via InternalMsg::ProxyUserConn.
+/// the blank line that ends it under Go textproto semantics — bare-LF and
+/// mixed line endings are legal), extract Host/path/auth, resolve the route,
+/// and forward the stream via InternalMsg::ProxyUserConn.
 ///
 /// The 4096-byte head cap is a deliberate hardening divergence from Go frp
 /// (http.Server defaultMaxHeaderBytes = 1 MiB — a hostile client can send a
@@ -738,9 +812,14 @@ async fn handle_http1_request<S>(
     // serve_vhost_request entry (audit round 3) — a slow-drip client would
     // otherwise stretch the head read to 4096 × timeout, and re-opening a
     // fresh window here would stack on top of the preface phase. The whole
-    // head must arrive within vhost_http_timeout of the first byte,
-    // matching Go frp's connReadTimeout semantics.
-    while pre_read.len() < 4096 && !pre_read.windows(4).any(|w| w == b"\r\n\r\n") {
+    // head must arrive within vhost_http_timeout of the first byte. (There
+    // is no Go "connReadTimeout" construct behind this window: Go frp's
+    // client-head window is the hardcoded 60s ReadHeaderTimeout on its
+    // vhost http.Server, and on this HTTP/1.1 path the config's Go role —
+    // the backend response-head wait — has no counterpart, since the bridge
+    // is raw forward (Go's CONNECT path has none either); the
+    // config-on-client-head divergence is documented on clamp_vhost_timeout.)
+    while pre_read.len() < 4096 && frp_core::textproto::head_end(&pre_read).is_none() {
         let mut buf = [0u8; 4096];
         let m = match tokio::time::timeout_at(head_deadline, stream.read(&mut buf)).await {
             Ok(Ok(m)) if m > 0 => m,
@@ -749,12 +828,14 @@ async fn handle_http1_request<S>(
         pre_read.extend_from_slice(&buf[..m]);
     }
 
-    // The head is capped at 4096 bytes. If the cap fills without the
-    // \r\n\r\n terminator, respond 431 Request Header Fields Too Large
+    // The head is capped at 4096 bytes. If the cap fills without a blank
+    // line (textproto semantics — Go accepts bare-LF/mixed EOL, so the
+    // strict \r\n\r\n scan would 431 legal heads that merely use another
+    // line-ending convention), respond 431 Request Header Fields Too Large
     // instead of forwarding a truncated head — forwarding it makes the
     // backend block waiting for the rest of the head, tying up a work-conn
     // slot (limited DoS on shared vhosts).
-    if pre_read.len() >= 4096 && !pre_read.windows(4).any(|w| w == b"\r\n\r\n") {
+    if pre_read.len() >= 4096 && frp_core::textproto::head_end(&pre_read).is_none() {
         let resp = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = stream.write_all(resp).await;
         return;
@@ -765,19 +846,17 @@ async fn handle_http1_request<S>(
     // `host`/`path` must still be owned Strings: `pre_read` is moved by
     // value into `resolve_vhost_request` below, so we cannot keep references
     // into it across that call.
-    // Only the header block up to the first \r\n\r\n is parsed (audit fix):
+    // Only the header block up to the blank line is parsed (audit fix):
     // bytes past the terminator are entity body or pipelined requests and
     // must not influence routing/auth — a body line like
     // "authorization: Basic ..." must not authenticate the request. Same
-    // bound as inject_vhost_request_headers below.
+    // bound as inject_vhost_request_headers below. The terminator follows
+    // Go net/textproto semantics (head_end): any EOL convention — the blank
+    // line is "\n", "\r\n" or the bare "\n" that closes a bare-LF head.
     // Zero-allocation parse for the common ASCII case; fall back to lossy
     // replacement for non-UTF-8 heads. A 400 here would diverge from Go frp,
     // which tolerates obs-text (0x80-0xFF) bytes in header values.
-    let head_end = pre_read
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(pre_read.len());
+    let head_end = frp_core::textproto::head_end(&pre_read).unwrap_or(pre_read.len());
     let head = &pre_read[..head_end];
     let request_text_cow;
     let request_text: &str = match std::str::from_utf8(head) {
@@ -936,34 +1015,59 @@ async fn handle_http1_request<S>(
                 }
             } else {
                 warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control handler gone", scheme, host, path);
-                write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
+                // Go parity: a CONNECT whose control died surfaces in
+                // connectHandler's CreateConnection failure path
+                // (pkg/util/vhost/http.go:262), which writes the raw
+                // NotFoundResponse — byte-identical here (581B + close). A
+                // GET whose control died goes through the reverse-proxy
+                // ErrorHandler instead (http.go:128-137, a net/http
+                // server-layer render with Date etc.); both arms serve the
+                // same 404 status/body in frp-rs, with the NotFound arm's
+                // documented fixed-shape scoping (no server-layer headers).
+                // NotFoundResponse() (pkg/util/vhost/resource.go) re-reads
+                // custom404Page on EVERY call, so this arm serves the
+                // configured page too — not just the builtin body.
+                write_not_found_response(&mut stream, &state.custom_404_page).await;
             }
         }
         Err(VhostResolveError::Unauthorized { proxy_form: true }) => {
-            // Absolute-form request → Go checkRouteAuthByRequest 407 +
-            // Proxy-Authenticate (http.go:272-277 — realm "Restricted").
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
-                )
-                .await;
-        }
-        Err(VhostResolveError::Unauthorized { proxy_form: false }) => {
-            // Go http.Error 401 + WWW-Authenticate, realm "Restricted"
-            // (http.go:272-277 — Go frp's realm is NOT the old "frp").
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
-                )
-                .await;
-        }
-        Err(VhostResolveError::NotFound) => {
-            write_http_error(
+            // Absolute-form request → Go checkRouteAuthByRequest answers
+            // 407 + Proxy-Authenticate, realm "Restricted"
+            // (pkg/util/vhost/http.go:272-274), rendered by http.Error —
+            // body = http.StatusText(407) + "\n" ("Proxy Authentication
+            // Required\n", 30 bytes). The bare 3-line 407 (no body, no
+            // Content-Length) this arm used to write diverged (round-3
+            // review).
+            write_http_error_auth_response(
                 &mut stream,
-                "HTTP/1.1 404 Not Found",
-                &state.custom_404_page,
+                "407 Proxy Authentication Required",
+                "Proxy-Authenticate: Basic realm=\"Restricted\"",
+                "Proxy Authentication Required\n",
             )
             .await;
+        }
+        Err(VhostResolveError::Unauthorized { proxy_form: false }) => {
+            // Origin-form → Go http.Error 401 + WWW-Authenticate, realm
+            // "Restricted" (http.go:275-277 — Go frp's realm is NOT the old
+            // "frp"), body = http.StatusText(401) + "\n" ("Unauthorized\n",
+            // 12 bytes).
+            write_http_error_auth_response(
+                &mut stream,
+                "401 Unauthorized",
+                "WWW-Authenticate: Basic realm=\"Restricted\"",
+                "Unauthorized\n",
+            )
+            .await;
+        }
+        Err(VhostResolveError::NotFound) => {
+            // Go parity: the vhost GET path answers Go's NotFoundResponse
+            // (the 489-byte builtin body below, or custom_404_page content).
+            // Go's copy additionally carries Date / Connection: close /
+            // charset headers — those are added by net/http's response
+            // writer (http.Server layer), not by Go frp, and frp-rs writes
+            // raw bytes instead. Shape parity with the fixed fields is the
+            // goal, not byte-exactness with a live Go server's dated copy.
+            write_not_found_response(&mut stream, &state.custom_404_page).await;
         }
     }
 }
@@ -1107,6 +1211,19 @@ pub(crate) async fn resolve_vhost_request(
     // synthesized `{route_by_http_user}.{username}` global proxy lookup was a
     // cross-tenant hijack (any registered proxy could impersonate the
     // redirect target) and is removed (audit round 3, M12).
+
+    // EOL canonicalization: the read loop accepts bare-LF/mixed-EOL heads
+    // (Go textproto semantics), but Go net/http re-serializes every parsed
+    // request head with CRLF on write (`req.Write(remote)` — connectHandler
+    // and the reverse proxy both forward the parsed request, never the raw
+    // inbound bytes). The head region is therefore re-encoded here, before
+    // the rewrite/inject block below edits it and before either branch
+    // forwards it; the host-line and header-line scans that follow may rely
+    // on CRLF anchors. Tail bytes (entity body / pipelined requests) are
+    // forwarded verbatim — Go copies the body separately, and a body line
+    // must never be mistaken for a header (audit fix). A CRLF-only head maps
+    // byte-identically (no copy) — the common case.
+    let request_head = frp_core::textproto::canonicalize_head_crlf(request_head);
 
     // Host rewrite + forwarded-header injection apply only to non-CONNECT
     // requests: Go's ServeHTTP routes CONNECT to connectHandler, which writes
@@ -1606,16 +1723,17 @@ fn split_path_and_query(path: &str) -> &str {
 /// Returns a new Vec<u8> with the rewritten header. When no Host header is
 /// present, the input is returned unchanged (ownership transferred, no copy).
 fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
-    // Only the header block up to the first \r\n\r\n is scanned (audit fix):
-    // bytes past the terminator are entity body / pipelined requests and
-    // must not be rewritten — a body containing "\r\nhost: evil" must never
-    // be mutated, and a head without a Host header must not rewrite a body
-    // line. Same bound as inject_vhost_request_headers.
-    let head_end = data
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(data.len());
+    // Only the header block up to the first blank line is scanned (audit
+    // fix): bytes past the terminator are entity body / pipelined requests
+    // and must not be rewritten — a body containing "\r\nhost: evil" must
+    // never be mutated, and a head without a Host header must not rewrite a
+    // body line. Same bound as inject_vhost_request_headers. The caller
+    // (resolve_vhost_request) canonicalized the head region to CRLF already,
+    // so the textproto scan and the CRLF-anchored line searches below see
+    // canonical input; the head_end helper still beats a raw "\r\n\r\n"
+    // window scan when a tail that begins "\r\n" would otherwise extend the
+    // window past the true blank line.
+    let head_end = frp_core::textproto::head_end(&data).unwrap_or(data.len());
     let head = &data[..head_end];
     // Search for \r\nHost: anywhere in the head, plus first-line Host:
     let host_pos = {
@@ -1660,8 +1778,10 @@ fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
 /// Inject `X-Forwarded-For` (append semantics, Go httputil.ReverseProxy),
 /// `X-Forwarded-Host` / `X-Forwarded-Proto` (Go `ProxyRequest.SetXForwarded`)
 /// and configured requestHeaders (Set semantics, Go `req.Header.Set`) into
-/// the request head bytes. Only the header block up to `\r\n\r\n` is
-/// touched. The injection runs even when no requestHeaders are configured —
+/// the request head bytes. Only the header block up to the first blank line
+/// is touched (textproto head_end — the caller canonicalized the region to
+/// CRLF already, so the split_inclusive line walk below sees canonical
+/// input). The injection runs even when no requestHeaders are configured —
 /// Go's Rewrite hook (pkg/util/vhost/http.go) unconditionally calls
 /// `r.SetXForwarded()`; a configured header list is not a gate.
 /// `x_forwarded_host` must be the PRE-rewrite inbound Host (Go's
@@ -1673,11 +1793,7 @@ fn inject_vhost_request_headers(
     x_forwarded_host: &str,
     request_headers: &[(String, String)],
 ) -> Vec<u8> {
-    let header_end = data
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(data.len());
+    let header_end = frp_core::textproto::head_end(&data).unwrap_or(data.len());
     let head = &data[..header_end];
     let tail = &data[header_end..];
 
@@ -1688,18 +1804,15 @@ fn inject_vhost_request_headers(
     let mut existing_xff: Vec<u8> = Vec::new();
     // Precompute override prefixes once (case-insensitive ASCII set semantics):
     // `format!("{}:", ...)` + `to_lowercase()` per header line per request is
-    // wasted allocation — header names are ASCII. `config_names` also gates
-    // the auto-emitted X-Forwarded-* lines below (Go Set-replaces them).
-    let mut config_names: Vec<Vec<u8>> = Vec::with_capacity(request_headers.len());
+    // wasted allocation — header names are ASCII, and the trailing ':' is the
+    // line-compare boundary itself. The same Vec gates the auto-emitted
+    // X-Forwarded-* lines below (Go Set-replaces them); stripping the ':'
+    // yields the bare name for those comparisons.
     let mut override_prefixes: Vec<Vec<u8>> = Vec::with_capacity(request_headers.len());
     for (k, _) in request_headers {
-        let name = k.as_bytes().to_ascii_lowercase();
-        override_prefixes.push({
-            let mut p = name.clone();
-            p.push(b':');
-            p
-        });
-        config_names.push(name);
+        let mut p = k.as_bytes().to_ascii_lowercase();
+        p.push(b':');
+        override_prefixes.push(p);
     }
     for line in head.split_inclusive(|&b| b == b'\n') {
         let trimmed = line
@@ -1752,15 +1865,15 @@ fn inject_vhost_request_headers(
     // x-forwarded-for / x-forwarded-host / x-forwarded-proto suppresses the
     // auto line and ships the configured value alone (single header, config
     // wins — never two lines, never an append).
-    let overrides_xff = config_names
+    let overrides_xff = override_prefixes
         .iter()
-        .any(|n| n.as_slice() == b"x-forwarded-for");
-    let overrides_xfh = config_names
+        .any(|p| &p[..p.len() - 1] == b"x-forwarded-for");
+    let overrides_xfh = override_prefixes
         .iter()
-        .any(|n| n.as_slice() == b"x-forwarded-host");
-    let overrides_xfp = config_names
+        .any(|p| &p[..p.len() - 1] == b"x-forwarded-host");
+    let overrides_xfp = override_prefixes
         .iter()
-        .any(|n| n.as_slice() == b"x-forwarded-proto");
+        .any(|p| &p[..p.len() - 1] == b"x-forwarded-proto");
     // X-Forwarded-For: append peer (Go ReverseProxy appends to prior value).
     if !overrides_xff {
         let mut xff = existing_xff;
@@ -1872,7 +1985,8 @@ fn has_nonempty_header(request: &str, header: &str) -> bool {
 }
 
 /// Count Host header lines (RFC 7230 §5.4 allows at most one). Must only be
-/// called on the head (up to the first `\r\n\r\n`) — see `handle_http1_request`.
+/// called on the textproto head region (up to the first blank line, any EOL
+/// convention) — see `handle_http1_request`.
 pub(crate) fn count_host_headers(request: &str) -> usize {
     // Skip the request line: it cannot carry a Host header (RFC 7230 §5.4),
     // and a request-target beginning with "host:" must not be miscounted.
@@ -2762,22 +2876,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_http_error_empty_body() {
+    async fn test_write_not_found_response_go_shape() {
         let mut buf = Vec::new();
-        write_http_error(&mut buf, "HTTP/1.1 404 Not Found", "").await;
+        write_not_found_response(&mut buf, "").await;
+        // Head is fixed-order and fixed-shape vs Go's NotFoundResponse
+        // literal; builtin body is 489 bytes → Content-Length: 489.
         let resp = String::from_utf8_lossy(&buf);
-        assert!(resp.contains("HTTP/1.1 404 Not Found"));
-        assert!(resp.contains("Content-Length: 0"));
+        assert!(resp.starts_with(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 489\r\nContent-Type: text/html\r\nServer: frp/"
+        ));
+        let head_end = resp.find("\r\n\r\n").expect("blank line after the head") + 4;
+        // The body byte count must match the declared Content-Length.
+        assert_eq!(
+            resp.len() - head_end,
+            489,
+            "body length must match Content-Length: 489"
+        );
+        assert!(resp.contains("The page you requested was not found."));
     }
 
     #[tokio::test]
-    async fn test_write_http_error_custom_body() {
+    async fn test_write_not_found_response_custom_body() {
         let mut buf = Vec::new();
-        write_http_error(&mut buf, "HTTP/1.1 404 Not Found", "<h1>Not Found</h1>").await;
+        write_not_found_response(&mut buf, "<h1>Not Found</h1>").await;
         let resp = String::from_utf8_lossy(&buf);
-        assert!(resp.contains("HTTP/1.1 404 Not Found"));
-        assert!(resp.contains("Content-Type: text/html"));
-        assert!(resp.contains("<h1>Not Found</h1>"));
+        // "<h1>Not Found</h1>" is 18 bytes → Content-Length: 18.
+        assert!(resp.starts_with(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 18\r\nContent-Type: text/html\r\nServer: frp/"
+        ));
+        assert!(resp.ends_with("\r\n\r\n<h1>Not Found</h1>"));
+        // A non-empty custom body (even whitespace) replaces the builtin.
+        let mut buf = Vec::new();
+        write_not_found_response(&mut buf, " ").await;
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.contains("Content-Length: 1"));
     }
 
     /// Go frp compat (pkg/util/vhost/router.go): domains are stored

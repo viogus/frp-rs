@@ -756,13 +756,18 @@ async fn send_h2_error(
     Ok(())
 }
 
-/// Read bytes until the end of the HTTP/1.1 response head (`\r\n\r\n`),
-/// returning head + any body bytes that arrived with it.
+/// Read bytes until the end of the HTTP/1.1 response head, returning head +
+/// any body bytes that arrived with it.
+///
+/// Head end follows Go `textproto` semantics (the engine behind
+/// `http.ReadResponse`): each line ends at the next `\n` with ONE trailing
+/// `\r` stripped, and the first empty line ends the head — so LF-only and
+/// mixed-EOL backends are legal, not just `\r\n\r\n`.
 async fn read_until_head(r: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        if frp_core::textproto::head_end(&buf).is_some() {
             return Ok(buf);
         }
         // Guard against a malicious backend with unbounded headers.
@@ -810,16 +815,47 @@ fn trim_ascii_ws(mut b: &[u8]) -> &[u8] {
 }
 
 fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
-    let head_end = head.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    // Head end under Go textproto semantics (same helper as read_until_head),
+    // so LF-only / mixed-EOL backends parse instead of falling through to the
+    // caller's malformed-head 502.
+    let head_end = frp_core::textproto::head_end(head)?;
     let head_bytes = &head[..head_end];
-    let first_crlf = head_bytes.windows(2).position(|w| w == b"\r\n")?;
-    let status_line = std::str::from_utf8(&head_bytes[..first_crlf]).ok()?;
-    let mut parts = status_line.split_whitespace();
-    parts.next()?; // HTTP/1.1
-    let status: u16 = parts.next()?.parse().ok()?;
+    // Status line = first line under the same textproto rule: up to the next
+    // `\n`, ONE trailing `\r` stripped.
+    let first_nl = head_bytes.iter().position(|&b| b == b'\n')?;
+    let mut status_line = &head_bytes[..first_nl];
+    if status_line.last() == Some(&b'\r') {
+        status_line = &status_line[..status_line.len() - 1];
+    }
+    let status_line = std::str::from_utf8(status_line).ok()?;
+    // Go http.ReadResponse splits the status line at the FIRST literal
+    // space (strings.Cut, response.go) — a tab-separated
+    // "HTTP/1.1\t200 OK" keeps the tab inside the version token and fails
+    // ParseHTTPVersion below. split(' ') + empty-skip mirrors that
+    // (multi-space between version and code stays legal, like Go's
+    // TrimLeft).
+    let mut parts = status_line.split(' ');
+    // Go http.ReadResponse gates (response.go — round-3 review): the
+    // version token must be one of ParseHTTPVersion's exact-match set and
+    // the code token exactly 3 digits BEFORE conversion, so "HTTP/9.9 200"
+    // / "HTTP/1.1 0200 OK" / "FOO 200 OK" are all malformed → 502, never
+    // forwarded.
+    let version = parts.next()?;
+    if !frp_core::textproto::is_valid_http_version(version) {
+        return None;
+    }
+    let code_token = parts.find(|p| !p.is_empty())?;
+    if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let status: u16 = code_token.parse().ok()?;
 
     let mut headers = Vec::new();
-    for line in head_bytes[first_crlf + 2..head_end - 2].split(|&b| b == b'\n') {
+    // Header lines run from after the status line to head_end (which includes
+    // the terminating blank line); splitting on '\n' with a single trailing
+    // '\r' strip makes the final blank line split into an empty entry that
+    // the empty check below skips — uniform for CRLF and LF heads alike.
+    for line in head_bytes[first_nl + 1..head_end].split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let line = trim_ascii_ws(line);
         if line.is_empty() {
@@ -1320,6 +1356,71 @@ mod tests {
         assert!(parse_response_head(b"HTTP/1.1 200 OK\r\n").is_none()); // no blank line
         assert!(parse_response_head(b"not-http\r\n\r\n").is_none()); // no status token
         assert!(parse_response_head(b"HTTP/1.1 abc\r\n\r\n").is_none()); // non-numeric status
+                                                                         // Tab-separated status line → None: Go strings.Cut splits at the
+                                                                         // first literal space, so the tab stays inside the version token and
+                                                                         // ParseHTTPVersion rejects it (split_whitespace used to accept and
+                                                                         // forward such heads — round-7 review NIT).
+        assert!(parse_response_head(b"HTTP/1.1\t200 OK\r\n\r\n").is_none());
+        // Multi-space between version and code stays legal (Go TrimLeft).
+        assert_eq!(
+            parse_response_head(b"HTTP/1.1  200 OK\r\n\r\n")
+                .unwrap()
+                .status,
+            200
+        );
+    }
+
+    #[test]
+    fn test_parse_response_head_textproto_eol() {
+        // LF-only backend response head (textproto-legal; RED before the
+        // audit round-7 S1 fix: strict \r\n\r\n + \r\n scans returned None).
+        let head = b"HTTP/1.1 200 OK\nContent-Type: text/plain\nContent-Length: 11\n\nbody";
+        let parsed = parse_response_head(head).expect("LF-only head parses");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(
+            parsed.body_offset,
+            head.len() - 4,
+            "body starts after the LF blank line"
+        );
+        assert_eq!(
+            header_value(&parsed.headers, "content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/plain"
+        );
+        // Mixed EOLs in one head: LF status line + CRLF headers + LF blank.
+        let head = b"HTTP/1.1 200 OK\nX-A: 1\r\nX-B: 2\n\nbody";
+        let parsed = parse_response_head(head).expect("mixed-EOL head parses");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body_offset, head.len() - 4);
+        assert_eq!(
+            header_value(&parsed.headers, "x-a")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            header_value(&parsed.headers, "x-b")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "2"
+        );
+        // CRLF status line + LF-only blank line (the pre-fix \r\n\r\n scan
+        // missed this shape too: `\r\n\n` contains neither window).
+        let head = b"HTTP/1.1 200 OK\r\nX-C: 3\n\nbody";
+        let parsed = parse_response_head(head).expect("CRLF lines + LF blank parses");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body_offset, head.len() - 4);
+        assert_eq!(
+            header_value(&parsed.headers, "x-c")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "3"
+        );
     }
 
     #[test]
