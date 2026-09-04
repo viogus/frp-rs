@@ -1121,4 +1121,253 @@ mod tests {
         );
         assert_eq!(build_health_check_url("::1", "/x"), "http://127.0.0.1:0/x");
     }
+
+    // ---- GAP2 (round-6 audit): run_tcp_check arms never pinned ----
+
+    #[tokio::test]
+    async fn tcp_check_success_and_refused_arms() {
+        // Success: a real listener accepts the probe connect.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        assert!(run_tcp_check(&addr, Duration::from_secs(5)).await.is_ok());
+        drop(listener);
+        // Refused: the port is closed — deterministic on loopback.
+        let err = run_tcp_check(&addr, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.contains("TCP connect"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn tcp_check_timeout_arm_fires() {
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737 — never routed, never answered),
+        // so the probe's own 100ms budget is what reaps the dial — except on
+        // hosts without a default route, where connect(2) fails
+        // synchronously with EHOSTUNREACH before any timer can run. Loopback
+        // cannot pin this arm at all (a closed 127/8 port answers
+        // ECONNREFUSED on the kernel's first connect() call). Both outcomes
+        // are accepted: routed hosts (CI) exercise the timeout arm, unrouted
+        // hosts (offline sandboxes) exercise the dial-error arm that
+        // tcp_check_success_and_refused_arms pins via ECONNREFUSED.
+        let err = run_tcp_check("192.0.2.1:9", Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(
+            err == "timeout" || err.contains("TCP connect:"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ---- GAP3 (round-6 audit): http probe whole-chain deadline + head
+    // EOF/cap/empty edges ----
+
+    /// Server that answers each connection with `raw` bytes verbatim (no
+    /// added framing), or stays silent when `raw` is None. The probe's own
+    /// read shapes decide the outcome — these pins script what a real
+    /// (misbehaving or terse) server can send.
+    async fn spawn_raw_server(raw: Option<Vec<u8>>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                match raw.as_ref() {
+                    Some(bytes) => {
+                        let mut buf = [0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let _ = sock.write_all(bytes).await;
+                    }
+                    None => {
+                        // Stalling server: read the request, then hold the
+                        // connection open without answering (dropping the
+                        // socket would surface as EOF, not a stall).
+                        let mut buf = [0u8; 4096];
+                        let _ = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf))
+                            .await;
+                        let _ = tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn http_probe_stalling_server_hits_single_deadline() {
+        // The WHOLE chain runs under one timeout: a first-hop server that
+        // accepts and never responds must release the check within (a small
+        // multiple of) the budget — not hang the health task.
+        let (addr, _handle) = spawn_raw_server(None).await;
+        let url = format!("http://{addr}/healthz");
+        let started = tokio::time::Instant::now();
+        let err = run_http_check(&addr, &url, Duration::from_millis(200), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(err, "timeout");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "single-deadline breach: check took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_head_eof_without_blank_line_succeeds() {
+        // Connection: close servers may end the head at EOF without the
+        // CRLFCRLF terminator — the head reader stops at EOF and the
+        // status line still parses.
+        let (addr, _handle) =
+            spawn_raw_server(Some(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n".to_vec())).await;
+        let url = format!("http://{addr}/healthz");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_probe_empty_response_fails() {
+        // Peer closes without a single byte: empty head → parse error, a
+        // fail-closed verdict (Go: io.ReadAll gets EOF → error).
+        let (addr, _handle) = spawn_raw_server(Some(Vec::new())).await;
+        let url = format!("http://{addr}/healthz");
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("empty response"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn http_probe_oversized_head_fails_closed() {
+        // >16 KiB of header junk with no blank line: the head reader stops
+        // at its cap and the unparsable head fails the probe (bounded
+        // memory, fail-closed verdict).
+        let junk = vec![b'a'; MAX_HEALTH_RESPONSE_HEAD + 1024];
+        let (addr, _handle) = spawn_raw_server(Some(junk)).await;
+        let url = format!("http://{addr}/healthz");
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("malformed status line"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_oversized_head_with_valid_status_line_still_passes() {
+        // Cap is a memory bound, not a correctness gate: a valid status
+        // line with an enormous (unterminated) header block still yields
+        // the status verdict — the probe never reads past the head, so no
+        // drain cost applies (documented divergence from Go's io.Copy
+        // drain, which exists only to reuse keep-alive conns).
+        let mut head = b"HTTP/1.1 200 OK\r\n".to_vec();
+        head.extend(std::iter::repeat_n(b'x', MAX_HEALTH_RESPONSE_HEAD));
+        let (addr, _handle) = spawn_raw_server(Some(head)).await;
+        let url = format!("http://{addr}/healthz");
+        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+            .await
+            .is_ok());
+    }
+
+    // ---- GAP8 (round-6 audit): URL/authority parse helpers had zero
+    // direct pins (only e2e-shaped indirect coverage) ----
+
+    #[test]
+    fn parse_health_url_shapes() {
+        let u = parse_health_url("http://example.com:8080/healthz?x=1").unwrap();
+        assert_eq!(u.host, "example.com");
+        assert_eq!(u.port, 8080);
+        assert_eq!(u.target, "/healthz?x=1");
+        // Bare authority targets "/"; a leading '?' target gains '/'.
+        assert_eq!(parse_health_url("http://h").unwrap().target, "/");
+        assert_eq!(parse_health_url("http://h?q").unwrap().target, "/?q");
+        // Bracketed IPv6 authority is de-bracketed into the dial host.
+        let u = parse_health_url("http://[::1]:8080/x").unwrap();
+        assert_eq!(u.host, "::1");
+        assert_eq!(u.port, 8080);
+        // Fragments never enter the request target.
+        assert_eq!(parse_health_url("http://h/p#frag").unwrap().target, "/p");
+        // Fail-closed shapes.
+        assert!(parse_health_url("https://h/p").is_err());
+        assert!(parse_health_url("nonsense").is_err());
+        assert!(parse_health_url("http://h:abc/x").is_err());
+        // Empty authority parses with an empty host + default port (Go
+        // url.Parse parity — "http:///path" has Host ""; the probe then
+        // fails at the dial).
+        let u = parse_health_url("http:///path").unwrap();
+        assert!(u.host.is_empty());
+        assert_eq!(u.port, 80);
+    }
+
+    #[test]
+    fn split_url_authority_shapes() {
+        // host:port, default port, bracketed v6 with/without port,
+        // unbracketed v6 from a last-colon split.
+        assert_eq!(split_url_authority("h:80"), Some(("h".into(), 80)));
+        assert_eq!(split_url_authority("h"), Some(("h".into(), 80)));
+        assert_eq!(
+            split_url_authority("[::1]:8080"),
+            Some(("::1".into(), 8080))
+        );
+        assert_eq!(split_url_authority("[::1]"), Some(("::1".into(), 80)));
+        assert_eq!(split_url_authority("::1:8080"), Some(("::1".into(), 8080)));
+        // Fail-closed: empty host, non-numeric port, bracket garbage
+        // ("[::1]x]:80" — Go tooManyColons/missingPort parity), malformed
+        // IPv6 split.
+        assert_eq!(split_url_authority(":80"), None);
+        assert_eq!(split_url_authority("h:abc"), None);
+        assert_eq!(split_url_authority("[::1]x]:80"), None);
+        assert_eq!(split_url_authority("[]:80"), None);
+        assert_eq!(split_url_authority("::1"), None);
+    }
+
+    #[test]
+    fn resolve_redirect_url_shapes() {
+        // Relative reference merges against the base directory (RFC 3986).
+        assert_eq!(
+            resolve_redirect_url("http://h/a/b?q", "ok").unwrap(),
+            "http://h/a/ok"
+        );
+        // Absolute-path reference replaces the whole path.
+        assert_eq!(
+            resolve_redirect_url("http://h/a/b?q", "/new").unwrap(),
+            "http://h/new"
+        );
+        // Scheme-relative reference takes the current scheme.
+        assert_eq!(
+            resolve_redirect_url("http://h/a", "//other/p").unwrap(),
+            "http://other/p"
+        );
+        // Fragment-only Location strips to nothing (no-fragment re-probe).
+        assert_eq!(
+            resolve_redirect_url("http://h/a", "#frag").unwrap(),
+            "http://h/a"
+        );
+        // Empty Location resolves to the current URL (redirect loop is
+        // bounded by the hop counter).
+        assert_eq!(
+            resolve_redirect_url("http://h/a", "").unwrap(),
+            "http://h/a"
+        );
+        // https (or any non-http scheme) is refused — the probe has no TLS
+        // stack; the verdict lands on the redirecting response.
+        assert!(resolve_redirect_url("http://h/a", "https://t/x").is_err());
+    }
+
+    #[test]
+    fn parse_status_line_gates() {
+        // Go ReadResponse/Atoi parity: any HTTP/x.y version, all-digit
+        // codes (leading zeros accepted, Atoi-style), non-numeric codes
+        // and malformed versions fail.
+        assert_eq!(parse_status_code("HTTP/1.1 200 OK"), Some(200));
+        assert_eq!(parse_status_code("HTTP/2.0 200 OK"), Some(200));
+        assert_eq!(parse_status_code("HTTP/1.1 0200 OK"), Some(200));
+        assert_eq!(parse_status_code("HTTP/1.1 200"), Some(200));
+        assert_eq!(parse_status_code("HTTP/1 200 OK"), None);
+        assert_eq!(parse_status_code("HTTP/1.1 20A OK"), None);
+        assert_eq!(parse_status_code("FOO 200 OK"), None);
+        assert_eq!(parse_status_code(""), None);
+    }
 }

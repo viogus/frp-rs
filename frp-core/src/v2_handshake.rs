@@ -1007,4 +1007,286 @@ mod tests {
         }
         server.await.unwrap();
     }
+
+    // --- GAP4: fail-closed handshake validation arms (audit round 3) ---
+    //
+    // Every rejection path in v2_handshake_client_recv_hello (client side)
+    // and v2_handshake_server (server side) is pinned below. Two defensive
+    // arms are NOT scriptable from this module's deterministic cfg: the
+    // client's "UDP packet codec not advertised by client" and "algorithm
+    // not offered by client" checks compare the ServerHello against the
+    // re-derived ClientHello, whose offer always contains binary-v1 plus
+    // every from_str-valid algorithm under the current feature cfg — a
+    // ServerHello cannot name a valid-but-unoffered value in a test build.
+    // Both arms exist to fail closed across cfg drift (chacha20 toggled
+    // between builds); unknown-value rejection on the same comparisons is
+    // covered by client_rejects_unknown_crypto_algorithm and
+    // client_rejects_unknown_udp_packet_codec.
+
+    /// Spawn a fake server that reads one ClientHello frame, answers with
+    /// `answer_type`/`answer_payload`, then closes. Runs the real client
+    /// recv_hello against it and returns the client's result.
+    async fn client_recv_against(
+        answer_type: u16,
+        answer_payload: Vec<u8>,
+        with_crypto: bool,
+    ) -> Result<Option<CryptoContext>, crate::Error> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            let (ft, _, _) = io.read_raw_v2_frame().await.unwrap();
+            assert_eq!(ft, V2_FRAME_TYPE_CLIENT_HELLO);
+            io.write_raw_v2_frame(answer_type, 0, &answer_payload)
+                .await
+                .unwrap();
+        });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        let hello_json =
+            v2_handshake_client_send_hello(&mut client_io, "tcp", false, true, with_crypto)
+                .await
+                .unwrap();
+        let result = v2_handshake_client_recv_hello(
+            &mut client_io,
+            &hello_json,
+            "tcp",
+            false,
+            true,
+            with_crypto,
+        )
+        .await;
+        server.await.unwrap();
+        result
+    }
+
+    /// Assert a protocol error whose Display contains `needle`.
+    fn assert_protocol_err(err: crate::Error, needle: &str) {
+        let msg = err.to_string();
+        assert!(
+            msg.contains(needle),
+            "expected {needle:?} inside protocol error {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_rejects_message_frame_instead_of_serverhello() {
+        // A server answering the ClientHello with the first Message frame
+        // (type=16) skipped ServerHello — fail closed, never treat it as a
+        // successful handshake.
+        let err = client_recv_against(V2_FRAME_TYPE_MESSAGE, b"not a server hello".to_vec(), true)
+            .await
+            .unwrap_err();
+        assert_protocol_err(err, "server skipped ServerHello");
+    }
+
+    #[tokio::test]
+    async fn client_rejects_unknown_frame_type_during_handshake() {
+        let err = client_recv_against(77, b"junk".to_vec(), true)
+            .await
+            .unwrap_err();
+        assert_protocol_err(err, "unexpected V2 frame type during handshake");
+    }
+
+    #[tokio::test]
+    async fn client_rejects_garbage_serverhello_json() {
+        let err = client_recv_against(V2_FRAME_TYPE_SERVER_HELLO, b"not json".to_vec(), true)
+            .await
+            .unwrap_err();
+        assert_protocol_err(err, "deserialize ServerHello");
+    }
+
+    #[tokio::test]
+    async fn client_rejects_serverhello_carrying_error() {
+        let err = client_recv_against(
+            V2_FRAME_TYPE_SERVER_HELLO,
+            serde_json::to_vec(&ServerHello::with_error("boom")).unwrap(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_protocol_err(err, "ServerHello error: boom");
+    }
+
+    #[tokio::test]
+    async fn client_rejects_non_json_message_codec() {
+        // Server selecting a codec other than json is a protocol violation.
+        let mut sh = ServerHello::default_ok();
+        sh.selected.message.codec = Cow::Borrowed("xml");
+        let err = client_recv_against(
+            V2_FRAME_TYPE_SERVER_HELLO,
+            serde_json::to_vec(&sh).unwrap(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_protocol_err(err, "server selected unsupported codec: xml");
+    }
+
+    #[tokio::test]
+    async fn client_rejects_unknown_udp_packet_codec() {
+        let err = client_recv_against(
+            V2_FRAME_TYPE_SERVER_HELLO,
+            serde_json::to_vec(&ServerHello::with_crypto_and_udp(
+                AeadAlgorithm::Aes256Gcm,
+                vec![0u8; CRYPTO_RANDOM_SIZE],
+                "binary-2",
+            ))
+            .unwrap(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_protocol_err(err, "unsupported UDP packet codec");
+    }
+
+    #[tokio::test]
+    async fn client_rejects_unknown_crypto_algorithm() {
+        // Valid wire name space but unknown to this build → from_str Err.
+        let mut sh =
+            ServerHello::with_crypto(AeadAlgorithm::Aes256Gcm, vec![0u8; CRYPTO_RANDOM_SIZE]);
+        sh.selected.crypto.as_mut().unwrap().algorithm = "aes-128-gcm".to_string();
+        let err = client_recv_against(
+            V2_FRAME_TYPE_SERVER_HELLO,
+            serde_json::to_vec(&sh).unwrap(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_protocol_err(err, "server selected unknown algorithm: aes-128-gcm");
+    }
+
+    #[tokio::test]
+    async fn client_rejects_short_server_random() {
+        let err = client_recv_against(
+            V2_FRAME_TYPE_SERVER_HELLO,
+            serde_json::to_vec(&ServerHello::with_crypto(
+                AeadAlgorithm::Aes256Gcm,
+                vec![0u8; 4],
+            ))
+            .unwrap(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_protocol_err(err, "invalid server random length: 4");
+    }
+
+    #[tokio::test]
+    async fn server_rejects_unexpected_first_frame_type() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            v2_handshake_server(&mut io).await
+        });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        client_io.write_raw_v2_frame(77, 0, b"junk").await.unwrap();
+        let err = server.await.unwrap().unwrap_err();
+        assert_protocol_err(err, "unexpected V2 frame type on accept");
+    }
+
+    #[tokio::test]
+    async fn server_rejects_garbage_clienthello_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            v2_handshake_server(&mut io).await
+        });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        client_io
+            .write_raw_v2_frame(V2_FRAME_TYPE_CLIENT_HELLO, 0, b"not json")
+            .await
+            .unwrap();
+        let err = server.await.unwrap().unwrap_err();
+        assert_protocol_err(err, "deserialize ClientHello");
+    }
+
+    #[tokio::test]
+    async fn server_rejects_clienthello_without_json_codec() {
+        // Mirror of the Go unsupported-codec path: the server answers with a
+        // ServerHello carrying the error, then tears down.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            v2_handshake_server(&mut io).await
+        });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        let mut hello = ClientHello::new("tcp", false, true).unwrap();
+        hello.capabilities.message.codecs = vec![Cow::Borrowed("xml")];
+        client_io
+            .write_raw_v2_frame(
+                V2_FRAME_TYPE_CLIENT_HELLO,
+                0,
+                &serde_json::to_vec(&hello).unwrap(),
+            )
+            .await
+            .unwrap();
+        // The client must see the error-carrying ServerHello.
+        let (ft, _, payload) = client_io.read_raw_v2_frame().await.unwrap();
+        assert_eq!(ft, V2_FRAME_TYPE_SERVER_HELLO);
+        let sh: ServerHello = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(sh.error.as_deref(), Some("unsupported message codec"));
+        let err = server.await.unwrap().unwrap_err();
+        assert_protocol_err(err, "ClientHello rejected: unsupported codec");
+    }
+
+    #[tokio::test]
+    async fn server_rejects_crypto_offer_without_client_random() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            v2_handshake_server(&mut io).await
+        });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        let mut hello = ClientHello::new("tcp", false, true).unwrap();
+        hello.capabilities.crypto.client_random = None;
+        client_io
+            .write_raw_v2_frame(
+                V2_FRAME_TYPE_CLIENT_HELLO,
+                0,
+                &serde_json::to_vec(&hello).unwrap(),
+            )
+            .await
+            .unwrap();
+        let err = server.await.unwrap().unwrap_err();
+        assert_protocol_err(err, "no client_random");
+    }
+
+    #[tokio::test]
+    async fn server_rejects_short_client_random() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            v2_handshake_server(&mut io).await
+        });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        let mut hello = ClientHello::new("tcp", false, true).unwrap();
+        hello.capabilities.crypto.client_random = Some(vec![0u8; 4]);
+        client_io
+            .write_raw_v2_frame(
+                V2_FRAME_TYPE_CLIENT_HELLO,
+                0,
+                &serde_json::to_vec(&hello).unwrap(),
+            )
+            .await
+            .unwrap();
+        let err = server.await.unwrap().unwrap_err();
+        assert_protocol_err(err, "invalid client random length: 4");
+    }
 }

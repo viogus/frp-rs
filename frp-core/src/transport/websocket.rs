@@ -1501,6 +1501,51 @@ mod tests {
         assert_eq!(&out[..n2], payload2);
     }
 
+    /// Masked frame with an arbitrary (possibly reserved) opcode — the wire
+    /// shape a broken peer sends to a server-mode stream (mask bit set per
+    /// RFC 6455 §5.3, payload ≤ 125).
+    fn ws_masked_opcode_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask: [u8; 4] = rand::random();
+        let mut frame = vec![0x80 | opcode, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i & 3]);
+        }
+        frame
+    }
+
+    /// GAP9: reserved opcodes must fail closed as a protocol error — never
+    /// swallowed, forwarded, or left hanging (RFC 6455 §5.5: "All other
+    /// opcodes [...] are reserved for future use and MUST NOT be used [...]
+    /// treated as a protocol error"). One reserved non-control (0x3) and one
+    /// reserved control (0xb) shape.
+    #[tokio::test]
+    async fn ws_reserved_opcode_is_protocol_error() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+
+        for opcode in [0x03u8, 0x0b] {
+            let (mut server_io, client_io) = tokio::io::duplex(8192);
+            let mut ws = WsByteStream::from_raw(Box::new(client_io), false);
+            server_io
+                .write_all(&ws_masked_opcode_frame(opcode, &[0x61]))
+                .await
+                .unwrap();
+            let err = timeout(Duration::from_secs(5), ws.read(&mut [0u8; 8]))
+                .await
+                .expect("reserved opcode must error, not hang")
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            let msg = err.to_string();
+            let needle = format!("unexpected WS opcode: {opcode:#x}");
+            assert!(
+                msg.contains(&needle),
+                "expected {needle:?} inside io error {msg:?}"
+            );
+        }
+    }
+
     /// Round-15 finding: the `n == 0` stash arm of dispatch_raw_frame (caller
     /// ReadBuf exactly full) had no coverage — a regression there (lost wake,
     /// dropped stash) would silently stall the tunnel: poll_read returns
