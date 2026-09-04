@@ -97,6 +97,9 @@ rustls = { path = "vendor/rustls" }
 # yamux 0.14.0 with a per-stream RST on inbound stream-cap hits (instead
 # of a session-killing GoAway) — see vendor/yamux/README-FRP-RS.md.
 yamux = { path = "vendor/yamux" }
+# russh 0.62.7 with ssh-key's `encryption` + `ppk` features dropped (dead
+# code in the frp-rs SSH gateway) — see vendor/russh/README-FRP-RS.md.
+russh = { path = "vendor/russh" }
 
 [profile.release]
 opt-level = "z"
