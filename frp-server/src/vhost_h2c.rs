@@ -828,7 +828,13 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
         status_line = &status_line[..status_line.len() - 1];
     }
     let status_line = std::str::from_utf8(status_line).ok()?;
-    let mut parts = status_line.split_whitespace();
+    // Go http.ReadResponse splits the status line at the FIRST literal
+    // space (strings.Cut, response.go) — a tab-separated
+    // "HTTP/1.1\t200 OK" keeps the tab inside the version token and fails
+    // ParseHTTPVersion below. split(' ') + empty-skip mirrors that
+    // (multi-space between version and code stays legal, like Go's
+    // TrimLeft).
+    let mut parts = status_line.split(' ');
     // Go http.ReadResponse gates (response.go — round-3 review): the
     // version token must be one of ParseHTTPVersion's exact-match set and
     // the code token exactly 3 digits BEFORE conversion, so "HTTP/9.9 200"
@@ -838,7 +844,7 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
     if !frp_core::textproto::is_valid_http_version(version) {
         return None;
     }
-    let code_token = parts.next()?;
+    let code_token = parts.find(|p| !p.is_empty())?;
     if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -1350,6 +1356,18 @@ mod tests {
         assert!(parse_response_head(b"HTTP/1.1 200 OK\r\n").is_none()); // no blank line
         assert!(parse_response_head(b"not-http\r\n\r\n").is_none()); // no status token
         assert!(parse_response_head(b"HTTP/1.1 abc\r\n\r\n").is_none()); // non-numeric status
+                                                                         // Tab-separated status line → None: Go strings.Cut splits at the
+                                                                         // first literal space, so the tab stays inside the version token and
+                                                                         // ParseHTTPVersion rejects it (split_whitespace used to accept and
+                                                                         // forward such heads — round-7 review NIT).
+        assert!(parse_response_head(b"HTTP/1.1\t200 OK\r\n\r\n").is_none());
+        // Multi-space between version and code stays legal (Go TrimLeft).
+        assert_eq!(
+            parse_response_head(b"HTTP/1.1  200 OK\r\n\r\n")
+                .unwrap()
+                .status,
+            200
+        );
     }
 
     #[test]

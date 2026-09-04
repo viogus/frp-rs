@@ -507,8 +507,13 @@ pub async fn run_tcpmux_listener(
             // map and nil Body, so net/http writes the status line then
             // "Content-Length: 0" (transfer.go — nil body + ContentLength 0
             // + bodyAllowedForStatus → shouldSendContentLength) then the
-            // blank line. The 407 carries its map headers first, then the
-            // same CL:0.
+            // blank line. The 407 likewise carries "Content-Length: 0"
+            // BEFORE its map headers: raw Response.Write runs
+            // transferWriter.writeHeader (which emits CL) ahead of
+            // Header.WriteSubset (transfer.go:254-308) — Go's
+            // Server-layer path (vhost http.go) emits CL after the map
+            // headers instead, but tcpmux writes via resp.Write(conn),
+            // no server layer.
             //
             // pre_read is built AFTER the auth gate: the 407 path must not
             // allocate a forward buffer it will never send. When it is
@@ -549,8 +554,8 @@ pub async fn run_tcpmux_listener(
                     if let Err(e) = stream
                         .write_all(
                             b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                          Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\
-                          Content-Length: 0\r\n\r\n",
+                          Content-Length: 0\r\n\
+                          Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
                         )
                         .await
                     {
