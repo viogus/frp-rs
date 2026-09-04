@@ -383,26 +383,44 @@ async fn probe_http_hop(
 }
 
 /// Read the response head (status line + headers) into a bounded buffer.
-/// Stops at the CRLFCRLF terminator, at EOF (Connection: close servers may
-/// close without a trailing blank line), or at `MAX_HEALTH_RESPONSE_HEAD`.
-/// Never reads past the head — the body is not drained (see run_http_check).
+///
+/// Verdict-shape parity with Go's `http.ReadResponse` (which health.go's
+/// `DefaultClient.Do` uses): a head only yields a verdict once its CRLFCRLF
+/// terminator has been read. EOF before the terminator is a truncated head
+/// (Go net/textproto maps it to `io.ErrUnexpectedEOF`), and a head that
+/// fills `MAX_HEALTH_RESPONSE_HEAD` without a terminator is a cap hit —
+/// both FAIL the check. ("Connection: close" servers still send the blank
+/// line; only peers that die mid-head omit it.) Never reads past the head —
+/// the body is not drained (see run_http_check).
 async fn read_http_response_head(stream: &mut tokio::net::TcpStream) -> Result<String, String> {
     let mut head = Vec::with_capacity(1024);
     let mut buf = [0u8; 1024];
     loop {
-        if head.len() >= MAX_HEALTH_RESPONSE_HEAD {
-            break;
-        }
         let n = stream
             .read(&mut buf)
             .await
             .map_err(|e| format!("read: {e}"))?;
         if n == 0 {
-            break; // EOF: head complete (Connection: close) or peer gone.
+            if head.is_empty() {
+                return Err("empty response".into());
+            }
+            return Err("head truncated: EOF before blank line".into());
         }
         head.extend_from_slice(&buf[..n]);
         if head.ends_with(b"\r\n\r\n") {
             break;
+        }
+        if head.len() >= MAX_HEALTH_RESPONSE_HEAD {
+            // Hardening bound with no Go counterpart (Go reads the head
+            // without a cap): a >16 KiB response head is pathological for a
+            // health endpoint, and the fail-closed verdict matches Go's on
+            // every shape Go can see (Go DOWNs an unterminated head by
+            // deadline). Documented divergence for the legit-oversized
+            // case: Go UP, frp-rs DOWN.
+            return Err(format!(
+                "head exceeds {} B cap without terminator",
+                MAX_HEALTH_RESPONSE_HEAD
+            ));
         }
     }
     Ok(String::from_utf8_lossy(&head).into_owned())
@@ -1149,12 +1167,23 @@ mod tests {
         // are accepted: routed hosts (CI) exercise the timeout arm, unrouted
         // hosts (offline sandboxes) exercise the dial-error arm that
         // tcp_check_success_and_refused_arms pins via ECONNREFUSED.
+        let started = tokio::time::Instant::now();
         let err = run_tcp_check("192.0.2.1:9", Duration::from_millis(100))
             .await
             .unwrap_err();
         assert!(
             err == "timeout" || err.contains("TCP connect:"),
             "unexpected error: {err}"
+        );
+        // The named property is that the probe's OWN 100ms budget reaps the
+        // dial. Without the tokio::time::timeout in run_tcp_check the routed
+        // branch would drift into the OS connect timeout (~130s) and report
+        // "TCP connect: Connection timed out" — accepted by the OR above —
+        // so the elapsed bound is what actually pins the timeout arm.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout arm breached: check took {elapsed:?}"
         );
     }
 
@@ -1214,16 +1243,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_probe_head_eof_without_blank_line_succeeds() {
-        // Connection: close servers may end the head at EOF without the
-        // CRLFCRLF terminator — the head reader stops at EOF and the
-        // status line still parses.
+    async fn http_probe_truncated_head_fails_closed() {
+        // Peer dies mid-head: status line + one header line, then EOF
+        // without the CRLFCRLF terminator. Go net/textproto maps this to
+        // io.ErrUnexpectedEOF inside http.ReadResponse, so Go frp's check
+        // verdicts DOWN — frp-rs must too, not "parse what arrived".
         let (addr, _handle) =
             spawn_raw_server(Some(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n".to_vec())).await;
         let url = format!("http://{addr}/healthz");
-        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
             .await
-            .is_ok());
+            .unwrap_err();
+        assert!(err.contains("truncated"), "unexpected error: {err}");
     }
 
     #[tokio::test]
@@ -1241,8 +1272,10 @@ mod tests {
     #[tokio::test]
     async fn http_probe_oversized_head_fails_closed() {
         // >16 KiB of header junk with no blank line: the head reader stops
-        // at its cap and the unparsable head fails the probe (bounded
-        // memory, fail-closed verdict).
+        // at its cap and the cap-hit verdict fails the probe (bounded
+        // memory, fail-closed). Go has no head cap — its verdict on this
+        // input is DOWN via deadline — so fail-closed here matches Go on
+        // every shape Go can see.
         let junk = vec![b'a'; MAX_HEALTH_RESPONSE_HEAD + 1024];
         let (addr, _handle) = spawn_raw_server(Some(junk)).await;
         let url = format!("http://{addr}/healthz");
@@ -1250,25 +1283,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.contains("malformed status line"),
+            err.contains("cap without terminator"),
             "unexpected error: {err}"
         );
     }
 
     #[tokio::test]
-    async fn http_probe_oversized_head_with_valid_status_line_still_passes() {
-        // Cap is a memory bound, not a correctness gate: a valid status
-        // line with an enormous (unterminated) header block still yields
-        // the status verdict — the probe never reads past the head, so no
-        // drain cost applies (documented divergence from Go's io.Copy
-        // drain, which exists only to reuse keep-alive conns).
+    async fn http_probe_unterminated_oversized_head_with_valid_status_line_fails() {
+        // A valid status line does NOT rescue an unterminated head: the
+        // reader only yields a verdict at the CRLFCRLF terminator (Go
+        // ReadResponse parity), so hitting the 16 KiB cap with no blank
+        // line in sight fails the check even though "HTTP/1.1 200 OK\r\n"
+        // arrived first. Divergence vs Go (which has no cap): a legit
+        // >16 KiB response head that completes would be UP in Go and is
+        // DOWN here — a documented hardening bound, pathological for a
+        // health endpoint.
         let mut head = b"HTTP/1.1 200 OK\r\n".to_vec();
         head.extend(std::iter::repeat_n(b'x', MAX_HEALTH_RESPONSE_HEAD));
         let (addr, _handle) = spawn_raw_server(Some(head)).await;
         let url = format!("http://{addr}/healthz");
-        assert!(run_http_check(&addr, &url, Duration::from_secs(5), &[])
+        let err = run_http_check(&addr, &url, Duration::from_secs(5), &[])
             .await
-            .is_ok());
+            .unwrap_err();
+        assert!(
+            err.contains("cap without terminator"),
+            "unexpected error: {err}"
+        );
     }
 
     // ---- GAP8 (round-6 audit): URL/authority parse helpers had zero
