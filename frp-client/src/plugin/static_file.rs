@@ -54,11 +54,14 @@ async fn handle_static_file_conn(
     local_path: &str,
     strip_prefix: Option<&str>,
 ) -> Result<(), String> {
-    // Read HTTP request headers in chunks until \r\n\r\n. Stop at the FIRST
-    // \r\n\r\n anywhere in the buffer (not only at its end): a pipelined or
-    // body-carrying request may follow the head terminator with more bytes,
-    // and the tail-only check would read past it into the next request until
-    // the 64 KiB cap.
+    // Read the request head in chunks. Head end follows Go textproto
+    // semantics (the engine behind http.ReadRequest): each line ends at the
+    // next '\n' with ONE trailing '\r' stripped, and the first empty line
+    // ends the head — so LF-only and mixed-EOL heads are legal, not just
+    // \r\n\r\n. Stop at the first empty line anywhere in the buffer (not
+    // only at its end): a pipelined or body-carrying request may follow the
+    // head terminator with more bytes, and the tail-only check would read
+    // past it into the next request until the 64 KiB cap.
     // Go parity: http.Server ReadHeaderTimeout (60s) — one absolute deadline
     // over the whole header read, so a slowloris "trickle" cannot park the
     // task + fd + plugin listener slot indefinitely.
@@ -74,7 +77,7 @@ async fn handle_static_file_conn(
                 return Err("connection closed".into());
             }
             buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            if frp_core::textproto::head_end(&buf).is_some() {
                 break;
             }
             if buf.len() > 65536 {

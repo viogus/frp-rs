@@ -574,8 +574,10 @@ pub(super) fn resolve_content_length<'a>(
     }
 }
 
-/// Read an HTTP request head from `stream` (chunked until CRLFCRLF, 64 KiB cap),
-/// parse the request line, and build the forwarded HTTP/1.0 request head with
+/// Read an HTTP request head from `stream` (chunked until the first empty
+/// line — Go textproto semantics, LF-only and mixed-EOL heads legal — with
+/// the 64 KiB cap), parse the request line, and build the forwarded HTTP/1.0
+/// request head with
 /// optional Host rewrite and injected request headers. Shared by the
 /// http2http/http2https/https2http/https2https plugins; each then connects its
 /// own backend, writes the returned head, and streams the request body with
@@ -601,10 +603,14 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     request_headers: &std::collections::HashMap<String, String>,
     x_forwarded_for: Option<std::net::IpAddr>,
 ) -> Result<ForwardedRequest, String> {
-    // Read HTTP headers in chunks until \r\n\r\n. Stop at the FIRST
-    // \r\n\r\n anywhere in the buffer (not only at its end): with a request
-    // body the head terminator is followed by body bytes, and reading past
-    // it would swallow the body into the "headers" until the 64 KiB cap.
+    // Read the request head in chunks. Head end follows Go textproto
+    // semantics (the engine behind http.ReadRequest): each line ends at the
+    // next '\n' with ONE trailing '\r' stripped, and the first empty line
+    // ends the head — so LF-only and mixed-EOL heads are legal, not just
+    // \r\n\r\n. Stop at the first empty line anywhere in the buffer (not
+    // only at its end): with a request body the head terminator is followed
+    // by body bytes, and reading past it would swallow the body into the
+    // "headers" until the 64 KiB cap.
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     loop {
@@ -623,7 +629,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
             return Err("connection closed".into());
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        if frp_core::textproto::head_end(&buf).is_some() {
             break;
         }
         if buf.len() > 65536 {
@@ -631,12 +637,11 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         }
     }
 
-    // Split buffer on first \r\n\r\n to separate headers from any pre-read body data.
-    let header_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(buf.len());
+    // Split the head from any pre-read body bytes at the first empty line
+    // (Go textproto semantics — the same helper the read loop above used,
+    // so the split lands exactly where the loop stopped; for CRLF input the
+    // index is byte-identical to the old \r\n\r\n scan).
+    let header_end = frp_core::textproto::head_end(&buf).unwrap_or(buf.len());
     let headers_str = String::from_utf8_lossy(&buf[..header_end]);
     let mut lines = headers_str.lines();
 
@@ -1697,5 +1702,37 @@ mod tests {
             !head.contains("1.2.3.4"),
             "inbound chain must not leak alongside the configured value"
         );
+    }
+
+    /// Audit round-7 S1 pin: an LF-only request head (request line + one
+    /// header + LF blank line) terminates the read loop and builds the
+    /// forward — Go http.ReadRequest/textproto semantics. RED pre-fix: the
+    /// \r\n\r\n scan never matched, the loop read on and hit EOF once the
+    /// writer half dropped ("connection closed"); the dropped writer makes
+    /// the RED arm fail fast instead of stalling the 60 s per-read timeout.
+    #[tokio::test]
+    async fn forward_lf_only_head_terminates() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+        client_io
+            .write_all(b"GET /p HTTP/1.1\nHost: b\nX-A: 1\n\n")
+            .await
+            .unwrap();
+        client_io.flush().await.unwrap();
+        drop(client_io); // EOF after the buffered head drains
+        let fwd = read_request_and_build_forward(&mut server_io, "", &Default::default(), None)
+            .await
+            .expect("LF-only head must end the head read, not EOF-error");
+        assert!(
+            fwd.head.starts_with("GET /p HTTP/1.0\r\n"),
+            "forwarded head: {}",
+            fwd.head
+        );
+        assert!(
+            fwd.head.contains("X-A: 1\r\n"),
+            "LF header line must be forwarded: {}",
+            fwd.head
+        );
+        assert!(fwd.body_prefix.is_empty(), "no body bytes were pre-read");
     }
 }
