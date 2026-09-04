@@ -13,11 +13,14 @@
 //!   keeps its second `\r` and is not blank.
 //!
 //! Audit round 7 (S1 family): the pre-helper scans at the vhost HTTP/1.1
-//! request-head loop, tcpmux CONNECT head, and client health response-head
-//! matched only `\r\n\r\n` (or `\n\n`) windows, so a legal mixed-EOL head
-//! either never terminated (vhost read to the 4096 cap → 431, tcpmux to the
-//! cap → silent close, health read on until EOF → false DOWN) or truncated
-//! at the wrong byte. All four sites now share this helper.
+//! request-head loop, tcpmux CONNECT head, client health response-head,
+//! vhost h2c backend response-head, the vhost ResponseHeaderInjector backend
+//! head, the frp-core WS upgrade accept, and five frp-client plugin head
+//! sites matched only `\r\n\r\n` (or `\n\n`) windows, so a legal mixed-EOL
+//! head either never terminated (vhost read to the 4096 cap → 431, tcpmux to
+//! the cap → silent close, health read on until EOF → false DOWN, injector
+//! skipped injection) or truncated at the wrong byte. All sites now share
+//! this helper.
 
 /// End index (exclusive — past the terminating `\n`) of the first blank
 /// line in `head` under Go `textproto.ReadLine` semantics.
