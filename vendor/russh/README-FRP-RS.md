@@ -1,7 +1,7 @@
 # Vendored russh 0.62.7 (frp-rs)
 
-This directory vendors `russh` 0.62.7 (crates.io, warp-tech) with one
-patch, wired in via `[patch.crates-io]` in the workspace root
+This directory vendors `russh` 0.62.7 (crates.io, warp-tech) with two
+patches, wired in via `[patch.crates-io]` in the workspace root
 `Cargo.toml` (`russh = { path = "vendor/russh" }`).
 
 ## License
@@ -45,20 +45,9 @@ bloat plus pre-release dependency risk:
   replaced with `Err(Error::KeyIsEncrypted)`; the parameter is renamed
   `_password`.
 
-The `pkcs5`/`pkcs8` decryption paths are untouched: they use russh's own
-direct dependencies (`aes`/`cbc`/`md5`, the `pkcs8` crate), not ssh-key's
-`encryption` feature, so they still compile and still reject encrypted
-keys the same way.
-
-### What is NOT removed
-
-The aes-gcm 0.11 / aead 0.6 / cipher 0.5 new-generation RustCrypto trait
-stack stays. It is pulled independently by the SSH key-algorithm crates
-(`ed25519-dalek 3.0` / `rsa 0.10-rc` / `p256`/`p384`/`p521 0.14-rc` →
-`pkcs8 0.11` → `pkcs5 0.8` → `aes-gcm 0.11`) via russh's own
-`pkcs8 = { features = ["encryption", ...] }` dependency, which this patch
-does not touch. Dropping it would mean removing SSH key-algorithm
-support, not dead decryption code.
+The `pkcs8` encrypted-key decryption path is covered by Patch 2 below,
+which drops the encrypted-PKCS8 chain entirely (pkcs8's `encryption`
+feature → the `pkcs5` crate → scrypt/salsa20/sha3).
 
 ### Behavior change
 
@@ -68,11 +57,68 @@ so no reachable behavior changes.
 
 ### Upgrade note
 
-When bumping russh upstream: re-apply the two source edits (the
-`format/mod.rs` PuTTY branch removal and the `format/openssh.rs` decrypt
-replacement) and the `Cargo.toml` ssh-key feature trim, or carry the
-patch upstream (preferred: an ssh-key feature knob in russh so `ppk` and
-`encryption` can be disabled from the crate root).
+When bumping russh upstream: re-apply the source edits from Patch 1 and
+Patch 2 (the `format/mod.rs` PuTTY branch removal, the
+`format/openssh.rs` decrypt replacement, the `format/pkcs8.rs`
+encrypted-key rejection + `encode_pkcs8_encrypted` removal, and the
+`format/mod.rs` `encode_pkcs8_pem_encrypted` removal) and the two
+`Cargo.toml` trims (ssh-key features; pkcs8 features + the
+pkcs5/salsa20/scrypt/sha3 direct deps), or carry the patch upstream
+(preferred: feature knobs in russh so `ppk`, ssh-key `encryption`, and
+pkcs8 `encryption` can be disabled from the crate root).
+
+## Patch 2: drop pkcs8 `encryption` (encrypted-PKCS8 decryption chain)
+
+Upstream russh hardcodes `pkcs8 = { features = ["encryption", ...] }`,
+which turns on pkcs8's `encryption` feature. That feature = `alloc` +
+`pkcs5/alloc` + `pkcs5/pbes2` + `rand_core`, and pulls the `pkcs5`
+crate, whose `pbes2` path drags in scrypt 0.12, salsa20 0.11, sha3 0.12
+and (transitively) aes-gcm 0.11. Russh uses it in exactly one place:
+`keys/format/pkcs8.rs` decrypts `-----BEGIN ENCRYPTED PRIVATE KEY-----`
+files via `EncryptedPrivateKeyInfoRef::decrypt`.
+
+frp-rs's SSH gateway never loads private-key files at all: the host key
+is generated in-memory (`PrivateKey::random`), auth is password + public
+keys (`authorized_keys`), and no config path reads an encrypted PKCS#8
+key. So the entire encrypted-PKCS8/PKCS5 path is dead, and its dependency
+chain is pure compile-time + audit-surface cost (LTO already strips the
+unused crypto from the binary, but the crates still have to build and be
+security-audited).
+
+### What changed
+
+- `Cargo.toml`: pkcs8 features trimmed to `["std"]`; the direct
+  `pkcs5`/`salsa20`/`scrypt`/`sha3` dependencies are removed.
+- `src/keys/format/pkcs8.rs`: `decode_pkcs8` rejects an encrypted key up
+  front (`password.is_some()` → `Error::KeyIsEncrypted`) instead of
+  decrypting; `encode_pkcs8_encrypted` is removed.
+- `src/keys/format/mod.rs`: `encode_pkcs8_pem_encrypted` is removed (it
+  called the now-deleted `encode_pkcs8_encrypted`).
+
+### What this drops
+
+Five crates leave `Cargo.lock`: `pkcs5`, `salsa20`, `scrypt`, `sha3`
+0.12, and `sponge-cursor`. Their transitively-shared deps (`cipher`,
+`aes`, `cbc`, `keccak`, `pbkdf2`) stay because russh's own direct deps
+still use them. `sha3` 0.11 also stays — it is a hard dependency of
+`ml-kem` (post-quantum Kyber KEX), not of the removed PKCS5 chain.
+`aes-gcm` 0.11 was already unreachable after Patch 1 (its only puller,
+`ssh-cipher` via ssh-key's `encryption` feature, is gone); its lock entry
+lingers as an orphan. The SSH key algorithms (rsa/ed25519/p256/p384/p521)
+are unaffected: they use pkcs8's core (`alloc`), never the `encryption`
+path. russh's internal `keys/format/pkcs5` module (legacy OpenSSL
+`DEK-Info: AES-128-CBC` PEM, on the `aes`/`cbc`/`md5` direct deps) is
+unrelated to the removed `pkcs5` crate and is still present.
+
+The win is build-time + audit surface, not binary size: LTO already
+strips the unused crypto from the shipped binary, but these crates no
+longer compile or need security review.
+
+### Behavior change
+
+Encrypted PKCS#8 private keys (`-----BEGIN ENCRYPTED PRIVATE KEY-----`)
+now return `Error::KeyIsEncrypted` instead of being decrypted. frp-rs
+never had a code path that fed one in, so no reachable behavior changes.
 
 ## Minor deviations (not patches)
 
@@ -86,5 +132,6 @@ patch upstream (preferred: an ssh-key feature knob in russh so `ppk` and
 ## Diff from crates.io russh 0.62.7
 
 Everything else in this tree is byte-identical to crates.io russh
-0.62.7 (the normalized `Cargo.toml`); the full delta is the two source
-edits above, the ssh-key feature trim, and the one `#[allow(dead_code)]`.
+0.62.7 (the normalized `Cargo.toml`); the full delta is the source edits
+from Patch 1 and Patch 2, the two `Cargo.toml` trims, and the one
+`#[allow(dead_code)]`.

@@ -133,19 +133,6 @@ pub fn encode_pkcs8_pem<W: Write>(key: &PrivateKey, mut w: W) -> Result<(), Erro
     Ok(())
 }
 
-pub fn encode_pkcs8_pem_encrypted<W: Write>(
-    key: &PrivateKey,
-    pass: &[u8],
-    rounds: u32,
-    mut w: W,
-) -> Result<(), Error> {
-    let x = self::pkcs8::encode_pkcs8_encrypted(pass, rounds, key)?;
-    w.write_all(b"-----BEGIN ENCRYPTED PRIVATE KEY-----\n")?;
-    w.write_all(BASE64_MIME.encode(&x).as_bytes())?;
-    w.write_all(b"\n-----END ENCRYPTED PRIVATE KEY-----\n")?;
-    Ok(())
-}
-
 #[cfg(feature = "rsa")]
 fn decode_rsa_pkcs1_der(secret: &[u8]) -> Result<ssh_key::private::RsaKeypair, Error> {
     use std::convert::TryInto;

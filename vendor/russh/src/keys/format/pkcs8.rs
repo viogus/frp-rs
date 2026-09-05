@@ -9,20 +9,25 @@ use ssh_key::PrivateKey;
 use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, Ed25519PrivateKey, KeypairData};
 
 use crate::keys::Error;
-use crate::keys::key::safe_rng;
 
 /// Decode a PKCS#8-encoded private key (ASN.1 or X9.62)
+///
+/// frp-rs patch: encrypted PKCS#8 keys are unsupported. Upstream russh
+/// decrypts them via `EncryptedPrivateKeyInfoRef::decrypt` (pkcs8's
+/// `encryption` feature -> the `pkcs5` crate -> scrypt/salsa20/sha3).
+/// frp-rs never loads private-key files — its SSH gateway generates the
+/// host key in-memory (`PrivateKey::random`) and parses only public keys —
+/// so the encrypted-key path is dead and its dependency chain is dropped.
+/// Encrypted keys now return `Error::KeyIsEncrypted` instead of being
+/// decrypted.
 pub fn decode_pkcs8(
     ciphertext: &[u8],
     password: Option<&[u8]>,
 ) -> Result<ssh_key::PrivateKey, Error> {
+    if password.is_some() {
+        return Err(Error::KeyIsEncrypted);
+    }
     let doc = SecretDocument::try_from(ciphertext)?;
-    let doc = if let Some(password) = password {
-        doc.decode_msg::<pkcs8::EncryptedPrivateKeyInfoRef<'_>>()?
-            .decrypt(password)?
-    } else {
-        doc
-    };
 
     if let Ok(key) = doc.decode_msg::<sec1::EcPrivateKey>() {
         // X9.62 EC private key
@@ -208,30 +213,6 @@ mod explicit_curve_params {
             Err(Error::UnknownAlgorithm(curve_oid))
         }
     }
-}
-
-/// Encode into a password-protected PKCS#8-encoded private key.
-pub fn encode_pkcs8_encrypted(
-    pass: &[u8],
-    rounds: u32,
-    key: &PrivateKey,
-) -> Result<Vec<u8>, Error> {
-    let pvi_bytes = encode_pkcs8(key)?;
-    let pvi = PrivateKeyInfoRef::try_from(pvi_bytes.as_slice())?;
-
-    use rand_core::Rng;
-    let mut rng = safe_rng();
-    let mut salt = [0; 32];
-    rng.fill_bytes(&mut salt);
-    let mut iv = [0; 16];
-    rng.fill_bytes(&mut iv);
-
-    let doc = pvi.encrypt_with_params(
-        pkcs5::pbes2::Parameters::generate_pbkdf2_sha256_aes256cbc(rounds, &salt, iv)
-            .map_err(|_| Error::InvalidParameters)?,
-        pass,
-    )?;
-    Ok(doc.as_bytes().to_vec())
 }
 
 /// Encode into a PKCS#8-encoded private key.
