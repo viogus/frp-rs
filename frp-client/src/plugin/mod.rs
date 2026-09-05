@@ -516,8 +516,14 @@ fn transfer_encoding_is_chunked(value: &str) -> bool {
 /// value per RFC 7230 §3.3.2 ("reject or replace with a single value"),
 /// mirroring Go's net/http `fixLength` + `parseContentLength`
 /// (transfer.go — probed against the Go frp v0.71.0 binary, go1.25.12).
-/// Go stores each header line value trimmed of ASCII space/tab (and the
-/// other textproto `isASCIISpace` bytes) and never splits on commas, so:
+/// Go stores each header line value trimmed of ASCII space/tab only —
+/// textproto's `isASCIISpace` is exactly {' ', '\t', '\n', '\r'} with the
+/// newline bytes unreachable in a value, and every OTHER control byte
+/// (<0x21 except tab, plus 0x7f) is rejected by `validHeaderValueByte`
+/// while the head is read (reader.go — 400 "malformed MIME header line").
+/// The trim below therefore strips only space/tab: a value carrying any
+/// other control byte survives to the digit parse and fails it, matching
+/// Go's rejection. Go never splits on commas, so:
 ///
 /// - no Content-Length → `Ok(None)`;
 /// - duplicate identical values (`Content-Length: 5` twice — identical on
@@ -551,11 +557,11 @@ pub(super) fn resolve_content_length<'a>(
         if !name.trim().eq_ignore_ascii_case("content-length") {
             continue;
         }
-        values.push(value.trim_matches(|c| {
-            // textproto.isASCIISpace parity (transfer.go TrimString); \n/\r
-            // cannot occur post-line-split but are kept for exactness.
-            c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0b' || c == '\x0c'
-        }));
+        // trim_matches of ASCII space/tab only (round-3 review, audit
+        // round 8): textproto.isASCIISpace has no \x0b/\x0c, and Go rejects
+        // control bytes in values while reading the head — accepting a
+        // \x0b-wrapped "5" here would be accept-where-Go-rejects.
+        values.push(value.trim_matches(|c| c == ' ' || c == '\t'));
     }
     match values.len() {
         0 => Ok(None),
@@ -1742,6 +1748,12 @@ mod tests {
         assert!(
             resolve_content_length("Content-Length: 5, 5\r\nContent-Length: 5, 5".lines()).is_err()
         );
+        // Control bytes other than space/tab in the value are NOT trimmed
+        // (textproto.isASCIISpace has no \x0b/\x0c; Go rejects them while
+        // reading the head — round-3 review, audit round 8): a \x0b-wrapped
+        // "5" survives to the digit parse and fails it.
+        assert!(resolve_content_length("Content-Length: \x0b5".lines()).is_err());
+        assert!(resolve_content_length("Content-Length: 5\x0c".lines()).is_err());
         // Non-numeric values are errors (Go 400 "bad Content-Length") —
         // including empty values (Go "invalid empty Content-Length") and
         // any sign (strconv.ParseUint accepts no sign, not even '+').

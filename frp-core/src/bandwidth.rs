@@ -232,11 +232,15 @@ mod tests {
     #[tokio::test]
     async fn shared_limiter_lock_not_held_across_sleep() {
         let lim = BandwidthLimiter::shared(1).unwrap(); // 1 B/s
-                                                        // Reserve the burst (1 B) plus 1 B of debt: ~1 s wait, all of it
-                                                        // spent inside the old code's critical section.
+                                                        // Reserve the burst (1 B) plus 4 B of debt: ~4 s wait, all of it
+                                                        // spent inside the old code's critical section (round-3 review,
+                                                        // audit round 8: consume(2) parked the probe only ~900 ms — a 2 s
+                                                        // bound could not catch old code; 4 s of debt parks it ~3.9 s,
+                                                        // comfortably past the bound, with the bound itself untouched so
+                                                        // scheduler-noise tolerance is unchanged).
         let sleeper = {
             let lim = lim.clone();
-            tokio::spawn(async move { BandwidthLimiter::consume_shared(&lim, 2).await })
+            tokio::spawn(async move { BandwidthLimiter::consume_shared(&lim, 5).await })
         };
         // The sleeper runs first (this task yields); 100 ms in, it is
         // mid-wait. A second consumer must lock and reserve immediately.
@@ -246,11 +250,10 @@ mod tests {
         // the elapsed time below is a pure lock-acquisition measurement.
         BandwidthLimiter::consume_shared(&lim, 0).await;
         let elapsed = start.elapsed();
-        // Bound widened from 500ms (round-2 review, audit round 8): lock
-        // acquisition post-fix is microseconds, but a cgroup-preempted test
-        // task can stretch any wall-clock window; the property under test is
-        // "not ~900ms behind the sleeper's held lock", so 2s separates that
-        // signal from scheduler noise.
+        // Lock acquisition post-fix is microseconds, but a cgroup-preempted
+        // test task can stretch any wall-clock window; the property under
+        // test is "not ~3.9s behind the sleeper's held lock", so 2s
+        // separates that signal from scheduler noise.
         assert!(
             elapsed.as_millis() < 2000,
             "second consumer blocked for {elapsed:?}: the limiter mutex is held \
