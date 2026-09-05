@@ -1202,8 +1202,7 @@ mod tests {
     fn test_fec_recovery_feed_error_does_not_strand_group() {
         let config = fec_config(); // data_shards = 3, parity_shards = 2
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let mut session =
-            KcpSession::new(7, "127.0.0.1:9999".parse().unwrap(), config, tx);
+        let mut session = KcpSession::new(7, "127.0.0.1:9999".parse().unwrap(), config, tx);
 
         // Offline search for a parity byte that makes the RS-recovered data
         // shard carry SIZE >= 3 (recovered.len() == 4 here, so the feed
@@ -1234,11 +1233,7 @@ mod tests {
         // Session-level sequence (all datagrams share shard_begin 0).
         let data0 = fec_datagram(0, TYPE_DATA, &[2, 0, 0xaa, 0xbb]);
         let data1 = fec_datagram(1, TYPE_DATA, &[2, 0, 0xcc, 0xdd]);
-        let parity = fec_datagram(
-            parity_slot as u32,
-            TYPE_PARITY,
-            &[e, 0x11, 0x22, 0x33],
-        );
+        let parity = fec_datagram(parity_slot as u32, TYPE_PARITY, &[e, 0x11, 0x22, 0x33]);
 
         session.input(&data0).expect("data shard 0 accepted");
         session.input(&data1).expect("data shard 1 accepted");
@@ -1252,12 +1247,13 @@ mod tests {
 
         // Fourth datagram for the same group: pre-fix it indexed the
         // stranded empty vec → panic. Must return Ok (fresh group) instead.
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            session.input(&data0)
-        }));
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.input(&data0)));
         match panicked {
             Ok(res) => assert!(res.is_ok(), "post-recovery group must restart cleanly"),
-            Err(_) => panic!("stranded FEC group panicked on the next datagram (abort under panic=abort)"),
+            Err(_) => {
+                panic!("stranded FEC group panicked on the next datagram (abort under panic=abort)")
+            }
         }
     }
 
