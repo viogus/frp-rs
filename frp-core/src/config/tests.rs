@@ -3597,8 +3597,15 @@ fn test_template_envs_reference_expands() {
     std::env::remove_var(NAME);
     assert_eq!(
         expand_template_in_str(&format!("{{{{ .Envs.{NAME} }}}}")),
-        "",
-        "unset .Envs reference expands to empty (Go renders the map zero value)"
+        "<no value>",
+        // Go frp's RenderWithTemplate calls template.New without a
+        // missingkey option (pkg/config/load.go:84-98), so the text/template
+        // default applies: `{{ .Envs.UNSET }}` — a missing map key — prints
+        // the literal "<no value>" when the template executes. Byte-parity
+        // matters here: an empty string could silently disable token auth
+        // (`token = "{{ .Envs.FRP_TOKEN }}"`), while "<no value>" never
+        // matches any client config.
+        "unset .Envs reference renders Go's '<no value>' placeholder"
     );
     std::env::set_var(NAME, "envval");
     assert_eq!(

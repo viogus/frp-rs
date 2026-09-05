@@ -16,6 +16,20 @@ use crate::service::{AppState, InternalMsg};
 use crate::state::{ControlTx, GroupPortQuery};
 
 /// Returns full detail when detailed_errors is enabled, otherwise generic message.
+/// Build a NewProxyResp error text, mirroring Go
+/// `util.GenerateResponseErrorString(summary, err, detailed)` (pkg/util/
+/// util/util.go:113-118): detailed mode sends the full error, non-detailed
+/// sends the summary.
+///
+/// Documented divergence (R1 review, round 10): Go ALWAYS passes the fixed
+/// summary "new proxy [<name>] error" (server/control.go:757) for every
+/// registration failure, so in non-detailed mode a Go client learns nothing
+/// beyond the proxy name. frp-rs deliberately uses per-class summaries
+/// ("group params invalid", "vhost route config conflict", …) — strictly
+/// more informative for frp-rs clients, and `detailed_errors_to_client`
+/// defaults to true on both sides, so the common path carries the exact Go
+/// error text either way. Keep per-arm summaries consistent: each arm
+/// should name its own failure class, never mask a sibling's.
 pub(crate) fn err_msg(detailed: bool, detail: String, generic: &str) -> String {
     if detailed {
         detail
@@ -1024,14 +1038,49 @@ async fn register_http_vhost(
         if domains.len() != 1 || locations.len() != 1 {
             rollback_vhost_conflict(state, run_id, port, false).await;
             state.proxy_manager.remove(&np.proxy_name).await;
+            // Go HTTPGroup.Register runs once per (domain, location) pair
+            // (proxy/http.go:76-91) against a group storing ONE pair, and
+            // stops at the FIRST error — the text a Go client sees is
+            // decided by the member's SECOND pair: an identical repeat
+            // re-enters Register under the same proxy name and hits the
+            // per-member duplicate check (`createFuncs[proxyName]`,
+            // http.go:108-113) → ErrProxyRepeated "group proxy repeated";
+            // a different pair fails the params comparison first
+            // (http.go:100-103) → ErrGroupParamsInvalid. (customDomains
+            // self-duplicates and a subdomain equal to a custom domain both
+            // produce the repeat shape via buildDomains, proxy.go:218-229.)
+            // frp-rs gates both shapes before any registration side effect
+            // — same net rejection, with the matching wire text.
+            let first_pair = (domains[0].as_str(), locations[0].as_str());
+            // Pair order is domain-major, location-minor; the second pair
+            // is (domains[0], locations[1]) when locations repeat.
+            let second_pair = if locations.len() > 1 {
+                (domains[0].as_str(), locations[1].as_str())
+            } else {
+                (domains[1].as_str(), locations[0].as_str())
+            };
+            let repeated = second_pair == first_pair;
             reject_new_proxy(
                 writer,
                 &np.proxy_name,
-                err_msg(
-                    state.detailed_errors_to_client,
-                    "http group proxies must configure exactly one custom_domain and one location (Go frp HTTPGroup semantics)".into(),
-                    "group params invalid",
-                ),
+                if repeated {
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        format!(
+                            "http group proxy '{}' repeats the (custom_domain, location) pair \
+                             ('{}', '{}') — the identical triple re-enters HTTPGroup.Register \
+                             under the same proxy name (Go: ErrProxyRepeated)",
+                            np.proxy_name, first_pair.0, first_pair.1
+                        ),
+                        "group proxy repeated",
+                    )
+                } else {
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        "http group proxies must configure exactly one custom_domain and one location (Go frp HTTPGroup semantics)".into(),
+                        "group params invalid",
+                    )
+                },
                 v2,
             )
             .await;
@@ -1099,11 +1148,19 @@ async fn register_http_vhost(
                 state.proxy_manager.remove(&np.proxy_name).await;
                 // register_member returns the Go constants verbatim
                 // ("group params invalid" / "group auth failed" /
-                // "group proxy repeated" — server/group/group.go:22-26).
+                // "group proxy repeated" — server/group/group.go:22-26), and
+                // register_member's internal ordering already chose the
+                // right one for the event. Send the constant as BOTH the
+                // detailed text and the non-detailed summary (mirrors the
+                // https arm): masking it under one fixed summary (the old
+                // "group params invalid") hid "group auth failed" /
+                // "group proxy repeated" from a non-detailed frp-rs client.
+                // Go in non-detailed mode would send the generic
+                // "new proxy [x] error" — see err_msg's divergence note.
                 reject_new_proxy(
                     writer,
                     &np.proxy_name,
-                    err_msg(state.detailed_errors_to_client, e, "group params invalid"),
+                    err_msg(state.detailed_errors_to_client, e.clone(), e.as_str()),
                     v2,
                 )
                 .await;
@@ -5021,6 +5078,103 @@ pub(crate) mod unregister_generation_tests {
                 .get_group_port("a", "k", 24062, "127.0.0.1")
                 .await,
             GroupPortQuery::Mismatch("group should have same remote port")
+        );
+    }
+
+    /// R3 test-gap pin: a full handler-level auto-assign group walk. The
+    /// ctl-level declared-port pins create groups directly, so every handler
+    /// wiring site that passes `np.remote_port.unwrap_or(0)` as the DECLARED
+    /// port (proxy_ops.rs join probe, group create, member registration) is
+    /// only exercised where declared == bound (explicit ports) — a regression
+    /// swapping the resolved bound port in for the declared value is
+    /// invisible to every explicit-port pin because the numbers coincide.
+    /// Here the first member declares nothing (remote_port None → auto-assign
+    /// binds an OS port while the group stores declared 0), a second
+    /// None-declaring member must still JOIN it, and an explicit-port member
+    /// naming the group's REAL port must be REJECTED — Go compares declared
+    /// numbers with no zero exemption (tcp.go:111-113), so 0 never matches
+    /// the real number.
+    #[tokio::test]
+    async fn tcp_group_auto_assign_handler_walk_declared_zero_semantics() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+
+        // First member: auto-assign. The group stores declared 0; the shared
+        // listener binds the OS-probed port.
+        let mut m1 = new_proxy("m1", "tcp");
+        m1.group = Some("g".to_string());
+        m1.group_key = Some("k".to_string());
+        m1.remote_port = None;
+        let _w1 = register_np(m1, &state).await;
+        let m1_info = state
+            .proxy_manager
+            .get("m1")
+            .await
+            .expect("auto-assigned first member must register");
+        let real = m1_info
+            .remote_port
+            .expect("first member carries the bound port");
+        assert!(real > 0, "auto-assign resolved a real port, got {real}");
+        assert!(
+            state.used_ports.read().await.contains(&real),
+            "the group's real port stays marked in used_ports"
+        );
+        // Declared 0 is the group's key: a 0 query matches, a query with the
+        // REAL number mismatches (declared-vs-declared).
+        assert_eq!(
+            state
+                .tcp_group_ctl
+                .get_group_port("g", "k", 0, "127.0.0.1")
+                .await,
+            GroupPortQuery::Matched(real)
+        );
+        assert_eq!(
+            state
+                .tcp_group_ctl
+                .get_group_port("g", "k", real, "127.0.0.1")
+                .await,
+            GroupPortQuery::Mismatch("group should have same remote port")
+        );
+
+        // Second member, also auto-assign-declaring: joins the group on its
+        // real port (no second bind).
+        let mut m2 = new_proxy("m2", "tcp");
+        m2.group = Some("g".to_string());
+        m2.group_key = Some("k".to_string());
+        m2.remote_port = None;
+        let _w2 = register_np(m2, &state).await;
+        let m2_info = state
+            .proxy_manager
+            .get("m2")
+            .await
+            .expect("auto-assign second member must join the group");
+        assert_eq!(
+            m2_info.remote_port,
+            Some(real),
+            "joiner is registered on the group's shared port"
+        );
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            2,
+            "both members count exactly once"
+        );
+
+        // Explicit-port member naming the group's REAL port: rejected —
+        // declared 0 vs declared real can never match, even though the
+        // values coincide with the bound port.
+        let mut m3 = new_proxy("m3", "tcp");
+        m3.group = Some("g".to_string());
+        m3.group_key = Some("k".to_string());
+        m3.remote_port = Some(real as i32);
+        let w3 = register_np(m3, &state).await;
+        let resp_text = String::from_utf8_lossy(&w3);
+        assert!(
+            resp_text.contains("group should have same remote port"),
+            "explicit member declaring the group's REAL port must mismatch its declared 0: {resp_text}"
+        );
+        assert!(
+            state.proxy_manager.get("m3").await.is_none(),
+            "rejected member must not register"
         );
     }
 

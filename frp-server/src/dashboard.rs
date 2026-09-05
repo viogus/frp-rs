@@ -1256,8 +1256,13 @@ const MAX_WS_SUBSCRIBERS: usize = 64;
 /// full map and rewrites the whole store file, so the cap bounds both the
 /// per-request O(n) clone+rewrite cost and the store's memory. Entries are
 /// inert (never promoted to the proxy registry) — the store is a dashboard
-/// planning surface, not a proxy limit.
-const MAX_STORE_PROXIES: usize = 128;
+/// planning surface, not a proxy limit. Operational limit (R2 review,
+/// round 10): sized well above any realistic planning list (4x the server's
+/// 256 default per-client live proxy budget) so legitimate workflows never
+/// brush it, while still bounding the per-POST O(n) clone+file rewrite.
+/// Raise here if a deployment plans more stashed configs; the dashboard
+/// returns 429 past the cap.
+const MAX_STORE_PROXIES: usize = 1024;
 /// Per-message cap for /api/events WebSocket frames. Subscribers never send
 /// meaningful payloads (only close/ping), and tungstenite's defaults (16 MiB
 /// frame / 64 MiB message) are far beyond anything the dashboard needs.

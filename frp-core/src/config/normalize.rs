@@ -144,9 +144,15 @@ fn expand_env_vars_in_str(s: &str) -> String {
 ///   - `{{ parseNumberRange "expr" }}` — expanded in place;
 ///   - `{{ .Envs.NAME }}` — Go frp's environment pattern (data field of
 ///     `Values`, `load.go`); NAME expands from the process env, unset →
-///     empty string with a warning. This is what Go configs in the wild use
-///     for `token = "{{ .Envs.FRP_TOKEN }}"` — leaving it verbatim shipped
-///     the literal text as the value (silent auth failure on migration).
+///     Go's literal `<no value>` with a warning (Go text/template runs
+///     without a `missingkey` option, so a missing map key prints
+///     `<no value>` — `pkg/config/load.go:84`). Byte-parity here also
+///     fails closed: `token = "{{ .Envs.FRP_TOKEN }}"` with the env unset
+///     yields a token no client can match, where an empty string could
+///     silently fall back to unauthenticated. This is what Go configs in
+///     the wild use for `token = "{{ .Envs.FRP_TOKEN }}"` — leaving it
+///     verbatim shipped the literal text as the value (silent auth
+///     failure on migration).
 /// - No other template syntax (variables, control flow, other functions,
 ///   `index` / `range` forms) is processed — anything that does not match
 ///   one of the two forms is left verbatim.
@@ -203,8 +209,14 @@ fn expand_template_functions_in_str(s: &str) -> String {
 ///   a warning.
 /// - `{{ .Envs.NAME }}` — Go frp's ONLY environment access (`token = "{{
 ///   .Envs.FRP_TOKEN }}"` is the documented Go pattern). NAME is looked up
-///   in the process env; unset → empty string with a warning (Go renders the
-///   `map[string]string` zero value `""` with no error — same result).
+///   in the process env; unset → the literal `<no value>` with a warning.
+///   Go frp calls `template.New("frp")` with no `Option("missingkey=...")`,
+///   so the text/template default applies: a missing map key prints
+///   `<no value>` (Go source `text/template`: `missingkey=default` — "if
+///   printed, the result of the index operation is the string `<no value>`";
+///   `Envs` is a `map[string]string` populated only from `os.Environ`, so an
+///   unset var IS a missing key). frp-rs renders the same literal for
+///   byte-parity; the warning is frp-rs-only diagnostics (Go is silent).
 ///
 /// On success returns the number of bytes consumed (the whole action) and
 /// the replacement text. Returns `None` when the text is not a well-formed
@@ -250,7 +262,19 @@ fn try_parse_template_call(s: &str) -> Option<(usize, String)> {
         // whitespace between chain elements is a parse error there).
         let name_start = match bytes.get(i) {
             Some(b'.') => i + 1,
-            _ => return None,
+            _ => {
+                // `.Envs` followed by anything but a dot: `.EnvsX` is a
+                // (valid Go syntax) field lookup that ERRORS at exec time
+                // (no such field), failing the whole render. frp-rs keeps it
+                // verbatim — warn so a migrated config is not silently
+                // shipping a literal template.
+                tracing::warn!(
+                    original = %s,
+                    "template action kept verbatim: only '{{ .Envs.NAME }}' (NAME = [A-Za-z0-9_]+) \
+                     is expanded; Go would error on any other .Envs field shape"
+                );
+                return None;
+            }
         };
         let name_end = bytes[name_start..]
             .iter()
@@ -259,7 +283,13 @@ fn try_parse_template_call(s: &str) -> Option<(usize, String)> {
             .unwrap_or(bytes.len());
         if name_end == name_start {
             // `{{ .Envs }}` alone would render the whole map in Go — out of
-            // the zero-dependency subset, kept verbatim.
+            // the zero-dependency subset, kept verbatim (warned, not silent:
+            // the map dump in a value is always an operator mistake).
+            tracing::warn!(
+                original = %s,
+                "bare '{{ .Envs }}' kept verbatim: frp-rs expands only '{{ .Envs.NAME }}' \
+                 (Go would dump the whole environment map here)"
+            );
             return None;
         }
         let name = &s[name_start..name_end];
@@ -272,13 +302,34 @@ fn try_parse_template_call(s: &str) -> Option<(usize, String)> {
         match std::env::var(name) {
             Ok(v) => Some((i, v)),
             Err(_) => {
+                // Go text/template default (no missingkey option in frp's
+                // RenderWithTemplate) prints "<no value>" for a missing map
+                // key — replicate byte-for-byte. Empty would be a silent
+                // divergence AND, for `token = "{{ .Envs.FRP_TOKEN }}"`,
+                // could fall back to unauthenticated.
                 tracing::warn!(
                     name,
-                    "{{ .Envs.{name} }}: environment variable not set; expanding to an empty string"
+                    "{{ .Envs.{name} }}: environment variable not set; rendering Go's '<no value>' placeholder"
                 );
-                Some((i, String::new()))
+                Some((i, "<no value>".to_string()))
             }
         }
+    } else if bytes.get(i..)?.starts_with(b"index") {
+        // `{{ index .Envs "K-E-Y" }}` is Go's ONLY legal way to read an env
+        // whose name holds non-identifier characters (.Envs.FOO-BAR is a Go
+        // parse error). Go renders it to the env value ("<no value>" for a
+        // missing key); frp-rs's zero-engine subset keeps the action
+        // verbatim — warn so the silent-literal-template failure mode (the
+        // template TEXT shipping as the config value) surfaces at load.
+        let after = skip_ws(bytes, i + b"index".len());
+        if bytes.get(after..).is_some_and(|r| r.starts_with(b".Envs")) {
+            tracing::warn!(
+                original = %s,
+                "{{ index .Envs ... }} kept verbatim: frp-rs expands only '{{ .Envs.NAME }}' \
+                 (Go renders the indexed env value here)"
+            );
+        }
+        None
     } else {
         None
     }

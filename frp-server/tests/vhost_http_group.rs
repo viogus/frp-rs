@@ -219,7 +219,9 @@ async fn test_http_group_round_robin() {
         "wrong group_key should be rejected, got: {err:?}"
     );
 
-    // Member D: mismatched domain must be rejected (Go ErrGroupParamsInvalid).
+    // Member D: mismatched domain must be rejected (Go ErrGroupParamsInvalid
+    // — "group params invalid" verbatim; the invented "params mismatch"
+    // phrasing died with the kind-keyed registry rework).
     let (mut ctl_d, _) = login_with_test_token(addr).await.expect("login D");
     let err = register_proxy(
         &mut ctl_d,
@@ -228,7 +230,7 @@ async fn test_http_group_round_robin() {
     .await;
     assert!(
         err.as_deref()
-            .is_some_and(|e| e.contains("params mismatch")),
+            .is_some_and(|e| e.contains("group params invalid")),
         "mismatched domain should be rejected, got: {err:?}"
     );
 

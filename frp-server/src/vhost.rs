@@ -1568,9 +1568,59 @@ pub async fn run_vhost_https_listener(
                         .lookup_combined(&sni, "/", "", "https")
                         .await
                     {
+                        // HTTPS group members share one SNI route, and Go
+                        // dispatches each conn to whichever member accepts
+                        // first (HTTPSGroup = baseGroup: every member's
+                        // Listener reads the same acceptCh). frp-rs picks
+                        // deterministically: round-robin over the https-kind
+                        // members via the kind-keyed registry (the http and
+                        // https groups may share the name). Owner-sticky
+                        // routing would strand every conn on the first
+                        // member while siblings stay idle.
+                        let (proxy_name, run_id) = if route.group.is_empty() {
+                            (route.proxy_name.to_string(), route.run_id.to_string())
+                        } else {
+                            match state
+                                .http_group_ctl
+                                .choose_endpoint(&route.group, true)
+                                .await
+                            {
+                                Some(member) => {
+                                    match state.proxy_manager.get(&member).await {
+                                        Some(info) => {
+                                            debug!(
+                                                sni = %sni, group = %route.group,
+                                                member = %member,
+                                                "HTTPS VHost group '{}' -> member '{}'",
+                                                route.group, member
+                                            );
+                                            (member, info.run_id.clone())
+                                        }
+                                        None => {
+                                            // Member gone between choose and
+                                            // lookup — fall back to the
+                                            // route's recorded proxy.
+                                            warn!(
+                                                group = %route.group, member = %member,
+                                                "HTTPS VHost: group member '{}' not registered, falling back to '{}'",
+                                                member, route.proxy_name
+                                            );
+                                            (route.proxy_name.to_string(), route.run_id.to_string())
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // Group has no members — route to the
+                                    // first member anyway; the control
+                                    // dispatch will fail cleanly if it is
+                                    // gone too.
+                                    (route.proxy_name.to_string(), route.run_id.to_string())
+                                }
+                            }
+                        };
                         let internal_tx = state
                             .run_id_to_ctl_tx
-                            .get(route.run_id.as_ref())
+                            .get(run_id.as_str())
                             .map(|v| v.tx.clone());
                         if let Some(ctl_tx) = internal_tx {
                             // send().await: same backpressure rationale as the
@@ -1583,12 +1633,17 @@ pub async fn run_vhost_https_listener(
                             match tokio::time::timeout(
                                 crate::state::CTL_SEND_TIMEOUT,
                                 ctl_tx.send(InternalMsg::ProxyUserConn {
-                                    proxy_name: route.proxy_name.to_string(),
+                                    proxy_name,
                                     // Passthrough: raw encrypted bytes, no TLS wrap.
                                     user_conn: frp_core::transport::IoStream::Tcp(stream),
                                     pre_read,
                                     user_conn_permit: None,
-                                    // Local sender — no group selection was done.
+                                    // Group selection was done here (choose_endpoint
+                                    // above) — TCP-group re-selection must not
+                                    // rerun. The receiving handler routes to the
+                                    // named proxy as-is (group LB applies to TCP
+                                    // groups only; http/https group members are
+                                    // always pre-selected by the vhost router).
                                     group_selected: false,
                                 }),
                             )

@@ -422,7 +422,6 @@ async fn stcp_allow_users_wildcard_admits_any_user() {
 
 /// STCP empty allow_users -> owner-only normalization: on the fresh-conn site
 /// a second user (not the owner) is denied; the owner himself is admitted.
-/// a second user (not the owner) is denied; the owner himself is admitted.
 #[tokio::test]
 async fn stcp_empty_allow_users_is_owner_only() {
     let addr = start_two_user_server(allocate_port()).await;

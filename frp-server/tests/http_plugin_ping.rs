@@ -338,9 +338,13 @@ async fn test_plugin_rejected_ping_does_not_update_last_ping() {
             // A live control answers within ms; a 3s stall means the server
             // wedged — but near the 3s watchdog boundary a slow-arriving
             // close can race the read, so only count it as a disconnect when
-            // the watchdog deadline has plausibly passed.
+            // the watchdog deadline has plausibly passed. 2000ms floor (not
+            // 2500): the deadline is measured from `start`, which is taken
+            // after the LoginResp round trip, so a >500ms scheduler stall of
+            // the login/ack path on a busy CI box shifts the observed
+            // disconnect below 3.0s without the watchdog firing early.
             Err(_) => {
-                if start.elapsed() >= Duration::from_millis(2500) {
+                if start.elapsed() >= Duration::from_millis(2000) {
                     disconnected_at = Some(start.elapsed());
                     break;
                 }
@@ -363,9 +367,17 @@ async fn test_plugin_rejected_ping_does_not_update_last_ping() {
          — a rejected ping answers Pong{{error}} and does not kill the control"
     );
     assert!(
-        elapsed >= Duration::from_millis(2500),
+        elapsed >= Duration::from_millis(2000),
         "watchdog disconnected too early ({elapsed:?}) — last_ping was set at login, so the \
-         disconnect must come at ~heartbeat_timeout (3s), not before"
+         disconnect must come at ~heartbeat_timeout (3s), not before (floor 2s absorbs login \
+         round-trip stalls on a busy CI box)"
+    );
+    assert!(
+        elapsed < Duration::from_millis(8000),
+        "watchdog disconnect came late ({elapsed:?}) — the deadline is ~3s after login; a \
+         later drop means the disconnect path is delayed. Without this upper bound, a \
+         regression delaying the drop past ~9s would false-pass via the read-timeout arm \
+         (the loop's last 3s read expires at ~9.4s and is counted as a disconnect)."
     );
     // The plugin saw each rejected ping: rejection is what froze last_ping.
     let requests = state.requests.lock().unwrap();
