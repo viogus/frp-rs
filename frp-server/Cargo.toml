@@ -7,7 +7,6 @@ license = "MIT"
 [dependencies]
 bytes = { workspace = true }
 frp-core = { path = "../frp-core", default-features = false }
-frp-vnet = { workspace = true, optional = true }
 # h2c HTTP vhost support: the byte-level bridge cannot decode HTTP/2 frames; h2
 # is the tokio-official HTTP/2 implementation (Go uses net/http's h2c; Rust has
 # no std HTTP/2). No existing dep fits (axum/hyper are dashboard-only and
@@ -30,7 +29,6 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-thiserror.workspace = true
 uuid.workspace = true
 tokio-rustls = { workspace = true, optional = true }
 tokio-util.workspace = true
@@ -51,7 +49,7 @@ kcp = ["frp-core/kcp"]
 oidc = ["frp-core/oidc"]
 tls = ["frp-core/tls", "dep:tokio-rustls"]
 http-proxy = ["frp-core/http-client", "dep:h2"]
-vnet = ["frp-core/vnet", "dep:frp-vnet"]
+vnet = ["frp-core/vnet"]
 compression = ["frp-core/compression"]
 chacha20 = ["frp-core/chacha20"]
 tcp-mux = ["frp-core/tcp-mux"]

@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[cfg(feature = "chacha20")]
-use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::aead::AeadInOut;
 #[cfg(feature = "chacha20")]
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
 use rand::TryRng;
@@ -147,9 +147,12 @@ impl AeadCipher {
             }
             #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305(c) => {
-                let nonce = chacha20poly1305::XNonce::from_slice(nonce);
+                let nonce = chacha20poly1305::XNonce::try_from(nonce)
+                    .map_err(|e| format!("xchacha20 nonce: {e}"))?;
+                let inout =
+                    chacha20poly1305::aead::inout::InOutBuf::from(&mut buf[plaintext_start..]);
                 let tag = c
-                    .encrypt_in_place_detached(nonce, aad, &mut buf[plaintext_start..])
+                    .encrypt_inout_detached(&nonce, aad, inout)
                     .map_err(|e| format!("xchacha20 encrypt: {e}"))?;
                 buf.extend_from_slice(tag.as_ref());
                 Ok(())
@@ -174,11 +177,14 @@ impl AeadCipher {
             }
             #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305(c) => {
-                let nonce = chacha20poly1305::XNonce::from_slice(nonce);
+                let nonce = chacha20poly1305::XNonce::try_from(nonce)
+                    .map_err(|e| format!("xchacha20 nonce: {e}"))?;
                 let tag_start = buf.len() - 16; // both algorithms use a 16-byte tag
                 let (ciphertext, tag_bytes) = buf.split_at_mut(tag_start);
-                let tag = chacha20poly1305::Tag::from_slice(tag_bytes);
-                c.decrypt_in_place_detached(nonce, aad, ciphertext, tag)
+                let tag = chacha20poly1305::Tag::try_from(&*tag_bytes)
+                    .map_err(|e| format!("xchacha20 tag: {e}"))?;
+                let inout = chacha20poly1305::aead::inout::InOutBuf::from(ciphertext);
+                c.decrypt_inout_detached(&nonce, aad, inout, &tag)
                     .map_err(|e| format!("xchacha20 decrypt: {e}"))?;
                 Ok(tag_start)
             }

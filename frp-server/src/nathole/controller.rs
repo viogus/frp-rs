@@ -490,7 +490,7 @@ pub fn gen_analysis_key(
     hash.update(c.behavior.as_bytes());
     hash.update(c.regular_ports_change.to_string().as_bytes());
 
-    format!("{:x}", hash.finalize())
+    frp_core::hex_encode(hash.finalize().as_slice())
 }
 
 /// Parameters for building a NatHoleResp message.

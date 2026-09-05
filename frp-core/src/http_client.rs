@@ -1,9 +1,9 @@
 //! Minimal HTTP client for OIDC and HTTP plugin operations.
 //!
-//! Uses hyper + hyper-rustls directly instead of reqwest to avoid pulling
-//! the url / idna / ICU dependency stack (~1-2 MB embedded data in release
-//! binaries). All call sites use simple GET/POST with full-body reads —
-//! streaming, multipart, and cookies are not needed.
+//! Uses hyper + tokio-rustls (a custom connector) instead of reqwest to avoid
+//! pulling the url / idna / ICU dependency stack (~1-2 MB embedded data in
+//! release binaries). All call sites use simple GET/POST with full-body reads
+//! — streaming, multipart, and cookies are not needed.
 //!
 //! Feature-gated behind `http-client` so `micro`/`tiny` builds can omit it.
 
