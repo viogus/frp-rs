@@ -33,7 +33,9 @@ debug-logs = ["frp-core/debug-logs"]
 # - tracing-opentelemetry: bridge from tracing spans to OTel — no alternative
 # All optional; zero binary size impact when `otel` feature disabled.
 # Estimated binary size impact with otel: +2-3 MB (http-proto only, no tonic).
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "frp-core/otel"]
+# Carries the full OTel dep tree via frp-core/otel (logging.rs owns the init);
+# the binary itself never names an opentelemetry crate.
+otel = ["frp-core/otel"]
 # Measurement-only counting global allocator. OFF in all shipped builds.
 mem-profile = ["frp-client/mem-profile"]
 profiling = ["frp-client/profiling"]
@@ -44,17 +46,9 @@ mimalloc = ["dep:mimalloc"]
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }
 frp-client = { path = "../frp-client", default-features = false }
-opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", optional = true, features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", optional = true, features = ["http-proto"] }
-tracing-opentelemetry = { version = "0.28", optional = true }
 tokio.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tracing-appender.workspace = true
-toml.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 mimalloc = { workspace = true, optional = true }
 

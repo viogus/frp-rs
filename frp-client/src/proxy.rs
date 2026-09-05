@@ -730,7 +730,7 @@ mod tests {
         let mut hasher = md5::Md5::new();
         hasher.update(sk.as_bytes());
         hasher.update(ts.to_string().as_bytes());
-        format!("{:x}", hasher.finalize())
+        frp_core::hex_encode(hasher.finalize().as_slice())
     }
 
     #[test]
