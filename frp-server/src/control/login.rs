@@ -192,6 +192,12 @@ async fn send_login_error(
 /// window quota (`None` → the attempt proceeds to the normal error
 /// response).
 ///
+/// The caller passes `throttle_peer` — the peer address only when the
+/// transport's source IP is a trusted throttle key (see
+/// `AppState::login_throttle` docs): TCP/TLS/WS/QUIC pass the real peer;
+/// KCP passes `None` (spoofable UDP source — exempt, E1/S1), which also
+/// means a KCP-sourced failure can never trip the pre-auth gate.
+///
 /// Deliberate frp-rs hardening (NOT Go frp parity — Go frp v0.71.0 has
 /// no login throttle in its source): only failures consume a slot — this
 /// helper is invoked on failure paths only, so successful logins are
@@ -229,6 +235,12 @@ async fn throttled_login_error(state: &AppState, peer: Option<SocketAddr>) -> Op
 ///
 /// Extracted from `authenticate` so the large login future is split into
 /// two smaller state machines (auth phase + setup phase).
+///
+/// `throttle_keyed` marks whether the peer's source IP may key the per-IP
+/// login throttle (audit E1/S1): TCP/TLS/WS/QUIC logins carry a real,
+/// non-spoofable source → true. KCP logins are exempt (false) — their
+/// "peer IP" is a spoofable UDP datagram source. See `AppState::login_throttle`
+/// docs in state.rs for the full rationale.
 #[inline(never)]
 async fn verify_login_auth(
     stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
@@ -237,6 +249,7 @@ async fn verify_login_auth(
     peer: Option<SocketAddr>,
     v2: bool,
     internal: bool,
+    throttle_keyed: bool,
 ) -> Result<
     (
         Option<String>,
@@ -268,6 +281,14 @@ async fn verify_login_auth(
         );
     }
 
+    // Effective per-IP throttle key. `throttle_keyed=false` (KCP-sourced
+    // logins — spoofable UDP source, see state.rs login_throttle docs)
+    // disables the per-IP throttle entirely: failure paths below consume no
+    // throttle slot (the pre-auth gate lives in `authenticate`). Socket-
+    // layer KCP session caps (32/IP/10s, 256/10s global —
+    // frp-core/src/kcp/socket.rs) remain the KCP attempt bound.
+    let throttle_peer = if throttle_keyed { peer } else { None };
+
     // The pre-auth throttle gate lives in `authenticate`, BEFORE the plugin
     // hook (see there — a throttled IP must not trigger plugin HTTP calls
     // either). The failure paths below still consume a slot via
@@ -292,7 +313,7 @@ async fn verify_login_auth(
                     peer = ?peer,
                     "OIDC login rejected: JWT jti reused with a different subject (replay suspected)"
                 );
-                if let Some(msg) = throttled_login_error(state, peer).await {
+                if let Some(msg) = throttled_login_error(state, throttle_peer).await {
                     send_login_error(stream, msg, v2).await;
                     return Err(());
                 }
@@ -317,7 +338,7 @@ async fn verify_login_auth(
                     // must not be exempt from the login throttle, and the
                     // client needs a LoginResp error rather than a silent
                     // hang.
-                    if let Some(msg) = throttled_login_error(state, peer).await {
+                    if let Some(msg) = throttled_login_error(state, throttle_peer).await {
                         send_login_error(stream, msg, v2).await;
                         return Err(());
                     }
@@ -344,7 +365,7 @@ async fn verify_login_auth(
                     warn!(peer = ?peer, error = %e, "OIDC login rejected: {}", e);
                     // Rate-limit failed logins per IP — the OIDC path must
                     // not be exempt from the login throttle (F1).
-                    if let Some(msg) = throttled_login_error(state, peer).await {
+                    if let Some(msg) = throttled_login_error(state, throttle_peer).await {
                         send_login_error(stream, msg, v2).await;
                         return Err(());
                     }
@@ -360,7 +381,9 @@ async fn verify_login_auth(
                     .await;
                     return Err(());
                 }
-                info!(subject = %oidc_token.subject, "OIDC login verified: subject={}", oidc_token.subject);
+                // E3/C2: Go frp logs no OIDC subject on login — demoted from
+                // info to debug (per-login PII in the info stream).
+                debug!(subject = %oidc_token.subject, "OIDC login verified: subject={}", oidc_token.subject);
                 Some(oidc_token.subject)
             }
             Err(e) => {
@@ -371,7 +394,7 @@ async fn verify_login_auth(
                 // at any rate, each costing a signature verification (+ a
                 // JWKS refresh retry, itself cooldown-gated in the
                 // verifier).
-                if let Some(msg) = throttled_login_error(state, peer).await {
+                if let Some(msg) = throttled_login_error(state, throttle_peer).await {
                     send_login_error(stream, msg, v2).await;
                     return Err(());
                 }
@@ -402,7 +425,7 @@ async fn verify_login_auth(
             // Rate-limit failed logins per IP (deliberate frp-rs hardening
             // — Go frp v0.71.0 has no login throttle). Only failures
             // consume a slot — successful logins are not counted.
-            if let Some(msg) = throttled_login_error(state, peer).await {
+            if let Some(msg) = throttled_login_error(state, throttle_peer).await {
                 send_login_error(stream, msg, v2).await;
                 return Err(());
             }
@@ -444,7 +467,7 @@ async fn verify_login_auth(
                     // replaying captured (ts, md5) pairs with a stale clock
                     // would otherwise fail here forever without ever
                     // advancing toward the per-IP throttle.
-                    let throttled = throttled_login_error(state, peer).await;
+                    let throttled = throttled_login_error(state, throttle_peer).await;
                     send_login_error(stream, throttled.unwrap_or(e), v2).await;
                     return Err(());
                 }
@@ -523,7 +546,7 @@ async fn verify_login_auth(
                     // freely — each rejection was uncounted — and never
                     // advance toward the throttle that caps their later
                     // guess attempts.
-                    let throttled = throttled_login_error(state, peer).await;
+                    let throttled = throttled_login_error(state, throttle_peer).await;
                     send_login_error(stream, throttled.unwrap_or(error), v2).await;
                     return Err(());
                 }
@@ -584,6 +607,11 @@ fn is_printable_run_id_char(c: char) -> bool {
 /// On failure sends LoginResp with an error and returns `Err(())`.
 /// When `internal` is true and the login's ClientSpec.AlwaysAuthPass is set,
 /// authentication is bypassed (Go frp SSH gateway compat).
+///
+/// `throttle_keyed` marks whether the peer's source IP may key the per-IP
+/// login throttle (audit E1/S1): true for TCP/TLS/WS/QUIC (real,
+/// non-spoofable sources), false for KCP-sourced logins (spoofable UDP
+/// source — see `AppState::login_throttle` docs in state.rs).
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 pub(crate) async fn authenticate(
@@ -596,6 +624,7 @@ pub(crate) async fn authenticate(
     crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
     internal: bool,
     auth_success: Option<oneshot::Sender<()>>,
+    throttle_keyed: bool,
 ) -> Result<
     (
         ControlContext,
@@ -612,6 +641,18 @@ pub(crate) async fn authenticate(
     // Raw wire-byte counter (S1): wrapped below the cipher in both
     // encryption branches so the stall reaper sees IV/frame-header bytes.
     let raw = Arc::new(AtomicU64::new(0));
+    // Effective per-IP throttle key. `throttle_keyed=false` (KCP-sourced
+    // logins — the peer IP is a spoofable UDP datagram source, session
+    // created from the FIRST datagram, no handshake round-trip) disables
+    // the per-IP login throttle entirely: no slot consumption on any
+    // failure path and no pre-auth gate. 5 spoofed wrong-token logins
+    // would otherwise hard-lock the victim IP's REAL frpc logins for the
+    // 60 s window, refreshable at ~5 spoofed logins/min indefinitely —
+    // the throttle (Rust-only hardening; Go frp has none) becomes a
+    // targeted lockout primitive. KCP attempt volume stays bounded at the
+    // socket layer: 32 sessions/IP/10s + 256/10s global session-create
+    // caps (frp-core/src/kcp/socket.rs).
+    let throttle_peer = if throttle_keyed { peer } else { None };
     // Login throttle: FAIL-ONLY rate limiting (deliberate frp-rs hardening
     // — Go frp v0.71.0 has no login throttle).
     // `check_login_throttle` is invoked on authentication failure below and
@@ -636,7 +677,7 @@ pub(crate) async fn authenticate(
             .as_ref()
             .and_then(|cs| cs.always_auth_pass)
             .unwrap_or(false);
-    if !is_auth_bypass && state.is_login_throttled(peer).await {
+    if !is_auth_bypass && state.is_login_throttled(throttle_peer).await {
         warn!(
             peer = ?peer,
             "Login rejected pre-auth: IP already throttled",
@@ -703,7 +744,7 @@ pub(crate) async fn authenticate(
                 // Consume a throttle slot: this is a pre-auth failure (round
                 // 6 B5 DoS gate) — without it an attacker could trigger
                 // plugin HTTP round-trips at any rate.
-                if let Some(msg) = throttled_login_error(&state, peer).await {
+                if let Some(msg) = throttled_login_error(&state, throttle_peer).await {
                     send_login_error(stream, msg, v2).await;
                     return Err(());
                 }
@@ -740,7 +781,7 @@ pub(crate) async fn authenticate(
                 // Consume a throttle slot: a plugin that rejects on
                 // attacker-controlled fields (user, metas) must not get
                 // unbounded pre-auth HTTP calls per IP (round-6 B5 DoS gate).
-                if let Some(msg) = throttled_login_error(&state, peer).await {
+                if let Some(msg) = throttled_login_error(&state, throttle_peer).await {
                     send_login_error(stream, msg, v2).await;
                     return Err(());
                 }
@@ -759,7 +800,7 @@ pub(crate) async fn authenticate(
                         // Consume a throttle slot: a pre-auth failure must
                         // not be exempt from the login throttle (round-6 B5
                         // DoS gate — the plugin hook runs BEFORE auth).
-                        if let Some(msg) = throttled_login_error(&state, peer).await {
+                        if let Some(msg) = throttled_login_error(&state, throttle_peer).await {
                             send_login_error(stream, msg, v2).await;
                             return Err(());
                         }
@@ -806,7 +847,7 @@ pub(crate) async fn authenticate(
             // unbounded failure rate (round-8 finding — the old path
             // returned before `throttled_login_error`, so the pre-auth
             // gate never armed).
-            if let Some(msg) = throttled_login_error(&state, peer).await {
+            if let Some(msg) = throttled_login_error(&state, throttle_peer).await {
                 send_login_error(stream, msg, v2).await;
                 return Err(());
             }
@@ -839,7 +880,7 @@ pub(crate) async fn authenticate(
                 client_id_len = %cid.len(),
                 "Login rejected: client_id too long (max 256 bytes)"
             );
-            if let Some(msg) = throttled_login_error(&state, peer).await {
+            if let Some(msg) = throttled_login_error(&state, throttle_peer).await {
                 send_login_error(stream, msg, v2).await;
                 return Err(());
             }
@@ -873,7 +914,13 @@ pub(crate) async fn authenticate(
         > + Send
         + 'a;
     let auth_fut: Pin<Box<AuthFuture<'_>>> = Box::pin(verify_login_auth(
-        stream, &login, &state, peer, v2, internal,
+        stream,
+        &login,
+        &state,
+        peer,
+        v2,
+        internal,
+        throttle_keyed,
     ));
     let (oidc_subject, mut stream) = auth_fut.await?;
 
@@ -1545,6 +1592,7 @@ mod auth_signal_tests {
             None,
             false,
             Some(tx),
+            true,
         )
         .await;
 
@@ -1620,6 +1668,7 @@ mod auth_signal_tests {
                 None,
                 false,
                 None,
+                true,
             )
             .await;
             assert!(result.is_err(), "attempt {attempt} must be rejected");
@@ -1636,6 +1685,160 @@ mod auth_signal_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn kcp_sourced_logins_exempt_from_per_ip_login_throttle() {
+        // E1/S1 (audit round 9): the per-IP login throttle keys on the peer
+        // IP for every transport, but a KCP peer IP is a spoofable UDP
+        // datagram source — the session is created from the FIRST datagram
+        // (sn=0, no ACK round-trip), so a full V1 wrong-token Login can be
+        // delivered from a spoofed source. 5 spoofed failures inside the
+        // anchored 60s window would hard-lock the victim IP's real frpc
+        // logins, refreshable at ~5 spoofed logins/min indefinitely — the
+        // throttle (Rust-only hardening; Go frp has none) becomes a
+        // 5-packet/min targeted lockout primitive. KCP-sourced logins
+        // therefore run with throttle_keyed=false: they must neither
+        // consume per-IP throttle slots nor trip the pre-auth gate (KCP
+        // attempt volume stays bounded at the socket layer — 32 sessions/
+        // IP/10s, 256/10s global, frp-core/src/kcp/socket.rs).
+        //
+        // Both arms of the matrix:
+        //  - throttle_keyed=false (KCP): 6 consecutive failed logins from
+        //    one IP → NONE throttled (every attempt gets the auth error).
+        //  - throttle_keyed=true (TCP/WS/QUIC): 5 failures consume slots;
+        //    the 6th attempt is rejected pre-auth as throttled (existing
+        //    keyed behavior, pinned here for contrast).
+        let state = test_state();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let bad_login = |run_tag: &str| frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some(format!("kcp-throttle-{run_tag}")),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("wrong-secret", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let kcp_peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        // KCP arm: exempt — none of the 6 failures may be throttled.
+        for attempt in 1..=6u32 {
+            let (server, mut client) = tokio::io::duplex(4096);
+            let result = super::authenticate(
+                Box::new(server),
+                &bad_login(&format!("kcp-{attempt}")),
+                state.clone(),
+                Some(kcp_peer),
+                None,
+                false,
+                None,
+                false,
+                None,
+                false, // throttle_keyed=false: KCP transport (spoofable UDP src)
+            )
+            .await;
+            assert!(result.is_err(), "KCP attempt {attempt} must be rejected");
+            let error = read_login_resp_error(&mut client).await;
+            assert!(
+                !error.contains("throttled"),
+                "KCP-sourced attempt {attempt} must never be throttled, got: {error}"
+            );
+            assert!(
+                !error.is_empty(),
+                "KCP-sourced attempt {attempt} must fail auth"
+            );
+        }
+        // TCP arm (mirror): keyed — the 6th attempt IS pre-auth-throttled.
+        let tcp_peer: std::net::SocketAddr = "127.0.0.2:12345".parse().unwrap();
+        for attempt in 1..=6u32 {
+            let (server, mut client) = tokio::io::duplex(4096);
+            let result = super::authenticate(
+                Box::new(server),
+                &bad_login(&format!("tcp-{attempt}")),
+                state.clone(),
+                Some(tcp_peer),
+                None,
+                false,
+                None,
+                false,
+                None,
+                true, // throttle_keyed=true: TCP/WS/QUIC (real source IP)
+            )
+            .await;
+            assert!(result.is_err(), "TCP attempt {attempt} must be rejected");
+            let error = read_login_resp_error(&mut client).await;
+            if attempt <= 5 {
+                assert!(
+                    !error.contains("throttled"),
+                    "TCP attempt {attempt} must fail auth (not throttle), got: {error}"
+                );
+            } else {
+                assert!(
+                    error.contains("throttled"),
+                    "TCP 6th attempt must be throttled, got: {error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detailed_login_resp_token_mismatch_matches_go_literal() {
+        // E2/C3 (audit round 9): Go frp's detailed_errors_to_client=true
+        // puts err.Error() verbatim in LoginResp.error; its VerifyLogin
+        // (pkg/auth/token.go:66) returns the literal
+        // "token in login doesn't match token from configuration".
+        // test_state() below runs detailed_errors_to_client=true, so the
+        // wire text must byte-match Go's literal.
+        let state = test_state();
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("e2-go-literal".into()),
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("wrong-secret", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let (server, mut client) = tokio::io::duplex(4096);
+        let result = super::authenticate(
+            Box::new(server),
+            &login,
+            state,
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+            None,
+            true,
+        )
+        .await;
+        assert!(result.is_err(), "wrong token must be rejected");
+        let error = read_login_resp_error(&mut client).await;
+        assert_eq!(
+            error, "token in login doesn't match token from configuration",
+            "detailed-mode LoginResp.error must byte-match Go pkg/auth/token.go:66"
+        );
     }
 
     #[test]
@@ -1732,6 +1935,7 @@ mod auth_signal_tests {
             None,
             false,
             None,
+            true,
         )
         .await;
         assert!(result.is_ok(), "valid login must authenticate");
@@ -1797,6 +2001,7 @@ mod auth_signal_tests {
             None,
             false,
             None,
+            true,
         )
         .await;
         assert!(
@@ -1835,6 +2040,7 @@ mod auth_signal_tests {
             None,
             false,
             None,
+            true,
         )
         .await;
         assert!(result.is_ok(), "a sane client_id must still authenticate");
@@ -2142,6 +2348,7 @@ mod oidc_throttle_tests {
                 None,
                 false,
                 None,
+                true,
             )
             .await;
             assert!(result.is_err(), "attempt {attempt} must be rejected");
@@ -2243,6 +2450,7 @@ mod oidc_throttle_tests {
                 None,
                 false,
                 None,
+                true,
             )
             .await;
             assert!(result.is_err(), "attempt {attempt} must be rejected");
@@ -2332,6 +2540,7 @@ mod oidc_throttle_tests {
             None,
             false,
             None,
+            true,
         )
         .await;
         assert!(result.is_err(), "oversized run_id must be rejected");
@@ -2353,6 +2562,7 @@ mod oidc_throttle_tests {
             None,
             false,
             None,
+            true,
         )
         .await;
         assert!(result.is_err(), "U+00A0 run_id must be rejected");
@@ -2377,6 +2587,7 @@ mod oidc_throttle_tests {
             None,
             false,
             None,
+            true,
         )
         .await;
         assert!(
@@ -2397,6 +2608,7 @@ mod oidc_throttle_tests {
             None,
             false,
             None,
+            true,
         )
         .await;
         assert!(result.is_ok(), "valid run_id + valid JWT must authenticate");

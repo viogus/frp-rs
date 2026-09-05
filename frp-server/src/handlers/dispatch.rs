@@ -959,6 +959,7 @@ pub(crate) async fn dispatch_v2_message(
         visitor_addr,
         crypto_ctx,
         None,
+        true,
     )
     .await;
 }
@@ -984,12 +985,17 @@ pub(crate) async fn dispatch_v2_message_with_auth_signal(
         visitor_addr,
         crypto_ctx,
         Some(auth_success),
+        true,
     )
     .await;
 }
 
+/// `throttle_keyed`: whether the login's peer source IP may key the per-IP
+/// login throttle. True for TCP/TLS/WS/QUIC (real source); false for
+/// KCP-sourced logins (spoofable UDP source — audit E1/S1; see
+/// `AppState::login_throttle` docs). Forwarded via `handle_control_inner`.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_v2_message_inner(
+pub(crate) async fn dispatch_v2_message_inner(
     io: IoStream,
     payload: Vec<u8>,
     state: std::sync::Arc<AppState>,
@@ -998,6 +1004,7 @@ async fn dispatch_v2_message_inner(
     visitor_addr: Option<String>,
     crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
     auth_success: Option<tokio::sync::oneshot::Sender<()>>,
+    throttle_keyed: bool,
 ) {
     if payload.len() < 2 {
         warn!(addr = %addr, "V2 message payload too short from {}", addr);
@@ -1013,32 +1020,23 @@ async fn dispatch_v2_message_inner(
     };
     match msg {
         FrpMessage::Login(login) => {
-            if let Some(auth_success) = auth_success {
-                control::handle_control_with_auth_signal(
-                    io,
-                    *login,
-                    state,
-                    Some(addr),
-                    incoming,
-                    true,
-                    crypto_ctx,
-                    false,
-                    auth_success,
-                )
-                .await;
-            } else {
-                control::handle_control(
-                    io,
-                    *login,
-                    state,
-                    Some(addr),
-                    incoming,
-                    true,
-                    crypto_ctx,
-                    false,
-                )
-                .await;
-            }
+            // `throttle_keyed` forwarded as-is: the public wrappers (TCP/TLS/
+            // WS/QUIC) pass true; KCP-sourced logins call *_inner directly
+            // with false (spoofable UDP source — see
+            // `AppState::login_throttle` docs in state.rs).
+            control::handle_control_inner(
+                io,
+                *login,
+                state,
+                Some(addr),
+                incoming,
+                true,
+                crypto_ctx,
+                false,
+                auth_success,
+                throttle_keyed,
+            )
+            .await;
         }
         FrpMessage::NewWorkConn(nwc) => {
             handle_work_conn_inner(io, nwc, state, true).await;

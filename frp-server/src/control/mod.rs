@@ -302,6 +302,11 @@ pub(crate) struct ControlContext {
 /// `peer` is passed separately because generic stream types don't have peer_addr().
 /// `internal` marks connections from internal sources (SSH gateway) — when combined
 /// with AlwaysAuthPass in the login ClientSpec, authentication is bypassed.
+///
+/// Logins over TCP/TLS/WS/QUIC key the per-IP login throttle on the peer IP
+/// (real, non-spoofable source). KCP-sourced logins pass through
+/// `handle_control_inner` with `throttle_keyed=false` (spoofable UDP source —
+/// audit E1/S1, see `AppState::login_throttle` docs in state.rs).
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(stream, state, incoming, crypto_ctx, login), fields(run_id = %login.run_id.clone().unwrap_or_default(), peer = ?peer, internal))]
 pub async fn handle_control<S>(
@@ -317,7 +322,7 @@ pub async fn handle_control<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     handle_control_inner(
-        stream, login, state, peer, incoming, v2, crypto_ctx, internal, None,
+        stream, login, state, peer, incoming, v2, crypto_ctx, internal, None, true,
     )
     .await;
 }
@@ -348,12 +353,17 @@ pub async fn handle_control_with_auth_signal<S>(
         crypto_ctx,
         internal,
         Some(auth_success),
+        true,
     )
     .await;
 }
 
+/// `throttle_keyed`: whether the login's peer source IP may key the per-IP
+/// login throttle. True for TCP/TLS/WS/QUIC (real source); false for
+/// KCP-sourced logins (spoofable UDP source — audit E1/S1; see
+/// `AppState::login_throttle` docs). Forwarded into `login::authenticate`.
 #[allow(clippy::too_many_arguments)]
-async fn handle_control_inner<S>(
+pub(crate) async fn handle_control_inner<S>(
     stream: S,
     login: msg::Login,
     state: Arc<AppState>,
@@ -363,6 +373,7 @@ async fn handle_control_inner<S>(
     crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
     internal: bool,
     auth_success: Option<tokio::sync::oneshot::Sender<()>>,
+    throttle_keyed: bool,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -382,6 +393,7 @@ async fn handle_control_inner<S>(
             crypto_ctx,
             internal,
             auth_success,
+            throttle_keyed,
         )
         .await
         {

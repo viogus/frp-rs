@@ -8,10 +8,162 @@ use tokio::task::JoinHandle;
 
 use frp_core::config::ServerConfig;
 use frp_core::encryption;
-use frp_core::msg::{FrpMessage, Login, LoginResp};
+use frp_core::msg::{self, FrpMessage, Login, LoginResp};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 use frp_server::service::Service;
+
+/// Register a TCP proxy with an explicit remote port on a logged-in control
+/// stream, asserting a successful NewProxyResp. The remote port must come
+/// from `allocate_port` (an explicit port keeps frps from racing parallel
+/// test servers on a full-range auto-assign scan).
+#[allow(dead_code)]
+pub async fn register_tcp_proxy(ctl: &mut IoStream, name: &str, remote_port: u16) {
+    let np = FrpMessage::NewProxy(Box::new(msg::NewProxy {
+        proxy_name: name.into(),
+        proxy_type: "tcp".into(),
+        sk: None,
+        use_encryption: None,
+        use_compression: None,
+        group: None,
+        group_key: None,
+        local_str: Some("127.0.0.1:1".into()),
+        remote_port: Some(remote_port as i32),
+        custom_domains: None,
+        subdomain: None,
+        locations: None,
+        http_user: None,
+        http_pwd: None,
+        host_header_rewrite: None,
+        headers: None,
+        response_headers: None,
+        route_by_http_user: None,
+        allow_users: None,
+        bandwidth_limit: None,
+        bandwidth_limit_mode: None,
+        annotations: None,
+        metas: None,
+        multiplexer: None,
+        virtual_net: None,
+        proxy_protocol_version: None,
+        advertise_subnet: None,
+        vnet_ip: None,
+        vnet_netmask: None,
+        vnet_mtu: None,
+    }));
+    write_msg_v1(ctl, &np)
+        .await
+        .unwrap_or_else(|e| panic!("send NewProxy for {name}: {e}"));
+    match read_msg_v1(ctl)
+        .await
+        .unwrap_or_else(|e| panic!("read NewProxyResp for {name}: {e}"))
+    {
+        FrpMessage::NewProxyResp(r) => {
+            assert!(r.error.is_none(), "register {name}: {:?}", r.error);
+        }
+        other => panic!(
+            "expected NewProxyResp for {name}, got type byte {:?}",
+            other.v1_type_byte()
+        ),
+    }
+}
+
+/// Bridge one user connection through a live TCP proxy the way an frpc does.
+/// The user connects to the proxy's remote port; because the test never
+/// answers the post-login pre-warm ReqWorkConn, the work pool is empty and
+/// the server asks for a work conn on the control; a fresh NewWorkConn TCP
+/// connection answers and the server writes StartWorkConn on it.
+///
+/// Returns the `(user, work)` stream pair with the bridge live. `ctl` must
+/// be the encrypted control stream from `raw_login`/`login_with_test_token`.
+#[allow(dead_code)]
+pub async fn open_tcp_proxy_bridge(
+    server_addr: SocketAddr,
+    remote_port: u16,
+    ctl: &mut IoStream,
+    run_id: &str,
+) -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+    let user = tokio::net::TcpStream::connect(("127.0.0.1", remote_port))
+        .await
+        .expect("user conn to proxy remote port");
+    match tokio::time::timeout(Duration::from_secs(5), read_msg_v1(ctl))
+        .await
+        .expect("ReqWorkConn after user connect within 5s")
+        .expect("read ReqWorkConn")
+    {
+        FrpMessage::ReqWorkConn(_) => {}
+        other => panic!(
+            "expected ReqWorkConn, got type byte {:?}",
+            other.v1_type_byte()
+        ),
+    }
+    let mut work = tokio::net::TcpStream::connect(server_addr)
+        .await
+        .expect("work conn dial");
+    write_msg_v1(
+        &mut work,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id.into()),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+    match tokio::time::timeout(Duration::from_secs(5), read_msg_v1(&mut work))
+        .await
+        .expect("StartWorkConn within 5s")
+        .expect("read StartWorkConn")
+    {
+        FrpMessage::StartWorkConn(swc) => assert!(swc.error.is_none(), "{:?}", swc.error),
+        other => panic!(
+            "expected StartWorkConn, got type byte {:?}",
+            other.v1_type_byte()
+        ),
+    }
+    (user, work)
+}
+
+/// Pump `user_to_work` bytes user → work and `work_to_user` bytes work →
+/// user through a live bridge, then half-close each side (write shutdown) in
+/// an order that lets the server's relay terminate cleanly with exact byte
+/// counts: FIN after the user→work data ends that arm, FIN after the
+/// work→user data ends the other. The bridge task records the traffic on
+/// completion, so callers poll the traffic endpoints afterwards.
+#[allow(dead_code)]
+pub async fn pump_tcp_bridge(
+    mut user: tokio::net::TcpStream,
+    mut work: tokio::net::TcpStream,
+    user_to_work: usize,
+    work_to_user: usize,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // user → work: write the payload, then half-close so the server's
+    // user→work relay arm sees EOF (after all bytes) and finishes.
+    let payload = vec![0xA5u8; user_to_work];
+    user.write_all(&payload).await.expect("user writes payload");
+    user.shutdown().await.expect("user half-close");
+    // The frpc side (local service) receives exactly user_to_work bytes.
+    let mut received = vec![0u8; user_to_work];
+    work.read_exact(&mut received)
+        .await
+        .expect("work reads payload");
+    assert_eq!(received, payload, "work conn payload must be byte-exact");
+
+    // work → user: mirrored, closing the other direction.
+    let response = vec![0x5Au8; work_to_user];
+    work.write_all(&response)
+        .await
+        .expect("work writes response");
+    work.shutdown().await.expect("work half-close");
+    let mut echoed = vec![0u8; work_to_user];
+    user.read_exact(&mut echoed)
+        .await
+        .expect("user reads response");
+    assert_eq!(echoed, response, "user conn response must be byte-exact");
+    // Both conns drop here, fully closed.
+}
 
 /// Go frp v0.71.0 `NotFoundResponse` (pkg/util/http/http.go) — the exact
 /// 404 answer frps writes on a vhost/tcpmux route miss (and control-gone)

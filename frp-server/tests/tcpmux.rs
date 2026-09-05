@@ -621,10 +621,20 @@ async fn test_tcpmux_proxy_auth() {
             "the 200 OK success hook must precede the 407 (Go order): {}",
             text
         );
+        // Go raw Response.Write header order for the CL==0 407 (probe vs
+        // go1.25): writeHeader emits NO Content-Length when CL==0 (nil
+        // TransferEncoding is not "identity"), so Header.WriteSubset (the
+        // Proxy-Authenticate map header) lands first and Response.Write's
+        // explicit "Content-Length: 0" fallback closes the head — the wire
+        // order is Proxy-Authenticate THEN Content-Length: 0.
         assert!(
-            text.contains("HTTP/1.1 407 Proxy Authentication Required\r\n")
-                && text.contains("Basic realm=\"Restricted\""),
-            "expected the Go-parity 407 + Restricted realm after the 200, got: {}",
+            text.contains(
+                "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                 Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\
+                 Content-Length: 0\r\n"
+            ),
+            "expected the Go-parity 407 head (Proxy-Authenticate before \
+             Content-Length: 0) after the 200, got: {}",
             text
         );
         println!("Auth required: 200 OK then 407 received (Go parity)");

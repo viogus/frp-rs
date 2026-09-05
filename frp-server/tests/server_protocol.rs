@@ -77,10 +77,13 @@ async fn test_login_wrong_token_fails() {
         .expect("login should return a response");
 
     assert!(resp.error.is_some(), "expected auth error, got success");
-    let err = resp.error.unwrap().to_lowercase();
+    let err = resp.error.unwrap();
+    // Go pkg/auth/token.go:66 literal — detailed login errors carry the
+    // exact token.go text ("token in login doesn't match token from
+    // configuration"), not a category word.
     assert!(
-        err.contains("invalid") || err.contains("authentication failed"),
-        "expected auth error, got: {err}"
+        err.contains("token in login doesn't match token from configuration"),
+        "expected Go token.go:66 literal, got: {err}"
     );
 }
 
