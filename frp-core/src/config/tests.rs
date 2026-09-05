@@ -3588,21 +3588,65 @@ fn test_parse_number_range_huge_expansion_capped() {
 }
 
 #[test]
-fn test_parse_number_range_non_call_templates_kept_verbatim() {
-    // Other `{{ ... }}` text is NOT template syntax for us — only the exact
-    // parseNumberRange call form is expanded (deliberate subset).
-    let other = "{{ .Envs.X }}";
+fn test_template_envs_reference_expands() {
+    // `{{ .Envs.NAME }}` is Go frp's documented environment pattern
+    // (template data Values.Envs, pkg/config/load.go) — `token = "{{
+    // .Envs.FRP_TOKEN }}"` is the canonical Go config. It must expand, not
+    // stay verbatim (a literal `{{ .Envs.X }}` token fails auth silently).
+    const NAME: &str = "FRP_RS_TEST_TEMPLATE_ENVS_1";
+    let _ = std::env::remove_var(NAME);
+    assert_eq!(
+        expand_template_in_str(&format!("{{{{ .Envs.{NAME} }}}}")),
+        "",
+        "unset .Envs reference expands to empty (Go renders the map zero value)"
+    );
+    std::env::set_var(NAME, "envval");
+    assert_eq!(
+        expand_template_in_str(&format!("{{{{ .Envs.{NAME} }}}}")),
+        "envval",
+        "set .Envs reference expands to the environment value"
+    );
+    let mixed = format!("a{{{{ parseNumberRange \"7000\" }}}}b{{{{ .Envs.{NAME} }}}}c");
+    assert_eq!(
+        expand_template_in_str(&mixed),
+        "a7000benvvalc",
+        "parseNumberRange and .Envs actions both expand in one string"
+    );
+    std::env::remove_var(NAME);
+}
+
+#[test]
+fn test_template_non_envs_actions_kept_verbatim() {
+    // Template syntax OUTSIDE the two recognized forms is not processed
+    // (deliberate zero-engine subset): `.Envs` alone (Go renders the whole
+    // map), dotted variable chains, index/range argument forms.
+    let other = "{{ .SomeField.X }}";
     assert_eq!(
         expand_template_in_str(other),
         other,
-        "non-parseNumberRange template text kept verbatim"
+        "non-Envs variable chain kept verbatim"
     );
-    let mixed = "a{{ parseNumberRange \"7000\" }}b{{ .Envs.X }}c";
+    let envs_alone = "{{ .Envs }}";
     assert_eq!(
-        expand_template_in_str(mixed),
-        "a7000b{{ .Envs.X }}c",
-        "only the parseNumberRange call is expanded"
+        expand_template_in_str(envs_alone),
+        envs_alone,
+        "bare {{ .Envs }} map render kept verbatim"
     );
+    let index_form = "{{ index .Envs \"X-Y\" }}";
+    assert_eq!(
+        expand_template_in_str(index_form),
+        index_form,
+        "index-syntax .Envs access kept verbatim"
+    );
+    let range_arg = "{{ parseNumberRange .Envs.PORT_RANGE }}";
+    assert_eq!(
+        expand_template_in_str(range_arg),
+        range_arg,
+        ".Envs as a parseNumberRange argument kept verbatim"
+    );
+    // A `}}` missing entirely is not an action at all.
+    let unclosed = "{{ .Envs.X";
+    assert_eq!(expand_template_in_str(unclosed), unclosed);
 }
 
 #[test]
@@ -4814,8 +4858,7 @@ fn test_ini_nested_bracket_recursion_depth_capped() {
     }
     raw.push_str("\nserver_port = 7000\n");
 
-    let value =
-        super::format::parse_to_toml_value(&raw, super::format::ConfigFormat::Ini).unwrap();
+    let value = super::format::parse_to_toml_value(&raw, super::format::ConfigFormat::Ini).unwrap();
     let table = value.as_table().unwrap();
     let token = table.get("token").unwrap();
 
@@ -4824,7 +4867,6 @@ fn test_ini_nested_bracket_recursion_depth_capped() {
     // remainder. Pre-fix this value overflowed the stack (SIGABRT).
     let mut depth = 0usize;
     let mut cur = token;
-    let mut saw_string = false;
     loop {
         match cur {
             toml::Value::Array(items) => {
@@ -4833,18 +4875,42 @@ fn test_ini_nested_bracket_recursion_depth_capped() {
                 cur = &items[0];
             }
             toml::Value::String(s) => {
-                saw_string = true;
                 assert!(s.starts_with('['), "string remainder keeps brackets");
                 break;
             }
             other => panic!("unexpected nested value {other:?}"),
         }
     }
-    assert!(saw_string, "chain terminates in a string literal");
     assert!(
         depth <= 16,
         "nesting depth {depth} must be capped at 16 (no stack overflow)"
     );
+}
+
+/// bind_port: an EXPLICIT 0 maps to the default 7000 in complete(), exactly
+/// like an absent key. Go frp `v1/server.go:111` `BindPort =
+/// util.EmptyOr(BindPort, 7000)`; serde's default fn fires only on absent,
+/// so complete() closes the present-but-zero gap — `bindPort = 0` must bind
+/// 7000, not an OS-chosen ephemeral port (TcpListener::bind("0.0.0.0:0")).
+#[test]
+fn test_server_bind_port_zero_maps_to_default_in_complete() {
+    let mut cfg: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 0 })).unwrap();
+    assert_eq!(cfg.bind_port, 0, "deserialization alone must not default");
+    cfg.complete();
+    assert_eq!(cfg.bind_port, 7000);
+}
+
+/// server_port: same EmptyOr mapping on the client (Go v1/client.go:87).
+/// `server_port = 0` used to dial port 0 (connect refused) instead of the
+/// default listener.
+#[test]
+fn test_client_server_port_zero_maps_to_default_in_complete() {
+    let mut cfg: ClientConfig =
+        serde_json::from_value(serde_json::json!({ "server_port": 0 })).unwrap();
+    assert_eq!(cfg.server_port, 0, "deserialization alone must not default");
+    cfg.complete();
+    assert_eq!(cfg.server_port, 7000);
 }
 
 /// The lone-quote token through the FULL client pipeline (parse → normalize
@@ -5758,6 +5824,68 @@ remote_port = 2001
     assert_eq!(cfg.proxies[0].local_port, 1000);
     assert_eq!(cfg.proxies[1].local_port, 1001);
     assert_eq!(cfg.proxies[1].remote_port, 2001);
+}
+
+#[test]
+fn test_include_missing_directory_is_fatal() {
+    // file.rs process_includes: Go frp fails when the include's directory is
+    // missing (load.go LoadAdditionalClientConfigs os.Stat error;
+    // legacy/client.go:393 "include: directory of %s not exist"). A typo'd
+    // glob path must not silently merge nothing — that drops proxy configs
+    // without a word.
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &main_path,
+        "server_addr = \"127.0.0.1\"\nincludes = [\"nope.d/*.toml\"]\n",
+    )
+    .unwrap();
+    let err = load_client_config(main_path.to_str().unwrap(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("directory of") && err.contains("not exist"),
+        "missing include dir must be fatal, got: {err}"
+    );
+}
+
+#[test]
+fn test_include_unparseable_file_is_fatal() {
+    // A matched include file that fails to parse aborts loading (Go "load
+    // additional config from %s error") instead of warn-and-skip.
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &main_path,
+        "server_addr = \"127.0.0.1\"\nincludes = [\"conf.d/*.toml\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("conf.d")).unwrap();
+    std::fs::write(dir.path().join("conf.d").join("bad.toml"), "not [[[ toml").unwrap();
+    let err = load_client_config(main_path.to_str().unwrap(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("include") && err.contains("bad.toml"),
+        "unparseable include file must be fatal, got: {err}"
+    );
+}
+
+#[test]
+fn test_include_zero_match_glob_is_silent() {
+    // Go parity: a glob that matches nothing in an EXISTING directory is not
+    // an error (the loop just appends nothing). Only the missing-directory
+    // and per-file failure cases are fatal.
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &main_path,
+        "server_addr = \"127.0.0.1\"\nincludes = [\"conf.d/*.toml\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("conf.d")).unwrap();
+    let cfg = load_client_config(main_path.to_str().unwrap(), false).unwrap();
+    assert_eq!(cfg.server_addr, "127.0.0.1");
 }
 
 // ─── Type-mismatch values ─────────────────────────────────────────────
