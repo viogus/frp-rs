@@ -1212,10 +1212,19 @@ async fn register_https_vhost(
     let headers: Vec<(String, String)> =
         np.headers.clone().unwrap_or_default().into_iter().collect();
 
-    // HTTPS group (Go frp v0.71.0 HTTPGroupController, SNI routing).
+    // HTTPS group (Go frp v0.71.0 HTTPSGroup.Listen, server/group/https.go,
+    // SNI routing — audit round-8 F5).
     let group_name = np.group.as_deref().unwrap_or("");
     if !group_name.is_empty() {
-        if domains.len() != 1 {
+        // Go runs one listen per custom_domain entry: repeated IDENTICAL
+        // domains register the same group member once, while a second
+        // DIFFERENT domain is ErrGroupParamsInvalid. Collapse duplicates
+        // (order-preserving) so the count check separates the two cases and
+        // the first-member route registration is not handed duplicates.
+        let mut group_domains: Vec<String> = domains.clone();
+        let mut seen = std::collections::HashSet::new();
+        group_domains.retain(|d| seen.insert(d.clone()));
+        if group_domains.len() != 1 {
             rollback_vhost_conflict(state, run_id, port, false).await;
             state.proxy_manager.remove(&np.proxy_name).await;
             reject_new_proxy(
@@ -1223,23 +1232,26 @@ async fn register_https_vhost(
                 &np.proxy_name,
                 err_msg(
                     state.detailed_errors_to_client,
-                    "https group proxies must configure exactly one custom_domain (Go frp HTTPGroup semantics)".into(),
-                    "https group params invalid",
+                    "https group proxies must configure exactly one distinct custom_domain (Go frp HTTPSGroup semantics)".into(),
+                    "group params invalid",
                 ),
                 v2,
             )
             .await;
             return false;
         }
-        let domain = &domains[0];
+        let domain = &group_domains[0];
+        // HTTPS group membership compares ONLY group name + domain — location
+        // and route_by_http_user never participate (Go listenForDomain builds
+        // an empty RouteConfig; HTTPSProxyConfig cannot even express rubu).
+        // The https-kind register rejects cross-kind joins and returns the Go
+        // constants verbatim ("group params invalid" / "group auth failed").
         match state
             .http_group_ctl
-            .register_member(
+            .register_https_member(
                 group_name,
                 np.group_key.as_deref().unwrap_or(""),
                 domain,
-                "",
-                rubu,
                 &np.proxy_name,
             )
             .await
@@ -1250,7 +1262,7 @@ async fn register_https_vhost(
                         .vhost_manager
                         .register(
                             &np.proxy_name,
-                            &domains,
+                            &group_domains,
                             "https",
                             &[], // no locations for HTTPS SNI routing
                             run_id,
@@ -1297,14 +1309,24 @@ async fn register_https_vhost(
             Err(e) => {
                 rollback_vhost_conflict(state, run_id, port, false).await;
                 state.proxy_manager.remove(&np.proxy_name).await;
+                // register_https_member returns the Go constants verbatim
+                // ("group params invalid" / "group auth failed") except the
+                // cross-kind rejection, which is a frp-rs-only constraint
+                // with a descriptive sentence (Go keeps HTTP/HTTPS groups in
+                // separate controllers and never sees the conflict). That
+                // sentence must not reach the generic wire arm — a Go client
+                // cannot match a non-Go text. Map it to the standard Go
+                // group constant (the http-kind arm's cross-kind error is
+                // likewise genericized to "http group registration failed").
+                let generic = if e.starts_with("http group [") {
+                    "group params invalid"
+                } else {
+                    &e
+                };
                 reject_new_proxy(
                     writer,
                     &np.proxy_name,
-                    err_msg(
-                        state.detailed_errors_to_client,
-                        e,
-                        "https group registration failed",
-                    ),
+                    err_msg(state.detailed_errors_to_client, e.clone(), generic),
                     v2,
                 )
                 .await;
@@ -4490,6 +4512,310 @@ pub(crate) mod unregister_generation_tests {
                 .await
                 .as_deref(),
             Some("mux-a")
+        );
+    }
+
+    /// F5 (audit round 8): HTTPS group membership compares ONLY the group
+    /// name and domain — Go HTTPSGroup.Listen (server/group/https.go) never
+    /// looks at the routeConfig's route_by_http_user (an https proxy carries
+    /// no locations and listenForDomain builds an empty RouteConfig). Pre-fix
+    /// the https path routed through the HTTP-group register_member, which
+    /// compared rubu too, so a second https member with a different
+    /// route_by_http_user was wrongly rejected as a params mismatch.
+    #[tokio::test]
+    async fn https_group_member_with_different_rubu_joins() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        insert_control(&state, "run-2", 2).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np1 = new_proxy("h-a", "https");
+        np1.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np1.group = Some("web".to_string());
+        np1.group_key = Some("gk".to_string());
+        np1.route_by_http_user = Some("alice".to_string());
+        let mut writer1 = Vec::new();
+        let ok = handle_new_proxy(
+            np1,
+            "run-1",
+            1,
+            &state,
+            &mut writer1,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "first https group member must register");
+
+        // Same group + domain, DIFFERENT route_by_http_user — must join
+        // (Go https.go compares only group + domain).
+        let mut np2 = new_proxy("h-b", "https");
+        np2.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np2.group = Some("web".to_string());
+        np2.group_key = Some("gk".to_string());
+        np2.route_by_http_user = Some("bob".to_string());
+        let mut writer2 = Vec::new();
+        let ok = handle_new_proxy(
+            np2,
+            "run-2",
+            2,
+            &state,
+            &mut writer2,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        let text = String::from_utf8_lossy(&writer2).to_string();
+        assert!(
+            ok,
+            "different rubu must not block an https group join: {text}"
+        );
+
+        // Round-robin over both members.
+        assert_eq!(
+            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            Some("h-a")
+        );
+        assert_eq!(
+            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            Some("h-b")
+        );
+    }
+
+    /// F5: a second, DIFFERENT domain under the same https group name
+    /// rejects with Go's ErrGroupParamsInvalid text on the default-config
+    /// (non-detailed) branch — whether it arrives as one proxy listing two
+    /// domains ([a,b]; Go HTTPSProxy.Run fails on the second Listen) or as a
+    /// second member with a different single domain. A wrong group_key
+    /// rejects with ErrGroupAuthFailed verbatim. test_state enables detailed
+    /// errors, so the wire here explains the constraint, and the generic
+    /// mapping (what a default server sends) is pinned to the Go constant.
+    /// The [a,b] rejection must also roll back the first domain's group
+    /// membership and shared SNI route — no half-registered state survives.
+    #[tokio::test]
+    async fn https_group_second_domain_rejected_with_go_text() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        insert_control(&state, "run-2", 2).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // One proxy listing [a, b]: the second (different) domain must fail
+        // the whole registration with the Go text, rolling back the first.
+        let mut np1 = new_proxy("h-ab", "https");
+        np1.custom_domains = Some(vec![
+            "a.example.com".to_string(),
+            "b.example.com".to_string(),
+        ]);
+        np1.group = Some("web".to_string());
+        np1.group_key = Some("gk".to_string());
+        let mut writer1 = Vec::new();
+        let ok = handle_new_proxy(
+            np1,
+            "run-1",
+            1,
+            &state,
+            &mut writer1,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        let text1 = String::from_utf8_lossy(&writer1).to_string();
+        assert!(!ok, "[a,b] group https proxy must be rejected");
+        assert!(
+            text1.contains("exactly one distinct custom_domain"),
+            "rejection must explain the constraint: {text1}"
+        );
+        // Default-config (detailed_errors off) branch: the generic mapping
+        // of this exact error must be Go's ErrGroupParamsInvalid text.
+        assert_eq!(
+            err_msg(false, text1.clone(), "group params invalid"),
+            "group params invalid",
+            "the default-config wire text must be Go-verbatim"
+        );
+        assert!(
+            state.proxy_manager.get("h-ab").await.is_none(),
+            "rejected proxy must be rolled back"
+        );
+        assert_eq!(
+            state.http_group_ctl.choose_endpoint("web").await,
+            None,
+            "the group created by the rejected registration must be gone"
+        );
+        assert!(
+            state
+                .vhost_manager
+                .lookup("a.example.com", "", "", "https")
+                .await
+                .is_none(),
+            "the shared SNI route of the rejected registration must be rolled back"
+        );
+
+        // Second member with a DIFFERENT single domain: rejected verbatim,
+        // the existing group survives.
+        let mut np2 = new_proxy("h-b", "https");
+        np2.custom_domains = Some(vec!["b.example.com".to_string()]);
+        np2.group = Some("web".to_string());
+        np2.group_key = Some("gk".to_string());
+        let mut writer2 = Vec::new();
+        let ok = handle_new_proxy(
+            np2,
+            "run-2",
+            2,
+            &state,
+            &mut writer2,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        assert!(ok, "first member (domain b) must register");
+        let mut np3 = new_proxy("h-a2", "https");
+        np3.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np3.group = Some("web".to_string());
+        np3.group_key = Some("gk".to_string());
+        let mut writer3 = Vec::new();
+        let ok = handle_new_proxy(
+            np3,
+            "run-2",
+            2,
+            &state,
+            &mut writer3,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        let text3 = String::from_utf8_lossy(&writer3).to_string();
+        assert!(!ok, "different-domain member must be rejected");
+        assert!(
+            text3.contains("group params invalid"),
+            "rejection must carry the Go text: {text3}"
+        );
+        assert_eq!(
+            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            Some("h-b"),
+            "the existing group must survive the rejected join"
+        );
+
+        // Matching domain, WRONG group_key → Go ErrGroupAuthFailed.
+        let mut np4 = new_proxy("h-key", "https");
+        np4.custom_domains = Some(vec!["b.example.com".to_string()]);
+        np4.group = Some("web".to_string());
+        np4.group_key = Some("WRONG".to_string());
+        let mut writer4 = Vec::new();
+        let ok = handle_new_proxy(
+            np4,
+            "run-2",
+            2,
+            &state,
+            &mut writer4,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        let text4 = String::from_utf8_lossy(&writer4).to_string();
+        assert!(!ok, "group_key mismatch must reject");
+        assert!(
+            text4.contains("group auth failed"),
+            "rejection must carry the Go text: {text4}"
+        );
+    }
+
+    /// F5: a proxy listing the SAME custom_domain twice under a group name
+    /// is accepted — Go HTTPSGroup.Listen adds a second shared listener for
+    /// the repeated identical domain (https.go has no ErrProxyRepeated;
+    /// only the HTTP-group path repeats-rejects). frp-rs dedups to a single
+    /// member registration (both Go handles share one muxer listener and
+    /// one route — the dedup is a weight approximation, documented
+    /// divergence). Pre-fix the https group branch rejected ANY proxy whose
+    /// domain list was not exactly one entry.
+    #[tokio::test]
+    async fn https_group_repeated_same_domain_accepted() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        insert_control(&state, "run-2", 2).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        let mut np1 = new_proxy("h-aa", "https");
+        np1.custom_domains = Some(vec![
+            "a.example.com".to_string(),
+            "a.example.com".to_string(),
+        ]);
+        np1.group = Some("web".to_string());
+        np1.group_key = Some("gk".to_string());
+        let mut writer1 = Vec::new();
+        let ok = handle_new_proxy(
+            np1,
+            "run-1",
+            1,
+            &state,
+            &mut writer1,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        let text1 = String::from_utf8_lossy(&writer1).to_string();
+        assert!(ok, "[a,a] group https proxy must register: {text1}");
+        assert_eq!(
+            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            Some("h-aa"),
+            "the single deduped member must serve the group"
+        );
+
+        // A normal second member can still join the same group.
+        let mut np2 = new_proxy("h-b", "https");
+        np2.custom_domains = Some(vec!["a.example.com".to_string()]);
+        np2.group = Some("web".to_string());
+        np2.group_key = Some("gk".to_string());
+        let mut writer2 = Vec::new();
+        let ok = handle_new_proxy(
+            np2,
+            "run-2",
+            2,
+            &state,
+            &mut writer2,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            false,
+        )
+        .await;
+        let text2 = String::from_utf8_lossy(&writer2).to_string();
+        assert!(ok, "second member must join: {text2}");
+        assert_eq!(
+            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            Some("h-b"),
+            "round-robin must reach the second member"
         );
     }
 

@@ -1353,4 +1353,251 @@ mod tests {
         assert_eq!(udp_addr_to_socket(&mk("", 53, "")), None);
         assert_eq!(udp_addr_to_socket(&mk("not-an-ip", 53, "")), None);
     }
+
+    // ─── Fuzz / property-based tests (proptest) ─────────────────────
+
+    mod proptest_fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        // G7 (audit round 8): udp_binary had no property tests. Structure
+        // mirrors the protocol.rs proptest_fuzz precedent: arbitrary-byte
+        // never-panic fuzz over every decode entry point, plus decode∘encode
+        // roundtrips for well-formed packets (v4, v6, IPv4-mapped ::ffff:
+        // normalization, zoned) asserting byte-identical re-encode.
+        //
+        // Address equality is deliberately NOT asserted: encode normalizes
+        // IPv4-mapped IPv6 to family 4 (Go `net.IP.To4()`), so the decoded
+        // ip *string* may differ from the original text — the wire bytes are
+        // the invariant (round-7 M1: decode keeps family as received).
+
+        fn v4_sa() -> impl Strategy<Value = std::net::SocketAddr> {
+            (any::<[u8; 4]>(), any::<u16>())
+                .prop_map(|(o, p)| std::net::SocketAddr::from((std::net::Ipv4Addr::from(o), p)))
+        }
+
+        fn plain_v6_sa() -> impl Strategy<Value = std::net::SocketAddr> {
+            (any::<u128>(), any::<u16>())
+                .prop_map(|(o, p)| std::net::SocketAddr::from((std::net::Ipv6Addr::from(o), p)))
+        }
+
+        /// Deliberate IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) — the
+        /// family-4 normalization case that random u128 generation would
+        /// never hit (2^32/2^128 chance).
+        fn mapped_v6_sa() -> impl Strategy<Value = std::net::SocketAddr> {
+            (any::<[u8; 4]>(), any::<u16>()).prop_map(|(o, p)| {
+                let mut b = [0u8; 16];
+                b[10..12].copy_from_slice(&[0xff, 0xff]);
+                b[12..16].copy_from_slice(&o);
+                std::net::SocketAddr::from((std::net::Ipv6Addr::from(b), p))
+            })
+        }
+
+        fn any_sa() -> impl Strategy<Value = std::net::SocketAddr> {
+            prop_oneof![v4_sa(), plain_v6_sa(), mapped_v6_sa()]
+        }
+
+        fn sa_to_udp_addr(sa: &std::net::SocketAddr) -> UdpAddr {
+            UdpAddr {
+                ip: sa.ip().to_string(),
+                port: sa.port(),
+                zone: String::new(),
+            }
+        }
+
+        /// Assert every decode entry point accepts the (well-formed) body
+        /// and preserves the payload, and that re-encoding produces the
+        /// original bytes. Slice comparisons throughout — `prop_assert_eq!`
+        /// takes its operands by value, so Vec fields must not be moved out
+        /// of structs that are still needed (the re-encode steps below).
+        fn assert_roundtrip(body: &[u8], content: &[u8]) -> Result<(), TestCaseError> {
+            // Message-form decode + message-form re-encode.
+            let dec = decode_udp_packet_binary(body)
+                .map_err(|e| TestCaseError::fail(format!("decode: {e}")))?;
+            prop_assert_eq!(dec.content.as_slice(), content);
+            let mut reenc = Vec::new();
+            encode_udp_packet_binary_into(&dec, &mut reenc)
+                .map_err(|e| TestCaseError::fail(format!("re-encode: {e}")))?;
+            prop_assert_eq!(
+                reenc.as_slice(),
+                body,
+                "message-form re-encode not byte-identical"
+            );
+
+            // Owned decode (small payload → copy-out path, buffer intact).
+            let mut owned = body.to_vec();
+            let dec2 = decode_udp_packet_binary_owned(&mut owned)
+                .map_err(|e| TestCaseError::fail(format!("owned decode: {e}")))?;
+            prop_assert_eq!(dec2.content.as_slice(), content);
+            prop_assert_eq!(
+                owned.as_slice(),
+                body,
+                "small-payload owned decode must not consume the buffer"
+            );
+
+            // Native-address decode: encode never writes zones → Ok(Some).
+            let mut owned2 = body.to_vec();
+            let dec3 = decode_udp_packet_binary_socket_owned(&mut owned2)
+                .map_err(|e| TestCaseError::fail(format!("socket decode: {e}")))?
+                .ok_or_else(|| {
+                    TestCaseError::fail(
+                        "socket decode returned None — this helper only accepts \
+                         unzoned bodies (encoded locally; zones never written)",
+                    )
+                })?;
+            prop_assert_eq!(dec3.content.as_slice(), content);
+            // Cross-form re-encode (native addresses → same wire bytes).
+            let mut reenc2 = Vec::new();
+            let local3 = dec3.local_addr.as_ref().map(sa_to_udp_addr);
+            encode_udp_packet_binary_socket_addr(
+                &dec3.content,
+                local3.as_ref(),
+                &dec3.remote_addr,
+                &mut reenc2,
+            )
+            .map_err(|e| TestCaseError::fail(format!("socket re-encode: {e}")))?;
+            prop_assert_eq!(
+                reenc2.as_slice(),
+                body,
+                "socket-form re-encode not byte-identical"
+            );
+            Ok(())
+        }
+
+        proptest! {
+            /// Fuzz all three decode entry points with arbitrary bytes. Must
+            /// never panic — Ok or Err are both acceptable (the parsers'
+            /// strictness checks live in the fixed-vector tests).
+            #[test]
+            fn fuzz_decode_never_panics(
+                body in prop::collection::vec(any::<u8>(), 0..2048),
+            ) {
+                let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode_udp_packet_binary(&body)
+                }));
+                match r1 {
+                    Ok(Ok(_)) | Ok(Err(_)) => {}
+                    Err(_) => panic!("decode_udp_packet_binary panicked on {} bytes", body.len()),
+                }
+
+                let mut owned = body.clone();
+                let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode_udp_packet_binary_owned(&mut owned)
+                }));
+                match r2 {
+                    Ok(Ok(_)) | Ok(Err(_)) => {}
+                    Err(_) => panic!("decode_udp_packet_binary_owned panicked on {} bytes", body.len()),
+                }
+
+                let mut owned2 = body.clone();
+                let r3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode_udp_packet_binary_socket_owned(&mut owned2)
+                }));
+                match r3 {
+                    Ok(Ok(_)) | Ok(Err(_)) => {}
+                    Err(_) => panic!("decode_udp_packet_binary_socket_owned panicked on {} bytes", body.len()),
+                }
+            }
+        }
+
+        proptest! {
+            /// Well-formed packet (native SocketAddr remote, optional local)
+            /// encoded on the zero-alloc socket-addr path: every decode form
+            /// preserves the payload and re-encodes byte-identically, mapped
+            /// `::ffff:` addresses included (they normalize on encode only).
+            #[test]
+            fn roundtrip_socket_form_byte_stable(
+                remote in any_sa(),
+                local in prop::option::of(any_sa()),
+                content in prop::collection::vec(any::<u8>(), 0..512),
+            ) {
+                let local_udp = local.as_ref().map(sa_to_udp_addr);
+                let mut body = Vec::new();
+                encode_udp_packet_binary_socket_addr(
+                    &content,
+                    local_udp.as_ref(),
+                    &remote,
+                    &mut body,
+                )
+                .expect("well-formed packet encodes");
+                assert_roundtrip(&body, &content)?;
+            }
+        }
+
+        proptest! {
+            /// Message-form roundtrip: UdpAddr ip strings (canonical forms,
+            /// including mapped text) parse on encode and re-encode
+            /// byte-identically from the decoded form.
+            #[test]
+            fn roundtrip_message_form_byte_stable(
+                remote in any_sa(),
+                local in prop::option::of(any_sa()),
+                content in prop::collection::vec(any::<u8>(), 0..512),
+            ) {
+                let pkt = UDPPacket {
+                    content: content.clone(),
+                    local_addr: local.as_ref().map(sa_to_udp_addr),
+                    remote_addr: Some(sa_to_udp_addr(&remote)),
+                };
+                let body = encode_udp_packet_binary(&pkt).expect("well-formed packet encodes");
+                assert_roundtrip(&body, &content)?;
+            }
+        }
+
+        proptest! {
+            /// Zoned v6 (Go peer writes zones; the Rust encode side never
+            /// does): message-form roundtrip is byte-stable and the native
+            /// decoder signals the unrepresentable zone via Ok(None) — the
+            /// caller's fallback to the message form.
+            #[test]
+            fn roundtrip_zoned_v6_byte_stable(
+                zone_idx in 0usize..3,
+                content in prop::collection::vec(any::<u8>(), 0..512),
+            ) {
+                let zones = ["", "eth0", "接口"];
+                let zone = zones[zone_idx];
+                let pkt = UDPPacket {
+                    content: content.clone(),
+                    local_addr: None,
+                    remote_addr: Some(UdpAddr {
+                        ip: "fe80::1".into(),
+                        port: 8080,
+                        zone: zone.into(),
+                    }),
+                };
+                let body = encode_udp_packet_binary(&pkt).expect("well-formed packet encodes");
+                // NOT `assert_roundtrip`: its socket-decode stage requires an
+                // unzoned body. The zone-carrying message form is byte-stable
+                // and zone-preserving, which is all that applies here.
+                let mut owned = body.clone();
+                let msg = decode_udp_packet_binary_owned(&mut owned)
+                    .expect("well-formed zoned body parses in message form");
+                prop_assert_eq!(msg.content.as_slice(), content.as_slice());
+                prop_assert_eq!(
+                    msg.remote_addr.as_ref().unwrap().zone.as_str(),
+                    zone,
+                    "message form must preserve the zone verbatim"
+                );
+                let mut reenc = Vec::new();
+                encode_udp_packet_binary_into(&msg, &mut reenc)
+                    .map_err(|e| TestCaseError::fail(format!("re-encode: {e}")))?;
+                prop_assert_eq!(
+                    reenc.as_slice(),
+                    body.as_slice(),
+                    "zoned message-form re-encode not byte-identical"
+                );
+                // Native decode: zoned → Ok(None) fallback signal, unzoned →
+                // full decode.
+                let mut owned2 = body.clone();
+                let native = decode_udp_packet_binary_socket_owned(&mut owned2)
+                    .expect("parse error on well-formed body");
+                if zone.is_empty() {
+                    let pkt = native.expect("unzoned body must decode natively");
+                    prop_assert_eq!(pkt.content.as_slice(), content.as_slice());
+                } else {
+                    prop_assert!(native.is_none(), "zoned v6 must fall back to the message form");
+                }
+            }
+        }
+    }
 }

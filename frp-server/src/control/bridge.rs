@@ -8,7 +8,6 @@ use tracing::{debug, warn};
 
 use futures_util::FutureExt;
 
-use frp_core::buffer_pool::BUFFER_SIZE;
 use frp_core::cipher_stream::{CipherReader, CipherWriter};
 use frp_core::encryption::derive_key;
 use frp_core::metrics::ConnGuard;
@@ -1042,10 +1041,11 @@ fn try_split_work_halves(
 }
 
 /// Holds split user-side halves as one `AsyncRead`+`AsyncWrite` object so the
-/// XTCP STCP fallback can keep its `copy_bidirectional` semantics (both
-/// directions run to completion; the work side is only shut down after the
-/// full bidirectional copy — avoids the premature-FIN race that a
-/// join-of-two-halves bridge would reintroduce).
+/// XTCP STCP fallback can keep its `copy_bidirectional` semantics via the
+/// pooled relay `relay_plain_pooled` (both directions run to completion; the
+/// work side is only shut down after the full bidirectional copy — avoids
+/// the premature-FIN race that a join-of-two-halves bridge would
+/// reintroduce).
 struct UserSide<R, W> {
     r: R,
     w: W,
@@ -1087,7 +1087,7 @@ impl<R: AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWri
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 async fn run_work_bridge(
-    mut work_conn: IoStream,
+    work_conn: IoStream,
     req: PendingRequest,
     proxy_info: Option<Arc<crate::proxy::ProxyInfo>>,
     encryption_key: [u8; 16],
@@ -1295,30 +1295,29 @@ async fn run_work_bridge(
         // so the server sees EOF on the user side ~60ms before the provider
         // starts its bridge. The premature FIN on the work connection races
         // with the provider's copy_bidirectional startup and produces
-        // ECONNRESET on VPS. copy_bidirectional avoids this: both directions
-        // run to completion within the same function, and the work side is
-        // only shut down after the full bidirectional copy finishes.
+        // ECONNRESET on VPS. relay_plain_pooled avoids this exactly like
+        // copy_bidirectional: both directions run to completion within the
+        // same function, and the work side is only shut down after the full
+        // bidirectional copy finishes (pooled buffers — audit round-8 P1).
         //
         // Visitor-segment encryption/compression (if on) split the user conn
         // into wrapped halves (via `split_user_side`), re-combined via
-        // `UserSide` for the same copy_bidirectional call.
+        // `UserSide` for the same relay call.
         if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
-            // Sized buffers so FRP_BRIDGE_BUF_KB governs the XTCP STCP
-            // fallback path too.
             let Some((u_r, u_w)) =
                 try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
             else {
                 return;
             };
-            let mut user_side = UserSide { r: u_r, w: u_w };
-            match tokio::io::copy_bidirectional_with_sizes(
-                &mut user_side,
-                &mut work_conn,
-                *BUFFER_SIZE,
-                *BUFFER_SIZE,
-            )
-            .await
-            {
+            // Pooled-buffer relay (audit round-8 P1): relay_plain_pooled has
+            // EXACTLY the copy_bidirectional semantics this arm's comment
+            // above requires — both directions run to completion and the
+            // work side is only shut down after the full bidirectional copy
+            // (FIN-propagation, no premature-FIN race), without the
+            // per-conn buffer pair. Buffer size stays FRP_BRIDGE_BUF_KB
+            // (the pool's BUFFER_SIZE governs the XTCP STCP fallback path).
+            let user_side = UserSide { r: u_r, w: u_w };
+            match frp_core::bridge::relay_plain_pooled(user_side, work_conn).await {
                 Ok((a, b)) => {
                     metrics.record_traffic(a, b);
                 }
@@ -1760,9 +1759,9 @@ pub(crate) async fn assign_work_to_proxy(
     // StartWorkConn JSON (newer frp) or a separate NatHoleSid frame
     // immediately after StartWorkConn (Go frp v0.69.1). Our Rust frpc
     // provider's byte-peek (V1) / V2 frame read handles both formats.
-    // The copy_bidirectional bridge (used for XTCP STCP fallback below)
-    // doesn't send a premature FIN, so the provider can safely consume
-    // this frame without the old ECONNRESET race.
+    // The copy_bidirectional-semantics relay (used for XTCP STCP fallback
+    // below) doesn't send a premature FIN, so the provider can safely
+    // consume this frame without the old ECONNRESET race.
     // V2-aware: use V2 or V1 framing based on protocol version.
     if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
         let dummy = FrpMessage::NatHoleSid(msg::NatHoleSid::default());

@@ -17,8 +17,9 @@ use frp_core::VERSION;
 
 use super::{PluginContext, PluginHandle};
 
-/// Recombine split read/write halves into a duplex stream for
-/// `copy_bidirectional_with_sizes`.
+/// Recombine split read/write halves into a duplex stream for the pooled
+/// bidirectional relay (`frp_core::bridge::relay_plain_pooled`, whose
+/// internal BiLock split re-splits it).
 struct Duplex<R, W> {
     r: R,
     w: W,
@@ -445,16 +446,13 @@ async fn handle_visitor_conn(
         s_w
     };
 
-    let mut user_side = Duplex { r: u_r, w: u_w };
-    let mut server_side = Duplex { r: s_r, w: s_w };
-    match tokio::io::copy_bidirectional_with_sizes(
-        &mut user_side,
-        &mut server_side,
-        *frp_core::buffer_pool::BUFFER_SIZE,
-        *frp_core::buffer_pool::BUFFER_SIZE,
-    )
-    .await
-    {
+    let user_side = Duplex { r: u_r, w: u_w };
+    let server_side = Duplex { r: s_r, w: s_w };
+    // Pooled-buffer relay (audit round-8 P1): relay_plain_pooled keeps
+    // copy_bidirectional semantics (both directions to completion, FIN
+    // propagated) without the per-conn buffer pair; its internal BiLock
+    // split re-splits the recombined Duplex wrappers.
+    match frp_core::bridge::relay_plain_pooled(user_side, server_side).await {
         Ok((n1, n2)) => {
             debug!(n1 = ?n1, n2 = ?n2, "visitor plugin: bridge done ({:?}B→server, {:?}B→user)", n1, n2)
         }

@@ -7,6 +7,9 @@
 //!   authenticate the request
 //! - a fragmented TLS ClientHello (short SNI-peek read) is replayed intact,
 //!   so the TLS handshake still succeeds
+//! - an unterminated (truncated) request head — head-deadline expiry or
+//!   mid-head close — is never parsed or forwarded: the connection closes
+//!   with no response bytes (audit round 8 F7)
 
 mod common;
 
@@ -341,7 +344,7 @@ async fn test_vhost_head_total_deadline_caps_slow_drip() {
     // 1s total deadline for the whole head.
     cfg.vhost_http_timeout = 1;
     let (_handle, _) = start_test_server(cfg).await;
-    // No proxy needed: the 400-on-incomplete-head path runs before routing.
+    // No proxy needed: the incomplete-head close runs before routing.
 
     let mut client = tokio::net::TcpStream::connect(vhost_addr)
         .await
@@ -364,16 +367,25 @@ async fn test_vhost_head_total_deadline_caps_slow_drip() {
         }
     });
 
+    // The deadline must release the connection with NO response bytes —
+    // audit-round-8 F7: an unterminated head is never parsed, so nothing is
+    // answered, and Go net/http parity for a mid-head timeout is a silent
+    // close (net/http conn.serve: a read-timeout error is an
+    // isCommonNetReadError → "return // don't reply"). The OLD code parsed
+    // the truncated head after the deadline and happened to answer 400 only
+    // because this particular head lacked a Host header — with a Host it
+    // would have been forwarded (the F7 bug). EOF and RST are both valid
+    // releases (RST when drip bytes are still buffered unread at the close).
     let mut resp = vec![0u8; 512];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(3), client_rd.read(&mut resp))
-        .await
-        .expect("server must cut the head off within the total deadline")
-        .expect("read response");
-    let text = String::from_utf8_lossy(&resp[..n]);
-    assert!(
-        text.starts_with("HTTP/1.1 400"),
-        "incomplete head must be rejected with 400, got: {text:?}"
-    );
+    match tokio::time::timeout(std::time::Duration::from_secs(3), client_rd.read(&mut resp)).await {
+        Ok(Ok(0)) => {}
+        Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!(
+            "incomplete head must be closed with NO response, got {n} bytes: {:?}",
+            String::from_utf8_lossy(&resp[..n])
+        ),
+        Err(_) => panic!("server must cut the head off within the total deadline"),
+    }
     let _ = drip.await;
 }
 
@@ -1082,4 +1094,87 @@ async fn test_vhost_connect_auth_route_no_creds_single_407_http_error_shape() {
         String::from_utf8_lossy(&bytes)
     );
     drop(client);
+}
+
+// ---------------------------------------------------------------
+// F7 (audit round 8): an unterminated (truncated) request head — deadline
+// expiry or mid-head close with fewer than 4096 bytes buffered — must never
+// be parsed and forwarded. Forwarding a head that lacks its blank-line
+// terminator leaves the backend blocked waiting for the rest of the head,
+// pinning a work-conn slot indefinitely (attacker: partial head then
+// silence). Go's vhost http.Server never dispatches an unterminated head:
+// mid-head timeout and EOF are both isCommonNetReadError cases that net/
+// http answers with NO response bytes (silent close); only the 4096-cap
+// analog of Go's errTooLarge answers (431).
+// ---------------------------------------------------------------
+
+/// A partial request head — valid request line and headers but NO closing
+/// blank line — followed by the client half-closing (FIN) must not be
+/// dispatched to a backend, and the client connection must be closed with
+/// no response bytes. Pre-fix the head-read loop broke on EOF and the
+/// truncated head was routed and forwarded as-is (the parse reads only up
+/// to head_end or the buffered length, so a valid request line + Host was
+/// enough to dispatch).
+#[tokio::test]
+async fn test_vhost_partial_head_then_eof_not_forwarded() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "f7-partial-head",
+            vec!["f7.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    // Valid request line + headers — but the head never ends: no blank line
+    // is sent, then the write side half-closes (FIN), exactly like an
+    // attacker that sends a partial head and goes away.
+    client
+        .write_all(
+            b"GET / HTTP/1.1\r\n\
+              Host: f7.example.com\r\n\
+              User-Agent: partial-head-no-terminator\r\n",
+        )
+        .await
+        .expect("send partial head");
+    client.shutdown().await.expect("half-close the write side");
+
+    // The unterminated head must not be dispatched: no StartWorkConn may
+    // reach the pooled work conn (the only way this vhost proxy contacts a
+    // backend).
+    let swc = tokio::time::timeout(
+        std::time::Duration::from_millis(800),
+        read_msg_v1(&mut work_conn),
+    )
+    .await;
+    assert!(
+        swc.is_err(),
+        "unterminated head must not be forwarded (StartWorkConn reached a backend)"
+    );
+
+    // ...and the client connection must be closed (clean EOF) rather than
+    // held open by the server waiting for a backend exchange that never
+    // happens.
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+        .await
+        .expect("server must close the conn after an unterminated head")
+        .expect("read from closed conn");
+    assert_eq!(
+        n,
+        0,
+        "server must send NO response bytes for an unterminated head, got: {:?}",
+        String::from_utf8_lossy(&buf[..n])
+    );
+    drop(client);
+    drop(_provider);
 }

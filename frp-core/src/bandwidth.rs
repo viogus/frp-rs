@@ -21,8 +21,9 @@ pub type SharedBandwidthLimiter = Arc<Mutex<BandwidthLimiter>>;
 pub struct BandwidthLimiter {
     /// Bytes per second. 0 = unlimited.
     rate: u64,
-    /// Current token balance (can go negative when a large write consumes
-    /// more than the bucket capacity).
+    /// Current token balance. Negative = Go `rate.Limiter` reserveN debt:
+    /// a consumer reserved more than the bucket held and is sleeping off the
+    /// deficit; the next refill repays it before crediting anyone else.
     tokens: f64,
     /// Burst capacity — set to `rate` so 1 s of traffic bursts through
     /// without delay.
@@ -60,13 +61,23 @@ impl BandwidthLimiter {
     /// Consume `n` bytes against a shared (per-proxy) limiter.
     ///
     /// The mutex serializes chunk accounting across both bridge directions
-    /// and all concurrent connections of the proxy; the bucket refills from
-    /// the previous consumer's post-sleep timestamp, so the combined budget
-    /// matches Go's single `rate.Limiter` shared by `NewReader` + `NewWriter`
-    /// (bidirectional traffic shares one rate).
+    /// and all concurrent connections of the proxy. The lock is held ONLY to
+    /// reserve the tokens and compute the wait; the sleep itself happens
+    /// outside the lock, so one throttled consumer (a 32 KiB chunk at
+    /// 1 KiB/s waits ~32 s) cannot block every other connection of the
+    /// proxy. The bucket keeps the Go-style negative balance while the
+    /// consumer sleeps — a mid-sleep arrival's refill credits the elapsed
+    /// interval and repays the debt first, so the combined budget still
+    /// matches Go's single `rate.Limiter` shared by `NewReader` +
+    /// `NewWriter` (bidirectional traffic shares one rate).
     pub async fn consume_shared(lim: &SharedBandwidthLimiter, n: usize) {
-        let mut l = lim.lock().await;
-        l.consume(n).await;
+        let wait = {
+            let mut l = lim.lock().await;
+            l.reserve(n)
+        };
+        if let Some(wait) = wait {
+            tokio::time::sleep(wait).await;
+        }
     }
 
     /// Whether this limiter applies any throttling.
@@ -87,27 +98,48 @@ impl BandwidthLimiter {
         self.last = now;
     }
 
-    /// Wait until `n` bytes are available, then deduct them from the bucket.
+    /// Reserve `n` bytes against the bucket and return the wait needed to
+    /// cover the reservation, if any.
     ///
-    /// When the rate is 0 this is a no-op. When `n` exceeds the current token
-    /// balance, the call sleeps for the time needed to accumulate the deficit
-    /// and resets the bucket to zero.
-    pub async fn consume(&mut self, n: usize) {
+    /// Go `rate.Limiter` `reserveN` semantics: when the balance is short the
+    /// token count goes NEGATIVE — the deficit is owed, and the next refill
+    /// (which credits the full elapsed interval, sleep included) repays the
+    /// debt before crediting anyone else. The caller sleeps `wait` outside
+    /// any lock and does not need to re-acquire on wake: the refill that
+    /// credits this interval zeroes the balance exactly, so the following
+    /// consumer starts from zero — byte-for-byte the schedule the old
+    /// zero-and-discard model produced, without holding the lock across the
+    /// sleep or discarding the accrual. A reservation cancelled mid-sleep
+    /// leaves the debt in the bucket; the next consumer's refill pays it
+    /// first (self-healing — bounded by the largest single reservation).
+    fn reserve(&mut self, n: usize) -> Option<std::time::Duration> {
         if self.rate == 0 || n == 0 {
-            return;
+            return None;
         }
         self.refill();
         let need = n as f64;
         if self.tokens >= need {
             self.tokens -= need;
-            return;
+            return None;
         }
-        // We don't have enough tokens. Sleep for the deficit.
-        let deficit = need - self.tokens;
-        self.tokens = 0.0;
-        let wait = std::time::Duration::from_secs_f64(deficit / self.rate as f64);
-        tokio::time::sleep(wait).await;
-        self.last = Instant::now();
+        self.tokens -= need;
+        Some(std::time::Duration::from_secs_f64(
+            -self.tokens / self.rate as f64,
+        ))
+    }
+
+    /// Wait until `n` bytes are available, then deduct them from the bucket.
+    ///
+    /// When the rate is 0 this is a no-op. When `n` exceeds the current
+    /// token balance, the call sleeps for the time needed to accumulate the
+    /// deficit. The bucket holds a negative balance (Go `reserveN`
+    /// semantics) while the caller waits; the next consumer's refill repays
+    /// it from the credited sleep interval, so throttled consumers are
+    /// serialized at exactly `rate` bytes per second.
+    pub async fn consume(&mut self, n: usize) {
+        if let Some(wait) = self.reserve(n) {
+            tokio::time::sleep(wait).await;
+        }
     }
 }
 
@@ -187,6 +219,44 @@ mod tests {
     async fn test_consume_zero_is_noop() {
         let mut lim = BandwidthLimiter::new(1024);
         lim.consume(0).await; // should not panic or alter state
+    }
+
+    /// P3 pin: `consume_shared` must not hold the mutex across its sleep.
+    ///
+    /// Old code locked, then slept inside the lock — a 32 KiB chunk at
+    /// 1 KiB/s blocked every other connection of the proxy for ~32 s. The
+    /// sleep is now computed under the lock and executed outside it; the
+    /// probe below (a second consumer arriving 100 ms into the sleeper's
+    /// ~1 s wait) must acquire the lock immediately. RED on old code: the
+    /// probe parks ~900 ms behind the sleeper's held lock.
+    #[tokio::test]
+    async fn shared_limiter_lock_not_held_across_sleep() {
+        let lim = BandwidthLimiter::shared(1).unwrap(); // 1 B/s
+                                                        // Reserve the burst (1 B) plus 1 B of debt: ~1 s wait, all of it
+                                                        // spent inside the old code's critical section.
+        let sleeper = {
+            let lim = lim.clone();
+            tokio::spawn(async move { BandwidthLimiter::consume_shared(&lim, 2).await })
+        };
+        // The sleeper runs first (this task yields); 100 ms in, it is
+        // mid-wait. A second consumer must lock and reserve immediately.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let start = Instant::now();
+        // n == 0 → reserve returns None right after acquiring the lock, so
+        // the elapsed time below is a pure lock-acquisition measurement.
+        BandwidthLimiter::consume_shared(&lim, 0).await;
+        let elapsed = start.elapsed();
+        // Bound widened from 500ms (round-2 review, audit round 8): lock
+        // acquisition post-fix is microseconds, but a cgroup-preempted test
+        // task can stretch any wall-clock window; the property under test is
+        // "not ~900ms behind the sleeper's held lock", so 2s separates that
+        // signal from scheduler noise.
+        assert!(
+            elapsed.as_millis() < 2000,
+            "second consumer blocked for {elapsed:?}: the limiter mutex is held \
+             across the first consumer's sleep"
+        );
+        sleeper.await.unwrap();
     }
 
     /// F1/F2 pin: mode names the SIDE that owns the shared limiter. The

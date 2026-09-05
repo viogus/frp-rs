@@ -88,7 +88,11 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                 // loopback); the real tunnel peer comes from StartWorkConn via
                 // the work-conn registry (Go http_common.go:116-117).
                 let real_peer = super::plugin_peer_ip(peer).await;
-                match acceptor.accept(tcp).await {
+                // Audit round-8 F6: the bare accept parked the handler task
+                // + fd forever on a partial-ClientHello peer (rustls waits
+                // for the record body); the shared PLUGIN_HANDSHAKE_TIMEOUT
+                // window releases it (same bound tls2raw already had).
+                match super::accept_tls_bounded(&acceptor, tcp).await {
                     Ok(client_tls) => {
                         #[cfg(feature = "http2http")]
                         {

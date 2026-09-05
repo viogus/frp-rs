@@ -448,11 +448,15 @@ fn now_epoch_ms() -> u64 {
 /// ephemeral port on the local IP) plus bookkeeping.
 ///
 /// `last_active` is an `Arc<AtomicU64>` holding epoch milliseconds, SHARED
-/// with the session's reader task (`run_udp_session`): the reader refreshes
-/// it per inbound packet with one lock-free Relaxed store, so the per-packet
-/// path never takes the shard lock (no mutex acquire, no hash lookup). The
-/// shard lock now guards only map insert/remove (per-session cold paths)
-/// and the reap sweep.
+/// with the session's reader task (`run_udp_session`). The reader task
+/// refreshes it per inbound packet (local replies) with one lock-free
+/// Relaxed store — that side of the per-packet path takes no shard lock.
+/// The work-conn reader refreshes it per remote datagram too, but it must
+/// reach the entry through the shard to find the `Arc`: it clones the Arc
+/// under the shard lock and performs the store AFTER the guard drops (the
+/// store itself has no ordering dependency on the shard — both writers use
+/// Relaxed). The shard lock therefore guards only map access (lookup,
+/// insert/remove, the reap sweep), never a liveness write.
 struct UdpSession {
     socket: Arc<UdpSocket>,
     last_active: Arc<AtomicU64>,
@@ -461,14 +465,18 @@ struct UdpSession {
 
 /// Sharded remote-visitor session table (8 shards).
 ///
-/// Per-packet liveness refresh is lock-free: the session reader task shares
-/// an `Arc<AtomicU64>` liveness timestamp with the table entry, so its
-/// per-packet path is one Relaxed store with no shard-lock acquire or hash
-/// lookup. The shard lock now guards only map insert/remove (per-session
-/// cold paths) and the reap sweep; the work-conn reader's per-packet socket
-/// lookup still takes the shard, so concurrent remotes never serialize on a
-/// single cache line. std Mutex is fine: critical sections are short and
-/// never held across an await (bind/connect happen outside any lock).
+/// The session reader task's per-packet liveness refresh is lock-free: it
+/// shares an `Arc<AtomicU64>` with the table entry, so its per-packet path
+/// is one Relaxed store with no shard-lock acquire or hash lookup. The
+/// work-conn reader's per-packet path DOES take the shard — a short
+/// lock + hash lookup to fetch the session's send socket (via the
+/// reader-owned mirror) and its `last_active` Arc — but concurrent remotes
+/// hash to different shards, so traffic never serializes on a single cache
+/// line, and no critical section is held across an await (bind/connect
+/// happen outside any lock). The `first_packet` flag is written only by the
+/// work-conn reader between the map insert and the same iteration's clear
+/// (no await in between), so mirror-arm hits can only ever observe it as
+/// `false`; the session reader task never touches it.
 struct UdpSessionTable {
     shards: [std::sync::Mutex<HashMap<SocketAddr, UdpSession>>; UDP_SESSION_SHARDS],
 }
@@ -923,11 +931,18 @@ async fn run_udp_work_conn(
                             // reader-owned mirror instead of an Arc clone per
                             // packet (mirror invariant: shared-map hit implies
                             // mirror hit).
+                            let mut liveness: Option<Arc<AtomicU64>> = None;
                             let entry = {
                                 let mut map = sessions.shard(&remote);
                                 match map.get_mut(&remote) {
                                     Some(entry) => {
-                                        entry.last_active.store(now_epoch_ms(), Ordering::Relaxed);
+                                        // Clone the shared liveness timestamp
+                                        // and store into it AFTER the guard
+                                        // drops below: the store has no
+                                        // ordering dependency on the shard
+                                        // lock (both writers use Relaxed), so
+                                        // the lock need not be held for it.
+                                        liveness = Some(entry.last_active.clone());
                                         let mirror = reader_socks
                                             .get(&remote)
                                             .cloned()
@@ -937,6 +952,10 @@ async fn run_udp_work_conn(
                                     None => (None, false),
                                 }
                             };
+                            // Liveness refresh outside the shard lock.
+                            if let Some(la) = liveness {
+                                la.store(now_epoch_ms(), Ordering::Relaxed);
+                            }
                             let (sock, first_packet) = match entry {
                                 (Some(sock), first_packet) => (sock, first_packet),
                                 (None, _) => {
@@ -1077,8 +1096,20 @@ async fn run_udp_work_conn(
                                     final_payload = buf;
                                 }
                             }
-                            if let Some(entry) = sessions.shard(&remote).get_mut(&remote) {
-                                entry.first_packet = false;
+                            // Clear `first_packet` only when THIS datagram was
+                            // the session's first (create arm). Mirror-arm
+                            // hits carry `first_packet == false` — the flag is
+                            // true only between the create arm's insert and
+                            // this clear, with no await in between, and the
+                            // session reader task never writes it — so gating
+                            // the clear on the observed flag turns the old
+                            // unconditional second shard-lock + hash lookup
+                            // per packet into a no-op on the steady-state
+                            // path.
+                            if first_packet {
+                                if let Some(entry) = sessions.shard(&remote).get_mut(&remote) {
+                                    entry.first_packet = false;
+                                }
                             }
                             debug!(proxy_name = %pn_r, byte_count = final_payload.len(),
                                 "UDP reader '{}': forwarding {} bytes to local", pn_r, final_payload.len());

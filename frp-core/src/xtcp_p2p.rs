@@ -1876,4 +1876,100 @@ mod tests {
         assert_eq!(clamp_hole_punch_timeout_ms(2_147_000_000), 60_000);
         assert_eq!(clamp_hole_punch_timeout_ms(u64::MAX), 60_000);
     }
+
+    // G6 (audit round 8): `encode_detect_msg` / `decode_detect_msg` decode
+    // error branches (frame too short, truncated payload, length overflow)
+    // were never pinned. Wire format (Go nathole/utils.go EncodeMessage):
+    // 1-byte type 0x35 + 8-byte BE JSON length + JSON, AES-128-CFB encrypted
+    // with a random 16-byte IV prepended (crate::encryption::encrypt).
+
+    #[test]
+    fn detect_msg_roundtrips_keyed_and_zero_key() {
+        use super::{decode_detect_msg, derive_detect_key, encode_detect_msg, NatHoleDetectSid};
+
+        // Roundtrip with a real derived key, both response polarities.
+        for (sk, response) in [("test-secret", true), ("", false), ("x", true)] {
+            let key = derive_detect_key(sk);
+            let msg = NatHoleDetectSid::new("sid-123", response);
+            let wire = encode_detect_msg(&msg, &key).expect("encode");
+            let got = decode_detect_msg(&wire, &key).expect("decode");
+            assert_eq!(got.transaction_id, msg.transaction_id, "sk={sk:?}");
+            assert_eq!(got.sid, msg.sid);
+            assert_eq!(got.response, msg.response);
+            assert_eq!(got.nonce, msg.nonce);
+        }
+
+        // Zero key (all-zero 16-byte key, Go `crypto.Encode` with empty sk).
+        let key = derive_detect_key("");
+        let msg = NatHoleDetectSid::new("", false);
+        let wire = encode_detect_msg(&msg, &key).expect("encode");
+        let got = decode_detect_msg(&wire, &key).expect("decode");
+        assert_eq!(got.transaction_id, msg.transaction_id);
+        assert_eq!(got.sid, "");
+        assert!(!got.response);
+    }
+
+    #[test]
+    fn detect_msg_rejects_decrypted_frame_too_short_for_v1_header() {
+        use super::decode_detect_msg;
+        use crate::encryption;
+
+        let key = crate::encryption::derive_key("sk");
+        // A plaintext shorter than the 9-byte V1 header (1 type + 8 length)
+        // must be rejected, not sliced. 8 bytes of plaintext, encrypted.
+        let wire = encryption::encrypt(&[0u8; 8], &key).expect("encrypt");
+        let err = decode_detect_msg(&wire, &key).expect_err("must reject");
+        assert_eq!(err, "frame too short for V1 header");
+    }
+
+    #[test]
+    fn detect_msg_rejects_truncated_payload() {
+        use super::decode_detect_msg;
+        use crate::encryption;
+
+        let key = crate::encryption::derive_key("sk");
+        // Honest header claiming a 100-byte JSON body, only 3 body bytes
+        // present: 9 header + 3 = 12 bytes on the wire after decrypt.
+        let mut frame = vec![0x35u8]; // TypeNatHoleSid = '5' (Go type byte)
+        frame.extend_from_slice(&100u64.to_be_bytes());
+        frame.extend_from_slice(&[1u8, 2, 3]);
+        assert_eq!(frame.len(), 12);
+        let wire = encryption::encrypt(&frame, &key).expect("encrypt");
+        let err = decode_detect_msg(&wire, &key).expect_err("must reject");
+        // Message mirrors the code's format string exactly.
+        assert_eq!(err, "frame truncated: need 109 bytes, have 12");
+    }
+
+    #[test]
+    fn detect_msg_rejects_length_overflow() {
+        use super::decode_detect_msg;
+        use crate::encryption;
+
+        let key = crate::encryption::derive_key("sk");
+        // Hostile length field of u64::MAX: `9usize.checked_add(usize::MAX)`
+        // overflows on 64-bit — must error, not wrap into a huge slice.
+        let mut frame = vec![0x35u8];
+        frame.extend_from_slice(&u64::MAX.to_be_bytes());
+        let wire = encryption::encrypt(&frame, &key).expect("encrypt");
+        let err = decode_detect_msg(&wire, &key).expect_err("must reject");
+        assert_eq!(err, "invalid frame: length overflow");
+    }
+
+    #[test]
+    fn detect_msg_rejects_undecryptable_data() {
+        use super::decode_detect_msg;
+        // Garbage shorter than the 16-byte IV: encryption::decrypt rejects
+        // it before any framing logic runs.
+        let key = crate::encryption::derive_key("sk");
+        let err = decode_detect_msg(&[0u8; 8], &key).expect_err("must reject");
+        assert_eq!(err, "data too short for AES-CFB (need at least 16-byte IV)");
+        // Tampered ciphertext: decrypt succeeds structurally but the stream
+        // decrypts to garbage → JSON decode must fail (or the length checks
+        // above fire first). Either way the result is an Err.
+        let msg = super::NatHoleDetectSid::new("sid", true);
+        let mut wire = super::encode_detect_msg(&msg, &key).expect("encode");
+        let n = wire.len();
+        wire[n - 1] ^= 0xff;
+        assert!(decode_detect_msg(&wire, &key).is_err());
+    }
 }

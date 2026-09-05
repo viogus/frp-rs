@@ -223,6 +223,12 @@ impl ClientRegistry {
                     info.online = false;
                     info.disconnected_at = Some(Instant::now());
                     info.disconnected_at_unix = Some(unix_now());
+                    // The run_id → key row dies with the session even for a
+                    // persistent (raw_client_id) client: the record survives
+                    // under its key, but a stale index row would shadow the
+                    // NEXT registration of the same run_id and accumulate
+                    // one orphan per reconnect cycle.
+                    run_index.remove(run_id);
                 }
             }
         }
@@ -345,6 +351,49 @@ mod tests {
         assert!(!info.online);
         assert!(info.run_id.is_empty());
         assert!(info.disconnected_at.is_some());
+    }
+
+    /// F12 (audit round 8): mark_offline must drop the run_index entry in
+    /// BOTH branches. Pre-fix the persist branch (raw_client_id set)
+    /// cleared `info.run_id` but left `run_index[run_id] → key` behind, so a
+    /// client reconnecting with a fresh run_id every session (frpc restart)
+    /// accumulated one stale run_index row per reconnect cycle forever —
+    /// the run_index and clients maps drifted apart.
+    #[test]
+    fn test_mark_offline_drops_run_index_for_persistent_clients() {
+        let r = mk_registry();
+        // N reconnect cycles: a fresh run_id per cycle (frpc restart), one
+        // stable client id (persistent raw_client_id).
+        for cycle in 0..50u64 {
+            let run_id = format!("run-{cycle}");
+            r.register_with_control_id(
+                "u",
+                "c1",
+                &run_id,
+                "testhost",
+                "0.71.0",
+                "1.2.3.4:5678",
+                "v1",
+                cycle,
+            );
+            r.mark_offline_by_run_id_and_control_id(&run_id, cycle);
+            assert_eq!(
+                r.run_index.read_ok().len(),
+                0,
+                "cycle {cycle}: run_index must be empty right after mark_offline"
+            );
+            assert_eq!(
+                r.clients.read_ok().len(),
+                1,
+                "cycle {cycle}: the persistent client record must survive"
+            );
+        }
+        // No accumulated stale rows after all 50 cycles.
+        assert_eq!(r.run_index.read_ok().len(), 0);
+        assert_eq!(r.clients.read_ok().len(), 1);
+        let info = r.get_by_key("u.c1").unwrap();
+        assert!(!info.online);
+        assert!(info.run_id.is_empty());
     }
 
     #[test]

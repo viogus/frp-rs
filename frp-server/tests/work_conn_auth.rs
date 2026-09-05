@@ -33,11 +33,13 @@ use frp_core::transport::IoStream;
 /// encrypted control stream, the yamux session (for opening work streams),
 /// and the run_id.
 ///
-/// NOTE: the control stream is NOT silent right after login — Go frps
-/// `ctl.Start()` sends one ReqWorkConn pre-warming request immediately
-/// after LoginResp, and login.rs `capped_pool_count` floors at 1 (even
-/// pool_count 0 gets one). This helper drains it, so callers can assert
-/// silence afterwards.
+/// NOTE: the control stream is NOT silent right after login — the server
+/// sends `pool_count` ReqWorkConn pre-warming requests immediately after
+/// LoginResp (Go control.go:690; the login below uses 1, the production
+/// frpc default — the old `capped_pool_count` floor that gave pool_count 0
+/// one prewarm was removed in round-8 F3, Go clamps with
+/// `min(PoolCount, MaxPoolCount)` only). This helper drains it, so callers
+/// can assert silence afterwards.
 async fn yamux_login(addr: SocketAddr) -> (IoStream, mux::YamuxSession, String) {
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
@@ -60,7 +62,7 @@ async fn yamux_login(addr: SocketAddr) -> (IoStream, mux::YamuxSession, String) 
         user: None,
         run_id: None,
         client_id: None,
-        pool_count: Some(0),
+        pool_count: Some(1),
         timestamp: Some(ts),
         privilege_key: Some(key),
         metas: None,

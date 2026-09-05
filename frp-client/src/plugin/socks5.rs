@@ -200,7 +200,7 @@ async fn handle_socks5_conn(
 
     // Step 4: Connect to target
     let target = format!("{host}:{port}");
-    let mut remote = match TcpStream::connect(&target).await {
+    let remote = match TcpStream::connect(&target).await {
         Ok(remote) => remote,
         Err(_) => {
             let reply = make_socks5_reply(REP_HOST_UNREACHABLE, ATYP_IPV4, &[0, 0, 0, 0], 0);
@@ -219,15 +219,10 @@ async fn handle_socks5_conn(
         .await
         .map_err(|e| format!("write reply: {e}"))?;
 
-    // Step 5: Bidirectional relay
-    if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
-        &mut client,
-        &mut remote,
-        *frp_core::buffer_pool::BUFFER_SIZE,
-        *frp_core::buffer_pool::BUFFER_SIZE,
-    )
-    .await
-    {
+    // Step 5: Bidirectional relay through pooled buffers (audit round-8 P1:
+    // relay_plain_pooled keeps copy_bidirectional semantics — FIN
+    // propagation both ways — without the per-conn buffer pair).
+    if let Err(e) = frp_core::bridge::relay_plain_pooled(client, remote).await {
         tracing::debug!(error = %e, "plugin relay error: {}", e);
     }
     Ok(())

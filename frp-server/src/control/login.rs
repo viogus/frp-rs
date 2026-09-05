@@ -108,10 +108,17 @@ pub(crate) fn authenticated_user(
 /// `max_pool_count`. An unset (0) `max_pool_count` is the Go default 5
 /// (Go `util.EmptyOr` parity, pkg/config/v1/server.go:186 — Go has no
 /// "uncapped" mode; a negative value was already rejected in
-/// `authenticate` with the Go control.go:440 error). Go frp treats
-/// poolCount < 1 as 1.
+/// `authenticate` with the Go control.go:440 error). Go clamps with a
+/// MIN-ONLY `min(PoolCount, MaxPoolCount)` (server/control.go:446): a
+/// client asking for poolCount 0 gets 0 prewarmed work conns (the pool is
+/// replenished on demand), never floored to 1. `None` (absent — the
+/// client did not declare a poolCount) means 1, the frp client default.
 fn capped_pool_count(pool_count: Option<i32>, max_pool_count: i64) -> usize {
-    let raw = pool_count.unwrap_or(1).max(1) as i64;
+    // Absent pool_count → the frp default 1. A negative value is rejected
+    // in `authenticate` before this runs; the `.max(0)` below is a
+    // defensive guard so an upstream regression can never turn into a
+    // giant usize loop bound.
+    let raw = pool_count.unwrap_or(1).max(0) as i64;
     // Negative max_pool_count is rejected at login before this runs; only
     // 0 (→ Go default 5) and positive values reach the min.
     let max = if max_pool_count > 0 {
@@ -119,7 +126,7 @@ fn capped_pool_count(pool_count: Option<i32>, max_pool_count: i64) -> usize {
     } else {
         5
     };
-    raw.min(max).max(1) as usize
+    raw.min(max) as usize
 }
 
 pub(crate) async fn remove_oidc_subject_generation(
@@ -806,6 +813,39 @@ pub(crate) async fn authenticate(
             send_login_error(
                 stream,
                 "invalid run id: must be at most 64 printable bytes".into(),
+                v2,
+            )
+            .await;
+            return Err(());
+        }
+    }
+
+    // --- Cap client_id (audit round-8 F12) ---
+    // client_id flows verbatim into the registry composite key
+    // ({user}.{client_id}), dashboard rows, and log lines — with a VALID
+    // auth token a hostile client could push megabytes of it past the run_id
+    // 64-byte cap (which does not cover it). Reject pre-auth at 256 bytes
+    // with throttle-slot consumption like every other pre-auth rejection
+    // (an oversized-client_id flood must advance the per-IP window, not
+    // race it). Empty/absent stays legal: the registry keys on run_id then.
+    // Deliberate divergence: Go frp validates clientID nowhere (control.go
+    // only checks the already-online conflict; the registry keys on the raw
+    // string) — an oversized client_id that Go accepts is rejected here.
+    // Same fail-fast treatment as the negative-poolCount config check.
+    if let Some(cid) = login.client_id.as_deref() {
+        if cid.len() > 256 {
+            warn!(
+                peer = ?peer,
+                client_id_len = %cid.len(),
+                "Login rejected: client_id too long (max 256 bytes)"
+            );
+            if let Some(msg) = throttled_login_error(&state, peer).await {
+                send_login_error(stream, msg, v2).await;
+                return Err(());
+            }
+            send_login_error(
+                stream,
+                "invalid client id: must be at most 256 bytes".into(),
                 v2,
             )
             .await;
@@ -1648,6 +1688,159 @@ mod auth_signal_tests {
             "Cf U+200D accepted (documented divergence from Go IsPrint)"
         );
     }
+
+    #[tokio::test]
+    async fn zero_pool_count_prewarms_no_req_work_conn() {
+        // F3: Go clamps the pool count with `min(PoolCount, MaxPoolCount)`
+        // (server/control.go:446) — no lower floor — and the worker()
+        // prewarm loop (control.go:690) sends exactly `poolCount`
+        // ReqWorkConns. The old `.max(1)` floor made pool_count = 0 prewarm
+        // one work conn where a Go server prewarms none (the pool is
+        // replenished on demand via ReqWorkConn when a proxy needs one).
+        // Drive a successful login with pool_count = Some(0) and assert the
+        // wire carries LoginResp followed by silence, not a ReqWorkConn.
+        use tokio::io::AsyncReadExt;
+        let state = test_state();
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("zero-pool-run-id".into()),
+            client_id: None,
+            pool_count: Some(0),
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("expected-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let (server, mut client) = tokio::io::duplex(4096);
+        let result = super::authenticate(
+            Box::new(server),
+            &login,
+            state,
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "valid login must authenticate");
+
+        // LoginResp first — success (empty error field).
+        let error = read_login_resp_error(&mut client).await;
+        assert!(error.is_empty(), "login must succeed, got: {error}");
+
+        // Then silence. pool_count = 0 must prewarm ZERO ReqWorkConns; the
+        // prewarm loop runs inside authenticate before it returns, so any
+        // frame is already buffered here and the read would complete.
+        let mut header = [0u8; 9];
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.read_exact(&mut header),
+        )
+        .await;
+        assert!(
+            next.is_err(),
+            "pool_count = 0 must not prewarm work conns (Go control.go:446 min-only clamp)"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_client_id_rejected_at_login() {
+        // F12 (audit round 8): the client-supplied client_id is never
+        // validated and flows verbatim into the registry composite key
+        // ({user}.{clientID}), dashboard rows, and log lines. A hostile
+        // client can push an arbitrarily long client_id (megabytes) with a
+        // VALID auth token — the run_id 64-byte cap (Go parity) does not
+        // cover it. Cap it pre-auth like run_id (with throttle-slot
+        // consumption) at 256 bytes with an explicit login error.
+        let state = test_state();
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("valid-run-id".into()),
+            // 10k chars — valid token, valid run_id, absurd client_id.
+            client_id: Some("x".repeat(10_000)),
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("expected-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let (server, mut client) = tokio::io::duplex(64 * 1024);
+        let result = super::authenticate(
+            Box::new(server),
+            &login,
+            state.clone(),
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an oversized client_id must be rejected before auth"
+        );
+        let error = read_login_resp_error(&mut client).await;
+        assert!(
+            error.contains("client id"),
+            "rejection must name the client id cap, got: {error}"
+        );
+        // And a sane-length client_id still logs in.
+        let login = frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: Some("valid-run-id-2".into()),
+            client_id: Some("frpc-host-1".into()),
+            pool_count: None,
+            timestamp: Some(ts),
+            privilege_key: Some(frp_core::auth::generate_token("expected-token", ts)),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let (server, mut client) = tokio::io::duplex(4096);
+        let result = super::authenticate(
+            Box::new(server),
+            &login,
+            state,
+            Some(peer),
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "a sane client_id must still authenticate");
+        let error = read_login_resp_error(&mut client).await;
+        assert!(error.is_empty(), "login must succeed, got: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -1723,8 +1916,10 @@ mod pool_count_tests {
         // Below the default: honored as requested.
         assert_eq!(capped_pool_count(Some(5), 0), 5);
         assert_eq!(capped_pool_count(None, 0), 1);
-        // Go frp treats poolCount < 1 as 1.
-        assert_eq!(capped_pool_count(Some(0), 0), 1);
+        // No floor: Go control.go:446 `min(PoolCount, MaxPoolCount)` clamps
+        // only the upper side (a negative value is rejected at login before
+        // this runs), so poolCount 0 must prewarm ZERO work conns.
+        assert_eq!(capped_pool_count(Some(0), 0), 0);
     }
 
     #[test]
@@ -1735,6 +1930,8 @@ mod pool_count_tests {
         // An explicitly configured cap above 5 is honored (Go same — the
         // EmptyOr default only applies to unset).
         assert_eq!(capped_pool_count(Some(100_000), 10_000), 10_000);
+        // Explicit cap, requested 0: min(0, 50) = 0, no floor.
+        assert_eq!(capped_pool_count(Some(0), 50), 0);
     }
 }
 
