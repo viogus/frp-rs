@@ -931,30 +931,22 @@ async fn handle_http1_request<S>(
     // line is 400 "missing required Host header" (Go conn.readRequest); the
     // gate-exempt shapes (HTTP/1.0, CONNECT, an empty-valued "Host:" line)
     // route on "" (Go req.Host fallback) and miss → 404.
-    let (host, path, is_absolute_form) = match parse_vhost_request_line(request_text) {
-        RequestLine::Ok {
-            host,
-            path,
-            absolute_form,
-        } => (host.map(str::to_string), path.to_string(), absolute_form),
-        RequestLine::BadRequest => {
-            // Go: "malformed HTTP request" / "malformed HTTP version" parse
-            // failures — generic 400 render (probes T2TOK/TABJOIN).
-            write_go_server_error(&mut stream, "400 Bad Request").await;
-            return;
-        }
-        RequestLine::VersionNotSupported => {
-            // Go conn.readRequest's http1ServerSupportsRequest gate — the
-            // detail is carried on the status line AND the body (probe
-            // EXPL20).
-            write_go_server_error(
-                &mut stream,
-                "505 HTTP Version Not Supported: unsupported protocol version",
-            )
-            .await;
-            return;
-        }
-    };
+    // Rounds 6 + audit round 9 (F1/F4/F5) + review round: Go net/http
+    // error ORDER (go1.25): readRequest parses the request line (shape
+    // failures → generic 400), reads headers (duplicate Host → generic
+    // 400 — request.go:1139 "too many Host headers"), and only THEN runs
+    // http1ServerSupportsRequest (major != 1 → 505) and the wire-Host
+    // gate (missing required Host → 400 with detail). The arms below
+    // follow that order, so a "HTTP/2.0" request that also carries two
+    // Host lines answers Go's 400 (not the 505) and a version-shape
+    // failure beats both.
+    let parse = parse_vhost_request_line(request_text);
+    if matches!(parse, RequestLine::BadRequest) {
+        // Go: "malformed HTTP request" / "malformed HTTP version" parse
+        // failures — generic 400 render (probes T2TOK/TABJOIN).
+        write_go_server_error(&mut stream, "400 Bad Request").await;
+        return;
+    }
     // Go ServeHTTP (pkg/util/vhost/http.go:282-285): a request whose METHOD
     // is CONNECT is handed to connectHandler, which forwards the head RAW —
     // the Rewrite hook (X-Forwarded-*) and rc.Headers (requestHeaders) never
@@ -972,12 +964,34 @@ async fn handle_http1_request<S>(
     // such requests with 400; forwarding duplicates verbatim would let a
     // second Host shadow the routed proxy's host_header_rewrite. Applies
     // to origin-form and absolute-form alike (Go's readRequest rejects
-    // duplicate Host headers before either routing path — probe DUPHOST11:
-    // generic 400).
+    // duplicate Host headers before the 505 gate — probe DUPHOST11:
+    // generic 400; a "HTTP/2.0" + duplicate-Host request answers this 400
+    // in Go, where the 505 gate runs after the header parse).
     if count_host_headers(request_text) > 1 {
         write_go_server_error(&mut stream, "400 Bad Request").await;
         return;
     }
+    let (host, path, is_absolute_form) = match parse {
+        RequestLine::Ok {
+            host,
+            path,
+            absolute_form,
+        } => (host.map(str::to_string), path.to_string(), absolute_form),
+        RequestLine::VersionNotSupported => {
+            // Go conn.readRequest's http1ServerSupportsRequest gate — the
+            // detail is carried on the status line AND the body (probe
+            // EXPL20).
+            write_go_server_error(
+                &mut stream,
+                "505 HTTP Version Not Supported: unsupported protocol version",
+            )
+            .await;
+            return;
+        }
+        RequestLine::BadRequest => {
+            unreachable!("BadRequest returned above")
+        }
+    };
     // F4 (audit round 9): Go conn.readRequest's wire-Host gate
     // (server.go:1056-1059): `req.ProtoAtLeast(1, 1) && (!haveHost ||
     // len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT"` →
@@ -4979,6 +4993,23 @@ mod tests {
             v505,
             b"HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n505 HTTP Version Not Supported: unsupported protocol version",
             "505 render must be Go's conn.serve shape with the detail"
+        );
+
+        // Review-round order pin: Go rejects a duplicate Host while parsing
+        // headers — BEFORE http1ServerSupportsRequest 505s a major-2
+        // version — so "HTTP/2.0" + duplicate Host answers the GENERIC 400,
+        // not the 505. (The old arm order 505'd first.) Verified against
+        // go1.25 server.go: readRequest returns the dup-Host error, the
+        // supports-request gate only runs after it returns.
+        let v505_dup = respond(
+            state.clone(),
+            b"GET / HTTP/2.0\r\nHost: a\r\nHost: b\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            v505_dup,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+            "dup-Host precedes the 505 major-version gate (Go readRequest order)"
         );
 
         // 431 oversized head (Go errTooLarge render — no Content-Length).

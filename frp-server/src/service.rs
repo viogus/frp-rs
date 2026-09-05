@@ -937,13 +937,13 @@ impl Service {
                                                                     Some((p, crypto)) => (p, crypto),
                                                                     None => return,
                                                                 };
-                                                                crate::handlers::dispatch_v2_message_inner(io, msg_payload, state, peer, Some(incoming), None, crypto_ctx, None, false).await; // KCP: spoofable UDP source — login-throttle exempt (E1/S1)
+                                                                crate::handlers::dispatch_v2_message_inner(io, msg_payload, state, peer, Some(incoming), None, crypto_ctx, None, true).await; // KCP+TLS: completed rustls handshake = non-spoofable source — throttle keyed
                                                             } else {
                                                                 let mut io = frp_core::transport::IoStream::BufferedRead(yamux_magic.to_vec(), 0, Box::new(io));
                                                                 match tokio::time::timeout_at(post_deadline, frp_core::protocol::read_msg_v1(&mut io)).await {
                                                                     Ok(Ok(frp_core::msg::FrpMessage::Login(login))) => {
                                                                         tracing::info!(peer = %peer, "KCP TLS+yamux Login from {}", peer);
-                                                                        control::handle_control_inner(io, *login, state, Some(peer), Some(incoming), false, None, false, None, false).await; // KCP: spoofable UDP source — login-throttle exempt (E1/S1)
+                                                                        control::handle_control_inner(io, *login, state, Some(peer), Some(incoming), false, None, false, None, true).await; // KCP+TLS: completed rustls handshake = non-spoofable source — throttle keyed
                                                                     }
                                                                     Ok(Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc))) => {
                                                                         tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS+yamux NewWorkConn from {}", peer);
@@ -1000,7 +1000,7 @@ impl Service {
                                                         Some((p, crypto)) => (p, crypto),
                                                         None => return,
                                                     };
-                                                    crate::handlers::dispatch_v2_message_inner(ctl, msg_payload, state, peer, None, None, crypto_ctx, None, false).await; // KCP: spoofable UDP source — login-throttle exempt (E1/S1)
+                                                    crate::handlers::dispatch_v2_message_inner(ctl, msg_payload, state, peer, None, None, crypto_ctx, None, true).await; // KCP+TLS: completed rustls handshake = non-spoofable source — throttle keyed
                                                 } else {
                                                     // After KCP TLS handshake, Go frpc's decrypted stream
                                                     // starts with non-FRP bytes (TLS Finished verify_data
@@ -1065,7 +1065,7 @@ impl Service {
                                                             match tokio::time::timeout_at(post_deadline, frp_core::protocol::read_msg_v1(&mut ctl)).await {
                                                                 Ok(Ok(frp_core::msg::FrpMessage::Login(login))) => {
                                                                     tracing::info!(peer = %peer, "KCP TLS Login from {}", peer);
-                                                                    control::handle_control_inner(ctl, *login, state, Some(peer), None, false, None, false, None, false).await; // KCP: spoofable UDP source — login-throttle exempt (E1/S1)
+                                                                    control::handle_control_inner(ctl, *login, state, Some(peer), None, false, None, false, None, true).await; // KCP+TLS: completed rustls handshake = non-spoofable source — throttle keyed
                                                                 }
                                                                 Ok(Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc))) => {
                                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS NewWorkConn from {}", peer);

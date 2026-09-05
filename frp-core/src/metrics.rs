@@ -86,11 +86,17 @@ impl Default for TrafficHistory {
 
 impl TrafficHistory {
     pub fn new() -> Self {
+        Self::at_day(days_since_epoch())
+    }
+
+    /// Constructor pinned to an explicit `last_day` (tests stand in for a
+    /// midnight rollover without clock injection; `new()` passes today).
+    fn at_day(last_day: u32) -> Self {
         Self {
             state: Mutex::new(TrafficState {
                 traffic_in: [0; 7],
                 traffic_out: [0; 7],
-                last_day: days_since_epoch(),
+                last_day,
             }),
         }
     }
@@ -98,6 +104,18 @@ impl TrafficHistory {
     pub fn record(&self, delta_in: u64, delta_out: u64) {
         let today = days_since_epoch();
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::rotate_locked(&mut s, today);
+        s.traffic_in[0] = s.traffic_in[0].saturating_add(delta_in);
+        s.traffic_out[0] = s.traffic_out[0].saturating_add(delta_out);
+    }
+
+    /// Roll the buffer forward when `today` has moved past `last_day`
+    /// (shift the tail down, zero the vacated slots, update `last_day`).
+    /// Mirrors Go `StandardDateCounter.rotate` (pkg/util/metric/
+    /// date_counter.go): a jump of >= 7 days zeroes the whole buffer; a
+    /// backward clock jump wraps and zeroes everything too (Go keeps the
+    /// buffer on `days <= 0` — divergence only under clock skew).
+    fn rotate_locked(s: &mut TrafficState, today: u32) {
         if today != s.last_day {
             let shift = (today.wrapping_sub(s.last_day) as usize).min(7);
             for i in (shift..7).rev() {
@@ -110,13 +128,19 @@ impl TrafficHistory {
             }
             s.last_day = today;
         }
-        s.traffic_in[0] = s.traffic_in[0].saturating_add(delta_in);
-        s.traffic_out[0] = s.traffic_out[0].saturating_add(delta_out);
     }
 
     /// Return (traffic_in[7], traffic_out[7]) where index 0 = today.
+    ///
+    /// Rotates on read like Go `DateCounter.GetLastDaysCount` (it calls
+    /// `c.rotate(now)` under the lock before copying): after a midnight
+    /// rollover with no traffic, a read must shift the old "today" into
+    /// index 1 and zero index 0 — otherwise the previous day's bytes stay
+    /// labeled "today" until the next record (review-round finding).
     pub fn snapshot(&self) -> ([u64; 7], [u64; 7]) {
-        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let today = days_since_epoch();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::rotate_locked(&mut s, today);
         (s.traffic_in, s.traffic_out)
     }
 }
@@ -256,5 +280,34 @@ mod tests {
         let (tin, tout) = h.snapshot();
         assert_eq!(tin[0], 40);
         assert_eq!(tout[0], 60);
+    }
+
+    /// Read-side midnight rollover (Go DateCounter parity): yesterday's
+    /// bytes sit at index 0 (they were "today" when recorded), the clock
+    /// crosses midnight, and a SNAPSHOT with no intervening record must
+    /// shift them into index 1 and zero index 0 — the old code returned
+    /// the unrotated buffer, labeling yesterday's bytes "today" until the
+    /// next record().
+    #[test]
+    fn test_traffic_history_snapshot_rotates_after_midnight() {
+        let today = days_since_epoch();
+        let h = TrafficHistory::at_day(today - 1);
+        {
+            let mut s = h.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.traffic_in[0] = 100;
+            s.traffic_out[0] = 200;
+        }
+        let (tin, tout) = h.snapshot();
+        assert_eq!(
+            tin[0], 0,
+            "today's slot must be zeroed on the read rotation"
+        );
+        assert_eq!(tin[1], 100, "yesterday's bytes shift to index 1");
+        assert_eq!(tout[0], 0);
+        assert_eq!(tout[1], 200);
+        // Rotation is idempotent on the same day: a second read is stable.
+        let (tin2, _) = h.snapshot();
+        assert_eq!(tin2[0], 0);
+        assert_eq!(tin2[1], 100);
     }
 }

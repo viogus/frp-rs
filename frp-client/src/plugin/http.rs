@@ -165,7 +165,7 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     let headers_str = String::from_utf8_lossy(&buf);
     let mut lines = headers_str.lines();
 
-    // Parse request line: METHOD URL HTTP/1.1. Go net/http parseRequestLine
+    // Parse request line: METHOD URL HTTP/1.x. Go net/http parseRequestLine
     // splits on literal SPACE only (two `Cut(line, " ")`), so every other
     // whitespace run — a tab-separated "GET\tURL\tHTTP/1.1" in particular —
     // never yields the required second space and the whole line is malformed
@@ -173,18 +173,18 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     // collapsed every whitespace run, so tab-joined tokens parsed and the
     // request was dialed/forwarded — accept-where-Go-rejects (round-7-era
     // Go parity, mirrored from the frp-server vhost/tcpmux request-line
-    // parsers). The version token must be one of Go ParseHTTPVersion's
-    // exact matches (HTTP/1.0/1.1/2.0/3.0 — an 8-char "HTTP/9.9" or a
-    // tab-contaminated token is rejected, not shape-approximated).
+    // parsers). The version token is validated by Go ParseHTTPVersion
+    // semantics (see `go_parse_http_version_ok` below) restricted to
+    // major 1: the frps vhost front has already 505-gated every request
+    // it forwards, so only HTTP/1.x tokens can reach this plugin — and Go
+    // serves/tunnels every parseable 1.x (HTTP/1.2..1.9 included; the old
+    // exact-match list closed those conns that Go forwards).
     let request_line = lines.next().ok_or("empty request")?;
     let mut parts = request_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("");
     let url = parts.next().unwrap_or("");
     let version = parts.next().unwrap_or("");
-    if method.is_empty()
-        || url.is_empty()
-        || !matches!(version, "HTTP/1.0" | "HTTP/1.1" | "HTTP/2.0" | "HTTP/3.0")
-    {
+    if method.is_empty() || url.is_empty() || !go_parse_http_version_ok(version) {
         return Err(format!("bad request line: {request_line}"));
     }
 
@@ -482,6 +482,35 @@ fn build_forward_head(
     fwd
 }
 
+/// Go `ParseHTTPVersion` (net/http/request.go, go1.25) restricted to
+/// major 1. ParseHTTPVersion is NOT an exact-match switch: HTTP/1.0 and
+/// HTTP/1.1 short-circuit, but every other version parses when it is
+/// exactly 8 chars "HTTP/X.Y" with single ASCII digits (HTTP/1.2 ..
+/// HTTP/9.9 all parse — verified against the go1.25.0 stdlib). The major-1
+/// restriction mirrors where this plugin sits in the stack: the frps vhost
+/// front 505s every request whose version token is not HTTP/1.x (Go
+/// conn.readRequest's http1ServerSupportsRequest), so a request reaching
+/// the plugin's inbound parse carries a major-1 token, and Go's plugin arms
+/// serve/tunnel every parseable 1.x (non-CONNECT: `ProtoMajor == 1` passes
+/// the supports-request gate; CONNECT: `http.ReadRequest` accepts the
+/// token and the tunnel ignores the minor). Rejecting HTTP/1.2..1.9 closed
+/// conns that Go forwards; malformed shapes and major != 1 tokens still
+/// reject (the close matches Go ReadRequest-error semantics on the CONNECT
+/// arm, and major != 1 cannot reach here from either frps).
+fn go_parse_http_version_ok(version: &str) -> bool {
+    match version {
+        "HTTP/1.0" | "HTTP/1.1" => true,
+        _ => {
+            let b = version.as_bytes();
+            b.len() == 8
+                && b.starts_with(b"HTTP/")
+                && b[5] == b'1'
+                && b[6] == b'.'
+                && b[7].is_ascii_digit()
+        }
+    }
+}
+
 /// Parse an HTTP URL into (host, port, path).
 fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
     // Handle absolute URLs: http://host:port/path
@@ -499,6 +528,35 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round-9 review: the version gate rejected HTTP/1.2..1.9 (exact
+    /// 4-token list) while Go ParseHTTPVersion accepts any 8-char
+    /// single-digit "HTTP/X.Y" and the plugin stack only ever forwards
+    /// major-1 tokens (frps front 505s the rest) — Go serves/tunnels
+    /// HTTP/1.2, frp-rs closed the conn. Pins the go1.25 stdlib matrix.
+    #[test]
+    fn test_go_parse_http_version_ok_matrix() {
+        // ParseHTTPVersion's exact short-circuit pair.
+        assert!(go_parse_http_version_ok("HTTP/1.0"));
+        assert!(go_parse_http_version_ok("HTTP/1.1"));
+        // Lenient shape, single-digit minors — accepted by Go, closed by
+        // the old exact-match gate.
+        assert!(go_parse_http_version_ok("HTTP/1.2"));
+        assert!(go_parse_http_version_ok("HTTP/1.9"));
+        // Major != 1: parseable by Go's ParseHTTPVersion but 505-gated by
+        // conn.readRequest before this plugin can ever see them — reject.
+        assert!(!go_parse_http_version_ok("HTTP/2.0"));
+        assert!(!go_parse_http_version_ok("HTTP/3.0"));
+        assert!(!go_parse_http_version_ok("HTTP/9.9"));
+        // Shape failures: Go ParseHTTPVersion rejects these too.
+        assert!(!go_parse_http_version_ok("HTTP/1.10")); // 9 chars
+        assert!(!go_parse_http_version_ok("HTTP/1x1"));
+        assert!(!go_parse_http_version_ok("HTTP/1.1 "));
+        assert!(!go_parse_http_version_ok("http/1.1")); // lowercase prefix
+        assert!(!go_parse_http_version_ok("HTTP/.1"));
+        assert!(!go_parse_http_version_ok(""));
+        assert!(!go_parse_http_version_ok("HTTP/1\t1")); // tab-contaminated
+    }
 
     #[test]
     fn test_parse_http_url() {

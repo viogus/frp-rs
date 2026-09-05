@@ -2064,3 +2064,85 @@ async fn test_http_proxy_tab_joined_request_line_rejected() {
         "the malformed request must never reach the backend"
     );
 }
+
+/// Round-9 review finding: the inbound version gate rejected HTTP/1.2
+/// (exact-match 4-token list) while Go ParseHTTPVersion (go1.25) accepts
+/// any 8-char single-digit "HTTP/X.Y" — a HTTP/1.2 request line passes the
+/// frps vhost front (major 1, Go http1ServerSupportsRequest) and Go's
+/// plugin arms serve it. The old gate silently closed conns that Go
+/// forwards. RED on the old gate: the connection dies with zero bytes and
+/// the backend never sees the request.
+#[tokio::test]
+async fn test_http_proxy_http12_request_line_forwarded() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let _ = tx.send(());
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = conn.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Outbound always speaks HTTP/1.1 (Go DefaultTransport parity).
+            assert!(
+                String::from_utf8_lossy(&head).starts_with("GET / HTTP/1.1\r\n"),
+                "forwarded head must be HTTP/1.1: {:?}",
+                String::from_utf8_lossy(&head)
+            );
+            let _ = conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+    client
+        .write_all(format!("GET http://{backend_addr}/ HTTP/1.2\r\nHost: h\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("HTTP/1.2 request must be served, not silently closed")
+    .unwrap();
+    assert!(
+        String::from_utf8_lossy(&resp).contains("200 OK"),
+        "HTTP/1.2 request must be forwarded (Go serves parseable 1.x): {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        rx.try_recv().is_ok(),
+        "the HTTP/1.2 request must reach the backend"
+    );
+}
