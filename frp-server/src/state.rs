@@ -1133,6 +1133,24 @@ pub struct AppState {
     pub accept_rate_limiter: Arc<RateLimiter>,
     /// Per-IP failed login attempt counter: IP -> (count, window_start).
     /// Window resets after 60 seconds. Max 5 failed attempts per window.
+    ///
+    /// Scope (audit E1/S1): only logins from non-spoofable sources key this
+    /// table — TCP/TLS/WS/QUIC, where the peer IP was authenticated by the
+    /// transport handshake. KCP-sourced frpc logins are EXEMPT: the source
+    /// address of a UDP datagram is attacker-spoofable, and a fresh KCP
+    /// session (new conv) delivers a full V1 wrong-token Login from the
+    /// FIRST datagram (sn=0, no ACK round-trip needed), so 5 spoofed
+    /// failures would hard-lock the victim IP's real logins for the 60s
+    /// anchored window — refreshable ~5/min indefinitely — turning the
+    /// throttle into a targeted lockout primitive. `login::authenticate`
+    /// expresses this by forwarding `throttle_keyed=false` from the KCP
+    /// accept path (service.rs) and calling the throttle helpers with
+    /// `peer = None`: no slot consumption, no pre-auth gate. The socket-
+    /// layer KCP session caps (32 sessions/IP/10s, 256 sessions/10s global,
+    /// frp-core/src/kcp/socket.rs) remain the attempt bound on that path.
+    /// SSH-gateway auth failures share this SAME table with main-port
+    /// logins (ssh_gateway.rs) — TCP-sourced, not spoofable, so that is
+    /// cross-surface collateral only, not a new attack.
     pub login_throttle: Arc<
         tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
     >,

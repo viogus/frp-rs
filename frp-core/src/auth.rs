@@ -266,7 +266,11 @@ impl AuthConfig {
                 // Go behavior — OIDC path keeps the check.
                 let expected = generate_token(token, ts);
                 if !constant_time_eq(key.as_bytes(), expected.as_bytes()) {
-                    return Err("invalid authentication token".into());
+                    // Audit C3: byte-match Go frp v0.71.0 pkg/auth/token.go:66
+                    // ("token in login doesn't match token from configuration") —
+                    // in detailed_errors_to_client mode the server sends
+                    // err.Error() verbatim (util.go GenerateResponseErrorString).
+                    return Err("token in login doesn't match token from configuration".into());
                 }
                 Ok(String::new())
             }
@@ -3358,6 +3362,10 @@ mod tests {
         let wrong_key = generate_token("wrong-secret", now);
         let result = cfg.validate_login(Some(&wrong_key), Some(now));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid authentication token"));
+        // Go frp v0.71.0 pkg/auth/token.go:66 literal (audit C3) — the
+        // detailed-mode LoginResp.error is err.Error() verbatim.
+        assert!(result
+            .unwrap_err()
+            .contains("token in login doesn't match token from configuration"));
     }
 }

@@ -316,7 +316,7 @@ pub enum AuthError {
     TimestampRequired,
     #[error("timestamp outside acceptable window")]
     TimestampOutsideWindow,
-    #[error("invalid authentication token")]
+    #[error("token in login doesn't match token from configuration")]
     InvalidToken,
     #[error("OIDC auth requires server-side verifier (not configured)")]
     OidcNotConfigured,

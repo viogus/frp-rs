@@ -805,6 +805,15 @@ impl Handler for SshSession {
             // limit — this is the same deliberate frp-rs hardening as the
             // login throttle (Go frp has neither). Throttled attempts
             // consume nothing; the entry decays via the 90s cleanup.
+            // NOTE (audit E1/S1e): this is the SAME table as the main-port
+            // frpc login throttle — pubkey/password rejections here and
+            // failed frpc logins share one per-IP budget. Cross-surface
+            // collateral only: 5 failed SSH passwords from a NAT IP arm
+            // that IP's main-port login window too (and vice versa). The
+            // source is TCP, not spoofable, so this arms no new attack —
+            // it only couples two already-throttled surfaces. KCP-sourced
+            // frpc logins are exempt from this table entirely (see the
+            // `AppState::login_throttle` docs in state.rs).
             self.state.check_login_throttle(self.peer_addr).await;
             Ok(Auth::Reject {
                 proceed_with_methods: None,
