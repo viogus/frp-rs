@@ -1305,7 +1305,16 @@ pub(crate) async fn resolve_vhost_request(
     let (group_proxy_name, group_run_id) = if route.group.is_empty() {
         (route.proxy_name.to_string(), route.run_id.to_string())
     } else {
-        match state.http_group_ctl.choose_endpoint(&route.group).await {
+        // Kind registry selection: an http group and an https group may
+        // share a name (Go keeps separate controllers per muxer). The
+        // dispatch scheme picks the kind — an HTTPS SNI hit must round-robin
+        // over the https group's members only.
+        let group_is_https = scheme_key == "https";
+        match state
+            .http_group_ctl
+            .choose_endpoint(&route.group, group_is_https)
+            .await
+        {
             Some(member) => match state.proxy_manager.get(&member).await {
                 Some(info) => {
                     debug!(

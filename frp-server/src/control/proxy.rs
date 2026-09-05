@@ -151,11 +151,12 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         // route when the group becomes empty (Go HTTPGroup.UnRegister).
         if is_http_group_member {
             let fresh = ctx.state.proxy_manager.get(&cp.proxy_name).await;
+            let kind_https = fresh.as_ref().is_some_and(|i| i.proxy_type == "https");
             let gname = fresh.and_then(|i| i.group.clone()).unwrap_or_default();
             if let Some(owner) = ctx
                 .state
                 .http_group_ctl
-                .unregister_member(&gname, &cp.proxy_name)
+                .unregister_member(&gname, &cp.proxy_name, kind_https)
                 .await
             {
                 // The shared route is keyed on the FIRST member's name; the

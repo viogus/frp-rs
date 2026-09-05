@@ -236,7 +236,19 @@ pub(crate) enum GroupPortQuery {
 
 /// State for a TCP group's shared listener.
 pub(crate) struct TcpGroupEntry {
+    /// The REAL port the shared listener is bound on — Go `realPort`
+    /// (server/group/tcp.go: the first member's `portManager.Acquire`
+    /// result, auto-assigned when the first member declared 0). Every
+    /// member's ProxyInfo reports this port.
     pub port: u16,
+    /// The FIRST member's DECLARED remote port — Go `tg.port`
+    /// (tcp.go:83 `tg.port = port`, the declared value; an auto-assign
+    /// declaration stays 0). Later members must declare the SAME value:
+    /// Go's join check is `tg.port != port` on the DECLARED numbers, no
+    /// zero exemption — a member declaring an explicit port cannot join a
+    /// group whose first member auto-assigned, even if the numbers happen
+    /// to coincide.
+    pub declared_port: u16,
     pub group_key: String,
     pub bind_addr: String,
     /// Shared listener task handle. None when stopped.
@@ -265,11 +277,17 @@ impl TcpGroupCtl {
     /// port → group_key). `NotFound` and each mismatch kind are
     /// distinguished so callers reject with the Go error text instead of
     /// silently falling through to group-create (F5 review finding).
+    /// `declared_port` is the JOINING member's DECLARED remote port (0 =
+    /// auto-assign): Go compares declared-vs-declared
+    /// (`tg.port != port`, tcp.go:111-113) with NO zero exemption — a
+    /// group whose first member declared an explicit port rejects an
+    /// auto-assign joiner and vice versa. The matched entry's REAL bound
+    /// port is returned for the joiner's ProxyInfo.
     pub async fn get_group_port(
         &self,
         group: &str,
         group_key: &str,
-        port: u16,
+        declared_port: u16,
         bind_addr: &str,
     ) -> GroupPortQuery {
         let groups = self.groups.read().await;
@@ -281,9 +299,8 @@ impl TcpGroupCtl {
         if entry.bind_addr != bind_addr {
             return GroupPortQuery::Mismatch("group params invalid");
         }
-        // Go: `tg.port != port` → ErrGroupDifferentPort. Port 0 = auto-assign,
-        // which takes the group's bound port (Go: members reuse realPort).
-        if port != 0 && port != entry.port {
+        // Go: `tg.port != port` (DECLARED numbers) → ErrGroupDifferentPort.
+        if entry.declared_port != declared_port {
             return GroupPortQuery::Mismatch("group should have same remote port");
         }
         // Go: `tg.groupKey != groupKey` → ErrGroupAuthFailed.
@@ -294,11 +311,16 @@ impl TcpGroupCtl {
     }
 
     /// Register a new TCP group. Returns Err if group already exists.
+    /// `port` is the REAL bound port of the shared listener (Go
+    /// `realPort`); `declared_port` the first member's DECLARED remote port
+    /// (Go `tg.port` — 0 when it auto-assigned, and the value later
+    /// members must declare to join).
     pub async fn create_group(
         &self,
         group: &str,
         group_key: &str,
         port: u16,
+        declared_port: u16,
         bind_addr: &str,
         handle: tokio::task::JoinHandle<()>,
         cancel_token: CancellationToken,
@@ -311,6 +333,7 @@ impl TcpGroupCtl {
             group.to_string(),
             TcpGroupEntry {
                 port,
+                declared_port,
                 group_key: group_key.to_string(),
                 bind_addr: bind_addr.to_string(),
                 handle: Some(handle),
@@ -508,20 +531,16 @@ pub type PortReservationMap = std::collections::HashMap<String, (u16, bool, std:
 /// kind-specific routing params match: http groups compare
 /// domain/location/route_by_http_user (Go HTTPGroup.Register) while https
 /// groups compare the domain ONLY (Go HTTPSGroup.Listen — audit round 8,
-/// F5; see `kind_https`).
+/// F5). Go keeps the two kinds in SEPARATE controllers (HTTPGroupController
+/// on the httpVhostRouter, HTTPSGroupController on the httpsMuxer —
+/// server/service.go), so an http group "grp" and an https group "grp"
+/// coexist without conflict; the frp-rs registry keys on (group name, kind)
+/// to mirror that (the kind is the key, not a struct field).
 pub(crate) struct HttpGroup {
     group_key: String,
     domain: String,
     location: String,
     route_by_http_user: String,
-    /// Proxy kind that created the group: https groups compare ONLY
-    /// group + domain on join (Go HTTPSGroup.Listen); http groups compare
-    /// domain + location + route_by_http_user (Go HTTPGroup.Register). Go
-    /// keeps the two kinds in separate controllers; frp-rs shares one
-    /// registry keyed by group name, so the first kind to register wins and
-    /// a cross-kind join is rejected (frp-rs-only constraint — audit
-    /// round 8, F5).
-    kind_https: bool,
     /// Member proxy names, in registration order (round-robin).
     members: RwLock<Vec<String>>,
     /// Round-robin cursor (Go `atomic.Uint64` index).
@@ -534,7 +553,11 @@ pub(crate) struct HttpGroup {
 }
 
 pub(crate) struct HttpGroupController {
-    groups: RwLock<HashMap<String, Arc<HttpGroup>>>,
+    /// Keyed by (group name, is_https): Go keeps HTTP and HTTPS groups in
+    /// separate controllers, so the same group NAME may exist in both kinds
+    /// at once (server/group/http.go + https.go, wired in server/service.go
+    /// on the httpVhostRouter and the httpsMuxer respectively).
+    groups: RwLock<HashMap<(String, bool), Arc<HttpGroup>>>,
 }
 
 impl HttpGroupController {
@@ -544,10 +567,15 @@ impl HttpGroupController {
         }
     }
 
-    /// Register a group member. The FIRST member creates the group (the
-    /// caller then registers the shared vhost route); subsequent members
-    /// are validated against the existing group (Go HTTPGroup.Register):
-    /// group_key must match and routing params must be identical.
+    /// Register an HTTP-kind group member. The FIRST member creates the
+    /// group (the caller then registers the shared vhost route); subsequent
+    /// members are validated against the existing group (Go
+    /// HTTPGroup.Register): routing params must be identical
+    /// (`ErrGroupParamsInvalid`) and group_key must match
+    /// (`ErrGroupAuthFailed`) — both texts verbatim, Go's check order
+    /// (http.go:96-109). A duplicate member registration is
+    /// `ErrProxyRepeated` ("group proxy repeated", http.go:111-113) — the
+    /// text verbatim, checked after the join validations exactly like Go.
     /// Returns `(group, is_first_member)` on success, Err(String) on
     /// mismatch/repeat. The caller registers the shared vhost route only for
     /// the first member.
@@ -563,38 +591,21 @@ impl HttpGroupController {
         proxy_name: &str,
     ) -> Result<(Arc<HttpGroup>, bool), String> {
         let mut groups = self.groups.write().await;
-        if let Some(g) = groups.get(group) {
-            // Existing group: validate params (Go ErrGroupParamsInvalid /
-            // ErrGroupAuthFailed).
-            // group name matches by construction (registry key); validate the
-            // routing params (Go ErrGroupParamsInvalid).
-            if g.kind_https {
-                return Err(format!(
-                    "http group [{}] is registered by an HTTPS proxy; an http proxy cannot join it (Go keeps HTTP/HTTPS groups in separate controllers)",
-                    group
-                ));
-            }
+        if let Some(g) = groups.get(&(group.to_string(), false)) {
+            // Existing http-kind group: validate the routing params (Go
+            // ErrGroupParamsInvalid).
             if g.domain != domain
                 || g.location != location
                 || g.route_by_http_user != route_by_http_user
             {
-                return Err(format!(
-                    "http group [{}] params mismatch (domain/location/routeByHTTPUser must match the group's first member)",
-                    group
-                ));
+                return Err("group params invalid".to_string());
             }
             if g.group_key != group_key {
-                return Err(format!(
-                    "http group [{}] auth failed: group_key mismatch",
-                    group
-                ));
+                return Err("group auth failed".to_string());
             }
             let mut members = g.members.write().await;
             if members.iter().any(|m| m == proxy_name) {
-                return Err(format!(
-                    "proxy [{}] is already a member of http group [{}]",
-                    proxy_name, group
-                ));
+                return Err("group proxy repeated".to_string());
             }
             members.push(proxy_name.to_string());
             return Ok((g.clone(), false));
@@ -604,12 +615,11 @@ impl HttpGroupController {
             domain: domain.to_string(),
             location: location.to_string(),
             route_by_http_user: route_by_http_user.to_string(),
-            kind_https: false,
             members: RwLock::new(vec![proxy_name.to_string()]),
             index: AtomicU64::new(0),
             route_owner: proxy_name.to_string(),
         });
-        groups.insert(group.to_string(), g.clone());
+        groups.insert((group.to_string(), false), g.clone());
         Ok((g, true))
     }
 
@@ -633,15 +643,7 @@ impl HttpGroupController {
         proxy_name: &str,
     ) -> Result<(Arc<HttpGroup>, bool), String> {
         let mut groups = self.groups.write().await;
-        if let Some(g) = groups.get(group) {
-            // Cross-kind join (frp-rs-only constraint — Go keeps separate
-            // controllers): an https proxy cannot join an http-kind group.
-            if !g.kind_https {
-                return Err(format!(
-                    "http group [{}] is registered by an HTTP proxy; an https proxy cannot join it (Go keeps HTTP/HTTPS groups in separate controllers)",
-                    group
-                ));
-            }
+        if let Some(g) = groups.get(&(group.to_string(), true)) {
             // Go HTTPSGroup.Listen (https.go): route config in the same
             // group must be equal — and ONLY the domain is part of it.
             if g.domain != domain {
@@ -661,12 +663,11 @@ impl HttpGroupController {
             domain: domain.to_string(),
             location: String::new(),
             route_by_http_user: String::new(),
-            kind_https: true,
             members: RwLock::new(vec![proxy_name.to_string()]),
             index: AtomicU64::new(0),
             route_owner: proxy_name.to_string(),
         });
-        groups.insert(group.to_string(), g.clone());
+        groups.insert((group.to_string(), true), g.clone());
         Ok((g, true))
     }
 
@@ -674,10 +675,17 @@ impl HttpGroupController {
     /// empty — the caller must then drop the shared vhost route using the
     /// OWNER's name (the first member registered it) and the group is
     /// removed. Returns `None` when the group still has members or did not
-    /// exist.
-    pub async fn unregister_member(&self, group: &str, proxy_name: &str) -> Option<String> {
+    /// exist. `is_https` selects the kind registry (an http and an https
+    /// group may share the name).
+    pub async fn unregister_member(
+        &self,
+        group: &str,
+        proxy_name: &str,
+        is_https: bool,
+    ) -> Option<String> {
         let mut groups = self.groups.write().await;
-        let g = groups.get(group)?;
+        let key = (group.to_string(), is_https);
+        let g = groups.get(&key)?;
         let empty = {
             let mut members = g.members.write().await;
             members.retain(|m| m != proxy_name);
@@ -685,18 +693,19 @@ impl HttpGroupController {
         };
         if empty {
             let owner = g.route_owner.clone();
-            groups.remove(group);
+            groups.remove(&key);
             Some(owner)
         } else {
             None
         }
     }
 
-    /// Round-robin pick a member proxy name (Go HTTPGroup.chooseEndpoint).
-    /// Returns None when the group has no members.
-    pub async fn choose_endpoint(&self, group: &str) -> Option<String> {
+    /// Round-robin pick a member proxy name (Go HTTPGroup.chooseEndpoint /
+    /// HTTPSGroup listener dispatch). Returns None when the group has no
+    /// members. `is_https` selects the kind registry.
+    pub async fn choose_endpoint(&self, group: &str, is_https: bool) -> Option<String> {
         let groups = self.groups.read().await;
-        let g = groups.get(group)?;
+        let g = groups.get(&(group.to_string(), is_https))?;
         let members = g.members.read().await;
         if members.is_empty() {
             return None;

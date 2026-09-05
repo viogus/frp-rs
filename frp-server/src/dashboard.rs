@@ -1104,7 +1104,11 @@ async fn handle_store_proxy_delete(
     {
         if let Some(owner) = state
             .http_group_ctl
-            .unregister_member(proxy.group.as_deref().unwrap_or_default(), &proxy.name)
+            .unregister_member(
+                proxy.group.as_deref().unwrap_or_default(),
+                &proxy.name,
+                proxy.proxy_type == "https",
+            )
             .await
         {
             state.vhost_manager.unregister(&owner).await;
@@ -1185,7 +1189,11 @@ async fn handle_proxies_delete(
             {
                 if let Some(owner) = state
                     .http_group_ctl
-                    .unregister_member(proxy.group.as_deref().unwrap_or_default(), &proxy.name)
+                    .unregister_member(
+                        proxy.group.as_deref().unwrap_or_default(),
+                        &proxy.name,
+                        proxy.proxy_type == "https",
+                    )
                     .await
                 {
                     state.vhost_manager.unregister(&owner).await;
