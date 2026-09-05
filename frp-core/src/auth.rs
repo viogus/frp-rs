@@ -1722,6 +1722,56 @@ mod oidc_impl {
             v
         }
 
+        /// Seed the JWKS cache AND set the config knobs under test (issuer /
+        /// audience / additional_audience / skip flags). `verify_login`
+        /// derives its jsonwebtoken `Validation` from exactly these fields
+        /// (auth.rs:760-782: `validate_exp = !skip_expiry`,
+        /// `validate_nbf = !skip_nbf`, `set_issuer` when `!skip_issuer`,
+        /// `set_audience` when an audience is configured), so the semantic
+        /// rejection arms (expired / nbf-future / wrong issuer / wrong
+        /// audience) are only reachable through the right configuration —
+        /// `test_verifier` keeps issuer and audience EMPTY, which disables
+        /// both checks (tokens without `iss` pass; `audience_validation`
+        /// returns None → `validate_aud = false`).
+        #[allow(clippy::too_many_arguments)]
+        async fn verifier_with_config(
+            issuer: &str,
+            audience: &str,
+            additional_audience: &[&str],
+            skip_expiry: bool,
+            skip_issuer: bool,
+            skip_nbf: bool,
+            skip_audience: bool,
+            keys: serde_json::Value,
+        ) -> OidcVerifier {
+            let mut v = test_verifier();
+            v.issuer = issuer.to_string();
+            v.audience = audience.to_string();
+            v.additional_audience = additional_audience.iter().map(|s| s.to_string()).collect();
+            v.skip_expiry = skip_expiry;
+            v.skip_issuer = skip_issuer;
+            v.skip_nbf = skip_nbf;
+            v.skip_audience = skip_audience;
+            *v.jwks.write().await = Some(CachedJwks {
+                keys,
+                fetched_at: std::time::Instant::now(),
+                refresh_after: std::time::Duration::from_secs(3600),
+            });
+            v
+        }
+
+        /// Single oct-key JWKS fixture (kid "k1") used by the semantic
+        /// rejection tests below.
+        fn oct_jwks(secret: &[u8]) -> serde_json::Value {
+            serde_json::json!({
+                "keys": [{
+                    "kty": "oct",
+                    "kid": "k1",
+                    "k": crate::base64::encode(secret),
+                }]
+            })
+        }
+
         /// Encode an HS256 JWT with the given kid and claims.
         fn encode_hs256(kid: &str, secret: &[u8], claims: &serde_json::Value) -> String {
             jsonwebtoken::encode(
@@ -1734,6 +1784,32 @@ mod oidc_impl {
                 &jsonwebtoken::EncodingKey::from_secret(secret),
             )
             .expect("encode HS256 token")
+        }
+
+        /// URL-safe base64 without padding (JWT segment form). The inline
+        /// `frp_core::base64` module is standard-alphabet with padding; the
+        /// two alphabets differ only in chars 62/63 and padding is dropped.
+        fn base64url_encode(data: &[u8]) -> String {
+            crate::base64::encode(data)
+                .replace('+', "-")
+                .replace('/', "_")
+                .trim_end_matches('=')
+                .to_string()
+        }
+
+        /// Hand-roll a JWT whose header carries the given `alg` string.
+        /// jsonwebtoken's typed `Header`/encode API cannot emit an algorithm
+        /// outside its 12-variant enum, but the wire form can — and
+        /// `decode_header` parses the header segment alone, so the payload
+        /// and signature segments only need to be structurally present.
+        fn raw_jwt_with_alg(alg: &str) -> String {
+            let header = serde_json::json!({"alg": alg, "kid": "k1"}).to_string();
+            format!(
+                "{}.{}.{}",
+                base64url_encode(header.as_bytes()),
+                base64url_encode(br#"{"sub":"alice","exp":4102444800}"#),
+                base64url_encode(b"bogus-signature")
+            )
         }
 
         #[tokio::test]
@@ -1886,6 +1962,349 @@ mod oidc_impl {
             assert!(
                 !e.refresh_warranted,
                 "empty-sub is a semantic error, not key-related"
+            );
+        }
+
+        #[tokio::test]
+        async fn oidc_verify_login_rejects_expired_token_when_expiry_enforced() {
+            // Coverage gap D: the EXPIRED-token rejection arm (ExpiredSignature
+            // from jsonwebtoken's validate_exp — the e2e suite always sets
+            // oidc_skip_expiry=true) is fed adversarially. Expiry is enforced
+            // by default (skip_expiry=false → validate_exp=true, auth.rs:761),
+            // the signature is VALID against the cached oct key (kid k1), so
+            // the rejection must come from the expiry check — and being a
+            // semantic error it must NOT warrant a JWKS refetch.
+            const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
+            // Far enough in the past to clear jsonwebtoken's 60s leeway.
+            let expired = now() - 3600;
+            let v = verifier_with_config("", "", &[], false, false, false, false, oct_jwks(SECRET))
+                .await;
+            let token = encode_hs256(
+                "k1",
+                SECRET,
+                &serde_json::json!({"sub": "alice", "exp": expired}),
+            );
+
+            let err = v
+                .verify_login(&token)
+                .await
+                .expect_err("expired token must be rejected with expiry enforced");
+            assert_eq!(
+                err, "OIDC: JWT verification failed: ExpiredSignature",
+                "expiry rejection must surface the ExpiredSignature marker"
+            );
+            assert!(
+                v.last_forced_refresh.lock().unwrap().is_none(),
+                "a semantic rejection must not arm the refresh-warranted path"
+            );
+            // Direct seam: the decode error is classified not key-related.
+            let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            val.required_spec_claims.insert("sub".to_string());
+            let e = v
+                .try_verify_token(&token, &val, Some("k1"))
+                .await
+                .expect_err("expired token must fail the direct seam too");
+            assert!(
+                !e.refresh_warranted,
+                "expired is semantic (no JWKS refresh), not key-related"
+            );
+
+            // Control: the very same token is ACCEPTED with oidc_skip_expiry
+            // = true — proves the rejection above is the expiry arm and the
+            // flag plumbing (skip_expiry → validate_exp) works end to end.
+            let v_skip =
+                verifier_with_config("", "", &[], true, false, false, false, oct_jwks(SECRET))
+                    .await;
+            let ok = v_skip
+                .verify_login(&token)
+                .await
+                .expect("skip_expiry must accept the expired token");
+            assert_eq!(ok.subject, "alice");
+            assert_eq!(
+                ok.expiry, expired,
+                "exp claim extraction on the accepted token"
+            );
+        }
+
+        #[tokio::test]
+        async fn oidc_verify_login_rejects_future_nbf_when_nbf_enforced() {
+            // Coverage gap D: the nbf-future rejection arm (ImmatureSignature).
+            // validate_nbf is off in jsonwebtoken's default Validation and only
+            // fires via auth.rs:762 (`validate_nbf = !self.skip_nbf`), so the
+            // rejection proves the flag reaches the Validation builder. The
+            // signature is valid; the token is not yet valid per its own nbf.
+            const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
+            let v = verifier_with_config("", "", &[], false, false, false, false, oct_jwks(SECRET))
+                .await;
+            let token = encode_hs256(
+                "k1",
+                SECRET,
+                &serde_json::json!({
+                    "sub": "alice",
+                    "exp": now() + 3600,
+                    // Far enough in the future to clear the 60s leeway.
+                    "nbf": now() + 3600,
+                }),
+            );
+
+            let err = v
+                .verify_login(&token)
+                .await
+                .expect_err("future nbf must be rejected with nbf enforced");
+            assert_eq!(
+                err, "OIDC: JWT verification failed: ImmatureSignature",
+                "nbf rejection must surface the ImmatureSignature marker"
+            );
+            assert!(
+                v.last_forced_refresh.lock().unwrap().is_none(),
+                "a semantic rejection must not arm the refresh-warranted path"
+            );
+            // Direct seam: not key-related.
+            let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            val.required_spec_claims.insert("sub".to_string());
+            val.validate_nbf = true;
+            let e = v
+                .try_verify_token(&token, &val, Some("k1"))
+                .await
+                .expect_err("future-nbf token must fail the direct seam too");
+            assert!(
+                !e.refresh_warranted,
+                "immature is semantic (no JWKS refresh), not key-related"
+            );
+
+            // Control: same token ACCEPTED with oidc_skip_nbf = true.
+            let v_skip =
+                verifier_with_config("", "", &[], false, false, true, false, oct_jwks(SECRET))
+                    .await;
+            let ok = v_skip
+                .verify_login(&token)
+                .await
+                .expect("skip_nbf must accept the future-nbf token");
+            assert_eq!(ok.subject, "alice");
+        }
+
+        #[tokio::test]
+        async fn oidc_verify_login_rejects_wrong_issuer_when_issuer_enforced() {
+            // Coverage gap D: the wrong-issuer rejection arm (InvalidIssuer).
+            // The issuer check fires only when skip_issuer=false (auth.rs:763)
+            // AND the token carries an `iss` claim; the signature is valid, so
+            // a mismatch between the token's iss and the verifier's configured
+            // issuer must surface InvalidIssuer — a semantic error.
+            const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
+            const ISSUER: &str = "https://issuer.example";
+            let v = verifier_with_config(
+                ISSUER,
+                "",
+                &[],
+                false,
+                false,
+                false,
+                false,
+                oct_jwks(SECRET),
+            )
+            .await;
+            let token = encode_hs256(
+                "k1",
+                SECRET,
+                &serde_json::json!({
+                    "sub": "alice",
+                    "exp": now() + 3600,
+                    "iss": "https://evil.example",
+                }),
+            );
+
+            let err = v
+                .verify_login(&token)
+                .await
+                .expect_err("token from a wrong issuer must be rejected");
+            assert_eq!(
+                err, "OIDC: JWT verification failed: InvalidIssuer",
+                "issuer rejection must surface the InvalidIssuer marker"
+            );
+            assert!(
+                v.last_forced_refresh.lock().unwrap().is_none(),
+                "a semantic rejection must not arm the refresh-warranted path"
+            );
+            // Direct seam: not key-related.
+            let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            val.required_spec_claims.insert("sub".to_string());
+            val.set_issuer(&[ISSUER]);
+            let e = v
+                .try_verify_token(&token, &val, Some("k1"))
+                .await
+                .expect_err("wrong-issuer token must fail the direct seam too");
+            assert!(
+                !e.refresh_warranted,
+                "wrong issuer is semantic (no JWKS refresh), not key-related"
+            );
+
+            // Controls on the same verifier: a matching iss is ACCEPTED with
+            // enforcement on; the wrong-issuer token is ACCEPTED with
+            // oidc_skip_issuer = true.
+            let good = encode_hs256(
+                "k1",
+                SECRET,
+                &serde_json::json!({
+                    "sub": "alice",
+                    "exp": now() + 3600,
+                    "iss": ISSUER,
+                }),
+            );
+            let ok = v
+                .verify_login(&good)
+                .await
+                .expect("matching issuer must verify with enforcement on");
+            assert_eq!(ok.subject, "alice");
+            let v_skip =
+                verifier_with_config(ISSUER, "", &[], false, true, false, false, oct_jwks(SECRET))
+                    .await;
+            let ok = v_skip
+                .verify_login(&token)
+                .await
+                .expect("skip_issuer must accept the wrong-issuer token");
+            assert_eq!(ok.subject, "alice");
+        }
+
+        #[tokio::test]
+        async fn oidc_verify_login_rejects_wrong_audience_when_audience_configured() {
+            // Coverage gap D: the wrong-audience rejection arm (InvalidAudience).
+            // Audience validation fires when an audience is configured and
+            // skip_audience=false (auth.rs:766-778); the token's `aud` claim
+            // must contain the configured audience. The signature is valid, so
+            // a mismatch must surface InvalidAudience — a semantic error.
+            const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
+            const AUDIENCE: &str = "api-prod";
+            let v = verifier_with_config(
+                "",
+                AUDIENCE,
+                &[],
+                false,
+                false,
+                false,
+                false,
+                oct_jwks(SECRET),
+            )
+            .await;
+            let token = encode_hs256(
+                "k1",
+                SECRET,
+                &serde_json::json!({
+                    "sub": "alice",
+                    "exp": now() + 3600,
+                    "aud": "other-app",
+                }),
+            );
+
+            let err = v
+                .verify_login(&token)
+                .await
+                .expect_err("token for a different audience must be rejected");
+            assert_eq!(
+                err, "OIDC: JWT verification failed: InvalidAudience",
+                "audience rejection must surface the InvalidAudience marker"
+            );
+            assert!(
+                v.last_forced_refresh.lock().unwrap().is_none(),
+                "a semantic rejection must not arm the refresh-warranted path"
+            );
+            // Direct seam: not key-related.
+            let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            val.required_spec_claims.insert("sub".to_string());
+            val.set_audience(&[AUDIENCE]);
+            let e = v
+                .try_verify_token(&token, &val, Some("k1"))
+                .await
+                .expect_err("wrong-audience token must fail the direct seam too");
+            assert!(
+                !e.refresh_warranted,
+                "wrong audience is semantic (no JWKS refresh), not key-related"
+            );
+
+            // Controls: matching aud (and a matching aud inside an array-form
+            // claim) is ACCEPTED on the same verifier; the wrong-aud token is
+            // ACCEPTED with oidc_skip_audience = true.
+            let good = encode_hs256(
+                "k1",
+                SECRET,
+                &serde_json::json!({
+                    "sub": "alice",
+                    "exp": now() + 3600,
+                    "aud": AUDIENCE,
+                }),
+            );
+            let ok = v
+                .verify_login(&good)
+                .await
+                .expect("matching audience must verify");
+            assert_eq!(ok.subject, "alice");
+            let good_array = encode_hs256(
+                "k1",
+                SECRET,
+                &serde_json::json!({
+                    "sub": "alice",
+                    "exp": now() + 3600,
+                    "aud": ["unrelated", AUDIENCE],
+                }),
+            );
+            let ok = v
+                .verify_login(&good_array)
+                .await
+                .expect("audience array containing the configured value must verify");
+            assert_eq!(ok.subject, "alice");
+            let v_skip = verifier_with_config(
+                "",
+                AUDIENCE,
+                &[],
+                false,
+                false,
+                false,
+                true,
+                oct_jwks(SECRET),
+            )
+            .await;
+            let ok = v_skip
+                .verify_login(&token)
+                .await
+                .expect("skip_audience must accept the wrong-audience token");
+            assert_eq!(ok.subject, "alice");
+        }
+
+        #[tokio::test]
+        async fn oidc_verify_login_rejects_alg_outside_allowlist_before_verification() {
+            // Coverage gap D: the algorithm rejection surface. The typed
+            // allowlist (auth.rs:720-736) contains every algorithm jsonwebtoken
+            // 9.3.1's enum can represent, so an attacker token whose alg is
+            // NOT allowlisted — "none" (unsigned-JWT attack) or "ES512" (a
+            // real JOSE name the library does not implement) — cannot reach
+            // the allowlist comparison: jsonwebtoken::decode_header itself
+            // rejects the unknown variant, BEFORE signature verification and
+            // before any JWKS access. Both shapes must fail closed with the
+            // header-decode marker and arm nothing.
+            const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
+            let v = verifier_with_config("", "", &[], false, false, false, false, oct_jwks(SECRET))
+                .await;
+            for alg in ["none", "ES512"] {
+                let token = raw_jwt_with_alg(alg);
+                let err = v
+                    .verify_login(&token)
+                    .await
+                    .expect_err("a token with a disallowed alg must be rejected");
+                assert!(
+                    err.starts_with("OIDC: failed to decode JWT header: JSON error: "),
+                    "disallowed alg must fail at header decode, got: {err}"
+                );
+                assert!(
+                    err.contains(&format!("unknown variant `{alg}`")),
+                    "the rejection must name the offending alg, got: {err}"
+                );
+                assert!(
+                    !err.contains("fetch JWKS") && !err.contains("JWT verification failed"),
+                    "no JWKS access or signature attempt may precede the alg rejection: {err}"
+                );
+            }
+            assert!(
+                v.last_forced_refresh.lock().unwrap().is_none(),
+                "alg rejection must not arm the refresh-warranted path"
             );
         }
 

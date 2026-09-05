@@ -383,6 +383,13 @@ impl ServerConfig {
     /// Apply conditional defaults matching Go frp dev (fatedier/frp@d486018)
     /// `ServerConfig.Complete()`. Call after deserialization, before consuming.
     pub fn complete(&mut self) {
+        // Go frp: `BindPort = util.EmptyOr(BindPort, 7000)` (v1/server.go:111)
+        // — an EXPLICIT 0 maps to the default too; serde's default fn only
+        // fires when the key is absent. Without this, `bindPort = 0` bound
+        // an OS-chosen ephemeral port (TcpListener::bind("0.0.0.0:0")).
+        if self.bind_port == 0 {
+            self.bind_port = 7000;
+        }
         // When proxy_bind_addr is empty, inherit from bind_addr (Go compat).
         if self.proxy_bind_addr.is_empty() {
             self.proxy_bind_addr = self.bind_addr.clone();

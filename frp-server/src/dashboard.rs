@@ -989,6 +989,14 @@ async fn handle_store_proxy_create(
                 }),
             ));
         }
+        if store.len() >= MAX_STORE_PROXIES {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    error: format!("proxy store full (max {MAX_STORE_PROXIES})"),
+                }),
+            ));
+        }
         let (local_ip, local_port) = if config.local_addr.is_empty() {
             (String::new(), 0u16)
         } else if let Some((ip, port_str)) = config.local_addr.rsplit_once(':') {
@@ -1096,7 +1104,11 @@ async fn handle_store_proxy_delete(
     {
         if let Some(owner) = state
             .http_group_ctl
-            .unregister_member(proxy.group.as_deref().unwrap_or_default(), &proxy.name)
+            .unregister_member(
+                proxy.group.as_deref().unwrap_or_default(),
+                &proxy.name,
+                proxy.proxy_type == "https",
+            )
             .await
         {
             state.vhost_manager.unregister(&owner).await;
@@ -1177,7 +1189,11 @@ async fn handle_proxies_delete(
             {
                 if let Some(owner) = state
                     .http_group_ctl
-                    .unregister_member(proxy.group.as_deref().unwrap_or_default(), &proxy.name)
+                    .unregister_member(
+                        proxy.group.as_deref().unwrap_or_default(),
+                        &proxy.name,
+                        proxy.proxy_type == "https",
+                    )
                     .await
                 {
                     state.vhost_manager.unregister(&owner).await;
@@ -1236,6 +1252,25 @@ async fn handle_proxies_delete(
 /// Caps per-process connection and task accumulation: the event feed is a
 /// best-effort broadcast, so excess connections are rejected outright.
 const MAX_WS_SUBSCRIBERS: usize = 64;
+/// Max stashed proxy configs in the in-memory store. Each POST clones the
+/// full map and rewrites the whole store file, so the cap bounds both the
+/// per-request O(n) clone+rewrite cost and the store's memory. Entries are
+/// inert (never promoted to the proxy registry) — the store is a dashboard
+/// planning surface, not a proxy limit. Operational limit (R2 review,
+/// round 10): sized well above any realistic planning list (4x the server's
+/// 256 default per-client live proxy budget) so legitimate workflows never
+/// brush it, while still bounding the per-POST O(n) clone+file rewrite.
+/// Raise here if a deployment plans more stashed configs; the dashboard
+/// returns 429 past the cap.
+const MAX_STORE_PROXIES: usize = 1024;
+/// Per-message cap for /api/events WebSocket frames. Subscribers never send
+/// meaningful payloads (only close/ping), and tungstenite's defaults (16 MiB
+/// frame / 64 MiB message) are far beyond anything the dashboard needs.
+const MAX_WS_FRAME_BYTES: usize = 1 << 20;
+/// Bounded write buffer per subscriber: a stalled reader must not grow the
+/// socket's buffered events without bound (tungstenite 0.29's default
+/// max_write_buffer_size is usize::MAX — effectively unbounded).
+const MAX_WS_WRITE_BUFFER_BYTES: usize = 4 << 20;
 
 /// Process-wide semaphore capping concurrent `/api/events` WebSocket
 /// connections. One permit is held for the lifetime of each connection
@@ -1275,7 +1310,11 @@ async fn handle_events(
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let sem = ws_conn_semaphore();
     let permit = try_acquire_ws_permit(&sem)?;
-    Ok(ws.on_upgrade(move |socket| handle_ws(socket, state, permit)))
+    Ok(ws
+        .max_frame_size(MAX_WS_FRAME_BYTES)
+        .max_message_size(MAX_WS_FRAME_BYTES)
+        .max_write_buffer_size(MAX_WS_WRITE_BUFFER_BYTES)
+        .on_upgrade(move |socket| handle_ws(socket, state, permit)))
 }
 
 /// `_permit` is the RAII guard that caps concurrent subscribers: it is held
@@ -3161,6 +3200,47 @@ mod v2 {
                 "empty update body must be rejected",
             );
             assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn test_store_proxy_cap_rejects_when_full() {
+            // The store is write-only per name (stored configs are inert and
+            // never reach the registry), so without a cap an authenticated
+            // client could grow the map + the rewritten store file without
+            // bound. Each POST clones the full map and rewrites the whole
+            // file, so the cap bounds both memory and per-request cost.
+            let state = test_state();
+            for i in 0..MAX_STORE_PROXIES {
+                let resp = handle_store_proxy_create(
+                    State(state.clone()),
+                    JsonBody(StoreProxyConfig {
+                        name: format!("s{i}"),
+                        proxy_type: "tcp".into(),
+                        remote_port: Some(6000 + i as u16),
+                        custom_domains: Vec::new(),
+                        local_addr: "127.0.0.1:80".into(),
+                        group: String::new(),
+                    }),
+                )
+                .await;
+                assert!(resp.is_ok(), "insert {i} must succeed");
+            }
+            let (status, _) = expect_err(
+                handle_store_proxy_create(
+                    State(state.clone()),
+                    JsonBody(StoreProxyConfig {
+                        name: "overflow".into(),
+                        proxy_type: "tcp".into(),
+                        remote_port: Some(7000),
+                        custom_domains: Vec::new(),
+                        local_addr: "127.0.0.1:80".into(),
+                        group: String::new(),
+                    }),
+                )
+                .await,
+                "cap must reject the insert past MAX_STORE_PROXIES",
+            );
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         }
 
         #[tokio::test]

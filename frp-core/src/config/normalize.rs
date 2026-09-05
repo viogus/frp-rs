@@ -139,14 +139,27 @@ fn expand_env_vars_in_str(s: &str) -> String {
 ///
 /// Deliberate minimal subset (frp-rs has a zero-new-dependency policy and
 /// does not embed a template engine):
-/// - Only the exact call form `{{ parseNumberRange "expr" }}` is recognized,
-///   with optional ASCII whitespace after `{{`, around the function name and
-///   before `}}`. No other template syntax (variables, control flow, other
-///   functions) is processed — anything that does not match is left verbatim.
-/// - A single string may contain several calls; each is expanded in place
+/// - Two action forms are recognized, with optional ASCII whitespace after
+///   `{{`, around the function name and before `}}`:
+///   - `{{ parseNumberRange "expr" }}` — expanded in place;
+///   - `{{ .Envs.NAME }}` — Go frp's environment pattern (data field of
+///     `Values`, `load.go`); NAME expands from the process env, unset →
+///     Go's literal `<no value>` with a warning (Go text/template runs
+///     without a `missingkey` option, so a missing map key prints
+///     `<no value>` — `pkg/config/load.go:84`). Byte-parity here also
+///     fails closed: `token = "{{ .Envs.FRP_TOKEN }}"` with the env unset
+///     yields a token no client can match, where an empty string could
+///     silently fall back to unauthenticated. This is what Go configs in
+///     the wild use for `token = "{{ .Envs.FRP_TOKEN }}"` — leaving it
+///     verbatim shipped the literal text as the value (silent auth
+///     failure on migration).
+/// - No other template syntax (variables, control flow, other functions,
+///   `index` / `range` forms) is processed — anything that does not match
+///   one of the two forms is left verbatim.
+/// - A single string may contain several actions; each is expanded in place
 ///   and the surrounding text is preserved.
-/// - Invalid expressions (non-numeric, N > M, out of 0..=65535) are kept
-///   verbatim and a `tracing::warn` is emitted.
+/// - Invalid range expressions (non-numeric, N > M, out of 0..=65535) are
+///   kept verbatim and a `tracing::warn` is emitted.
 pub(super) fn expand_template_functions(value: &mut toml::Value) {
     match value {
         toml::Value::String(s) => *s = expand_template_functions_in_str(s),
@@ -188,45 +201,137 @@ fn expand_template_functions_in_str(s: &str) -> String {
     out
 }
 
-/// Try to parse one `{{ parseNumberRange "expr" }}` call at the start of `s`
-/// (which must begin with `{{`). On success returns the number of bytes
-/// consumed (the whole call) and the replacement text — the expanded list,
-/// or the original call verbatim when the expression is invalid (after a
-/// warning). Returns `None` when the text is not a well-formed
-/// parseNumberRange call at all (kept verbatim by the caller).
+/// Try to parse one `{{ ... }}` action at the start of `s` (which must begin
+/// with `{{`). Two forms are recognized, mirroring the Go frp template layer
+/// (`pkg/config/load.go` `RenderWithTemplate`, data = `Values{Envs}`):
+/// - `{{ parseNumberRange "expr" }}` — expanded list (see
+///   [`expand_number_range_expr`]); invalid expressions stay verbatim after
+///   a warning.
+/// - `{{ .Envs.NAME }}` — Go frp's ONLY environment access (`token = "{{
+///   .Envs.FRP_TOKEN }}"` is the documented Go pattern). NAME is looked up
+///   in the process env; unset → the literal `<no value>` with a warning.
+///   Go frp calls `template.New("frp")` with no `Option("missingkey=...")`,
+///   so the text/template default applies: a missing map key prints
+///   `<no value>` (Go source `text/template`: `missingkey=default` — "if
+///   printed, the result of the index operation is the string `<no value>`";
+///   `Envs` is a `map[string]string` populated only from `os.Environ`, so an
+///   unset var IS a missing key). frp-rs renders the same literal for
+///   byte-parity; the warning is frp-rs-only diagnostics (Go is silent).
+///
+/// On success returns the number of bytes consumed (the whole action) and
+/// the replacement text. Returns `None` when the text is not a well-formed
+/// recognized action at all (kept verbatim by the caller) — e.g. `.Envs` in
+/// Go `index` syntax (`{{ index .Envs "X-Y" }}`), the bare `{{ .Envs }}`
+/// map dump, or `{{ parseNumberRange .Envs.PORT_RANGE }}` argument forms,
+/// all of which would need a full template engine.
 fn try_parse_template_call(s: &str) -> Option<(usize, String)> {
     let bytes = s.as_bytes();
     debug_assert!(bytes.starts_with(b"{{"));
     let mut i = skip_ws(bytes, 2);
-    if !bytes.get(i..)?.starts_with(b"parseNumberRange") {
-        return None;
-    }
-    i += b"parseNumberRange".len();
-    i = skip_ws(bytes, i);
-    if bytes.get(i) != Some(&b'"') {
-        return None;
-    }
-    i += 1;
-    let expr_start = i;
-    let expr_end = bytes[i..].iter().position(|&b| b == b'"').map(|p| i + p)?; // Unclosed quote — not a call.
-    let expr = &s[expr_start..expr_end];
-    i = expr_end + 1;
-    i = skip_ws(bytes, i);
-    if !bytes.get(i..)?.starts_with(b"}}") {
-        return None;
-    }
-    i += 2;
-    let original = &s[..i];
-    match expand_number_range_expr(expr) {
-        Some(expansion) => Some((i, expansion)),
-        None => {
-            tracing::warn!(
-                original = %original,
-                expr,
-                "invalid {{ parseNumberRange ... }} expression in config; leaving it verbatim"
-            );
-            Some((i, original.to_string()))
+    if bytes.get(i..)?.starts_with(b"parseNumberRange") {
+        i += b"parseNumberRange".len();
+        i = skip_ws(bytes, i);
+        if bytes.get(i) != Some(&b'"') {
+            return None;
         }
+        i += 1;
+        let expr_start = i;
+        let expr_end = bytes[i..].iter().position(|&b| b == b'"').map(|p| i + p)?; // Unclosed quote — not a call.
+        let expr = &s[expr_start..expr_end];
+        i = expr_end + 1;
+        i = skip_ws(bytes, i);
+        if !bytes.get(i..)?.starts_with(b"}}") {
+            return None;
+        }
+        i += 2;
+        let original = &s[..i];
+        match expand_number_range_expr(expr) {
+            Some(expansion) => Some((i, expansion)),
+            None => {
+                tracing::warn!(
+                    original = %original,
+                    expr,
+                    "invalid {{ parseNumberRange ... }} expression in config; leaving it verbatim"
+                );
+                Some((i, original.to_string()))
+            }
+        }
+    } else if bytes.get(i..)?.starts_with(b".Envs") {
+        i += b".Envs".len();
+        // The field chain is contiguous in Go templates (`.Envs.NAME` —
+        // whitespace between chain elements is a parse error there).
+        let name_start = match bytes.get(i) {
+            Some(b'.') => i + 1,
+            _ => {
+                // `.Envs` followed by anything but a dot: `.EnvsX` is a
+                // (valid Go syntax) field lookup that ERRORS at exec time
+                // (no such field), failing the whole render. frp-rs keeps it
+                // verbatim — warn so a migrated config is not silently
+                // shipping a literal template.
+                tracing::warn!(
+                    original = %s,
+                    "template action kept verbatim: only '{{ .Envs.NAME }}' (NAME = [A-Za-z0-9_]+) \
+                     is expanded; Go would error on any other .Envs field shape"
+                );
+                return None;
+            }
+        };
+        let name_end = bytes[name_start..]
+            .iter()
+            .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+            .map(|p| name_start + p)
+            .unwrap_or(bytes.len());
+        if name_end == name_start {
+            // `{{ .Envs }}` alone would render the whole map in Go — out of
+            // the zero-dependency subset, kept verbatim (warned, not silent:
+            // the map dump in a value is always an operator mistake).
+            tracing::warn!(
+                original = %s,
+                "bare '{{ .Envs }}' kept verbatim: frp-rs expands only '{{ .Envs.NAME }}' \
+                 (Go would dump the whole environment map here)"
+            );
+            return None;
+        }
+        let name = &s[name_start..name_end];
+        i = name_end;
+        i = skip_ws(bytes, i);
+        if !bytes.get(i..)?.starts_with(b"}}") {
+            return None;
+        }
+        i += 2;
+        match std::env::var(name) {
+            Ok(v) => Some((i, v)),
+            Err(_) => {
+                // Go text/template default (no missingkey option in frp's
+                // RenderWithTemplate) prints "<no value>" for a missing map
+                // key — replicate byte-for-byte. Empty would be a silent
+                // divergence AND, for `token = "{{ .Envs.FRP_TOKEN }}"`,
+                // could fall back to unauthenticated.
+                tracing::warn!(
+                    name,
+                    "{{ .Envs.{name} }}: environment variable not set; rendering Go's '<no value>' placeholder"
+                );
+                Some((i, "<no value>".to_string()))
+            }
+        }
+    } else if bytes.get(i..)?.starts_with(b"index") {
+        // `{{ index .Envs "K-E-Y" }}` is Go's ONLY legal way to read an env
+        // whose name holds non-identifier characters (.Envs.FOO-BAR is a Go
+        // parse error). Go renders it to the env value ("<no value>" for a
+        // missing key); frp-rs's zero-engine subset keeps the action
+        // verbatim — warn so the silent-literal-template failure mode (the
+        // template TEXT shipping as the config value) surfaces at load.
+        let after = skip_ws(bytes, i + b"index".len());
+        if bytes.get(after..).is_some_and(|r| r.starts_with(b".Envs")) {
+            tracing::warn!(
+                original = %s,
+                "{{ index .Envs ... }} kept verbatim: frp-rs expands only '{{ .Envs.NAME }}' \
+                 (Go renders the indexed env value here)"
+            );
+        }
+        None
+    } else {
+        None
     }
 }
 

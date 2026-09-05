@@ -16,6 +16,20 @@ use crate::service::{AppState, InternalMsg};
 use crate::state::{ControlTx, GroupPortQuery};
 
 /// Returns full detail when detailed_errors is enabled, otherwise generic message.
+/// Build a NewProxyResp error text, mirroring Go
+/// `util.GenerateResponseErrorString(summary, err, detailed)` (pkg/util/
+/// util/util.go:113-118): detailed mode sends the full error, non-detailed
+/// sends the summary.
+///
+/// Documented divergence (R1 review, round 10): Go ALWAYS passes the fixed
+/// summary "new proxy [<name>] error" (server/control.go:757) for every
+/// registration failure, so in non-detailed mode a Go client learns nothing
+/// beyond the proxy name. frp-rs deliberately uses per-class summaries
+/// ("group params invalid", "vhost route config conflict", …) — strictly
+/// more informative for frp-rs clients, and `detailed_errors_to_client`
+/// defaults to true on both sides, so the common path carries the exact Go
+/// error text either way. Keep per-arm summaries consistent: each arm
+/// should name its own failure class, never mask a sibling's.
 pub(crate) fn err_msg(detailed: bool, detail: String, generic: &str) -> String {
     if detailed {
         detail
@@ -1024,14 +1038,49 @@ async fn register_http_vhost(
         if domains.len() != 1 || locations.len() != 1 {
             rollback_vhost_conflict(state, run_id, port, false).await;
             state.proxy_manager.remove(&np.proxy_name).await;
+            // Go HTTPGroup.Register runs once per (domain, location) pair
+            // (proxy/http.go:76-91) against a group storing ONE pair, and
+            // stops at the FIRST error — the text a Go client sees is
+            // decided by the member's SECOND pair: an identical repeat
+            // re-enters Register under the same proxy name and hits the
+            // per-member duplicate check (`createFuncs[proxyName]`,
+            // http.go:108-113) → ErrProxyRepeated "group proxy repeated";
+            // a different pair fails the params comparison first
+            // (http.go:100-103) → ErrGroupParamsInvalid. (customDomains
+            // self-duplicates and a subdomain equal to a custom domain both
+            // produce the repeat shape via buildDomains, proxy.go:218-229.)
+            // frp-rs gates both shapes before any registration side effect
+            // — same net rejection, with the matching wire text.
+            let first_pair = (domains[0].as_str(), locations[0].as_str());
+            // Pair order is domain-major, location-minor; the second pair
+            // is (domains[0], locations[1]) when locations repeat.
+            let second_pair = if locations.len() > 1 {
+                (domains[0].as_str(), locations[1].as_str())
+            } else {
+                (domains[1].as_str(), locations[0].as_str())
+            };
+            let repeated = second_pair == first_pair;
             reject_new_proxy(
                 writer,
                 &np.proxy_name,
-                err_msg(
-                    state.detailed_errors_to_client,
-                    "http group proxies must configure exactly one custom_domain and one location (Go frp HTTPGroup semantics)".into(),
-                    "http group params invalid",
-                ),
+                if repeated {
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        format!(
+                            "http group proxy '{}' repeats the (custom_domain, location) pair \
+                             ('{}', '{}') — the identical triple re-enters HTTPGroup.Register \
+                             under the same proxy name (Go: ErrProxyRepeated)",
+                            np.proxy_name, first_pair.0, first_pair.1
+                        ),
+                        "group proxy repeated",
+                    )
+                } else {
+                    err_msg(
+                        state.detailed_errors_to_client,
+                        "http group proxies must configure exactly one custom_domain and one location (Go frp HTTPGroup semantics)".into(),
+                        "group params invalid",
+                    )
+                },
                 v2,
             )
             .await;
@@ -1075,7 +1124,7 @@ async fn register_http_vhost(
                     {
                         state
                             .http_group_ctl
-                            .unregister_member(group_name, &np.proxy_name)
+                            .unregister_member(group_name, &np.proxy_name, false)
                             .await;
                         rollback_vhost_conflict(state, run_id, port, false).await;
                         state.proxy_manager.remove(&np.proxy_name).await;
@@ -1097,14 +1146,21 @@ async fn register_http_vhost(
             Err(e) => {
                 rollback_vhost_conflict(state, run_id, port, false).await;
                 state.proxy_manager.remove(&np.proxy_name).await;
+                // register_member returns the Go constants verbatim
+                // ("group params invalid" / "group auth failed" /
+                // "group proxy repeated" — server/group/group.go:22-26), and
+                // register_member's internal ordering already chose the
+                // right one for the event. Send the constant as BOTH the
+                // detailed text and the non-detailed summary (mirrors the
+                // https arm): masking it under one fixed summary (the old
+                // "group params invalid") hid "group auth failed" /
+                // "group proxy repeated" from a non-detailed frp-rs client.
+                // Go in non-detailed mode would send the generic
+                // "new proxy [x] error" — see err_msg's divergence note.
                 reject_new_proxy(
                     writer,
                     &np.proxy_name,
-                    err_msg(
-                        state.detailed_errors_to_client,
-                        e,
-                        "http group registration failed",
-                    ),
+                    err_msg(state.detailed_errors_to_client, e.clone(), e.as_str()),
                     v2,
                 )
                 .await;
@@ -1287,7 +1343,7 @@ async fn register_https_vhost(
                     {
                         state
                             .http_group_ctl
-                            .unregister_member(group_name, &np.proxy_name)
+                            .unregister_member(group_name, &np.proxy_name, true)
                             .await;
                         rollback_vhost_conflict(state, run_id, port, false).await;
                         state.proxy_manager.remove(&np.proxy_name).await;
@@ -1310,23 +1366,14 @@ async fn register_https_vhost(
                 rollback_vhost_conflict(state, run_id, port, false).await;
                 state.proxy_manager.remove(&np.proxy_name).await;
                 // register_https_member returns the Go constants verbatim
-                // ("group params invalid" / "group auth failed") except the
-                // cross-kind rejection, which is a frp-rs-only constraint
-                // with a descriptive sentence (Go keeps HTTP/HTTPS groups in
-                // separate controllers and never sees the conflict). That
-                // sentence must not reach the generic wire arm — a Go client
-                // cannot match a non-Go text. Map it to the standard Go
-                // group constant (the http-kind arm's cross-kind error is
-                // likewise genericized to "http group registration failed").
-                let generic = if e.starts_with("http group [") {
-                    "group params invalid"
-                } else {
-                    &e
-                };
+                // ("group params invalid" / "group auth failed",
+                // server/group/group.go:22-26). The kind-keyed registry
+                // means a cross-kind join is structurally impossible — no
+                // non-Go text can reach this arm anymore.
                 reject_new_proxy(
                     writer,
                     &np.proxy_name,
-                    err_msg(state.detailed_errors_to_client, e.clone(), generic),
+                    err_msg(state.detailed_errors_to_client, e.clone(), e.as_str()),
                     v2,
                 )
                 .await;
@@ -1562,39 +1609,48 @@ async fn setup_proxy_listeners(
                 // rejected the first member). Per-proxy TCP listeners keep
                 // the reject behavior: their port is exclusive.
                 if e.kind() == std::io::ErrorKind::AddrInUse {
+                    // This member's DECLARED port decides the join, not the
+                    // port this attempt happened to bind (auto-assign
+                    // resolves 0 to a concrete number the sibling may not
+                    // share). Go compares declared-vs-declared (tcp.go).
+                    let declared_port = np.remote_port.unwrap_or(0) as u16;
                     match state
                         .tcp_group_ctl
-                        .get_group_port(&group_name, &group_key, port, &bind_addr)
+                        .get_group_port(&group_name, &group_key, declared_port, &bind_addr)
                         .await
                     {
-                        GroupPortQuery::Matched(_) => {
+                        GroupPortQuery::Matched(join_port) => {
                             // The group exists and matches this member's
-                            // group/key/port — join it. Roll back the
-                            // create-path registration (port mark + registry
-                            // entry + count), re-mark the port, then
+                            // declared group/key/port — join it on the
+                            // GROUP's real port (auto-assign groups resolve
+                            // to a real port this member never bound).
+                            // Roll back the create-path registration (port
+                            // mark + registry entry + count), then
                             // re-register via the member path, which writes
-                            // the NewProxyResp itself.
+                            // the NewProxyResp itself and marks the group's
+                            // real port.
                             tracing::warn!(
                                 port = %port,
+                                join_port = %join_port,
                                 group = %group_name,
                                 proxy_name = %np.proxy_name,
-                                "TCP group port {port} bind raced a sibling group create for '{}' — joining existing group",
+                                "TCP group port {port} bind raced a sibling group create for '{}' — joining existing group on port {join_port}",
                                 np.proxy_name,
                             );
                             rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
-                            state.used_ports.write().await.insert(port);
+                            state.used_ports.write().await.insert(join_port);
                             handle_tcp_group_member_registration(
                                 state,
                                 run_id,
                                 control_id,
                                 writer,
                                 np.clone(),
-                                np.remote_port.unwrap_or(0) as u16,
+                                declared_port,
                                 &itx,
                                 listener_handles,
                                 udp_sockets,
                                 v2,
-                                Some(port),
+                                Some(join_port),
                                 tcp_group_created,
                             )
                             .await;
@@ -1651,12 +1707,19 @@ async fn setup_proxy_listeners(
             tcp_group_listener(listener, port, gn, st, ct).await;
         });
         let abort_handle = handle.abort_handle();
+        // The group stores the member's DECLARED remote port separately
+        // from the bound one: Go keeps `tg.port` (declared, 0 for
+        // auto-assign) alongside `realPort`, and later members must declare
+        // the SAME number — an explicit port can never join an auto-assign
+        // group even if the values coincide.
+        let declared_port = np.remote_port.unwrap_or(0) as u16;
         let create_result = state
             .tcp_group_ctl
             .create_group(
                 &group_name,
                 &group_key,
                 port,
+                declared_port,
                 &bind_addr,
                 handle,
                 cancel_token,
@@ -1673,9 +1736,12 @@ async fn setup_proxy_listeners(
             // splitting the group across two listeners).
             abort_handle.abort();
             rollback_tcp_bind_failure(state, run_id, port, &np.proxy_name).await;
+            // Declared-vs-declared join probe (Go tcp.go: an explicit port
+            // cannot join an auto-assign group even if the numbers agree).
+            let declared_port = np.remote_port.unwrap_or(0) as u16;
             match state
                 .tcp_group_ctl
-                .get_group_port(&group_name, &group_key, port, &bind_addr)
+                .get_group_port(&group_name, &group_key, declared_port, &bind_addr)
                 .await
             {
                 GroupPortQuery::Matched(join_port) => {
@@ -3132,7 +3198,12 @@ pub(crate) async fn unregister_control(
             // unregister_member returns the route OWNER (first member) when
             // the group empties — the shared route is keyed on that name, so
             // unregistering with a later member's name would leak it.
-            if let Some(owner) = state.http_group_ctl.unregister_member(gname, &p.name).await {
+            let kind_https = p.proxy_type == "https";
+            if let Some(owner) = state
+                .http_group_ctl
+                .unregister_member(gname, &p.name, kind_https)
+                .await
+            {
                 state.vhost_manager.unregister(&owner).await;
             }
         } else {
@@ -3885,6 +3956,7 @@ pub(crate) mod unregister_generation_tests {
                 "grp",
                 "grp-key",
                 49911,
+                49911, // declared_port: unit harness registers with no conflict
                 "0.0.0.0",
                 tokio::spawn(async {}),
                 cancel_token.clone(),
@@ -4394,7 +4466,7 @@ pub(crate) mod unregister_generation_tests {
 
     /// Register a tcpmux proxy through `handle_new_proxy`, returning
     /// (accepted, response_text) for rejection-text assertions.
-    async fn register_tcpmux_group_member(
+    async fn register_proxy_via_handler(
         state: &Arc<AppState>,
         itx: &mpsc::Sender<InternalMsg>,
         handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
@@ -4441,7 +4513,7 @@ pub(crate) mod unregister_generation_tests {
         np1.group_key = Some("gk".to_string());
         np1.http_user = Some("alice".to_string());
         np1.http_pwd = Some("secret".to_string());
-        let (ok, _) = register_tcpmux_group_member(
+        let (ok, _) = register_proxy_via_handler(
             &state,
             &itx,
             &mut handles,
@@ -4460,7 +4532,7 @@ pub(crate) mod unregister_generation_tests {
         np2.group_key = Some("gk".to_string());
         np2.http_user = Some("alice".to_string());
         np2.http_pwd = Some("wrong".to_string());
-        let (ok, text) = register_tcpmux_group_member(
+        let (ok, text) = register_proxy_via_handler(
             &state,
             &itx,
             &mut handles,
@@ -4487,7 +4559,7 @@ pub(crate) mod unregister_generation_tests {
         np3.group_key = Some("WRONG".to_string());
         np3.http_user = Some("alice".to_string());
         np3.http_pwd = Some("secret".to_string());
-        let (ok, text) = register_tcpmux_group_member(
+        let (ok, text) = register_proxy_via_handler(
             &state,
             &itx,
             &mut handles,
@@ -4583,11 +4655,19 @@ pub(crate) mod unregister_generation_tests {
 
         // Round-robin over both members.
         assert_eq!(
-            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            state
+                .http_group_ctl
+                .choose_endpoint("web", true)
+                .await
+                .as_deref(),
             Some("h-a")
         );
         assert_eq!(
-            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            state
+                .http_group_ctl
+                .choose_endpoint("web", true)
+                .await
+                .as_deref(),
             Some("h-b")
         );
     }
@@ -4655,7 +4735,7 @@ pub(crate) mod unregister_generation_tests {
             "rejected proxy must be rolled back"
         );
         assert_eq!(
-            state.http_group_ctl.choose_endpoint("web").await,
+            state.http_group_ctl.choose_endpoint("web", true).await,
             None,
             "the group created by the rejected registration must be gone"
         );
@@ -4712,7 +4792,11 @@ pub(crate) mod unregister_generation_tests {
             "rejection must carry the Go text: {text3}"
         );
         assert_eq!(
-            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            state
+                .http_group_ctl
+                .choose_endpoint("web", true)
+                .await
+                .as_deref(),
             Some("h-b"),
             "the existing group must survive the rejected join"
         );
@@ -4787,7 +4871,11 @@ pub(crate) mod unregister_generation_tests {
         let text1 = String::from_utf8_lossy(&writer1).to_string();
         assert!(ok, "[a,a] group https proxy must register: {text1}");
         assert_eq!(
-            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            state
+                .http_group_ctl
+                .choose_endpoint("web", true)
+                .await
+                .as_deref(),
             Some("h-aa"),
             "the single deduped member must serve the group"
         );
@@ -4813,9 +4901,280 @@ pub(crate) mod unregister_generation_tests {
         let text2 = String::from_utf8_lossy(&writer2).to_string();
         assert!(ok, "second member must join: {text2}");
         assert_eq!(
-            state.http_group_ctl.choose_endpoint("web").await.as_deref(),
+            state
+                .http_group_ctl
+                .choose_endpoint("web", true)
+                .await
+                .as_deref(),
             Some("h-b"),
             "round-robin must reach the second member"
+        );
+    }
+
+    /// Go parity (server/service.go wires HTTPGroupController on the
+    /// httpVhostRouter and HTTPSGroupController on the httpsMuxer): an HTTP
+    /// group "web" and an HTTPS group "web" coexist — same group NAME,
+    /// independent member lists and routes. The kind-keyed registry
+    /// ((group, is_https)) mirrors the split; pre-fix both kinds shared one
+    /// registry, so the second kind's first member hit a false "already
+    /// exists" / params collision.
+    #[tokio::test]
+    async fn http_and_https_group_same_name_coexist() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+        let (itx, _rx) = mpsc::channel(8);
+        let mut handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut udp_sockets: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::net::UdpSocket>,
+        > = std::collections::HashMap::new();
+
+        // HTTP-kind member of group "web".
+        let mut np1 = new_proxy("h-web", "http");
+        np1.custom_domains = Some(vec!["web.example.com".to_string()]);
+        np1.group = Some("web".to_string());
+        np1.group_key = Some("k".to_string());
+        let (ok, text) = register_proxy_via_handler(
+            &state,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            np1,
+            "run-1",
+            1,
+        )
+        .await;
+        assert!(ok, "http member must register: {text}");
+
+        // HTTPS-kind member of the SAME group name, same domain.
+        let mut np2 = new_proxy("hs-web", "https");
+        np2.custom_domains = Some(vec!["web.example.com".to_string()]);
+        np2.group = Some("web".to_string());
+        np2.group_key = Some("k".to_string());
+        let (ok, text) = register_proxy_via_handler(
+            &state,
+            &itx,
+            &mut handles,
+            &mut udp_sockets,
+            np2,
+            "run-1",
+            1,
+        )
+        .await;
+        assert!(
+            ok,
+            "https member of the same group name must register: {text}"
+        );
+
+        // Each kind's registry serves its own member.
+        assert_eq!(
+            state
+                .http_group_ctl
+                .choose_endpoint("web", false)
+                .await
+                .as_deref(),
+            Some("h-web")
+        );
+        assert_eq!(
+            state
+                .http_group_ctl
+                .choose_endpoint("web", true)
+                .await
+                .as_deref(),
+            Some("hs-web")
+        );
+
+        // Unregistering the http member empties ONLY the http-kind group —
+        // the route owner of the http kind is returned, and the https-kind
+        // group keeps serving (kind-keyed removal).
+        assert_eq!(
+            state
+                .http_group_ctl
+                .unregister_member("web", "h-web", false)
+                .await
+                .as_deref(),
+            Some("h-web"),
+            "the http-kind group emptied with its owner"
+        );
+        assert_eq!(
+            state.http_group_ctl.choose_endpoint("web", false).await,
+            None
+        );
+        assert_eq!(
+            state
+                .http_group_ctl
+                .choose_endpoint("web", true)
+                .await
+                .as_deref(),
+            Some("hs-web"),
+            "the https-kind group is untouched"
+        );
+    }
+
+    /// Go parity (server/group/tcp.go:111-113): the group port comparison
+    /// is DECLARED-vs-DECLARED with NO zero exemption. An auto-assign
+    /// member (declared 0) cannot join an explicit-port group, and an
+    /// explicit-port member cannot join an auto-assign group (declared 0
+    /// stays 0 — the real port is stored separately). Both directions must
+    /// mismatch with the Go text; only declared==declared joins.
+    #[tokio::test]
+    async fn tcp_group_declared_port_strict_both_directions() {
+        let state = test_state();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+
+        // Explicit-port group (declared == real: the harness registers with
+        // no port conflict).
+        state
+            .tcp_group_ctl
+            .create_group(
+                "g",
+                "k",
+                24061,
+                24061, // declared_port
+                "127.0.0.1",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+        // Auto-assign member vs explicit group: mismatch, NOT a join on the
+        // group's real port (pre-fix the zero exemption let it in).
+        assert_eq!(
+            state
+                .tcp_group_ctl
+                .get_group_port("g", "k", 0, "127.0.0.1")
+                .await,
+            GroupPortQuery::Mismatch("group should have same remote port")
+        );
+
+        // Auto-assign group: declared stays 0, the real port is 24062.
+        state
+            .tcp_group_ctl
+            .create_group(
+                "a",
+                "k",
+                24062,
+                0, // declared_port: first member was auto-assigned
+                "127.0.0.1",
+                tokio::spawn(async {}),
+                cancel_token.clone(),
+            )
+            .await
+            .expect("create group");
+        // A second auto-assign member joins on the group's real port…
+        assert_eq!(
+            state
+                .tcp_group_ctl
+                .get_group_port("a", "k", 0, "127.0.0.1")
+                .await,
+            GroupPortQuery::Matched(24062)
+        );
+        // …but an explicit-port member mismatches (its declared number can
+        // never equal the group's declared 0).
+        assert_eq!(
+            state
+                .tcp_group_ctl
+                .get_group_port("a", "k", 24062, "127.0.0.1")
+                .await,
+            GroupPortQuery::Mismatch("group should have same remote port")
+        );
+    }
+
+    /// R3 test-gap pin: a full handler-level auto-assign group walk. The
+    /// ctl-level declared-port pins create groups directly, so every handler
+    /// wiring site that passes `np.remote_port.unwrap_or(0)` as the DECLARED
+    /// port (proxy_ops.rs join probe, group create, member registration) is
+    /// only exercised where declared == bound (explicit ports) — a regression
+    /// swapping the resolved bound port in for the declared value is
+    /// invisible to every explicit-port pin because the numbers coincide.
+    /// Here the first member declares nothing (remote_port None → auto-assign
+    /// binds an OS port while the group stores declared 0), a second
+    /// None-declaring member must still JOIN it, and an explicit-port member
+    /// naming the group's REAL port must be REJECTED — Go compares declared
+    /// numbers with no zero exemption (tcp.go:111-113), so 0 never matches
+    /// the real number.
+    #[tokio::test]
+    async fn tcp_group_auto_assign_handler_walk_declared_zero_semantics() {
+        let state = test_state();
+        insert_control(&state, "run-1", 1).await;
+
+        // First member: auto-assign. The group stores declared 0; the shared
+        // listener binds the OS-probed port.
+        let mut m1 = new_proxy("m1", "tcp");
+        m1.group = Some("g".to_string());
+        m1.group_key = Some("k".to_string());
+        m1.remote_port = None;
+        let _w1 = register_np(m1, &state).await;
+        let m1_info = state
+            .proxy_manager
+            .get("m1")
+            .await
+            .expect("auto-assigned first member must register");
+        let real = m1_info
+            .remote_port
+            .expect("first member carries the bound port");
+        assert!(real > 0, "auto-assign resolved a real port, got {real}");
+        assert!(
+            state.used_ports.read().await.contains(&real),
+            "the group's real port stays marked in used_ports"
+        );
+        // Declared 0 is the group's key: a 0 query matches, a query with the
+        // REAL number mismatches (declared-vs-declared).
+        assert_eq!(
+            state
+                .tcp_group_ctl
+                .get_group_port("g", "k", 0, "127.0.0.1")
+                .await,
+            GroupPortQuery::Matched(real)
+        );
+        assert_eq!(
+            state
+                .tcp_group_ctl
+                .get_group_port("g", "k", real, "127.0.0.1")
+                .await,
+            GroupPortQuery::Mismatch("group should have same remote port")
+        );
+
+        // Second member, also auto-assign-declaring: joins the group on its
+        // real port (no second bind).
+        let mut m2 = new_proxy("m2", "tcp");
+        m2.group = Some("g".to_string());
+        m2.group_key = Some("k".to_string());
+        m2.remote_port = None;
+        let _w2 = register_np(m2, &state).await;
+        let m2_info = state
+            .proxy_manager
+            .get("m2")
+            .await
+            .expect("auto-assign second member must join the group");
+        assert_eq!(
+            m2_info.remote_port,
+            Some(real),
+            "joiner is registered on the group's shared port"
+        );
+        assert_eq!(
+            *state.client_ports_used.read().await.get("run-1").unwrap(),
+            2,
+            "both members count exactly once"
+        );
+
+        // Explicit-port member naming the group's REAL port: rejected —
+        // declared 0 vs declared real can never match, even though the
+        // values coincide with the bound port.
+        let mut m3 = new_proxy("m3", "tcp");
+        m3.group = Some("g".to_string());
+        m3.group_key = Some("k".to_string());
+        m3.remote_port = Some(real as i32);
+        let w3 = register_np(m3, &state).await;
+        let resp_text = String::from_utf8_lossy(&w3);
+        assert!(
+            resp_text.contains("group should have same remote port"),
+            "explicit member declaring the group's REAL port must mismatch its declared 0: {resp_text}"
+        );
+        assert!(
+            state.proxy_manager.get("m3").await.is_none(),
+            "rejected member must not register"
         );
     }
 
@@ -6045,6 +6404,7 @@ pub(crate) mod unregister_generation_tests {
                 "grp",
                 "k",
                 24048,
+                24048, // declared_port: unit harness registers with no conflict
                 "127.0.0.1",
                 tokio::spawn(async {}),
                 cancel_token.clone(),
@@ -6105,6 +6465,7 @@ pub(crate) mod unregister_generation_tests {
                 "grp",
                 "k",
                 24055,
+                24055, // declared_port: unit harness registers with no conflict
                 "127.0.0.1",
                 tokio::spawn(async {}),
                 cancel_token.clone(),
@@ -6386,6 +6747,7 @@ pub(crate) mod unregister_generation_tests {
                 "grp",
                 "k",
                 24060,
+                24060, // declared_port: unit harness registers with no conflict
                 "127.0.0.1",
                 tokio::spawn(async {}),
                 cancel_token.clone(),
@@ -6640,6 +7002,7 @@ pub(crate) mod unregister_generation_tests {
                 "g",
                 "k",
                 24051,
+                24051, // declared_port: unit harness registers with no conflict
                 "127.0.0.1",
                 tokio::spawn(async {}),
                 cancel_token.clone(),
@@ -6731,6 +7094,7 @@ pub(crate) mod unregister_generation_tests {
                 "g",
                 "k",
                 24051,
+                24051, // declared_port: unit harness registers with no conflict
                 "127.0.0.1",
                 tokio::spawn(async {}),
                 cancel_token.clone(),
@@ -6765,6 +7129,7 @@ pub(crate) mod unregister_generation_tests {
                 "g",
                 "k",
                 24051,
+                24051, // declared_port: unit harness registers with no conflict
                 "127.0.0.1",
                 tokio::spawn(async {}),
                 cancel_token.clone(),
@@ -6796,6 +7161,7 @@ pub(crate) mod unregister_generation_tests {
                 "g",
                 "k",
                 24051,
+                24051, // declared_port: unit harness registers with no conflict
                 "127.0.0.1",
                 tokio::spawn(async {}),
                 cancel_token.clone(),
@@ -6808,10 +7174,13 @@ pub(crate) mod unregister_generation_tests {
             ctl.get_group_port("g", "k", 24051, "127.0.0.1").await,
             GroupPortQuery::Matched(24051)
         );
-        // Auto-assign (port 0) takes the group's port.
+        // Auto-assign (port 0) CANNOT join an explicit-port group: Go
+        // compares DECLARED numbers with no zero exemption (tcp.go:111-113),
+        // so a 0-declaring member versus a 24051-declaring group mismatches
+        // and the caller must not take the group's port.
         assert_eq!(
             ctl.get_group_port("g", "k", 0, "127.0.0.1").await,
-            GroupPortQuery::Matched(24051)
+            GroupPortQuery::Mismatch("group should have same remote port")
         );
         // Unknown group → NotFound (caller creates).
         assert_eq!(

@@ -419,6 +419,15 @@ impl ClientConfig {
             }
         }
 
+        // Go frp: `ServerPort = util.EmptyOr(ServerPort, 7000)`
+        // (v1/client.go:87) — an EXPLICIT 0 maps to the default too; serde's
+        // default fn only fires when the key is absent. Without this,
+        // `server_port = 0` dialed port 0 on the server (connect refused
+        // instead of connecting to the default listener).
+        if self.server_port == 0 {
+            self.server_port = 7000;
+        }
+
         // Go v0.71.0: with tcpMux enabled, application-layer heartbeats are
         // disabled by default (-1) and yamux keepalive covers liveness.
         // util.EmptyOr(v, -1): a zero value — explicit or default — means

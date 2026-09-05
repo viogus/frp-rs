@@ -86,30 +86,39 @@ pub(super) fn process_includes(
             base_dir.join(pattern).to_string_lossy().to_string()
         };
 
-        let paths = match simple_glob(&full_pattern) {
-            Ok(paths) => paths,
-            Err(_) => continue,
-        };
+        let full_path = Path::new(&full_pattern);
+        // Go frp fails hard when an include's directory is missing
+        // (pkg/config/load.go `LoadAdditionalClientConfigs`: `os.Stat(absDir)`
+        // error; legacy/client.go:393 "include: directory of %s not exist").
+        // frp-rs resolves relative patterns against the main config file's
+        // directory (documented divergence, docs/config.md) but mirrors the
+        // fatal error: a missing directory is a config bug, not a silent
+        // merge-nothing. A glob that matches nothing in an EXISTING dir stays
+        // silent, exactly like Go's zero-match loop.
+        let parent = full_path.parent().unwrap_or(Path::new("."));
+        if !parent.exists() || !parent.is_dir() {
+            return Err(format!(
+                "include: directory of {} not exist (included by pattern {pattern})",
+                parent.display()
+            )
+            .into());
+        }
+        // Directory read errors are fatal too (Go `os.ReadDir` error).
+        let paths = simple_glob(&full_pattern)?;
 
         for path in &paths {
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Include file {}: read error: {}", path.display(), e);
-                    continue;
-                }
-            };
+            let content = std::fs::read_to_string(path).map_err(|e| {
+                format!("include: read included file {} error: {e}", path.display())
+            })?;
             // Parse the include file with format detection (extension-based),
             // so `.yaml`/`.yml` include files go through the same
-            // YAML→TOML→merge pipeline as the main config.
+            // YAML→TOML→merge pipeline as the main config. A parse error in a
+            // matched file aborts loading (Go "load additional config from
+            // %s error"), never silently drops the file.
             let format = detect_format(path.to_string_lossy().as_ref());
-            let inc_value: Value = match parse_to_toml_value(&content, format) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Include file {}: parse error: {}", path.display(), e);
-                    continue;
-                }
-            };
+            let inc_value: Value = parse_to_toml_value(&content, format).map_err(|e| {
+                format!("include: parse included file {} error: {e}", path.display())
+            })?;
 
             // Deep-merge included config into main config
             deep_merge_toml(value, &inc_value);

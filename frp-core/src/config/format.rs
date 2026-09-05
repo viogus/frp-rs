@@ -193,8 +193,20 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
     Ok(toml::Value::Table(root))
 }
 
+/// Deepest legitimate nesting for infer_ini_value (array literal inside a
+/// comma element), ~2 levels. The recursion cap keeps a hostile
+/// `[`×k + "x" + `]`×k value from overflowing the stack — each frame
+/// trims, lowercases, and re-checks, so 30k brackets SIGSEGV/abort
+/// (panic="abort") at startup and on frpc reload paths. Past the cap the
+/// remaining value degrades to a plain string literal.
+const MAX_INI_NESTING: usize = 16;
+
 /// Infer INI value type matching Go Viper behavior.
 fn infer_ini_value(s: &str) -> toml::Value {
+    infer_ini_value_depth(s, 0)
+}
+
+fn infer_ini_value_depth(s: &str, depth: usize) -> toml::Value {
     let s = s.trim();
 
     if s.is_empty() {
@@ -222,6 +234,13 @@ fn infer_ini_value(s: &str) -> toml::Value {
         _ => {}
     }
 
+    // Nested type inference (array literals / comma splits) recurses — cap
+    // the depth so hostile nesting degrades to a string literal instead of
+    // overflowing the stack (see MAX_INI_NESTING).
+    if depth >= MAX_INI_NESTING {
+        return toml::Value::String(s.to_string());
+    }
+
     // ["a", "b"] array literal (Go ini.v1 []string syntax) → Array.
     // Only when the inner content looks like a list: quoted elements or at
     // least one comma. A bare "[::1]" (IPv6 literal) falls through to the
@@ -235,7 +254,7 @@ fn infer_ini_value(s: &str) -> toml::Value {
         if looks_like_list {
             let parts: Vec<toml::Value> = inner
                 .split(',')
-                .map(|p| infer_ini_value(p.trim()))
+                .map(|p| infer_ini_value_depth(p.trim(), depth + 1))
                 .collect();
             return toml::Value::Array(parts);
         }
@@ -243,7 +262,10 @@ fn infer_ini_value(s: &str) -> toml::Value {
 
     // Comma-separated → Array (type-infer each element)
     if s.contains(',') {
-        let parts: Vec<toml::Value> = s.split(',').map(|p| infer_ini_value(p.trim())).collect();
+        let parts: Vec<toml::Value> = s
+            .split(',')
+            .map(|p| infer_ini_value_depth(p.trim(), depth + 1))
+            .collect();
         return toml::Value::Array(parts);
     }
 
