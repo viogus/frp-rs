@@ -416,9 +416,9 @@ async fn test_https2http_xff_carries_real_user_ip_through_tunnel() {
     }
 
     // 9. Each captured backend head must carry the REAL user IP of the conn
-    //    that carried it. The plugin forwards as HTTP/1.0 (Go ReverseProxy
-    //    writes HTTP/1.1; frp-rs emits 1.0 — see read_request_and_build_forward
-    //    in plugin/mod.rs — documented deviation from the test design).
+    //    that carried it. The plugin forwards as HTTP/1.1 (Go ReverseProxy
+    //    http.DefaultTransport parity — see read_request_and_build_forward
+    //    in plugin/mod.rs; audit round-9 B1 aligned frp-rs with Go).
     let mut reqs: Vec<String> = Vec::new();
     for i in 0..sources.len() {
         reqs.push(
@@ -429,7 +429,7 @@ async fn test_https2http_xff_carries_real_user_ip_through_tunnel() {
         );
     }
     for req in &reqs {
-        assert!(req.starts_with("GET /xff HTTP/1.0"), "got: {req}");
+        assert!(req.starts_with("GET /xff HTTP/1.1"), "got: {req}");
         assert_eq!(
             req.matches("X-Forwarded-For").count(),
             1,

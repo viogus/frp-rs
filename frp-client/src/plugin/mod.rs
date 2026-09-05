@@ -424,7 +424,7 @@ pub(super) fn split_host_port(s: &str) -> (&str, u16) {
 /// request-body framing, and any body bytes that arrived in the same read
 /// as the head.
 pub(super) struct ForwardedRequest {
-    /// Rewritten HTTP/1.0 request head, ending in `\r\n\r\n`.
+    /// Rewritten HTTP/1.1 request head, ending in `\r\n\r\n`.
     pub head: String,
     /// Request body bytes that arrived together with the head. Forward these
     /// verbatim before draining the rest of the body with
@@ -602,7 +602,7 @@ fn parse_content_length_value(value: &str) -> Result<Option<usize>, String> {
 
 /// Read an HTTP request head from `stream` (chunked until the first empty
 /// line — Go textproto semantics, LF-only and mixed-EOL heads legal — with
-/// the 64 KiB cap), parse the request line, and build the forwarded HTTP/1.0
+/// the 64 KiB cap), parse the request line, and build the forwarded HTTP/1.1
 /// request head with
 /// optional Host rewrite and injected request headers. Shared by the
 /// http2http/http2https/https2http/https2https plugins; each then connects its
@@ -741,7 +741,17 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // Inbound X-Forwarded-For chain, preserved by the https plugins (Go
     // SetXForwarded appends the peer to the existing chain).
     let mut prior_xff: Vec<String> = Vec::new();
-    let mut fwd = format!("{method} {path} HTTP/1.0\r\n");
+    // The outbound request line speaks HTTP/1.1 — Go's
+    // http.DefaultTransport (the ReverseProxy backend of http2http/
+    // http2https/https2http/https2https, http2http.go:34-44) never writes
+    // HTTP/1.0 requests. Chunked bodies are the canary: chunked
+    // Transfer-Encoding is HTTP/1.1-only, so under the old HTTP/1.0
+    // request line an origin saw neither TE nor CL and silently dropped
+    // the upload body (audit round-9 B1, twin of the http.rs fix). The
+    // `Connection: close` terminator below is kept: each tunnel conn
+    // serves one request and closes after the response (Go sends close
+    // whenever the connection closes after the response).
+    let mut fwd = format!("{method} {path} HTTP/1.1\r\n");
     for line in lines {
         if line.is_empty() {
             continue;
@@ -797,7 +807,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         } else {
             // Strip CR/LF from forwarded header lines: header injection /
             // request-smuggling defense (the h2 plugin path rejects CR/LF
-            // outright — mirror that policy here for the HTTP/1.0 path).
+            // outright — mirror that policy here for the HTTP/1.1 path).
             // `lines()` already strips the trailing CRLF, so a lone `\r` can
             // only be mid-line (malformed client) — the common path appends
             // the line slice directly, no per-line String (round-17 audit E).
@@ -1796,6 +1806,45 @@ mod tests {
             .collect()
     }
 
+    /// Audit round-9 B1 twin (http.rs `build_forward_head_chunked_post_is_
+    /// http11`): the shared forward builder speaks HTTP/1.1 on the outbound
+    /// leg — Go's http.DefaultTransport (the ReverseProxy backend of the
+    /// http2http/http2https/https2http/https2https plugins, http2http.go)
+    /// never writes HTTP/1.0 requests. Chunked bodies are the canary:
+    /// chunked Transfer-Encoding is HTTP/1.1-only, so under the old
+    /// HTTP/1.0 request line an origin saw neither TE nor CL and silently
+    /// dropped the upload body. Pins the exact head bytes: request line,
+    /// re-added chunked framing, `Connection: close` terminator. RED on the
+    /// HTTP/1.0 request line (byte-exact compare fails).
+    #[tokio::test]
+    async fn build_forward_chunked_post_head_is_http11() {
+        let head = build_forward(
+            b"POST /p HTTP/1.1\r\nHost: b\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &Default::default(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            head,
+            "POST /p HTTP/1.1\r\nHost: b\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            "byte-exact outbound head (chunked POST)"
+        );
+
+        // A Content-Length-framed request keeps its canonical CL line and
+        // stays HTTP/1.1.
+        let cl_head = build_forward(
+            b"POST /p HTTP/1.1\r\nHost: b\r\nContent-Length: 3\r\n\r\n",
+            &Default::default(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            cl_head,
+            "POST /p HTTP/1.1\r\nHost: b\r\nContent-Length: 3\r\nConnection: close\r\n\r\n",
+            "byte-exact outbound head (CL POST)"
+        );
+    }
+
     /// R5 pin: the https plugins (peer-present) append the tunnel peer to
     /// the INBOUND X-Forwarded-For chain — one canonical line, the chain
     /// preserved and extended (Go SetXForwarded semantics).
@@ -1910,7 +1959,7 @@ mod tests {
             .await
             .expect("LF-only head must end the head read, not EOF-error");
         assert!(
-            fwd.head.starts_with("GET /p HTTP/1.0\r\n"),
+            fwd.head.starts_with("GET /p HTTP/1.1\r\n"),
             "forwarded head: {}",
             fwd.head
         );

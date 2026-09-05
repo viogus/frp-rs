@@ -165,14 +165,28 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     let headers_str = String::from_utf8_lossy(&buf);
     let mut lines = headers_str.lines();
 
-    // Parse request line: METHOD URL HTTP/1.1
+    // Parse request line: METHOD URL HTTP/1.1. Go net/http parseRequestLine
+    // splits on literal SPACE only (two `Cut(line, " ")`), so every other
+    // whitespace run — a tab-separated "GET\tURL\tHTTP/1.1" in particular —
+    // never yields the required second space and the whole line is malformed
+    // (ReadRequest error → the plugin closes). The old split_whitespace
+    // collapsed every whitespace run, so tab-joined tokens parsed and the
+    // request was dialed/forwarded — accept-where-Go-rejects (round-7-era
+    // Go parity, mirrored from the frp-server vhost/tcpmux request-line
+    // parsers). The version token must be one of Go ParseHTTPVersion's
+    // exact matches (HTTP/1.0/1.1/2.0/3.0 — an 8-char "HTTP/9.9" or a
+    // tab-contaminated token is rejected, not shape-approximated).
     let request_line = lines.next().ok_or("empty request")?;
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
+    let mut parts = request_line.splitn(3, ' ');
+    let method = parts.next().unwrap_or("");
+    let url = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("");
+    if method.is_empty()
+        || url.is_empty()
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1" | "HTTP/2.0" | "HTTP/3.0")
+    {
         return Err(format!("bad request line: {request_line}"));
     }
-    let method = parts[0];
-    let url = parts[1];
 
     // Parse headers
     let mut proxy_auth = String::new();
@@ -239,11 +253,15 @@ async fn handle_connect(mut client: TcpStream, target: &str) -> Result<(), Strin
     let remote = match TcpStream::connect(&target).await {
         Ok(s) => s,
         Err(e) => {
-            // Go frp http_proxy.go CONNECT arm: dial failure answers the
-            // client with HTTP/1.1 400 + Connection: close (the proxy is
-            // about to drop the connection), instead of closing silently.
-            let resp =
-                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            // Go frp http_proxy.go handleConnectReq dial-failure arm: it
+            // writes a bare http.Response{StatusCode: 400}.Write — probed
+            // against Go frp v0.71.0: byte-exactly "HTTP/1.1 400 Bad
+            // Request\r\nContent-Length: 0\r\n\r\n". NO Connection header
+            // (Connection: close belongs to the 407 getBadResponse arm
+            // only), no body. The round-13-era writer here added a
+            // spurious "Connection: close" the Go raw response does not
+            // carry.
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
             if let Err(we) = client.write_all(resp).await {
                 tracing::debug!(error = %we, "plugin relay error: {}", we);
             }
@@ -280,9 +298,40 @@ async fn handle_http_forward(
     // Parse host:port from URL
     let (host, port, path) = parse_http_url(url)?;
 
-    let mut remote = TcpStream::connect(format!("{host}:{port}"))
-        .await
-        .map_err(|e| format!("connect to {host}:{port}: {e}"))?;
+    let mut remote = match TcpStream::connect(format!("{host}:{port}")).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Go frp http_proxy.go HTTPHandler dial-failure arm:
+            // http.Error(rw, err.Error(), http.StatusInternalServerError)
+            // — probed against Go frp v0.71.0 (backend = refused port):
+            // "HTTP/1.1 500 Internal Server Error\r\nContent-Type:
+            // text/plain; charset=utf-8\r\nX-Content-Type-Options:
+            // nosniff\r\nDate: ...\r\nContent-Length: N\r\nConnection:
+            // close\r\n\r\n<dial error text>\n". Go adds Connection: close
+            // whenever the connection closes after the response; frp-rs
+            // serves exactly one request per tunnel conn and closes after
+            // every response, so the header is always truthful and written
+            // unconditionally. Date is omitted like every other frp-rs
+            // manual response writer; the body is the std dial error
+            // Display text + '\n' (Go fmt.Fprintln), with the real
+            // Content-Length. The old code closed the conn with ZERO
+            // bytes — a refused backend was indistinguishable from a
+            // vanished proxy.
+            let body = format!("{e}\n");
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\
+                 X-Content-Type-Options: nosniff\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if let Err(we) = client.write_all(resp.as_bytes()).await {
+                tracing::debug!(error = %we, "plugin relay error: {}", we);
+            }
+            return Err(format!("connect to {host}:{port}: {e}"));
+        }
+    };
     frp_core::transport::set_nodelay(&remote);
 
     // Split the head from any pre-read body data at the first empty line
@@ -357,32 +406,7 @@ async fn handle_http_forward(
         true
     });
 
-    let mut fwd = Vec::new();
-    fwd.extend_from_slice(format!("{method} {path} HTTP/1.0\r\n").as_bytes());
-    for line in &header_lines {
-        // Strip CR/LF from forwarded header lines: `lines()` splits only on
-        // `\n`, so a lone `\r` inside a header line (malformed client) would
-        // otherwise survive into the forwarded request as an injected line
-        // (request-smuggling shape). Same policy as read_request_and_build_
-        // forward and the h2 path, which reject CR/LF outright. Round-17
-        // audit E: `lines()` already strips the trailing CRLF, so the common
-        // path (no mid-line `\r`) appends the slice directly, no String.
-        if line.contains(['\r', '\n']) {
-            let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
-            fwd.extend_from_slice(safe_line.as_bytes());
-        } else {
-            fwd.extend_from_slice(line.as_bytes());
-        }
-        fwd.extend_from_slice(b"\r\n");
-    }
-    if framing == Some(super::BodyFraming::Chunked) {
-        fwd.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-    } else if let Some(n) = content_length {
-        // Exactly one Content-Length line (RFC 7230 §3.3.2), matching the
-        // byte count the body forward will stream.
-        fwd.extend_from_slice(format!("Content-Length: {n}\r\n").as_bytes());
-    }
-    fwd.extend_from_slice(b"Connection: close\r\n\r\n");
+    let fwd = build_forward_head(method, &path, &header_lines, framing, content_length);
 
     remote
         .write_all(&fwd)
@@ -406,6 +430,56 @@ async fn handle_http_forward(
         tracing::debug!(error = %e, "plugin relay error: {}", e);
     }
     Ok(())
+}
+
+/// Build the outbound request head for the forward path. The request line is
+/// HTTP/1.1 — Go's http.DefaultTransport (http_proxy.go HTTPHandler path)
+/// never writes HTTP/1.0 requests. The old HTTP/1.0 line silently dropped
+/// chunked upload bodies: chunked Transfer-Encoding is HTTP/1.1-only, so an
+/// origin that parses the request as 1.0 sees neither Transfer-Encoding nor
+/// Content-Length and treats the body as empty. `Connection: close` is kept
+/// (Go sends close whenever the connection closes after the response; this
+/// plugin serves one request per tunnel conn and closes — the origin then
+/// answers without keep-alive framing). Header lines arrive pre-filtered
+/// (hop-by-hop stripped, Content-Length lines dropped when chunked or a
+/// usable resolution exists); body framing is appended as one canonical line
+/// per RFC 7230 §3.3.2/§3.3.3. Extracted from handle_http_forward for a
+/// byte-exact unit pin (chunked POST head starts `POST <path> HTTP/1.1`,
+/// carries the chunked framing line, ends `Connection: close\r\n\r\n`).
+fn build_forward_head(
+    method: &str,
+    path: &str,
+    header_lines: &[&str],
+    framing: Option<super::BodyFraming>,
+    content_length: Option<usize>,
+) -> Vec<u8> {
+    let mut fwd = Vec::new();
+    fwd.extend_from_slice(format!("{method} {path} HTTP/1.1\r\n").as_bytes());
+    for line in header_lines {
+        // Strip CR/LF from forwarded header lines: `lines()` splits only on
+        // `\n`, so a lone `\r` inside a header line (malformed client) would
+        // otherwise survive into the forwarded request as an injected line
+        // (request-smuggling shape). Same policy as read_request_and_build_
+        // forward and the h2 path, which reject CR/LF outright. Round-17
+        // audit E: `lines()` already strips the trailing CRLF, so the common
+        // path (no mid-line `\r`) appends the slice directly, no String.
+        if line.contains(['\r', '\n']) {
+            let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            fwd.extend_from_slice(safe_line.as_bytes());
+        } else {
+            fwd.extend_from_slice(line.as_bytes());
+        }
+        fwd.extend_from_slice(b"\r\n");
+    }
+    if framing == Some(super::BodyFraming::Chunked) {
+        fwd.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    } else if let Some(n) = content_length {
+        // Exactly one Content-Length line (RFC 7230 §3.3.2), matching the
+        // byte count the body forward will stream.
+        fwd.extend_from_slice(format!("Content-Length: {n}\r\n").as_bytes());
+    }
+    fwd.extend_from_slice(b"Connection: close\r\n\r\n");
+    fwd
 }
 
 /// Parse an HTTP URL into (host, port, path).
@@ -437,6 +511,61 @@ mod tests {
         assert_eq!(host, "example.com");
         assert_eq!(port, 80);
         assert_eq!(path, "/");
+    }
+
+    /// B1: the outbound forward head speaks HTTP/1.1 — Go's
+    /// http.DefaultTransport (http_proxy.go HTTPHandler) never writes
+    /// HTTP/1.0 requests. Chunked bodies are the canary: chunked
+    /// Transfer-Encoding is HTTP/1.1-only, so under the old HTTP/1.0
+    /// request line an origin saw neither TE nor CL and silently dropped
+    /// the upload body. Pins the exact head bytes.
+    #[test]
+    fn build_forward_head_chunked_post_is_http11() {
+        let lines = [
+            "Host: 127.0.0.1:8080",
+            "Content-Type: application/octet-stream",
+        ];
+        let head = build_forward_head(
+            "POST",
+            "/up",
+            &lines,
+            Some(crate::plugin::BodyFraming::Chunked),
+            None,
+        );
+        let head = String::from_utf8(head).unwrap();
+        assert!(
+            head.starts_with("POST /up HTTP/1.1\r\n"),
+            "outbound request line must be HTTP/1.1: {head:?}"
+        );
+        assert!(!head.contains("HTTP/1.0"), "HTTP/1.0 leaks: {head:?}");
+        assert!(
+            head.contains("Host: 127.0.0.1:8080\r\n"),
+            "host line kept: {head:?}"
+        );
+        assert!(
+            head.contains("Content-Type: application/octet-stream\r\n"),
+            "header lines kept: {head:?}"
+        );
+        assert!(
+            head.contains("Transfer-Encoding: chunked\r\n"),
+            "chunked framing re-added after the hop-by-hop strip: {head:?}"
+        );
+        assert!(
+            head.ends_with("Connection: close\r\n\r\n"),
+            "head ends with the close terminator: {head:?}"
+        );
+
+        // Content-Length framing: exactly one canonical CL line, no
+        // Transfer-Encoding, still HTTP/1.1.
+        let cl_head = build_forward_head("POST", "/up", &lines, None, Some(5));
+        let cl_head = String::from_utf8(cl_head).unwrap();
+        assert!(cl_head.starts_with("POST /up HTTP/1.1\r\n"), "{cl_head:?}");
+        assert!(cl_head.contains("Content-Length: 5\r\n"), "{cl_head:?}");
+        assert!(!cl_head.contains("Transfer-Encoding:"), "{cl_head:?}");
+        assert!(
+            cl_head.ends_with("Connection: close\r\n\r\n"),
+            "{cl_head:?}"
+        );
     }
 
     fn auth(user: &str, pass: &str) -> HttpProxyAuth {
@@ -542,5 +671,58 @@ mod tests {
             !a.check(&b64("admin:s3cret")),
             "scheme-less header rejected"
         );
+    }
+
+    /// B6: audit round-8 F8 pin through the REAL http_proxy listener — the
+    /// head-read loop here in http.rs (a verbatim twin of the loop in
+    /// plugin/mod.rs, which has its own copy of this pin). A slowloris peer
+    /// that drips ONE byte per 59 s never trips a per-read re-armed deadline
+    /// (every byte resets the clock) but MUST be released by the single
+    /// absolute PLUGIN_HEADER_READ_TIMEOUT window over the whole head read
+    /// (Go http.Server ReadHeaderTimeout = 60 s): the handler errors out at
+    /// virtual t=60 s and drops the conn, and the client observes EOF.
+    /// Paused time keeps the 300 s outer bound deterministic. RED (per-read
+    /// re-arm): the outer bound trips and the test panics.
+    #[tokio::test(start_paused = true)]
+    async fn http_proxy_head_read_absolute_window_releases_trickler() {
+        use tokio::io::AsyncWriteExt;
+        let cfg = PluginConfig::default();
+        let handle = match start_http_proxy(&cfg).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Skipping test: plugin start failed (sandboxed?): {e}");
+                return;
+            }
+        };
+        let client = match TcpStream::connect(handle.local_addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping test: cannot connect (sandboxed?): {e}");
+                return;
+            }
+        };
+        let (mut reader, mut trickle_io) = tokio::io::split(client);
+        // One byte per 59 s forever — the head never completes (no blank
+        // line, no EOF), and each byte would re-arm a per-read deadline.
+        let trickle = tokio::spawn(async move {
+            loop {
+                if trickle_io.write_all(b"x").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(59)).await;
+            }
+        });
+        let mut buf = [0u8; 1];
+        let res = tokio::time::timeout(Duration::from_secs(300), reader.read(&mut buf)).await;
+        drop(trickle);
+        match res {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("unexpected {n} bytes from a trickled head read"),
+            Ok(Err(e)) => panic!("read error from a trickled head read: {e}"),
+            Err(_elapsed) => panic!(
+                "trickled head read was not released: the 60 s absolute window never fired \
+                 (per-read re-arm lets 1 B/59 s beat it)"
+            ),
+        }
     }
 }

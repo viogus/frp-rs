@@ -220,4 +220,99 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("crt_file"));
     }
+
+    /// Write a self-signed cert/key pair as PEM into `dir` and return the
+    /// file paths (rcgen is a dev-dependency; frp-core's generator is
+    /// private — same helper shape as the https2http/tls2raw tests).
+    fn write_self_signed_pem(dir: &tempfile::TempDir) -> (String, String) {
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let key_pair = rcgen::KeyPair::generate().expect("keypair");
+        let params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("cert params");
+        let cert = params.self_signed(&key_pair).expect("self-signed cert");
+        let wrap_pem = |label: &str, der: &[u8]| -> String {
+            let b64 = frp_core::base64::encode(der);
+            let mut out = format!("-----BEGIN {label}-----\n");
+            for chunk in b64.as_bytes().chunks(64) {
+                out.push_str(std::str::from_utf8(chunk).unwrap());
+                out.push('\n');
+            }
+            out.push_str(&format!("-----END {label}-----\n"));
+            out
+        };
+        std::fs::write(&cert_path, wrap_pem("CERTIFICATE", cert.der())).unwrap();
+        std::fs::write(
+            &key_path,
+            wrap_pem("PRIVATE KEY", &key_pair.serialize_der()),
+        )
+        .unwrap();
+        (
+            cert_path.to_str().unwrap().to_string(),
+            key_path.to_str().unwrap().to_string(),
+        )
+    }
+
+    /// B5: audit round-8 F6 pin for the https2https listener — a TLS client
+    /// that sends a partial ClientHello (rustls waits for the record body)
+    /// must be released by the 60 s handshake deadline; the handler task +
+    /// fd cannot park forever. Same pin shape as https2http.rs
+    /// `test_tls_handshake_deadline_releases_handler`, driven through the
+    /// REAL https2https plugin listener (accept_tls_bounded at
+    /// start_https2https_plugin's accept closure). Paused time: RED (bare
+    /// `acceptor.accept`) — no deadline timer exists, only the test's own
+    /// 70 s read bound fires and the client read times out while the server
+    /// conn stays open; GREEN (bounded accept) — the accept fails at
+    /// t=60 s, the handler drops the conn, and the client read returns EOF
+    /// well inside the bound.
+    #[tokio::test(start_paused = true)]
+    async fn test_https2https_handshake_deadline_releases_handler() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        let handshake_timeout = crate::plugin::PLUGIN_HANDSHAKE_TIMEOUT;
+        let dir = tempfile::tempdir().unwrap();
+        let (crt_file, key_file) = write_self_signed_pem(&dir);
+        let cfg = PluginConfig {
+            plugin_type: "https2https".into(),
+            local_addr: "127.0.0.1:0".into(),
+            crt_file,
+            key_file,
+            ..Default::default()
+        };
+        let handle = match start_https2https_plugin(&cfg).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Skipping test: plugin start failed (sandboxed?): {e}");
+                return;
+            }
+        };
+        let mut client = match tokio::net::TcpStream::connect(handle.local_addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping test: cannot connect (sandboxed?): {e}");
+                return;
+            }
+        };
+        // Partial TLS record header only (0x16 0x03 0x01 + no length/body):
+        // rustls cannot complete OR reject the handshake until more bytes
+        // arrive, so a bare accept parks on this conn forever.
+        client.write_all(&[0x16, 0x03, 0x01]).await.unwrap();
+        tokio::task::yield_now().await;
+
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(
+            handshake_timeout + std::time::Duration::from_secs(10),
+            client.read(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("unexpected {n} bytes from a stalled TLS handshake"),
+            Ok(Err(e)) => panic!("read error from a stalled TLS handshake: {e}"),
+            Err(_elapsed) => panic!(
+                "stalled TLS handshake was not released: conn still open after {}",
+                handshake_timeout.as_secs() + 10
+            ),
+        }
+    }
 }

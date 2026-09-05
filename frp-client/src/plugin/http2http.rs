@@ -119,7 +119,7 @@ mod tests {
                 let n = conn.read(&mut buf).await.unwrap();
                 let req = String::from_utf8_lossy(&buf[..n]);
                 assert!(
-                    req.contains("GET /test HTTP/1.0"),
+                    req.contains("GET /test HTTP/1.1"),
                     "unexpected request: {req}"
                 );
                 conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello")

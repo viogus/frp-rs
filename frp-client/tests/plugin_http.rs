@@ -132,9 +132,13 @@ async fn test_http2https_accepts_self_signed_backend() {
 
     let req = rx.await.expect("backend captured request");
     assert!(
-        req.contains("GET /secure HTTP/1.0"),
+        // B1: the shared forward path (plugin/mod.rs
+        // read_request_and_build_forward) speaks HTTP/1.1 — Go's
+        // http.DefaultTransport never writes HTTP/1.0.
+        req.contains("GET /secure HTTP/1.1"),
         "unexpected forwarded request: {req}"
     );
+    assert!(!req.contains("HTTP/1.0"), "HTTP/1.0 leaks: {req}");
     assert!(req.contains("Host: backend.local"), "got: {req}");
 }
 
@@ -229,7 +233,10 @@ async fn test_https2https_accepts_self_signed_backend() {
     );
 
     let req = rx.await.expect("backend captured request");
-    assert!(req.contains("GET /both HTTP/1.0"), "got: {req}");
+    // B1: shared forward path speaks HTTP/1.1 (Go http.DefaultTransport
+    // parity — ReverseProxy outbound leg of https2https).
+    assert!(req.contains("GET /both HTTP/1.1"), "got: {req}");
+    assert!(!req.contains("HTTP/1.0"), "HTTP/1.0 leaks: {req}");
 
     // IoStream import kept for API-surface sanity (tunnel side uses raw TLS).
     let _ = IoStream::Tcp;
@@ -361,10 +368,17 @@ async fn test_http2http_post_body_streams() {
         .position(|w| w == b"\r\n\r\n")
         .expect("forwarded request must end its head with CRLFCRLF")
         + 4;
+    let head = String::from_utf8_lossy(&captured[..head_end]);
     assert!(
-        captured.starts_with(b"POST /upload HTTP/1.0"),
-        "unexpected forwarded request: {}",
-        String::from_utf8_lossy(&captured[..head_end])
+        // B1: the shared forward path (plugin/mod.rs
+        // read_request_and_build_forward) speaks HTTP/1.1 — Go's
+        // http.DefaultTransport never writes HTTP/1.0.
+        captured.starts_with(b"POST /upload HTTP/1.1"),
+        "unexpected forwarded request: {head}"
+    );
+    assert!(
+        !head.contains("HTTP/1.0"),
+        "no HTTP/1.0 anywhere in the outbound head: {head}"
     );
     assert_eq!(
         &captured[head_end..],
@@ -451,6 +465,98 @@ async fn test_http2http_post_body_chunked() {
     );
 }
 
+/// B1 twin for the SHARED forward path (http2http → plugin/mod.rs
+/// read_request_and_build_forward): a chunked POST must leave the plugin on
+/// an HTTP/1.1 request line (Go http.DefaultTransport — the ReverseProxy
+/// outbound leg — never writes HTTP/1.0) with `Transfer-Encoding: chunked`
+/// re-added and `Connection: close` terminating the head. Chunked framing is
+/// the canary: it is HTTP/1.1-only, so an HTTP/1.0-speaking origin saw
+/// neither TE nor CL and silently dropped the upload body. RED on the
+/// HTTP/1.0 request line (both the request-line assert and the
+/// no-HTTP/1.0 scan fail).
+#[tokio::test]
+async fn test_http2http_chunked_post_head_is_http11() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let req = read_full_chunked_request(&mut conn).await;
+            let _ = tx.send(req);
+            let _ = conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http2http".into(),
+        local_addr: backend_addr.to_string(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http2http_plugin(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let body = b"5\r\nhello\r\n0\r\n\r\n";
+    client
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: original\r\nTransfer-Encoding: chunked\r\n\r\n")
+        .await
+        .unwrap();
+    client.write_all(body).await.unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("backend never responded: chunked body was not fully forwarded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.1 200 OK"), "got: {:?}", resp);
+
+    let captured = rx.await.expect("backend captured request");
+    let head_end = captured
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("forwarded request must end its head with CRLFCRLF")
+        + 4;
+    let head = String::from_utf8_lossy(&captured[..head_end]);
+    assert!(
+        captured.starts_with(b"POST /upload HTTP/1.1\r\n"),
+        "outbound request line must be HTTP/1.1 (Go http.DefaultTransport parity): {head}"
+    );
+    assert!(
+        !head.contains("HTTP/1.0"),
+        "no HTTP/1.0 anywhere in the outbound head: {head}"
+    );
+    assert!(
+        head.contains("Transfer-Encoding: chunked\r\n"),
+        "chunked framing must be re-added after the hop-by-hop strip: {head}"
+    );
+    assert!(
+        head.ends_with("Connection: close\r\n\r\n"),
+        "head must end with the Connection: close terminator: {head}"
+    );
+    assert_eq!(
+        &captured[head_end..],
+        body.as_slice(),
+        "client chunk framing must be forwarded verbatim"
+    );
+}
+
 /// http_proxy plugin: a POST with a body larger than one read must be fully
 /// forwarded to the backend before the response is relayed (Go
 /// http.DefaultTransport streams the body; forwarding only the bytes that
@@ -521,8 +627,15 @@ async fn test_http_proxy_post_body_streams() {
         + 4;
     let head = String::from_utf8_lossy(&captured[..head_end]);
     assert!(
-        captured.starts_with(b"POST /upload HTTP/1.0"),
-        "absolute-form URL must be rewritten to origin-form: {head}"
+        // B1: the outbound request line is HTTP/1.1 (Go http.DefaultTransport
+        // never writes HTTP/1.0). The absolute-form URL is rewritten to
+        // origin-form at the same time.
+        captured.starts_with(b"POST /upload HTTP/1.1"),
+        "absolute-form URL must be rewritten to origin-form on an HTTP/1.1 request line: {head}"
+    );
+    assert!(
+        !head.contains("HTTP/1.0"),
+        "no HTTP/1.0 anywhere in the outbound head: {head}"
     );
     assert_eq!(
         &captured[head_end..],
@@ -1635,5 +1748,319 @@ async fn test_http_proxy_auth_fail_closes_conn_promptly() {
         resp.starts_with(b"HTTP/1.1 407 Not authorized\r\n"),
         "got: {:?}",
         String::from_utf8_lossy(&resp)
+    );
+}
+
+/// B1 e2e: a chunked POST through the http_proxy path must leave the plugin
+/// on an HTTP/1.1 request line (Go http.DefaultTransport never writes
+/// HTTP/1.0) with `Transfer-Encoding: chunked` re-added and
+/// `Connection: close` terminating the head. Chunked framing is the canary:
+/// it is HTTP/1.1-only, so an HTTP/1.0-speaking origin saw neither TE nor
+/// CL and silently dropped the upload body. RED on the HTTP/1.0 request
+/// line (both the request-line assert and the no-HTTP/1.0 scan fail).
+#[tokio::test]
+async fn test_http_proxy_chunked_post_head_is_http11() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let req = read_full_chunked_request(&mut conn).await;
+            let _ = tx.send(req);
+            let _ = conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let body = b"5\r\nhello\r\n0\r\n\r\n";
+    client
+        .write_all(
+            format!(
+                "POST http://{backend_addr}/upload HTTP/1.1\r\n\
+                 Host: original\r\n\
+                 Transfer-Encoding: chunked\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    client.write_all(body).await.unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("backend never responded: chunked body was not fully forwarded (regression)")
+    .unwrap();
+    assert!(resp.starts_with(b"HTTP/1.1 200 OK"), "got: {:?}", resp);
+
+    let captured = rx.await.expect("backend captured request");
+    let head_end = captured
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("forwarded request must end its head with CRLFCRLF")
+        + 4;
+    let head = String::from_utf8_lossy(&captured[..head_end]);
+    assert!(
+        captured.starts_with(b"POST /upload HTTP/1.1\r\n"),
+        "outbound request line must be HTTP/1.1 (Go http.DefaultTransport parity): {head}"
+    );
+    assert!(
+        !head.contains("HTTP/1.0"),
+        "no HTTP/1.0 anywhere in the outbound head: {head}"
+    );
+    assert!(
+        head.contains("Transfer-Encoding: chunked\r\n"),
+        "chunked framing must be re-added after the hop-by-hop strip: {head}"
+    );
+    assert!(
+        head.ends_with("Connection: close\r\n\r\n"),
+        "head must end with the Connection: close terminator: {head}"
+    );
+    assert_eq!(
+        &captured[head_end..],
+        body.as_slice(),
+        "client chunk framing must be forwarded verbatim"
+    );
+}
+
+/// B2 (Go http_proxy.go HTTPHandler parity): a backend dial failure on the
+/// plain path answers `500 Internal Server Error` with the dial error as a
+/// text/plain body — NOT a silent zero-byte close (a refused backend was
+/// indistinguishable from a vanished proxy). Shape probed against Go frp
+/// v0.71.0: CT → X-CTO → (Go's Date, omitted here like every frp-rs manual
+/// response writer) → real Content-Length → Connection: close, body = dial
+/// error Display + '\n' (Go fmt.Fprintln). RED: zero-byte close → first
+/// assert fails on the empty response.
+#[tokio::test]
+async fn test_http_proxy_plain_dial_failure_answers_500() {
+    // A port that refuses: bind then drop the listener.
+    let refused = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let refused_addr = refused.local_addr().unwrap();
+    drop(refused);
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+    client
+        .write_all(
+            format!("GET http://{refused_addr}/ HTTP/1.1\r\nHost: {refused_addr}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("no response before the conn closed")
+    .unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "dial failure must answer 500 with the error body, got: {text:?}"
+    );
+    let head_end = text.find("\r\n\r\n").expect("head terminator");
+    let (head, body) = (&text[..head_end], &resp[head_end + 4..]);
+    let ct = head
+        .find("Content-Type: text/plain; charset=utf-8\r\n")
+        .expect("Content-Type present");
+    let xcto = head
+        .find("X-Content-Type-Options: nosniff\r\n")
+        .expect("X-CTO present");
+    assert!(
+        ct < xcto,
+        "Go http.Error header order (CT before X-CTO): {text:?}"
+    );
+    assert!(
+        !head.contains("Date:"),
+        "no Date header (frp-rs policy): {text:?}"
+    );
+    assert!(
+        // `head` is sliced before the blank-line terminator, so the LAST
+        // header ("Connection: close") carries no trailing CRLF there —
+        // match the header-terminating sequence in the full response.
+        text.contains("Connection: close\r\n\r\n"),
+        "single-request conn always closes: {text:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(body).contains("Connection refused"),
+        "body must carry the dial error text: {text:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(body).ends_with('\n'),
+        "body ends with newline (Go fmt.Fprintln): {text:?}"
+    );
+    let cl = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .expect("Content-Length present")
+        .split_once(':')
+        .unwrap()
+        .1
+        .trim()
+        .parse::<usize>()
+        .unwrap();
+    assert_eq!(cl, body.len(), "real Content-Length: {text:?}");
+}
+
+/// B3 (Go http_proxy.go handleConnectReq parity): a CONNECT dial failure
+/// answers byte-exactly `HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n
+/// \r\n`. Probed against Go frp v0.71.0: the raw http.Response{StatusCode:
+/// 400}.Write carries NO Connection header (Connection: close belongs to
+/// the 407 getBadResponse arm only) and no body. RED: a spurious
+/// `Connection: close` line fails the byte-exact compare.
+#[tokio::test]
+async fn test_http_proxy_connect_dial_failure_400_exact() {
+    let refused = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let refused_addr = refused.local_addr().unwrap();
+    drop(refused);
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+    client
+        .write_all(
+            format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: {refused_addr}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("no response before the conn closed")
+    .unwrap();
+    assert_eq!(
+        resp.as_slice(),
+        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+        "Go raw 400 response, byte-exact (no Connection header, no body)"
+    );
+}
+
+/// B4 (Go net/http parseRequestLine parity): the request line splits on
+/// literal SPACE only (two `Cut(line, " ")`), so a tab-joined
+/// "GET\tURL\tHTTP/1.1" is malformed and the connection closes with ZERO
+/// bytes — no forward, no response. The old split_whitespace collapsed
+/// every whitespace run, so tab-joined tokens parsed and the request was
+/// dialed and forwarded. (Go's own plain path answers http.Error 400 with
+/// an HTML body; this plugin's parse failures close silently per its
+/// established reject policy — documented divergence. The silent close
+/// matches the CONNECT arm, where Go reads the request directly and closes
+/// on ReadRequest error.) RED: the request is forwarded, the backend
+/// answers 200, and the empty-response assert fails.
+#[tokio::test]
+async fn test_http_proxy_tab_joined_request_line_rejected() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let _ = tx.send(());
+            let _ = conn
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+    client
+        .write_all(format!("GET\thttp://{backend_addr}/\tHTTP/1.1\r\nHost: h\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("plugin must close the conn on a malformed request line")
+    .unwrap();
+    assert!(
+        resp.is_empty(),
+        "tab-joined request line must be rejected with a silent close (Go \
+         parseRequestLine splits on literal space only), got: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the malformed request must never reach the backend"
     );
 }
