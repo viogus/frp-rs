@@ -1588,6 +1588,23 @@ async fn wait_detect_on_any(
 /// legitimate behaviors are unaffected.
 const MAX_LISTEN_RANDOM_PORTS: i32 = 256; // extra receiver listener sockets (Go NAT analyzer recommends up to 256)
 const MAX_CANDIDATE_PORT_PROBES: u64 = 2048; // total candidate-port-range probes
+/// Per-socket cap on `send_random_ports` probe iterations. The wire field is
+/// an i32 with no upper bound in Go; an uncompromised frps never sends more
+/// than a few dozen, so this only clips hostile values.
+const MAX_SEND_RANDOM_PORTS: i32 = 4096;
+
+/// Decide whether/how many SendRandomPorts probe iterations to spawn.
+/// `None` when the behavior carries nothing to do: count <= 0, or an empty
+/// candidate list — a probe task over zero candidates would spin its outer
+/// `count` loop without ever awaiting (Go goroutines are preempted by the
+/// scheduler; a tokio task with no await parks the whole worker thread).
+/// Returns the clamped iteration count otherwise.
+fn probe_random_ports_params(count: i32, candidate_count: usize) -> Option<usize> {
+    if count <= 0 || candidate_count == 0 {
+        return None;
+    }
+    Some(count.min(MAX_SEND_RANDOM_PORTS) as usize)
+}
 
 /// Go `MakeHole` full-feature hole punch (owned socket variant).
 ///
@@ -1747,9 +1764,10 @@ pub async fn punch_udp_hole_makehole_owned(
     // stopped once a reply arrives (Go cancels the shared context).
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut random_handles = Vec::new();
-    if behavior.send_random_ports > 0 {
-        let candidate_ips: Vec<SocketAddr> =
-            candidates.iter().filter_map(|a| a.parse().ok()).collect();
+    let candidate_ips: Vec<SocketAddr> = candidates.iter().filter_map(|a| a.parse().ok()).collect();
+    // Probe count clamped + empty-candidate skip (a task over zero
+    // candidates would spin without awaiting — see probe_random_ports_params).
+    if let Some(n) = probe_random_ports_params(behavior.send_random_ports, candidate_ips.len()) {
         // Owned copies for the spawned tasks (spawn requires 'static).
         let sid_owned = sid.map(|s| s.to_string());
         let key_owned = key.copied();
@@ -1759,7 +1777,6 @@ pub async fn punch_udp_hole_makehole_owned(
             let cips = candidate_ips.clone();
             let sid_task = sid_owned.clone();
             let key_task = key_owned;
-            let n = behavior.send_random_ports as usize;
             random_handles.push(tokio::spawn(async move {
                 send_random_ports_probe(
                     &s,
@@ -1849,7 +1866,26 @@ fn get_unused_random_port(used: &mut std::collections::HashSet<u16>) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_punch_role;
+    use super::{probe_random_ports_params, resolve_punch_role, MAX_SEND_RANDOM_PORTS};
+
+    #[test]
+    fn probe_random_ports_skips_empty_candidates_and_clamps() {
+        // count <= 0 → no probe task (Go also skips on `> 0` only).
+        assert_eq!(probe_random_ports_params(0, 3), None);
+        assert_eq!(probe_random_ports_params(-1, 3), None);
+        // Empty candidate list → no probe task. A spawned task would spin
+        // its outer count loop with no await inside (inner candidate loop
+        // empty), parking a whole tokio worker forever; Go goroutines are
+        // scheduler-preempted, tokio tasks are not.
+        assert_eq!(probe_random_ports_params(4, 0), None);
+        // Hostile i32::MAX from a compromised frps → clamped.
+        assert_eq!(
+            probe_random_ports_params(i32::MAX, 1),
+            Some(MAX_SEND_RANDOM_PORTS as usize)
+        );
+        // Legitimate values pass through unchanged.
+        assert_eq!(probe_random_ports_params(4, 1), Some(4));
+    }
 
     #[test]
     fn punch_role_defaults_to_receiver() {

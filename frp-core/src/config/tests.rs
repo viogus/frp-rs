@@ -4793,6 +4793,60 @@ fn test_ini_lone_quote_char_no_panic() {
     }
 }
 
+/// infer_ini_value: deeply nested array-literal brackets must not overflow
+/// the stack. `[`×k + `"x"` + `]`×k recurses once per bracket pair (each
+/// frame trims, lowercases, and re-checks the value), so a multi-MB config
+/// value SIGSEGVs the process — reachable at startup AND on runtime reload
+/// (frpc SIGUSR1 / admin API) — under panic="abort" nothing catches it.
+/// Legitimate nesting is at most 2 levels; the depth cap returns the
+/// remaining value as a string literal instead of recursing.
+#[test]
+fn test_ini_nested_bracket_recursion_depth_capped() {
+    let k = 30_000; // ~150+ B/frame → well past the 2 MiB test-thread stack
+    let mut raw = String::with_capacity(2 * k + 3);
+    raw.push_str("token = ");
+    for _ in 0..k {
+        raw.push('[');
+    }
+    raw.push_str("\"x\"");
+    for _ in 0..k {
+        raw.push(']');
+    }
+    raw.push_str("\nserver_port = 7000\n");
+
+    let value =
+        super::format::parse_to_toml_value(&raw, super::format::ConfigFormat::Ini).unwrap();
+    let table = value.as_table().unwrap();
+    let token = table.get("token").unwrap();
+
+    // The recursion must stop at the cap: nested Arrays <= MAX_INI_NESTING
+    // deep, innermost element a String holding the unparsed bracket
+    // remainder. Pre-fix this value overflowed the stack (SIGABRT).
+    let mut depth = 0usize;
+    let mut cur = token;
+    let mut saw_string = false;
+    loop {
+        match cur {
+            toml::Value::Array(items) => {
+                depth += 1;
+                assert_eq!(items.len(), 1, "single-element chain");
+                cur = &items[0];
+            }
+            toml::Value::String(s) => {
+                saw_string = true;
+                assert!(s.starts_with('['), "string remainder keeps brackets");
+                break;
+            }
+            other => panic!("unexpected nested value {other:?}"),
+        }
+    }
+    assert!(saw_string, "chain terminates in a string literal");
+    assert!(
+        depth <= 16,
+        "nesting depth {depth} must be capped at 16 (no stack overflow)"
+    );
+}
+
 /// The lone-quote token through the FULL client pipeline (parse → normalize
 /// → validate → deserialize), proving the panic fix survives reload paths.
 #[test]
