@@ -51,19 +51,20 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                 }
                 result = listener.accept() => {
                     match result {
-                        Ok((mut tcp_stream, peer)) => {
+                        Ok((tcp_stream, peer)) => {
                             debug!(peer = %peer, "unix_domain_socket plugin: new connection from {}", peer);
                             // Forwarded interactive data path — disable Nagle.
                             frp_core::transport::set_nodelay(&tcp_stream);
                             let path = path_clone.clone();
                             handlers.spawn(async move {
                                 match UnixStream::connect(&path).await {
-                                    Ok(mut unix_stream) => {
-                                        if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
-                                            &mut tcp_stream,
-                                            &mut unix_stream,
-                                            *frp_core::buffer_pool::BUFFER_SIZE,
-                                            *frp_core::buffer_pool::BUFFER_SIZE,
+                                    Ok(unix_stream) => {
+                                        // Pooled-buffer relay (audit round-8
+                                        // P1): relay_plain_pooled keeps
+                                        // copy_bidirectional semantics
+                                        // without the per-conn buffer pair.
+                                        if let Err(e) = frp_core::bridge::relay_plain_pooled(
+                                            tcp_stream, unix_stream,
                                         )
                                         .await
                                         {

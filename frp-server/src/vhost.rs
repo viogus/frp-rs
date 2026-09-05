@@ -793,8 +793,11 @@ async fn serve_vhost_request<S>(
 /// (http.Server defaultMaxHeaderBytes = 1 MiB — a hostile client can send a
 /// ~1 MiB head per request slot); the h2c surface is capped at 4096 the same
 /// way while Go's h2 default is 16 MiB. Policy split-surface rationale lives
-/// in CLAUDE.md (round-13/14 hardening rows). A head that fills the cap
-/// without its terminator gets a 431 below, never a truncated forward.
+/// in CLAUDE.md (round-13/14 hardening rows). An unterminated head is never
+/// forwarded: if it fills the cap it gets a 431 below (Go's errTooLarge
+/// analog); if the deadline expires or the peer closes mid-head with fewer
+/// than 4096 bytes buffered, the connection is closed with no response
+/// (audit round 8 F7 — Go's isCommonNetReadError silent close).
 async fn handle_http1_request<S>(
     mut stream: S,
     mut pre_read: Vec<u8>,
@@ -841,7 +844,26 @@ async fn handle_http1_request<S>(
         return;
     }
 
-    // Parse the head text once, borrowing from the pre-read bytes (no full
+    // F7 (audit round 8, MEDIUM): the read loop above ALSO exits without a
+    // terminator when the head deadline expires or the peer closes mid-head
+    // with fewer than 4096 bytes buffered. Such a head lacks its closing
+    // blank line — parsing and routing it would forward a TRUNCATED head
+    // that leaves the backend blocked waiting for the rest of the head,
+    // pinning a work-conn slot indefinitely (attacker: partial head, then
+    // silence). Go's vhost http.Server never dispatches an unterminated
+    // head: a mid-head timeout or EOF surfaces as a readRequest error that
+    // isCommonNetReadError classifies as "don't reply" (net/http
+    // conn.serve), so Go closes the connection with NO response bytes —
+    // the 431 arm above is the frp-rs cap analog of Go's errTooLarge 431.
+    // Close silently: the same 0-byte precedent as the malformed-request-
+    // line silent closes elsewhere in this module.
+    if frp_core::textproto::head_end(&pre_read).is_none() {
+        debug!(
+            peer = %peer, scheme = %scheme, len = pre_read.len(),
+            "closing vhost connection: unterminated request head (deadline expiry or mid-head close)"
+        );
+        return;
+    }
     // copy — `into_owned()` would duplicate up to 4096 bytes per request).
     // `host`/`path` must still be owned Strings: `pre_read` is moved by
     // value into `resolve_vhost_request` below, so we cannot keep references

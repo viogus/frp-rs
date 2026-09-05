@@ -1104,10 +1104,17 @@ async fn test_http_proxy_conflicting_cl_rejects() {
     assert_conflicting_cl_rejects("http_proxy").await;
 }
 
-/// `Content-Length: 5, 5` (list form) declares a 10-byte body: the plugin
-/// must forward it as a single summed `Content-Length: 10` line and stream
-/// all 10 body bytes (RFC 7230 §3.3.2 replace-with-a-single-value policy).
-async fn assert_sum_form_cl_forwarded(plugin_type: &str) {
+/// `Content-Length: 5, 5` (list form, single line) is rejected: Go's
+/// `parseContentLength` (`strconv.ParseUint`) accepts no comma, so net/http
+/// answers 400 (audit round-8 F9 — the old code summed the parts into a
+/// single `Content-Length: 10` and forwarded the whole body; Go frp never
+/// did, probed against the Go v0.71.0-era stdlib, go1.25.12). Rejection is
+/// header-driven, so no body bytes are sent and the plugin closes cleanly.
+/// `chunked` also exercises the Transfer-Encoding: chunked arm: Go probes
+/// the CL values even when chunked wins the framing (chunked + "5, 5"
+/// still 400s — a chunked-skip that accepted garbage CL under chunked and
+/// forwarded the request would not).
+async fn assert_list_form_cl_rejects(plugin_type: &str, chunked: bool) {
     let backend = match TcpListener::bind("127.0.0.1:0").await {
         Ok(l) => l,
         Err(e) => {
@@ -1117,16 +1124,20 @@ async fn assert_sum_form_cl_forwarded(plugin_type: &str) {
     };
     let backend_addr = backend.local_addr().unwrap();
 
+    // The backend must receive NO bytes: the http2http path rejects before
+    // dialing (no accept at all); the http_proxy path dials before
+    // rejecting, so the connection may be accepted and then closed with 0
+    // bytes. Either way nothing may be forwarded.
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        if let Ok((mut conn, _)) = backend.accept().await {
-            // The forwarded head carries the summed "Content-Length: 10",
-            // so read_full_cl_request reads exactly the 10 summed bytes.
-            let req = read_full_cl_request(&mut conn).await;
-            let _ = tx.send(req);
-            let _ = conn
-                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                .await;
+        match tokio::time::timeout(std::time::Duration::from_secs(3), backend.accept()).await {
+            Ok(Ok((mut conn, _))) => {
+                let mut buf = vec![0u8; 1024];
+                let _ = tx.send(Some(conn.read(&mut buf).await.unwrap_or(0)));
+            }
+            Ok(Err(_)) | Err(_) => {
+                let _ = tx.send(None);
+            }
         }
     });
 
@@ -1152,62 +1163,65 @@ async fn assert_sum_form_cl_forwarded(plugin_type: &str) {
         "http_proxy" => format!("POST http://{backend_addr}/sum HTTP/1.1\r\n"),
         _ => "POST /sum HTTP/1.1\r\n".to_string(),
     };
-    let body = b"0123456789"; // 10 bytes = 5 + 5
+    let extra_te = if chunked {
+        "Transfer-Encoding: chunked\r\n"
+    } else {
+        ""
+    };
     client
-        .write_all(format!("{req_line}Host: original\r\nContent-Length: 5, 5\r\n\r\n").as_bytes())
+        .write_all(
+            format!("{req_line}Host: original\r\n{extra_te}Content-Length: 5, 5\r\n\r\n")
+                .as_bytes(),
+        )
         .await
         .unwrap();
-    client.write_all(body).await.unwrap();
 
+    // The plugin must close the connection without writing any response.
     let mut resp = Vec::new();
     tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(5),
         client.read_to_end(&mut resp),
     )
     .await
-    .expect("summed request body was not fully forwarded (regression)")
+    .expect("list-form Content-Length must be rejected: connection not closed (regression)")
     .unwrap();
-    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
-
-    let captured = rx.await.expect("backend captured request");
-    let head_end = captured
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("forwarded request must end its head with CRLFCRLF")
-        + 4;
-    let head = String::from_utf8_lossy(&captured[..head_end]);
     assert!(
-        head.contains("Content-Length: 10"),
-        "list-form Content-Length must be forwarded as a single summed value: {head}"
+        resp.is_empty(),
+        "no response must be sent on a rejected request, got: {:?}",
+        String::from_utf8_lossy(&resp[..resp.len().min(80)])
     );
+    let forwarded = rx.await.expect("backend task finished");
     assert!(
-        !head.contains("Content-Length: 5, 5"),
-        "the original list-form line must not be forwarded as-is: {head}"
-    );
-    assert_eq!(
-        head.to_lowercase().matches("content-length:").count(),
-        1,
-        "exactly one Content-Length line must be forwarded: {head}"
-    );
-    assert_eq!(
-        &captured[head_end..],
-        body.as_slice(),
-        "backend must receive the full summed body"
+        forwarded == Some(0) || forwarded.is_none(),
+        "backend must receive no bytes on a rejected request, got: {forwarded:?}"
     );
 }
 
-/// Sum-form Content-Length is summed on the shared http2http path.
+/// List-form Content-Length is rejected on the shared http2http path.
 #[tokio::test]
-async fn test_http2http_sum_form_cl_forwarded() {
-    assert_sum_form_cl_forwarded("http2http").await;
+async fn test_http2http_list_form_cl_rejects() {
+    assert_list_form_cl_rejects("http2http", false).await;
 }
 
-/// Sum-form Content-Length is summed by the http_proxy head builder.
+/// List-form Content-Length is rejected by the http_proxy head builder.
 #[tokio::test]
-async fn test_http_proxy_sum_form_cl_forwarded() {
-    assert_sum_form_cl_forwarded("http_proxy").await;
+async fn test_http_proxy_list_form_cl_rejects() {
+    assert_list_form_cl_rejects("http_proxy", false).await;
 }
 
+/// List-form Content-Length is rejected under chunked too (Go probes CL
+/// values even when chunked wins the framing) — shared http2http path.
+#[tokio::test]
+async fn test_http2http_list_form_cl_rejects_chunked() {
+    assert_list_form_cl_rejects("http2http", true).await;
+}
+
+/// List-form Content-Length is rejected under chunked too (Go probes CL
+/// values even when chunked wins the framing) — http_proxy head builder.
+#[tokio::test]
+async fn test_http_proxy_list_form_cl_rejects_chunked() {
+    assert_list_form_cl_rejects("http_proxy", true).await;
+}
 /// A HEAD request carries no body even when the head declares a
 /// Content-Length (RFC 7230 §3.3.2): the plugin must not block reading a
 /// body the client will never send — pre-fix the response relay stalled

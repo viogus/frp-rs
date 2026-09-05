@@ -135,8 +135,10 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     // "headers" until the 64 KiB cap.
     // Go parity: http.Server ReadHeaderTimeout (60s) — one absolute deadline
     // over the whole header read, so a slowloris "trickle" cannot park the
-    // task + fd + plugin listener slot indefinitely.
-    let buf = tokio::time::timeout(Duration::from_secs(60), async {
+    // task + fd + plugin listener slot indefinitely (audit round-8 F8; the
+    // shared const PLUGIN_HEADER_READ_TIMEOUT has the same absolute-window
+    // semantics).
+    let buf = tokio::time::timeout(super::PLUGIN_HEADER_READ_TIMEOUT, async {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 512];
         loop {
@@ -234,7 +236,7 @@ async fn handle_connect(mut client: TcpStream, target: &str) -> Result<(), Strin
         format!("{target}:443")
     };
 
-    let mut remote = match TcpStream::connect(&target).await {
+    let remote = match TcpStream::connect(&target).await {
         Ok(s) => s,
         Err(e) => {
             // Go frp http_proxy.go CONNECT arm: dial failure answers the
@@ -260,15 +262,10 @@ async fn handle_connect(mut client: TcpStream, target: &str) -> Result<(), Strin
         .await
         .map_err(|e| format!("write: {e}"))?;
 
-    // Bidirectional copy
-    if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
-        &mut client,
-        &mut remote,
-        *frp_core::buffer_pool::BUFFER_SIZE,
-        *frp_core::buffer_pool::BUFFER_SIZE,
-    )
-    .await
-    {
+    // Bidirectional relay through pooled buffers (audit round-8 P1: the
+    // copy_bidirectional_with_sizes pair of fresh buffers per conn is gone;
+    // relay_plain_pooled has identical FIN-propagation semantics).
+    if let Err(e) = frp_core::bridge::relay_plain_pooled(client, remote).await {
         tracing::debug!(error = %e, "plugin relay error: {}", e);
     }
     Ok(())
@@ -321,9 +318,18 @@ async fn handle_http_forward(
     // is stripped below as hop-by-hop and re-added only when chunked.
     let framing = super::parse_request_body_framing(headers_str.lines().skip(1));
     // Content-Length is resolved per RFC 7230 §3.3.2 ("reject or replace
-    // with a single value"): duplicate identical values collapse to one
-    // line, list-form values ("5, 5") sum, and conflicting values make the
-    // request framing invalid — reject (the connection closes).
+    // with a single value") under Go fixLength/parseContentLength
+    // semantics: duplicate identical values collapse to one line, while
+    // list-form values ("5, 5"), non-decimal values, and conflicting
+    // values make the request framing invalid — reject (the connection
+    // closes). Resolution runs UNCONDITIONALLY, chunked requests included:
+    // Go probes the CL values even when chunked wins the framing — probed
+    // against the Go frp v0.71.0-era stdlib (go1.25.12): chunked + "5, 5",
+    // chunked + "5x", and chunked + conflicting values all 400, while a
+    // chunked + valid "5" is accepted and the header deleted. The retain
+    // gate below drops every Content-Length line on chunked requests and
+    // the canonical-line append keys on `framing != Chunked`, so a valid
+    // resolution is never forwarded under chunked — matching Go's delete.
     let content_length = super::resolve_content_length(headers_str.lines().skip(1))?;
     header_lines.retain(|line| {
         // Skip the head's trailing blank line(s) too: lines() yields "" for

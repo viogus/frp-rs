@@ -464,10 +464,11 @@ pub(super) fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
 /// header means the request has no body.
 ///
 /// Content-Length is resolved by [`resolve_content_length`]: duplicate
-/// identical values collapse to one length and list-form values ("5, 5")
-/// sum. A conflicting set of values yields no inferable framing — the
-/// request is malformed and the head builders reject it via
-/// [`resolve_content_length`] before this runs.
+/// identical values collapse to one length; list-form values ("5, 5") and
+/// every non-decimal value are rejected (Go `parseContentLength` —
+/// `strconv.ParseUint` takes no commas, so net/http answers 400). On error
+/// no framing is inferred here — the head builders reject the request on
+/// that error before any body is forwarded.
 pub(super) fn parse_request_body_framing<'a>(
     headers: impl Iterator<Item = &'a str>,
 ) -> Option<BodyFraming> {
@@ -512,15 +513,29 @@ fn transfer_encoding_is_chunked(value: &str) -> bool {
 }
 
 /// Resolve the Content-Length header(s) of a request head to one canonical
-/// value per RFC 7230 §3.3.2 ("reject or replace with a single value").
+/// value per RFC 7230 §3.3.2 ("reject or replace with a single value"),
+/// mirroring Go's net/http `fixLength` + `parseContentLength`
+/// (transfer.go — probed against the Go frp v0.71.0 binary, go1.25.12).
+/// Go stores each header line value trimmed of ASCII space/tab only —
+/// textproto's `isASCIISpace` is exactly {' ', '\t', '\n', '\r'} with the
+/// newline bytes unreachable in a value, and every OTHER control byte
+/// (<0x21 except tab, plus 0x7f) is rejected by `validHeaderValueByte`
+/// while the head is read (reader.go — 400 "malformed MIME header line").
+/// The trim below therefore strips only space/tab: a value carrying any
+/// other control byte survives to the digit parse and fails it, matching
+/// Go's rejection. Go never splits on commas, so:
 ///
 /// - no Content-Length → `Ok(None)`;
-/// - duplicate identical values (`Content-Length: 5` twice) → `Ok(Some(5))`,
-///   forwarded as a single line;
-/// - a list-form value (`Content-Length: 5, 5`) → `Ok(Some(10))` — the sum,
-///   forwarded as a single line with the summed body read;
-/// - an unparseable value → `Ok(None)` (no body length can be inferred; the
-///   head is forwarded as-is, matching the no-body fallback);
+/// - duplicate identical values (`Content-Length: 5` twice — identical on
+///   the trimmed raw text, so `05` + `5` differ and are rejected) →
+///   `Ok(Some(5))`, forwarded as a single line;
+/// - a list-form value (`Content-Length: 5, 5`) → `Err` — Go's
+///   `strconv.ParseUint` accepts no comma, so net/http answers 400 (audit
+///   round-8 F9: the old code summed the parts);
+/// - an empty value → `Err("invalid empty Content-Length")` (Go's text);
+/// - a non-decimal value (letters, any sign — ParseUint accepts no sign,
+///   not even `+`) → `Err("bad Content-Length")` (Go's text);
+/// - a value above 2^63-1 → `Err("bad Content-Length")` (Go's bitSize=63);
 /// - conflicting values (`Content-Length: 5` + `Content-Length: 100`) →
 ///   `Err`: the request framing is invalid and the request must be rejected
 ///   (the connection closes — no 400 is sent, like the other parser
@@ -528,8 +543,10 @@ fn transfer_encoding_is_chunked(value: &str) -> bool {
 pub(super) fn resolve_content_length<'a>(
     headers: impl Iterator<Item = &'a str>,
 ) -> Result<Option<usize>, String> {
-    // Parsed values per Content-Length line, in header order.
-    let mut per_line: Vec<Vec<usize>> = Vec::new();
+    // Trimmed raw text of every Content-Length line, in header order
+    // (Go readMIMEHeader trims each stored value; fixLength compares the
+    // trimmed texts byte-for-byte).
+    let mut values: Vec<&str> = Vec::new();
     for line in headers {
         if line.is_empty() {
             continue;
@@ -540,38 +557,47 @@ pub(super) fn resolve_content_length<'a>(
         if !name.trim().eq_ignore_ascii_case("content-length") {
             continue;
         }
-        let mut values = Vec::new();
-        for token in value.split(',') {
-            match token.trim().parse::<usize>() {
-                Ok(n) => values.push(n),
-                Err(_) => {
-                    // Unparseable — no body length can be inferred. The head
-                    // is forwarded as-is (Go's server would reject the
-                    // request outright, but a body cannot be inferred from
-                    // it either).
-                    return Ok(None);
-                }
+        // trim_matches of ASCII space/tab only (round-3 review, audit
+        // round 8): textproto.isASCIISpace has no \x0b/\x0c, and Go rejects
+        // control bytes in values while reading the head — accepting a
+        // \x0b-wrapped "5" here would be accept-where-Go-rejects.
+        values.push(value.trim_matches(|c| c == ' ' || c == '\t'));
+    }
+    match values.len() {
+        0 => Ok(None),
+        1 => parse_content_length_value(values[0]),
+        _ => {
+            // Multiple Content-Length lines: Go fixLength accepts them only
+            // when every trimmed raw text is byte-identical (RFC 7230
+            // §3.3.2) — any difference invalidates the framing, including
+            // one that parses to the same number ("05" vs "5").
+            if values.iter().any(|v| *v != values[0]) {
+                return Err("conflicting Content-Length headers".into());
             }
+            parse_content_length_value(values[0])
         }
-        per_line.push(values);
     }
-    if per_line.is_empty() {
-        return Ok(None);
+}
+
+/// One Content-Length value under Go `parseContentLength` semantics
+/// (transfer.go): empty → error; otherwise `strconv.ParseUint(value, 10,
+/// 63)` — unsigned decimal digits only, no sign, no commas, no whitespace,
+/// capped at 2^63-1. `usize` truncation past 64-bit would already have
+/// failed the 63-bit cap on every supported target.
+fn parse_content_length_value(value: &str) -> Result<Option<usize>, String> {
+    if value.is_empty() {
+        return Err("invalid empty Content-Length".into());
     }
-    if per_line.len() == 1 {
-        // Single Content-Length line: list-form values ("5, 5") declare a
-        // body of the sum of the parts — forward the summed length and
-        // stream that many bytes.
-        return Ok(Some(per_line[0].iter().sum()));
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("bad Content-Length".into());
     }
-    // Multiple Content-Length lines: identical values collapse to one copy;
-    // any difference means the framing is invalid.
-    let first = per_line[0][0];
-    if per_line.iter().all(|v| v.len() == 1 && v[0] == first) {
-        Ok(Some(first))
-    } else {
-        Err("conflicting Content-Length headers".into())
+    let n: u64 = value
+        .parse()
+        .map_err(|_| "bad Content-Length".to_string())?;
+    if n > i64::MAX as u64 {
+        return Err("bad Content-Length".into());
     }
+    Ok(Some(n as usize))
 }
 
 /// Read an HTTP request head from `stream` (chunked until the first empty
@@ -611,31 +637,38 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // only at its end): with a request body the head terminator is followed
     // by body bytes, and reading past it would swallow the body into the
     // "headers" until the 64 KiB cap.
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 512];
-    loop {
-        // Bound each read: a peer that connects (or sends a partial header)
-        // but then stalls must not pin the handler task + fd forever. Any
-        // byte resets the clock — only a fully-silent / stalled peer trips
-        // this (Go sets a connection read deadline per-read).
-        let read_res =
-            tokio::time::timeout(PLUGIN_HEADER_READ_TIMEOUT, stream.read(&mut chunk)).await;
-        let n = match read_res {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(format!("read: {e}")),
-            Err(_elapsed) => return Err("timed out reading request headers".into()),
-        };
-        if n == 0 {
-            return Err("connection closed".into());
+    // Read the whole head under ONE absolute deadline armed at the first
+    // read attempt (audit round-8 F8). A per-read deadline re-arms on
+    // every byte, so a peer dripping 1 B/59 s could hold the handler task
+    // + fd forever without ever parking on a single read. The single
+    // window bounds the ENTIRE head — mirrors Go http.Server's
+    // ReadHeaderTimeout (60 s inside Go frp's http_proxy plugin,
+    // plugin/http.rs), which a fresh byte does not extend. Body reads
+    // downstream stay unbounded (Go parity: a body may stream for the
+    // life of the connection).
+    let buf = tokio::time::timeout(PLUGIN_HEADER_READ_TIMEOUT, async {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                return Err("connection closed".into());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if frp_core::textproto::head_end(&buf).is_some() {
+                break;
+            }
+            if buf.len() > 65536 {
+                return Err("request headers too large".into());
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if frp_core::textproto::head_end(&buf).is_some() {
-            break;
-        }
-        if buf.len() > 65536 {
-            return Err("request headers too large".into());
-        }
-    }
+        Ok::<Vec<u8>, String>(buf)
+    })
+    .await
+    .map_err(|_elapsed| "timed out reading request headers".to_string())??;
 
     // Split the head from any pre-read body bytes at the first empty line
     // (Go textproto semantics — the same helper the read loop above used,
@@ -659,10 +692,19 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // chunked (the forwarded body bytes keep the client's own framing).
     let framing = parse_request_body_framing(lines.clone());
     // Content-Length is resolved per RFC 7230 §3.3.2 ("reject or replace
-    // with a single value"): duplicate identical values collapse to one
-    // line, list-form values ("5, 5") sum, and conflicting values make the
-    // request framing invalid — reject (the connection closes, matching
-    // the other parser failures; no 400 is sent).
+    // with a single value") under Go fixLength/parseContentLength
+    // semantics: duplicate identical values collapse to one line, while
+    // list-form values ("5, 5"), non-decimal values, and conflicting
+    // values make the request framing invalid — reject (the connection
+    // closes, matching the other parser failures; no 400 is sent).
+    // Resolution runs UNCONDITIONALLY, chunked requests included: Go
+    // probes the CL values even when chunked wins the framing — probed
+    // against the Go frp v0.71.0-era stdlib (go1.25.12): chunked + "5, 5",
+    // chunked + "5x", and chunked + conflicting values all 400, while a
+    // chunked + valid "5" is accepted and the header deleted. The retain
+    // gate below drops every Content-Length line on chunked requests and
+    // the canonical-line append keys on `framing != Chunked`, so a valid
+    // resolution is never forwarded under chunked — matching Go's delete.
     let content_length = resolve_content_length(lines.clone())?;
 
     // Build forwarded request with optional Host rewrite.
@@ -828,13 +870,47 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
 /// bound on chunk-size / trailer lines read from the backend.
 pub(super) const CHUNK_LINE_MAX: usize = 64 * 1024;
 
-/// Bound on a single read while parsing an HTTP request head / chunk line /
-/// trailer in the plugins. A peer that connects (or sends a partial line)
-/// then stalls must not pin the handler task + fd forever; any fresh byte
-/// resets the clock, so only a silent/stalled peer trips this (Go sets a
-/// per-read connection deadline).
+/// Bound on the whole HTTP request-head read in the plugins (audit round-8
+/// F8). The head must be read within ONE absolute window armed at the first
+/// read — NOT re-armed per read: a per-read deadline lets a peer dripping
+/// 1 B/59 s hold the handler task + fd forever without ever parking on a
+/// single read. Mirrors Go http.Server's ReadHeaderTimeout, which a fresh
+/// byte does not extend. Request-body reads downstream are deliberately
+/// unbounded (Go parity: a body may stream for the life of the connection).
 pub(super) const PLUGIN_HEADER_READ_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(60);
+
+/// Bound on a TLS listener handshake in the TLS-terminating plugins
+/// (tls2raw/https2http/https2https; audit round-8 F6). A peer that sends a
+/// partial ClientHello (rustls waits for the record body) must be released
+/// — the accept cannot park the handler task + fd + plugin listener slot
+/// forever. One absolute window per handshake (no per-record re-arm). Go
+/// frp's plugins have no equivalent bound (net/http's ReadHeaderTimeout
+/// applies after TLS); this is Rust-only hardening, shared with tls2raw's
+/// original per-site deadline.
+#[cfg(feature = "tls")]
+pub(super) const PLUGIN_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Accept one TLS handshake under the shared [`PLUGIN_HANDSHAKE_TIMEOUT`]
+/// window. The bare `acceptor.accept` in https2http/https2https had no
+/// bound at all; tls2raw already bounded its accept with the same 60 s.
+/// Error strings are debug-log only (both sites log and drop the
+/// connection — no 4xx is possible before the request is read).
+#[cfg(feature = "tls")]
+pub(super) async fn accept_tls_bounded(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: tokio::net::TcpStream,
+) -> Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, String> {
+    tokio::time::timeout(PLUGIN_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+        .await
+        .map_err(|_elapsed| {
+            format!(
+                "TLS handshake timed out after {:?}",
+                PLUGIN_HANDSHAKE_TIMEOUT
+            )
+        })?
+        .map_err(|e| e.to_string())
+}
 
 /// Stream a request body to `writer`: first the bytes that arrived together
 /// with the request head (`body_prefix`), then the rest of the body per its
@@ -1535,21 +1611,82 @@ mod tests {
             parse_request_body_framing("Content-Length: 42\r\nTransfer-Encoding: chunked".lines()),
             Some(BodyFraming::Chunked)
         );
-        // List-form Content-Length sums ("5, 5" declares a 10-byte body).
+        // List-form Content-Length ("5, 5") is malformed: Go's
+        // strconv.ParseUint takes no commas, so net/http (the server
+        // inside Go frp's http_proxy plugin) answers 400. resolve_
+        // content_length errors, and the head builders reject the request
+        // on that error — no framing is inferred here.
         assert_eq!(
             parse_request_body_framing("Content-Length: 5, 5".lines()),
-            Some(BodyFraming::Length(10))
+            None
         );
         // Duplicate identical Content-Length lines collapse to one value.
         assert_eq!(
             parse_request_body_framing("Content-Length: 5\r\nContent-Length: 5".lines()),
             Some(BodyFraming::Length(5))
         );
-        // Unparseable Content-Length is ignored (Go's server rejects the
-        // request outright, but a body cannot be inferred from it).
+        // Unparseable Content-Length is malformed — Go's server rejects
+        // the request outright (400 "bad Content-Length"). resolve_
+        // content_length errors, and the head builders reject the request
+        // on that error.
         assert_eq!(
             parse_request_body_framing("Content-Length: abc".lines()),
             None
+        );
+    }
+
+    /// Go parity (probed against the Go frp v0.71.0-era stdlib, go1.25.12):
+    /// Go validates Content-Length values even when Transfer-Encoding:
+    /// chunked wins the framing — chunked + "5, 5" is still 400 "bad
+    /// Content-Length". The F9 resolve gate in the head builders therefore
+    /// runs UNCONDITIONALLY: the old chunked-skip accepted garbage CL
+    /// under chunked and forwarded the request (round-8 F9). A chunked
+    /// request carrying a VALID Content-Length still forwards with the CL
+    /// line dropped (Go deletes the header once chunked wins) and the
+    /// Transfer-Encoding preserved.
+    #[tokio::test]
+    async fn chunked_request_resolves_content_length() {
+        use tokio::io::AsyncWriteExt;
+        // Malformed (list-form) Content-Length under chunked fails the
+        // forward build, mirroring Go's 400.
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+        client_io
+            .write_all(
+                b"POST /p HTTP/1.1\r\nHost: b\r\nTransfer-Encoding: chunked\r\nContent-Length: 5, 5\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        client_io.flush().await.unwrap();
+        let err =
+            read_request_and_build_forward(&mut server_io, "", &Default::default(), None).await;
+        let err = match err {
+            Ok(_) => panic!(
+                "chunked + list-form Content-Length must reject the forward build (regression)"
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("Content-Length"),
+            "rejection must name the header, got: {err}"
+        );
+
+        // A VALID Content-Length under chunked is accepted; the retain
+        // gate drops the CL line and the Transfer-Encoding survives.
+        let head = build_forward(
+            b"POST /p HTTP/1.1\r\nHost: b\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+            &Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            !head
+                .lines()
+                .any(|l| starts_with_ignore_ascii_case(l, "content-length:")),
+            "Content-Length must be dropped under chunked, got: {head}"
+        );
+        assert!(
+            head.contains("Transfer-Encoding: chunked"),
+            "chunked framing must survive, got: {head}"
         );
     }
 
@@ -1565,25 +1702,74 @@ mod tests {
             resolve_content_length("Content-Length: 42".lines()).unwrap(),
             Some(42)
         );
-        // List-form values sum: "5, 5" declares a 10-byte body.
+        // Zero is a legal body length.
         assert_eq!(
-            resolve_content_length("Content-Length: 5, 5".lines()).unwrap(),
-            Some(10)
+            resolve_content_length("Content-Length: 0".lines()).unwrap(),
+            Some(0)
         );
-        // Duplicate identical lines collapse to one copy (RFC 7230 §3.3.2).
+        // Leading zeros and trailing ASCII OWS are accepted (Go
+        // textproto.TrimString + strconv.ParseUint).
+        assert_eq!(
+            resolve_content_length("Content-Length: 05".lines()).unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            resolve_content_length("Content-Length: 5   ".lines()).unwrap(),
+            Some(5)
+        );
+        // Duplicate identical lines collapse to one copy (Go fixLength
+        // dedupes — the comparison is on the ASCII-OWS-trimmed raw text).
         assert_eq!(
             resolve_content_length("Content-Length: 5\r\nContent-Length: 5".lines()).unwrap(),
             Some(5)
         );
-        // Conflicting values invalidate the request framing.
+        assert_eq!(
+            resolve_content_length("Content-Length: 5 \r\nContent-Length: 5".lines()).unwrap(),
+            Some(5)
+        );
+        // Conflicting values invalidate the request framing (Go answers
+        // 400 "message cannot contain multiple Content-Length headers").
         assert!(
             resolve_content_length("Content-Length: 5\r\nContent-Length: 100".lines()).is_err()
         );
-        // Unparseable value → no usable length (head forwarded as-is).
-        assert_eq!(
-            resolve_content_length("Content-Length: abc".lines()).unwrap(),
-            None
+        // ... including raw-text differences that parse to the same number
+        // ("05" == 5 numerically, but the trimmed texts differ).
+        assert!(resolve_content_length("Content-Length: 05\r\nContent-Length: 5".lines()).is_err());
+        // List forms are NOT legal. Go strconv.ParseUint rejects any
+        // non-digit, so a comma list ("5, 5", RFC 7230 §3.3.2's legal form
+        // notwithstanding) is a 400. Probed against the Go frp v0.71.0
+        // binary (built with go1.25.12): every list shape below is answered
+        // "HTTP/1.1 400 Bad Request".
+        assert!(resolve_content_length("Content-Length: 5, 5".lines()).is_err());
+        assert!(resolve_content_length("Content-Length: 5, 7".lines()).is_err());
+        assert!(resolve_content_length("Content-Length:  5 , 5 ".lines()).is_err());
+        assert!(resolve_content_length("Content-Length: 5,5,5".lines()).is_err());
+        // ... and identical list lines do not rescue the form.
+        assert!(
+            resolve_content_length("Content-Length: 5, 5\r\nContent-Length: 5, 5".lines()).is_err()
         );
+        // Control bytes other than space/tab in the value are NOT trimmed
+        // (textproto.isASCIISpace has no \x0b/\x0c; Go rejects them while
+        // reading the head — round-3 review, audit round 8): a \x0b-wrapped
+        // "5" survives to the digit parse and fails it.
+        assert!(resolve_content_length("Content-Length: \x0b5".lines()).is_err());
+        assert!(resolve_content_length("Content-Length: 5\x0c".lines()).is_err());
+        // Non-numeric values are errors (Go 400 "bad Content-Length") —
+        // including empty values (Go "invalid empty Content-Length") and
+        // any sign (strconv.ParseUint accepts no sign, not even '+').
+        assert!(resolve_content_length("Content-Length: abc".lines()).is_err());
+        assert!(resolve_content_length("Content-Length:".lines()).is_err());
+        assert!(resolve_content_length("Content-Length:   ".lines()).is_err());
+        assert!(resolve_content_length("Content-Length: -5".lines()).is_err());
+        assert!(resolve_content_length("Content-Length: +5".lines()).is_err());
+        // 63-bit cap (Go ParseUint bitSize=63): 2^63-1 is the largest
+        // accepted value; anything larger is an error even when it fits u64.
+        assert_eq!(
+            resolve_content_length("Content-Length: 9223372036854775807".lines()).unwrap(),
+            Some(i64::MAX as usize)
+        );
+        assert!(resolve_content_length("Content-Length: 9223372036854775808".lines()).is_err());
+        assert!(resolve_content_length("Content-Length: 9999999999999999999".lines()).is_err());
     }
 
     /// Drive `read_request_and_build_forward` over a duplex stream and
@@ -1734,5 +1920,47 @@ mod tests {
             fwd.head
         );
         assert!(fwd.body_prefix.is_empty(), "no body bytes were pre-read");
+    }
+
+    /// Audit round-8 F8 pin: a slowloris peer that drips ONE byte per 59 s
+    /// never trips a per-read re-armed deadline (every byte resets the
+    /// clock), but MUST be released by one absolute window over the whole
+    /// head read (Go http.Server ReadHeaderTimeout = 60 s inside Go frp's
+    /// http_proxy plugin). Paused time keeps the 300 s outer bound
+    /// deterministic: RED (per-read re-arm) trips the OUTER timeout instead
+    /// of the 60 s window; GREEN (single absolute window) returns
+    /// "timed out reading request headers" at virtual t=60 s.
+    #[tokio::test(start_paused = true)]
+    async fn header_read_single_absolute_window_beats_trickle() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+        // One byte per 59 s forever — the head never completes (no blank
+        // line) and each byte would re-arm a per-read deadline.
+        let trickle = tokio::spawn(async move {
+            loop {
+                if client_io.write_all(b"x").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(59)).await;
+            }
+        });
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            read_request_and_build_forward(&mut server_io, "", &Default::default(), None),
+        )
+        .await;
+        drop(trickle);
+        match res {
+            Ok(Ok(_)) => panic!("a trickled, unterminated head must not build a forward"),
+            Ok(Err(e)) => {
+                assert_eq!(
+                    e, "timed out reading request headers",
+                    "the single absolute window must trip at 60 s"
+                );
+            }
+            Err(_elapsed) => panic!(
+                "per-read deadline re-arms on every byte: 1 B/59 s trickle beat the 60 s bound"
+            ),
+        }
     }
 }

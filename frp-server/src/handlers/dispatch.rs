@@ -869,13 +869,15 @@ pub(crate) async fn handle_nat_hole_visitor(
     }
 
     // Send to provider via control channel.
-    // send().await: backpressure is correct — if the provider's
-    // control handler cannot drain messages, the XTCP session
-    // should wait rather than silently drop the NatHoleResp
-    // (which would cause a permanent visitor hang).
+    // send().await: backpressure to a LIVE provider is correct — a dropped
+    // NatHoleResp would hang the visitor permanently. Bounded (F14, audit
+    // round 8): a provider control handler that stops draining must not park
+    // the flow task + visitor fd + session forever; after CTL_SEND_TIMEOUT
+    // the session dies, the visitor fd closes, and the visitor retries.
     if let Some(ref cr) = c_resp {
-        let _ = ctl_tx
-            .send(InternalMsg::WriteNatHoleResp {
+        match tokio::time::timeout(
+            crate::state::CTL_SEND_TIMEOUT,
+            ctl_tx.send(InternalMsg::WriteNatHoleResp {
                 transaction_id: cr.transaction_id.clone(),
                 error: cr.error.clone(),
                 sid: cr.sid.clone(),
@@ -883,8 +885,25 @@ pub(crate) async fn handle_nat_hole_visitor(
                 candidate_addrs: cr.candidate_addrs.clone(),
                 assisted_addrs: cr.assisted_addrs.clone(),
                 detect_behavior: cr.detect_behavior.clone(),
-            })
-            .await;
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                // Channel closed: provider disconnected between step 2 and 6.
+                warn!(run_id = %run_id, "Provider for run_id {} disconnected before NatHoleResp delivery", run_id);
+                state.xtcp.nat_hole.remove(&sid).await;
+                drop(reader);
+                return;
+            }
+            Err(_elapsed) => {
+                warn!(run_id = %run_id, "Provider for run_id {} is wedged (channel full for {:?}); dropping NatHole session", run_id, crate::state::CTL_SEND_TIMEOUT);
+                state.xtcp.nat_hole.remove(&sid).await;
+                drop(reader);
+                return;
+            }
+        }
     }
 
     info!(sid = %sid, "NatHole session {}: NatHoleResp sent to both sides", sid);
@@ -1289,5 +1308,168 @@ mod visitor_admission_tests {
         assert!(visitor_user_allowed("", "", &["*".to_string()]));
         assert!(!visitor_user_allowed("", "", &["alice".to_string()]));
         assert!(!visitor_user_allowed("", "owner", &[]));
+    }
+}
+
+#[cfg(test)]
+mod nat_hole_visitor_bounded_send_tests {
+    use super::*;
+    use crate::control::proxy_ops::unregister_generation_tests::{proxy_info, test_state};
+
+    /// F14 (audit round 8): the step-6 provider NatHoleResp hand-off must be
+    /// bounded by CTL_SEND_TIMEOUT like its siblings — NewWorkConn
+    /// (dispatch.rs ~1262), VisitorConn (~314), and step-2's own
+    /// NatHoleSidOnWorkConn send (5s, ~637). Pre-fix the `.send().await` at
+    /// step 6 was unbounded: a provider control handler that stopped
+    /// draining its 1024-cap channel parked the flow task + visitor fd +
+    /// session forever — step-3's NAT_HOLE_TIMEOUT only bounds the
+    /// NatHoleClient wait, and step-7's report wait is never reached, so no
+    /// timer ever fires on the wedged send.
+    #[tokio::test(start_paused = true)]
+    async fn provider_resp_send_times_out_on_full_ctl_channel() {
+        let state = test_state();
+        // XTCP proxy under run_id "run-1" with a shared secret.
+        let mut info = proxy_info("xtcp-proxy", "xtcp", "run-1", None, 1);
+        info.sk = Some("secret-sk".into());
+        state
+            .proxy_manager
+            .register("run-1".into(), info)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .proxy_manager
+                .get_run_id("xtcp-proxy")
+                .await
+                .as_deref(),
+            Some("run-1")
+        );
+
+        // Provider control handle. A drain task consumes EXACTLY step-2's
+        // NatHoleSidOnWorkConn (the flow needs one free slot for it), then
+        // exits — leaving the channel permanently full for step-6's
+        // NatHoleResp, exactly like a control handler that stops draining.
+        let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::channel::<InternalMsg>(8);
+        state.run_id_to_ctl_tx.insert(
+            "run-1".to_string(),
+            crate::state::ControlTx {
+                tx: ctl_tx.clone(),
+                client_addr: None,
+                login_time: std::time::Instant::now(),
+                login_time_unix: 0,
+                pool_stats: Arc::new(crate::state::PoolStats::default()),
+                user: String::new(),
+                control_id: 1,
+                udp_packet_codec: String::new(),
+                wire_v2: false,
+                superseded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let (step2_tx, step2_rx) = oneshot::channel::<()>();
+        let drain = tokio::spawn(async move {
+            // First message on the channel is step-2's NatHoleSidOnWorkConn.
+            let first = ctl_rx.recv().await;
+            assert!(matches!(
+                first,
+                Some(InternalMsg::NatHoleSidOnWorkConn { .. })
+            ));
+            let _ = step2_tx.send(());
+            // Park holding the receiver: never read again (the channel must
+            // stay FULL for the step-6 bounded send to time out) but never
+            // drop it either — dropping closes the channel and the fillers
+            // below would fail with SendError instead of filling it. The
+            // test runtime tears the task down at shutdown.
+            tokio::time::sleep(Duration::from_secs(120)).await;
+        });
+
+        // Visitor end of the TCP pair; the server end becomes the session's
+        // visitor_writer. The peer socket is held open (v_resp is small and
+        // the kernel send buffer absorbs it without a reader).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let _visitor_peer = client;
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let visitor_msg = msg::NatHoleVisitor {
+            transaction_id: "sid-f14-1".into(),
+            proxy_name: "xtcp-proxy".into(),
+            pre_check: false,
+            protocol: None,
+            sign_key: Some(frp_core::auth::generate_token("secret-sk", ts)),
+            timestamp: Some(ts),
+            mapped_addrs: None,   // empty => classify errs => fallback arm
+            assisted_addrs: None, // (both sides still produce a c_resp)
+        };
+
+        let state2 = state.clone();
+        let flow = tokio::spawn(async move {
+            handle_nat_hole_visitor(IoStream::Tcp(server), visitor_msg, state2, None, false).await;
+        });
+
+        // Wait for step-2's NatHoleSidOnWorkConn to be consumed, then fill the
+        // channel to capacity so step-6's NatHoleResp send has no slot.
+        step2_rx.await.unwrap();
+        for i in 0..8 {
+            ctl_tx
+                .send(InternalMsg::NatHoleSidOnWorkConn {
+                    sid: format!("filler-{i}"),
+                    proxy_name: "xtcp-proxy".into(),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(ctl_tx.capacity(), 0);
+
+        // Deliver the provider's NatHoleClient (STUN addrs) as the control
+        // handler would — fires the session notify so the flow reaches the
+        // step-6 send.
+        state
+            .xtcp
+            .nat_hole
+            .handle_client(msg::NatHoleClient {
+                transaction_id: "provider-tx".into(),
+                proxy_name: "xtcp-proxy".into(),
+                sid: Some("sid-f14-1".into()),
+                protocol: None,
+                mapped_addrs: Some(vec!["1.2.3.4:1000".into(), "5.6.7.8:2000".into()]),
+                assisted_addrs: None,
+                visitor_addr: None,
+            })
+            .await;
+
+        // Advance past CTL_SEND_TIMEOUT (15s). Pre-fix the flow parks on the
+        // full channel forever; post-fix the bounded send fires, the session
+        // is expired, and the flow task completes.
+        tokio::time::advance(crate::state::CTL_SEND_TIMEOUT + Duration::from_secs(5)).await;
+        // Let the woken flow task run its cleanup to completion before
+        // asserting (advance returns without a final scheduler yield).
+        tokio::time::advance(crate::state::CTL_SEND_TIMEOUT + Duration::from_secs(5)).await;
+        // advance() returns before tasks woken at the advanced time have
+        // completed their cleanup polls — yield until the flow task's final
+        // poll (session removal + reader drop) has run.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            flow.is_finished(),
+            "F14: step-6 NatHoleResp send must be bounded by CTL_SEND_TIMEOUT — \
+             a wedged provider control handler must not park the flow task + \
+             visitor fd + session forever"
+        );
+        assert!(
+            state.xtcp.nat_hole.sessions.read().await.is_empty(),
+            "F14: session must be expired after the bounded send times out"
+        );
+
+        drain.abort();
+        flow.abort();
+        let _ = drain.await;
+        let _ = flow.await;
+        drop(_visitor_peer);
     }
 }

@@ -169,27 +169,59 @@ fn spawn_daily_log_cleanup(dir: PathBuf, log_name: String, max_days: i32) {
 ///
 /// Replaces `EnvFilter::try_from_default_env()` so the `env-filter` feature —
 /// and with it the `matchers` + `regex-automata` + `regex-syntax` chain
-/// (~131 KiB per release binary) — can be dropped. `Targets::from_str` parses
-/// each directive with the *same* `StaticDirective` parser `EnvFilter` uses for
-/// its non-regex directives, so target matching is byte-for-byte identical.
+/// (~131 KiB per release binary) — can be dropped.
 ///
-/// Supported `RUST_LOG` syntax (the non-regex subset of `EnvFilter`):
+/// Supported `RUST_LOG` syntax (the static `Targets` grammar, verified
+/// against tracing-subscriber 0.3.23):
 ///   - bare level: `debug`, `info`, `warn`, `error`, `trace`, `off`
-///   - `target=level`: `frp_core=debug`, `rustls=trace`
+///   - numeric levels `0`..`5` (`0`=off, `5`=trace) — accepted anywhere a
+///     level token is (`3`, `frp_core=4`)
+///   - `target=level`: `frp_core=debug`, `rustls=trace` (level names are
+///     case-insensitive)
 ///   - bare target (no `=`): `frp_core` → that target at `trace`
 ///   - field-name lists: `target[{field}]=level` (name presence, no regex)
 ///   - comma-separated list of the above
 ///
-/// Unsupported (present in `EnvFilter`, unused by frp-rs, and the source of
-/// the regex dependency): `target[span{field=value}]=level` field *value*
-/// matchers, `target::*=level` glob suffixes, `-target` exclusions, numeric
-/// levels. A `RUST_LOG` containing any of these fails `Targets::from_str` and
-/// falls back to `default_level` (the same all-or-nothing behavior EnvFilter
-/// applies to a malformed directive).
+/// Divergences from `EnvFilter` (all verified against the 0.3.23 static
+/// parser):
+///   - **Whole-string failure.** One malformed directive fails the ENTIRE
+///     parse, so `filter_from_env` falls back to `default_level` — reported
+///     on stderr, since logging is not initialized yet. Malformed means: an
+///     unparseable level token after `=` (`frp_core=bogus` — every
+///     `EnvFilter` field-*value* matcher lands here, because its
+///     `]`-terminated value can never parse as a level:
+///     `foo[span{name=x}]`, `foo[bar=baz]`), a second `=` (`a=b=c`,
+///     `foo[span{name=x}]=trace`), or a malformed `[{...}]` field list.
+///   - **`-target` exclusions and `target::*=level` glob suffixes parse as
+///     inert literals.** `info,-tokio` and `foo::*=debug` are ACCEPTED (no
+///     fallback) but never match anything: the literal strings `-tokio` and
+///     `foo::*` prefix-match no real module path, so those directives
+///     silently do nothing. EnvFilter would give them exclusion / glob
+///     semantics; frp-rs has neither — a `RUST_LOG` relying on them must be
+///     rewritten as explicit `target=level` pairs. Bare numeric tokens
+///     outside 0..5 (`6`) are the same kind of inert literal target.
+///   - **No regex.** `EnvFilter`'s field-value matchers and `span{...}`
+///     scoping (the source of the regex dependency this filter replaces)
+///     are unsupported and fail the parse as described above.
 pub fn filter_from_env(default_level: &str) -> Targets {
     let fallback = || Targets::new().with_default(parse_level(default_level));
     match std::env::var("RUST_LOG") {
-        Ok(raw) => raw.trim().parse::<Targets>().unwrap_or_else(|_| fallback()),
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            match trimmed.parse::<Targets>() {
+                Ok(filter) => filter,
+                Err(e) => {
+                    // Pre-init: no logger exists yet, so stderr is the only
+                    // channel. Without this a typo'd RUST_LOG silently
+                    // discards the operator's whole filter (all-or-nothing
+                    // fallback above).
+                    eprintln!(
+                        "frp: ignoring RUST_LOG={trimmed:?}: {e}; falling back to default level"
+                    );
+                    fallback()
+                }
+            }
+        }
         Err(_) => fallback(),
     }
 }
@@ -575,10 +607,65 @@ mod tests {
 
     #[test]
     fn targets_from_str_rejects_malformed() {
-        // A bad level token fails the whole parse (all-or-nothing, EnvFilter
-        // parity) — `filter_from_env` falls back to the default level.
+        // A bad level token fails the whole parse (all-or-nothing) —
+        // `filter_from_env` falls back to the default level (and now says so
+        // on stderr). A single bad directive drops EVERY valid one too.
         assert!("frp_core=bogus".parse::<Targets>().is_err());
+        assert!("info,frp_core=bogus".parse::<Targets>().is_err());
         // Too many `=` in a single directive.
         assert!("a=b=c".parse::<Targets>().is_err());
+        // EnvFilter field-VALUE matchers / span scoping always fail here:
+        // the token after their last `=` ends in `]` / `}]`, which can never
+        // parse as a level (static Targets has no regex engine).
+        assert!("foo[bar=baz]".parse::<Targets>().is_err());
+        assert!("foo[span{name=x}]".parse::<Targets>().is_err());
+        assert!("foo[span{name=x}]=trace".parse::<Targets>().is_err());
+    }
+
+    #[test]
+    fn targets_from_str_inert_directives_parse_ok() {
+        use tracing::Level;
+
+        // `-target` exclusions and `target::*=level` glob suffixes PARSE —
+        // no fallback, no error — but become literal target strings that
+        // prefix-match nothing real. The directive silently does nothing
+        // (EnvFilter would exclude / glob-enable). Pinned so a parser
+        // upgrade that starts rejecting or honoring them is a visible
+        // change instead of a silent behavior shift.
+        let t: Targets = "info,-tokio".parse().unwrap();
+        assert!(t.would_enable("anything", &Level::INFO), "default survives");
+        // The distinguishing observable: the literal target "-tokio" never
+        // matches "tokio", so the GLOBAL DEFAULT still governs it — a real
+        // exclusion (EnvFilter semantics) would drop tokio to off here.
+        assert!(
+            t.would_enable("tokio", &Level::ERROR),
+            "inert -tokio must not suppress the default the way a real \
+             exclusion would (EnvFilter drops tokio here)"
+        );
+        let t: Targets = "foo::*=debug".parse().unwrap();
+        assert!(
+            !t.would_enable("foo::bar", &Level::DEBUG),
+            "glob must NOT enable (inert literal), but it enabled foo::bar"
+        );
+        // Bare numeric token outside the 0-5 level range: a literal target,
+        // same as any other bare token that is not a level name.
+        let t: Targets = "6".parse().unwrap();
+        assert!(!t.would_enable("anything", &Level::TRACE));
+    }
+
+    #[test]
+    fn targets_from_str_accepts_numeric_levels() {
+        use tracing::Level;
+
+        // LevelFilter accepts numeric 0-5 (0 = off, 5 = trace) — the same
+        // level parser env-filter uses, so numeric RUST_LOG values are NOT
+        // a parse-failure source (doc claim pinned).
+        assert!("0".parse::<Targets>().is_ok());
+        assert!("3".parse::<Targets>().is_ok());
+        assert!("5".parse::<Targets>().is_ok());
+        assert!("frp_core=0".parse::<Targets>().is_ok());
+        let t: Targets = "frp_core=4".parse().unwrap();
+        assert!(t.would_enable("frp_core", &Level::DEBUG));
+        assert!(!t.would_enable("frp_core", &Level::TRACE));
     }
 }

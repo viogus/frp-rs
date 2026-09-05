@@ -2257,7 +2257,7 @@ async fn run_sudp_worker(
         srv_w
     };
     // Buffer frame reads: read_msg_v1 issues two read_exact calls per message.
-    let mut srv_r = tokio::io::BufReader::with_capacity(16 * 1024, srv_r);
+    let srv_r = tokio::io::BufReader::with_capacity(16 * 1024, srv_r);
     // Reused binary-codec wire buffer (write side; the `scratch` inside the
     // loop is the read side).
     let mut wire_scratch: Vec<u8> = Vec::new();
@@ -2283,9 +2283,53 @@ async fn run_sudp_worker(
     // NOT a fresh sleep() per loop iteration, which would never fire (the
     // 100ms shutdown poll would always win the select and restart it).
     let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    // Reusable payload buffer for the V2 UDP read path (avoids a heap alloc
-    // per UDP packet).
-    let mut scratch = Vec::new();
+    // Dedicated frame-read task (audit round-8 F13): the read owns `srv_r`
+    // exclusively, so a frame that is only partially read when the local
+    // branch wins the select below is never discarded — the old
+    // per-iteration rebuild dropped the consumed prefix mid-frame and the
+    // next parse read the frame tail as a header (garbage → tunnel
+    // teardown + reconnect churn). The task stops on shutdown (select arm)
+    // or after a read error, and its end reaches the loop via the channel.
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(8);
+    let shutdown_task = shutdown.clone();
+    let udp_codec_owned = udp_codec_opt.map(str::to_string);
+    let reader_handle = tokio::spawn(async move {
+        let mut srv_r = srv_r;
+        // Reusable payload buffer for the V2 UDP read path (avoids a heap
+        // alloc per UDP packet).
+        let mut scratch = Vec::new();
+        loop {
+            tokio::select! {
+                _ = wait_sudp_shutdown(&shutdown_task) => break,
+                res = async {
+                    if v2 {
+                        read_msg_v2_with_udp_codec(&mut srv_r, udp_codec_owned.as_deref(), &mut scratch).await
+                    } else {
+                        read_msg_v1(&mut srv_r).await
+                    }
+                } => {
+                    let is_err = res.is_err();
+                    if frame_tx.send(res).await.is_err() {
+                        break;
+                    }
+                    if is_err {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    // Abort-guard: the reader task exclusively owns the read half, so every
+    // worker exit path (idle deadline, shutdown, channel close, write/read
+    // error — the breaks below and the return at the function end) must kill
+    // it or the tunnel conn stays half-open forever with one task parked in
+    // read_msg_*. Pre-fix the idle-deadline break dropped only `srv_w`, and
+    // the reader — parked on a read the peer never answers — neither saw the
+    // channel close (it only sends after a read completes) nor the shutdown
+    // flag: one leaked task + fd + 16 KiB BufReader per idle cycle. Aborting
+    // drops `srv_r`, both halves close, and the conn FINs. (Round-2 review,
+    // audit round 8.)
+    let _reader_guard = SudpReaderAbort(reader_handle);
     loop {
         // Fast-path shutdown check: the 100ms wait_sudp_shutdown poll below
         // can be starved under sustained bidirectional traffic (unbiased
@@ -2334,35 +2378,41 @@ async fn run_sudp_worker(
                     }
                 }
             }
-            msg_result = async {
-                if v2 {
-                    read_msg_v2_with_udp_codec(&mut srv_r, udp_codec_opt, &mut scratch).await
-                } else {
-                    read_msg_v1(&mut srv_r).await
-                }
-            } => {
-                match msg_result {
-                    Ok(FrpMessage::UDPPacket(up)) => {
+            msg = frame_rx.recv() => {
+                match msg {
+                    Some(Ok(FrpMessage::UDPPacket(up))) => {
                         idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
                         if read_tx.send(up).await.is_err() {
                             debug!(visitor_name = %visitor_name, "SUDP visitor '{}': reader loop dropped", visitor_name);
                             break;
                         }
                     }
-                    Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => {
+                    Some(Ok(FrpMessage::Ping(_))) | Some(Ok(FrpMessage::Pong(_))) => {
                         // Go sudp.go ignores Ping on the data plane.
-                        continue;
                     }
-                    Ok(other) => {
+                    Some(Ok(other)) => {
                         debug!(visitor_name = %visitor_name, v1_type = %other.v1_type_byte(), "SUDP visitor '{}': unexpected message 0x{:02x}", visitor_name, other.v1_type_byte());
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         debug!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': read closed: {}", visitor_name, e);
+                        break;
+                    }
+                    None => {
+                        debug!(visitor_name = %visitor_name, "SUDP visitor '{}': frame reader ended", visitor_name);
                         break;
                     }
                 }
             }
         }
+    }
+}
+
+/// Aborts the SUDP frame-read task when the worker exits by any path.
+struct SudpReaderAbort(tokio::task::JoinHandle<()>);
+
+impl Drop for SudpReaderAbort {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

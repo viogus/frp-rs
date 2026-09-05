@@ -21,7 +21,7 @@
 //!    service sees the real client IP/port — the v0.70.0 fix (it was not
 //!    written before).
 //! 5. Bridge the decrypted TLS stream and the raw TCP connection
-//!    (`tokio::io::copy_bidirectional_with_sizes`, Go: `libio.Join`).
+//!    (`frp_core::bridge::relay_plain_pooled`, Go: `libio.Join`).
 //!
 //! Config:
 //! - plugin_local_addr: local raw TCP service address
@@ -39,16 +39,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(feature = "tls")]
 use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
-use tokio::time::{timeout, Duration};
+use tokio::time::timeout;
 #[cfg(feature = "tls")]
 use tracing::{debug, warn};
-
-/// Bounded time for the tls2raw handshake phase (PROXY header read + TLS
-/// ServerHello): a remote client that sends TLS bytes but never completes
-/// the handshake must not pin the handler task + fd (and the work-conn
-/// bridge) forever. The subsequent bridge is long-lived and NOT bounded.
-#[cfg(feature = "tls")]
-const PLUGIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Start a TLS-to-raw plugin (Go frp compat: TLS2RawPlugin).
 #[cfg(feature = "tls")]
@@ -98,7 +91,7 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
             //    Any bytes that arrived past the header are returned and
             //    replayed into the TLS handshake below.
             let (proxy_header, extra) = match proxy_proto_ver.as_str() {
-                "v1" => match timeout(PLUGIN_HANDSHAKE_TIMEOUT, read_proxy_header_v1(&mut tunnel_stream))
+                "v1" => match timeout(super::PLUGIN_HANDSHAKE_TIMEOUT, read_proxy_header_v1(&mut tunnel_stream))
                     .await
                 {
                     Ok(Ok(v)) => v,
@@ -107,11 +100,11 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
                         return;
                     }
                     Err(_elapsed) => {
-                        warn!(%target, timeout = ?PLUGIN_HANDSHAKE_TIMEOUT, "tls2raw: PROXY v1 header read timed out");
+                        warn!(%target, timeout = ?super::PLUGIN_HANDSHAKE_TIMEOUT, "tls2raw: PROXY v1 header read timed out");
                         return;
                     }
                 },
-                "v2" => match timeout(PLUGIN_HANDSHAKE_TIMEOUT, read_proxy_header_v2(&mut tunnel_stream))
+                "v2" => match timeout(super::PLUGIN_HANDSHAKE_TIMEOUT, read_proxy_header_v2(&mut tunnel_stream))
                     .await
                 {
                     Ok(Ok(v)) => v,
@@ -120,7 +113,7 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
                         return;
                     }
                     Err(_elapsed) => {
-                        warn!(%target, timeout = ?PLUGIN_HANDSHAKE_TIMEOUT, "tls2raw: PROXY v2 header read timed out");
+                        warn!(%target, timeout = ?super::PLUGIN_HANDSHAKE_TIMEOUT, "tls2raw: PROXY v2 header read timed out");
                         return;
                     }
                 },
@@ -131,14 +124,14 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
             //    Handshake), replaying bytes read past the PROXY header.
             let mut stream = Tls2RawStream::new(tunnel_stream);
             stream.prepend(extra);
-            let mut tls_stream = match timeout(PLUGIN_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+            let tls_stream = match timeout(super::PLUGIN_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                 Ok(Ok(tls)) => tls,
                 Ok(Err(e)) => {
                     warn!(%target, ?e, "tls2raw: TLS handshake failed: {e}");
                     return;
                 }
                 Err(_elapsed) => {
-                    warn!(%target, timeout = ?PLUGIN_HANDSHAKE_TIMEOUT, "tls2raw: TLS handshake timed out");
+                    warn!(%target, timeout = ?super::PLUGIN_HANDSHAKE_TIMEOUT, "tls2raw: TLS handshake timed out");
                     return;
                 }
             };
@@ -162,14 +155,11 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
                 }
             }
 
-            // 5. Bridge TLS (tunnel) ↔ raw TCP (local).
-            if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
-                &mut tls_stream,
-                &mut raw_conn,
-                *frp_core::buffer_pool::BUFFER_SIZE,
-                *frp_core::buffer_pool::BUFFER_SIZE,
-            )
-            .await
+            // 5. Bridge TLS (tunnel) ↔ raw TCP (local) — pooled buffers
+            // (audit round-8 P1: relay_plain_pooled keeps
+            // copy_bidirectional semantics without the per-conn pair).
+            if let Err(e) =
+                frp_core::bridge::relay_plain_pooled(tls_stream, raw_conn).await
             {
                 tracing::debug!(error = %e, "plugin relay error: {}", e);
             }

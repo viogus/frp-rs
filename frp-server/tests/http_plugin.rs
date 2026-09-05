@@ -1213,7 +1213,10 @@ async fn test_plugin_new_work_conn_noop_keeps_valid_conn_pooled() {
 /// session (for opening work streams), and the run_id.
 ///
 /// Same pattern as work_conn_auth.rs::yamux_login (test files are separate
-/// crates; helpers are duplicated).
+/// crates; helpers are duplicated). The login uses pool_count 1 (the
+/// production frpc default): the server prewarms exactly `pool_count`
+/// ReqWorkConns (Go control.go:690, no floor — round-8 F3 removed the old
+/// clamp that prewarmed one even for pool_count 0).
 async fn yamux_login(addr: SocketAddr) -> (IoStream, frp_core::mux::YamuxSession, String) {
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
@@ -1237,7 +1240,7 @@ async fn yamux_login(addr: SocketAddr) -> (IoStream, frp_core::mux::YamuxSession
         user: None,
         run_id: None,
         client_id: None,
-        pool_count: Some(0),
+        pool_count: Some(1),
         timestamp: Some(ts),
         privilege_key: Some(key),
         metas: None,

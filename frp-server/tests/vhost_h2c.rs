@@ -13,6 +13,7 @@ mod common;
 
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{timeout, Duration};
 
 use bytes::Bytes;
 use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
@@ -1044,4 +1045,169 @@ async fn test_h2c_close_delimited_backend_response() {
         body, b"close-delimited body line 1\r\nclose-delimited body line 2",
         "close-delimited body must be streamed byte-exact to EOF"
     );
+}
+
+/// Audit round 8 (G1): backend chunked responses with TRAILERS — announced
+/// via the `Trailer:` head field, delivered after the 0-chunk — must reach
+/// the h2 client as real h2 trailers before END_STREAM. Pre-fix the trailer
+/// section was read and DISCARDED while the `Trailer:` announce header was
+/// still forwarded into the h2 response head (it is not hop-by-hop, so the
+/// head-forward loop keeps it): the h2c client was PROMISED trailers that
+/// never arrived and received bare END_STREAM — internally inconsistent
+/// with the h1 vhost front, which relays chunked responses byte-raw and so
+/// does deliver trailers to h1 clients. Go semantics (pkg/util/vhost/
+/// http.go:57 — httputil.ReverseProxy): what the chunked body carries is
+/// delivered, announced or not; the `Trailer:` head field is the
+/// pre-announce only.
+#[tokio::test]
+async fn test_h2c_backend_trailers_delivered_as_h2_trailers() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-trailers", "trailers.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://trailers.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    let head = read_request_bytes(&mut work_conn).await;
+    assert!(
+        String::from_utf8_lossy(&head).contains("Host: trailers.example.com\r\n"),
+        "head: {:?}",
+        String::from_utf8_lossy(&head)
+    );
+
+    // Chunked backend response with a trailer section: "hello" body, the
+    // terminating 0-chunk, then two trailer fields — X-Checksum is
+    // ANNOUNCED in the `Trailer:` head field, X-Mirror is NOT — followed by
+    // the closing blank line.
+    work_conn
+        .write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Trailer: X-Checksum\r\n\
+              Transfer-Encoding: chunked\r\n\
+              \r\n\
+              5\r\nhello\r\n\
+              0\r\n\
+              X-Checksum: abc123\r\n\
+              X-Mirror: unannounced\r\n\
+              \r\n",
+        )
+        .await
+        .expect("write trailer-bearing backend response");
+
+    // Bounded (round-2 review, audit round 8): a regression that wedges the
+    // vhost→backend forward path parks these awaits forever — a hang stalls
+    // the whole test binary instead of failing. One shared 10s deadline
+    // bounds the response wait AND the body/trailer drain, so a wedge
+    // FAILS loudly instead of hanging.
+    timeout(Duration::from_secs(10), async {
+        let response = response_fut
+            .await
+            .expect("h2 response never forwarded (wedged forward path?)");
+        assert_eq!(response.status().as_u16(), 200);
+        // The announce header is forwarded into the h2 response head.
+        assert_eq!(
+            response.headers()["trailer"].to_str().unwrap(),
+            "X-Checksum"
+        );
+
+        let mut body = response.into_body();
+        let mut data = Vec::new();
+        while let Some(chunk) = body.data().await {
+            data.extend_from_slice(&chunk.expect("h2 body chunk"));
+        }
+        assert_eq!(data, b"hello");
+
+        let trailers = body
+            .trailers()
+            .await
+            .expect("trailers() must not error")
+            .expect(
+                "announced backend trailer X-Checksum must be delivered as an h2 trailer \
+                 before END_STREAM (pre-fix the trailer section was discarded)",
+            );
+        assert_eq!(
+            trailers.get("x-checksum").and_then(|v| v.to_str().ok()),
+            Some("abc123")
+        );
+        // A trailer name NOT declared in the announce is still delivered — Go
+        // delivers what arrives.
+        assert_eq!(
+            trailers.get("x-mirror").and_then(|v| v.to_str().ok()),
+            Some("unannounced")
+        );
+    })
+    .await
+    .expect("h2 response + trailer drain never completed (wedged forward path?)");
+}
+
+/// Audit round 8 (G10): duplicate same-name backend response headers must
+/// survive the h2 re-encode with ALL values preserved, in order. The
+/// response-head forward loop appends (never inserts — `insert` collapses
+/// duplicates and the last value wins), which is what keeps two `Set-Cookie`
+/// headers distinct. Pin the property end-to-end so a regression to
+/// `insert` cannot pass silently.
+#[tokio::test]
+async fn test_h2c_duplicate_response_headers_all_values_preserved() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-dup-hdrs", "dup-hdrs.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://dup-hdrs.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    let head = read_request_bytes(&mut work_conn).await;
+    assert!(
+        String::from_utf8_lossy(&head).contains("Host: dup-hdrs.example.com\r\n"),
+        "head: {:?}",
+        String::from_utf8_lossy(&head)
+    );
+
+    // Two distinct Set-Cookie headers on a Content-Length response.
+    work_conn
+        .write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Length: 2\r\n\
+              Set-Cookie: a=1; Path=/\r\n\
+              Set-Cookie: b=2; Path=/\r\n\
+              \r\n\
+              ok",
+        )
+        .await
+        .expect("write backend response");
+
+    // Bounded (round-2 review, audit round 8): see the trailers test — the
+    // response wait and body drain share one 10s deadline so a wedged
+    // forward path fails instead of hanging the test binary.
+    timeout(Duration::from_secs(10), async {
+        let response = response_fut
+            .await
+            .expect("h2 response never forwarded (wedged forward path?)");
+        assert_eq!(response.status().as_u16(), 200);
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().expect("ascii cookie value"))
+            .collect();
+        assert_eq!(
+            cookies,
+            vec!["a=1; Path=/", "b=2; Path=/"],
+            "BOTH Set-Cookie values must arrive in order — a regression to \
+             insert would collapse them into the last value only"
+        );
+        let body = read_h2_body(response.into_body()).await;
+        assert_eq!(body, b"ok");
+    })
+    .await
+    .expect("h2 response + body never completed (wedged forward path?)");
 }

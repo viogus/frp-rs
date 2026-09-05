@@ -1021,21 +1021,25 @@ fn is_blank_line(b: &[u8]) -> bool {
     b.iter().all(|&c| matches!(c, b'\r' | b'\n' | b' ' | b'\t'))
 }
 
-/// Decode a chunked response body and stream it as HTTP/2 DATA frames.
-/// Read errors truncate the body (Go treats an aborted backend body as EOF);
-/// a MALFORMED chunk terminator is an explicit framing error (Go
-/// chunkedReader: "malformed chunked encoding") that drops the stream
-/// instead of delivering a truncated 200. `scratch` is the caller-owned
-/// buffer reused for every chunk (see `BodyReader::read_exact_into`).
+/// Decode a chunked response body and stream it as HTTP/2 DATA frames,
+/// returning the trailer section (RFC 7230 §4.1.2) the backend sent after
+/// the terminating 0-chunk, if any.
+///
+/// Read errors truncate the body (Go treats an aborted backend body as EOF)
+/// and yield no trailers; a MALFORMED chunk terminator is an explicit
+/// framing error (Go chunkedReader: "malformed chunked encoding") that
+/// drops the stream instead of delivering a truncated 200. `scratch` is the
+/// caller-owned buffer reused for every chunk (see
+/// `BodyReader::read_exact_into`).
 async fn stream_chunked_body(
     reader: &mut BodyReader<'_, impl AsyncRead + Unpin>,
     send: &mut SendStream<Bytes>,
     scratch: &mut Vec<u8>,
-) -> Result<(), h2::Error> {
+) -> Result<http::HeaderMap, h2::Error> {
     loop {
         let line = match reader.read_line().await {
             Ok(l) => l,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(http::HeaderMap::new()),
         };
         let mut line = line.as_slice();
         if line.ends_with(b"\r\n") {
@@ -1051,17 +1055,57 @@ async fn stream_chunked_body(
         let size_part = line.split(|&b| b == b';').next().unwrap_or(line);
         let size = match parse_hex(trim_ascii_ws(size_part)) {
             Ok(s) => s,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(http::HeaderMap::new()),
         };
         if size == 0 {
-            // Trailing headers until the final blank line (RFC 7230 §4.1.2).
+            // Trailer section: trailer fields run from after the terminating
+            // 0-chunk to the final blank line (RFC 7230 §4.1.2). Audit
+            // round 8 (G1): these used to be read and DISCARDED here while
+            // the backend's `Trailer:` announce header was still forwarded
+            // into the h2 response head (it is not hop-by-hop, so the head
+            // loop keeps it) — the h2c client was PROMISED trailers that
+            // never arrived and then got bare END_STREAM. Collect the
+            // fields; the caller delivers them as h2 trailers before
+            // END_STREAM. Go semantics (pkg/util/vhost/http.go:57 —
+            // httputil.ReverseProxy): what the chunked body carries is
+            // delivered, announced or not; the `Trailer:` head field is the
+            // pre-announce only.
+            let mut trailers = http::HeaderMap::new();
             loop {
-                match reader.read_line().await {
-                    Ok(t) if !is_blank_line(&t) => continue,
+                let line = match reader.read_line().await {
+                    Ok(l) if !is_blank_line(&l) => l,
                     Ok(_) | Err(_) => break,
+                };
+                let mut field = line.as_slice();
+                if field.ends_with(b"\r\n") {
+                    field = &field[..field.len() - 2];
+                } else if field.ends_with(b"\n") {
+                    field = &field[..field.len() - 1];
                 }
+                let field = trim_ascii_ws(field);
+                let Some(colon) = field.iter().position(|&b| b == b':') else {
+                    continue; // not a field line — ignored (tolerance as before)
+                };
+                // Same parse shape as parse_response_head (name and value
+                // outer-trimmed; invalid names/values skipped so one hostile
+                // field cannot kill delivery of the rest).
+                let (Ok(name), Ok(value)) = (
+                    http::HeaderName::from_bytes(trim_ascii_ws(&field[..colon])),
+                    http::HeaderValue::from_bytes(trim_ascii_ws(&field[colon + 1..])),
+                ) else {
+                    continue;
+                };
+                if is_hop_by_hop(name.as_str()) {
+                    // Connection-specific fields are forbidden in ANY h2
+                    // HEADERS block (RFC 9113 §8.2.2 — the h2 encoder
+                    // rejects them in trailers too).
+                    continue;
+                }
+                // `append`, not `insert`: duplicate trailer names keep every
+                // value, like the response-head forward loop.
+                trailers.append(name, value);
             }
-            return Ok(());
+            return Ok(trailers);
         }
         // Round 10 (MEDIUM): `size` comes from the backend's chunk-size
         // line — buffering it in one `read_exact(size)` allocates
@@ -1076,7 +1120,7 @@ async fn stream_chunked_body(
             let n = remaining.min(MAX_CHUNK_SIZE);
             match reader.read_exact_into(scratch, n).await {
                 Ok(()) => {}
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(http::HeaderMap::new()),
             }
             send.send_data(Bytes::copy_from_slice(scratch), false)?;
             remaining -= n;
@@ -1185,8 +1229,22 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     let mut scratch: Vec<u8> = Vec::new();
 
     if chunked {
-        stream_chunked_body(&mut reader, &mut send, &mut scratch).await?;
-    } else if let Some(mut remaining) = content_length {
+        let trailers = stream_chunked_body(&mut reader, &mut send, &mut scratch).await?;
+        if trailers.is_empty() {
+            send.send_data(Bytes::new(), true)?;
+        } else {
+            // Audit round 8 (G1): the backend sent a trailer section after
+            // its terminating 0-chunk — deliver it as real h2 trailers.
+            // `send_trailers` ends the stream with a HEADERS frame
+            // (END_STREAM), replacing the bare empty-DATA end. The values
+            // were announced to the client already via the forwarded
+            // `Trailer:` head field (and unannounced fields arrive too —
+            // Go delivers what arrives).
+            send.send_trailers(trailers)?;
+        }
+        return Ok(());
+    }
+    if let Some(mut remaining) = content_length {
         while remaining > 0 {
             let n = remaining.min(8192);
             match reader.read_exact_into(&mut scratch, n).await {

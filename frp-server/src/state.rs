@@ -505,12 +505,23 @@ pub type PortReservationMap = std::collections::HashMap<String, (u16, bool, std:
 /// The first member to register creates the group and (through
 /// `register_http_vhost`/`register_https_vhost`) the shared vhost route;
 /// subsequent members only join the member list after the group_key and
-/// routing params (domain/location/route_by_http_user) match.
+/// kind-specific routing params match: http groups compare
+/// domain/location/route_by_http_user (Go HTTPGroup.Register) while https
+/// groups compare the domain ONLY (Go HTTPSGroup.Listen — audit round 8,
+/// F5; see `kind_https`).
 pub(crate) struct HttpGroup {
     group_key: String,
     domain: String,
     location: String,
     route_by_http_user: String,
+    /// Proxy kind that created the group: https groups compare ONLY
+    /// group + domain on join (Go HTTPSGroup.Listen); http groups compare
+    /// domain + location + route_by_http_user (Go HTTPGroup.Register). Go
+    /// keeps the two kinds in separate controllers; frp-rs shares one
+    /// registry keyed by group name, so the first kind to register wins and
+    /// a cross-kind join is rejected (frp-rs-only constraint — audit
+    /// round 8, F5).
+    kind_https: bool,
     /// Member proxy names, in registration order (round-robin).
     members: RwLock<Vec<String>>,
     /// Round-robin cursor (Go `atomic.Uint64` index).
@@ -557,6 +568,12 @@ impl HttpGroupController {
             // ErrGroupAuthFailed).
             // group name matches by construction (registry key); validate the
             // routing params (Go ErrGroupParamsInvalid).
+            if g.kind_https {
+                return Err(format!(
+                    "http group [{}] is registered by an HTTPS proxy; an http proxy cannot join it (Go keeps HTTP/HTTPS groups in separate controllers)",
+                    group
+                ));
+            }
             if g.domain != domain
                 || g.location != location
                 || g.route_by_http_user != route_by_http_user
@@ -587,6 +604,64 @@ impl HttpGroupController {
             domain: domain.to_string(),
             location: location.to_string(),
             route_by_http_user: route_by_http_user.to_string(),
+            kind_https: false,
+            members: RwLock::new(vec![proxy_name.to_string()]),
+            index: AtomicU64::new(0),
+            route_owner: proxy_name.to_string(),
+        });
+        groups.insert(group.to_string(), g.clone());
+        Ok((g, true))
+    }
+
+    /// Register an HTTPS group member (Go frp v0.71.0 `HTTPSGroup.Listen`,
+    /// server/group/https.go). HTTPS group membership compares ONLY the
+    /// group name and domain — the route config's location and
+    /// route_by_http_user never participate (an https proxy carries no
+    /// locations and Go's listenForDomain builds an empty RouteConfig, so
+    /// rubu is meaningless). Validation ORDER matches Go: params (domain)
+    /// before the key. Errors are the Go constants verbatim
+    /// (`ErrGroupParamsInvalid` / `ErrGroupAuthFailed`,
+    /// server/group/group.go:22-26) — the caller sends them to the client
+    /// unconditionally. Repeated identical same-domain registration (a
+    /// proxy listing the same custom_domain twice) is accepted; the member
+    /// is added once.
+    pub async fn register_https_member(
+        &self,
+        group: &str,
+        group_key: &str,
+        domain: &str,
+        proxy_name: &str,
+    ) -> Result<(Arc<HttpGroup>, bool), String> {
+        let mut groups = self.groups.write().await;
+        if let Some(g) = groups.get(group) {
+            // Cross-kind join (frp-rs-only constraint — Go keeps separate
+            // controllers): an https proxy cannot join an http-kind group.
+            if !g.kind_https {
+                return Err(format!(
+                    "http group [{}] is registered by an HTTP proxy; an https proxy cannot join it (Go keeps HTTP/HTTPS groups in separate controllers)",
+                    group
+                ));
+            }
+            // Go HTTPSGroup.Listen (https.go): route config in the same
+            // group must be equal — and ONLY the domain is part of it.
+            if g.domain != domain {
+                return Err("group params invalid".to_string());
+            }
+            if g.group_key != group_key {
+                return Err("group auth failed".to_string());
+            }
+            let mut members = g.members.write().await;
+            if !members.iter().any(|m| m == proxy_name) {
+                members.push(proxy_name.to_string());
+            }
+            return Ok((g.clone(), false));
+        }
+        let g = Arc::new(HttpGroup {
+            group_key: group_key.to_string(),
+            domain: domain.to_string(),
+            location: String::new(),
+            route_by_http_user: String::new(),
+            kind_https: true,
             members: RwLock::new(vec![proxy_name.to_string()]),
             index: AtomicU64::new(0),
             route_owner: proxy_name.to_string(),
@@ -1282,14 +1357,49 @@ impl AppState {
         // limiting while the table drains.
         if !throttle.contains_key(&ip) && throttle.len() >= MAX_THROTTLE_ENTRIES {
             const OVERFLOW_MAX_PER_IP: u32 = 50;
+            // Overflow-bucket bound (audit round 8, F11): the 90s retain
+            // alone left the bucket UNBOUNDED under a sustained flood of
+            // fresh source IPs (every new IP inside the 90s window was
+            // kept, ~4096+ rows per 90s forever). Cap the bucket and evict
+            // the OLDEST entry (earliest window_start) at the cap
+            // (ReplayTable cap-evicts-oldest precedent). Both the 90s
+            // retain and the eviction scan are O(OVERFLOW_CAP) and run
+            // ONLY at cap pressure — never O(n) per attempt below it
+            // (entries below the cap expire via the at-cap retain; memory
+            // is bounded by the cap either way). Per-IP semantics are
+            // unchanged: 50 attempts per 60s window.
+            const OVERFLOW_CAP: usize = 4096;
             // Drop the main-table guard before acquiring the overflow lock —
             // the nested acquisition was safe (no reverse order anywhere) but
             // fragile to future refactoring (audit round 5, MEDIUM 3.1).
             drop(throttle);
             let mut overflow = self.login_throttle_overflow.lock().await;
-            // Cleanup mirrors the main table (90s).
-            overflow
-                .retain(|_, (_, window_start)| now.duration_since(*window_start) < CLEANUP_TIMEOUT);
+            // Cleanup mirrors the main table (90s) — amortized to cap
+            // pressure only: below the cap expired rows cost nothing to
+            // keep (the cap bounds memory) and the 60s window logic below
+            // resets a stale row in place when its IP returns.
+            if !overflow.contains_key(&ip) && overflow.len() >= OVERFLOW_CAP {
+                overflow.retain(|_, (_, window_start)| {
+                    now.duration_since(*window_start) < CLEANUP_TIMEOUT
+                });
+                if overflow.len() >= OVERFLOW_CAP {
+                    // Still full of live entries — evict the oldest so the
+                    // new IP is admitted (ReplayTable precedent). Ties in
+                    // window_start evict the first row iterated: any
+                    // oldest-age row is a valid victim.
+                    let mut oldest_ip: Option<std::net::IpAddr> = None;
+                    let mut oldest_start = now;
+                    for (entry_ip, (_, window_start)) in overflow.iter() {
+                        if oldest_ip.is_none() || *window_start < oldest_start {
+                            oldest_start = *window_start;
+                            oldest_ip = Some(*entry_ip);
+                        }
+                    }
+                    if let Some(oldest) = oldest_ip {
+                        overflow.remove(&oldest);
+                    }
+                }
+            }
             let (count, window_start) = overflow.entry(ip).or_insert((0, now));
             if now.duration_since(*window_start) > std::time::Duration::from_secs(60) {
                 *count = 1;
@@ -2162,6 +2272,198 @@ mod tests {
                 .check_login_throttle(std::net::SocketAddr::from((untracked, 103)))
                 .await
         );
+    }
+
+    // F11: the overflow bucket must be BOUNDED. The main table caps at 512
+    // and the 90s retain only removes TIME-expired rows, so the overflow
+    // bucket previously grew without limit under a sustained flood of fresh
+    // source IPs (~4096+ rows per 90s forever). A cap with oldest-eviction
+    // (ReplayTable precedent) bounds total per-IP state at
+    // MAX_THROTTLE_ENTRIES + OVERFLOW_CAP; per-IP 50/60s semantics are
+    // unchanged.
+    #[tokio::test]
+    async fn check_login_throttle_overflow_bucket_bounded_under_ip_burst() {
+        let state = test_state();
+        // Fill the main table to its 512-entry cap with distinct IPs.
+        for i in 0u16..512 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                10,
+                (i >> 8) as u8,
+                (i & 0xff) as u8,
+                1,
+            ));
+            assert!(
+                state
+                    .check_login_throttle(std::net::SocketAddr::from((ip, 1)))
+                    .await
+            );
+        }
+        // Burst ~6200 more distinct IPs (all inside the 90s retain window —
+        // the whole burst runs in milliseconds). Pre-fix the overflow
+        // bucket kept every one of them.
+        let mut newest = std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0));
+        for i in 512u32..=6800 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                172,
+                (i >> 16) as u8,
+                ((i >> 8) & 0xff) as u8,
+                (i & 0xff) as u8,
+            ));
+            assert!(
+                state
+                    .check_login_throttle(std::net::SocketAddr::from((ip, 1)))
+                    .await,
+                "first attempt of burst IP {i} must be allowed"
+            );
+            newest = ip;
+        }
+        {
+            let t = state.login_throttle.lock().await;
+            assert_eq!(t.len(), 512, "main table must stay at its cap");
+        }
+        let o = state.login_throttle_overflow.lock().await;
+        assert!(
+            o.len() <= 4096,
+            "overflow bucket must be capped at 4096 entries, got {}",
+            o.len()
+        );
+        assert!(
+            o.contains_key(&newest),
+            "the newest burst IP must survive (just admitted)"
+        );
+    }
+
+    // F11: eviction at the cap must remove the OLDEST entry (earliest
+    // window_start), never an arbitrary/newer one — the flood victim is
+    // always the entry whose throttle state is closest to expiry.
+    #[tokio::test]
+    async fn check_login_throttle_overflow_at_cap_evicts_oldest() {
+        let state = test_state();
+        // Fill the main table so untracked IPs fall into the overflow
+        // bucket.
+        for i in 0u16..512 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                10,
+                (i >> 8) as u8,
+                (i & 0xff) as u8,
+                1,
+            ));
+            state
+                .check_login_throttle(std::net::SocketAddr::from((ip, 1)))
+                .await;
+        }
+        // Seed the overflow bucket AT the cap (4096) with staggered
+        // timestamps all inside the 90s retain window: entry i is
+        // 2s + i*20ms old → entry 4095 (83.9s old) is the oldest and must
+        // be the eviction victim.
+        let now = std::time::Instant::now();
+        {
+            let mut o = state.login_throttle_overflow.lock().await;
+            for i in 0..4096u32 {
+                let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    172,
+                    16 + (i >> 8) as u8,
+                    (i & 0xff) as u8,
+                    1,
+                ));
+                o.insert(
+                    ip,
+                    (
+                        1,
+                        now - std::time::Duration::from_millis(2000 + 20 * i as u64),
+                    ),
+                );
+            }
+        }
+        let new_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 32, 0, 1));
+        assert!(
+            state
+                .check_login_throttle(std::net::SocketAddr::from((new_ip, 1)))
+                .await,
+            "new IP must be admitted at the cap (evict-oldest)"
+        );
+        let o = state.login_throttle_overflow.lock().await;
+        assert_eq!(o.len(), 4096, "cap must hold: one eviction per admission");
+        assert!(o.contains_key(&new_ip), "new IP must be present");
+        let oldest = std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 31, 255, 1));
+        assert!(
+            !o.contains_key(&oldest),
+            "the oldest entry (i=4095) must be the eviction victim"
+        );
+        let newest_seed = std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1));
+        assert!(
+            o.contains_key(&newest_seed),
+            "the newest seeded entry (i=0) must survive"
+        );
+    }
+
+    // F11: at-cap admission must FIRST sweep 90s-expired rows so live
+    // entries are only evicted when the bucket is genuinely full of fresh
+    // state.
+    #[tokio::test]
+    async fn check_login_throttle_overflow_at_cap_cleans_stale_before_evicting() {
+        let state = test_state();
+        for i in 0u16..512 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                10,
+                (i >> 8) as u8,
+                (i & 0xff) as u8,
+                1,
+            ));
+            state
+                .check_login_throttle(std::net::SocketAddr::from((ip, 1)))
+                .await;
+        }
+        let now = std::time::Instant::now();
+        {
+            let mut o = state.login_throttle_overflow.lock().await;
+            // 100 stale rows (>90s old, would be retained forever pre-fix
+            // without an at-cap sweep)...
+            for i in 0..100u32 {
+                let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    172,
+                    16 + (i >> 8) as u8,
+                    (i & 0xff) as u8,
+                    1,
+                ));
+                o.insert(
+                    ip,
+                    (
+                        50,
+                        now - std::time::Duration::from_millis(91_000 + 20 * i as u64),
+                    ),
+                );
+            }
+            // ...and 3996 live rows fill the rest of the cap.
+            for i in 100..4096u32 {
+                let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    172,
+                    16 + (i >> 8) as u8,
+                    (i & 0xff) as u8,
+                    1,
+                ));
+                o.insert(ip, (1, now - std::time::Duration::from_secs(10)));
+            }
+        }
+        let new_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 32, 0, 1));
+        assert!(
+            state
+                .check_login_throttle(std::net::SocketAddr::from((new_ip, 1)))
+                .await,
+            "new IP must be admitted via the stale sweep (no live eviction needed)"
+        );
+        let o = state.login_throttle_overflow.lock().await;
+        assert_eq!(
+            o.len(),
+            4096 - 100 + 1,
+            "stale rows must be swept at cap pressure before any admission"
+        );
+        assert!(o.contains_key(&new_ip));
+        // A live row must NOT have been evicted (the sweep made room).
+        let live = std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 17, 0, 1));
+        assert!(o.contains_key(&live), "live rows must survive the sweep");
+        let stale = std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1));
+        assert!(!o.contains_key(&stale), "91s+ rows must be swept");
     }
     // M2: tcpmux group fan-out (Go frp v0.71.0 group.TCPMuxGroup). Second
     // members join after Go-order validation (params → "group params
