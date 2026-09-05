@@ -517,6 +517,22 @@ impl KcpSession {
                 });
             group.last_active_ms = now;
 
+            // Belt-and-braces: an entry whose shards vec no longer matches
+            // `total` can only be a stranded leftover of a decode error path
+            // (see the recovery feed below) — indexing it would panic. Reset
+            // it to a fresh group instead of touching the empty vec.
+            if group.shards.len() != total {
+                tracing::warn!(
+                    conv = self.conv,
+                    shard_begin,
+                    "KCP SESSION: resetting malformed FEC group (shards.len()={}, total={})",
+                    group.shards.len(),
+                    total
+                );
+                group.shards = vec![None; total];
+                group.received_count = 0;
+            }
+
             // Feed data shards to KCP immediately (Go kcp-go behavior).
             // Raw KCP data = shard_data[2..][..SIZE-2] where SIZE is first 2 bytes.
             if flag == TYPE_DATA && group.shards[shard_index].is_none() && shard_data.len() >= 2 {
@@ -578,8 +594,15 @@ impl KcpSession {
                     v.resize(max_len, 0);
                 }
 
+                // Feed recovered (previously missing) data shards to KCP.
+                // Errors are collected, NOT propagated with `?`: the group
+                // must be removed unconditionally. A hostile SIZE field
+                // (recovered slice < KCP_OVERHEAD → Err) used to return
+                // early with the mem::take'd empty vec still registered —
+                // the next datagram for this shard_begin indexed it and
+                // panicked (abort under panic="abort").
+                let mut feed_err: Option<io::Error> = None;
                 if fec.decode(&mut decode_shards) {
-                    // Feed recovered (previously missing) data shards to KCP.
                     for i in 0..self.config.data_shards {
                         if had_data[i] {
                             continue;
@@ -590,10 +613,14 @@ impl KcpSession {
                                     u16::from_le_bytes([recovered[0], recovered[1]]) as usize;
                                 if size >= 2 {
                                     let payload_end = (size - 2).min(recovered.len() - 2);
-                                    if payload_end > 0 {
-                                        self.kcp
+                                    if payload_end > 0 && feed_err.is_none() {
+                                        if let Err(e) = self
+                                            .kcp
                                             .input(&recovered[2..2 + payload_end])
-                                            .map_err(io::Error::other)?;
+                                            .map_err(io::Error::other)
+                                        {
+                                            feed_err = Some(e);
+                                        }
                                     }
                                 }
                             }
@@ -601,6 +628,9 @@ impl KcpSession {
                     }
                 }
                 self.shard_groups.remove(&shard_begin);
+                if let Some(e) = feed_err {
+                    return Err(e);
+                }
             }
         } else {
             self.kcp.input(data).map_err(io::Error::other)?;
@@ -1147,6 +1177,88 @@ mod tests {
             }
         }
         panic!("timed out waiting for FEC data with trailing zero");
+    }
+
+    /// Build one FEC wire datagram: seqid u32 LE + flag u16 LE + body.
+    fn fec_datagram(seqid: u32, flag: u16, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(FEC_HEADER_SIZE + body.len());
+        v.extend_from_slice(&seqid.to_le_bytes());
+        v.extend_from_slice(&flag.to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// Audit round 10 BLOCKER regression: a recovery-feed error must not
+    /// strand a taken-but-unremoved shard group.
+    ///
+    /// Old code `mem::take`d the group's shards, fed the RS-recovered data
+    /// shard to KCP with `?` BEFORE `shard_groups.remove()`, so a hostile
+    /// SIZE field (recovered slice < KCP_OVERHEAD → `Err`) returned early
+    /// with the group still registered: `shards == []`, `received_count >=
+    /// data_shards`. The next FEC datagram for the same group then indexed
+    /// the empty vec at the DATA/parity store sites → panic → abort under
+    /// `panic="abort"` — unauthenticated remote crash.
+    #[test]
+    fn test_fec_recovery_feed_error_does_not_strand_group() {
+        let config = fec_config(); // data_shards = 3, parity_shards = 2
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut session =
+            KcpSession::new(7, "127.0.0.1:9999".parse().unwrap(), config, tx);
+
+        // Offline search for a parity byte that makes the RS-recovered data
+        // shard carry SIZE >= 3 (recovered.len() == 4 here, so the feed
+        // slice is SIZE-2 <= 2 bytes — always < KCP_OVERHEAD → Err). The
+        // decode matrix is content-independent, so the winner is
+        // deterministic for a fixed (parity_slot, byte) pair.
+        let fec = Fec::new(3, 2);
+        let mut steering: Option<(usize, u8)> = None;
+        'search: for parity_slot in [3usize, 4] {
+            for e in 0u8..=255 {
+                let mut shards: Vec<Option<Vec<u8>>> = vec![None; 5];
+                shards[0] = Some(vec![2, 0, 0xaa, 0xbb]);
+                shards[1] = Some(vec![2, 0, 0xcc, 0xdd]);
+                shards[parity_slot] = Some(vec![e, 0x11, 0x22, 0x33]);
+                if !fec.decode(&mut shards) {
+                    continue; // singular selection for this slot — try next
+                }
+                let recovered = shards[2].as_ref().expect("slot 2 recovered");
+                let size = u16::from_le_bytes([recovered[0], recovered[1]]) as usize;
+                if size >= 3 {
+                    steering = Some((parity_slot, e));
+                    break 'search;
+                }
+            }
+        }
+        let (parity_slot, e) = steering.expect("steering byte found");
+
+        // Session-level sequence (all datagrams share shard_begin 0).
+        let data0 = fec_datagram(0, TYPE_DATA, &[2, 0, 0xaa, 0xbb]);
+        let data1 = fec_datagram(1, TYPE_DATA, &[2, 0, 0xcc, 0xdd]);
+        let parity = fec_datagram(
+            parity_slot as u32,
+            TYPE_PARITY,
+            &[e, 0x11, 0x22, 0x33],
+        );
+
+        session.input(&data0).expect("data shard 0 accepted");
+        session.input(&data1).expect("data shard 1 accepted");
+        // Third shard fills data_shards → decode path → recovered slot 2
+        // feeds KCP a < 24-byte slice → Err. Pre-fix code returned BEFORE
+        // removing the group, stranding `shards == []`.
+        assert!(
+            session.input(&parity).is_err(),
+            "hostile SIZE on the recovered shard must surface as an error"
+        );
+
+        // Fourth datagram for the same group: pre-fix it indexed the
+        // stranded empty vec → panic. Must return Ok (fresh group) instead.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.input(&data0)
+        }));
+        match panicked {
+            Ok(res) => assert!(res.is_ok(), "post-recovery group must restart cleanly"),
+            Err(_) => panic!("stranded FEC group panicked on the next datagram (abort under panic=abort)"),
+        }
     }
 
     #[test]
