@@ -315,6 +315,7 @@ impl TcpGroupCtl {
     /// `realPort`); `declared_port` the first member's DECLARED remote port
     /// (Go `tg.port` — 0 when it auto-assigned, and the value later
     /// members must declare to join).
+    #[allow(clippy::too_many_arguments)] // mirrors the register_member signature shape
     pub async fn create_group(
         &self,
         group: &str,

@@ -108,10 +108,7 @@ pub(super) fn process_includes(
 
         for path in &paths {
             let content = std::fs::read_to_string(path).map_err(|e| {
-                format!(
-                    "include: read included file {} error: {e}",
-                    path.display()
-                )
+                format!("include: read included file {} error: {e}", path.display())
             })?;
             // Parse the include file with format detection (extension-based),
             // so `.yaml`/`.yml` include files go through the same
@@ -120,10 +117,7 @@ pub(super) fn process_includes(
             // %s error"), never silently drops the file.
             let format = detect_format(path.to_string_lossy().as_ref());
             let inc_value: Value = parse_to_toml_value(&content, format).map_err(|e| {
-                format!(
-                    "include: parse included file {} error: {e}",
-                    path.display()
-                )
+                format!("include: parse included file {} error: {e}", path.display())
             })?;
 
             // Deep-merge included config into main config

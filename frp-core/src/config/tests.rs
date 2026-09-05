@@ -3594,7 +3594,7 @@ fn test_template_envs_reference_expands() {
     // .Envs.FRP_TOKEN }}"` is the canonical Go config. It must expand, not
     // stay verbatim (a literal `{{ .Envs.X }}` token fails auth silently).
     const NAME: &str = "FRP_RS_TEST_TEMPLATE_ENVS_1";
-    let _ = std::env::remove_var(NAME);
+    std::env::remove_var(NAME);
     assert_eq!(
         expand_template_in_str(&format!("{{{{ .Envs.{NAME} }}}}")),
         "",
