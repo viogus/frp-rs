@@ -648,6 +648,38 @@ async fn write_http_error_auth_response(
     }
 }
 
+/// Write the raw error response Go's `conn.serve` produces for
+/// readRequest/parse failures (net/http server.go `errorHeaders`: status
+/// line + Content-Type: text/plain; charset=utf-8 + Connection: close +
+/// the status text as body — verified byte-for-byte against live go1.25
+/// probes for the generic 400, the 431 errTooLarge render, the 505
+/// statusError render, and the badRequestError renders). `status` is the
+/// FULL text — the status line and the body carry the same string, detail
+/// included ("505 HTTP Version Not Supported: unsupported protocol
+/// version", "400 Bad Request: missing required Host header" — Go shows
+/// the detail for these; the generic "malformed HTTP request" parse
+/// failure is the bare "400 Bad Request"). No Content-Length (the 431
+/// arm's old CL:0 line was round-9 F5 divergence), no trailing LF after
+/// the body text, and no nosniff — the auth-fail render above is a
+/// different http.Error shape with its own fixed fields. (F5, audit
+/// round 9 — the four pre-existing bare 3-line 400/505 writers and the
+/// CL:0 431 all routed through this one Go-shape emitter.)
+async fn write_go_server_error(stream: &mut (impl tokio::io::AsyncWriteExt + Unpin), status: &str) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    if let Err(e) = stream.write_all(head.as_bytes()).await {
+        tracing::debug!(error = %e, "failed to write HTTP error response header");
+        return;
+    }
+    if let Err(e) = stream.write_all(status.as_bytes()).await {
+        tracing::debug!(error = %e, "failed to write HTTP error response body");
+    }
+}
+
 /// Upper cap (seconds) applied by `clamp_vhost_timeout`. 24h is far beyond
 /// any real client-head bound — the value only ever clocks client-side head
 /// reads / handshakes plus the h2c backend response-head read; Rust-only
@@ -839,8 +871,10 @@ async fn handle_http1_request<S>(
     // backend block waiting for the rest of the head, tying up a work-conn
     // slot (limited DoS on shared vhosts).
     if pre_read.len() >= 4096 && frp_core::textproto::head_end(&pre_read).is_none() {
-        let resp = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let _ = stream.write_all(resp).await;
+        // Go's errTooLarge render (conn.serve: status line + charset +
+        // Connection: close + body text — NO Content-Length; the old CL:0
+        // shape was audit-round-9 F5 divergence, probe OVERSIZE).
+        write_go_server_error(&mut stream, "431 Request Header Fields Too Large").await;
         return;
     }
 
@@ -888,29 +922,36 @@ async fn handle_http1_request<S>(
             &request_text_cow
         }
     };
-    // Round 6 (A3/A4/A7): Go net/http request-line semantics — version
-    // gates (malformed shape → 400, non-1.x → 505), absolute-form routing
-    // (req.Host = req.URL.Host — Host header ignored), path minus query.
+    // Rounds 6 + audit round 9 (F1/F4/F5): Go net/http request-line
+    // semantics — version gates (malformed shape OR missing version → 400,
+    // non-1.x → 505), absolute-form routing (req.Host = req.URL.Host — Host
+    // header ignored for routing), path minus query. The parse-Ok arm no
+    // longer answers for a missing Host value: the wire-Host gate below
+    // decides (F4) — an HTTP/1.1 non-CONNECT request with NO Host header
+    // line is 400 "missing required Host header" (Go conn.readRequest); the
+    // gate-exempt shapes (HTTP/1.0, CONNECT, an empty-valued "Host:" line)
+    // route on "" (Go req.Host fallback) and miss → 404.
     let (host, path, is_absolute_form) = match parse_vhost_request_line(request_text) {
         RequestLine::Ok {
             host,
             path,
             absolute_form,
-        } => {
-            let Some(host) = host else {
-                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-                return;
-            };
-            (host.to_string(), path.to_string(), absolute_form)
-        }
+        } => (host.map(str::to_string), path.to_string(), absolute_form),
         RequestLine::BadRequest => {
-            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            // Go: "malformed HTTP request" / "malformed HTTP version" parse
+            // failures — generic 400 render (probes T2TOK/TABJOIN).
+            write_go_server_error(&mut stream, "400 Bad Request").await;
             return;
         }
         RequestLine::VersionNotSupported => {
-            let _ = stream
-                .write_all(b"HTTP/1.1 505 HTTP Version Not Supported\r\nConnection: close\r\n\r\n")
-                .await;
+            // Go conn.readRequest's http1ServerSupportsRequest gate — the
+            // detail is carried on the status line AND the body (probe
+            // EXPL20).
+            write_go_server_error(
+                &mut stream,
+                "505 HTTP Version Not Supported: unsupported protocol version",
+            )
+            .await;
             return;
         }
     };
@@ -931,11 +972,37 @@ async fn handle_http1_request<S>(
     // such requests with 400; forwarding duplicates verbatim would let a
     // second Host shadow the routed proxy's host_header_rewrite. Applies
     // to origin-form and absolute-form alike (Go's readRequest rejects
-    // duplicate Host headers before either routing path).
+    // duplicate Host headers before either routing path — probe DUPHOST11:
+    // generic 400).
     if count_host_headers(request_text) > 1 {
-        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        write_go_server_error(&mut stream, "400 Bad Request").await;
         return;
     }
+    // F4 (audit round 9): Go conn.readRequest's wire-Host gate
+    // (server.go:1056-1059): `req.ProtoAtLeast(1, 1) && (!haveHost ||
+    // len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT"` →
+    // badRequestError("missing required Host header"), rendered with the
+    // detail (probes 1.1NOHOST / ABS1.1NOHOST: ": missing required Host
+    // header" on the status line and body). "haveHost" means a Host header
+    // LINE exists — Go's MIME parser counts an empty-valued "Host:" as
+    // present (probe EMPTYHOSTV: served with Host=""), so the gate is a
+    // count==0 test. Only parse-Ok requests reach here, so
+    // ProtoAtLeast(1,1) is a minor-digit >= 1 check ("HTTP/1.0" exempt —
+    // probe 1.0NOHOST: served with Host=""). CONNECT is exempt by method
+    // (case-sensitive — Go compares the literal "CONNECT", so lowercase
+    // "connect" is NOT exempt).
+    if !is_connect
+        && count_host_headers(request_text) == 0
+        && request_line_minor_gte_1(request_text)
+    {
+        write_go_server_error(&mut stream, "400 Bad Request: missing required Host header").await;
+        return;
+    }
+    // No usable Host value (no Host line on a gate-exempt request, or an
+    // empty-valued "Host:") routes on "" — Go's req.Host == "" fallback;
+    // the frp router has no "" route, so the request answers Go's 404
+    // route-miss response. (Pre-F4 this arm wrote a bare 400.)
+    let host = host.unwrap_or_default();
 
     // Parse Basic Auth once — reused for route matching, auth check,
     // and per-user routing (Go frp compat: getByRoute(host, path, username)).
@@ -997,6 +1064,32 @@ async fn handle_http1_request<S>(
     .await
     {
         Ok(forward) => {
+            // DELIBERATE DIVERGENCE (audit round 9, F4 — documented, not
+            // fixed): the HTTP/1.1 vhost path is a RAW BYTE RELAY — one
+            // routed backend per client connection. `forward` carries the
+            // edited request head (routing/auth were applied once, above);
+            // from here the connection is handed to the control handler,
+            // which bridges the head + tail bytes to the backend and relays
+            // bytes both ways until EOF. Consequences, all accepted:
+            //   * routing/auth/route membership are resolved ONCE per
+            //     connection — a pipelined second request on the same
+            //     connection is NOT re-routed or re-authenticated (Go frp
+            //     uses httputil.ReverseProxy, which re-parses and re-routes
+            //     every request on the keep-alive connection);
+            //   * the response is relayed raw — Go's ReverseProxy instead
+            //     re-parses the response and strips its hop-by-hop headers
+            //     (the mirror of the request-side strip in
+            //     strip_vhost_hop_by_hop_headers);
+            //   * only one backend request per connection — the client
+            //     connection is dropped when the bridge ends, and HTTP/1.1
+            //     keep-alive semantics beyond that are not honored.
+            // Per-request routing after request 1 would require parsing
+            // response boundaries (Content-Length/chunk framing) on the
+            // relayed stream — a stateful HTTP parser in the data path —
+            // for a feature (HTTP keep-alive through a proxy tunnel) Go frp
+            // itself only offers on the plain-HTTP vhost surface. The
+            // request-side head surgery (rewrite/inject/hop-strip) still
+            // matches Go byte-for-byte for the ONE request that is routed.
             // Only the mpsc::Sender is consumed here — the full-ControlTx
             // clone (two Strings + two Arc bumps) per vhost forward was pure
             // waste (round-3 server finding 6).
@@ -1119,7 +1212,8 @@ pub(crate) enum VhostResolveError {
 ///
 /// Extracted from `serve_vhost_request`: looks up the route (domain/wildcard/
 /// path + httpUser), enforces Basic Auth, applies per-user routing
-/// (`route_by_http_user`), then rewrites the Host header and injects
+/// (`route_by_http_user`), then rewrites the Host header, strips the Go
+/// ReverseProxy hop-by-hop set (non-CONNECT only, F3), and injects
 /// X-Forwarded-For / X-Forwarded-Host / X-Forwarded-Proto / requestHeaders
 /// into the forwarded head. `raw_host` is the inbound Host exactly as
 /// received (case + port preserved, NOT canonicalized) — Go's
@@ -1267,9 +1361,27 @@ pub(crate) async fn resolve_vhost_request(
     // HTTP path; the HTTPS vhost muxer is SNI passthrough and never
     // injects), then requestHeaders (Set semantics — user-configured
     // overrides win, exactly like Go's rc.Headers loop after SetXForwarded).
+    // The hop-by-hop strip (F3) runs FIRST, mirroring Go's ServeHTTP order:
+    // removeHopByHopHeaders (with its Te/Upgrade re-adds) happens before the
+    // Rewrite hook that SetXForwarded and the rc.Headers loop live in.
     let request_head = if is_connect {
+        // CONNECT forwards raw — Go connectHandler (http.go:282-285):
+        // no hop strip, no forwarded-header injection (Rewrite never runs).
         request_head
     } else {
+        let (request_head, req_up_type) = strip_vhost_hop_by_hop_headers(request_head);
+        // Go checks the requested upgrade protocol's printability BEFORE
+        // stripping (reverseproxy.go: `if !ascii.IsPrint(reqUpType)`) and
+        // answers through the proxy ErrorHandler — Go frp's 404 route-miss
+        // response (http.go:128-137). req_up_type is Some only when the
+        // Connection value named Upgrade; a non-printable value must never
+        // reach a backend.
+        if let Some(up) = &req_up_type {
+            if !up.iter().all(|b| (0x20..=0x7e).contains(b)) {
+                warn!(host = %host, path = %path, peer = %peer, "{} VHost: rejecting request for non-printable upgrade protocol (Go ascii.IsPrint gate)", scheme);
+                return Err(VhostResolveError::NotFound);
+            }
+        }
         inject_vhost_request_headers(request_head, peer, raw_host, route.headers.as_slice())
     };
 
@@ -1545,7 +1657,15 @@ pub async fn run_vhost_https_listener(
 /// Outcome of parsing the HTTP request line with Go net/http semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestLine<'a> {
-    /// host: None when no Host header is present (caller replies 400).
+    /// host: None when no usable Host value is present (no Host header
+    /// line, or an empty-valued "Host:" line — Go's MIME parser counts the
+    /// line as present, but the value is ""). The caller applies Go's
+    /// conn.readRequest wire-Host gate: HTTP/1.1 non-CONNECT with no Host
+    /// LINE → 400 missing required Host header; every exempt shape routes
+    /// on "" (Go req.Host fallback — always a route miss → 404). An
+    /// absolute-form target with no wire Host carries its authority here
+    /// and is still gated on the wire headers (Go checks the headers, not
+    /// req.Host — probe ABS1.1NOHOST).
     /// `absolute_form` mirrors Go `req.URL.Host != ""` — an absolute-form
     /// request target ("GET http://host/…") — and drives the auth shape
     /// (Proxy-Authorization + 407, Go `checkRouteAuthByRequest`).
@@ -1561,16 +1681,22 @@ enum RequestLine<'a> {
 }
 
 /// Parse the request line with Go net/http `readRequest` semantics for the
-/// vhost path (round 6: A3/A4/A7, verified against Go 1.25.0 stdlib).
+/// vhost path (rounds 6 A3/A4/A7 + audit round 9 F1, verified against Go
+/// 1.25.0 stdlib source and live probes).
 ///
-/// Version handling mirrors `ParseHTTPVersion` + `http1ServerSupportsRequest`:
-/// - no version token (2-part line) → `VersionNotSupported`. Go's
-///   `parseRequestLine` defaults a missing version to "HTTP/0.9", which
-///   `http1ServerSupportsRequest` rejects (only major 1 passes, plus the
-///   binary-h2 PRI preface this text path never sees) → 505;
+/// Version handling mirrors `parseRequestLine` + `ParseHTTPVersion` +
+/// `http1ServerSupportsRequest`:
+/// - fewer than three SP-separated tokens (2-part "GET /", a bare method,
+///   a tab-joined "GET /\tHTTP/1.1") → `BadRequest`. Go's parseRequestLine
+///   requires TWO literal single-space cuts (method SP target SP version)
+///   and fails the whole parse otherwise → 400 "malformed HTTP request".
+///   (Go ≤1.19 instead defaulted a missing version to "HTTP/0.9" and 505'd
+///   at the server gate; the default was removed with HTTP/0.9 support in
+///   Go 1.20 — probes vs go1.25: all of these answer 400, never 505. An
+///   EXPLICIT "HTTP/0.9" still parses and 505s at the gate below.)
 /// - version not exactly 8 chars "HTTP/X.Y" with single digits
-///   ("HTTP/1.10", "HTTP/1.x", "HTTP/11.0") → `BadRequest` (Go 400
-///   "malformed HTTP version");
+///   ("HTTP/1.10", "HTTP/1.x", "HTTP/11.0", trailing-space "HTTP/1.1 ") →
+///   `BadRequest` (Go 400 "malformed HTTP version");
 /// - "HTTP/0.x" / "HTTP/2.x" / "HTTP/9.9" → `VersionNotSupported` (505);
 /// - "HTTP/1.x" → routed.
 ///
@@ -1583,16 +1709,21 @@ enum RequestLine<'a> {
 fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
     let first_line = request.lines().next().unwrap_or("");
     // Go readRequest parity: a request that opens with a blank line is
-    // "malformed HTTP request" → 400. (Go's HTTP/0.9 default only applies
-    // once a non-empty request line parses with <3 space-separated tokens;
-    // an empty first line fails readRequest's shape check before that.)
+    // "malformed HTTP request" → 400.
     if first_line.is_empty() {
         return RequestLine::BadRequest;
     }
     let mut parts = first_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
-    let version = parts.next().unwrap_or("HTTP/0.9"); // Go: len(parts)<3 → HTTP/0.9
+    // Go readRequest parity (F1, audit round 9): parseRequestLine returns
+    // ok=false when EITHER literal-space Cut fails — a missing version
+    // token ("GET /"), a bare method, or a tab-joined line all fail the
+    // parse → 400 "malformed HTTP request". Go 1.20 removed the HTTP/0.9
+    // default that made Go ≤1.19 505 these (probe vs go1.25: 400).
+    let Some(version) = parts.next() else {
+        return RequestLine::BadRequest;
+    };
 
     // ParseHTTPVersion: exactly 8 chars "HTTP/X.Y", single digits.
     let valid_shape = version.len() == 8
@@ -1730,6 +1861,23 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
     }
 }
 
+/// Go `req.ProtoAtLeast(1, 1)` on the raw request line — the wire-Host gate
+/// (F4, audit round 9) only fires for HTTP/1.1+ (HTTP/1.0 and earlier are
+/// exempt — probe 1.0NOHOST). Only "HTTP/1.x" version tokens survive
+/// `parse_vhost_request_line`, so this reduces to a minor-digit check on
+/// the third SP-separated token ("HTTP/1.0" → false). Callers have already
+/// lossy-converted the head to UTF-8 (`request_text`), so byte access is
+/// safe; `get(7)` guards a short token.
+fn request_line_minor_gte_1(request: &str) -> bool {
+    let Some(version) = request.lines().next().unwrap_or("").splitn(3, ' ').nth(2) else {
+        return false;
+    };
+    version
+        .as_bytes()
+        .get(7)
+        .is_some_and(|minor| *minor >= b'1')
+}
+
 /// Strip the query/fragment from a URL path (Go `req.URL.Path` — vhost
 /// routes match locations against the path only).
 fn split_path_and_query(path: &str) -> &str {
@@ -1795,6 +1943,204 @@ fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
     result.extend_from_slice(new_header.as_bytes());
     result.extend_from_slice(&data[line_end..]);
     result
+}
+
+/// Audit round 9 (F3): remove the Go `httputil.ReverseProxy` hop-by-hop
+/// header set from a forwarded non-CONNECT request head — the
+/// `removeHopByHopHeaders` call in ServeHTTP (reverseproxy.go), mirrored in
+/// Go's exact order and with Go's exact re-adds:
+/// 1. every header NAMED by a Connection value token is removed (pass 1);
+/// 2. the fixed hop set is removed (pass 2): Connection, Proxy-Connection,
+///    Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Te, Trailer,
+///    Transfer-Encoding, Upgrade;
+/// 3. `Te: trailers` is re-added when the INBOUND Te value contained the
+///    "trailers" token (the Issue 21096 block — Go reads req.Header, the
+///    pre-strip request);
+/// 4. when the inbound Connection named Upgrade, exactly
+///    `Connection: Upgrade` + `Upgrade: <value>` are re-added (the upgrade
+///    value is captured BEFORE stripping — Go's upgradeType).
+///
+/// Why this exists: the old head forward passed every header verbatim, so
+/// the client's route credential leaked to the local backend —
+/// Proxy-Authorization, which an absolute-form request authenticated with
+/// at the vhost gate (Go strips it from the outbound request and reads it
+/// only at its own auth check, pkg/util/vhost/http.go
+/// checkRouteAuthByRequest).
+///
+/// Entity headers are untouched — Authorization (origin-form credentials
+/// belong to the backend, not the proxy), X-* and custom headers all
+/// survive, as in Go.
+///
+/// Wire-framing notes where the raw-byte forward diverges from Go's
+/// re-serialization: Go strips the Transfer-Encoding and Trailer map
+/// entries and the transport then re-encodes the OUTBOUND request from
+/// parsed state, putting `Transfer-Encoding: chunked` and the declared
+/// trailer names back on the wire (chunk framing re-derived from
+/// req.TransferEncoding / req.Trailer). frp-rs forwards the client's RAW
+/// body bytes, so the framing lines must survive in the head: a
+/// Transfer-Encoding line whose value is exactly "chunked" is dropped and
+/// re-emitted canonically, and Trailer declaration lines are kept verbatim
+/// — the backend needs both to frame the body it is about to receive. A
+/// NON-chunked Transfer-Encoding value is kept verbatim too: Go's server
+/// would have 501-rejected it before the proxy ran, but frp-rs has no such
+/// gate and dropping the line would silently deframe a body that is
+/// currently forwarded. Response-side stripping does not apply: the
+/// frp-rs HTTP/1.1 bridge relays the backend's response bytes raw (the
+/// divergence note at the ProxyUserConn bridge-handoff site).
+///
+/// CONNECT never passes through here — Go's ServeHTTP routes CONNECT to
+/// connectHandler, which writes `req.Write(remote)` raw (http.go:282-285)
+/// with every header as parsed. The caller runs this only on the
+/// non-CONNECT arm, before the header injection (Go: removeHopByHopHeaders
+/// runs before the Rewrite hook).
+///
+/// Returns the rewritten head plus the requested upgrade protocol
+/// (Some(value)) when the inbound Connection named Upgrade — the caller
+/// enforces Go's `!ascii.IsPrint(reqUpType)` rejection (checked BEFORE
+/// stripping in ServeHTTP, answered via the proxy ErrorHandler → Go frp's
+/// 404 route-miss response).
+fn strip_vhost_hop_by_hop_headers(data: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) {
+    let header_end = frp_core::textproto::head_end(&data).unwrap_or(data.len());
+    let head = &data[..header_end];
+    let tail = &data[header_end..];
+
+    // OWS trim (space/tab) — Go textproto.TrimString.
+    fn trim_ows(b: &[u8]) -> &[u8] {
+        let s = b
+            .iter()
+            .position(|c| *c != b' ' && *c != b'\t')
+            .unwrap_or(b.len());
+        let e = b
+            .iter()
+            .rposition(|c| *c != b' ' && *c != b'\t')
+            .map(|i| i + 1)
+            .unwrap_or(s);
+        &b[s..e]
+    }
+
+    let mut out: Vec<&[u8]> = Vec::with_capacity(16);
+    // Connection value tokens — the names pass 1 removes (Go splits
+    // h["Connection"] on commas, OWS-trimming each token).
+    let mut conn_named: Vec<Vec<u8>> = Vec::new();
+    // Upgrade value captured pre-strip (Go upgradeType: a Connection token
+    // equal to "upgrade" gates the read of the first Upgrade header value).
+    let mut upgrade_value: Option<Vec<u8>> = None;
+    let mut connection_upgrade = false;
+    // Inbound Te token list mentions "trailers" → the Issue-21096 re-add.
+    let mut te_trailers = false;
+    // A "Transfer-Encoding: chunked" line → dropped, re-emitted canonically
+    // (the raw-body framing equivalent of Go's transport re-encode).
+    let mut te_chunked = false;
+
+    let mut lines = head.split_inclusive(|&b| b == b'\n');
+    if let Some(request_line) = lines.next() {
+        out.push(request_line); // the request line is not a header
+    }
+    for line in lines {
+        // CRLF or bare-LF — the caller canonicalized the head region to
+        // CRLF already, but the line walk tolerates both (and a
+        // terminator-less final line) like the injector below.
+        let trimmed = line
+            .strip_suffix(b"\r\n")
+            .or_else(|| line.strip_suffix(b"\n"))
+            .unwrap_or(line);
+        if trimmed.is_empty() {
+            continue; // blank line — head_end already cut before it
+        }
+        let Some(colon) = trimmed.iter().position(|&b| b == b':') else {
+            // No colon — obs-fold continuation or junk the MIME parser
+            // never made a header; keep verbatim (same tolerance as the
+            // header-value walk below).
+            out.push(line);
+            continue;
+        };
+        let name = &trimmed[..colon];
+        let value = trim_ows(&trimmed[colon + 1..]);
+        let is = |n: &str| name.eq_ignore_ascii_case(n.as_bytes());
+
+        if is("connection") {
+            for tok in value.split(|&b| b == b',') {
+                let tok = trim_ows(tok);
+                if tok.is_empty() {
+                    continue;
+                }
+                if tok.eq_ignore_ascii_case(b"upgrade") {
+                    connection_upgrade = true;
+                }
+                if !conn_named.iter().any(|c| c == tok) {
+                    conn_named.push(tok.to_vec());
+                }
+            }
+            continue; // the Connection line itself never survives
+        }
+        if is("te") {
+            te_trailers = value
+                .split(|&b| b == b',')
+                .map(trim_ows)
+                .any(|t| t.eq_ignore_ascii_case(b"trailers"));
+            continue;
+        }
+        if is("upgrade") {
+            if upgrade_value.is_none() {
+                upgrade_value = Some(value.to_vec()); // Go Header.Get: first
+            }
+            continue; // re-added below when Connection named Upgrade
+        }
+        if is("transfer-encoding") {
+            if value.eq_ignore_ascii_case(b"chunked") {
+                te_chunked = true;
+                continue; // re-emitted canonically below
+            }
+            out.push(line); // non-chunked value — see the doc note
+            continue;
+        }
+        if is("trailer") {
+            // Trailer DECLARATIONS survive the drop (raw-body framing — see
+            // the doc note; Go strips the line and the transport re-declares
+            // the names on re-serialization, so keeping the verbatim line is
+            // the wire-parity equivalent).
+            out.push(line);
+            continue;
+        }
+        if is("proxy-connection")
+            || is("keep-alive")
+            || is("proxy-authenticate")
+            || is("proxy-authorization")
+        {
+            continue; // fixed hop set (pass 2) — Upgrade/Te/Connection fell
+                      // out above, Trailer survives just above
+        }
+        if conn_named.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+            continue; // pass 1: Connection-named token removal
+        }
+        out.push(line);
+    }
+
+    let mut out_vec = Vec::with_capacity(data.len());
+    for l in &out {
+        out_vec.extend_from_slice(l);
+    }
+    // Go re-adds (ServeHTTP order): the Te block first, then the upgrade
+    // pair.
+    if te_trailers {
+        out_vec.extend_from_slice(b"Te: trailers\r\n");
+    }
+    if te_chunked {
+        out_vec.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
+    let upgrade = if connection_upgrade {
+        upgrade_value
+    } else {
+        None
+    };
+    if let Some(u) = &upgrade {
+        out_vec.extend_from_slice(b"Connection: Upgrade\r\nUpgrade: ");
+        out_vec.extend_from_slice(u);
+        out_vec.extend_from_slice(b"\r\n");
+    }
+    out_vec.extend_from_slice(b"\r\n");
+    out_vec.extend_from_slice(tail);
+    (out_vec, upgrade)
 }
 
 /// Inject `X-Forwarded-For` (append semantics, Go httputil.ReverseProxy),
@@ -2616,15 +2962,37 @@ mod tests {
 
     #[test]
     fn test_parse_vhost_request_line_versions() {
-        // A7: 2-token line → HTTP/0.9 → 505 (Go http1ServerSupportsRequest).
+        // F1 (audit round 9): Go 1.25 parseRequestLine requires TWO literal
+        // space cuts — method SP target SP version — so a missing version
+        // token is a parse failure → 400 "malformed HTTP request" (probe
+        // T2TOK vs go1.25: 400). The HTTP/0.9 default + 505 was Go ≤1.19
+        // behavior; HTTP/0.9 support was removed in Go 1.20.
+        assert_eq!(parse_vhost_request_line("GET /"), RequestLine::BadRequest);
+        // Tab-joined request line: the tab is not the SP the parser cuts
+        // on, so the version token never parses → 400 (probe TABJOIN).
         assert_eq!(
-            parse_vhost_request_line("GET /"),
-            RequestLine::VersionNotSupported
+            parse_vhost_request_line("GET /\tHTTP/1.1"),
+            RequestLine::BadRequest
         );
+        // A bare method (no target, no version) → first Cut fails → 400.
+        assert_eq!(parse_vhost_request_line("GET"), RequestLine::BadRequest);
+        // Explicit HTTP/0.9 still PARSES (ParseHTTPVersion accepts the
+        // 8-char shape) and 505s at the http1ServerSupportsRequest gate —
+        // only the IMPLICIT missing-version default was removed (probe
+        // EXPL09: 505).
         assert_eq!(
             parse_vhost_request_line("GET / HTTP/0.9"),
             RequestLine::VersionNotSupported
         );
+        // Trailing-space version token: splitn(3, ' ') keeps the space in
+        // the third token ("HTTP/1.1 ") — the 8-char shape check fails,
+        // like Go's Cut + ParseHTTPVersion ("malformed HTTP version", 400).
+        assert_eq!(
+            parse_vhost_request_line("GET / HTTP/1.1 "),
+            RequestLine::BadRequest
+        );
+        // Empty third token ("GET / " → "") is an empty version → 400.
+        assert_eq!(parse_vhost_request_line("GET / "), RequestLine::BadRequest);
         // Shape malformed → 400 (Go ParseHTTPVersion 8-char rule).
         assert_eq!(
             parse_vhost_request_line("GET / HTTP/1.10"),
@@ -4542,5 +4910,437 @@ mod tests {
         );
         // Unoverridden auto line still emits (peer-only XFF).
         assert!(text.contains("X-Forwarded-For: 192.0.2.55\r\n"), "{text:?}");
+    }
+
+    /// F5/A3 + F4/A5 (audit round 9): every HTTP/1.1 vhost error render must
+    /// match Go's conn.serve raw error shape byte-for-byte (live probes vs
+    /// go1.25 on disk): `HTTP/1.1 {status}\r\nContent-Type: text/plain;
+    /// charset=utf-8\r\nConnection: close\r\n\r\n{status}` — no
+    /// Content-Length (the old 431 CL:0 line was round-9 F5 divergence), no
+    /// trailing LF after the body text, and the detail text (": …") carried
+    /// on BOTH the status line and the body where Go carries it. And the A5
+    /// missing-required-Host gate + exempt shapes (HTTP/1.0 / empty-value
+    /// Host must ROUTE on "", never 400).
+    #[tokio::test]
+    async fn test_vhost_http1_error_shapes_match_go() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_app_state();
+
+        // Drive serve_vhost_request over a duplex pair; collect the exact
+        // response bytes. The error arms never call `wrap`, so the closure
+        // panics if a bug ever routes one of these to the Ok(forward) arm —
+        // the spawned task dies and the short response fails the assert.
+        async fn respond(state: Arc<AppState>, raw: &[u8]) -> Vec<u8> {
+            let (mut client, server) = tokio::io::duplex(8192);
+            client.write_all(raw).await.unwrap();
+            tokio::spawn(serve_vhost_request(
+                server,
+                std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+                state,
+                "HTTP",
+                |_| unreachable!("error arms never wrap the stream"),
+            ));
+            let mut resp = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let r =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), client.read(&mut buf))
+                        .await;
+                match r {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => resp.extend_from_slice(&buf[..n]),
+                }
+            }
+            resp
+        }
+
+        let dup_host = respond(
+            state.clone(),
+            // Go readRequest rejects a duplicate Host ("too many Host
+            // headers") with a GENERIC 400 — the message is suppressed
+            // (probe DUPHOST11).
+            b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            dup_host,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+            "dup-Host render must be Go's conn.serve generic 400 shape"
+        );
+
+        // 505: the http1ServerSupportsRequest gate carries the detail on
+        // the status line AND the body (probe EXPL20).
+        let v505 = respond(
+            state.clone(),
+            b"GET / HTTP/2.0\r\nHost: a.example.com\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            v505,
+            b"HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n505 HTTP Version Not Supported: unsupported protocol version",
+            "505 render must be Go's conn.serve shape with the detail"
+        );
+
+        // 431 oversized head (Go errTooLarge render — no Content-Length).
+        let mut big = Vec::with_capacity(5000);
+        big.extend_from_slice(b"GET / HTTP/1.1\r\nHost: a.example.com\r\n");
+        while big.len() < 4096 {
+            big.extend_from_slice(b"X-Junk: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        }
+        let v431 = respond(state.clone(), &big).await;
+        assert_eq!(
+            v431,
+            b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large",
+            "431 render must be Go's conn.serve shape (no Content-Length)"
+        );
+
+        // A5 gate: HTTP/1.1 with NO Host header line → 400 missing required
+        // Host header (Go conn.readRequest server.go:1058; detail carried,
+        // probe 1.1NOHOST).
+        let nohost11 = respond(state.clone(), b"GET / HTTP/1.1\r\n\r\n").await;
+        assert_eq!(
+            nohost11,
+            b"HTTP/1.1 400 Bad Request: missing required Host header\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: missing required Host header",
+            "1.1-without-Host must answer Go's missing-required-Host 400"
+        );
+
+        // The gate checks WIRE Host headers — an absolute-form target with
+        // no wire Host 400s too (probe ABS1.1NOHOST).
+        let abs_nohost = respond(
+            state.clone(),
+            b"GET http://a.example.com/x HTTP/1.1\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            abs_nohost,
+            b"HTTP/1.1 400 Bad Request: missing required Host header\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: missing required Host header",
+            "absolute-form 1.1 without a wire Host must 400 missing Host"
+        );
+
+        // Gate-exempt shapes ROUTE on "" (never 400): HTTP/1.0 without Host
+        // (Go probe 1.0NOHOST: served with Host="") → frp router miss on ""
+        // → Go NotFoundResponse 404.
+        let nohost10 = respond(state.clone(), b"GET / HTTP/1.0\r\n\r\n").await;
+        assert!(
+            nohost10.starts_with(b"HTTP/1.1 404 Not Found\r\n"),
+            "HTTP/1.0 without Host must route on \"\" → 404, got: {:?}",
+            String::from_utf8_lossy(&nohost10)
+        );
+
+        // Empty-value "Host:" — the header line is PRESENT, so the gate is
+        // exempt (Go probe EMPTYHOSTV: served with Host=""); routing "" →
+        // 404. (The pre-fix code 400'd on the unparseable empty value.)
+        let empty_host = respond(state.clone(), b"GET / HTTP/1.1\r\nHost:\r\n\r\n").await;
+        assert!(
+            empty_host.starts_with(b"HTTP/1.1 404 Not Found\r\n"),
+            "empty-value Host must route on \"\" → 404, got: {:?}",
+            String::from_utf8_lossy(&empty_host)
+        );
+
+        // 2-token request line → parse failure → generic 400 (probe T2TOK).
+        // The head must be terminated (\r\n\r\n) for the vhost read loop to
+        // finish — the probe's line + blank line — so the request LINE is
+        // "GET /" with no version token.
+        let two_tok = respond(state.clone(), b"GET /\r\n\r\n").await;
+        assert_eq!(
+            two_tok,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+            "2-token request line must answer Go's malformed-request 400"
+        );
+
+        // Tab-joined request line → 400 (probe TABJOIN).
+        let tab_join = respond(state.clone(), b"GET /\tHTTP/1.1\r\n\r\n").await;
+        assert_eq!(
+            tab_join,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+            "tab-joined request line must answer Go's malformed-request 400"
+        );
+    }
+
+    /// Registers a route for `hop.example.com` and resolves a raw head
+    /// through `resolve_vhost_request` — the shared h1/h2c forward path.
+    async fn resolve_hop_head(
+        state: &AppState,
+        head: Vec<u8>,
+    ) -> Result<VhostForward, VhostResolveError> {
+        resolve_vhost_request(
+            state,
+            "hop.example.com",
+            "/",
+            "hop.example.com", // raw inbound Host (test head's Host)
+            None,
+            None, // no routing-only fallback user
+            head,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            "HTTP",
+            false, // origin-form request
+            false, // non-CONNECT request
+        )
+        .await
+    }
+
+    /// F3 (audit round 9, MEDIUM): the non-CONNECT forward arm must strip
+    /// Go's ReverseProxy hop-by-hop set (removeHopByHopHeaders in
+    /// reverseproxy.go): Connection-named tokens FIRST, then
+    /// Connection/Proxy-Connection/Keep-Alive/Proxy-Authenticate/
+    /// Proxy-Authorization/Te/Trailer/Transfer-Encoding/Upgrade — while
+    /// entity headers (Authorization — origin-form credentials belong to
+    /// the backend, not the proxy — plus custom headers) survive, and the
+    /// Go Te-trailers re-add (Issue 21096 block) restores what stripping
+    /// took from a backend that cares about trailer support.
+    #[tokio::test]
+    async fn test_vhost_resolve_strips_hop_by_hop_non_connect() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "hop-p",
+                &["hop.example.com".into()],
+                "http",
+                &[],
+                "run-1",
+                "", // host_header_rewrite
+                "", // http_user
+                "", // http_pwd
+                "", // route_by_http_user
+                &[("X-Added".to_string(), "cfg".to_string())],
+                "", // group
+            )
+            .await
+            .expect("route registration must succeed");
+
+        let fwd = resolve_hop_head(
+            &state,
+            b"GET / HTTP/1.1\r\n\
+              Host: hop.example.com\r\n\
+              Connection: keep-alive\r\n\
+              Keep-Alive: 5\r\n\
+              Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\
+              Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\
+              Te: trailers\r\n\
+              Trailer: X-Checksum\r\n\
+              Upgrade: h2c\r\n\
+              X-Custom: keep-me\r\n\
+              Authorization: Basic dXNlcjpwYXNz\r\n\
+              \r\n"
+                .to_vec(),
+        )
+        .await
+        .expect("strip test route must forward");
+        let text = String::from_utf8(fwd.request_head).expect("utf8 head");
+        let name = |l: &str| l.split(':').next().unwrap_or("").to_ascii_lowercase();
+        for banned in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "upgrade",
+        ] {
+            assert!(
+                !text.lines().any(|l| name(l) == banned),
+                "hop-by-hop header {banned} must be stripped from the forwarded head: {text:?}"
+            );
+        }
+        // Go Issue 21096: the inbound Te line is stripped and Te: trailers
+        // re-added (the ONLY te-named line in the forwarded head) when the
+        // inbound Te value contained the "trailers" token.
+        let te_lines: Vec<&str> = text.lines().filter(|l| name(l) == "te").collect();
+        assert_eq!(
+            te_lines,
+            vec!["Te: trailers"],
+            "Te: trailers must be re-added (Go Issue 21096): {text:?}"
+        );
+        // Trailer declarations stay (raw-body forwarding keeps the line —
+        // Go's transport re-declares them on re-serialization).
+        assert!(
+            text.lines()
+                .any(|l| name(l) == "trailer" && l.contains("X-Checksum")),
+            "Trailer declaration must be preserved: {text:?}"
+        );
+        // Entity headers survive the strip.
+        assert!(
+            text.lines().any(|l| name(l) == "authorization"),
+            "Authorization is an entity header and must be forwarded: {text:?}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| name(l) == "x-custom" && l.contains("keep-me")),
+            "custom header must be forwarded: {text:?}"
+        );
+        // Configured requestHeaders still apply (inject runs AFTER the
+        // strip — Go's Rewrite hook after removeHopByHopHeaders).
+        assert!(
+            text.lines()
+                .any(|l| name(l) == "x-added" && l.contains("cfg")),
+            "config requestHeader must apply after the strip: {text:?}"
+        );
+        assert!(
+            text.lines().any(|l| l.starts_with("X-Forwarded-For: ")),
+            "XFF injection must still run: {text:?}"
+        );
+    }
+
+    /// Connection-token semantics: a header NAMED by the Connection value
+    /// list is removed even when it is not in the fixed hop set (Go's
+    /// removeHopByHopHeaders pass 1), while `Transfer-Encoding: chunked` is
+    /// re-emitted (canonical line) and `Trailer` declarations survive — the
+    /// backend needs both to frame the raw-forwarded body.
+    #[tokio::test]
+    async fn test_vhost_resolve_connection_named_and_chunked_te() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "hop-p",
+                &["hop.example.com".into()],
+                "http",
+                &[],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect("route registration must succeed");
+
+        let fwd = resolve_hop_head(
+            &state,
+            b"POST /submit HTTP/1.1\r\n\
+              Host: hop.example.com\r\n\
+              Connection: X-Sum, keep-alive\r\n\
+              X-Sum: 42\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Trailer: X-Sum\r\n\
+              \r\n"
+                .to_vec(),
+        )
+        .await
+        .expect("must forward");
+        let text = String::from_utf8(fwd.request_head).expect("utf8 head");
+        let name = |l: &str| l.split(':').next().unwrap_or("").to_ascii_lowercase();
+        assert!(
+            !text.lines().any(|l| name(l) == "connection"),
+            "Connection line must be stripped: {text:?}"
+        );
+        assert!(
+            !text.lines().any(|l| name(l) == "x-sum"),
+            "Connection-named X-Sum must be stripped (Go pass-1 token removal): {text:?}"
+        );
+        let te_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| name(l) == "transfer-encoding")
+            .collect();
+        assert_eq!(
+            te_lines,
+            vec!["Transfer-Encoding: chunked"],
+            "chunked Transfer-Encoding must survive as the single canonical line: {text:?}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| name(l) == "trailer" && l.contains("X-Sum")),
+            "Trailer declaration must survive: {text:?}"
+        );
+    }
+
+    /// Protocol-upgrade requests: Go strips every hop header and then
+    /// RE-ADDS exactly `Connection: Upgrade` + `Upgrade: <value>` when the
+    /// inbound Connection named Upgrade (reverseproxy.go) — the vhost
+    /// WebSocket path must keep working through the strip.
+    #[tokio::test]
+    async fn test_vhost_resolve_upgrade_readd() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "hop-p",
+                &["hop.example.com".into()],
+                "http",
+                &[],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect("route registration must succeed");
+
+        let fwd = resolve_hop_head(
+            &state,
+            b"GET /ws HTTP/1.1\r\n\
+              Host: hop.example.com\r\n\
+              Connection: keep-alive, Upgrade\r\n\
+              Upgrade: websocket\r\n\
+              \r\n"
+                .to_vec(),
+        )
+        .await
+        .expect("upgrade must forward");
+        let text = String::from_utf8(fwd.request_head).expect("utf8 head");
+        let conn_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                l.split(':')
+                    .next()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case("connection")
+            })
+            .collect();
+        assert_eq!(
+            conn_lines,
+            vec!["Connection: Upgrade"],
+            "exactly one canonical Connection: Upgrade after the strip: {text:?}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.eq_ignore_ascii_case("Upgrade: websocket")),
+            "Upgrade value must be re-added: {text:?}"
+        );
+    }
+
+    /// Go checks `ascii.IsPrint(reqUpType)` BEFORE stripping and answers
+    /// through the proxy ErrorHandler — Go frp's 404 route-miss response.
+    /// A Connection: Upgrade whose Upgrade value carries a control byte
+    /// must be rejected (route-miss), never forwarded to a backend.
+    #[tokio::test]
+    async fn test_vhost_resolve_nonprintable_upgrade_rejected() {
+        let state = test_app_state();
+        state
+            .vhost_manager
+            .register(
+                "hop-p",
+                &["hop.example.com".into()],
+                "http",
+                &[],
+                "run-1",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                "",
+            )
+            .await
+            .expect("route registration must succeed");
+
+        let res = resolve_hop_head(
+            &state,
+            b"GET /ws HTTP/1.1\r\n\
+              Host: hop.example.com\r\n\
+              Connection: Upgrade\r\n\
+              Upgrade: websocket\x01x\r\n\
+              \r\n"
+                .to_vec(),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(VhostResolveError::NotFound)),
+            "non-printable upgrade protocol must be a 404 route-miss (Go ascii.IsPrint gate)"
+        );
     }
 }
