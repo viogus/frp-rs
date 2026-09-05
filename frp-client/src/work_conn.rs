@@ -1066,15 +1066,26 @@ async fn run_udp_work_conn(
                             };
                             // PROXY header on the first packet of each remote
                             // session (Go: first packet of each remote conn).
-                            // Go parity: a source port of 0 (UDP packets may
-                            // legally carry one) skips the header, and an
-                            // unparsable source address is logged + skipped
-                            // by the builder's callers below.
+                            // Go parity (pkg/proto/udp/udp.go Forwarder +
+                            // go-proxyproto v0.15.0): the ONLY gate is the
+                            // remote address being present
+                            // (`!ok && proxyProtocolVersion != "" &&
+                            // udpMsg.RemoteAddr != nil`) — there is NO
+                            // source-port-0 skip on the UDP path (the TCP
+                            // `m.SrcAddr != "" && m.SrcPort != 0` gate of
+                            // client/proxy/proxy.go does not apply here).
+                            // `remote` is always a parsed SocketAddr, so the
+                            // header is emitted for every new remote session
+                            // when a version is configured — a port-0 source
+                            // (legal on the wire) rides in the header block
+                            // exactly as Go would write it. The transport kind
+                            // threads into the builder so UDP sessions are
+                            // never mislabeled as TCP: v1 collapses to the
+                            // literal `PROXY UNKNOWN\r\n` (the v1 grammar has
+                            // no UDP address line) and v2 emits the
+                            // UDP-DATAGRAM frame (transport 0x12/0x22).
                             let mut final_payload = payload;
-                            if first_packet
-                                && !proxy_protocol_version.is_empty()
-                                && remote.port() != 0
-                            {
+                            if first_packet && !proxy_protocol_version.is_empty() {
                                 if let Ok(header) =
                                     frp_core::proxy_protocol::build_proxy_protocol_header(
                                         &remote.ip().to_string(),
@@ -1087,6 +1098,7 @@ async fn run_udp_work_conn(
                                         remote.port(),
                                         local_addr.port(),
                                         &proxy_protocol_version,
+                                        frp_core::proxy_protocol::ProxyTransport::Udp,
                                     )
                                 {
                                     let mut buf =
