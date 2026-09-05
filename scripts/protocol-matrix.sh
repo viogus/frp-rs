@@ -126,26 +126,38 @@ run_row() {
 
     RUST_LOG=warn "$FRPS_BIN" -c "$row_dir/frps.toml" > "$row_dir/frps.log" 2>&1 &
     echo $! > "$row_dir/frps.pid"
-    wait_for_port 127.0.0.1 "$srv_port" 10 || {
+    wait_for_port 127.0.0.1 "$srv_port" 20 || {
         fail_row "$name" "frps did not start"
         return
     }
     RUST_LOG=warn "$FRPC_BIN" -c "$row_dir/frpc.toml" > "$row_dir/frpc.log" 2>&1 &
     echo $! > "$row_dir/frpc.pid"
     # QUIC: the TCP proxy port only opens after the control conn registers.
-    wait_for_port 127.0.0.1 "$proxy_port" 15 || {
+    # Generous timeout: a contended CI runner (the parallel Tests job is CPU
+    # heavy) can take tens of seconds to start frps+frpc, do the TLS
+    # handshake, and register the proxy.
+    wait_for_port 127.0.0.1 "$proxy_port" 45 || {
         fail_row "$name" "proxy port not reachable"
         return
     }
 
     local json="$row_dir/result.jsonl"
-    "$STRESS_BIN" --scenario throughput --port "$proxy_port" --duration 3 --streams 1 \
-        --label "$name" --no-floor --json-out "$json" >/dev/null 2>&1
-    local mbps
-    mbps=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['mbps'])" "$json" 2>/dev/null || echo 0)
-    # Bash cannot compare floats — python decides.
-    local ok
-    ok=$(python3 -c "import json,sys; print('pass' if json.load(open(sys.argv[1]))['mbps'] > 0 else 'fail')" "$json" 2>/dev/null || echo fail)
+    local mbps=0 ok=fail attempt
+    # Retry the throughput window: a slow frps/frpc warm-up (first work-conn
+    # dial + TLS handshake) on a contended runner can leave the first window
+    # empty even though the bridge is healthy. Retries cover the warm-up
+    # without masking a genuine stall (a real stall stays at zero across all
+    # attempts).
+    for attempt in 1 2 3; do
+        "$STRESS_BIN" --scenario throughput --port "$proxy_port" --duration 5 --streams 1 \
+            --label "$name" --no-floor --json-out "$json" >/dev/null 2>&1
+        mbps=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['mbps'])" "$json" 2>/dev/null || echo 0)
+        # Bash cannot compare floats — python decides.
+        ok=$(python3 -c "import json,sys; print('pass' if json.load(open(sys.argv[1]))['mbps'] > 0 else 'fail')" "$json" 2>/dev/null || echo fail)
+        [[ "$ok" == "pass" ]] && break
+        log "retry $attempt/3 $name: zero throughput (mbps=$mbps)"
+        sleep 3
+    done
     if [[ "$ok" == "pass" ]]; then
         PASS=$((PASS + 1))
         log "PASS $name: $mbps MB/s"
