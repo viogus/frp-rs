@@ -311,6 +311,34 @@ struct ErrorResponse {
     error: String,
 }
 
+/// Go `model.GetProxyTrafficResp` (`server/http/model/types.go:131-136`):
+///
+/// ```go
+/// // /api/traffic/:name
+/// type GetProxyTrafficResp struct {
+///     Name       string  `json:"name"`
+///     TrafficIn  []int64 `json:"trafficIn"`
+///     TrafficOut []int64 `json:"trafficOut"`
+/// }
+/// ```
+///
+/// `trafficIn`/`trafficOut` are 7-element per-day histories, index 0 = today
+/// … 6 = six days ago (Go `DateCounter` is today-first — see
+/// `pkg/util/metric/date_counter.go` + the `GetLastDaysCount(ReserveDays=7)`
+/// call in `pkg/metrics/mem/server.go`). No conn counters: conns are not part
+/// of Go's traffic model (they live on the proxy stats endpoints as
+/// `curConns`). Served by GET /api/traffic/{name} (Go v1 route,
+/// `server/api_router.go:46`) and the frp-rs extension alias
+/// GET /api/proxy/{name}/traffic.
+#[derive(Serialize)]
+struct GetProxyTrafficResp {
+    name: String,
+    #[serde(rename = "trafficIn")]
+    traffic_in: [i64; 7],
+    #[serde(rename = "trafficOut")]
+    traffic_out: [i64; 7],
+}
+
 #[derive(Deserialize, Default)]
 struct ProxiesQuery {
     #[serde(rename = "type", default)]
@@ -548,10 +576,24 @@ async fn handle_proxy_detail(
     }))
 }
 
+/// GET /api/traffic/{name} (and the frp-rs alias GET /api/proxy/{name}/traffic)
+/// — Go `APIProxyTraffic` / `model.GetProxyTrafficResp`
+/// (`server/http/controller.go:176-190`, `server/http/model/types.go:131-136`).
+///
+/// The body is the 7-day per-day traffic history drawn from the shared daily
+/// buffer (`ProxyMetrics.daily` — the same data source the v2 history
+/// endpoints read), serialized in Go's v1 array shape: index 0 = today …
+/// index 6 = six days ago (`DateCounter.GetLastDaysCount(ReserveDays=7)` is
+/// today-first, `pkg/util/metric/date_counter.go`; the v2 endpoints reverse
+/// this into dated oldest→newest points). Always 7 entries, zero-filled.
+///
+/// Go v1 route table (`server/api_router.go:43-46`) has `/api/traffic/{name}`
+/// only; the `/api/proxy/{name}/traffic` route is a frp-rs extension and
+/// serves the same body.
 async fn handle_proxy_traffic(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> Result<Json<MetricsSnapshot>, (axum::http::StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<GetProxyTrafficResp>, (axum::http::StatusCode, Json<ErrorResponse>)> {
     // Verify proxy exists
     let _proxy = state
         .proxy_manager
@@ -559,14 +601,20 @@ async fn handle_proxy_traffic(
         .await
         .ok_or_else(|| not_found("proxy not found"))?;
 
-    let traffic = state
+    // Shared 7-day daily history (index 0 = today), same source as the v2
+    // traffic endpoint; i64 cast mirrors Go's int64 counters.
+    let (traffic_in, traffic_out) = state
         .proxy_metrics
         .get(&name)
         .await
-        .map(|m| m.snapshot())
-        .unwrap_or_default();
+        .map(|m| m.daily.snapshot())
+        .unwrap_or(([0u64; 7], [0u64; 7]));
 
-    Ok(Json(traffic))
+    Ok(Json(GetProxyTrafficResp {
+        name,
+        traffic_in: traffic_in.map(|v| v as i64),
+        traffic_out: traffic_out.map(|v| v as i64),
+    }))
 }
 
 /// GET /api/proxy/{type} — list proxies filtered by type (path-param variant of ?type=).
@@ -574,8 +622,20 @@ async fn handle_proxies_by_type(
     State(state): State<Arc<AppState>>,
     Path(proxy_type): Path<String>,
 ) -> Result<Json<Vec<ProxyEntry>>, StatusCode> {
-    // Validate proxy type — reject unknown types with 404
-    let valid_types = ["tcp", "udp", "http", "https", "stcp", "xtcp", "sudp"];
+    // Validate proxy type — reject unknown types with 404. The list must
+    // track every proxy type Go frp registers: `tcpmux` was missing here
+    // (v1 404'd it while the v2 VALID_TYPES accepted it) although Go v0.71.0
+    // registers tcpmux proxies under type "tcpmux" (frpc sends the wire
+    // ProxyType from `config/v1/proxy.go:233` ProxyTypeTCPMUX; the server
+    // keys its stats on that wire type, `server/control.go:766`).
+    // NOTE: Go's v1 handler performs NO allow-list validation at all —
+    // `APIProxyByType` filters registered stats by the raw type param, so an
+    // unknown type returns 200 with an empty list. frp-rs keeps this guard so
+    // dashboard consumers see 404 for a typo'd type instead of a silent empty
+    // array (documented divergence; tcpmux acceptance is aligned).
+    let valid_types = [
+        "tcp", "udp", "http", "https", "tcpmux", "stcp", "xtcp", "sudp",
+    ];
     if !valid_types.contains(&proxy_type.as_str()) {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -3333,8 +3393,14 @@ pub async fn run_dashboard(
         .route("/api/proxies/{name}", get(handle_proxy_by_name))
         .route("/api/proxy/{type}", get(handle_proxies_by_type))
         .route("/api/proxy/{type}/{name}", get(handle_proxy_by_type_name))
-        .route("/api/proxy/{name}/traffic", get(handle_proxy_traffic))
+        // Go v1 route — /api/traffic/{name} (server/api_router.go:46) —
+        // Go model.GetProxyTrafficResp body (today-first 7-day arrays).
         .route("/api/traffic/{name}", get(handle_proxy_traffic))
+        // frp-rs extension alias — Go's v1 route table has NO
+        // /api/proxy/{name}/traffic (only /api/proxy/{type},
+        // /api/proxy/{type}/{name}, /api/proxies/{name}, /api/traffic/{name}).
+        // Serves the same Go-shaped body as /api/traffic/{name}.
+        .route("/api/proxy/{name}/traffic", get(handle_proxy_traffic))
         .route("/api/clients", get(handle_clients))
         .route("/api/clients/{run_id}", get(handle_client_detail))
         .route(

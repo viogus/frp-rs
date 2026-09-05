@@ -1,5 +1,7 @@
 #![cfg(feature = "dashboard")]
 use common::FrpsHandle;
+use frp_core::msg::{self, FrpMessage};
+use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod common;
@@ -909,4 +911,425 @@ async fn http_get_vhost(vhost: std::net::SocketAddr, host: &str) -> String {
     let mut buf = Vec::new();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), c.read_to_end(&mut buf)).await;
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Live-traffic pin (round-9 gap + Go-shape alignment): real bytes through a
+/// registered TCP proxy must land on the v1 traffic endpoints in Go's
+/// `model.GetProxyTrafficResp` shape — `{name, trafficIn, trafficOut}` with
+/// two 7-element per-day arrays, index 0 = today (Go `DateCounter`
+/// today-first; same shared daily buffer the v2 history endpoints read), with
+/// the Go counter sides (trafficIn = user -> frpc, trafficOut = frpc -> user)
+/// and the exact byte counts. Conns counters are NOT part of Go's traffic
+/// model (they live on the proxy stats endpoints as curConns), so the old
+/// frp-rs scalar shape (bytes_in/bytes_out/current_conns/total_conns) is gone.
+#[tokio::test]
+async fn test_dashboard_proxy_traffic_live() {
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let remote_port = common::allocate_port();
+    let frps = FrpsHandle::start(&base_config(bind_port, dashboard_port)).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+    let client = auth_client();
+    let proxy_name = "live-tcp";
+
+    let (mut ctl, resp) = common::login_with_test_token(addr).await.expect("login");
+    let run_id = resp.run_id.expect("run_id");
+    common::register_tcp_proxy(&mut ctl, proxy_name, remote_port).await;
+
+    // Negative arm: before any traffic, both traffic endpoints report Go's
+    // zero shape — name + exactly the keys {name, trafficIn, trafficOut}
+    // (no conn/scalar keys) and two 7-entry all-zero day arrays.
+    for path in [
+        format!("/api/traffic/{proxy_name}"),
+        format!("/api/proxy/{proxy_name}/traffic"),
+    ] {
+        let resp = client
+            .get(frps.dashboard_url(&path))
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let j: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(j["name"], proxy_name, "fresh proxy {path} name");
+        let mut keys: Vec<&str> = j.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["name", "trafficIn", "trafficOut"],
+            "fresh proxy {path} must expose exactly Go's GetProxyTrafficResp keys"
+        );
+        for dir in ["trafficIn", "trafficOut"] {
+            let a = j[dir]
+                .as_array()
+                .unwrap_or_else(|| panic!("{path} {dir} array"));
+            assert_eq!(a.len(), 7, "fresh proxy {path} {dir} must be 7 day buckets");
+            for (i, v) in a.iter().enumerate() {
+                assert_eq!(
+                    v.as_u64().unwrap(),
+                    0,
+                    "fresh proxy {path} {dir}[{i}] must be 0"
+                );
+            }
+        }
+    }
+
+    // Pump exact payloads through the live bridge, then poll for the day
+    // buckets. The relay records traffic only after both conns close.
+    let user_to_work: u64 = 123_457;
+    let work_to_user: u64 = 67_891;
+    let (user, work) = common::open_tcp_proxy_bridge(addr, remote_port, &mut ctl, &run_id).await;
+    common::pump_tcp_bridge(user, work, user_to_work as usize, work_to_user as usize).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let traffic: serde_json::Value = loop {
+        let resp = client
+            .get(frps.dashboard_url(&format!("/api/traffic/{proxy_name}")))
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let t: serde_json::Value = resp.json().await.unwrap();
+        let sum_in: u64 = t["trafficIn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .sum();
+        let sum_out: u64 = t["trafficOut"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .sum();
+        if sum_in == user_to_work && sum_out == work_to_user {
+            break t;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "traffic counters never reached {user_to_work}/{work_to_user}: {t}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+
+    // Direction semantics (Go frp Join(c1=local, c2=userConn)): trafficIn is
+    // user -> frpc and trafficOut is frpc -> user. The pump's bytes land in
+    // the record day's bucket — index 0 for a same-day pump (today-first
+    // arrays, Go DateCounter semantics). The one tolerated drift is a conn
+    // close straddling UTC midnight: the rollover shift then moves the
+    // earlier close's bytes to index 1 (analogous to the v2 pin's
+    // "post-midnight" arm). Buckets 2..7 must stay empty either way.
+    assert_eq!(traffic["name"], proxy_name);
+    let arr_in = traffic["trafficIn"].as_array().unwrap();
+    let arr_out = traffic["trafficOut"].as_array().unwrap();
+    assert_eq!(arr_in.len(), 7, "trafficIn must stay 7 day buckets");
+    assert_eq!(arr_out.len(), 7, "trafficOut must stay 7 day buckets");
+    for (dir, total) in [("trafficIn", user_to_work), ("trafficOut", work_to_user)] {
+        let arr = traffic[dir].as_array().unwrap();
+        for (i, v) in arr.iter().enumerate().skip(2) {
+            assert_eq!(
+                v.as_u64().unwrap(),
+                0,
+                "{dir}[{i}] must be empty beyond the record day: {traffic}"
+            );
+        }
+        let sum: u64 = arr.iter().map(|v| v.as_u64().unwrap()).sum();
+        assert_eq!(sum, total, "{dir} bucket sum must equal the pumped bytes");
+    }
+
+    // Alias endpoint /api/proxy/{name}/traffic serves the same Go-shaped body.
+    let resp = client
+        .get(frps.dashboard_url(&format!("/api/proxy/{proxy_name}/traffic")))
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<serde_json::Value>().await.unwrap(), traffic);
+
+    // /api/proxies list entry carries the same live counters.
+    let resp = client
+        .get(frps.dashboard_url("/api/proxies"))
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .unwrap();
+    let list: Vec<serde_json::Value> = resp.json().await.unwrap();
+    let entry = list
+        .iter()
+        .find(|p| p["name"] == proxy_name)
+        .unwrap_or_else(|| panic!("proxy {proxy_name} missing from list: {list:?}"));
+    assert_eq!(entry["status"], "online");
+    assert_eq!(entry["traffic_in"], user_to_work);
+    assert_eq!(entry["traffic_out"], work_to_user);
+    assert_eq!(entry["total_conns"], 1);
+
+    // Typed detail embeds the traffic snapshot too.
+    let resp = client
+        .get(frps.dashboard_url(&format!("/api/proxy/tcp/{proxy_name}")))
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .unwrap();
+    let detail: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(detail["name"], proxy_name);
+    // Go model.ProxyInfo parity: the JSON key is "type", not "proxy_type".
+    assert_eq!(detail["type"], "tcp");
+    assert_eq!(detail["traffic"]["bytes_in"], user_to_work);
+    assert_eq!(detail["traffic"]["bytes_out"], work_to_user);
+    assert_eq!(detail["traffic"]["total_conns"], 1);
+    assert_eq!(detail["traffic"]["current_conns"], 0);
+}
+
+/// A NewProxy wire message builder for the server-side proxy type filters.
+/// Field set mirrors `common::register_tcp_proxy` plus the type-specific
+/// fields (domains for http, sk for stcp).
+fn typed_proxy_msg(
+    name: &str,
+    proxy_type: &str,
+    remote_port: Option<u16>,
+    custom_domains: Option<Vec<String>>,
+    sk: Option<String>,
+) -> FrpMessage {
+    FrpMessage::NewProxy(Box::new(msg::NewProxy {
+        proxy_name: name.into(),
+        proxy_type: proxy_type.into(),
+        sk,
+        use_encryption: None,
+        use_compression: None,
+        group: None,
+        group_key: None,
+        local_str: Some("127.0.0.1:1".into()),
+        remote_port: remote_port.map(|p| p as i32),
+        custom_domains,
+        subdomain: None,
+        locations: None,
+        http_user: None,
+        http_pwd: None,
+        host_header_rewrite: None,
+        headers: None,
+        response_headers: None,
+        route_by_http_user: None,
+        allow_users: None,
+        bandwidth_limit: None,
+        bandwidth_limit_mode: None,
+        annotations: None,
+        metas: None,
+        multiplexer: None,
+        virtual_net: None,
+        proxy_protocol_version: None,
+        advertise_subnet: None,
+        vnet_ip: None,
+        vnet_netmask: None,
+        vnet_mtu: None,
+    }))
+}
+
+async fn register_proxy_ok(ctl: &mut frp_core::transport::IoStream, name: &str, msg: FrpMessage) {
+    write_msg_v1(ctl, &msg)
+        .await
+        .unwrap_or_else(|e| panic!("send NewProxy for {name}: {e}"));
+    // The server may interleave ReqWorkConn (pool pre-arms, e.g. after a UDP
+    // registration) with the NewProxyResp — tolerate and skip them, like a
+    // real frpc control loop would.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), read_msg_v1(ctl))
+            .await
+            .unwrap_or_else(|_| panic!("no NewProxyResp for {name} within 5s"));
+        match read.unwrap_or_else(|e| panic!("read NewProxyResp for {name}: {e}")) {
+            FrpMessage::NewProxyResp(r) => {
+                assert!(r.error.is_none(), "register {name}: {:?}", r.error);
+                break;
+            }
+            FrpMessage::ReqWorkConn(_) => continue,
+            other => panic!(
+                "expected NewProxyResp for {name}, got type byte {:?}",
+                other.v1_type_byte()
+            ),
+        }
+    }
+    assert!(
+        tokio::time::Instant::now() < deadline,
+        "register {name} deadline"
+    );
+}
+
+/// Per-type proxy listing/detail pins (round-9 gap): /api/proxy/{type},
+/// /api/proxy/{type}/{name} and the ?type= filter on /api/proxies with live
+/// registrations of several proxy types on the wire.
+#[tokio::test]
+async fn test_dashboard_proxy_type_and_name_filters() {
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let vhost_port = common::allocate_port();
+    let tcp_port = common::allocate_port();
+    let udp_port = common::allocate_port();
+    let cfg = format!(
+        r#"bind_addr = "127.0.0.1"
+bind_port = {bind_port}
+vhost_http_port = {vhost_port}
+
+[auth]
+method = "token"
+token = "test-token"
+
+[transport]
+tcp_mux = false
+
+[web_server]
+addr = "127.0.0.1"
+port = {dashboard_port}
+user = "admin"
+password = "admin"
+"#,
+        bind_port = bind_port,
+        dashboard_port = dashboard_port,
+        vhost_port = vhost_port,
+    );
+    let frps = FrpsHandle::start(&cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+    let client = auth_client();
+
+    let (mut ctl, _resp) = common::login_with_test_token(addr).await.expect("login");
+    // Register order: UDP last. The server pre-arms a pooled work conn after
+    // a UDP registration (a ReqWorkConn trails the NewProxyResp); register_proxy_ok
+    // tolerates interleaved ReqWorkConn anyway, but this keeps the common case
+    // strictly sequential.
+    register_proxy_ok(
+        &mut ctl,
+        "tcp-one",
+        typed_proxy_msg("tcp-one", "tcp", Some(tcp_port), None, None),
+    )
+    .await;
+    register_proxy_ok(
+        &mut ctl,
+        "http-one",
+        typed_proxy_msg(
+            "http-one",
+            "http",
+            None,
+            Some(vec!["app1.example.com".into()]),
+            None,
+        ),
+    )
+    .await;
+    register_proxy_ok(
+        &mut ctl,
+        "stcp-one",
+        typed_proxy_msg("stcp-one", "stcp", None, None, Some("sk-1".into())),
+    )
+    .await;
+    register_proxy_ok(
+        &mut ctl,
+        "udp-one",
+        typed_proxy_msg("udp-one", "udp", Some(udp_port), None, None),
+    )
+    .await;
+
+    let client = &client;
+    let frps = &frps;
+    let get = |path: &str| {
+        let path = path.to_string();
+        async move {
+            let resp = client
+                .get(frps.dashboard_url(&path))
+                .basic_auth("admin", Some("admin"))
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            let json: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+    };
+
+    // Path-param type listing: each type returns exactly its own proxies.
+    for (path, ty, expected) in [
+        ("/api/proxy/tcp", "tcp", &["tcp-one"][..]),
+        ("/api/proxy/udp", "udp", &["udp-one"][..]),
+        ("/api/proxy/http", "http", &["http-one"][..]),
+        ("/api/proxy/stcp", "stcp", &["stcp-one"][..]),
+        // No xtcp/sudp registered — the handler returns an empty array.
+        ("/api/proxy/xtcp", "xtcp", &[][..]),
+        ("/api/proxy/sudp", "sudp", &[][..]),
+    ] {
+        let (status, json) = get(path).await;
+        assert_eq!(status, 200, "{path} must be 200");
+        let names: Vec<&str> = json
+            .as_array()
+            .expect("list body")
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, expected, "{path} type filter must be exact");
+        for p in json.as_array().unwrap() {
+            assert_eq!(p["type"], ty, "{path} must only carry {ty} entries");
+        }
+    }
+
+    // tcpmux IS a valid registered proxy type in Go v0.71.0 (config/v1
+    // ProxyTypeTCPMUX, stats keyed on the wire type "tcpmux"), so the v1
+    // /api/proxy/tcpmux arm must accept it like the v2 VALID_TYPES does —
+    // Go parity is 200; with no tcpmux proxy registered here that is an
+    // empty list. (Round-9 alignment: frp-rs v1 previously 404'd tcpmux.)
+    let (status, json) = get("/api/proxy/tcpmux").await;
+    assert_eq!(status, 200, "v1 type filter must accept tcpmux (Go parity)");
+    assert_eq!(
+        json.as_array().expect("tcpmux list body").len(),
+        0,
+        "no tcpmux proxy is registered in this test"
+    );
+    // Unknown types stay 404 (frp-rs guard — Go v1 returns 200 + empty list
+    // for any type string; documented divergence, see handle_proxies_by_type).
+    let (status, _) = get("/api/proxy/bogus").await;
+    assert_eq!(status, 404, "unknown type must 404");
+
+    // ?type= query filter on /api/proxies.
+    let (status, json) = get("/api/proxies").await;
+    assert_eq!(status, 200);
+    let all: Vec<String> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(all.len(), 4);
+    let (_, json) = get("/api/proxies?type=http").await;
+    let names: Vec<&str> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["http-one"], "?type=http filter must be exact");
+    let (_, json) = get("/api/proxies?type=stcp").await;
+    let names: Vec<&str> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["stcp-one"], "?type=stcp filter must be exact");
+
+    // Typed detail: matching type+name 200, mismatched type 404, alias route.
+    let (status, json) = get("/api/proxy/tcp/tcp-one").await;
+    assert_eq!(status, 200);
+    assert_eq!(json["name"], "tcp-one");
+    assert_eq!(json["type"], "tcp", "Go parity: detail key is \"type\"");
+    assert_eq!(json["status"], "online");
+    assert!(
+        json["traffic"].is_object(),
+        "detail embeds a traffic snapshot"
+    );
+
+    let (status, _) = get("/api/proxy/udp/tcp-one").await;
+    assert_eq!(status, 404, "type/name mismatch must 404");
+    let (status, _) = get("/api/proxy/tcp/unknown-one").await;
+    assert_eq!(status, 404, "unknown proxy must 404");
+    // /api/proxies/{name} alias serves the same detail.
+    let (status, json2) = get("/api/proxies/tcp-one").await;
+    assert_eq!(status, 200);
+    assert_eq!(json2, json, "alias detail must match the typed detail");
 }
