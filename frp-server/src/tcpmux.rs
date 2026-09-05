@@ -503,17 +503,25 @@ pub async fn run_tcpmux_listener(
             // return nil }`).
             //
             // Wire bytes match Go Response.Write on a raw conn (no
-            // http.Server layer, no Date): OkResponse has an empty header
-            // map and nil Body, so net/http writes the status line then
-            // "Content-Length: 0" (transfer.go — nil body + ContentLength 0
-            // + bodyAllowedForStatus → shouldSendContentLength) then the
-            // blank line. The 407 likewise carries "Content-Length: 0"
-            // BEFORE its map headers: raw Response.Write runs
-            // transferWriter.writeHeader (which emits CL) ahead of
-            // Header.WriteSubset (transfer.go:254-308) — Go's
-            // Server-layer path (vhost http.go) emits CL after the map
-            // headers instead, but tcpmux writes via resp.Write(conn),
-            // no server layer.
+            // http.Server layer, no Date). Both Go frp responses written on
+            // this path are CL==0 (nil Body, empty/one-entry Header map —
+            // OkResponse / ProxyUnauthorizedResponse), and for CL==0 the
+            // header order is: status line, Header.WriteSubset (the map
+            // headers — none for the 200, Proxy-Authenticate for the 407),
+            // THEN the explicit "Content-Length: 0". tw.writeHeader emits
+            // no CL in this case: shouldSendContentLength fires only for
+            // CL>0 or CL==0 with an explicit "identity" Transfer-Encoding
+            // token (transfer.go isIdentity: len==1 — nil TE is not
+            // identity), so the trailing "Content-Length: 0" comes from
+            // Response.Write's own fallback (response.go: ContentLength ==
+            // 0 && !chunked && !shouldSendContentLength &&
+            // bodyAllowedForStatus), AFTER WriteSubset — the earlier
+            // comment claiming writeHeader emits CL ahead of the map
+            // headers was wrong for the CL==0 case — a live probe vs
+            // go1.25 returns Proxy-Authenticate before Content-Length: 0.
+            // Contrast the 404 arm below (NotFoundResponse, body present):
+            // CL>0 trips shouldSendContentLength inside writeHeader, so
+            // that response is genuinely CL-first.
             //
             // pre_read is built AFTER the auth gate: the 407 path must not
             // allocate a forward buffer it will never send. When it is
@@ -554,8 +562,8 @@ pub async fn run_tcpmux_listener(
                     if let Err(e) = stream
                         .write_all(
                             b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                          Content-Length: 0\r\n\
-                          Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\r\n",
+                          Proxy-Authenticate: Basic realm=\"Restricted\"\r\n\
+                          Content-Length: 0\r\n\r\n",
                         )
                         .await
                     {
