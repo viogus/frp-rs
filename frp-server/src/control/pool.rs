@@ -53,6 +53,16 @@ pub(super) fn pending_request_timeout(user_conn_timeout_secs: u64) -> Duration {
 /// arm, entries only expired when a work conn arrived — a provider that
 /// never delivers work conns let the queue grow unbounded (each entry
 /// otherwise only expired inside `handle_new_work_conn`).
+///
+/// The timeout deliberately reuses the pending-request budget
+/// (`pending_request_timeout` → `user_conn_timeout`, default 10s) instead
+/// of the server-side `NAT_HOLE_TIMEOUT` (10s, nathole/controller.rs):
+/// the two are the same order of magnitude by default, and a sid that
+/// lives past its server session is harmless — delivery writes a
+/// StartWorkConn+NatHoleSid into a dead session and the provider's
+/// NatHoleReport error arm already handles that. A longer operator-set
+/// `user_conn_timeout` only delays that self-healing, never breaks it
+/// (round-13 audit note; deliberately not a separate constant).
 pub(crate) fn expire_pending_nat_hole_sids(
     pending: &mut VecDeque<(String, String, Instant)>,
     timeout: Duration,
@@ -128,6 +138,15 @@ pub(crate) struct PendingRequest {
     /// reads local_addr/remote_port/bandwidth_limit/etc. from it instead of
     /// re-acquiring the proxy-map RwLock per user connection.
     pub(crate) proxy_info: Option<Arc<ProxyInfo>>,
+    /// The routed HTTP request method was CONNECT (HTTP/1.1 vhost
+    /// connectHandler + h2c CONNECT arms). Only the two vhost HTTP send
+    /// sites set this; every other producer sends false. The bridge's
+    /// response-header injector reads it to skip CONNECT tunnels (Go
+    /// connectHandler joins raw — ModifyResponse never runs) and to narrow
+    /// its http-type gate from `starts_with("http")` to `== "http"`
+    /// (https tunnels bypass injectors entirely — Go drops the wire
+    /// response_headers field on HTTPSProxyConfig).
+    pub(crate) request_is_connect: bool,
 }
 
 // ---- Helpers ----
@@ -575,6 +594,9 @@ pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
             // and already gated by sk auth).
             user_conn_permit: None,
             proxy_info,
+            // Visitors arrive on their own control-plane handshake
+            // (NewVisitorConn) — never an HTTP vhost request, so never CONNECT.
+            request_is_connect: false,
         },
         ctl.bridge_cancel.clone(),
     )
@@ -611,6 +633,7 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
     pre_read: Vec<u8>,
     forwarded_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     group_selected: bool,
+    request_is_connect: bool,
 ) -> Result<(), ()> {
     // NewUserConn plugin hook — control-enabled plugins can reject.
     // Skip payload construction when no plugins are configured (the
@@ -755,6 +778,10 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
                 // must route directly, not re-run group selection (would
                 // bounce the conn between members forever).
                 group_selected: true,
+                // Passed through so the backend bridge's injector gate sees
+                // the routed method (vhost CONNECT raw tunnel) even across
+                // run_id group boundaries.
+                request_is_connect,
             }) {
                 Ok(()) => {
                     // Reset health on successful dispatch
@@ -845,6 +872,7 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             created_at: Instant::now(),
             user_conn_permit,
             proxy_info,
+            request_is_connect,
         },
         ctl.bridge_cancel.clone(),
     )
@@ -1048,6 +1076,7 @@ mod tests {
             created_at: Instant::now(),
             user_conn_permit: None,
             proxy_info: None,
+            request_is_connect: false,
         }
     }
 
@@ -1317,6 +1346,7 @@ mod tests {
             None,
             // Local conn, no prior group selection — selection runs here.
             false,
+            false,
         )
         .await;
         assert!(
@@ -1386,6 +1416,7 @@ mod tests {
             None,
             // Local conn, no prior group selection — selection runs here.
             false,
+            false,
         )
         .await;
         assert!(res.is_ok());
@@ -1402,6 +1433,7 @@ mod tests {
             pre_read,
             user_conn_permit,
             group_selected,
+            ..
         } = msg
         else {
             panic!("unexpected internal message: {msg:?}");
@@ -1436,6 +1468,7 @@ mod tests {
             // The message was forwarded with group_selected — the backend
             // routes directly to the named proxy.
             true,
+            false,
         )
         .await;
         assert!(res.is_ok());
@@ -1524,6 +1557,7 @@ mod tests {
             Vec::new(),
             None,
             true,
+            false,
         )
         .await;
         assert!(res.is_ok());
@@ -1551,6 +1585,7 @@ mod tests {
             Vec::new(),
             None,
             true,
+            false,
         )
         .await;
         assert!(res.is_ok());

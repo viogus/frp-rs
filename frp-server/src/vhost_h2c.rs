@@ -241,6 +241,18 @@ async fn handle_stream(
     // would look absolute-form.
     let is_absolute_form = h2_request_is_absolute_form(&request);
     let (http_auth, route_user) = h2_select_auth(request.headers(), is_absolute_form);
+    // CONNECT (RFC 7540 §8.3, :method CONNECT) forwards raw — no host
+    // rewrite, no forwarded-header injection. Modeled on the HTTP/1.1
+    // connectHandler (Go http.go:282-285), but note: Go's h2 ResponseWriter
+    // implements no http.Hijacker (h2_bundle.go:4684 — "no plan for
+    // StateHijacked"), so Go's connectHandler CANNOT run over h2 at all and
+    // Go frp answers such a request 500 — this raw-CONNECT leg is a
+    // Rust-only extension of the H1 behavior, not a Go-parity path
+    // (round-13 review comment correction). http::Method equality is the
+    // byte-exact "CONNECT" gate (Go http.MethodConnect). Hoisted so the
+    // ProxyUserConn below carries the same verdict to the bridge's
+    // injector gate.
+    let is_connect = request.method() == http::Method::CONNECT;
     tracing::debug!(host = %host, path = %path, peer = %peer, "HTTP VHost (h2c) request for '{}' path '{}' from {}", host, path, peer);
 
     // Re-encode as an HTTP/1.1 request head. Go's reverse proxy forwards to
@@ -274,12 +286,7 @@ async fn handle_stream(
         // Go checkRouteAuthByRequest's `req.URL.Host != ""` gate — decides
         // the 407-vs-401 response shape on auth failure below.
         is_absolute_form,
-        // CONNECT (RFC 7540 §8.3, :method CONNECT) forwards raw like the
-        // HTTP/1.1 connectHandler — no host rewrite, no forwarded-header
-        // injection (Go http.go:282-285; the h2 layer is the same
-        // ServeHTTP). http::Method equality is the byte-exact "CONNECT"
-        // gate (Go http.MethodConnect).
-        request.method() == http::Method::CONNECT,
+        is_connect,
     )
     .await
     {
@@ -349,6 +356,9 @@ async fn handle_stream(
             user_conn_permit: None,
             // Local sender — no group selection was done.
             group_selected: false,
+            // vhost CONNECT tunnels raw — the bridge's injector must skip
+            // them (Go connectHandler joins raw, ModifyResponse never runs).
+            request_is_connect: is_connect,
         }),
     )
     .await
@@ -763,8 +773,13 @@ async fn send_h2_error(
 /// `http.ReadResponse`): each line ends at the next `\n` with ONE trailing
 /// `\r` stripped, and the first empty line ends the head — so LF-only and
 /// mixed-EOL backends are legal, not just `\r\n\r\n`.
-async fn read_until_head(r: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+/// Read until the end of an HTTP/1.1 response head, seeded with bytes
+/// already read (a consumed interim 1xx head's leftover — the next head's
+/// start, possibly already complete).
+async fn read_until_head_from(
+    r: &mut (impl AsyncRead + Unpin),
+    mut buf: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
     let mut tmp = [0u8; 4096];
     loop {
         if frp_core::textproto::head_end(&buf).is_some() {
@@ -1145,9 +1160,34 @@ async fn stream_chunked_body(
     }
 }
 
+/// One bounded response-head read continuing from `seed` (bytes of a
+/// consumed interim head's leftover). Head-read failures map to
+/// `HeadReadError` — the caller answers 502/504 like the Go reverse proxy.
+enum HeadReadError {
+    Closed,
+    TimedOut,
+}
+
+async fn read_backend_head<R: AsyncRead + Unpin>(
+    r: &mut R,
+    seed: Vec<u8>,
+    head_timeout: Option<std::time::Duration>,
+) -> Result<Vec<u8>, HeadReadError> {
+    match head_timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, read_until_head_from(r, seed)).await {
+            Ok(Ok(h)) => Ok(h),
+            Ok(Err(_e)) => Err(HeadReadError::Closed),
+            Err(_elapsed) => Err(HeadReadError::TimedOut),
+        },
+        None => read_until_head_from(r, seed)
+            .await
+            .map_err(|_e| HeadReadError::Closed),
+    }
+}
+
 /// Read the backend HTTP/1.1 response from `r`, send the HTTP/2 response head,
 /// then stream the body (decoding chunked transfer-encoding) as HTTP/2 DATA
-/// frames. When `head_timeout` is `Some`, the response-head read is bounded —
+/// frames. When `head_timeout` is `Some`, each response-head read is bounded —
 /// on timeout a body-less `504 Gateway Timeout` is sent (Go semantics); a
 /// backend that closes before the head produces `502 Bad Gateway`.
 async fn stream_h2_response<R: AsyncRead + Unpin>(
@@ -1155,32 +1195,51 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     respond: &mut SendResponse<Bytes>,
     head_timeout: Option<std::time::Duration>,
 ) -> Result<(), h2::Error> {
-    let head = if let Some(timeout) = head_timeout {
-        match tokio::time::timeout(timeout, read_until_head(r)).await {
-            Ok(Ok(h)) => h,
-            Ok(Err(_e)) => {
-                // Backend closed (or no work conn was ever assigned) before
-                // the response head — Go's reverse proxy answers 502.
-                tracing::debug!("h2c backend closed before response head, sending 502");
-                return send_h2_error(respond, 502, &[], Bytes::new()).await;
-            }
-            Err(_elapsed) => {
-                tracing::debug!("h2c backend response-head timeout, sending 504");
-                return send_h2_error(respond, 504, &[], Bytes::new()).await;
-            }
+    let mut head = match read_backend_head(r, Vec::new(), head_timeout).await {
+        Ok(h) => h,
+        Err(HeadReadError::Closed) => {
+            // Backend closed (or no work conn was ever assigned) before
+            // the response head — Go's reverse proxy answers 502.
+            tracing::debug!("h2c backend closed before response head, sending 502");
+            return send_h2_error(respond, 502, &[], Bytes::new()).await;
         }
-    } else {
-        match read_until_head(r).await {
-            Ok(h) => h,
-            Err(_e) => {
-                tracing::debug!("h2c backend closed before response head, sending 502");
-                return send_h2_error(respond, 502, &[], Bytes::new()).await;
-            }
+        Err(HeadReadError::TimedOut) => {
+            tracing::debug!("h2c backend response-head timeout, sending 504");
+            return send_h2_error(respond, 504, &[], Bytes::new()).await;
         }
     };
-    let Some(parsed) = parse_response_head(&head) else {
-        tracing::debug!("h2c backend sent a malformed response head, sending 502");
-        return send_h2_error(respond, 502, &[], Bytes::new()).await;
+    // Go Transport readResponse parity (round-13 review finding): non-101
+    // 1xx heads (a 100 Continue answering `Expect: 100-continue`) are
+    // consumed internally and never surface as the response — keep reading
+    // until a final/101 head ends the exchange. Without the skip the
+    // interim head was sent to the h2 client as `:status 100` and the
+    // pipelined final head streamed as its body. (This h2c leg is a
+    // Rust-only extension — Go frp has no h2c vhost — modeled on the Go
+    // client transport, which consumes 1xx the same way.)
+    let parsed = loop {
+        let Some(parsed) = parse_response_head(&head) else {
+            tracing::debug!("h2c backend sent a malformed response head, sending 502");
+            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        };
+        if parsed.status != 101 && (100..=199).contains(&parsed.status) {
+            // A 1xx head carries no body — bytes after its blank line are
+            // the next head's start (possibly already complete).
+            tracing::trace!("h2c consuming backend interim {} head", parsed.status);
+            let seed = head[parsed.body_offset..].to_vec();
+            head = match read_backend_head(r, seed, head_timeout).await {
+                Ok(h) => h,
+                Err(HeadReadError::Closed) => {
+                    tracing::debug!("h2c backend closed between response heads, sending 502");
+                    return send_h2_error(respond, 502, &[], Bytes::new()).await;
+                }
+                Err(HeadReadError::TimedOut) => {
+                    tracing::debug!("h2c backend response-head timeout, sending 504");
+                    return send_h2_error(respond, 504, &[], Bytes::new()).await;
+                }
+            };
+            continue;
+        }
+        break parsed;
     };
     let ParsedHead {
         status,

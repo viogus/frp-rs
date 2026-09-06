@@ -110,6 +110,50 @@ async fn pool_work_conn(addr: SocketAddr, run_id: &str) -> tokio::net::TcpStream
     work_conn
 }
 
+/// Read the StartWorkConn for a dispatched user conn from a pooled work
+/// conn. This harness reads its provider conn only for the NewProxyResp, so
+/// it cannot answer the server's ReqWorkConn: if the user-conn dispatch
+/// beats the pool registration, the conn lands on the server's pending
+/// queue and the pooled conn would stay silent until the 90s heartbeat
+/// kill. When the current conn stays silent for 2s, a fresh pool conn is
+/// opened — the pending queue pops on the next NewWorkConn and the
+/// StartWorkConn arrives on that conn — and the read moves to it. Returns
+/// the conn that actually carried the frame. The attempt budget is 10: the
+/// harness pool (pool_count 1) caps at 11 total conns, and a 10th timeout
+/// retry never over-consumes the server's cap.
+async fn take_start_work_conn(
+    addr: SocketAddr,
+    run_id: &str,
+    mut work_conn: tokio::net::TcpStream,
+) -> (tokio::net::TcpStream, Box<msg::StartWorkConn>) {
+    for attempt in 0..10 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_msg_v1(&mut work_conn),
+        )
+        .await
+        {
+            Ok(Ok(FrpMessage::StartWorkConn(swc))) => {
+                // A rejected dispatch carries Go's verbatim pool-full error
+                // ("work connection pool is full, discarding") — the frame
+                // is a StartWorkConn but the bridge never started.
+                if let Some(err) = &swc.error {
+                    panic!("StartWorkConn carried an error (attempt {attempt}): {err}");
+                }
+                return (work_conn, swc);
+            }
+            Ok(Ok(other)) => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+            Ok(Err(e)) => panic!("StartWorkConn read failed: {e:?}"),
+            Err(_elapsed) => {
+                // Dispatch raced the pool registration and queued the user
+                // conn as pending; answer it with a fresh pool conn.
+                work_conn = pool_work_conn(addr, run_id).await;
+            }
+        }
+    }
+    panic!("StartWorkConn never arrived after 10 pooled conns")
+}
+
 fn vhost_pair() -> (SocketAddr, SocketAddr, ServerConfig) {
     let bind_port = allocate_port();
     let vhost_port = allocate_port();
@@ -1176,5 +1220,203 @@ async fn test_vhost_partial_head_then_eof_not_forwarded() {
         String::from_utf8_lossy(&buf[..n])
     );
     drop(client);
+    drop(_provider);
+}
+
+// ---------------------------------------------------------------
+// Round-13 (F1#2): response-header injector gates
+// ---------------------------------------------------------------
+
+/// Round-13 (F1#2): a CONNECT tunnel routed on an http proxy that HAS
+/// `response_headers` configured must pass the backend's response to the
+/// tunnel user byte-exact — Go's connectHandler joins raw and
+/// ModifyResponse never runs (pkg/util/vhost/http.go:282-285). RED pre-fix:
+/// the bridge injector armed on every `proxy_type == "http"` response
+/// regardless of request method and spliced configured headers into the
+/// tunnel stream.
+#[tokio::test]
+async fn test_vhost_connect_response_headers_not_injected_into_tunnel() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let mut np = http_proxy(
+        "tunnel-rh",
+        vec!["tunnel-rh.example.com".into()],
+        None,
+        None,
+    );
+    np.response_headers = Some(std::collections::HashMap::from([(
+        "X-Backend-Resp".to_string(),
+        "injected".to_string(),
+    )]));
+    let (_provider, run_id) = register_proxy(addr, FrpMessage::NewProxy(Box::new(np))).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(
+            b"CONNECT tunnel-rh.example.com:443 HTTP/1.1\r\n\
+              Host: tunnel-rh.example.com\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send CONNECT");
+
+    let work_conn = pool_work_conn(addr, &run_id).await;
+    let (mut work_conn, swc) = take_start_work_conn(addr, &run_id, work_conn).await;
+    assert!(swc.error.is_none(), "{:?}", swc.error);
+
+    // The CONNECT head reaches the backend raw (request-side parity is
+    // pinned by test_vhost_http_connect_forwards_raw; this test pins the
+    // RESPONSE direction).
+    let head = read_forwarded_head(&mut work_conn).await;
+    assert!(
+        String::from_utf8_lossy(&head).starts_with("CONNECT tunnel-rh.example.com:443"),
+        "CONNECT head must reach the backend, got: {:?}",
+        String::from_utf8_lossy(&head)
+    );
+
+    // Backend answers the tunnel the way an upstream HTTP proxy does: a
+    // response head followed by opaque tunnel bytes. response_headers is
+    // configured on this route — nothing may be spliced in.
+    let backend_bytes = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nTUNNEL-DATA-1";
+    work_conn
+        .write_all(backend_bytes)
+        .await
+        .expect("backend response");
+
+    let mut resp = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut chunk))
+            .await
+            .expect("tunnel response within 5s")
+            .expect("read tunnel response");
+        resp.extend_from_slice(&chunk[..n]);
+        if resp.len() >= backend_bytes.len() {
+            break;
+        }
+    }
+    assert_eq!(
+        &resp[..],
+        backend_bytes,
+        "CONNECT tunnel bytes must reach the user byte-exact (no response_headers injection)"
+    );
+    drop(client);
+    drop(_provider);
+}
+
+/// Round-13 (F1#2): `response_headers` declared on an https proxy must
+/// never run the injector — Go drops the field at config time
+/// (HTTPSProxyConfig in pkg/config/v1/proxy.go has no ResponseHeaders), and
+/// the https leg carries opaque TLS anyway. RED pre-fix: the bridge
+/// injector's `starts_with("http")` gate armed on https legs and buffered
+/// the TLS backend's handshake flight waiting for an HTTP head boundary
+/// that never comes — the TLS handshake starved and the tunnel never
+/// established. The pin: a full rustls handshake through the https leg
+/// (backend = real rustls server on the pooled work conn) plus a plaintext
+/// echo.
+#[tokio::test]
+async fn test_https_declared_response_headers_tls_handshake_completes() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
+    let (addr, _vhost_addr, mut cfg) = vhost_pair();
+    // HTTPS proxies route on the dedicated vhost HTTPS listener (main-port
+    // SNI sniff was removed for Go parity) — without a vhost_https_port the
+    // SNI route has no listener and the dispatch never fires.
+    let https_port = allocate_port();
+    cfg.vhost_https_port = https_port;
+    let https_addr: SocketAddr = format!("127.0.0.1:{https_port}")
+        .parse()
+        .expect("https addr");
+    let (_handle, _) = start_test_server(cfg).await;
+
+    // An https proxy with response_headers declared on the wire (Go would
+    // silently drop it at config load; frp-rs stores it but the bridge gate
+    // must never apply it).
+    let mut np = https_proxy("tls-rh", vec!["tls-rh.example.com".into()]);
+    np.response_headers = Some(std::collections::HashMap::from([(
+        "X-Injected".to_string(),
+        "yes".to_string(),
+    )]));
+    let (_provider, run_id) = register_proxy(addr, FrpMessage::NewProxy(Box::new(np))).await;
+
+    // Client side (NoVerify) handshakes through the SNI https route on the
+    // vhost HTTPS port; the backend side is a real rustls server answering
+    // from the pooled work conn.
+    let client_cfg = Arc::new(
+        tokio_rustls::rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth(),
+    );
+    let server_name: tokio_rustls::rustls::pki_types::ServerName<'static> =
+        "tls-rh.example.com".try_into().expect("server name");
+    let addr_for_task = https_addr;
+    let client_task = tokio::spawn(async move {
+        let raw = tokio::net::TcpStream::connect(addr_for_task)
+            .await
+            .expect("connect to vhost https route");
+        tokio_rustls::TlsConnector::from(client_cfg)
+            .connect(server_name, raw)
+            .await
+    });
+
+    let work_conn = pool_work_conn(addr, &run_id).await;
+    let (work_conn, swc) = take_start_work_conn(addr, &run_id, work_conn).await;
+    assert!(swc.error.is_none(), "{:?}", swc.error);
+    // Round-12 B1: ONLY type=http legs drop the dst pair — https legs
+    // keep the real server-side local addr (Go handleUserTCPConnection
+    // proxy.go:288). The https leg here must carry it: the frpc
+    // PROXY-header fallback (127.0.0.1:0) is for http legs alone.
+    assert_eq!(
+        swc.dst_addr.as_deref(),
+        Some("127.0.0.1"),
+        "https leg must report the accept socket's local addr as dst: {:?}",
+        swc.dst_addr
+    );
+    assert!(
+        swc.dst_port.is_some_and(|p| p != 0),
+        "https leg dst_port must be the real accept port: {:?}",
+        swc.dst_port
+    );
+    // Both handshakes are wrapped in 20s timeouts so a regression (an
+    // injector buffering raw TLS looking for an HTTP head) fails fast with
+    // the failing side named instead of hanging the test to the 90s
+    // heartbeat kill — the pre-fix failure mode this pin guards.
+    let mut backend_tls = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio_rustls::TlsAcceptor::from(Arc::new(
+            frp_core::transport::generate_self_signed_tls_config().expect("self-signed TLS config"),
+        ))
+        .accept(work_conn),
+    )
+    .await
+    .expect("backend TLS handshake timed out")
+    .expect(
+        "backend TLS handshake must complete — the https leg must relay raw TLS, \
+         not buffer it in an injector looking for an HTTP head",
+    );
+    let mut client_tls = tokio::time::timeout(std::time::Duration::from_secs(20), client_task)
+        .await
+        .expect("client TLS handshake timed out")
+        .expect("client task")
+        .expect("client TLS handshake must complete");
+
+    // Plaintext echo through the tunnel: the TLS records flow intact.
+    client_tls.write_all(b"ping").await.expect("client write");
+    let mut echo = [0u8; 4];
+    backend_tls
+        .read_exact(&mut echo)
+        .await
+        .expect("backend read");
+    assert_eq!(&echo, b"ping", "backend must receive client plaintext");
+    backend_tls.write_all(b"pong").await.expect("backend write");
+    client_tls.read_exact(&mut echo).await.expect("client read");
+    assert_eq!(&echo, b"pong", "client must receive backend plaintext");
+
+    drop(client_tls);
+    drop(backend_tls);
     drop(_provider);
 }

@@ -570,3 +570,270 @@ async fn test_ssh_gateway_password_throttle_cuts_off_fresh_connection() {
         "throttle cutoff never observed across 4 fresh connections from the armed IP"
     );
 }
+
+/// Round-13 (S RISK): the per-IP pre-auth cap — a single source cannot
+/// fill the global SSH conn semaphore with unauthenticated conns and hold
+/// them to the auth deadline (8 slots/IP bounds one source to ~0.5
+/// conns/s sustained; the old code let one reconnect-loop IP hold all
+/// 128 global slots for up to ~15s each).
+#[tokio::test]
+async fn test_ssh_gateway_preauth_per_ip_cap_drops_overflow_conn() {
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let mut cfg = ssh_test_config(ssh_port, bind_port);
+    cfg.auth.token = common::TEST_TOKEN.into();
+
+    let (_handle, _port) = start_test_server(cfg).await;
+
+    let connect_raw = || async {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match tokio::net::TcpStream::connect(format!("127.0.0.1:{ssh_port}")).await {
+                Ok(s) => return s,
+                Err(e) => last_err = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("raw SSH connect failed; last error: {last_err:?}");
+    };
+
+    // Phase 1: hold 8 unauthenticated conns from one IP. Reading the
+    // banner proves the conn was accepted AND its pre-auth slot acquired —
+    // the slot is taken in the accept loop before the spawn that runs the
+    // russh server and writes the banner.
+    let mut held: Vec<tokio::net::TcpStream> = Vec::new();
+    for i in 0..8 {
+        let mut s = connect_raw().await;
+        let banner = read_ssh_banner(&mut s).await;
+        assert!(
+            banner.starts_with("SSH-"),
+            "held conn {i} must receive the banner: {banner:?}"
+        );
+        held.push(s);
+    }
+
+    // Phase 2: the 9th concurrent conn from the same IP is dropped at the
+    // accept gate — no banner, no handshake: clean EOF (server closed the
+    // accepted stream) or reset, never banner bytes.
+    let mut ninth = connect_raw().await;
+    let mut buf = [0u8; 8];
+    let n = timeout(Duration::from_secs(2), ninth.read(&mut buf))
+        .await
+        .expect("9th conn must be cut off quickly, not left hanging")
+        .unwrap_or_else(|e| {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "9th conn read error: {e}"
+            );
+            0
+        });
+    assert_eq!(
+        n, 0,
+        "9th concurrent pre-auth conn from one IP must be dropped before the banner"
+    );
+    drop(ninth);
+
+    // Phase 3: release one held conn (its accept task ends, returning the
+    // permit). A fresh conn from the same IP is admitted again. Retry: the
+    // task end is asynchronous, and a still-denied conn just reads EOF.
+    held.pop();
+    drop(held);
+    let mut admitted = false;
+    for _ in 0..20 {
+        let mut s = connect_raw().await;
+        let mut probe = [0u8; 64];
+        let n = match timeout(Duration::from_secs(2), s.read(&mut probe)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => 0,
+            Ok(Err(e)) => panic!("post-release conn read error: {e}"),
+            Err(_) => panic!("post-release conn banner timed out"),
+        };
+        if n > 0 && String::from_utf8_lossy(&probe[..n]).starts_with("SSH-") {
+            admitted = true;
+            break;
+        }
+    }
+    assert!(
+        admitted,
+        "a conn after a pre-auth slot release must be admitted again"
+    );
+}
+
+/// Round-13: the authorized_keys PUBLICKEY accept arm had only parse-level
+/// units (test_parse_authorized_keys_shapes) — no e2e proved a key in the
+/// allow-list actually authenticates through russh, nor that an absent key
+/// is denied while the token password path keeps working.
+#[tokio::test]
+async fn test_ssh_gateway_authorized_keys_accept_and_deny_e2e() {
+    use russh::keys::PublicKeyBase64;
+
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let keys_path = dir.path().join("authorized_keys");
+    let key1 = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+        .expect("key1");
+    let key2 = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+        .expect("key2");
+    std::fs::write(
+        &keys_path,
+        format!(
+            "ssh-ed25519 {} allow-listed\n",
+            key1.public_key().public_key_base64()
+        ),
+    )
+    .unwrap();
+
+    let mut cfg = ssh_test_config(ssh_port, bind_port);
+    cfg.ssh_tunnel_gateway.authorized_keys_file = keys_path.to_str().unwrap().into();
+
+    let (_handle, _port) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
+    let connect = || async {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match russh::client::connect(
+                Arc::new(russh::client::Config::default()),
+                addr,
+                TestSshClient { local_target: None },
+            )
+            .await
+            {
+                Ok(c) => return c,
+                Err(e) => last_err = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("SSH client should connect; last error: {last_err:?}");
+    };
+
+    // Key NOT in the allow-list: denied.
+    let mut denied = connect().await;
+    let auth = denied
+        .authenticate_publickey(
+            "v0",
+            russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key2.clone()), None),
+        )
+        .await
+        .expect("publickey attempt must complete");
+    assert!(!auth.success(), "an absent key must be denied");
+    denied
+        .disconnect(russh::Disconnect::ByApplication, "denied", "")
+        .await
+        .ok();
+
+    // Key IN the allow-list: accepted.
+    let mut accepted = connect().await;
+    let auth = accepted
+        .authenticate_publickey(
+            "v0",
+            russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key1.clone()), None),
+        )
+        .await
+        .expect("publickey attempt must complete");
+    assert!(auth.success(), "an allow-listed key must authenticate");
+    accepted
+        .disconnect(russh::Disconnect::ByApplication, "accepted", "")
+        .await
+        .ok();
+
+    // The token password path still works alongside the allow-list.
+    let mut by_password = connect().await;
+    let auth = by_password
+        .authenticate_password("v0", common::TEST_TOKEN)
+        .await
+        .expect("password auth should succeed");
+    assert!(auth.success(), "token password auth must still work");
+}
+
+/// Round-13: an authorized_keys_file that EXISTS but is unreadable (load
+/// error → `unwrap_or_default` empty allow-list) must not crash the
+/// gateway: fail-closed — every publickey attempt denied — while token
+/// password auth keeps working (the load-once behavior lives in
+/// SshListener::new; Go's per-auth re-read with abort-on-first-error is
+/// documented as a divergence).
+#[tokio::test]
+async fn test_ssh_gateway_unreadable_authorized_keys_file_fails_closed() {
+    use russh::keys::PublicKeyBase64;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root bypasses file mode bits (EACCES never fires) — the 0o000 premise
+    // of this test does not hold under euid 0; skip rather than fake it.
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: chmod 0o000 cannot gate root (euid 0)");
+        return;
+    }
+
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let keys_path = dir.path().join("authorized_keys");
+    let key1 = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+        .expect("key1");
+    std::fs::write(
+        &keys_path,
+        format!(
+            "ssh-ed25519 {} would-allow\n",
+            key1.public_key().public_key_base64()
+        ),
+    )
+    .unwrap();
+    // 0000: the load's read_to_string fails with EACCES for the test user.
+    std::fs::set_permissions(&keys_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut cfg = ssh_test_config(ssh_port, bind_port);
+    cfg.ssh_tunnel_gateway.authorized_keys_file = keys_path.to_str().unwrap().into();
+
+    let (_handle, _port) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
+    let connect = || async {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match russh::client::connect(
+                Arc::new(russh::client::Config::default()),
+                addr,
+                TestSshClient { local_target: None },
+            )
+            .await
+            {
+                Ok(c) => return c,
+                Err(e) => last_err = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("SSH client should connect; last error: {last_err:?}");
+    };
+
+    // The gateway is up (token set — no refuse-to-start), but the key that
+    // WOULD have allowed this client is invisible: denied.
+    let mut denied = connect().await;
+    let auth = denied
+        .authenticate_publickey(
+            "v0",
+            russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key1), None),
+        )
+        .await
+        .expect("publickey attempt must complete");
+    assert!(
+        !auth.success(),
+        "an unreadable allow-list must fail closed (no key accepted)"
+    );
+
+    // Token password auth is unaffected.
+    let mut by_password = connect().await;
+    let auth = by_password
+        .authenticate_password("v0", common::TEST_TOKEN)
+        .await
+        .expect("password auth should succeed");
+    assert!(auth.success(), "token password auth must still work");
+
+    drop(denied);
+    drop(by_password);
+    std::fs::set_permissions(&keys_path, std::fs::Permissions::from_mode(0o600)).ok();
+}
