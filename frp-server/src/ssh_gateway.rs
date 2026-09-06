@@ -3304,9 +3304,19 @@ impl SshListener {
             // cap the conn is dropped immediately — no handshake started.
             let preauth_permit = {
                 let ip = peer_addr.ip();
-                let sem = per_ip_preauth
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                // Look up (or create) the IP's semaphore and acquire under
+                // the SAME lock hold: try_acquire_owned never blocks, and
+                // holding the map lock across clone + acquire closes the
+                // round-13 review race where a final permit release removes
+                // the entry between a clone and the acquire — an acquire on
+                // that orphaned semaphore would let a fresh full entry
+                // coexist with the stale holder (transient 9th concurrent
+                // pre-auth). Once a permit is held the entry is pinned:
+                // removal requires all SSH_PREAUTH_PER_IP_CAP permits
+                // returned (see PreauthPermit::drop), so no later release
+                // can remove it while this one is outstanding.
+                let mut map = per_ip_preauth.lock().unwrap_or_else(|e| e.into_inner());
+                let sem = map
                     .entry(ip)
                     .or_insert_with(|| {
                         std::sync::Arc::new(tokio::sync::Semaphore::new(SSH_PREAUTH_PER_IP_CAP))

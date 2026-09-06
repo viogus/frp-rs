@@ -2275,13 +2275,43 @@ fn inject_vhost_request_headers(
         p.push(b':');
         override_prefixes.push(p);
     }
-    for line in head.split_inclusive(|&b| b == b'\n') {
+    // Physical lines of the head (EOL retained). An obs-fold continuation
+    // line (leading SP/HT, RFC 7230 §3.2.4) BELONGS to the previous
+    // header; Go's textproto reader unfolds it before any header logic
+    // runs (readContinuedLineSlice joins continuation content with a
+    // single space), so a stripped or chained header must take its
+    // continuations with it — a dropped `X-Forwarded-For:` name line must
+    // not leave its fold tail behind to obs-fold onto the PRECEDING kept
+    // header at the backend (round-13 review, 2 independent reviewers).
+    // Kept headers stay byte-identical (folded form preserved); only
+    // dropped/chained headers are unfolded.
+    let physical: Vec<&[u8]> = head.split_inclusive(|&b| b == b'\n').collect();
+    // Advance `i` past the obs-fold continuation lines that follow the
+    // line at `*i` (a dropped/chained header takes its continuations).
+    let swallow_continuations = |i: &mut usize| {
+        while *i < physical.len() {
+            let t = physical[*i]
+                .strip_suffix(b"\n")
+                .unwrap_or(physical[*i])
+                .strip_suffix(b"\r")
+                .unwrap_or(physical[*i]);
+            if matches!(t.first(), Some(b' ' | b'\t')) {
+                *i += 1;
+            } else {
+                break;
+            }
+        }
+    };
+    let mut i = 0;
+    while i < physical.len() {
+        let line = physical[i];
         let trimmed = line
             .strip_suffix(b"\n")
             .unwrap_or(line)
             .strip_suffix(b"\r")
             .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line));
         if trimmed.is_empty() {
+            i += 1;
             continue;
         }
         // Case-insensitive ASCII compare against the precomputed prefixes;
@@ -2291,6 +2321,10 @@ fn inject_vhost_request_headers(
             .iter()
             .any(|p| trimmed.len() >= p.len() && trimmed[..p.len()].eq_ignore_ascii_case(p));
         if is_override {
+            // request_headers will Set-replace this header — swallow its
+            // folded continuation lines whole.
+            i += 1;
+            swallow_continuations(&mut i);
             continue;
         }
         if trimmed
@@ -2312,6 +2346,31 @@ fn inject_vhost_request_headers(
             // leading ", " in the chain (", 127.0.0.1"), so empty
             // values are kept, not skipped.
             existing_xff.extend_from_slice(value);
+            // Folded continuation content joins the value with a single
+            // space (Go textproto unfold — readContinuedLineSlice), so
+            // the chain carries the whole inbound logical value before
+            // the ", " separator.
+            i += 1;
+            while i < physical.len() {
+                let t = physical[i]
+                    .strip_suffix(b"\n")
+                    .unwrap_or(physical[i])
+                    .strip_suffix(b"\r")
+                    .unwrap_or(physical[i]);
+                match t.first() {
+                    Some(b' ' | b'\t') => {
+                        let content = t
+                            .iter()
+                            .position(|&b| b != b' ' && b != b'\t')
+                            .map(|p| &t[p..])
+                            .unwrap_or(&[]);
+                        existing_xff.push(b' ');
+                        existing_xff.extend_from_slice(content);
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
             existing_xff.extend_from_slice(b", ");
             continue;
         }
@@ -2327,9 +2386,14 @@ fn inject_vhost_request_headers(
             || (trimmed.len() >= 18 && trimmed[..18].eq_ignore_ascii_case(b"x-forwarded-proto:"))
             || (trimmed.len() >= 10 && trimmed[..10].eq_ignore_ascii_case(b"forwarded:"));
         if is_go_stripped {
+            // Swallow this header's folded continuation lines too — they
+            // belong to the deleted logical header.
+            i += 1;
+            swallow_continuations(&mut i);
             continue;
         }
         lines.push(line);
+        i += 1;
     }
 
     let mut out = Vec::with_capacity(data.len() + 64 + request_headers.len() * 24);
@@ -4983,6 +5047,68 @@ mod tests {
         assert!(
             text.contains("x-forwarded-hostile: keep-me\r\n"),
             "lookalike header must survive the exact-name strip: {text:?}"
+        );
+    }
+
+    /// obs-fold continuation lines (RFC 7230 §3.2.4 — leading SP/HT)
+    /// BELONG to the previous logical header. Go's textproto unfolds before
+    /// any header logic, so a stripped header takes its continuations with
+    /// it — a leftover fold tail must not obs-fold onto the preceding kept
+    /// `Host` line at the backend (round-13 review, 2 independent
+    /// reviewers), and an XFF fold tail joins the chained value with a
+    /// single space (Go readContinuedLineSlice).
+    #[test]
+    fn inject_folded_stripped_and_xff_lines_swallow_continuations() {
+        // One literal line: Rust `\` string continuation would eat the fold
+        // lines' leading spaces (obs-fold is leading SP/HT — must be real
+        // bytes).
+        let head = b"GET / HTTP/1.1\r\nHost: app.example.com\r\nX-Forwarded-Host: evil.example.com\r\n fold-tail-1\r\nX-Forwarded-For: 203.0.113.1\r\n 5.6.7.8\r\nx-kept: v\r\n\r\nbody"
+            .to_vec();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
+        let out = inject_vhost_request_headers(head, peer, "app.example.com", &[]);
+        let text = String::from_utf8(out).unwrap();
+        // The stripped header and its fold tail are gone whole — the tail
+        // must not survive as a dangling line that obs-folds onto `Host`
+        // (backend would read `Host: app.example.com fold-tail-1`).
+        assert!(
+            !text.contains("fold-tail-1"),
+            "fold continuation of a stripped header must not survive: {text:?}"
+        );
+        // The XFF fold tail joined the chained value (single space, Go
+        // unfold) — no dangling continuation line in the emitted head.
+        assert!(
+            text.contains("X-Forwarded-For: 203.0.113.1 5.6.7.8, 192.0.2.55\r\n"),
+            "folded XFF value must chain as one logical value: {text:?}"
+        );
+        assert!(
+            !text.contains("\r\n 5.6.7.8"),
+            "no dangling XFF continuation line: {text:?}"
+        );
+        assert!(text.contains("x-kept: v\r\n"), "{text:?}");
+        assert!(text.ends_with("\r\nbody"), "body tail untouched: {text:?}");
+    }
+
+    /// A requestHeaders override swallows the backend header's folded
+    /// continuation lines too (Go Header.Set replaces the whole unfolded
+    /// logical header).
+    #[test]
+    fn inject_override_drops_folded_header_whole() {
+        let head = b"GET / HTTP/1.1\r\nHost: app.example.com\r\nX-Custom: a\r\n b\r\n\r\n".to_vec();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
+        let overrides = [("X-Custom".to_string(), "cfg".to_string())];
+        let out = inject_vhost_request_headers(head, peer, "app.example.com", &overrides);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("X-Custom: a"),
+            "backend value must be replaced (Set semantics): {text:?}"
+        );
+        assert!(
+            !text.contains("\r\n b\r\n"),
+            "fold tail of the replaced header must not dangle: {text:?}"
+        );
+        assert!(
+            text.contains("X-Custom: cfg\r\n"),
+            "configured value alone: {text:?}"
         );
     }
 

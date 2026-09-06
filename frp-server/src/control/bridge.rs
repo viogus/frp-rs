@@ -105,11 +105,16 @@ impl Drop for ActiveGuard {
 /// head (status >= 200) and on a 101 Switching Protocols (Go runs
 /// modifyResponse on 101 before handleUpgradeResponse), but NEVER on an
 /// interim 1xx head other than 101 — Go's Transport consumes those heads
-/// internally and modifyResponse never sees them. Interim heads are still
+/// internally and modifyResponse never sees them — nor on a MALFORMED
+/// first line (unparseable version token or code: Go errors the whole
+/// response and the reverse proxy answers 502, see head_status_code).
+/// Interim heads are still
 /// real bytes on this raw pipe (an `Expect: 100-continue` backend waits
 /// for its 100 head to reach the client before sending the body), so they
 /// are served through UNINJECTED and promptly, not withheld until a final
 /// head shows up (withholding would deadlock the Expect handshake).
+/// Malformed heads pass through uninjected too — never manufacture
+/// configured headers into a head Go would reject outright.
 struct ResponseHeaderInjector<R> {
     inner: R,
     headers: std::collections::HashMap<String, String>,
@@ -164,23 +169,49 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
         }
     }
 
+    /// True when the version token parses like Go `http.ParseHTTPVersion`
+    /// — `HTTP/` + one or more digits + `.` + one or more digits
+    /// (response.go:183-185 — the version is validated BEFORE the code, so
+    /// a first token like `FOO 200 OK` errors the whole response).
+    fn is_http_version(v: &[u8]) -> bool {
+        let Some(rest) = v.strip_prefix(b"HTTP/") else {
+            return false;
+        };
+        let Some(dot) = rest.iter().position(|&b| b == b'.') else {
+            return false;
+        };
+        dot > 0
+            && rest[..dot].iter().all(u8::is_ascii_digit)
+            && !rest[dot + 1..].is_empty()
+            && rest[dot + 1..].iter().all(u8::is_ascii_digit)
+    }
+
     /// Status code of the head's first line, or None when the line is not
-    /// a parseable `HTTP/x.y <3-digit-code>` shape (treated as final — the
-    /// old behavior of injecting into any unparseable-but-terminated head
-    /// is kept; only clean 1xx codes classify as interim).
+    /// a parseable `HTTP/x.y <3-digit-code>` status line. Round-13 review
+    /// (3 independent reviewers): the version token must parse (Go
+    /// ParseHTTPVersion) and the remainder is trimmed of ASCII SPACES only
+    /// (Go TrimLeft(" ", ...) — a TAB before the code keeps the token
+    /// `\t100`, 4 chars, malformed, exactly like Go; trimming TAB was
+    /// classifying `HTTP/1.1 \t100 Continue` as interim when Go 502s it).
     fn head_status_code(head: &[u8]) -> Option<u16> {
         let line_end = head.iter().position(|&b| b == b'\n')?;
         let line = &head[..line_end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         // Go ReadResponse parseStatusLine parity: the version token is cut
-        // at the FIRST literal space, the remainder is TrimLeft'd (extra
-        // spaces legal — "HTTP/1.1  100 Continue"), then the code is the
-        // next space-delimited token, exactly 3 ASCII digits (checked
-        // before Atoi — "0200" rejected).
+        // at the FIRST literal space, the remainder is TrimLeft'd of
+        // spaces (extra spaces legal — "HTTP/1.1  100 Continue"), then the
+        // code is the next space-delimited token, exactly 3 ASCII digits
+        // (checked before Atoi — "0200" rejected).
         let mut sp = line.splitn(2, |&b| b == b' ');
-        sp.next()?;
+        let version = sp.next()?;
         let rest = sp.next()?;
-        let rest = rest.trim_ascii_start();
+        if !Self::is_http_version(version) {
+            return None;
+        }
+        let mut rest = rest;
+        while let Some(stripped) = rest.strip_prefix(b" ") {
+            rest = stripped;
+        }
         let code = rest.split(|&b| b == b' ').next()?;
         if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
             return None;
@@ -191,11 +222,62 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
         )
     }
 
-    /// A head whose first line parsed as interim (100..=199, NOT 101 —
-    /// Go runs modifyResponse on 101). `head` must be the full head
-    /// INCLUDING its terminating blank line.
-    fn is_interim(head: &[u8]) -> bool {
-        matches!(Self::head_status_code(head), Some(c) if (100..=199).contains(&c) && c != 101)
+    /// Copy the status + header lines of a backend response head
+    /// (`head_region` EXCLUDES the terminating blank line) into `out`,
+    /// dropping any header whose name matches a configured response header
+    /// (case-insensitive, Go canonicalization), folded obs-fold
+    /// continuation lines included — Go `Header.Set` semantics: the
+    /// configured value replaces the backend value; both never reach the
+    /// wire. A continuation AFTER a kept line stays with its parent (bytes
+    /// preserved verbatim).
+    fn splice_head_deduplicated(
+        head_region: &[u8],
+        headers: &std::collections::HashMap<String, String>,
+        out: &mut Vec<u8>,
+    ) {
+        let mut pos = 0;
+        while pos < head_region.len() {
+            let (line, next) = match head_region[pos..].iter().position(|&b| b == b'\n') {
+                Some(p) => (&head_region[pos..pos + p + 1], pos + p + 1),
+                None => (&head_region[pos..], head_region.len()),
+            };
+            let body = line.strip_suffix(b"\n").unwrap_or(line);
+            let body = body.strip_suffix(b"\r").unwrap_or(body);
+            let is_continuation = matches!(body.first(), Some(b' ' | b'\t'));
+            if !is_continuation {
+                if let Some(colon) = body.iter().position(|&b| b == b':') {
+                    let name = &body[..colon];
+                    if headers
+                        .keys()
+                        .any(|k| k.as_bytes().eq_ignore_ascii_case(name))
+                    {
+                        // Drop this header AND its folded continuation
+                        // lines (they belong to it — a leftover fold tail
+                        // would obs-fold onto the PRECEDING kept header at
+                        // the client).
+                        let mut after = next;
+                        while after < head_region.len() {
+                            let (c_line, c_next) =
+                                match head_region[after..].iter().position(|&b| b == b'\n') {
+                                    Some(p) => (&head_region[after..after + p + 1], after + p + 1),
+                                    None => (&head_region[after..], head_region.len()),
+                                };
+                            let c_body = c_line.strip_suffix(b"\n").unwrap_or(c_line);
+                            let c_body = c_body.strip_suffix(b"\r").unwrap_or(c_body);
+                            if matches!(c_body.first(), Some(b' ' | b'\t')) {
+                                after = c_next;
+                            } else {
+                                break;
+                            }
+                        }
+                        pos = after;
+                        continue;
+                    }
+                }
+            }
+            out.extend_from_slice(line);
+            pos = next;
+        }
     }
 }
 
@@ -235,7 +317,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
             this.buffer_offset += to_copy;
             if this.buffer_offset >= this.buffer.len() {
                 if this.raw_head {
-                    // Interim head fully served — resume accumulating the
+                    // Raw head (interim 1xx, or malformed — neither is
+                    // injected) fully served — resume accumulating the
                     // next head from the split-off tail.
                     this.raw_head = false;
                     this.buffer = this.tail.take().unwrap_or_default();
@@ -285,15 +368,26 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                             "backend response head has no status line",
                         )));
                     }
-                    if Self::is_interim(&this.buffer[..end]) {
-                        // Interim 1xx (not 101): Go's Transport consumes
-                        // these and modifyResponse never runs — no
-                        // injection. Serve the head raw NOW (an
-                        // Expect:100-continue backend waits for its 100
-                        // head to reach the client before sending the
-                        // body); bytes past the blank line are the next
-                        // head's start and go back into `buffer` once the
-                        // emission drains.
+                    // Go ReadResponse parity: an interim 1xx head (not
+                    // 101) is consumed internally by Go's Transport and
+                    // modifyResponse never runs on it, and a MALFORMED
+                    // first line (unparseable version token or code — Go
+                    // errors the response, the reverse proxy answers 502)
+                    // never reaches modifyResponse either. Both are served
+                    // through this raw pipe UNINJECTED — never manufacture
+                    // configured headers into a head Go would swallow or
+                    // reject (round-13 review, 3 independent reviewers).
+                    let served_raw = match Self::head_status_code(&this.buffer[..end]) {
+                        Some(c) if (100..=199).contains(&c) && c != 101 => true,
+                        None => true,
+                        Some(_) => false,
+                    };
+                    if served_raw {
+                        // Serve the head raw NOW (an Expect:100-continue
+                        // backend waits for its 100 head to reach the
+                        // client before sending the body); bytes past the
+                        // blank line are the next head's start and go back
+                        // into `buffer` once the emission drains.
                         this.tail = Some(this.buffer.split_off(end));
                         this.buffer_offset = 0;
                         this.raw_head = true;
@@ -309,7 +403,19 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                     // blank line are the backend's entity body and pass
                     // verbatim.
                     let mut injected = Vec::with_capacity(this.buffer.len() + 512);
-                    injected.extend_from_slice(&this.buffer[..blank_start]);
+                    // Go ModifyResponse `Header.Set(k, v)` REPLACES a
+                    // backend-sent value for a configured name — the wire
+                    // must never carry both lines (round-13 review finding:
+                    // a backend `X-Custom: a` + configured `X-Custom: b`
+                    // previously shipped both, backend's first, breaking a
+                    // first-value-wins security header). Backend lines whose
+                    // name matches a configured key are dropped,
+                    // case-insensitively, folded continuations included.
+                    Self::splice_head_deduplicated(
+                        &this.buffer[..blank_start],
+                        &this.headers,
+                        &mut injected,
+                    );
                     for (k, v) in &this.headers {
                         // Sanitize header names/values to prevent HTTP
                         // header injection.
@@ -2751,5 +2857,58 @@ mod tests {
             b"HTTP/1.1 100 Continue\r\n\r\n",
             "the lone interim head must pass raw with a clean EOF"
         );
+    }
+
+    /// Round-13 review (3 independent reviewers): a head whose first line
+    /// does not parse as `HTTP/x.y <3-digit-code>` is malformed — Go errors
+    /// the whole response and the reverse proxy answers 502, ModifyResponse
+    /// never runs. The injector must serve such heads raw and NEVER
+    /// manufacture configured headers into them. Pins the strict status
+    /// line: tab separator, unparseable version token, and a 4-digit code
+    /// are all malformed (space-TrimLeft is spaces-only, "0200" rejected
+    /// before Atoi), while extra SPACES stay legal and DO inject.
+    #[tokio::test]
+    async fn injector_malformed_first_line_served_raw_never_injected() {
+        use tokio::io::AsyncWriteExt;
+        let headers = || {
+            let mut h = std::collections::HashMap::new();
+            h.insert("X-Injected".to_string(), String::from("yes"));
+            h
+        };
+        for (name, head) in [
+            ("tab separator", &b"HTTP/1.1\t100 Continue\r\n\r\n"[..]),
+            ("bad version token", &b"HTTP/1.x 200 OK\r\n\r\n"[..]),
+            ("4-digit code", &b"HTTP/1.1 0200 OK\r\n\r\n"[..]),
+            ("no code", &b"HTTP/1.1 \r\n\r\n"[..]),
+        ] {
+            let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+            let mut injector = ResponseHeaderInjector::new(inner_r, headers());
+            inner_w.write_all(head).await.expect("write head");
+            inner_w.shutdown().await.expect("shutdown");
+            drop(inner_w);
+            let out = injector_read_all(&mut injector).await;
+            assert_eq!(
+                &out[..],
+                head,
+                "[{name}] malformed first line must pass through byte-exact, uninjected"
+            );
+        }
+        // Extra spaces between version and code are legal (Go TrimLeft): the
+        // head IS final (200) and MUST be injected.
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers());
+        inner_w
+            .write_all(b"HTTP/1.1   200 OK\r\nContent-Type: text/plain\r\n\r\nhello")
+            .await
+            .expect("write 200");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+        let out = injector_read_all(&mut injector).await;
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("X-Injected: yes"),
+            "multi-space first line is a valid final head and must inject, got: {s:?}"
+        );
+        assert!(s.ends_with("hello"), "body must survive, got: {s:?}");
     }
 }
