@@ -1987,26 +1987,32 @@ mod tests {
     fn test_parse_authorized_key_line_backslash_escaped_quotes() {
         use russh::keys::PublicKeyBase64;
 
-        let key =
+        let key1 =
             russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
                 .unwrap();
-        let k_b64 = key.public_key().public_key_base64();
-        let expected = russh::keys::parse_public_key_base64(&k_b64).unwrap();
+        let k1_b64 = key1.public_key().public_key_base64();
+        let expected1 = russh::keys::parse_public_key_base64(&k1_b64).unwrap();
+        let key2 =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let k2_b64 = key2.public_key().public_key_base64();
 
         // `\"` inside a quoted option value: the tokenizer must not close
         // the quote at the escaped `"`, so the keytype+blob pair stays
-        // reachable. Also exercises a trailing unclosed quote on a
-        // SEPARATE line (the rest of that line is consumed inside the
-        // quote — no key — but the neighbor line must survive).
+        // reachable. The SECOND line is the discriminating shape: a real
+        // key material pair sits inside an unterminated quote — the
+        // quote-aware parser drops the whole line, while a naive
+        // whitespace tokenizer would surface it. Exactly key1 must parse.
         let parsed = parse_authorized_keys(&format!(
-            "restrict,command=\"echo \\\"hi\\\"\",from=\"a b\" ssh-ed25519 {k_b64} u@h\n\
-             command=\"unterminated ssh-ed25519\n\
-             ssh-ed25519 {k_b64}\n"
+            "restrict,command=\"echo \\\"hi\\\"\",from=\"a b\" ssh-ed25519 {k1_b64} u@h\n\
+             command=\"unterminated quote swallows ssh-ed25519 {k2_b64} u@h\n"
         ));
         assert_eq!(
             parsed,
-            vec![expected],
-            "escaped quotes must not split the option token"
+            vec![expected1],
+            "escaped quotes must not split the option token, and key material \
+             inside an unterminated quote must stay dropped (got {} keys)",
+            parsed.len()
         );
     }
 

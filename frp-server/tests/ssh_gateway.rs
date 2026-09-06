@@ -688,7 +688,6 @@ async fn test_ssh_gateway_authorized_keys_accept_and_deny_e2e() {
     .unwrap();
 
     let mut cfg = ssh_test_config(ssh_port, bind_port);
-    cfg.auth.token = common::TEST_TOKEN.into();
     cfg.ssh_tunnel_gateway.authorized_keys_file = keys_path.to_str().unwrap().into();
 
     let (_handle, _port) = start_test_server(cfg).await;
@@ -762,6 +761,14 @@ async fn test_ssh_gateway_unreadable_authorized_keys_file_fails_closed() {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    // Root bypasses file mode bits (EACCES never fires) — the 0o000 premise
+    // of this test does not hold under euid 0; skip rather than fake it.
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: chmod 0o000 cannot gate root (euid 0)");
+        return;
+    }
+
     let ssh_port = allocate_port();
     let bind_port = allocate_port();
 
@@ -781,7 +788,6 @@ async fn test_ssh_gateway_unreadable_authorized_keys_file_fails_closed() {
     std::fs::set_permissions(&keys_path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let mut cfg = ssh_test_config(ssh_port, bind_port);
-    cfg.auth.token = common::TEST_TOKEN.into();
     cfg.ssh_tunnel_gateway.authorized_keys_file = keys_path.to_str().unwrap().into();
 
     let (_handle, _port) = start_test_server(cfg).await;

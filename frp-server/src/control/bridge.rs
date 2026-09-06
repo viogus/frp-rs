@@ -172,12 +172,16 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
         let line_end = head.iter().position(|&b| b == b'\n')?;
         let line = &head[..line_end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        // "HTTP/1.1 100 Continue" — code is the second space-separated
-        // token, exactly 3 ASCII digits (Go ReadResponse checks the code
-        // token before Atoi).
-        let mut sp = line.splitn(3, |&b| b == b' ');
+        // Go ReadResponse parseStatusLine parity: the version token is cut
+        // at the FIRST literal space, the remainder is TrimLeft'd (extra
+        // spaces legal — "HTTP/1.1  100 Continue"), then the code is the
+        // next space-delimited token, exactly 3 ASCII digits (checked
+        // before Atoi — "0200" rejected).
+        let mut sp = line.splitn(2, |&b| b == b' ');
         sp.next()?;
-        let code = sp.next()?;
+        let rest = sp.next()?;
+        let rest = rest.trim_ascii_start();
+        let code = rest.split(|&b| b == b' ').next()?;
         if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
             return None;
         }
@@ -215,7 +219,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
         // head, or the post-EOF truncated tail. M3: nothing pre-boundary
         // is ever served — a header spanning several internal reads (e.g.
         // a big Set-Cookie set over 4 KiB) must not leak fragment-first.
-        if this.buffer_offset < this.buffer.len() {
+        //
+        // The flag gate: a drained interim head hands accumulation back to
+        // its split-off tail, which may already hold the pipelined final
+        // head (100 + 200 in one backend segment). That swapped-in tail is
+        // flagless; it must NOT be served raw (which would skip injection)
+        // and must not trip the debug_assert below — a flagless non-empty
+        // buffer falls through to the gather loop, which re-resolves the
+        // head boundary and re-enters classification.
+        if (this.injected || this.eof || this.raw_head) && this.buffer_offset < this.buffer.len() {
             debug_assert!(this.injected || this.eof || this.raw_head);
             let remaining = this.buffer.len() - this.buffer_offset;
             let to_copy = remaining.min(buf.remaining());

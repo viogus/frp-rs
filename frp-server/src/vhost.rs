@@ -2242,7 +2242,9 @@ fn strip_vhost_hop_by_hop_headers(data: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) {
 /// `r.SetXForwarded()`; a configured header list is not a gate.
 /// `x_forwarded_host` must be the PRE-rewrite inbound Host (Go's
 /// SetXForwarded reads `r.In.Host`; host_header_rewrite lands on
-/// `r.Out.Host` after it); empty → line omitted (Go `r.In.Host != ""`).
+/// `r.Out.Host` after it). An empty value still emits
+/// `X-Forwarded-Host:` — Go `Header.Set` on a missing header writes an
+/// empty-valued line unconditionally (pinned by the unit test below).
 fn inject_vhost_request_headers(
     data: Vec<u8>,
     peer: std::net::SocketAddr,

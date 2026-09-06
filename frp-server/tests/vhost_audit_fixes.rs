@@ -118,20 +118,30 @@ async fn pool_work_conn(addr: SocketAddr, run_id: &str) -> tokio::net::TcpStream
 /// kill. When the current conn stays silent for 2s, a fresh pool conn is
 /// opened — the pending queue pops on the next NewWorkConn and the
 /// StartWorkConn arrives on that conn — and the read moves to it. Returns
-/// the conn that actually carried the frame.
+/// the conn that actually carried the frame. The attempt budget is 10: the
+/// harness pool (pool_count 1) caps at 11 total conns, and a 10th timeout
+/// retry never over-consumes the server's cap.
 async fn take_start_work_conn(
     addr: SocketAddr,
     run_id: &str,
     mut work_conn: tokio::net::TcpStream,
 ) -> (tokio::net::TcpStream, Box<msg::StartWorkConn>) {
-    for _ in 0..12 {
+    for attempt in 0..10 {
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),
             read_msg_v1(&mut work_conn),
         )
         .await
         {
-            Ok(Ok(FrpMessage::StartWorkConn(swc))) => return (work_conn, swc),
+            Ok(Ok(FrpMessage::StartWorkConn(swc))) => {
+                // A rejected dispatch carries Go's verbatim pool-full error
+                // ("work connection pool is full, discarding") — the frame
+                // is a StartWorkConn but the bridge never started.
+                if let Some(err) = &swc.error {
+                    panic!("StartWorkConn carried an error (attempt {attempt}): {err}");
+                }
+                return (work_conn, swc);
+            }
             Ok(Ok(other)) => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
             Ok(Err(e)) => panic!("StartWorkConn read failed: {e:?}"),
             Err(_elapsed) => {
@@ -141,7 +151,7 @@ async fn take_start_work_conn(
             }
         }
     }
-    panic!("StartWorkConn never arrived after 12 pooled conns")
+    panic!("StartWorkConn never arrived after 10 pooled conns")
 }
 
 fn vhost_pair() -> (SocketAddr, SocketAddr, ServerConfig) {
@@ -1371,17 +1381,26 @@ async fn test_https_declared_response_headers_tls_handshake_completes() {
         "https leg dst_port must be the real accept port: {:?}",
         swc.dst_port
     );
-    let mut backend_tls = tokio_rustls::TlsAcceptor::from(Arc::new(
-        frp_core::transport::generate_self_signed_tls_config().expect("self-signed TLS config"),
-    ))
-    .accept(work_conn)
+    // Both handshakes are wrapped in 20s timeouts so a regression (an
+    // injector buffering raw TLS looking for an HTTP head) fails fast with
+    // the failing side named instead of hanging the test to the 90s
+    // heartbeat kill — the pre-fix failure mode this pin guards.
+    let mut backend_tls = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio_rustls::TlsAcceptor::from(Arc::new(
+            frp_core::transport::generate_self_signed_tls_config().expect("self-signed TLS config"),
+        ))
+        .accept(work_conn),
+    )
     .await
+    .expect("backend TLS handshake timed out")
     .expect(
         "backend TLS handshake must complete — the https leg must relay raw TLS, \
          not buffer it in an injector looking for an HTTP head",
     );
-    let mut client_tls = client_task
+    let mut client_tls = tokio::time::timeout(std::time::Duration::from_secs(20), client_task)
         .await
+        .expect("client TLS handshake timed out")
         .expect("client task")
         .expect("client TLS handshake must complete");
 
