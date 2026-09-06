@@ -1723,11 +1723,28 @@ pub(crate) async fn assign_work_to_proxy(
         Some(info) => Some(info),
         None => state.proxy_manager.get(&req.proxy_name).await,
     };
-    let dst_addr = proxy_info
-        .as_ref()
-        .and_then(|p| p.local_addr.clone())
+    // DstAddr/DstPort = the server-side endpoint the user actually dialed
+    // (Go `GetWorkConnFromPool(userConn.RemoteAddr(), userConn.LocalAddr())`
+    // — server/proxy/proxy.go:288, dst fields at 178-186). The frpc client
+    // consumes these as the PROXY-protocol destination pair (client
+    // proxy.go:179-211: `if m.DstAddr == "" { m.DstAddr = "127.0.0.1" }`),
+    // so the backend sees the real dialed address, NOT the client-declared
+    // local service (round-11 audit F1: local_str is never set by Go frpc
+    // and is the wrong semantic even when set — the frpc-side local service
+    // is not the address the user's connection targeted on frps). Raw-TCP
+    // user conns (tcp/http/tcpmux legs) report their real local addr; TLS-
+    // wrapped https legs fall back to the declared local service until the
+    // Transport trait gains a local_addr accessor (Go's tls.Conn delegates
+    // LocalAddr to the underlying socket).
+    let user_local = req.user_conn.try_tcp().and_then(|s| s.local_addr().ok());
+    let dst_addr = user_local
+        .map(|a| a.ip().to_string())
+        .or_else(|| proxy_info.as_ref().and_then(|p| p.local_addr.clone()))
         .unwrap_or_default();
-    let dst_port = proxy_info.as_ref().and_then(|p| p.remote_port).unwrap_or(0);
+    let dst_port = user_local
+        .map(|a| a.port())
+        .or_else(|| proxy_info.as_ref().and_then(|p| p.remote_port))
+        .unwrap_or(0);
 
     let swc = build_start_work_conn(&req, &src_addr, src_port, &dst_addr, dst_port);
 

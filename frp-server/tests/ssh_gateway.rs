@@ -419,3 +419,116 @@ async fn test_ssh_gateway_reverse_forwarding_roundtrip() {
         .ok();
     echo_task.abort();
 }
+
+/// Round-11 audit GAP 1: the per-IP password throttle must DENY, not just
+/// count. After 5 wrong passwords from one IP (each answered with a normal
+/// USERAUTH_FAILURE round-trip), a FRESH connection from the same IP inside
+/// the 60s window is cut off by the server before its first guess is
+/// evaluated as another round-trip. RED pre-fix: the throttle bool was
+/// discarded in auth_password, so the 6th attempt (on any connection)
+/// always got a fresh Reject round-trip.
+///
+/// Wire signature of the cutoff: the russh CLIENT maps a dropped connection
+/// during auth to `Ok(Failure { empty methods })` (vendor/russh client
+/// `wait_recv_reply`, receiver-closed arm — client/mod.rs), so the result
+/// TYPE cannot distinguish a server cutoff from a normal reject. What
+/// distinguishes them on the wire: every evaluated rejection round-trip is
+/// delayed by russh's `auth_rejection_time` (3s, ssh_gateway.rs
+/// `russh_config`) before the USERAUTH_FAILURE is sent, while a cutoff
+/// kills the session immediately and the attempt returns in milliseconds.
+/// Asserting the 6th-attempt latency < 2s (vs a 3s pre-fix floor) pins the
+/// cutoff: the server never answered the guess with a rejection round-trip.
+#[tokio::test]
+async fn test_ssh_gateway_password_throttle_cuts_off_fresh_connection() {
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let mut cfg = ssh_test_config(ssh_port, bind_port);
+    cfg.auth.token = common::TEST_TOKEN.into();
+
+    let (_handle, _port) = start_test_server(cfg).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
+    let connect = || async {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match russh::client::connect(
+                Arc::new(russh::client::Config::default()),
+                addr,
+                TestSshClient { local_target: None },
+            )
+            .await
+            {
+                Ok(c) => return Some(c),
+                Err(e) => last_err = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("SSH client should connect; last error: {last_err:?}");
+    };
+
+    // Connection A: 5 wrong passwords. Each must be answered with a normal
+    // auth failure (the attempt is evaluated and consumes a throttle slot).
+    let mut client_a = connect().await.expect("connection A should connect");
+    for i in 0..5 {
+        let auth = client_a
+            .authenticate_password("v0", "wrong-password")
+            .await
+            .unwrap_or_else(|e| panic!("attempt {i} should be answered, not cut off: {e}"));
+        assert!(
+            !auth.success(),
+            "attempt {i} with a wrong password must fail cleanly"
+        );
+    }
+
+    drop(client_a);
+    // NOTE: no same-session attempt-6 assertion here — by the time the 5th
+    // rejection round-trip completes (~3s each, russh auth_rejection_time),
+    // the session has burned its ~15s auth deadline and the accept-task
+    // watchdog kills it, so a fast 6th-attempt return is indistinguishable
+    // from a throttle cutoff. The fresh-connection assertion below is the
+    // discriminator: a new session gets a fresh deadline, and only the
+    // throttle cutoff (count persists per IP in AppState) answers its first
+    // guess with instant death instead of a 3s-delayed rejection.
+
+    // Connection B (retried), same IP, inside the 60s window: once the
+    // throttle is armed (5 consumed slots), the FIRST wrong password on a
+    // fresh connection must be cut off by the server (connection dropped,
+    // no auth-failure round-trip — russh maps the killed session to a fast
+    // Ok(Failure) since the client never sees the server's reject).
+    // Pre-fix this returned a clean 3s-delayed Ok(failure).
+    //
+    // Retry loop: conn A's 5th rejection is processed ~12s after KEX
+    // (5 × 3s auth_rejection_time serialized), ~3s before the 15s auth
+    // deadline — under heavy parallel load the 5th attempt can lag and the
+    // arm may not have landed when conn B connects. An attempt that gets
+    // the 3s rejection floor is itself consuming the 5th slot, so a fresh
+    // connection retry makes the test self-arming instead of timing-bound.
+    let mut cutoff_seen = false;
+    for _round in 0..3 {
+        let mut client_b = connect().await.expect("fresh connection should connect");
+        let start = tokio::time::Instant::now();
+        let result = client_b.authenticate_password("v0", "wrong-password").await;
+        let elapsed = start.elapsed();
+        client_b
+            .disconnect(russh::Disconnect::ByApplication, "test B complete", "")
+            .await
+            .ok();
+        assert!(
+            !result.as_ref().is_ok_and(|a| a.success()),
+            "fresh connection from a throttled IP must not get a clean auth result, got: {result:?}"
+        );
+        if elapsed < Duration::from_secs(2) {
+            // Fast Ok(Failure) — the session was killed by the throttle,
+            // not answered with the 3s rejection floor.
+            cutoff_seen = true;
+            break;
+        }
+        // ~3s rejection floor: the arm had not landed (A's 5th attempt in
+        // flight); this attempt consumed the last slot — retry fresh.
+    }
+    assert!(
+        cutoff_seen,
+        "throttle cutoff never observed across 3 fresh connections from the armed IP"
+    );
+}

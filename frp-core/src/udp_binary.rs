@@ -164,7 +164,12 @@ impl AddrParts<'_> {
 
 fn parse_addr_parts(body: &[u8], offset: usize) -> Result<AddrParts<'_>, String> {
     let err = |msg: String| format!("UDP binary address at offset {offset}: {msg}");
-    if body.len() - offset < 4 {
+    // Defense-in-depth: a hostile `offset` past the end must fail the parse
+    // (saturating_sub keeps `len - offset` below well-defined for the
+    // truncation checks that follow), never underflow. Every current call
+    // site bounds `offset` already; this guard makes the arithmetic
+    // independently safe if a future caller forgets.
+    if body.len().saturating_sub(offset) < 4 {
         return Err(err("truncated address header".into()));
     }
     let family = body[offset];

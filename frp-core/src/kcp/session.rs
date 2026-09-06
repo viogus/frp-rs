@@ -498,7 +498,28 @@ impl KcpSession {
             );
 
             let shard_data = &data[FEC_HEADER_SIZE..];
-            let total = self.config.data_shards + self.config.parity_shards;
+            // saturating_add: parity_shards is a compile-time constant today
+            // (never user-config), so the add cannot overflow — but the
+            // guard below is the perimeter for a future gate that admits a
+            // huge shard count, and the add itself must not be the panic.
+            let total = self
+                .config
+                .data_shards
+                .saturating_add(self.config.parity_shards);
+            // Defense-in-depth: `self.fec` is Some only when BOTH shard
+            // counts are > 0 (see the constructor gate), so `total >= 2` and
+            // the modulo below is well-defined. If that gate ever changes, a
+            // zero total would divide by zero on the first FEC-shard input —
+            // fall back to raw KCP instead of panicking.
+            if total == 0 {
+                tracing::debug!(
+                    conv = self.conv,
+                    "KCP SESSION: FEC enabled with zero total shards, treating as raw KCP"
+                );
+                self.kcp.input(data).map_err(io::Error::other)?;
+                self.reconcile_snd_backlog();
+                return Ok(());
+            }
 
             // Group shards by shard_begin (Go: seqid - seqid % total).
             let shard_begin = seqid.wrapping_sub(seqid % total as u32);

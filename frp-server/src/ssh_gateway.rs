@@ -797,6 +797,7 @@ impl Handler for SshSession {
         if constant_time_eq(password.as_bytes(), self.server_token.as_bytes()) {
             Ok(Auth::Accept)
         } else {
+            let allowed = self.state.check_login_throttle(self.peer_addr).await;
             // Per-IP throttle on the failure path (mirrors login.rs
             // `throttled_login_error`): only failed attempts consume a
             // slot, so legitimate sessions are never throttled, and an IP
@@ -806,15 +807,36 @@ impl Handler for SshSession {
             // login throttle (Go frp has neither). Throttled attempts
             // consume nothing; the entry decays via the 90s cleanup.
             // NOTE (audit E1/S1e): this is the SAME table as the main-port
-            // frpc login throttle — pubkey/password rejections here and
-            // failed frpc logins share one per-IP budget. Cross-surface
-            // collateral only: 5 failed SSH passwords from a NAT IP arm
-            // that IP's main-port login window too (and vice versa). The
-            // source is TCP, not spoofable, so this arms no new attack —
-            // it only couples two already-throttled surfaces. KCP-sourced
-            // frpc logins are exempt from this table entirely (see the
-            // `AppState::login_throttle` docs in state.rs).
-            self.state.check_login_throttle(self.peer_addr).await;
+            // frpc login throttle — PASSWORD rejections here and failed
+            // frpc logins share one per-IP budget. (Pubkey and "none"
+            // rejections do NOT pass through this site: `auth_publickey` /
+            // `auth_none` return Reject without calling
+            // `check_login_throttle`, so only password failures consume
+            // slots.) Cross-surface collateral only: 5 failed SSH passwords
+            // from a NAT IP arm that IP's main-port login window too (and
+            // vice versa). The source is TCP, not spoofable, so this arms
+            // no new attack — it only couples two already-throttled
+            // surfaces. KCP-sourced frpc logins are exempt from this table
+            // entirely (see the `AppState::login_throttle` docs in
+            // state.rs).
+            // Round-11 fix (audit GAP 1): the bool was DISCARDED here, so
+            // the 5-failure cutoff never fired — after 5 wrong passwords an
+            // attacker could keep guessing (fresh reject round-trips on the
+            // same connection and on new ones) until the 15s auth deadline,
+            // and login.rs:212's `!check_login_throttle(...)` denial
+            // pattern proves the intended semantics. A throttled attempt
+            // now returns Err, which russh treats as fatal for the session
+            // (server/encrypted.rs auth dispatch propagates handler errors)
+            // — the connection dies instead of handing out another guess.
+            if !allowed {
+                tracing::warn!(
+                    ip = %self.peer_addr.ip(),
+                    "SSH gateway: rejecting session after 5 failed passwords (60s throttle window)"
+                );
+                return Err(anyhow!(
+                    "ssh gateway: too many failed authentication attempts (60s window)"
+                ));
+            }
             Ok(Auth::Reject {
                 proceed_with_methods: None,
                 partial_success: false,
@@ -1666,6 +1688,44 @@ mod tests {
             !state.check_login_throttle(addr).await,
             "6th attempt from the same IP must be throttled"
         );
+        // Round-11 GAP-1 pin: the throttle must DENY, not merely return
+        // false from the table. The 6th wrong password on this session is
+        // cut off with an Err (russh treats a handler error as fatal for
+        // the session — the connection dies) instead of a fresh Reject
+        // round-trip. Pre-fix this returned Ok(Reject) again: the
+        // check_login_throttle bool was discarded at the call site.
+        let result = session.auth_password("v0", "wrong").await;
+        assert!(
+            result.is_err(),
+            "6th wrong password must end the session with Err, got: {result:?}"
+        );
+        // A FRESH connection from the same IP within the window is denied
+        // without a USERAUTH_FAILURE round-trip (same state table, shared
+        // below). Precision: the throttle check runs AFTER the constant-time
+        // compare on the mismatch branch, so the guess itself IS evaluated —
+        // only the reject round-trip is skipped. Note this is fail-OPEN for
+        // a correct password from an armed IP on a fresh conn (a full KEX +
+        // compare completes before death), unlike login.rs's pre-auth
+        // `is_login_throttled` gate which is fail-closed; SSH has no
+        // equivalent pre-gate (the throttle is per-session-attempt, not
+        // per-connection).
+        let (auth_tx2, _auth_rx2) = tokio::sync::watch::channel(false);
+        let run_id2 = Arc::new(std::sync::Mutex::new(None));
+        let mut fresh = SshSession::new(
+            "test-token".into(),
+            Vec::new(),
+            state.clone(),
+            addr,
+            auth_tx2,
+            run_id2,
+            tokio::time::Instant::now() + SSH_AUTH_DEADLINE,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let result = fresh.auth_password("v0", "wrong").await;
+        assert!(
+            result.is_err(),
+            "fresh session from a throttled IP must be cut off, got: {result:?}"
+        );
         // Other IPs are unaffected.
         assert!(
             state
@@ -1735,6 +1795,51 @@ mod tests {
         );
         let result = session.auth_none("v0").await.unwrap();
         assert!(matches!(result, Auth::Reject { .. }));
+    }
+
+    /// Round-11 GAP5: the authorized_keys parser is a pure fn with an
+    /// externally visible contract (a hostile or hand-edited file must not
+    /// crash the gateway, and only valid keys may enter the allow-list).
+    /// This was inline in SshListener::new with zero unit coverage; the
+    /// shapes below pin the extraction.
+    #[test]
+    fn test_parse_authorized_keys_shapes() {
+        use russh::keys::PublicKeyBase64;
+
+        let key1 =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let key2 =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let k1_b64 = key1.public_key().public_key_base64();
+        let k2_b64 = key2.public_key().public_key_base64();
+        let expected1 = russh::keys::parse_public_key_base64(&k1_b64).unwrap();
+        let expected2 = russh::keys::parse_public_key_base64(&k2_b64).unwrap();
+
+        // (a) valid line with comment; (b) blank + # comment skipped;
+        // (c) indented key lines parse (trim).
+        let parsed = parse_authorized_keys(&format!(
+            "ssh-ed25519 {k1_b64} user@host\n\n  # comment\n   \nssh-ed25519 {k2_b64}\n"
+        ));
+        assert_eq!(parsed, vec![expected1.clone(), expected2.clone()]);
+        assert_eq!(parsed[0].algorithm(), russh::keys::Algorithm::Ed25519);
+
+        // (d) type-only line (no base64) is dropped;
+        // (e) garbage base64 is dropped, neighbors survive.
+        let parsed = parse_authorized_keys(&format!(
+            "ssh-ed25519\nssh-rsa NOT-BASE64!!\nssh-ed25519 {k1_b64}\n"
+        ));
+        assert_eq!(parsed, vec![expected1]);
+
+        // (f) a wrong type field does not invalidate a decodable key
+        // (the blob itself carries the type; see the fn doc).
+        let parsed = parse_authorized_keys(&format!("ssh-rsa {k2_b64} comment\n"));
+        assert_eq!(parsed, vec![expected2]);
+
+        // (g) empty body / comment-only body parse to nothing.
+        assert!(parse_authorized_keys("").is_empty());
+        assert!(parse_authorized_keys("# only comments\n\n").is_empty());
     }
 
     #[test]
@@ -2730,6 +2835,44 @@ pub struct SshListener {
     ssh_session_idle_timeout: u64,
 }
 
+/// Parse an authorized_keys file body into the gateway's allow-list.
+///
+/// One key per line: `"ssh-ed25519 AAAAC3NzaC1... [comment]"`. Each line is
+/// trimmed, blank lines and `#` comments are skipped, and a line that does
+/// not split into at least `[type, base64]` fields — or whose base64 does
+/// not decode — is dropped.
+///
+/// DELIBERATE DIVERGENCE from Go frp v0.71.0 (pkg/ssh/gateway.go
+/// `loadAuthorizedKeysFromFile`): Go aborts on the FIRST line that fails
+/// `ssh.ParseAuthorizedKey` (`return nil, err` → PublicKeyCallback answers
+/// every pubkey attempt with "internal error" — fail-closed), so one
+/// malformed line voids the whole file. frp-rs drops only the bad line and
+/// keeps the rest. Also note Go re-reads the file on EVERY auth attempt,
+/// while frp-rs caches it once at `SshListener::new` (load-once).
+///
+/// The leading `type` field is NOT cross-checked against
+/// the decoded key (the blob itself carries the type); OpenSSH
+/// authorized_keys files with a wrong-but-parseable type field are still
+/// accepted, mirroring the russh decode used here.
+///
+/// Behavior-preserving extraction of the SshListener::new inline parse —
+/// unit-tested (audit round-11 GAP5).
+fn parse_authorized_keys(content: &str) -> Vec<russh::keys::PublicKey> {
+    content
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                russh::keys::parse_public_key_base64(parts[1]).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 impl SshListener {
     pub async fn new(
         cfg: &frp_core::config::ServerConfig,
@@ -2751,21 +2894,7 @@ impl SshListener {
             let path = std::path::Path::new(&ssh_cfg.authorized_keys_file);
             if path.exists() {
                 std::fs::read_to_string(path)
-                    .map(|s| {
-                        s.lines()
-                            .map(|l| l.trim().to_string())
-                            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                            .filter_map(|line| {
-                                // Line format: "ssh-ed25519 AAAAC3NzaC1... [comment]"
-                                let parts: Vec<&str> = line.split_whitespace().collect();
-                                if parts.len() >= 2 {
-                                    russh::keys::parse_public_key_base64(parts[1]).ok()
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    })
+                    .map(|s| parse_authorized_keys(&s))
                     .unwrap_or_default()
             } else {
                 Vec::new()

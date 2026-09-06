@@ -11,6 +11,10 @@ mod proxy;
 // reuse proxy_ops' test helpers and the SUDP owner-check helper.
 pub(crate) mod proxy_ops;
 
+// Re-export for the work-conn rejection paths (dispatch.rs + the yamux
+// accept arm), which live outside control/ — Go parity F2.
+pub(crate) use pool::reply_work_conn_rejection;
+
 // Re-export for the dashboard delete path (cleanup_deleted_proxy_port),
 // which mirrors handle_close_proxy's SUDP shared-port owner check.
 // Gated on `dashboard`: the only consumer outside control/ is dashboard.rs,
@@ -713,7 +717,7 @@ pub(crate) async fn handle_control_inner<S>(
                             .map_err(|e| e.to_string())?;
                         Ok((msg, io))
                     });
-                    let (nwc, io) = match stream_read.await {
+                    let (nwc, mut io) = match stream_read.await {
                         Ok(Ok((FrpMessage::NewWorkConn(nwc), io))) => (nwc, io),
                         Ok(Ok((other, _io))) => {
                             debug!(run_id = %run_id, msg_type = ?other.v1_type_byte(), "Unexpected yamux stream message for {run_id}: {:?}", other.v1_type_byte());
@@ -731,6 +735,17 @@ pub(crate) async fn handle_control_inner<S>(
                     let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
                     if stream_run_id != run_id {
                         debug!(expected_run_id = %run_id, got_run_id = %stream_run_id, "Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
+                        // Go parity (F2): reject with a StartWorkConn error
+                        // frame on the stream before dropping it.
+                        reply_work_conn_rejection(
+                            &mut io,
+                            v2,
+                            state.detailed_errors_to_client,
+                            format!(
+                                "no client control found for run id [{stream_run_id}]"
+                            ),
+                        )
+                        .await;
                         continue;
                     }
                     // NewWorkConn plugin hook — Go frp v0.71.0 RegisterWorkConn
@@ -748,6 +763,14 @@ pub(crate) async fn handle_control_inner<S>(
                         Ok(None) => nwc,
                         Err(reason) => {
                             warn!(run_id = %run_id, reason = %reason, "Yamux work conn plugin hook rejected: {reason}");
+                            // Go parity (F2): StartWorkConn error frame on the stream.
+                            reply_work_conn_rejection(
+                                &mut io,
+                                v2,
+                                state.detailed_errors_to_client,
+                                reason,
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -764,6 +787,14 @@ pub(crate) async fn handle_control_inner<S>(
                     .await
                     {
                         warn!(run_id = %run_id, error = %e, "Yamux work conn auth failed for {run_id}: {e}");
+                        // Go parity (F2): auth failure → StartWorkConn error frame.
+                        reply_work_conn_rejection(
+                            &mut io,
+                            v2,
+                            state.detailed_errors_to_client,
+                            e.to_string(),
+                        )
+                        .await;
                         continue;
                     }
                     // Route through pool::handle_new_work_conn for consistent

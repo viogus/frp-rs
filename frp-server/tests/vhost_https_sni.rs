@@ -74,6 +74,13 @@ fn client_hello_with_sni(host: &str) -> Vec<u8> {
     bytes
 }
 
+fn https_group_proxy(name: &str, group: &str, group_key: &str, domain: &str) -> NewProxy {
+    let mut np = https_proxy(name, vec![domain.into()]);
+    np.group = Some(group.into());
+    np.group_key = Some(group_key.into());
+    np
+}
+
 fn https_proxy(name: &str, domains: Vec<String>) -> NewProxy {
     NewProxy {
         proxy_name: name.into(),
@@ -324,4 +331,169 @@ async fn test_tls_control_login_not_hijacked_by_https_wildcard() {
 
     drop(io);
     drop(provider);
+}
+
+/// HTTPS group SNI fan-out (round-10 kind-keyed registry e2e — GAP4).
+/// Two https proxies sharing one group + group_key + custom_domains register
+/// on the HTTPS vhost kind; an external TLS client's ClientHello (SNI
+/// app.example.com) is dispatched round-robin across the members (Go hands
+/// each conn to whichever member accepts first; frp-rs round-robins over the
+/// https-kind members). Each dispatch must land on a pooled work conn of ONE
+/// member — StartWorkConn names the winner and the raw ClientHello follows.
+#[tokio::test]
+async fn test_https_group_sni_fan_out_round_robin() {
+    let bind_port = allocate_port();
+    let vhost_https_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        vhost_https_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+    let https_addr: SocketAddr = format!("127.0.0.1:{vhost_https_port}").parse().unwrap();
+
+    let (mut ctl_a, resp_a) = login_with_test_token(addr).await.expect("login A");
+    let run_id_a = resp_a.run_id.expect("run_id A");
+    let np = FrpMessage::NewProxy(Box::new(https_group_proxy(
+        "grp-a",
+        "webgrp",
+        "secret-key",
+        "app.example.com",
+    )));
+    write_msg_v1(&mut ctl_a, &np)
+        .await
+        .expect("send NewProxy A");
+    match read_msg_v1(&mut ctl_a).await.expect("NewProxyResp A") {
+        FrpMessage::NewProxyResp(ref r) => {
+            assert!(r.error.is_none(), "first member rejected: {:?}", r.error);
+        }
+        other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+    }
+
+    let (mut ctl_b, resp_b) = login_with_test_token(addr).await.expect("login B");
+    let run_id_b = resp_b.run_id.expect("run_id B");
+    let np = FrpMessage::NewProxy(Box::new(https_group_proxy(
+        "grp-b",
+        "webgrp",
+        "secret-key",
+        "app.example.com",
+    )));
+    write_msg_v1(&mut ctl_b, &np)
+        .await
+        .expect("send NewProxy B");
+    match read_msg_v1(&mut ctl_b).await.expect("NewProxyResp B") {
+        FrpMessage::NewProxyResp(ref r) => {
+            assert!(r.error.is_none(), "second member rejected: {:?}", r.error);
+        }
+        other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+    }
+
+    let hello = client_hello_with_sni("app.example.com");
+    let mut served_a = 0usize;
+    let mut served_b = 0usize;
+    let mut last_winner: Option<&str> = None;
+    for round in 0..4 {
+        // The kind-keyed registry round-robins over the members in
+        // registration order (choose_endpoint: index fetch_add from 0), so
+        // round r dispatches to members[r % 2] = grp-a, grp-b, grp-a, grp-b.
+        // Open ONE pooled work conn under the expected member's run_id —
+        // the server pops it and StartWorkConn names that member. (The other
+        // member's control has no pooled conn and the server would send
+        // ReqWorkConn into the void, so only the expected member's conn may
+        // exist when the hello arrives.)
+        let expected = if round % 2 == 0 { "grp-a" } else { "grp-b" };
+        let expected_run_id = if round % 2 == 0 {
+            run_id_a.clone()
+        } else {
+            run_id_b.clone()
+        };
+        let mut work = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("pool work conn");
+        write_msg_v1(
+            &mut work,
+            &FrpMessage::NewWorkConn(msg::NewWorkConn {
+                run_id: Some(expected_run_id),
+                timestamp: None,
+                privilege_key: None,
+            }),
+        )
+        .await
+        .expect("send NewWorkConn");
+        let (mut rd, _wr) = work.into_split();
+
+        let mut client = tokio::net::TcpStream::connect(https_addr)
+            .await
+            .expect("connect to https vhost port");
+        client.write_all(&hello).await.expect("send ClientHello");
+
+        // The dispatch must land on THIS conn, naming the expected member.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(4), read_msg_v1(&mut rd))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("round {round}: dispatch to {expected} timed out (no StartWorkConn)")
+            })
+            .unwrap_or_else(|e| panic!("round {round}: read StartWorkConn errored: {e}"));
+        match frame {
+            FrpMessage::StartWorkConn(swc) => {
+                assert!(
+                    swc.error.is_none(),
+                    "round {round}: dispatch to {expected} rejected: {:?}",
+                    swc.error
+                );
+                assert_eq!(
+                    swc.proxy_name, expected,
+                    "round {round}: wheel must dispatch to the next member in registration order"
+                );
+            }
+            other => panic!(
+                "round {round}: expected StartWorkConn for {expected}, got type {}",
+                other.v1_type_byte()
+            ),
+        }
+
+        // The dispatched conn carries the raw ClientHello (SNI passthrough).
+        let mut forwarded = Vec::new();
+        let mut chunk = [0u8; 512];
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let n = rd.read(&mut chunk).await.expect("read forwarded");
+                if n == 0 {
+                    break;
+                }
+                forwarded.extend_from_slice(&chunk[..n]);
+                if forwarded.len() >= hello.len() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for forwarded TLS bytes");
+        assert!(
+            forwarded.starts_with(&hello),
+            "round {round}: member {expected} must receive the raw ClientHello, got prefix {:?}",
+            &forwarded[..forwarded.len().min(16)]
+        );
+
+        let winner: &str = if round % 2 == 0 { "A" } else { "B" };
+        if winner == "A" {
+            served_a += 1;
+        } else {
+            served_b += 1;
+        }
+        if let Some(prev) = last_winner {
+            assert_ne!(
+                prev, winner,
+                "round {round}: dispatch must alternate members"
+            );
+        }
+        last_winner = Some(winner);
+        drop(client);
+    }
+    assert!(served_a >= 1, "member A never served: {served_a}");
+    assert!(served_b >= 1, "member B never served: {served_b}");
 }
