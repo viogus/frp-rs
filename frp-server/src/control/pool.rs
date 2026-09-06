@@ -291,12 +291,14 @@ pub(crate) async fn write_start_work_conn_with_nat_hole_sid<W: AsyncWriteExt + U
 /// Go frps parity (server/service.go:512-522): a rejected NewWorkConn gets a
 /// best-effort `StartWorkConn{error}` reply before the conn/stream is
 /// dropped, so the client sees the rejection REASON instead of a bare EOF
-/// (round-11 audit finding F2; the Go reply carries Error only — proxy_name
-/// is omitted by Go's omitempty, Rust's struct serializes an empty one,
-/// which clients ignore on the error path). Best-effort: a dead conn makes
-/// the write fail and we drop anyway. Error text mirrors Go
-/// GenerateResponseErrorString via `proxy_ops::err_msg`: full detail in
-/// detailed mode, the "invalid NewWorkConn" summary otherwise.
+/// (round-11 audit finding F2). Go's StartWorkConn is all-omitempty
+/// (msg.go:154-161), so the wire frame carries ONLY the error key
+/// (round-12 audit B3 — `proxy_name` skips serialization when empty, see
+/// msg.rs; earlier comment here claimed an empty proxy_name was serialized).
+/// Best-effort: a dead conn makes the write fail and we drop anyway. Error
+/// text mirrors Go GenerateResponseErrorString via `proxy_ops::err_msg`:
+/// full detail in detailed mode, the "invalid NewWorkConn" summary
+/// otherwise.
 pub(crate) async fn reply_work_conn_rejection(
     stream: &mut IoStream,
     v2: bool,

@@ -510,14 +510,19 @@ impl KcpSession {
             // counts are > 0 (see the constructor gate), so `total >= 2` and
             // the modulo below is well-defined. If that gate ever changes, a
             // zero total would divide by zero on the first FEC-shard input —
-            // fall back to raw KCP instead of panicking.
+            // drop the shard instead of panicking. It must NOT be re-fed as
+            // raw KCP (round-12): this branch only sees FEC-tagged packets
+            // (flag == TYPE_DATA/TYPE_PARITY, checked above), and a shard
+            // carries a 6-byte FEC header + shard payload, not a raw KCP
+            // segment — kcp.input would misparse it as garbage (the raw
+            // fallback for non-FEC flags sits above). Unreachable today
+            // (constructor gate), so no test can drive it; kept as the
+            // perimeter for a future shard-count gate.
             if total == 0 {
                 tracing::debug!(
                     conv = self.conv,
-                    "KCP SESSION: FEC enabled with zero total shards, treating as raw KCP"
+                    "KCP SESSION: FEC enabled with zero total shards, dropping FEC shard"
                 );
-                self.kcp.input(data).map_err(io::Error::other)?;
-                self.reconcile_snd_backlog();
                 return Ok(());
             }
 

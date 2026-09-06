@@ -1435,3 +1435,164 @@ async fn test_plugin_new_work_conn_mutation_yamux_repairs_bad_key() {
         "plugin-repaired yamux work stream must be pooled (stays open), not closed"
     );
 }
+
+/// Plugin REJECT on the raw-TCP work-conn hook (dispatch.rs plugin-Err
+/// arm): a plugin whose handler answers `{"reject":true,
+/// "rejectReason":...}` makes `notify` return Err(reason), and the reason
+/// is forwarded VERBATIM in the StartWorkConn rejection frame — the
+/// round-11 F2 error-frame-before-close shape, distinct from the mutation
+/// arms (bad-key mutation → auth text) pinned above.
+#[tokio::test]
+async fn test_plugin_new_work_conn_reject_arm_raw() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let good_key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let rejector = Arc::new(MockPluginState {
+        reject: true,
+        reject_reason: "no new work conns for you".into(),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(rejector.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: AuthServerConfig {
+            additional_auth_scopes: vec!["NewWorkConns".into()],
+            ..test_auth_cfg()
+        },
+        http_plugins: vec![plugin_cfg(port, vec!["NewWorkConn"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let (provider, resp) = login_with_test_token(addr).await.expect("login succeeds");
+    assert!(resp.error.is_none(), "login rejected: {:?}", resp.error);
+    let run_id = resp.run_id.expect("run_id");
+
+    // A VALID-key work conn; the plugin rejects the hook outright, so the
+    // rejection text is the plugin's own reason, not an auth error.
+    let mut work = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect work conn");
+    write_msg_v1(
+        &mut work,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: Some(ts),
+            privilege_key: Some(good_key),
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+
+    let mut work = &mut work;
+    let frame = tokio::time::timeout(Duration::from_secs(2), read_msg_v1(&mut work))
+        .await
+        .expect("rejection StartWorkConn frame must arrive")
+        .expect("read rejection frame");
+    match frame {
+        FrpMessage::StartWorkConn(swc) => assert_eq!(
+            swc.error.as_deref(),
+            Some("no new work conns for you"),
+            "rejection error text must carry the plugin's rejectReason verbatim"
+        ),
+        other => panic!(
+            "expected StartWorkConn rejection, got type {}",
+            other.v1_type_byte()
+        ),
+    }
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(2), work.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!("rejected work conn must close after the frame, got {n} bytes"),
+        Ok(Err(_)) => {} // RST is also a valid close
+        Err(_) => panic!("rejected work conn must be closed after the rejection frame"),
+    }
+
+    assert!(
+        rejector
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(op, _)| op == "NewWorkConn"),
+        "the new_work_conn hook must fire before the reject"
+    );
+    drop(provider);
+}
+
+/// The same plugin-reject arm on the yamux work-conn path
+/// (control/mod.rs plugin-Err arm): rejectReason forwarded verbatim, then
+/// the stream closes.
+#[tokio::test]
+async fn test_plugin_new_work_conn_reject_arm_yamux() {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let good_key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    let rejector = Arc::new(MockPluginState {
+        reject: true,
+        reject_reason: "no new work conns for you".into(),
+        ..Default::default()
+    });
+    let port = start_mock_plugin(rejector.clone()).await;
+
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth: AuthServerConfig {
+            additional_auth_scopes: vec!["NewWorkConns".into()],
+            ..test_auth_cfg()
+        },
+        http_plugins: vec![plugin_cfg(port, vec!["NewWorkConn"], true)],
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server_tcpmux_on(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let (_control, session, run_id) = yamux_login(addr).await;
+
+    let io = open_yamux_and_write(
+        &session,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id),
+            timestamp: Some(ts),
+            privilege_key: Some(good_key),
+        }),
+    )
+    .await;
+    let mut io = io;
+    let frame = tokio::time::timeout(Duration::from_secs(2), read_msg_v1(&mut io))
+        .await
+        .expect("rejection StartWorkConn frame must arrive on the yamux stream")
+        .expect("read rejection frame");
+    match frame {
+        FrpMessage::StartWorkConn(swc) => assert_eq!(
+            swc.error.as_deref(),
+            Some("no new work conns for you"),
+            "rejection error text must carry the plugin's rejectReason verbatim (yamux)"
+        ),
+        other => panic!(
+            "expected StartWorkConn rejection on yamux stream, got type {}",
+            other.v1_type_byte()
+        ),
+    }
+    assert_stream_closed(io, "plugin-rejected yamux work stream").await;
+
+    assert!(
+        rejector
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(op, _)| op == "NewWorkConn"),
+        "the new_work_conn hook must fire on the yamux path before the reject"
+    );
+}

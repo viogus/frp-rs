@@ -467,19 +467,50 @@ async fn test_ssh_gateway_password_throttle_cuts_off_fresh_connection() {
         panic!("SSH client should connect; last error: {last_err:?}");
     };
 
-    // Connection A: 5 wrong passwords. Each must be answered with a normal
-    // auth failure (the attempt is evaluated and consumes a throttle slot).
+    // Connection A: 5 wrong passwords. Each consumes a throttle slot; the
+    // throttle slot for attempt N is consumed at attempt ARRIVAL (the
+    // check precedes russh's 3s rejection delay), so attempts 1-4 get a
+    // genuine USERAUTH_FAILURE round-trip. Attempt 5 is a corner: its
+    // rejection reply is scheduled ~15.3s after accept (5 × ~3s
+    // auth_rejection_time) while the ~15s SSH_AUTH_DEADLINE watchdog kills
+    // the session at ~15s — the attempt's slot is still consumed at
+    // arrival (~12.3s, before the sleep), and the russh CLIENT maps the
+    // dropped session to Ok(Failure) (vendor/russh client
+    // `wait_recv_reply` receiver-closed arm), so `!auth.success()` holds
+    // on every arm either way.
+    //
+    // The Err arm: if the deadline kill lands BEFORE attempt i's send (a
+    // scheduling delay >~2.8s anywhere in the loop pushes attempt 5's
+    // ~12.2s send past the 15s deadline), russh returns Err(SendError)
+    // instead of the Ok(Failure) it maps a mid-round-trip kill to. That is
+    // the watchdog doing its job, not a handler failure — attempts 0..i
+    // all got their round-trips (an Err before attempt 4 would need the
+    // deadline to fire at <9.2s, outside any realistic schedule), so break
+    // with the landed slots and let conn B's retry loop discriminate.
     let mut client_a = connect().await.expect("connection A should connect");
+    let mut slots_landed = 0usize;
     for i in 0..5 {
-        let auth = client_a
-            .authenticate_password("v0", "wrong-password")
-            .await
-            .unwrap_or_else(|e| panic!("attempt {i} should be answered, not cut off: {e}"));
+        let auth = match client_a.authenticate_password("v0", "wrong-password").await {
+            Ok(auth) => auth,
+            Err(e) => {
+                eprintln!(
+                    "connection A's session died mid-loop (auth deadline) at attempt \
+                     {i} with {slots_landed} slots landed: {e}"
+                );
+                break;
+            }
+        };
         assert!(
             !auth.success(),
             "attempt {i} with a wrong password must fail cleanly"
         );
+        slots_landed = i + 1;
     }
+    assert!(
+        slots_landed >= 2,
+        "connection A must land at least 2 throttle slots (deadline kill before \
+         attempt 2 is not schedulable), got {slots_landed}"
+    );
 
     drop(client_a);
     // NOTE: no same-session attempt-6 assertion here — by the time the 5th
@@ -504,8 +535,15 @@ async fn test_ssh_gateway_password_throttle_cuts_off_fresh_connection() {
     // arm may not have landed when conn B connects. An attempt that gets
     // the 3s rejection floor is itself consuming the 5th slot, so a fresh
     // connection retry makes the test self-arming instead of timing-bound.
+    // Budget: with N slots landed by A, a B round arriving when count < 5
+    // consumes a slot (3s floor) and round k = 6 − N is the first cutoff.
+    // 4 rounds therefore guarantee a cutoff whenever N ≥ 2 — conn A's
+    // attempt 2 arrives ~3-6s after KEX, so N ≤ 1 would need conn A's
+    // first attempts to arrive >12s after accept (>12s KEX on localhost),
+    // outside realistic CI load. The self-arm consumes the last slots on
+    // the late path exactly as round-10's design intended.
     let mut cutoff_seen = false;
-    for _round in 0..3 {
+    for _round in 0..4 {
         let mut client_b = connect().await.expect("fresh connection should connect");
         let start = tokio::time::Instant::now();
         let result = client_b.authenticate_password("v0", "wrong-password").await;
@@ -529,6 +567,6 @@ async fn test_ssh_gateway_password_throttle_cuts_off_fresh_connection() {
     }
     assert!(
         cutoff_seen,
-        "throttle cutoff never observed across 3 fresh connections from the armed IP"
+        "throttle cutoff never observed across 4 fresh connections from the armed IP"
     );
 }
