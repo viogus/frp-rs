@@ -735,6 +735,17 @@ pub(crate) async fn handle_control_inner<S>(
                     let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
                     if stream_run_id != run_id {
                         debug!(expected_run_id = %run_id, got_run_id = %stream_run_id, "Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
+                        // Deliberate divergence (round-12 audit B4): the check
+                        // is OWNER-SCOPED — the stream rides this control's
+                        // yamux session, so a run_id naming a different live
+                        // control is rejected here. Go looks the run_id up in
+                        // a GLOBAL registry (server/service.go:860-865
+                        // `GetByID`) and would route the stream to that other
+                        // control's work-conn pool instead. Only a
+                        // protocol-violating client can reach the arm (a
+                        // legit session never carries another run_id), and
+                        // rejecting is fail-safe: the stream dies instead of
+                        // being misdelivered across controls.
                         // Go parity (F2): reject with a StartWorkConn error
                         // frame on the stream before dropping it.
                         reply_work_conn_rejection(

@@ -298,3 +298,112 @@ async fn test_vhost_http_connect_forwards_raw() {
     drop(client);
     drop(provider);
 }
+
+/// Go parity (server/proxy/http.go:64/114-122): an HTTP reverse-proxy leg
+/// reports the user conn's remote address as StartWorkConn src but NIL as
+/// dst — Go's vhost CreateConnFn is `GetRealConn(rAddr, nil)`, and Go frpc
+/// falls back to 127.0.0.1:0 for the PROXY-protocol destination pair. The
+/// pre-round-12 code reported the real vhost accept addr on http-type legs
+/// (round-12 audit B1) — every PROXY-header-enabled http backend saw a dst
+/// shape Go never produces. TCP-family legs (tcp/https/tcpmux) keep the
+/// real server-side local addr; ONLY type=http drops it.
+#[tokio::test]
+async fn test_vhost_http_start_work_conn_src_without_dst() {
+    let bind_port = allocate_port();
+    let vhost_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        vhost_http_port: vhost_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+    let vhost_addr: SocketAddr = format!("127.0.0.1:{}", vhost_port).parse().unwrap();
+
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
+    let run_id = resp.run_id.expect("run_id");
+    let mut np = http_proxy("http-no-dst", vec!["dst.example.com".into()], None, None);
+    np.proxy_protocol_version = Some("v1".into()); // the dst pair feeds the PROXY header
+    write_msg_v1(&mut provider, &FrpMessage::NewProxy(Box::new(np)))
+        .await
+        .expect("send NewProxy");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_msg_v1(&mut provider),
+    )
+    .await
+    .expect("timed out waiting for NewProxyResp")
+    .expect("read NewProxyResp")
+    {
+        FrpMessage::NewProxyResp(ref r) => {
+            assert!(r.error.is_none(), "registration failed: {:?}", r.error);
+        }
+        other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+    }
+
+    // Pool a work conn.
+    let mut work_conn = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("work conn");
+    write_msg_v1(
+        &mut work_conn,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+
+    // One client request on the vhost port drives the assignment.
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(
+            b"GET / HTTP/1.1\r\n\
+              Host: dst.example.com\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send request");
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_msg_v1(&mut work_conn),
+    )
+    .await
+    .expect("timed out waiting for StartWorkConn")
+    .expect("read StartWorkConn")
+    {
+        FrpMessage::StartWorkConn(swc) => {
+            assert_eq!(swc.proxy_name, "http-no-dst");
+            assert!(swc.error.is_none(), "{:?}", swc.error);
+            assert_eq!(
+                swc.src_addr.as_deref(),
+                Some("127.0.0.1"),
+                "http leg must report the real client as src (Go http.go:122 rAddr)"
+            );
+            assert!(
+                swc.src_port.is_some_and(|p| p != 0),
+                "http leg must report the real client port: {:?}",
+                swc.src_port
+            );
+            assert!(
+                swc.dst_addr.is_none() && swc.dst_port.is_none(),
+                "http leg must send NO dst pair (Go GetRealConn(rAddr, nil)): {:?}:{:?}",
+                swc.dst_addr,
+                swc.dst_port
+            );
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+
+    drop(client);
+    drop(work_conn);
+    drop(provider);
+}

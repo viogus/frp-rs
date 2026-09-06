@@ -309,6 +309,14 @@ pub struct ReqWorkConn {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StartWorkConn {
+    /// `skip_serializing_if` + `default`: Go's StartWorkConn is all-omitempty
+    /// (msg.go:154-161), so a Go REJECT frame carries only `{"error": ...}`
+    /// (round-11 F2 built the reject via this same struct — the empty
+    /// proxy_name previously leaked onto the wire as an extra key; round-12
+    /// B3). Assignment frames always name the proxy, so the omit is
+    /// reject-only and inert either way; `default` keeps Go reject frames
+    /// (no proxy_name) decodable.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
     pub proxy_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub src_addr: Option<String>,
@@ -1247,6 +1255,36 @@ mod tests {
             &swc,
             r#"{"proxy_name":"p1","src_addr":"1.2.3.4","src_port":12345}"#,
         );
+    }
+
+    #[test]
+    fn test_start_work_conn_reject_frame_omits_empty_proxy_name() {
+        // Round-12 B3: a REJECT StartWorkConn (empty proxy_name, error set)
+        // must serialize Go-identically — all fields omitempty, so the wire
+        // frame is `{"error": ...}` alone (Go msg.go:154-161). Pre-fix the
+        // empty proxy_name leaked as `"proxy_name":""`.
+        let reject = StartWorkConn {
+            proxy_name: String::new(),
+            src_addr: None,
+            src_port: None,
+            dst_addr: None,
+            dst_port: None,
+            error: Some("work connection pool is full, discarding".into()),
+            use_encryption: None,
+            use_compression: None,
+            nat_hole_sid: None,
+            nat_hole_visitor_addr: None,
+            sk: None,
+        };
+        roundtrip(
+            &reject,
+            r#"{"error":"work connection pool is full, discarding"}"#,
+        );
+        // A Go reject frame (no proxy_name key) must also DECODE — the
+        // `default` on proxy_name.
+        let go_frame = serde_json::from_str::<StartWorkConn>(r#"{"error":"no"}"#).unwrap();
+        assert_eq!(go_frame.proxy_name, "");
+        assert_eq!(go_frame.error.as_deref(), Some("no"));
     }
 
     #[test]

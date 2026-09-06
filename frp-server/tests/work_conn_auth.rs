@@ -506,3 +506,234 @@ async fn test_pool_full_rejection_detailed_and_generic() {
         assert_stream_rejected(io, "pool-full 12th NewWorkConn", expected).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wire-protocol mismatch arm (dispatch.rs handle_work_conn_inner): a work
+// conn whose wire protocol (V1 or V2) differs from the control session it
+// names is rejected with a StartWorkConn error frame — "work connection
+// wire protocol mismatch: got {conn} want {control}" (round-11 F2, Go
+// RegisterWorkConn parity; a mixed-protocol conn would be misparsed by the
+// control's frame reader). Both directions are pinned below — the same arm
+// with the text interpolation flipped. Each needs a LIVE control of the
+// OPPOSITE protocol: with no control at all the GetByID-miss arm fires
+// first, so the test server runs tcp_mux OFF and the V2 leg exercises
+// handle_v2_connection's no-mux branch (service.rs: V2 magic →
+// ClientHello/ServerHello → first message on raw TCP).
+// ---------------------------------------------------------------------------
+
+/// V2 client leg on raw TCP (server tcp_mux OFF): dial, write the V2
+/// magic, run the ClientHello/ServerHello handshake with crypto
+/// negotiated. Returns the stream positioned at the first plaintext V2
+/// message frame — the first frame after the handshake travels in the
+/// clear (AEAD wrapping starts only after LoginResp on control conns, and
+/// never on work conns), mirroring the client side of
+/// handle_v2_connection's no-mux branch.
+async fn v2_handshake_conn(addr: SocketAddr) -> IoStream {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to server");
+    let mut control = IoStream::Tcp(stream);
+    frp_core::protocol::write_v2_magic(&mut control)
+        .await
+        .expect("write V2 magic");
+    frp_core::v2_handshake::v2_handshake_client(&mut control, "tcp", false, false, true)
+        .await
+        .expect("V2 handshake")
+        .expect("crypto must be negotiated");
+    control
+}
+
+/// V2 raw-TCP control login (server tcp_mux OFF). Returns the open control
+/// stream — KEPT ALIVE so the server keeps the run_id registered — and the
+/// run_id. The post-login pre-warm ReqWorkConn arrives AEAD-wrapped and is
+/// not drained here: the caller only asserts on work-conn rejections, never
+/// on control-stream silence, and the server writes it into the socket
+/// buffer without blocking.
+async fn v2_raw_login(addr: SocketAddr) -> (IoStream, String) {
+    let mut control = v2_handshake_conn(addr).await;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = auth::generate_token(TEST_TOKEN, ts);
+    let login = FrpMessage::Login(Box::new(msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("v2-mismatch-test".into()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: None,
+        run_id: None,
+        client_id: None,
+        pool_count: Some(1),
+        timestamp: Some(ts),
+        privilege_key: Some(key),
+        metas: None,
+        client_spec: None,
+        multiplexer: None, // tcp_mux OFF on this server
+    }));
+    control.write_v2_frame(&login).await.expect("send V2 Login");
+
+    let run_id = match control.read_v2_frame().await.expect("read V2 LoginResp") {
+        FrpMessage::LoginResp(resp) => {
+            assert!(resp.error.is_none(), "login failed: {:?}", resp.error);
+            resp.run_id.expect("run_id")
+        }
+        other => panic!("expected V2 LoginResp, got type {}", other.v1_type_byte()),
+    };
+    (control, run_id)
+}
+
+/// V2 twin of `assert_raw_rejected`: the rejection frame is a V2 binary
+/// frame on the raw stream (reply_work_conn_rejection writes V2 frames on
+/// the v2 arm), read via `read_v2_frame`; the close that follows is EOF or
+/// RST within 2s.
+async fn assert_v2_rejected(mut io: IoStream, what: &str, expected: &str) {
+    let frame = tokio::time::timeout(Duration::from_secs(2), io.read_v2_frame())
+        .await
+        .unwrap_or_else(|_| panic!("{what}: rejection StartWorkConn frame timed out"))
+        .unwrap_or_else(|e| panic!("{what}: read of rejection frame errored: {e}"));
+    match frame {
+        FrpMessage::StartWorkConn(swc) => {
+            assert_eq!(
+                swc.error.as_deref(),
+                Some(expected),
+                "{what}: rejection error text"
+            );
+        }
+        other => panic!(
+            "{what}: expected StartWorkConn rejection, got type {}",
+            other.v1_type_byte()
+        ),
+    }
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(2), io.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!("{what}: expected EOF after rejection frame, got {n} bytes"),
+        Ok(Err(_)) => {} // RST is also a valid close
+        Err(_) => panic!("{what}: stream was NOT closed after the rejection frame"),
+    }
+}
+
+/// V1 work conn naming a V2 control session → "got v1 want v2".
+#[tokio::test]
+async fn test_wire_mismatch_v1_conn_against_v2_control() {
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    // Live V2 control (raw TCP, no-mux branch).
+    let (_v2_control, run_id) = v2_raw_login(addr).await;
+
+    // Raw V1 NewWorkConn naming the V2 control: the mismatch arm fires
+    // (auth never runs — the gate sits before plugin + auth), the V1 error
+    // frame is written, the conn drops.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("dial work conn");
+    let (mut rd, mut wr) = stream.into_split();
+    write_msg_v1(
+        &mut wr,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: Some(ts),
+            privilege_key: Some(auth::generate_token(TEST_TOKEN, ts)),
+        }),
+    )
+    .await
+    .expect("write V1 NewWorkConn");
+    assert_raw_rejected(
+        &mut rd,
+        "V2 control + V1 work conn",
+        "work connection wire protocol mismatch: got v1 want v2",
+    )
+    .await;
+}
+
+/// V2 work conn naming a V1 control session → "got v2 want v1".
+#[tokio::test]
+async fn test_wire_mismatch_v2_conn_against_v1_control() {
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    // Live V1 control (raw TCP — login_with_test_token drains the
+    // pre-warm, so the control is silent and the pool empty).
+    let (_control, resp) = login_with_test_token(addr).await.expect("control login");
+    let run_id = resp.run_id.expect("run_id in LoginResp");
+
+    // V2 NewWorkConn on a raw V2 leg: handshake, then the frame in the
+    // clear (work conns never AEAD-wrap).
+    let mut conn = v2_handshake_conn(addr).await;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    conn.write_v2_frame(&FrpMessage::NewWorkConn(msg::NewWorkConn {
+        run_id: Some(run_id.clone()),
+        timestamp: Some(ts),
+        privilege_key: Some(auth::generate_token(TEST_TOKEN, ts)),
+    }))
+    .await
+    .expect("write V2 NewWorkConn");
+    assert_v2_rejected(
+        conn,
+        "V1 control + V2 work conn",
+        "work connection wire protocol mismatch: got v2 want v1",
+    )
+    .await;
+}
+
+/// dispatch.rs run-id-None arm: a NewWorkConn frame with NO run_id is a
+/// protocol-shape error (every legit work conn names its control) —
+/// rejected with the empty-run_id text "no client control found for run id
+/// []" (Go: control lookup on "" fails the same way), then dropped. No
+/// control session exists or is needed: the arm fires before any lookup.
+#[tokio::test]
+async fn test_raw_work_conn_missing_run_id_rejected() {
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("dial work conn");
+    let (mut rd, mut wr) = stream.into_split();
+    write_msg_v1(
+        &mut wr,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: None,
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("write run_id-less NewWorkConn");
+    assert_raw_rejected(
+        &mut rd,
+        "missing run_id",
+        "no client control found for run id []",
+    )
+    .await;
+}

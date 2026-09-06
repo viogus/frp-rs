@@ -1723,28 +1723,47 @@ pub(crate) async fn assign_work_to_proxy(
         Some(info) => Some(info),
         None => state.proxy_manager.get(&req.proxy_name).await,
     };
-    // DstAddr/DstPort = the server-side endpoint the user actually dialed
-    // (Go `GetWorkConnFromPool(userConn.RemoteAddr(), userConn.LocalAddr())`
-    // — server/proxy/proxy.go:288, dst fields at 178-186). The frpc client
-    // consumes these as the PROXY-protocol destination pair (client
-    // proxy.go:179-211: `if m.DstAddr == "" { m.DstAddr = "127.0.0.1" }`),
-    // so the backend sees the real dialed address, NOT the client-declared
-    // local service (round-11 audit F1: local_str is never set by Go frpc
-    // and is the wrong semantic even when set — the frpc-side local service
-    // is not the address the user's connection targeted on frps). Raw-TCP
-    // user conns (tcp/http/tcpmux legs) report their real local addr; TLS-
-    // wrapped https legs fall back to the declared local service until the
-    // Transport trait gains a local_addr accessor (Go's tls.Conn delegates
-    // LocalAddr to the underlying socket).
+    // DstAddr/DstPort family semantics (Go v0.71.0): only the HTTP
+    // reverse-proxy family sends NONE. Go wires its vhost http CreateConnFn
+    // to `GetRealConn(rAddr, nil)` (server/proxy/http.go:64/114-122) — the
+    // conn's remote address survives as src, the local endpoint is dropped,
+    // and Go frpc falls back to 127.0.0.1:0 for the PROXY-protocol
+    // destination pair (client/proxy/proxy.go:179-211:
+    // `if m.DstAddr == "" { m.DstAddr = "127.0.0.1" }` — round-12 audit
+    // B1: the pre-round-12 code reported the real vhost accept addr here,
+    // shape-differing from Go on every http-type leg). Every OTHER raw
+    // user-conn leg (tcp + https + tcpmux + stcp) reports the server-side
+    // endpoint the user actually dialed (Go `handleUserTCPConnection` →
+    // `GetWorkConnFromPool(userConn.RemoteAddr(), userConn.LocalAddr())`,
+    // server/proxy/proxy.go:288, dst fields at 178-186), NOT the
+    // client-declared local service (round-11 audit F1: local_str is never
+    // set by Go frpc and is the wrong semantic even when set — the
+    // frpc-side local service is not the address the user's connection
+    // targeted on frps). HTTPS vhost legs reach here as raw passthrough
+    // conns (`run_vhost_https_listener` enqueues the un-wrapped
+    // `IoStream::Tcp` — frps only peeks the ClientHello SNI, vhost.rs), so
+    // they report their real local addr exactly like Go's https handler.
+    // The `local_addr` fallback below stays as the STCP/XTCP
+    // visitor-before-registration safety net and for any future wrapped
+    // conn; it is NOT a Go-parity path.
     let user_local = req.user_conn.try_tcp().and_then(|s| s.local_addr().ok());
-    let dst_addr = user_local
-        .map(|a| a.ip().to_string())
-        .or_else(|| proxy_info.as_ref().and_then(|p| p.local_addr.clone()))
-        .unwrap_or_default();
-    let dst_port = user_local
-        .map(|a| a.port())
-        .or_else(|| proxy_info.as_ref().and_then(|p| p.remote_port))
-        .unwrap_or(0);
+    let http_reverse_proxy_leg = proxy_info.as_ref().is_some_and(|p| p.proxy_type == "http");
+    let dst_addr = if http_reverse_proxy_leg {
+        String::new()
+    } else {
+        user_local
+            .map(|a| a.ip().to_string())
+            .or_else(|| proxy_info.as_ref().and_then(|p| p.local_addr.clone()))
+            .unwrap_or_default()
+    };
+    let dst_port = if http_reverse_proxy_leg {
+        0
+    } else {
+        user_local
+            .map(|a| a.port())
+            .or_else(|| proxy_info.as_ref().and_then(|p| p.remote_port))
+            .unwrap_or(0)
+    };
 
     let swc = build_start_work_conn(&req, &src_addr, src_port, &dst_addr, dst_port);
 

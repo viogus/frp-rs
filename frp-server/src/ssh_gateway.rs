@@ -794,40 +794,56 @@ impl Handler for SshSession {
                 partial_success: false,
             });
         }
+        // Per-IP throttle, fail-closed PRE-AUTH gate (round-12 audit A1):
+        // an IP inside its throttle window is denied BEFORE the constant-
+        // time compare, so no guess is evaluated during the window —
+        // mirroring login.rs:680 `is_login_throttled`. Round-11 ran the
+        // deny only on the mismatch branch (after the compare): fail-open
+        // meant an armed IP still got one full credential evaluation per
+        // fresh connection (online guessing of the actual password was
+        // never stopped — the correct password still accepted), and the
+        // `Err` elided russh's `auth_rejection_time` reject pacing, making
+        // the 6th+ guess FASTER than the pre-fix paced rejects. The
+        // pre-gate restores the actual 5-per-60s rate limit: no compare,
+        // no accept, no reject round-trip for a throttled IP.
+        // The throttle is the same deliberate frp-rs hardening as the
+        // login throttle (Go frp's SSH gateway has no password path at all
+        // — pkg/ssh/gateway.go:74-76 NoClientAuth/PublicKeyCallback only).
+        // NOTE (audit E1/S1e): this is the SAME table as the main-port
+        // frpc login throttle — SSH password failures and failed frpc
+        // logins share one per-IP budget. (Pubkey and "none" rejections do
+        // NOT pass through this site: `auth_publickey` / `auth_none`
+        // return Reject without calling `check_login_throttle`, so only
+        // password failures consume slots.) Cross-surface collateral: 5
+        // failed SSH passwords from a NAT IP arm that IP's main-port login
+        // window too (and vice versa) — and the fail-closed SSH pre-gate
+        // means a correct password from that IP is denied on BOTH surfaces
+        // for the window (same property login.rs already has). The source
+        // is TCP, not spoofable, so this arms no new attack. Only
+        // PLAIN-KCP frpc logins are exempt from the table (spoofable UDP
+        // source — state.rs scopes that exemption to the 4 non-TLS KCP
+        // accept arms); KCP+TLS logins key the table like every TCP
+        // surface, and a KCP+TLS frpc retry loop can arm this pre-gate.
+        if self.state.is_login_throttled(Some(self.peer_addr)).await {
+            tracing::warn!(
+                ip = %self.peer_addr.ip(),
+                "SSH gateway: denying password auth before credential check (60s throttle window)"
+            );
+            return Err(anyhow!(
+                "ssh gateway: too many failed authentication attempts (60s window)"
+            ));
+        }
         if constant_time_eq(password.as_bytes(), self.server_token.as_bytes()) {
             Ok(Auth::Accept)
         } else {
+            // Failure path: consume a throttle slot (only real failures
+            // count). The Err arm below is reachable only through a race —
+            // two in-flight sessions from the same IP both passed the
+            // pre-gate at count 4 and this one arrives second at count 5 —
+            // and returns Err (russh treats a handler error as fatal for
+            // the session: the connection dies, no USERAUTH_FAILURE
+            // round-trip) instead of handing out another guess.
             let allowed = self.state.check_login_throttle(self.peer_addr).await;
-            // Per-IP throttle on the failure path (mirrors login.rs
-            // `throttled_login_error`): only failed attempts consume a
-            // slot, so legitimate sessions are never throttled, and an IP
-            // brute-forcing the SSH gateway is cut off for the 60s window
-            // after the 5th failure. The SSH handshake itself has no rate
-            // limit — this is the same deliberate frp-rs hardening as the
-            // login throttle (Go frp has neither). Throttled attempts
-            // consume nothing; the entry decays via the 90s cleanup.
-            // NOTE (audit E1/S1e): this is the SAME table as the main-port
-            // frpc login throttle — PASSWORD rejections here and failed
-            // frpc logins share one per-IP budget. (Pubkey and "none"
-            // rejections do NOT pass through this site: `auth_publickey` /
-            // `auth_none` return Reject without calling
-            // `check_login_throttle`, so only password failures consume
-            // slots.) Cross-surface collateral only: 5 failed SSH passwords
-            // from a NAT IP arm that IP's main-port login window too (and
-            // vice versa). The source is TCP, not spoofable, so this arms
-            // no new attack — it only couples two already-throttled
-            // surfaces. KCP-sourced frpc logins are exempt from this table
-            // entirely (see the `AppState::login_throttle` docs in
-            // state.rs).
-            // Round-11 fix (audit GAP 1): the bool was DISCARDED here, so
-            // the 5-failure cutoff never fired — after 5 wrong passwords an
-            // attacker could keep guessing (fresh reject round-trips on the
-            // same connection and on new ones) until the 15s auth deadline,
-            // and login.rs:212's `!check_login_throttle(...)` denial
-            // pattern proves the intended semantics. A throttled attempt
-            // now returns Err, which russh treats as fatal for the session
-            // (server/encrypted.rs auth dispatch propagates handler errors)
-            // — the connection dies instead of handing out another guess.
             if !allowed {
                 tracing::warn!(
                     ip = %self.peer_addr.ip(),
@@ -1701,14 +1717,15 @@ mod tests {
         );
         // A FRESH connection from the same IP within the window is denied
         // without a USERAUTH_FAILURE round-trip (same state table, shared
-        // below). Precision: the throttle check runs AFTER the constant-time
-        // compare on the mismatch branch, so the guess itself IS evaluated —
-        // only the reject round-trip is skipped. Note this is fail-OPEN for
-        // a correct password from an armed IP on a fresh conn (a full KEX +
-        // compare completes before death), unlike login.rs's pre-auth
-        // `is_login_throttled` gate which is fail-closed; SSH has no
-        // equivalent pre-gate (the throttle is per-session-attempt, not
-        // per-connection).
+        // below). Round-12 pin (audit A1): the deny is now a FAIL-CLOSED
+        // pre-auth gate (login.rs:680 `is_login_throttled` parity) that
+        // runs BEFORE the constant-time compare — an armed IP's guess is
+        // never evaluated, and even a CORRECT password from an armed IP is
+        // denied for the window. Round-11's deny ran only on the mismatch
+        // branch (after the compare): fail-open meant the throttle never
+        // stopped online guessing of the actual password (1 evaluated guess
+        // per fresh conn) and skipped the russh 3s rejection pacing, so the
+        // 6th+ guess was FASTER than the pre-fix paced rejects.
         let (auth_tx2, _auth_rx2) = tokio::sync::watch::channel(false);
         let run_id2 = Arc::new(std::sync::Mutex::new(None));
         let mut fresh = SshSession::new(
@@ -1725,6 +1742,27 @@ mod tests {
         assert!(
             result.is_err(),
             "fresh session from a throttled IP must be cut off, got: {result:?}"
+        );
+        // Fail-closed pin: the pre-gate denies BEFORE the credential
+        // compare, so the CORRECT password from an armed IP inside the
+        // window is also cut off (no guess evaluated, no accept). RED on
+        // round-11 code: the mismatch-branch-only deny let this Accept.
+        let (auth_tx3, _auth_rx3) = tokio::sync::watch::channel(false);
+        let run_id3 = Arc::new(std::sync::Mutex::new(None));
+        let mut fresh_correct = SshSession::new(
+            "test-token".into(),
+            Vec::new(),
+            state.clone(),
+            addr,
+            auth_tx3,
+            run_id3,
+            tokio::time::Instant::now() + SSH_AUTH_DEADLINE,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let result = fresh_correct.auth_password("v0", "test-token").await;
+        assert!(
+            result.is_err(),
+            "correct password from an armed IP must be denied by the pre-gate, got: {result:?}"
         );
         // Other IPs are unaffected.
         assert!(
@@ -1743,6 +1781,54 @@ mod tests {
             state2.check_login_throttle(addr2).await,
             "successful auth must not consume a throttle slot"
         );
+    }
+
+    #[tokio::test]
+    async fn test_pubkey_and_none_rejections_do_not_consume_throttle_slots() {
+        // D5 pin: only PASSWORD failures consume per-IP throttle slots.
+        // `auth_publickey` / `auth_none` return Reject without calling
+        // `check_login_throttle`, so a client that probes with pubkey or
+        // "none" methods cannot arm the window against the password path
+        // (or the shared frpc-login table) — and 5 pubkey/none rejections
+        // from one IP leave a subsequent password attempt fully allowed.
+        let (mut session, _auth_rx, _run_id) = pre_auth_session();
+        let addr = session.peer_addr;
+        let state = session.state.clone();
+
+        // 5 publickey rejections (key not in the empty authorized_keys).
+        let key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let pubkey = key.public_key().clone();
+        for i in 0..5 {
+            let result = session.auth_publickey("v0", &pubkey).await.unwrap();
+            assert!(
+                matches!(result, Auth::Reject { .. }),
+                "pubkey rejection {i} must reject (key not authorized)"
+            );
+        }
+        assert!(
+            state.check_login_throttle(addr).await,
+            "5 pubkey rejections must not arm the password throttle window"
+        );
+
+        // 5 "none" rejections (token configured → auth_none rejects).
+        let mut s2 = session;
+        for i in 0..5 {
+            let result = s2.auth_none("v0").await.unwrap();
+            assert!(
+                matches!(result, Auth::Reject { .. }),
+                "none rejection {i} must reject (token configured)"
+            );
+        }
+        assert!(
+            state.check_login_throttle(addr).await,
+            "5 none rejections must not arm the password throttle window"
+        );
+
+        // And a password attempt from the same IP is still fully allowed.
+        let result = s2.auth_password("v0", "test-token").await.unwrap();
+        assert!(matches!(result, Auth::Accept));
     }
 
     #[tokio::test]
@@ -1830,16 +1916,46 @@ mod tests {
         let parsed = parse_authorized_keys(&format!(
             "ssh-ed25519\nssh-rsa NOT-BASE64!!\nssh-ed25519 {k1_b64}\n"
         ));
-        assert_eq!(parsed, vec![expected1]);
+        assert_eq!(parsed, vec![expected1.clone()]);
 
         // (f) a wrong type field does not invalidate a decodable key
         // (the blob itself carries the type; see the fn doc).
         let parsed = parse_authorized_keys(&format!("ssh-rsa {k2_b64} comment\n"));
-        assert_eq!(parsed, vec![expected2]);
+        assert_eq!(parsed, vec![expected2.clone()]);
 
         // (g) empty body / comment-only body parse to nothing.
         assert!(parse_authorized_keys("").is_empty());
         assert!(parse_authorized_keys("# only comments\n\n").is_empty());
+
+        // (h) OpenSSH option-prefixed lines parse (round-12 A2: the old
+        // parts[1]-as-base64 reader dropped every options line — a
+        // migrated stock authorized_keys uses options everywhere). Covers
+        // bare options, quoted values with embedded spaces/commas, and
+        // option lists that swallow several tokens.
+        let parsed = parse_authorized_keys(&format!(
+            "restrict,command=\"echo hi\",from=\"1.2.3.4, 5.6.7.8\" ssh-ed25519 {k1_b64} u@h\n\
+             no-port-forwarding ssh-ed25519 {k2_b64}\n"
+        ));
+        assert_eq!(parsed, vec![expected1.clone(), expected2.clone()]);
+
+        // (i) certificate entries are dropped whole (frp-rs has no CA trust
+        // store — see the fn doc) even when the blob decodes — the cert
+        // anchor + a raw key blob is the (f)-style trap: the old parser
+        // accepted the embedded raw key with zero CA validation; neighbor
+        // lines survive.
+        let parsed = parse_authorized_keys(&format!(
+            "ssh-ed25519-cert-v01@openssh.com {k1_b64}\n\
+             ssh-ed25519 {k2_b64}\n"
+        ));
+        assert_eq!(parsed, vec![expected2]);
+
+        // (j) options lines whose key material does not decode are dropped
+        // (the malformed line, not the file — per-line-drop divergence).
+        let parsed = parse_authorized_keys(&format!(
+            "restrict,from=\"9.9.9.9\" ssh-ed25519 NOT-BASE64!!\n\
+             ssh-ed25519 {k1_b64}\n"
+        ));
+        assert_eq!(parsed, vec![expected1]);
     }
 
     #[test]
@@ -2837,10 +2953,24 @@ pub struct SshListener {
 
 /// Parse an authorized_keys file body into the gateway's allow-list.
 ///
-/// One key per line: `"ssh-ed25519 AAAAC3NzaC1... [comment]"`. Each line is
-/// trimmed, blank lines and `#` comments are skipped, and a line that does
-/// not split into at least `[type, base64]` fields — or whose base64 does
-/// not decode — is dropped.
+/// Line grammar is OpenSSH's: `[options] keytype base64key [comment]` with
+/// the keytype/base64 pair required. Options may hold quoted values with
+/// embedded spaces or commas (`from="1.2.3.4, 5.6.7.8"`,
+/// `command="echo hi"`), so locating the keytype needs a quote-aware
+/// token scan: a token is a maximal run of characters outside double
+/// quotes, and the FIRST adjacent `(t1, t2)` pair whose `t2` base64-
+/// decodes to a key wins. Option tokens cannot produce a false pair —
+/// they contain `=` or `,` (never true of a keytype) or are bare words
+/// whose neighbor fails to decode. Each line is trimmed; blank lines and
+/// `#` comments are skipped; a line with no parseable pair is dropped.
+///
+/// Certificate entries (`*-cert-v01@openssh.com` keytypes) are DROPPED
+/// whole even when the blob decodes: frp-rs compares raw client public
+/// keys against this list and has no CA trust store, so a cert line
+/// cannot be honored with Go's certificate semantics — accepting the
+/// embedded raw key without any CA validation would be worse than
+/// dropping the line. Go `ssh.ParseAuthorizedKey` accepts cert entries
+/// and validates them at auth time.
 ///
 /// DELIBERATE DIVERGENCE from Go frp v0.71.0 (pkg/ssh/gateway.go
 /// `loadAuthorizedKeysFromFile`): Go aborts on the FIRST line that fails
@@ -2850,27 +2980,83 @@ pub struct SshListener {
 /// keeps the rest. Also note Go re-reads the file on EVERY auth attempt,
 /// while frp-rs caches it once at `SshListener::new` (load-once).
 ///
-/// The leading `type` field is NOT cross-checked against
-/// the decoded key (the blob itself carries the type); OpenSSH
-/// authorized_keys files with a wrong-but-parseable type field are still
-/// accepted, mirroring the russh decode used here.
+/// The leading `type` field is NOT cross-checked against the decoded key
+/// (the blob itself carries the type); OpenSSH authorized_keys files with
+/// a wrong-but-parseable type field are still accepted, mirroring the
+/// russh decode used here — EXCEPT cert keytypes, which are dropped whole
+/// (above).
 ///
 /// Behavior-preserving extraction of the SshListener::new inline parse —
-/// unit-tested (audit round-11 GAP5).
+/// unit-tested (audit round-11 GAP5); options-prefix + cert-line handling
+/// added in audit round-12 (A2/D6: the old parts[1]-as-base64 reader
+/// silently dropped every options-prefixed line, and would have accepted
+/// a cert anchor's embedded raw key with zero CA validation).
 fn parse_authorized_keys(content: &str) -> Vec<russh::keys::PublicKey> {
     content
         .lines()
-        .map(|l| l.trim().to_string())
+        .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                russh::keys::parse_public_key_base64(parts[1]).ok()
-            } else {
-                None
-            }
-        })
+        .filter_map(parse_authorized_key_line)
         .collect()
+}
+
+/// Parse one non-empty, non-comment authorized_keys line. `None` when the
+/// line holds no supported key (bad line → dropped, per-line divergence;
+/// cert-typed anchors → dropped whole; see `parse_authorized_keys`).
+fn parse_authorized_key_line(line: &str) -> Option<russh::keys::PublicKey> {
+    // Quote-aware tokenization with `\`-escape handling inside quotes, so
+    // `from="a b,c",command="echo \"hi\""` tokens stay whole. Cheap: a
+    // single pass, one small Vec, never more tokens than the line has
+    // words — an authorized_keys line is operator-sized.
+    let mut tokens: Vec<&str> = Vec::with_capacity(4);
+    let mut start = None;
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (i, &b) in line.as_bytes().iter().enumerate() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_quote = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_quote = true,
+            b if b.is_ascii_whitespace() => {
+                if let Some(s) = start.take() {
+                    tokens.push(&line[s..i]);
+                }
+            }
+            _ => {
+                if start.is_none() {
+                    start = Some(i);
+                }
+            }
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(&line[s..]);
+    }
+    for pair in tokens.windows(2) {
+        // Certificate anchors are dropped whole, before any decode.
+        if pair[0].contains("-cert-v01@") {
+            return None;
+        }
+        // Option tokens contain '=' or ',' — a keytype never does.
+        if pair[0].contains(['=', ',']) {
+            continue;
+        }
+        // Bare option words (e.g. `restrict`, `no-port-forwarding`)
+        // reach here; their neighbor is the keytype and fails to
+        // decode, so the scan falls through to the real pair.
+        if let Ok(key) = russh::keys::parse_public_key_base64(pair[1]) {
+            return Some(key);
+        }
+    }
+    None
 }
 
 impl SshListener {

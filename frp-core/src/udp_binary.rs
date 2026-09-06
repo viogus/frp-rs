@@ -142,7 +142,7 @@ fn put_enc_addr(out: &mut Vec<u8>, addr: &EncAddr<'_>) {
 /// pay a per-datagram `ip` `String` alloc + re-parse that only message-form
 /// consumers (V1/JSON, the SUDP message relay) need. All wire-strictness
 /// checks (and their error strings) live here, shared by both forms.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct AddrParts<'a> {
     family: u8,
     /// 4 (family 4) or 16 (family 6) bytes, unvalidated content.
@@ -622,6 +622,30 @@ fn take_or_copy_payload(body: &mut Vec<u8>, payload_len: usize, payload_offset: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_addr_parts_hostile_offset_is_err_not_underflow() {
+        // Round-11 added the saturating_sub guard; round-12 audit D9 pins it:
+        // a hostile `offset` past the end of `body` must fail the parse
+        // cleanly ("truncated address header"), never underflow-panic on
+        // `len - offset`. Every current caller bounds the offset already —
+        // this makes the arithmetic independently safe for future callers.
+        // v4 127.0.0.1:80, zone_len 0: family(1) + ip(4) + port(2) + zlen(1).
+        let body = b"\x04\x7f\x00\x00\x01\x00\x50\x00";
+        for bad in [body.len() + 1, usize::MAX / 2, usize::MAX] {
+            let err = parse_addr_parts(body, bad)
+                .expect_err("hostile offset must be rejected, not underflow");
+            assert!(err.contains("truncated address header"), "{err}");
+        }
+        // Truncation at the boundary: offset leaves < 4 bytes of header.
+        for tail in [body.len() - 1, body.len() - 2] {
+            let err = parse_addr_parts(body, tail)
+                .expect_err("tail offset must be rejected as truncated");
+            assert!(err.contains("truncated"), "{err}");
+        }
+        // Sanity: the same guard still parses the well-formed call.
+        assert!(parse_addr_parts(body, 0).is_ok());
+    }
 
     fn sample_packet() -> UDPPacket {
         UDPPacket {
