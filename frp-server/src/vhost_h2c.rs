@@ -241,6 +241,13 @@ async fn handle_stream(
     // would look absolute-form.
     let is_absolute_form = h2_request_is_absolute_form(&request);
     let (http_auth, route_user) = h2_select_auth(request.headers(), is_absolute_form);
+    // CONNECT (RFC 7540 §8.3, :method CONNECT) forwards raw like the
+    // HTTP/1.1 connectHandler — no host rewrite, no forwarded-header
+    // injection (Go http.go:282-285; the h2 layer is the same ServeHTTP).
+    // http::Method equality is the byte-exact "CONNECT" gate (Go
+    // http.MethodConnect). Hoisted so the ProxyUserConn below carries the
+    // same verdict to the bridge's injector gate.
+    let is_connect = request.method() == http::Method::CONNECT;
     tracing::debug!(host = %host, path = %path, peer = %peer, "HTTP VHost (h2c) request for '{}' path '{}' from {}", host, path, peer);
 
     // Re-encode as an HTTP/1.1 request head. Go's reverse proxy forwards to
@@ -274,12 +281,7 @@ async fn handle_stream(
         // Go checkRouteAuthByRequest's `req.URL.Host != ""` gate — decides
         // the 407-vs-401 response shape on auth failure below.
         is_absolute_form,
-        // CONNECT (RFC 7540 §8.3, :method CONNECT) forwards raw like the
-        // HTTP/1.1 connectHandler — no host rewrite, no forwarded-header
-        // injection (Go http.go:282-285; the h2 layer is the same
-        // ServeHTTP). http::Method equality is the byte-exact "CONNECT"
-        // gate (Go http.MethodConnect).
-        request.method() == http::Method::CONNECT,
+        is_connect,
     )
     .await
     {
@@ -349,6 +351,9 @@ async fn handle_stream(
             user_conn_permit: None,
             // Local sender — no group selection was done.
             group_selected: false,
+            // vhost CONNECT tunnels raw — the bridge's injector must skip
+            // them (Go connectHandler joins raw, ModifyResponse never runs).
+            request_is_connect: is_connect,
         }),
     )
     .await

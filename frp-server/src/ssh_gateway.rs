@@ -787,7 +787,13 @@ impl Handler for SshSession {
     // ── Authentication ──────────────────────────────────────
 
     async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
-        // No token configured → disable password auth per spec
+        // No token configured → disable password auth per spec. Intended
+        // (round-13 audit note): on a pubkey-only gateway this path always
+        // rejects with NO credential comparison, so it needs no pacing and
+        // consumes no per-IP throttle slot — every attempt costs the
+        // attacker a full auth round-trip with nothing evaluated, and the
+        // per-IP pre-auth cap (SSH_PREAUTH_PER_IP_CAP) bounds the
+        // concurrent attempts from one source regardless.
         if self.server_token.is_empty() {
             return Ok(Auth::Reject {
                 proceed_with_methods: None,
@@ -1521,6 +1527,21 @@ async fn bridge_ssh_side(
         else {
             return;
         };
+    } else {
+        // An oversized frame (> 10 KiB V1 cap) from the control-pipe peer
+        // is not a legal StartWorkConn — the header's payload-length field
+        // is attacker-controlled and the remaining body bytes must NOT be
+        // forwarded to the SSH client as tunnel data (round-13 audit
+        // finding). Drop the connection; the peer (a frpc virtual client)
+        // treats the drop as a failed bridge and re-dials.
+        tracing::warn!(
+            len,
+            channel = ?channel_id,
+            "SSH forwarded-tcpip bridge: work-conn header declares {} bytes (V1 cap {}), dropping",
+            len,
+            frp_core::protocol::V1_MAX_MSG_LENGTH
+        );
+        return;
     }
 
     let (mut ssh_read, mut ssh_write) = tokio::io::split(ssh_side);
@@ -1956,6 +1977,37 @@ mod tests {
              ssh-ed25519 {k1_b64}\n"
         ));
         assert_eq!(parsed, vec![expected1]);
+    }
+
+    /// Round-13: the quote-aware tokenizer's `\`-escape arm (an escaped
+    /// quote inside a quoted option value must NOT close the quote) has no
+    /// direct coverage — a hand-edited file like
+    /// `command="echo \"hi\"" ssh-ed25519 ...` must still yield the key.
+    #[test]
+    fn test_parse_authorized_key_line_backslash_escaped_quotes() {
+        use russh::keys::PublicKeyBase64;
+
+        let key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let k_b64 = key.public_key().public_key_base64();
+        let expected = russh::keys::parse_public_key_base64(&k_b64).unwrap();
+
+        // `\"` inside a quoted option value: the tokenizer must not close
+        // the quote at the escaped `"`, so the keytype+blob pair stays
+        // reachable. Also exercises a trailing unclosed quote on a
+        // SEPARATE line (the rest of that line is consumed inside the
+        // quote — no key — but the neighbor line must survive).
+        let parsed = parse_authorized_keys(&format!(
+            "restrict,command=\"echo \\\"hi\\\"\",from=\"a b\" ssh-ed25519 {k_b64} u@h\n\
+             command=\"unterminated ssh-ed25519\n\
+             ssh-ed25519 {k_b64}\n"
+        ));
+        assert_eq!(
+            parsed,
+            vec![expected],
+            "escaped quotes must not split the option token"
+        );
     }
 
     #[test]
@@ -2809,6 +2861,60 @@ const SSH_MAX_CONNECTIONS: usize = 128;
 const SSH_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 const SSH_DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Per-IP pre-auth connection cap (round-13 audit S finding). The global
+/// 128-slot semaphore cannot stop ONE source IP from occupying every slot:
+/// a denied conn (bad password/key, throttle window) holds its slot for
+/// the whole auth deadline (~15s), so a single reconnect-looping source
+/// (~8.5 attempts/s — each fresh TCP conn gets a fresh pre-auth hold)
+/// fills all 128 slots in ~15s and starves every other client. Each source
+/// IP therefore gets its own small PRE-AUTH budget; the permit is held
+/// only while the conn is unauthenticated and released as soon as auth
+/// settles — success (the conn then counts against the global 128 like
+/// any other tunnel) or the conn ends. Legit clients with many concurrent
+/// sessions are unaffected: post-auth conns hold no per-IP permit.
+const SSH_PREAUTH_PER_IP_CAP: usize = 8;
+
+/// Per-IP pre-auth slot registry: source IP -> its own pre-auth semaphore.
+/// Entries are removed when the last outstanding permit of an IP returns
+/// (see `PreauthPermit::drop`), so the map stays bounded by the number of
+/// IPs with in-flight pre-auth conns (itself bounded by the global
+/// SSH_MAX_CONNECTIONS cap) instead of growing per distinct source IP.
+type PerIpPreauthMap = std::sync::Mutex<
+    std::collections::HashMap<std::net::IpAddr, std::sync::Arc<tokio::sync::Semaphore>>,
+>;
+
+/// A held per-IP pre-auth slot. Release returns the slot to the IP's
+/// semaphore; when that release empties the semaphore (all of the IP's
+/// pre-auth conns have settled), the map entry is removed.
+struct PreauthPermit {
+    ip: std::net::IpAddr,
+    map: std::sync::Arc<PerIpPreauthMap>,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for PreauthPermit {
+    fn drop(&mut self) {
+        // Release the slot first so the availability check below reflects
+        // this release.
+        drop(self.permit.take());
+        if let Ok(mut map) = self.map.lock() {
+            if let Some(entry) = map.get(&self.ip) {
+                // Remove only when (a) THIS semaphore is still the one the
+                // map holds — a concurrent acquire may have removed and
+                // re-inserted a fresh semaphore after an earlier release,
+                // and removing that entry would drop the new owner's slot
+                // bookkeeping — and (b) no permits are outstanding.
+                if std::sync::Arc::ptr_eq(entry, &self.sem)
+                    && entry.available_permits() == SSH_PREAUTH_PER_IP_CAP
+                {
+                    map.remove(&self.ip);
+                }
+            }
+        }
+    }
+}
+
 /// How long exec_request waits for the NewProxyResp of a registration —
 /// Go frp's waitProxyStatusReady poll budget (time.Second).
 const PROXY_REGISTER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -3134,6 +3240,9 @@ impl SshListener {
         )));
         let russh_config = std::sync::Arc::new(russh_config);
         let ssh_connections = Arc::new(tokio::sync::Semaphore::new(SSH_MAX_CONNECTIONS));
+        // Per-IP pre-auth slot registry (see SSH_PREAUTH_PER_IP_CAP).
+        let per_ip_preauth: std::sync::Arc<PerIpPreauthMap> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let auth_timeout = self.auth_deadline;
 
         loop {
@@ -3181,10 +3290,40 @@ impl SshListener {
                 },
                 None => None,
             };
+            // Per-IP pre-auth slot: acquire BEFORE the SSH handshake (the
+            // handshake runs unauthenticated for up to the auth deadline).
+            // A denied conn must not be allowed to hold one of the 128
+            // global slots for the full deadline while a single source
+            // reconnect-loops (see SSH_PREAUTH_PER_IP_CAP). At an IP's own
+            // cap the conn is dropped immediately — no handshake started.
+            let preauth_permit = {
+                let ip = peer_addr.ip();
+                let sem = per_ip_preauth
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(ip)
+                    .or_insert_with(|| {
+                        std::sync::Arc::new(tokio::sync::Semaphore::new(SSH_PREAUTH_PER_IP_CAP))
+                    })
+                    .clone();
+                match sem.clone().try_acquire_owned() {
+                    Ok(permit) => PreauthPermit {
+                        ip,
+                        map: per_ip_preauth.clone(),
+                        sem,
+                        permit: Some(permit),
+                    },
+                    Err(_) => {
+                        tracing::warn!(peer_address = %peer_addr, "SSH pre-auth connection cap reached for {}", ip);
+                        continue;
+                    }
+                }
+            };
 
             tokio::spawn(async move {
                 let _ssh_permit = ssh_permit;
                 let _global_permit = global_permit;
+                let preauth_permit = preauth_permit;
                 let (stream, stream_closer) = CloseableSshStream::new(stream);
                 let (auth_complete_tx, mut auth_complete_rx) = tokio::sync::watch::channel(false);
                 let authenticated_run_id = Arc::new(std::sync::Mutex::new(None));
@@ -3265,6 +3404,18 @@ impl SshListener {
                         }
                     }
                 };
+
+                // Auth settled. When the session authenticated, the conn is
+                // a trusted tunnel — release the per-IP pre-auth slot (it
+                // now counts against the global 128 like any other conn; a
+                // legit client's 9th+ concurrent session must not be
+                // blocked by its own earlier tunnels). When it did not,
+                // the conn is ending and the permit drops with this task
+                // (either path above that `return`s, or the session-task
+                // result match below).
+                if *auth_complete_rx.borrow() {
+                    drop(preauth_permit);
+                }
 
                 let result = match pre_auth_result {
                     Some(result) => result,

@@ -1128,6 +1128,10 @@ async fn handle_http1_request<S>(
                         user_conn_permit: None,
                         // Local sender — no group selection was done.
                         group_selected: false,
+                        // vhost CONNECT tunnels raw — the bridge's injector
+                        // must skip them (Go connectHandler joins raw,
+                        // ModifyResponse never runs).
+                        request_is_connect: is_connect,
                     }),
                 )
                 .await
@@ -1645,6 +1649,12 @@ pub async fn run_vhost_https_listener(
                                     // groups only; http/https group members are
                                     // always pre-selected by the vhost router).
                                     group_selected: false,
+                                    // Raw encrypted passthrough — never an HTTP
+                                    // request the injector could splice (the
+                                    // bridge sees TLS bytes, not a response
+                                    // head). false matches every non-vhost
+                                    // producer.
+                                    request_is_connect: false,
                                 }),
                             )
                             .await
@@ -2244,8 +2254,11 @@ fn inject_vhost_request_headers(
     let tail = &data[header_end..];
 
     // Collect header lines, dropping ones that request_headers will override
-    // (case-insensitive Set semantics) and X-Forwarded-For (re-emitted with
-    // the peer appended).
+    // (case-insensitive Set semantics), X-Forwarded-For (re-emitted with
+    // the peer appended), and the X-Forwarded-Host / X-Forwarded-Proto /
+    // Forwarded lines go1.25's ReverseProxy deletes before the Rewrite hook
+    // (reverseproxy.go:434-437 — SetXForwarded re-Sets the two X-Forwarded
+    // names to canonical values below; `Forwarded` is never re-added).
     let mut lines: Vec<&[u8]> = Vec::new();
     let mut existing_xff: Vec<u8> = Vec::new();
     // Precompute override prefixes once (case-insensitive ASCII set semantics):
@@ -2291,10 +2304,27 @@ fn inject_vhost_request_headers(
                 .position(|&b| b != b' ' && b != b'\t')
                 .map(|i| &value[i..])
                 .unwrap_or(value);
-            if !value.is_empty() {
-                existing_xff.extend_from_slice(value);
-                existing_xff.extend_from_slice(b", ");
-            }
+            // Go parity (go1.25 SetXForwarded): the chain is
+            // `strings.Join(prior, ", ") + ", " + peer` — a single
+            // EMPTY-valued inbound XFF line joins to "" and leaves a
+            // leading ", " in the chain (", 127.0.0.1"), so empty
+            // values are kept, not skipped.
+            existing_xff.extend_from_slice(value);
+            existing_xff.extend_from_slice(b", ");
+            continue;
+        }
+        // Go go1.25 reverseproxy.go:434-437 deletes every client-supplied
+        // `Forwarded`, `X-Forwarded-Host`, and `X-Forwarded-Proto` line
+        // from the outbound request BEFORE the Rewrite hook runs;
+        // SetXForwarded then re-Sets X-Forwarded-Host / X-Forwarded-Proto
+        // to single canonical values (emitted below) and Go never re-adds
+        // `Forwarded` at all. Exact-name + ':' compare — an invented
+        // `x-forwarded-hostile:` header is not stripped.
+        let is_go_stripped = (trimmed.len() >= 17
+            && trimmed[..17].eq_ignore_ascii_case(b"x-forwarded-host:"))
+            || (trimmed.len() >= 18 && trimmed[..18].eq_ignore_ascii_case(b"x-forwarded-proto:"))
+            || (trimmed.len() >= 10 && trimmed[..10].eq_ignore_ascii_case(b"forwarded:"));
+        if is_go_stripped {
             continue;
         }
         lines.push(line);
@@ -2328,11 +2358,14 @@ fn inject_vhost_request_headers(
         out.extend_from_slice(&xff);
         out.extend_from_slice(b"\r\n");
     }
-    // X-Forwarded-Host: inbound Host as received (Go SetXForwarded:
-    // `r.In.Host != ""` guard, pre-rewrite value). Emitted AFTER XFF, both
-    // before the configured headers, which may override them (Go `Header.Set`
+    // X-Forwarded-Host: inbound Host as received (Go SetXForwarded reads
+    // `r.In.Host`, the pre-rewrite value — go1.25 sets it UNCONDITIONALLY,
+    // `Header.Set("X-Forwarded-Host", r.In.Host)`, so an HTTP/1.0 request
+    // with no Host header emits the header with an empty value, exactly as
+    // Go writes `Set(k, "")`). Emitted AFTER XFF, both before the
+    // configured headers, which may override them (Go `Header.Set`
     // semantics — the rc.Headers loop runs after SetXForwarded).
-    if !overrides_xfh && !x_forwarded_host.is_empty() {
+    if !overrides_xfh {
         out.extend_from_slice(b"X-Forwarded-Host: ");
         out.extend_from_slice(x_forwarded_host.as_bytes());
         out.extend_from_slice(b"\r\n");
@@ -4876,20 +4909,79 @@ mod tests {
         );
     }
 
-    /// Empty inbound Host → the X-Forwarded-Host line is OMITTED (Go
-    /// `r.In.Host != ""` guard); XFF and XFP still emit.
+    /// Empty inbound Host → the X-Forwarded-Host line is emitted WITH AN
+    /// EMPTY VALUE (go1.25 `SetXForwarded` sets `X-Forwarded-Host` to
+    /// `r.In.Host` UNCONDITIONALLY — no `!= ""` guard — and an HTTP/1.0
+    /// request with no Host header ships `Header.Set(k, "")`, which Go
+    /// serializes as `X-Forwarded-Host: ` + CRLF exactly like any other
+    /// empty-value header line). Round-13 audit flipped the old
+    /// "omitted-on-empty" pin to the source-verified semantics.
     #[test]
-    fn inject_xfh_omitted_when_host_empty() {
+    fn inject_xfh_empty_value_when_host_empty() {
         let head = b"GET / HTTP/1.1\r\n\r\n".to_vec();
         let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
         let out = inject_vhost_request_headers(head, peer, "", &[]);
         let text = String::from_utf8(out).unwrap();
         assert!(
-            !text.contains("X-Forwarded-Host:"),
-            "empty inbound Host must omit X-Forwarded-Host: {text:?}"
+            text.contains("X-Forwarded-Host: \r\n"),
+            "empty inbound Host must emit an empty-value X-Forwarded-Host: {text:?}"
         );
         assert!(text.contains("X-Forwarded-For: 192.0.2.55\r\n"), "{text:?}");
         assert!(text.contains("X-Forwarded-Proto: http\r\n"), "{text:?}");
+    }
+
+    /// Client-supplied X-Forwarded-Host / X-Forwarded-Proto / Forwarded
+    /// lines are STRIPPED and re-emitted as the canonical single line (Go
+    /// go1.25 reverseproxy.go:434-437 deletes all three before the Rewrite
+    /// hook; SetXForwarded re-Sets the two X-Forwarded names, `Forwarded`
+    /// is never re-added). An invented lookalike (`x-forwarded-hostile`)
+    /// is not stripped.
+    #[test]
+    fn inject_strips_client_forwarded_lines() {
+        let head = b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\
+            X-Forwarded-For: 203.0.113.1\r\n\
+            X-Forwarded-Host: spoofed.example.com\r\n\
+            X-Forwarded-Proto: https\r\n\
+            Forwarded: for=1.2.3.4\r\n\
+            x-forwarded-hostile: keep-me\r\n\r\n"
+            .to_vec();
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
+        let out = inject_vhost_request_headers(head, peer, "app.example.com", &[]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("spoofed.example.com"),
+            "client X-Forwarded-Host must not survive: {text:?}"
+        );
+        assert!(
+            !text.contains("Forwarded: for="),
+            "client Forwarded must not survive: {text:?}"
+        );
+        // Canonical single lines: XFH = inbound Host, XFP = http, XFF
+        // chained with the peer — and exactly ONE of each.
+        assert_eq!(
+            text.matches("X-Forwarded-Host: ").count(),
+            1,
+            "exactly one canonical X-Forwarded-Host: {text:?}"
+        );
+        assert_eq!(
+            text.matches("X-Forwarded-Proto: ").count(),
+            1,
+            "exactly one canonical X-Forwarded-Proto: {text:?}"
+        );
+        assert!(
+            text.contains("X-Forwarded-Host: app.example.com\r\n"),
+            "{text:?}"
+        );
+        assert!(text.contains("X-Forwarded-Proto: http\r\n"), "{text:?}");
+        // XFF chained (empty join semantics untouched by the strip).
+        assert!(
+            text.contains("X-Forwarded-For: 203.0.113.1, 192.0.2.55\r\n"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("x-forwarded-hostile: keep-me\r\n"),
+            "lookalike header must survive the exact-name strip: {text:?}"
+        );
     }
 
     /// Configured requestHeaders may override the forwarded headers (Go
