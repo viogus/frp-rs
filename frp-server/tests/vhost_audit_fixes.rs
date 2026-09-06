@@ -124,7 +124,7 @@ async fn take_start_work_conn(
     run_id: &str,
     mut work_conn: tokio::net::TcpStream,
 ) -> (tokio::net::TcpStream, Box<msg::StartWorkConn>) {
-    for attempt in 0..12 {
+    for _ in 0..12 {
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),
             read_msg_v1(&mut work_conn),
