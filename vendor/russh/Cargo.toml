@@ -278,13 +278,9 @@ version = "0.13"
 version = "=0.8.0-rc.4"
 optional = true
 
-[dependencies.pkcs5]
-version = "0.8"
-
 [dependencies.pkcs8]
 version = "0.11"
 features = [
-    "encryption",
     "std",
 ]
 
@@ -313,12 +309,6 @@ features = ["ssh-encoding"]
 [dependencies.russh-util]
 version = "0.52.0"
 
-[dependencies.salsa20]
-version = "0.11.0"
-
-[dependencies.scrypt]
-version = "0.12.0"
-
 [dependencies.sec1]
 version = "0.8"
 features = ["der"]
@@ -330,9 +320,6 @@ features = ["oid"]
 [dependencies.sha2]
 version = "0.11"
 features = ["oid"]
-
-[dependencies.sha3]
-version = "0.12.0"
 
 [dependencies.signature]
 version = "3"

@@ -1998,7 +1998,7 @@ dependencies = [
  "module-lattice",
  "pkcs8",
  "rand_core 0.10.1",
- "sha3 0.11.0",
+ "sha3",
 ]
 
 [[package]]
@@ -2351,31 +2351,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "pkcs5"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63d440a804ec8d6fafbb6b84471e013286658d373248927692ab3366686220ca"
-dependencies = [
- "aes",
- "aes-gcm",
- "cbc",
- "der",
- "pbkdf2",
- "rand_core 0.10.1",
- "scrypt",
- "sha2",
- "spki",
-]
-
-[[package]]
 name = "pkcs8"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
 dependencies = [
  "der",
- "pkcs5",
- "rand_core 0.10.1",
  "spki",
 ]
 
@@ -2964,7 +2945,6 @@ dependencies = [
  "pageant",
  "pbkdf2",
  "pkcs1",
- "pkcs5",
  "pkcs8",
  "polyval",
  "rand 0.10.2",
@@ -2973,12 +2953,9 @@ dependencies = [
  "rsa",
  "russh-cryptovec",
  "russh-util",
- "salsa20",
- "scrypt",
  "sec1",
  "sha1 0.11.0",
  "sha2",
- "sha3 0.12.0",
  "signature",
  "spki",
  "ssh-encoding",
@@ -3146,16 +3123,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "salsa20"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f874456e72520ff1375a06c588eaf074b0f01f9e9e1aada45bd9b7954a6e42c"
-dependencies = [
- "cfg-if",
- "cipher",
-]
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3178,18 +3145,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "scrypt"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d87af57419b594aa23fa95f09f0e06d80d84ba01c26148c43844cad6ff4485f0"
-dependencies = [
- "cfg-if",
- "pbkdf2",
- "salsa20",
- "sha2",
-]
 
 [[package]]
 name = "sec1"
@@ -3376,17 +3331,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha3"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
-dependencies = [
- "digest 0.11.3",
- "keccak",
- "sponge-cursor",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3501,12 +3445,6 @@ dependencies = [
  "base64ct",
  "der",
 ]
-
-[[package]]
-name = "sponge-cursor"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "ssh-cipher"
