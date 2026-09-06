@@ -1333,3 +1333,152 @@ password = "admin"
     assert_eq!(status, 200);
     assert_eq!(json2, json, "alias detail must match the typed detail");
 }
+
+/// GAP7: the Prometheus /metrics endpoint HTTP surface. frp-rs renders
+/// Go-frp-compatible prom metrics on /metrics when
+/// `[web_server] enable_prometheus = true` — but no test ever issued an
+/// HTTP GET to it (metrics/prom.rs inline tests pin text rendering and
+/// sync_from_state deltas only). Pin the full surface: 404 when the flag is
+/// off, Basic-auth-wrapped when web_server creds are set (401 without/with
+/// wrong creds), plain 200 with no creds configured, and a live registered
+/// proxy visible in the scraped body.
+#[tokio::test]
+async fn test_dashboard_metrics_endpoint_http_surface() {
+    // (1) enable_prometheus OFF (base_config has no flag): 404 even with
+    // valid auth — the route is never merged (dashboard.rs).
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let frps = FrpsHandle::start(&base_config(bind_port, dashboard_port)).await;
+    let client = auth_client();
+    let resp = client
+        .get(frps.dashboard_url("/metrics"))
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "/metrics must 404 when enable_prometheus is off"
+    );
+
+    // (2) enable_prometheus ON with web_server creds: /metrics is behind
+    // the same Basic auth as the API. A live tcp proxy must show up in the
+    // scraped gauge.
+    drop(frps);
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let tcp_port = common::allocate_port();
+    let cfg = format!(
+        r#"bind_addr = "127.0.0.1"
+bind_port = {bind_port}
+
+[auth]
+method = "token"
+token = "test-token"
+
+[transport]
+tcp_mux = false
+
+[web_server]
+addr = "127.0.0.1"
+port = {dashboard_port}
+user = "admin"
+password = "admin"
+enable_prometheus = true
+"#,
+        bind_port = bind_port,
+        dashboard_port = dashboard_port,
+    );
+    let frps = FrpsHandle::start(&cfg).await;
+    let client = auth_client();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let resp = client
+        .get(frps.dashboard_url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "/metrics must require Basic auth when creds are set"
+    );
+    let resp = client
+        .get(frps.dashboard_url("/metrics"))
+        .basic_auth("admin", Some("wrong"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "wrong creds must be rejected");
+
+    let (mut ctl, _resp) = common::login_with_test_token(addr).await.expect("login");
+    register_proxy_ok(
+        &mut ctl,
+        "metrics-one",
+        typed_proxy_msg("metrics-one", "tcp", Some(tcp_port), None, None),
+    )
+    .await;
+
+    let resp = client
+        .get(frps.dashboard_url("/metrics"))
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "authenticated scrape must succeed");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("# HELP frp_server_proxy_counts"),
+        "scrape body must render the Go-parity proxy_counts family, got: {body}"
+    );
+    assert!(
+        body.contains("frp_server_proxy_counts{type=\"tcp\"}"),
+        "live tcp proxy must be counted in the scrape, got: {body}"
+    );
+    assert!(
+        body.contains("frp_server_proxy_counts_detailed{name=\"metrics-one\""),
+        "live proxy must be listed by name, got: {body}"
+    );
+
+    // (3) enable_prometheus ON, no web_server creds: plain 200, no auth.
+    drop(frps);
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let cfg = format!(
+        r#"bind_addr = "127.0.0.1"
+bind_port = {bind_port}
+
+[auth]
+method = "token"
+token = "test-token"
+
+[transport]
+tcp_mux = false
+
+[web_server]
+addr = "127.0.0.1"
+port = {dashboard_port}
+enable_prometheus = true
+"#,
+        bind_port = bind_port,
+        dashboard_port = dashboard_port,
+    );
+    let frps = FrpsHandle::start(&cfg).await;
+    let client = auth_client();
+    let resp = client
+        .get(frps.dashboard_url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "no-creds config must serve /metrics open"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("frp_server_client_counts"),
+        "scrape body must render the client_counts family, got: {body}"
+    );
+}

@@ -4,10 +4,13 @@
 //! exactly like standalone TCP work connections — this was a real prior
 //! auth-bypass bug class (yamux streams skipped NewWorkConn verification).
 //!
-//! Each invalid stream must be dropped by the server: a wrong run_id
-//! (control/mod.rs run_id mismatch), a bad privilege_key
-//! (validate_new_work_conn_auth), or an unexpected message type (Login).
-//! And no StartWorkConn may ever be written back. A stream the server
+//! Each invalid stream must be REJECTED by the server: a wrong run_id
+//! (control/mod.rs run_id mismatch) or a bad privilege_key
+//! (validate_new_work_conn_auth) gets a StartWorkConn error frame written
+//! back before the stream drops (round-11 F2 — Go parity:
+//! server/service.go:512-522 writes StartWorkConn{Error: "invalid
+//! NewWorkConn"} then closes). An unexpected message type (Login) is an
+//! accept-loop shape error, dropped with no reply. A stream the server
 //! accepted would be pooled (kept OPEN); a rejected stream is closed.
 
 mod common;
@@ -101,9 +104,46 @@ async fn yamux_login(addr: SocketAddr) -> (IoStream, mux::YamuxSession, String) 
     (control, session, run_id)
 }
 
-/// Assert the server DROPS the yamux stream: the read must return EOF
-/// (Ok(0), clean FIN) or an error (RST) within 2s. A timeout — the stream
-/// still open — means the server pooled/accepted it instead of rejecting.
+/// Assert the server REJECTS the yamux stream with a StartWorkConn error
+/// frame (round-11 F2, Go parity) and then closes it: the first read is the
+/// rejection frame, the second read is EOF (Ok(0)) or an error (RST) within
+/// 2s. The callers below run the default `detailed_errors_to_client = true`
+/// and pass the full Go-style detail text; under
+/// `detailed_errors_to_client = false` the same rejection collapses to the
+/// generic "invalid NewWorkConn" summary (proxy_ops::err_msg) — exercised by
+/// test_pool_full_rejection_detailed_and_generic.
+async fn assert_stream_rejected(mut io: IoStream, what: &str, expected: &str) {
+    let frame = tokio::time::timeout(Duration::from_secs(2), read_msg_v1(&mut io))
+        .await
+        .unwrap_or_else(|_| panic!("{what}: rejection StartWorkConn frame timed out"))
+        .unwrap_or_else(|e| panic!("{what}: read of rejection frame errored: {e}"));
+    match frame {
+        FrpMessage::StartWorkConn(swc) => {
+            // The test config uses default `detailed_errors_to_client =
+            // true`, so the rejection carries the full Go-style detail.
+            assert_eq!(
+                swc.error.as_deref(),
+                Some(expected),
+                "{what}: rejection error text"
+            );
+        }
+        other => panic!(
+            "{what}: expected StartWorkConn rejection, got type {}",
+            other.v1_type_byte()
+        ),
+    }
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(2), io.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!("{what}: expected EOF after rejection frame, got {n} bytes"),
+        Ok(Err(_)) => {} // RST is also a valid close
+        Err(_) => panic!("{what}: stream was NOT closed after the rejection frame"),
+    }
+}
+
+/// Assert the server DROPS the yamux stream with no reply (the Login-frame
+/// accept-shape error): EOF (Ok(0), clean FIN) or an error (RST) within 2s.
+/// A timeout — the stream still open — means the server pooled/accepted it.
 async fn assert_stream_closed(mut io: IoStream, what: &str) {
     let mut buf = [0u8; 64];
     match tokio::time::timeout(Duration::from_secs(2), io.read(&mut buf)).await {
@@ -125,11 +165,11 @@ async fn open_and_write(session: &mux::YamuxSession, msg: &FrpMessage) -> IoStre
 }
 
 /// The validation chain on yamux work streams:
-/// (a) wrong run_id, (b) bad privilege_key, (c) unexpected message type —
-/// each stream must be dropped by the server with no StartWorkConn ever
-/// sent back. A subsequent VALID NewWorkConn must still be accepted
-/// (pooled, i.e. kept open), proving the rejections were validation, not a
-/// broken yamux accept path.
+/// (a) wrong run_id, (b) bad privilege_key — each rejected with a
+/// StartWorkConn error frame (F2) and dropped; (c) unexpected message type
+/// (Login) — dropped with no reply. A subsequent VALID NewWorkConn must
+/// still be accepted (pooled, i.e. kept open), proving the rejections were
+/// validation, not a broken yamux accept path.
 #[tokio::test]
 async fn test_yamux_work_conn_validation_drops_bad_streams() {
     let bind_port = allocate_port();
@@ -144,7 +184,7 @@ async fn test_yamux_work_conn_validation_drops_bad_streams() {
 
     let (mut control, session, run_id) = yamux_login(addr).await;
 
-    // (a) wrong run_id → dropped, never pooled.
+    // (a) wrong run_id → StartWorkConn error frame, then dropped.
     let io = open_and_write(
         &session,
         &FrpMessage::NewWorkConn(msg::NewWorkConn {
@@ -154,9 +194,14 @@ async fn test_yamux_work_conn_validation_drops_bad_streams() {
         }),
     )
     .await;
-    assert_stream_closed(io, "wrong run_id").await;
+    assert_stream_rejected(
+        io,
+        "wrong run_id",
+        "no client control found for run id [wrong-run-id]",
+    )
+    .await;
 
-    // (b) correct run_id but bad privilege_key → dropped by auth validation.
+    // (b) correct run_id but bad privilege_key → rejection frame, then dropped.
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -170,9 +215,14 @@ async fn test_yamux_work_conn_validation_drops_bad_streams() {
         }),
     )
     .await;
-    assert_stream_closed(io, "bad privilege_key").await;
+    assert_stream_rejected(
+        io,
+        "bad privilege_key",
+        "token in login doesn't match token from configuration",
+    )
+    .await;
 
-    // (c) unexpected message type (a Login frame) → dropped.
+    // (c) unexpected message type (a Login frame) → dropped, no reply.
     let io = open_and_write(
         &session,
         &FrpMessage::Login(Box::new(msg::Login {
@@ -234,10 +284,11 @@ async fn test_yamux_work_conn_validation_drops_bad_streams() {
 /// handle_work_conn_inner). With tcp_mux OFF, work connections are
 /// standalone TCP connections to the main port carrying one V1 NewWorkConn
 /// frame — the same validation chain as the yamux streams above must hold:
-/// a wrong run_id or a bad privilege_key gets the connection dropped, no
-/// StartWorkConn is ever written, and the control stream stays silent.
-/// A subsequent VALID NewWorkConn is pooled (connection kept open), proving
-/// the rejections were validation, not a broken work-conn accept path.
+/// a wrong run_id or a bad privilege_key gets a StartWorkConn error frame
+/// (F2) and then the connection is dropped; the control stream stays
+/// silent. A subsequent VALID NewWorkConn is pooled (connection kept
+/// open), proving the rejections were validation, not a broken work-conn
+/// accept path.
 ///
 /// NOTE: the yamux chain's case (c) — a Login frame on a work stream — has
 /// NO raw-TCP analogue: on raw TCP a Login frame on a NEW connection is a
@@ -262,7 +313,7 @@ async fn test_raw_tcp_work_conn_validation_drops_bad_connections() {
     let (mut control, resp) = login_with_test_token(addr).await.expect("control login");
     let run_id = resp.run_id.expect("run_id in LoginResp");
 
-    // (a) wrong run_id → connection dropped (EOF or RST within 2s).
+    // (a) wrong run_id → StartWorkConn error frame, then dropped.
     let stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("dial work conn");
@@ -277,9 +328,14 @@ async fn test_raw_tcp_work_conn_validation_drops_bad_connections() {
     )
     .await
     .expect("write wrong-run_id NewWorkConn");
-    assert_raw_conn_closed(&mut rd, "wrong run_id").await;
+    assert_raw_rejected(
+        &mut rd,
+        "wrong run_id",
+        "no client control found for run id [wrong-run-id]",
+    )
+    .await;
 
-    // (b) correct run_id but bad privilege_key → dropped by auth validation.
+    // (b) correct run_id but bad privilege_key → rejection frame, then dropped.
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -298,7 +354,12 @@ async fn test_raw_tcp_work_conn_validation_drops_bad_connections() {
     )
     .await
     .expect("write bad-key NewWorkConn");
-    assert_raw_conn_closed(&mut rd, "bad privilege_key").await;
+    assert_raw_rejected(
+        &mut rd,
+        "bad privilege_key",
+        "token in login doesn't match token from configuration",
+    )
+    .await;
 
     // No StartWorkConn / ReqWorkConn leaked onto the control stream from the
     // rejections: it must stay silent (the login pre-warm ReqWorkConn was
@@ -338,15 +399,110 @@ async fn test_raw_tcp_work_conn_validation_drops_bad_connections() {
     );
 }
 
-/// Assert the server DROPS a raw work connection: the read must return EOF
-/// (Ok(0), clean FIN) or an error (RST) within 2s. A timeout — the conn
-/// still open — means the server pooled/accepted it instead of rejecting.
-async fn assert_raw_conn_closed(rd: &mut tokio::net::tcp::OwnedReadHalf, what: &str) {
+/// Assert the server REJECTS a raw work connection: read the StartWorkConn
+/// error frame (F2), then EOF (Ok(0)) or RST within 2s. A timeout — the
+/// conn still open — means the server pooled/accepted it instead.
+async fn assert_raw_rejected(rd: &mut tokio::net::tcp::OwnedReadHalf, what: &str, expected: &str) {
+    let frame = tokio::time::timeout(Duration::from_secs(2), read_msg_v1(rd))
+        .await
+        .unwrap_or_else(|_| panic!("{what}: rejection StartWorkConn frame timed out"))
+        .unwrap_or_else(|e| panic!("{what}: read of rejection frame errored: {e}"));
+    match frame {
+        FrpMessage::StartWorkConn(swc) => {
+            assert_eq!(
+                swc.error.as_deref(),
+                Some(expected),
+                "{what}: rejection error text"
+            );
+        }
+        other => panic!(
+            "{what}: expected StartWorkConn rejection, got type {}",
+            other.v1_type_byte()
+        ),
+    }
     let mut buf = [0u8; 64];
     match tokio::time::timeout(Duration::from_secs(2), rd.read(&mut buf)).await {
         Ok(Ok(0)) => {}
-        Ok(Ok(n)) => panic!("{what}: expected EOF, got {n} bytes"),
+        Ok(Ok(n)) => panic!("{what}: expected EOF after rejection frame, got {n} bytes"),
         Ok(Err(_)) => {} // RST is also a valid close
-        Err(_) => panic!("{what}: connection was NOT dropped by the server (still open / pooled)"),
+        Err(_) => panic!("{what}: connection was NOT dropped after the rejection frame"),
+    }
+}
+
+/// Pool-full rejection (F2, Go parity): with `pool_count` 1 the server
+/// pre-warms exactly one work conn, so the pool fills at capacity 1 — the
+/// second NewWorkConn must be REJECTED with a StartWorkConn error frame
+/// carrying Go's verbatim literal "work connection pool is full,
+/// discarding" (control.go:335 — NO run id), not silently dropped, and the
+/// stream must then close. Under `detailed_errors_to_client = false` the
+/// same rejection collapses to the generic "invalid NewWorkConn" summary.
+#[tokio::test]
+async fn test_pool_full_rejection_detailed_and_generic() {
+    for detailed in [true, false] {
+        let bind_port = allocate_port();
+        let cfg = ServerConfig {
+            bind_addr: "127.0.0.1".into(),
+            bind_port,
+            auth: test_auth_cfg(),
+            detailed_errors_to_client: detailed,
+            ..Default::default()
+        };
+        let (_handle, _) = start_test_server_tcpmux_on(cfg).await;
+        let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+        let (mut _control, session, run_id) = yamux_login(addr).await;
+
+        // Pool capacity = pool_count(1) + WORK_POOL_EXTRA(10) headroom = 11
+        // (login.rs pool_cap construction). Fill it: the first 10 conns are
+        // opened write-only and held, the 11th must be pooled (stays OPEN),
+        // and the 12th hits the full pool.
+        let mut held: Vec<IoStream> = Vec::new();
+        for _i in 0..10 {
+            held.push(
+                open_and_write(
+                    &session,
+                    &FrpMessage::NewWorkConn(msg::NewWorkConn {
+                        run_id: Some(run_id.clone()),
+                        timestamp: None,
+                        privilege_key: None,
+                    }),
+                )
+                .await,
+            );
+        }
+        let mut pooled_conn = open_and_write(
+            &session,
+            &FrpMessage::NewWorkConn(msg::NewWorkConn {
+                run_id: Some(run_id.clone()),
+                timestamp: None,
+                privilege_key: None,
+            }),
+        )
+        .await;
+        let mut buf = [0u8; 64];
+        let kept =
+            tokio::time::timeout(Duration::from_millis(300), pooled_conn.read(&mut buf)).await;
+        assert!(
+            kept.is_err(),
+            "11th NewWorkConn must be pooled (stream stays open), not rejected"
+        );
+        held.push(pooled_conn);
+
+        // 12th NewWorkConn hits the full pool: rejection frame + close.
+        let io = open_and_write(
+            &session,
+            &FrpMessage::NewWorkConn(msg::NewWorkConn {
+                run_id: Some(run_id.clone()),
+                timestamp: None,
+                privilege_key: None,
+            }),
+        )
+        .await;
+        let expected = if detailed {
+            "work connection pool is full, discarding"
+        } else {
+            "invalid NewWorkConn"
+        };
+        assert_stream_rejected(io, "pool-full 12th NewWorkConn", expected).await;
     }
 }

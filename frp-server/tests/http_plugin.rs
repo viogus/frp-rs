@@ -1060,15 +1060,30 @@ async fn test_plugin_new_work_conn_mutation_bad_key_rejects_valid_conn() {
     .await
     .expect("send NewWorkConn");
 
+    // Round-11 F2 (Go parity, service.go:512-522): the rejection arrives as
+    // a StartWorkConn error frame on the conn, then the conn closes.
+    let mut work = &mut work;
+    let frame = tokio::time::timeout(Duration::from_secs(2), read_msg_v1(&mut work))
+        .await
+        .expect("rejection StartWorkConn frame must arrive")
+        .expect("read rejection frame");
+    match frame {
+        FrpMessage::StartWorkConn(swc) => assert_eq!(
+            swc.error.as_deref(),
+            Some("token in login doesn't match token from configuration"),
+            "rejection error text for plugin-rewritten privilege_key"
+        ),
+        other => panic!(
+            "expected StartWorkConn rejection, got {:?}",
+            other.v1_type_byte()
+        ),
+    }
     let mut buf = [0u8; 64];
     match tokio::time::timeout(Duration::from_secs(2), work.read(&mut buf)).await {
         Ok(Ok(0)) => {}
-        Ok(Ok(n)) => panic!("rejected work conn must be closed, got {n} bytes"),
+        Ok(Ok(n)) => panic!("rejected work conn must close after the frame, got {n} bytes"),
         Ok(Err(_)) => {} // RST is also a valid close
-        Err(_) => panic!(
-            "valid-key work conn must be REJECTED after the plugin rewrote its privilege_key \
-             (auth must run on the mutated message)"
-        ),
+        Err(_) => panic!("rejected work conn must be closed after the rejection frame"),
     }
 
     // The hook must have fired with the Go wire shape: `user` object + the
@@ -1339,6 +1354,24 @@ async fn test_plugin_new_work_conn_mutation_yamux_rejects_valid_stream() {
         }),
     )
     .await;
+    // Round-11 F2 (Go parity, service.go:512-522): the rejection is a
+    // StartWorkConn error frame on the stream, then the stream closes.
+    let mut io = io;
+    let frame = tokio::time::timeout(Duration::from_secs(2), read_msg_v1(&mut io))
+        .await
+        .expect("rejection StartWorkConn frame must arrive on the yamux stream")
+        .expect("read rejection frame");
+    match frame {
+        FrpMessage::StartWorkConn(swc) => assert_eq!(
+            swc.error.as_deref(),
+            Some("token in login doesn't match token from configuration"),
+            "rejection error text for plugin-rewritten privilege_key (yamux)"
+        ),
+        other => panic!(
+            "expected StartWorkConn rejection on yamux stream, got type {}",
+            other.v1_type_byte()
+        ),
+    }
     assert_stream_closed(io, "valid-key yamux work stream rewritten by plugin").await;
 
     assert!(

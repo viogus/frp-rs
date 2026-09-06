@@ -1775,6 +1775,18 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
         .await;
         match swc_result {
             Ok(FrpMessage::StartWorkConn(swc)) => {
+                // Go parity (client/control.go InWorkConn): the server's
+                // rejection of a work conn arrives as StartWorkConn with an
+                // Error field set — log it and close instead of looking the
+                // proxy up and bridging a rejected conn. Go gates on
+                // `startMsg.Error != ""` (client/control.go:152), so an
+                // EMPTY error string is a normal assignment — the filter
+                // below mirrors that: `Some("")` must not be treated as a
+                // rejection.
+                if let Some(err) = swc.error.as_deref().filter(|e| !e.is_empty()) {
+                    warn!(label = %label, error = %err, "Work conn {} StartWorkConn contains error: {}", label, err);
+                    return;
+                }
                 let proxy_name = &swc.proxy_name;
                 debug!(label = %label, proxy_name = %proxy_name, "Work conn {} assigned to proxy '{}'", label, proxy_name);
                 // proxy_info_map uses wire names (with {user}. prefix) —

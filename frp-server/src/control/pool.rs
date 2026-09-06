@@ -288,6 +288,45 @@ pub(crate) async fn write_start_work_conn_with_nat_hole_sid<W: AsyncWriteExt + U
 
 // ---- InternalMsg Handlers ----
 
+/// Go frps parity (server/service.go:512-522): a rejected NewWorkConn gets a
+/// best-effort `StartWorkConn{error}` reply before the conn/stream is
+/// dropped, so the client sees the rejection REASON instead of a bare EOF
+/// (round-11 audit finding F2; the Go reply carries Error only — proxy_name
+/// is omitted by Go's omitempty, Rust's struct serializes an empty one,
+/// which clients ignore on the error path). Best-effort: a dead conn makes
+/// the write fail and we drop anyway. Error text mirrors Go
+/// GenerateResponseErrorString via `proxy_ops::err_msg`: full detail in
+/// detailed mode, the "invalid NewWorkConn" summary otherwise.
+pub(crate) async fn reply_work_conn_rejection(
+    stream: &mut IoStream,
+    v2: bool,
+    detailed: bool,
+    detail: String,
+) {
+    let error = crate::control::proxy_ops::err_msg(detailed, detail, "invalid NewWorkConn");
+    let swc = FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
+        proxy_name: String::new(),
+        src_addr: None,
+        src_port: None,
+        dst_addr: None,
+        dst_port: None,
+        error: Some(error),
+        use_encryption: None,
+        use_compression: None,
+        nat_hole_sid: None,
+        nat_hole_visitor_addr: None,
+        sk: None,
+    }));
+    let result = if v2 {
+        stream.write_v2_frame(&swc).await
+    } else {
+        stream.write_v1_frame(&swc).await
+    };
+    if let Err(e) = result {
+        debug!(error = %e, "Failed to write work-conn rejection frame: {}", e);
+    }
+}
+
 /// Handle a new work connection arriving for this control session.
 ///
 /// Priority order: (1) deliver pending NatHoleSid, (2) assign to waiting UDP
@@ -433,6 +472,19 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
             } else {
                 ctx.state.pool.drops.fetch_add(1, Ordering::Relaxed);
                 debug!(run_id = %ctx.run_id, pool_size = %ctl.work_pool.len(), pool_cap = %ctx.pool_cap, "Work pool full for {} ({}/{}), dropping work conn", ctx.run_id, ctl.work_pool.len(), ctx.pool_cap);
+                // Go frps parity (control.go:329-335 + service.go:517-522):
+                // a pool-full work conn is rejected with a StartWorkConn
+                // error frame before the drop, not silently (F2). The error
+                // text is Go's verbatim literal (control.go:335) — it does
+                // NOT carry a run id; the run id stays in the server log
+                // above.
+                reply_work_conn_rejection(
+                    &mut stream,
+                    ctx.v2,
+                    ctx.state.detailed_errors_to_client,
+                    "work connection pool is full, discarding".to_string(),
+                )
+                .await;
             }
         }
     }
@@ -1025,6 +1077,96 @@ mod tests {
         assert_eq!(ctl.pending_requests[0].proxy_name, "p1");
         // Replenish ReqWorkConn was written to the control channel.
         assert!(!writer.is_empty(), "ReqWorkConn replenish must be written");
+    }
+
+    /// Round-11 audit F1: StartWorkConn's DstAddr/DstPort must be the
+    /// server-side endpoint the user actually dialed (Go
+    /// `GetWorkConnFromPool(userConn.RemoteAddr(), userConn.LocalAddr())`
+    /// — server/proxy/proxy.go:288; dst fields at 178-186), NOT the
+    /// client-declared local service. The frpc client feeds these into the
+    /// PROXY-protocol header pair (client proxy.go:179-211), so a backend
+    /// must see the real dialed destination. RED pre-fix: with no
+    /// proxy_info (the STCP/XTCP visitor-before-registration race snapshot
+    /// being None) the old local_str fallback produced EMPTY DstAddr/DstPort.
+    #[tokio::test]
+    async fn start_work_conn_carries_user_dialed_destination() {
+        use frp_core::protocol::read_msg_v1;
+
+        // User-side pair: the accepted half stands in for the proxy
+        // listener accept (its local_addr IS the endpoint the user dialed);
+        // the client half stays open so the spawned bridge parks on reads.
+        let (user_client, user_accepted) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (c, a) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+            (c.unwrap(), a.unwrap().0)
+        };
+        let dialed = user_accepted.local_addr().unwrap();
+        // Work-conn pair: the server-side pooled conn is handed to
+        // assign_work_to_proxy; the client half receives the frame.
+        let (work_client, work_server) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (c, a) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+            (c.unwrap(), a.unwrap().0)
+        };
+
+        let mut req = test_req("f1-dst");
+        req.user_conn = IoStream::Tcp(user_accepted);
+        req.proxy_info = None; // no client-declared local_str available
+
+        let state = test_state();
+        let enc_key = state
+            .reloadable
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .encryption_key;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let res = bridge::assign_work_to_proxy(
+            IoStream::Tcp(work_server),
+            req,
+            enc_key,
+            state,
+            false,
+            cancel.clone(),
+        )
+        .await;
+        assert!(res.is_ok(), "assign must write StartWorkConn");
+
+        let mut work_client = work_client;
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_msg_v1(&mut work_client),
+        )
+        .await
+        .expect("StartWorkConn must be written to the work conn")
+        .expect("frame must parse");
+        let FrpMessage::StartWorkConn(swc) = msg else {
+            panic!("expected StartWorkConn, got {:?}", msg.v1_type_byte());
+        };
+        assert_eq!(
+            swc.src_addr.as_deref(),
+            Some("127.0.0.1"),
+            "src = user conn peer (user_client dialed from 127.0.0.1)"
+        );
+        assert_eq!(
+            swc.dst_addr.as_deref(),
+            Some(dialed.ip().to_string()).as_deref(),
+            "dst = the endpoint the user dialed, not the client-declared local service"
+        );
+        assert_eq!(
+            swc.dst_port,
+            Some(dialed.port()),
+            "dst port = the proxy port the user dialed"
+        );
+        assert!(
+            swc.dst_port != Some(0),
+            "dst must not fall back to empty when proxy_info is None"
+        );
+
+        cancel.cancel();
+        drop(work_client);
+        drop(user_client);
     }
 
     /// Register a control channel for a run_id and hand back the receiver so

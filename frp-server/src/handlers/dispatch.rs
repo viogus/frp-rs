@@ -1206,7 +1206,7 @@ pub(crate) async fn run_new_work_conn_plugin_with_msg(
 /// InternalMsg.
 #[instrument(skip(stream, state), fields(run_id = %msg.run_id.clone().unwrap_or_default()))]
 pub(crate) async fn handle_work_conn_inner(
-    stream: IoStream,
+    mut stream: IoStream,
     mut msg: msg::NewWorkConn,
     state: Arc<AppState>,
     v2: bool,
@@ -1215,6 +1215,16 @@ pub(crate) async fn handle_work_conn_inner(
         Some(id) => id.clone(),
         None => {
             warn!("NewWorkConn without run_id, ignoring");
+            // Go parity (F2): a rejected work conn gets a StartWorkConn
+            // error frame before the close, so the client's control loop
+            // learns why (server/service.go:512-522).
+            control::reply_work_conn_rejection(
+                &mut stream,
+                v2,
+                state.detailed_errors_to_client,
+                "no client control found for run id []".to_string(),
+            )
+            .await;
             return;
         }
     };
@@ -1230,6 +1240,15 @@ pub(crate) async fn handle_work_conn_inner(
     let (ctl_wire_v2, ctl_tx) = {
         let Some(ctl) = state.run_id_to_ctl_tx.get(&run_id) else {
             warn!(run_id = %run_id, "no client control found for run id [{}]", run_id);
+            // Go parity (F2): reject with a StartWorkConn error frame
+            // (Go GetByID miss → RegisterWorkConn err → reply, service.go:512-522).
+            control::reply_work_conn_rejection(
+                &mut stream,
+                v2,
+                state.detailed_errors_to_client,
+                format!("no client control found for run id [{run_id}]"),
+            )
+            .await;
             return;
         };
         (ctl.wire_v2, ctl.tx.clone())
@@ -1249,6 +1268,19 @@ pub(crate) async fn handle_work_conn_inner(
             if v2 { "v2" } else { "v1" },
             if ctl_wire_v2 { "v2" } else { "v1" }
         );
+        // Go parity (F2): error frame before close (Go text "work
+        // connection wire protocol mismatch: got %s want %s").
+        control::reply_work_conn_rejection(
+            &mut stream,
+            v2,
+            state.detailed_errors_to_client,
+            format!(
+                "work connection wire protocol mismatch: got {} want {}",
+                if v2 { "v2" } else { "v1" },
+                if ctl_wire_v2 { "v2" } else { "v1" }
+            ),
+        )
+        .await;
         return;
     }
 
@@ -1261,6 +1293,14 @@ pub(crate) async fn handle_work_conn_inner(
         Ok(None) => {}
         Err(reason) => {
             warn!(run_id = %run_id, reason = %reason, "NewWorkConn plugin hook rejected: {}", reason);
+            // Go parity (F2): plugin rejection → StartWorkConn error frame.
+            control::reply_work_conn_rejection(
+                &mut stream,
+                v2,
+                state.detailed_errors_to_client,
+                reason,
+            )
+            .await;
             return;
         }
     }
@@ -1268,6 +1308,15 @@ pub(crate) async fn handle_work_conn_inner(
     // Auth verifies the (possibly plugin-mutated) message.
     if let Err(e) = validate_new_work_conn_auth(&msg, &run_id, &state).await {
         warn!(run_id = %run_id, error = %e, "Work conn auth failed for run_id {}: {}", run_id, e);
+        // Go parity (F2): auth failure → StartWorkConn error frame before
+        // close (Go VerifyNewWorkConn err → RegisterWorkConn err → reply).
+        control::reply_work_conn_rejection(
+            &mut stream,
+            v2,
+            state.detailed_errors_to_client,
+            e.to_string(),
+        )
+        .await;
         return;
     }
 
@@ -1285,10 +1334,28 @@ pub(crate) async fn handle_work_conn_inner(
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => {
+        Ok(Err(err)) => {
             warn!(run_id = %run_id, "Control handler for {} has gone away", run_id);
+            // Go parity (F2): a work conn whose control is gone gets a
+            // StartWorkConn error frame (Go: "client control for run id
+            // [...] is no longer current", control.go RegisterWorkConn),
+            // not a silent close. Recover the stream from the send error —
+            // tokio mpsc hands the payload back on a closed channel.
+            if let InternalMsg::NewWorkConn(mut recovered) = err.0 {
+                control::reply_work_conn_rejection(
+                    &mut recovered,
+                    v2,
+                    state.detailed_errors_to_client,
+                    format!("client control for run id [{run_id}] is no longer current"),
+                )
+                .await;
+            }
         }
         Err(_elapsed) => {
+            // The timed-out send future owns the stream and drops it on
+            // cancel, so no reply is possible here — documented divergence
+            // (Go blocks on workConnCh with no timeout; frp-rs bounds the
+            // wait at CTL_SEND_TIMEOUT and the control handler re-requests).
             warn!(run_id = %run_id, "NewWorkConn delivery for {} timed out; dropping work conn", run_id);
         }
     }
