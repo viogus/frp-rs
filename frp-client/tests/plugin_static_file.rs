@@ -37,11 +37,12 @@ fn b64(s: &str) -> String {
     frp_core::base64::encode(s.as_bytes())
 }
 
-/// Send a raw HTTP GET and return (status_code, body).
+/// Send a raw HTTP request and return (status_code, body).
 /// Reads until EOF — the static_file responses carry `Connection: close`, so
 /// EOF is the body end. Read the full body so the caller can assert on it.
-async fn http_get(
+async fn http_req(
     addr: std::net::SocketAddr,
+    method: &str,
     path: &str,
     user: Option<(&str, &str)>,
 ) -> (u16, String) {
@@ -50,7 +51,7 @@ async fn http_get(
         Some((u, p)) => format!("Authorization: Basic {}\r\n", b64(&format!("{u}:{p}"))),
         None => String::new(),
     };
-    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth}\r\n");
+    let req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
 
     let mut raw = Vec::new();
@@ -76,9 +77,18 @@ async fn http_get(
         .map(|s| s.parse().unwrap_or(0))
         .unwrap_or(0);
     if status == 0 {
-        eprintln!("http_get raw bytes: {:?}", &raw[..raw.len().min(256)]);
+        eprintln!("http_req raw bytes: {:?}", &raw[..raw.len().min(256)]);
     }
     (status, text)
+}
+
+/// Send a raw HTTP GET and return (status_code, body).
+async fn http_get(
+    addr: std::net::SocketAddr,
+    path: &str,
+    user: Option<(&str, &str)>,
+) -> (u16, String) {
+    http_req(addr, "GET", path, user).await
 }
 
 #[tokio::test]
@@ -144,8 +154,12 @@ async fn test_static_file_plugin_missing_file_404() {
     let handle = frp_client::plugin::start_static_file_proxy(&cfg)
         .await
         .expect("start static_file plugin");
-    let (status, _) = http_get(handle.local_addr, "/nope.html", None).await;
+    let (status, body) = http_get(handle.local_addr, "/nope.html", None).await;
     assert_eq!(status, 404, "missing file must 404");
+    assert!(
+        body.contains("404 page not found\n"),
+        "Go http.Error 404-page body (not a bare CL:0 head), got: {body:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -172,5 +186,87 @@ async fn test_static_file_plugin_rejects_path_traversal() {
     // predates the anchored path.Clean (".." clamped at root instead of
     // rejected outright).
     assert_eq!(status, 404, "path traversal must 404 like Go FileServer");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_static_file_plugin_head_is_405() {
+    let dir = temp_dir_with_index("head-body");
+    let cfg = PluginConfig {
+        plugin_type: "static_file".into(),
+        local_path: dir.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let handle = frp_client::plugin::start_static_file_proxy(&cfg)
+        .await
+        .expect("start static_file plugin");
+
+    // gorilla Methods("GET") matches the raw request method exactly — HEAD
+    // is NOT rewritten onto the GET route (round-13-era claim was false;
+    // mux_test.go:2643 pins it), so HEAD answers the bare 405
+    // methodNotAllowedHandler render before any auth or file I/O.
+    let (status, body) = http_req(handle.local_addr, "HEAD", "/", None).await;
+    assert_eq!(status, 405, "HEAD must be a route-method miss: {body}");
+    assert!(
+        body.starts_with(
+            "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+        "bare 405 render, got: {body:?}"
+    );
+
+    // POST: same gate, on a valid file path too.
+    let (status, body) = http_req(handle.local_addr, "POST", "/index.html", None).await;
+    assert_eq!(status, 405, "POST must be a route-method miss: {body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_static_file_plugin_dir_listing() {
+    // Root keeps an index.html (temp_dir_with_index) — the listing is
+    // exercised on a subdirectory that has none.
+    let dir = temp_dir_with_index("root-body");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/alpha.txt"), b"a").unwrap();
+    std::fs::write(dir.join("sub/beta.txt"), b"b").unwrap();
+    std::fs::create_dir(dir.join("sub/leaf")).unwrap();
+    let cfg = PluginConfig {
+        plugin_type: "static_file".into(),
+        local_path: dir.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let handle = frp_client::plugin::start_static_file_proxy(&cfg)
+        .await
+        .expect("start static_file plugin");
+
+    // GET on a dir without index.html → 200 dirList page (Go fs.go
+    // dirList parity): text/html, byte-wise sorted <pre> anchors, dirs
+    // "/"-suffixed.
+    let (status, body) = http_get(handle.local_addr, "/sub/", None).await;
+    assert_eq!(status, 200, "dir without index must list: {body}");
+    assert!(
+        body.contains("Content-Type: text/html; charset=utf-8\r\n"),
+        "listing is html: {body}"
+    );
+    let t = body.as_str();
+    let alpha = t
+        .find("<a href=\"alpha.txt\">alpha.txt</a>")
+        .unwrap_or_else(|| panic!("alpha anchor missing: {t}"));
+    let beta = t
+        .find("<a href=\"beta.txt\">beta.txt</a>")
+        .unwrap_or_else(|| panic!("beta anchor missing: {t}"));
+    let leaf = t
+        .find("<a href=\"leaf/\">leaf/</a>")
+        .unwrap_or_else(|| panic!("leaf anchor missing: {t}"));
+    assert!(alpha < beta && beta < leaf, "byte-wise sorted listing: {t}");
+    assert!(t.ends_with("</pre>\n"), "dirList closes the pre block: {t}");
+
+    // The slash-less dir still redirects BEFORE any listing (FileServer
+    // localRedirect parity).
+    let (status, body) = http_get(handle.local_addr, "/sub", None).await;
+    assert_eq!(status, 301, "slash-less dir must redirect: {body}");
+    assert!(
+        body.contains("Location: sub/\r\n"),
+        "relative Location, got: {body:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

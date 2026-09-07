@@ -628,13 +628,47 @@ pub(super) fn go_parse_http_version_ok(version: &str) -> bool {
     }
 }
 
+/// Go conn.readRequest `validMethod` gate (net/http/request.go, go1.25):
+/// the method token must be non-empty and made of RFC 7230 tchar bytes
+/// only — alphanumerics plus `!#$%&'*+-.^_`|~`. No case rule: lowercase
+/// "get" is a legal token here (gorilla mux's `Method("GET")` mismatch 405s
+/// it later in Go, at the router). Applied after the line parse, matching
+/// Go's order — readRequest parses the request line, then rejects a
+/// non-tchar method with a badRequestError (http.Server renders 400)
+/// BEFORE routing, so a "G@T" request never reaches the handler.
+pub(super) fn go_valid_method_ok(method: &str) -> bool {
+    !method.is_empty()
+        && method.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 /// Strict HTTP request-line parse shared by every HTTP/1.1 plugin inbound
 /// path. Go net/http parseRequestLine splits on literal SPACE only (two
 /// `Cut(line, " ")`), so every other whitespace run — a tab-separated
 /// "GET\tURL\tHTTP/1.1" in particular — never yields the required second
 /// space and the whole line is malformed (ReadRequest error). Returns
 /// (method, request-target, version) when the line has exactly three
-/// non-empty space-separated parts and the version token passes
+/// non-empty space-separated parts, the method token passes Go's
+/// [`go_valid_method_ok`] gate (readRequest rejects non-tchar methods with
+/// a 400 before routing), and the version token passes
 /// [`go_parse_http_version_ok`] (request-side Go ParseHTTPVersion
 /// semantics). The old split_whitespace collapsed every whitespace run, so
 /// tab-joined tokens parsed and multi-space request lines were forwarded —
@@ -644,7 +678,7 @@ pub(super) fn parse_request_line(line: &str) -> Option<(&str, &str, &str)> {
     let method = parts.next()?;
     let target = parts.next()?;
     let version = parts.next()?;
-    if method.is_empty() || target.is_empty() || !go_parse_http_version_ok(version) {
+    if target.is_empty() || !go_parse_http_version_ok(version) || !go_valid_method_ok(method) {
         return None;
     }
     Some((method, target, version))
@@ -1747,6 +1781,52 @@ mod tests {
         assert_eq!(parse_request_line("GET /x garbage"), None);
         assert_eq!(parse_request_line("GET /x HTTP/1.1 trailing"), None);
         assert_eq!(parse_request_line(""), None);
+        // Go conn.readRequest validMethod gate: the method token must be
+        // non-empty and made of RFC 7230 tchar bytes only. Lowercase "get"
+        // is a LEGAL token (validMethod has no case rule — gorilla mux
+        // Method("GET") 405s it later in Go); "G@T" is a 400 before
+        // routing. A tab EMBEDDED in the method ("GE\tT /x") splits on the
+        // literal space into a parseable line whose token then fails the
+        // gate — accept-where-Go-rejects before the gate, now rejected.
+        assert_eq!(
+            parse_request_line("get /x HTTP/1.1"),
+            Some(("get", "/x", "HTTP/1.1"))
+        );
+        assert_eq!(
+            parse_request_line("M-SEARCH /x HTTP/1.1"),
+            Some(("M-SEARCH", "/x", "HTTP/1.1"))
+        );
+        assert_eq!(parse_request_line("G@T /x HTTP/1.1"), None);
+        assert_eq!(parse_request_line("GE(T /x HTTP/1.1"), None);
+        assert_eq!(parse_request_line("GE\tT /x HTTP/1.1"), None);
+        assert_eq!(parse_request_line("GÉT /x HTTP/1.1"), None); // non-ASCII byte
+        assert_eq!(parse_request_line(" /x HTTP/1.1"), None); // empty method token
+    }
+
+    /// Go conn.readRequest `validMethod` (request.go go1.25): non-empty +
+    /// tchar-only (alnum and `!#$%&'*+-.^_`|~`). No case rule — lowercase
+    /// "get" passes, exactly like Go (gorilla's Method("GET") route check
+    /// is where lowercase 405s later).
+    #[test]
+    fn test_go_valid_method_ok() {
+        assert!(go_valid_method_ok("GET"));
+        assert!(go_valid_method_ok("get"), "lowercase is a legal token");
+        assert!(go_valid_method_ok("CONNECT"));
+        assert!(go_valid_method_ok("PATCH"));
+        assert!(go_valid_method_ok("M-SEARCH"));
+        assert!(go_valid_method_ok("_foo"));
+        assert!(go_valid_method_ok("!#$%&'*+-.^_`|~0123456789"));
+        assert!(go_valid_method_ok(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        ));
+        assert!(!go_valid_method_ok(""));
+        assert!(!go_valid_method_ok("G@T"));
+        assert!(!go_valid_method_ok("GE(T"));
+        assert!(!go_valid_method_ok("GET:FOO")); // colon is not tchar
+        assert!(!go_valid_method_ok("/GET")); // slash is not tchar
+        assert!(!go_valid_method_ok("GET\u{7f}"));
+        assert!(!go_valid_method_ok("GÉT")); // non-ASCII bytes are not tchar
+        assert!(!go_valid_method_ok("GE T")); // space is not tchar
     }
 
     #[test]

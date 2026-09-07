@@ -354,7 +354,6 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
                 Vec::new(),
                 bw_limiter,
                 Some(proxy_metrics.clone()),
-                None,
             )
             .await
             {
@@ -386,7 +385,6 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
             Vec::new(),
             bw_limiter,
             Some(proxy_metrics.clone()),
-            None,
         )
         .await;
         debug!(name = %name, "Proxy {} rate-limited bridge closed", name);

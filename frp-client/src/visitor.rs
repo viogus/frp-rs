@@ -1419,7 +1419,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                             vec![],
                                             None,
                                             None,
-                                            None,
                                             false,
                                         ),
                                     )
@@ -1439,7 +1438,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                         p2p_w,
                                         use_compression,
                                         vec![],
-                                        None,
                                         None,
                                     ),
                                 )
@@ -1578,7 +1576,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     vec![],
                                     None,
                                     None,
-                                    None,
                                     false,
                                 ),
                             )
@@ -1597,7 +1594,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     srv_w,
                                     use_compression,
                                     vec![],
-                                    None,
                                     None,
                                 ),
                             )
@@ -1712,7 +1708,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     vec![],
                                     None,
                                     None,
-                                    None,
                                     false,
                                 ),
                             )
@@ -1731,7 +1726,6 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     srv_w,
                                     use_compression,
                                     vec![],
-                                    None,
                                     None,
                                 ),
                             )
@@ -3675,16 +3669,7 @@ mod bridge_cancel_tests {
                 "XTCP",
                 "shutting down, aborting XTCP P2P bridge",
                 &bridge_cancel,
-                frp_core::bridge::bridge_plain(
-                    user_r,
-                    user_w,
-                    p2p_r,
-                    p2p_w,
-                    false,
-                    vec![],
-                    None,
-                    None,
-                ),
+                frp_core::bridge::bridge_plain(user_r, user_w, p2p_r, p2p_w, false, vec![], None),
             )
             .await;
         });

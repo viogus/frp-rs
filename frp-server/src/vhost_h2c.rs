@@ -1417,12 +1417,20 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     // answer and then holds the connection open with no body bytes (a lie
     // for these statuses — HEAD says so by definition, 204/304 by RFC) —
     // the FIX-1 hang: `read_exact_into` waits for bytes that can never
-    // come. RFC 9113 §8.6.1: a 204 (and any 1xx) MUST NOT carry
-    // Content-Length, and Go drops it from 304 answers too — strip it for
-    // both; a HEAD answer KEEPS its Content-Length (it truthfully describes
-    // the GET the client would receive).
+    // come.
+    //
+    // Content-Length: stripped for 204 ALWAYS — RFC 9110 §8.6 forbids the
+    // header on any 204, HEAD method or not (the pre-round-15 code kept it
+    // on a HEAD + 204 answer), and stripped for 304 (Go h1's
+    // suppressedHeaders304 drops it there; h2's writer has no such
+    // suppression — h2_bundle.go writeChunk moves a declared CL into the
+    // response verbatim — so the strip is a fail-closed RFC/Go-h1-parity
+    // divergence from Go's h2 pass-through, matching the h1 front frp-rs
+    // serves). A HEAD answer to a body-bearing status KEEPS its
+    // Content-Length (it truthfully describes the GET the client would
+    // receive; RFC 9110 §8.6 allows it).
     if is_head || status == 204 || status == 304 {
-        if !is_head {
+        if status == 204 || status == 304 {
             resp.headers_mut().remove("content-length");
         }
         respond.send_response(resp, true)?;
@@ -2280,7 +2288,27 @@ mod tests {
         assert_eq!(status, 304);
         assert!(
             !headers.contains_key("content-length"),
-            "304 must not carry Content-Length (Go drops it with Body = NoBody)"
+            "304 must not carry Content-Length (Go h1 suppressedHeaders304; the h2 strip is a documented fail-closed divergence — Go's h2 writer passes a declared CL through)"
+        );
+        assert!(body.is_empty());
+
+        // Round-15: the 204 strip applies to a HEAD request too — RFC 9110
+        // §8.6 forbids Content-Length on ANY 204, method notwithstanding
+        // (pre-fix: `if !is_head` kept the header on a HEAD + 204 answer).
+        // A HEAD 200 keeps its truthful CL (first pin above); a HEAD 204
+        // must not.
+        let (status, headers, body) = h2c_test_roundtrip("HEAD", |respond| async move {
+            let mut respond = respond;
+            let mut backend =
+                HeadThenPanicMock::new(b"HTTP/1.1 204 No Content\r\nContent-Length: 50\r\n\r\n");
+            let page = h2c_not_found_body("");
+            stream_h2_response(&mut backend, &mut respond, None, true, &page).await
+        })
+        .await;
+        assert_eq!(status, 204);
+        assert!(
+            !headers.contains_key("content-length"),
+            "204 must not carry Content-Length even for HEAD (RFC 9110 §8.6)"
         );
         assert!(body.is_empty());
     }
