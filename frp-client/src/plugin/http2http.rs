@@ -58,10 +58,17 @@ async fn handle_conn(
     )
     .await?;
 
-    // Connect to backend
-    let mut remote = TcpStream::connect(target)
-        .await
-        .map_err(|e| format!("connect to {target}: {e}"))?;
+    // Connect to backend. A dial failure answers Go's default
+    // ReverseProxy 502 (Go http2http.go's forward proxy = http.ReverseProxy
+    // with no ErrorHandler — a refused backend renders the bare
+    // "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n" and the
+    // client conn closes; the old code dropped the conn with nothing).
+    let mut remote = match TcpStream::connect(target).await {
+        Ok(s) => s,
+        Err(e) => {
+            return super::write_go_502(&mut client, format!("connect to {target}: {e}")).await
+        }
+    };
     frp_core::transport::set_nodelay(&remote);
 
     remote
@@ -205,5 +212,53 @@ mod tests {
         let mut resp = Vec::new();
         client.read_to_end(&mut resp).await.unwrap();
         assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "expected 200 OK");
+    }
+
+    /// Audit FIX 3 pin: a refused backend answers with frp-rs's bare
+    /// ReverseProxy 502 — 47 bytes — before the client conn closes (Go
+    /// http2http.go's forward proxy is a plain ReverseProxy with no
+    /// ErrorHandler; its 502 travels through net/http, which adds a Date
+    /// header and keeps the conn alive — the Date-less close-after-write
+    /// here is the documented frp-rs divergence, same as `write_go_502`).
+    /// The old code closed with nothing.
+    #[tokio::test]
+    async fn test_http2http_backend_refused_answers_go_502() {
+        // Bind then drop: the port is closed, so the backend dial is a
+        // deterministic ECONNREFUSED.
+        let refused = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let refused_addr = refused.local_addr().unwrap();
+        drop(refused);
+
+        let cfg = PluginConfig {
+            plugin_type: "http2http".into(),
+            local_addr: refused_addr.to_string(),
+            ..Default::default()
+        };
+        let handle = match start_http2http_plugin(&cfg).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+                return;
+            }
+        };
+        let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(
+            resp,
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+            "refused backend must render Go's 502, got: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
     }
 }

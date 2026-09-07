@@ -382,6 +382,193 @@ async fn test_dashboard_offline_clients_listed() {
     );
 }
 
+/// Login with a full client identity (user + run_id + optional client_id),
+/// returning the plain control stream. Caller keeps the stream alive to stay
+/// online or drops it to disconnect (registry retains explicit-clientId
+/// entries as offline).
+async fn login_identity_ctl(
+    addr: std::net::SocketAddr,
+    user: &str,
+    run_id: &str,
+    client_id: Option<&str>,
+) -> frp_core::transport::IoStream {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = frp_core::auth::generate_token("test-token", ts);
+    let mut io =
+        frp_core::transport::IoStream::Tcp(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let login = FrpMessage::Login(Box::new(frp_core::msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("clients-filter-test".into()),
+        os: None,
+        arch: None,
+        user: Some(user.into()),
+        run_id: Some(run_id.into()),
+        client_id: client_id.map(str::to_string),
+        pool_count: Some(1),
+        timestamp: Some(ts),
+        privilege_key: Some(key),
+        metas: None,
+        client_spec: None,
+        multiplexer: None,
+    }));
+    write_msg_v1(&mut io, &login).await.unwrap();
+    match read_msg_v1(&mut io).await.unwrap() {
+        FrpMessage::LoginResp(r) => assert!(r.error.is_none(), "login rejected: {:?}", r.error),
+        other => panic!("expected LoginResp, got {:?}", other.v1_type_byte()),
+    }
+    io
+}
+
+/// GET {url}?{query} and return the `key` fields in wire order.
+async fn fetch_client_keys(client: &reqwest::Client, url: &str, query: &str) -> Vec<String> {
+    let url = if query.is_empty() {
+        url.to_string()
+    } else {
+        format!("{url}?{query}")
+    };
+    let resp = client
+        .get(url)
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    json.as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["key"].as_str().expect("client key").to_string())
+        .collect()
+}
+
+/// Go `APIClientList` parity (`server/http/controller.go:92-129`): /api/clients
+/// query filters `user`/`clientId`/`runId`/`status` (each applied only when
+/// non-empty, clientId matched against the resolved `ClientID()` — raw id with
+/// run_id fallback) plus the ascending (User, ClientID, Key) slices.SortFunc
+/// order. Status semantics = Go `matchStatusFilter`: online/offline narrow,
+/// ""/all/unknown pass.
+#[tokio::test]
+async fn test_dashboard_clients_filters_and_sort() {
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let frps = FrpsHandle::start(&base_config(bind_port, dashboard_port)).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+    let base = frps.dashboard_url("/api/clients");
+
+    // Two "alice" clients (one is dropped offline — retained because it has
+    // an explicit clientId), one "bob" (explicit clientId), one "carol" (no
+    // clientId: the registry resolves her ClientID to the run_id).
+    let alice = login_identity_ctl(addr, "alice", "r-alice", Some("c-alice")).await;
+    let alice_old = login_identity_ctl(addr, "alice", "r-alice-old", Some("c-alice-old")).await;
+    let bob = login_identity_ctl(addr, "bob", "r-bob", Some("c-bob")).await;
+    let carol = login_identity_ctl(addr, "carol", "r-carol", None).await;
+    drop(alice_old); // disconnect → offline
+
+    // Wait for the server to notice the disconnect before asserting filters.
+    let client = auth_client();
+    let mut offline_seen = false;
+    for _ in 0..50 {
+        let resp = client
+            .get(&base)
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        if json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["key"] == "alice.c-alice-old" && c["online"] == false)
+        {
+            offline_seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(offline_seen, "alice.c-alice-old never went offline");
+
+    // Unfiltered: all four, sorted ascending by (User, ClientID, Key) —
+    // registry map order is nondeterministic, so this pins the handler sort.
+    let all = [
+        "alice.c-alice",
+        "alice.c-alice-old",
+        "bob.c-bob",
+        "carol.r-carol",
+    ];
+    assert_eq!(fetch_client_keys(&client, &base, "").await, all);
+
+    // user filter (case-sensitive, exact).
+    assert_eq!(
+        fetch_client_keys(&client, &base, "user=alice").await,
+        ["alice.c-alice", "alice.c-alice-old"]
+    );
+    assert_eq!(
+        fetch_client_keys(&client, &base, "user=bob").await,
+        ["bob.c-bob"]
+    );
+    assert_eq!(
+        fetch_client_keys(&client, &base, "user=nobody").await,
+        Vec::<String>::new()
+    );
+
+    // clientId filter resolves via ClientID(): raw id AND run_id fallback.
+    assert_eq!(
+        fetch_client_keys(&client, &base, "clientId=c-bob").await,
+        ["bob.c-bob"]
+    );
+    assert_eq!(
+        fetch_client_keys(&client, &base, "clientId=c-alice").await,
+        ["alice.c-alice"]
+    );
+    assert_eq!(
+        fetch_client_keys(&client, &base, "clientId=r-carol").await,
+        ["carol.r-carol"]
+    );
+
+    // runId filter (run_id is cleared on disconnect → offline client misses).
+    assert_eq!(
+        fetch_client_keys(&client, &base, "runId=r-bob").await,
+        ["bob.c-bob"]
+    );
+    assert_eq!(
+        fetch_client_keys(&client, &base, "runId=r-alice-old").await,
+        Vec::<String>::new()
+    );
+
+    // status filter: Go matchStatusFilter semantics.
+    assert_eq!(
+        fetch_client_keys(&client, &base, "status=online").await,
+        ["alice.c-alice", "bob.c-bob", "carol.r-carol"]
+    );
+    assert_eq!(
+        fetch_client_keys(&client, &base, "status=offline").await,
+        ["alice.c-alice-old"]
+    );
+    assert_eq!(fetch_client_keys(&client, &base, "status=all").await, all);
+    // Unknown status passes (fail-open, differs from v2 validate_status).
+    assert_eq!(fetch_client_keys(&client, &base, "status=bogus").await, all);
+    // Query value is lowercased before matching.
+    assert_eq!(
+        fetch_client_keys(&client, &base, "status=ONLINE").await,
+        ["alice.c-alice", "bob.c-bob", "carol.r-carol"]
+    );
+
+    // Combined filters.
+    assert_eq!(
+        fetch_client_keys(&client, &base, "user=alice&status=online").await,
+        ["alice.c-alice"]
+    );
+
+    drop(alice);
+    drop(bob);
+    drop(carol);
+}
+
 /// Dashboard proxy-delete paths must honor http-group route ownership (same
 /// lifecycle as handle_close_proxy):
 /// - deleting the route OWNER while other members remain keeps the shared

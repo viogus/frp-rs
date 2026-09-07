@@ -140,9 +140,13 @@ struct ResponseHeaderInjector<R> {
     /// start, possibly already complete) while the interim head is being
     /// emitted. Taken back into `buffer` when the emission drains.
     tail: Option<Vec<u8>>,
-    /// True once the inner stream hit EOF before an injectable head ended —
-    /// the buffered partial header is served (no injection), then EOF.
-    eof: bool,
+    /// The last head served raw was MALFORMED (unparseable first line)
+    /// rather than a legal interim 1xx. Round-13 serves malformed heads raw
+    /// — Go would 404 before relaying anything — so once one is out it IS
+    /// the response: a following EOF ends the stream cleanly instead of
+    /// signaling a missing final head (never append a 404 head after
+    /// relayed garbage). Cleared whenever a legal interim is served.
+    malformed_raw: bool,
     /// True once every buffered byte is served and no further buffering is
     /// possible — the rest of the response passes through raw.
     complete: bool,
@@ -177,7 +181,7 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
             injected: false,
             raw_head: false,
             tail: None,
-            eof: false,
+            malformed_raw: false,
             complete: false,
             read_buf: [0u8; 4096],
             deadline_sleep: header_timeout.map(|d| Box::pin(tokio::time::sleep(d))),
@@ -328,18 +332,39 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
     ) -> Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
 
-        // Everything buffered has been served and injection is settled
-        // (headers injected, or EOF cut the response short) — the rest of
-        // the response passes through untouched.
+        // Everything buffered has been served and the head phase is over
+        // (a final/101 head was injected or a malformed head was served
+        // raw) — the rest of the response passes through untouched.
         if this.complete {
-            return Pin::new(&mut this.inner).poll_read(cx, buf);
+            // Round-14 review fix: a mid-body read failure AFTER the final
+            // head went out must never surface as an error kind frp-core
+            // answers with a gateway head — Go's ErrorHandler never runs
+            // once the head is out (RoundTrip returned; the transport copy
+            // merely aborts) while frp-core maps InvalidData to a 404.
+            // Producer: SnappyStreamReader decode failure under the
+            // injector on a compressed arm. Swallow it as clean EOF (the
+            // stream framing is lost either way) and own the log here.
+            return match Pin::new(&mut this.inner).poll_read(cx, buf) {
+                Poll::Ready(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    tracing::debug!(
+                        error = %e,
+                        "response injector: mid-body decode failure after head served, ending stream"
+                    );
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            };
         }
 
-        // Serve buffered emission content. Three shapes, all emitted only
-        // post-boundary: the injected final/101 head, a raw interim 1xx
-        // head, or the post-EOF truncated tail. M3: nothing pre-boundary
-        // is ever served — a header spanning several internal reads (e.g.
-        // a big Set-Cookie set over 4 KiB) must not leak fragment-first.
+        // Serve buffered emission content. Two shapes, all emitted only
+        // post-boundary: the injected final/101 head, or a raw interim 1xx
+        // head (a malformed head is served raw the same way — Go would
+        // reject it, frp-rs forwards it uninjected for the browser's own
+        // parser to reject; round-13 review). M3: nothing pre-boundary is
+        // ever served — a header spanning several internal reads (e.g. a
+        // big Set-Cookie set over 4 KiB) must not leak fragment-first, and
+        // a head cut short by EOF is dropped whole, never relayed partial
+        // (Go relays nothing until a head parses).
         //
         // The flag gate: a drained interim head hands accumulation back to
         // its split-off tail, which may already hold the pipelined final
@@ -348,8 +373,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
         // and must not trip the debug_assert below — a flagless non-empty
         // buffer falls through to the gather loop, which re-resolves the
         // head boundary and re-enters classification.
-        if (this.injected || this.eof || this.raw_head) && this.buffer_offset < this.buffer.len() {
-            debug_assert!(this.injected || this.eof || this.raw_head);
+        if (this.injected || this.raw_head) && this.buffer_offset < this.buffer.len() {
+            debug_assert!(this.injected || this.raw_head);
             let remaining = this.buffer.len() - this.buffer_offset;
             let to_copy = remaining.min(buf.remaining());
             buf.put_slice(&this.buffer[this.buffer_offset..this.buffer_offset + to_copy]);
@@ -363,18 +388,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                     this.buffer = this.tail.take().unwrap_or_default();
                     this.buffer_offset = 0;
                 } else {
-                    // Injected head (or truncated tail) is fully out; the
-                    // remainder of the response is raw pass-through.
+                    // Injected head is fully out; the remainder of the
+                    // response is raw pass-through.
                     this.complete = true;
                 }
             }
-            return Poll::Ready(Ok(()));
-        }
-
-        // No buffered bytes left. If EOF already cut the header short,
-        // signal EOF now (the buffer was drained above).
-        if this.eof {
-            this.complete = true;
             return Poll::Ready(Ok(()));
         }
 
@@ -416,7 +434,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                     // through this raw pipe UNINJECTED — never manufacture
                     // configured headers into a head Go would swallow or
                     // reject (round-13 review, 3 independent reviewers).
-                    let served_raw = match Self::head_status_code(&this.buffer[..end]) {
+                    let status = Self::head_status_code(&this.buffer[..end]);
+                    let served_raw = match status {
                         Some(c) if (100..=199).contains(&c) && c != 101 => true,
                         None => true,
                         Some(_) => false,
@@ -430,6 +449,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         this.tail = Some(this.buffer.split_off(end));
                         this.buffer_offset = 0;
                         this.raw_head = true;
+                        this.malformed_raw = status.is_none();
                         break;
                     }
                     // Final head (>= 200) or 101 — the one head Go's
@@ -529,23 +549,39 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                 Poll::Ready(Ok(())) => {
                     let n = temp_buf.filled().len();
                     if n == 0 {
-                        // EOF before the terminator: no configured headers
-                        // are injected; the partial bytes (if any) are
-                        // served below (returning Ready-with-0 here would
-                        // read as EOF and drop them — callers treat a
-                        // zero-byte Ready as end-of-stream). Empty buffer →
-                        // real EOF right away.
-                        this.eof = true;
-                        if this.buffer.is_empty() {
+                        // EOF before a head terminator. If the last unit
+                        // served raw was a MALFORMED head, that relayed
+                        // unit is the response and the stream ends cleanly
+                        // (see `malformed_raw`). Otherwise the backend
+                        // closed without completing a usable head (nothing
+                        // relayed; interim 1xx heads may have been). Go
+                        // readResponse errors on an unterminated head
+                        // (partial bytes included — the reverse proxy
+                        // relays nothing until a head parses) and the vhost
+                        // ErrorHandler answers 404; surface
+                        // Err(UnexpectedEof) so frp-core's 404 arm fires.
+                        // A bare Ok(0) here would read as clean
+                        // end-of-stream (round-14 review fix), and the old
+                        // partial-byte relay put half a head on the wire.
+                        if this.malformed_raw {
                             this.complete = true;
                             return Poll::Ready(Ok(()));
                         }
-                        break;
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "backend closed before completing response head",
+                        )));
                     }
                     // Guard against memory exhaustion from backends that
                     // never terminate the head with a blank line (the cap
                     // still bounds a backend that sends no blank line at
-                    // all, whatever EOL convention it uses).
+                    // all, whatever EOL convention it uses). Documented
+                    // Rust hardening divergence: Go's cap is the 10 MiB
+                    // `maxHeaderResponseSize` default
+                    // (transport.go:2106-2112) — a backend head between
+                    // 64 KiB and 10 MiB is answered 404 by frp-rs (bridge
+                    // Err-arm InvalidData → NotFoundResponse, Go
+                    // ErrorHandler parity) where Go would forward it.
                     if this.buffer.len() + n > 65536 {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1492,12 +1528,24 @@ async fn run_work_bridge(
         .as_ref()
         .and_then(|p| p.bandwidth_limiter.clone());
 
-    // The response-header injector only fires for PLAIN-HTTP proxies
-    // (`proxy_type == "http"`, NOT `starts_with("http")`) with configured
-    // headers; clone the HashMap at bridge time instead of deep-cloning it
-    // into every pending request at enqueue time. Uses the resolved
-    // metadata (bridge-time re-fetch when the enqueue-time snapshot was
-    // None).
+    // The response-header injector runs for EVERY plain-HTTP non-CONNECT
+    // leg (`proxy_type == "http"`, NOT `starts_with("http")`); clone the
+    // HashMap at bridge time instead of deep-cloning it into every pending
+    // request at enqueue time. Uses the resolved metadata (bridge-time
+    // re-fetch when the enqueue-time snapshot was None).
+    //
+    // The empty-map case is deliberate: when
+    // `response_headers` is not configured the injector carries NO headers
+    // and is a pure deadline-only pass-through — splice no-ops over the
+    // empty map, the head is copied verbatim, and the response bytes are
+    // byte-identical to the injector-less bridge. But the leg still gets Go
+    // ResponseHeaderTimeout parity: the injector's absolute deadline
+    // (armed at construction, never extended by interim 1xx) must run for
+    // http non-CONNECT legs even with no headers configured — Go's
+    // ReverseProxy arms ResponseHeaderTimeoutS from the transport config,
+    // independent of any ModifyResponse. Routing these legs through the
+    // injector also removes the duplicate one-shot first-read timeout in
+    // the frp-core bridge (see the injector arms below).
     //
     // The two exclusions mirror Go v0.71.0 exactly:
     //   * https tunnels: HTTPSProxyConfig (pkg/config/v1/proxy.go:369) has
@@ -1505,15 +1553,15 @@ async fn run_work_bridge(
     //     https proxy is silently dropped by Go, and the bridge here sees
     //     raw TLS bytes anyway (injecting would corrupt the ciphertext).
     //   * CONNECT tunnels on an http proxy: Go's connectHandler joins raw
-    //     (http.go:282-285) — no host rewrite, no ModifyResponse — so the
-    //     injector must not splice into the tunnel stream. `request_is_connect`
+    //     (http.go:282-285) — no host rewrite, no ModifyResponse, no
+    //     ResponseHeaderTimeout — so the injector must not splice into the
+    //     tunnel stream nor arm a head deadline on it. `request_is_connect`
     //     is set by the two vhost HTTP send sites (h1 + h2c) and rides the
     //     PendingRequest, including across run_id group forwarders.
     let injector_headers = proxy_info
         .as_ref()
         .filter(|p| p.proxy_type == "http" && !req.request_is_connect)
-        .map(|p| p.response_headers.clone())
-        .filter(|h| !h.is_empty());
+        .map(|p| p.response_headers.clone());
 
     // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
     // which writes them through the CipherWriter (matching Go frp streaming CFB).
@@ -1556,6 +1604,13 @@ async fn run_work_bridge(
                 decrypted
             };
             let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+            // The injector owns the absolute response-head deadline (armed
+            // at construction above); the frp-core bridge gets NO one-shot
+            // header_timeout here — a duplicate would consume on the first
+            // read (an interim 100 already served raw would burn it, and a
+            // backend stalling after interim bytes would park the bridge
+            // task + conns forever). The injector's TimedOut errors through
+            // the bridge Err arm into the Go-shaped 504.
             frp_core::bridge::bridge_encrypted_decompressed_read(
                 u_r,
                 u_w,
@@ -1566,7 +1621,7 @@ async fn run_work_bridge(
                 req.pre_read,
                 bw_limiter.as_ref(),
                 Some(metrics.clone()),
-                header_timeout,
+                None,
             )
             .await;
             // Matches the original inline closure: the injector path skips
@@ -1657,6 +1712,9 @@ async fn run_work_bridge(
                     w_r
                 };
                 let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                // No one-shot header_timeout to the bridge: the injector
+                // owns the absolute response-head deadline (see the
+                // encrypted arm above).
                 frp_core::bridge::bridge_plain_rate_limited_decompressed_read(
                     u_r,
                     u_w,
@@ -1666,7 +1724,7 @@ async fn run_work_bridge(
                     bridge_pre_read,
                     bw_limiter.as_ref(),
                     Some(metrics.clone()),
-                    header_timeout,
+                    None,
                 )
                 .await;
             } else {
@@ -1716,6 +1774,9 @@ async fn run_work_bridge(
                     w_r
                 };
                 let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                // No one-shot header_timeout to the bridge: the injector
+                // owns the absolute response-head deadline (see the
+                // encrypted arm above).
                 frp_core::bridge::bridge_plain_decompressed_read(
                     u_r,
                     u_w,
@@ -1724,7 +1785,7 @@ async fn run_work_bridge(
                     comp_key,
                     bridge_pre_read,
                     Some(metrics.clone()),
-                    header_timeout,
+                    None,
                 )
                 .await;
             } else {
@@ -2152,12 +2213,20 @@ pub(crate) async fn assign_work_to_proxy(
 
     // HTTP vhost backend response-header timeout (Go frp compat:
     // VhostHTTPTimeout drives httputil.ReverseProxy.ResponseHeaderTimeoutS).
-    // Only HTTP-family proxies get the timeout; TCP/STCP/XTCP bridges have no
-    // such semantic. 0 (unset) disables the timeout, matching Go where the
-    // ReverseProxy transport never arms a header deadline.
+    // Exactly `proxy_type == "http"` on a NON-CONNECT request — the two
+    // gates mirror Go v0.71.0's vhost architecture:
+    //   * CONNECT: http.go:229-234 + 282-285 route CONNECT to
+    //     connectHandler, which hijacks the conn and joins raw — the
+    //     ReverseProxy transport (and with it ResponseHeaderTimeout) never
+    //     arms, and the server never answers 504 on a silent backend.
+    //   * https tunnels: the HTTPS Muxer's registryRouter serves raw TLS
+    //     bytes (SNI routing only) — no ReverseProxy, no header deadline.
+    // TCP/STCP/XTCP bridges have no such semantic either. 0 (unset)
+    // disables the timeout, matching Go where the ReverseProxy transport
+    // never arms a header deadline.
     let header_timeout = if proxy_info
         .as_ref()
-        .is_some_and(|p| p.proxy_type.starts_with("http"))
+        .is_some_and(|p| p.proxy_type == "http" && !req.request_is_connect)
         && state.vhost_http_timeout > 0
     {
         Some(std::time::Duration::from_secs(state.vhost_http_timeout))
@@ -2756,9 +2825,14 @@ mod tests {
         assert!(s.ends_with("hello-body"), "body must be intact");
     }
 
-    /// No `\r\n\r\n` and EOF before it: bytes pass through unmodified.
+    /// Round-14 review: a backend that closes without any head terminator
+    /// (garbage, or a head cut short) must ERROR — nothing is relayed. Go
+    /// readResponse relays nothing until a head parses and errors on the
+    /// unterminated head; the vhost ErrorHandler answers 404 and frp-core
+    /// maps this UnexpectedEof to it. The old code relayed the partial
+    /// bytes raw and ended "clean" (half a head on the wire, no 404).
     #[tokio::test]
-    async fn injector_non_http_passthrough_on_eof() {
+    async fn injector_unterminated_bytes_then_eof_errors_not_relayed() {
         use tokio::io::AsyncWriteExt;
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
         let mut headers = std::collections::HashMap::new();
@@ -2772,8 +2846,12 @@ mod tests {
         inner_w.shutdown().await.expect("shutdown");
         drop(inner_w);
 
-        let out = injector_read_all(&mut injector).await;
-        assert_eq!(&out, b"no-header-terminator-here");
+        let mut buf = [0u8; 64];
+        let err = injector
+            .read(&mut buf)
+            .await
+            .expect_err("unterminated head + EOF must error, never relay partial bytes");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     /// Audit round 7 (S1 family): a backend response head with bare-LF line
@@ -2945,11 +3023,14 @@ mod tests {
         );
     }
 
-    /// Round-13 (F1#2): 100 head then backend EOF with no final head ever
-    /// arriving — the raw 100 passes through and the stream ends cleanly
-    /// (no injected headers, no error, no hang).
+    /// Round-13 (F1#2) + round-14 review: 100 head then backend EOF with
+    /// no final head ever arriving — the raw 100 passes through, then the
+    /// stream errors. Go readResponse consumes the interim and errors on
+    /// the EOF-before-final-head; the vhost ErrorHandler answers 404, and
+    /// frp-core maps this UnexpectedEof to that 404 (a 100 already on the
+    /// wire is a legal interim prefix to a late final head).
     #[tokio::test]
-    async fn injector_100_only_passthrough_clean_eof() {
+    async fn injector_100_only_then_eof_errors_after_interim() {
         use tokio::io::AsyncWriteExt;
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
         let mut headers = std::collections::HashMap::new();
@@ -2963,12 +3044,14 @@ mod tests {
         inner_w.shutdown().await.expect("shutdown");
         drop(inner_w);
 
-        let out = injector_read_all(&mut injector).await;
-        assert_eq!(
-            &out[..],
-            b"HTTP/1.1 100 Continue\r\n\r\n",
-            "the lone interim head must pass raw with a clean EOF"
-        );
+        let mut buf = [0u8; 4096];
+        let n = injector.read(&mut buf).await.expect("interim read");
+        assert_eq!(&buf[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
+        let err = injector
+            .read(&mut buf)
+            .await
+            .expect_err("EOF before the final head must error, not end cleanly");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     /// Round-13 review (3 independent reviewers): a head whose first line
@@ -2998,6 +3081,11 @@ mod tests {
             inner_w.write_all(head).await.expect("write head");
             inner_w.shutdown().await.expect("shutdown");
             drop(inner_w);
+            // The malformed head (blank line included) is served raw in one
+            // read; the EOF after it ends the stream CLEANLY — the relayed
+            // malformed unit IS the response (round-13: served uninjected
+            // for the browser's own parser to reject), so a following EOF
+            // must not signal a "missing final head" 404 on top of it.
             let out = injector_read_all(&mut injector).await;
             assert_eq!(
                 &out[..],
@@ -3273,12 +3361,15 @@ mod tests {
         assert!(s.ends_with("ok"), "body must survive: {s:?}");
     }
 
-    // B6 (round-13 review): a raw interim head, then a TRUNCATED second
-    // head ("HTTP/1.1 20" cut mid-code) followed by EOF — the interim goes
-    // out raw, the partial goes out raw, clean EOF, and nothing is ever
-    // injected.
+    // B6 (round-13 review) + round-14 rework: a raw interim head, then a
+    // TRUNCATED second head ("HTTP/1.1 20" cut mid-code) followed by EOF.
+    // The interim goes out raw; nothing of the unterminated final head is
+    // ever relayed (Go readResponse errors on an unterminated head before
+    // the reverse proxy writes anything) — the partial is dropped and the
+    // next read reports Err(UnexpectedEof) so the bridge's 404 arm answers
+    // after the legal interim prefix.
     #[tokio::test]
-    async fn injector_truncated_second_head_after_interim_served_raw() {
+    async fn injector_truncated_second_head_after_interim_not_relayed() {
         use tokio::io::AsyncWriteExt;
         let headers = || {
             let mut h = std::collections::HashMap::new();
@@ -3293,12 +3384,14 @@ mod tests {
             .expect("write");
         inner_w.shutdown().await.expect("shutdown");
         drop(inner_w);
-        let out = injector_read_all(&mut injector).await;
-        assert_eq!(
-            &out[..],
-            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 20",
-            "interim + truncated head must pass through byte-exact, uninjected"
-        );
+        let mut buf = [0u8; 4096];
+        let n = injector.read(&mut buf).await.expect("interim read");
+        assert_eq!(&buf[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
+        let err = injector
+            .read(&mut buf)
+            .await
+            .expect_err("truncated final head must not be relayed");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     // B7 (round-13 review): a head whose FIRST line is blank (no status

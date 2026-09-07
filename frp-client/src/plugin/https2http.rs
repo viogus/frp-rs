@@ -140,11 +140,16 @@ async fn handle_conn(
     )
     .await?;
 
-    // Connect to plain HTTP backend
+    // Connect to plain HTTP backend. Dial failure answers Go's default
+    // ReverseProxy 502 (bare "HTTP/1.1 502 Bad Gateway\r\nContent-Length:
+    // 0\r\n\r\n"; the old code dropped the TLS conn with nothing).
     let (host, port) = split_host_port(target);
-    let mut remote = TcpStream::connect(format!("{host}:{port}"))
-        .await
-        .map_err(|e| format!("connect to {host}:{port}: {e}"))?;
+    let mut remote = match TcpStream::connect(format!("{host}:{port}")).await {
+        Ok(s) => s,
+        Err(e) => {
+            return super::write_go_502(&mut tls, format!("connect to {host}:{port}: {e}")).await;
+        }
+    };
     frp_core::transport::set_nodelay(&remote);
 
     remote

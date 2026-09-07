@@ -426,8 +426,21 @@ async fn test_h2c_404_unmapped_host() {
 
     let response = response_fut.await.expect("h2 response");
     assert_eq!(response.status().as_u16(), 404);
+    assert_eq!(
+        response.headers()["content-type"].to_str().unwrap(),
+        "text/html",
+        "the 404 page is served as text/html"
+    );
+    // FIX 2/round-audit parity: every Go 404 carries the not-found page —
+    // the builtin HTML when no custom_404_page is configured
+    // (getNotFoundPageContent, pkg/util/vhost/resource.go) — never an
+    // empty body.
     let body = read_h2_body(response.into_body()).await;
-    assert!(body.is_empty());
+    assert_eq!(
+        body,
+        frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes(),
+        "the 404 body must be the builtin not-found page"
+    );
 }
 
 #[tokio::test]
@@ -519,8 +532,21 @@ async fn test_h2c_401_without_credentials_origin_form() {
         response.headers()["www-authenticate"].to_str().unwrap(),
         "Basic realm=\"Restricted\""
     );
+    // Go http.Error render (FIX 3): text/plain charset, nosniff, and the
+    // StatusText body with a trailing newline — the h2 mirror of the
+    // HTTP/1.1 auth-fail shape (vhost.rs write_http_error_auth_response).
+    assert_eq!(
+        response.headers()["content-type"].to_str().unwrap(),
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers()["x-content-type-options"]
+            .to_str()
+            .unwrap(),
+        "nosniff"
+    );
     let body = read_h2_body(response.into_body()).await;
-    assert!(body.is_empty());
+    assert_eq!(body, b"Unauthorized\n");
     // The pooled work conn must stay silent — the 401 was generated in the
     // vhost layer, no StartWorkConn reached a backend.
     let swc = tokio::time::timeout(
@@ -919,7 +945,11 @@ async fn test_h2c_malformed_proxy_auth_empty_bucket_404() {
         "malformed proxy-authorization must route to the empty bucket (404), not the Authorization username"
     );
     let body = read_h2_body(response.into_body()).await;
-    assert!(body.is_empty());
+    assert_eq!(
+        body,
+        frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes(),
+        "the route-miss 404 carries the not-found page (no empty-bodied 404s)"
+    );
     // Never forwarded.
     let swc = tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -1264,9 +1294,11 @@ async fn test_h2c_interim_100_swallowed_final_200_split_writes() {
 }
 
 /// 100 → backend EOF: the swallow loop's next read sees the close and the
-/// caller answers 502.
+/// caller answers the Go ErrorHandler non-timeout 404 (FIX 2 — only a
+/// net.Error timeout maps to 504; a truncated backend response is the
+/// 404 + not-found-page class, pkg/util/vhost/http.go:128-138).
 #[tokio::test]
-async fn test_h2c_interim_100_then_backend_close_answers_502() {
+async fn test_h2c_interim_100_then_backend_close_answers_404() {
     let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
         setup("h2c-i100eof", "i100eof.example.com").await;
 
@@ -1290,13 +1322,19 @@ async fn test_h2c_interim_100_then_backend_close_answers_502() {
         let response = response_fut.await.expect("h2 response");
         assert_eq!(
             response.status().as_u16(),
-            502,
-            "backend closed between interim and final head must answer 502"
+            404,
+            "backend closed between interim and final head must answer the \
+             ErrorHandler 404, not a 502"
         );
-        read_h2_body(response.into_body()).await;
+        let body = read_h2_body(response.into_body()).await;
+        assert_eq!(
+            body,
+            frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes(),
+            "the 404 carries the not-found page"
+        );
     })
     .await
-    .expect("502 never forwarded (wedged forward path?)");
+    .expect("404 never forwarded (wedged forward path?)");
 }
 
 /// 100 → silence: the ONE absolute deadline (vhost_http_timeout, 2s here)
@@ -1397,10 +1435,11 @@ async fn test_h2c_interim_chain_100_103_200_single_segment() {
 /// post-switch bytes as the body would be DATA before a final head — the
 /// h2 crate's client answers that with a whole-connection GOAWAY
 /// (PROTOCOL_ERROR), killing every concurrent stream. The leg must answer
-/// 502 (unsupported-backend class) WITHOUT waiting for a final head that
-/// never comes, and the h2 connection must survive for the next request.
+/// the ErrorHandler non-timeout 404 (FIX 2 — the same class as the
+/// malformed-head/invalid-status arms; no final head will ever come)
+/// and the h2 connection must survive for the next request.
 #[tokio::test]
-async fn test_h2c_interim_101_switching_answers_502_conn_survives() {
+async fn test_h2c_interim_101_switching_answers_404_conn_survives() {
     let (_bind, vhost_addr, mut provider, run_id, mut work_conn) =
         setup("h2c-101", "switch.example.com").await;
 
@@ -1427,15 +1466,20 @@ async fn test_h2c_interim_101_switching_answers_502_conn_survives() {
         let response = response_fut.await.expect("h2 response");
         assert_eq!(
             response.status().as_u16(),
-            502,
-            "a backend protocol switch must degrade to 502 — h2 cannot \
-             carry 101, and forwarding the upgrade stream as a body \
-             GOAWAYs the whole connection"
+            404,
+            "a backend protocol switch must degrade to the ErrorHandler 404 \
+             — h2 cannot carry 101, and forwarding the upgrade stream as a \
+             body GOAWAYs the whole connection"
         );
-        read_h2_body(response.into_body()).await;
+        let body = read_h2_body(response.into_body()).await;
+        assert_eq!(
+            body,
+            frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes(),
+            "the 404 carries the not-found page"
+        );
     })
     .await
-    .expect("502 never forwarded (wedged forward path?)");
+    .expect("404 never forwarded (wedged forward path?)");
 
     // The h2 connection must be alive (no GOAWAY): a second request over
     // the same connection reaches a normal 200 backend exchange.

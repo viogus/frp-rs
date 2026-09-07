@@ -50,8 +50,22 @@ struct ParsedProxyArgs {
     http_pwd: String,
     host_header_rewrite: String,
     locations: Vec<String>,
-    bandwidth_limit: String,
-    bandwidth_limit_mode: String,
+    /// Go `--metadatas` k=v pairs (pkg/config/flags.go
+    /// registerProxyBaseConfigFlags, pflag StringToString): comma-separated,
+    /// accumulating across repeated occurrences; later same-key pairs win.
+    metadatas: Vec<(String, String)>,
+    /// Go `--annotations` k=v pairs — same StringToString semantics.
+    annotations: Vec<(String, String)>,
+    /// Go `--allow_users` (STCP only, pflag StringSlice): comma-separated,
+    /// accumulating across repeated occurrences.
+    allow_users: Vec<String>,
+    /// Go persistent `--user` / `-u` (RegisterClientCommonConfigFlags,
+    /// pkg/ssh/server.go consumes it at virtual-client login).
+    user: String,
+    /// Go persistent `--token` / `-t`.
+    token: String,
+    /// Go persistent `--client-id` (no shorthand).
+    client_id: String,
 }
 
 /// Parse SSH remote command args like:
@@ -66,12 +80,17 @@ fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
         return Err("missing proxy type".into());
     }
 
-    let proxy_type = parts[0].to_lowercase();
+    // FIX 4 (Go parity, pkg/ssh/server.go parseClientAndProxyConfigurer):
+    // the type token is matched EXACTLY after TrimSpace — no case folding —
+    // against Go's support-types order [tcp http https tcpmux stcp]; a
+    // mismatch is the verbatim Go error (server.go:273-277), written to the
+    // client before the connection closes. (`TCP`, `Tcp`, trailing garbage
+    // inside a quoted token all land here.)
+    let proxy_type = parts[0].trim().to_string();
     if !VALID_PROXY_TYPES.contains(&proxy_type.as_str()) {
         return Err(format!(
-            "unsupported proxy type '{}', supported: {}",
-            proxy_type,
-            VALID_PROXY_TYPES.join(", ")
+            "invalid proxy type: {proxy_type}, support types: [{}]",
+            VALID_PROXY_TYPES.join(" ")
         ));
     }
 
@@ -93,8 +112,12 @@ fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
         http_pwd: String::new(),
         host_header_rewrite: String::new(),
         locations: Vec::new(),
-        bandwidth_limit: String::new(),
-        bandwidth_limit_mode: String::new(),
+        metadatas: Vec::new(),
+        annotations: Vec::new(),
+        allow_users: Vec::new(),
+        user: String::new(),
+        token: String::new(),
+        client_id: String::new(),
     };
 
     let mut i = 1;
@@ -145,18 +168,37 @@ fn parse_long_flag(
         Some((name, value)) => (name, Some(value)),
         None => (raw, None),
     };
-    let Some(canon) = canonical_flag_name(name) else {
+    let Some(entry) = flag_spelling(name) else {
         if name == "help" {
             // pflag: an unregistered `--help` prints the usage (ErrHelp).
             return Err(ssh_gateway_usage());
         }
         return Err(format!("unknown flag: --{name}"));
     };
+    // Per-type gate (FIX 2c): a Go flag registered only for other proxy
+    // types is reported exactly like an unknown flag — Go never registers
+    // it for this type (pflag parseLongArg unknown-flag arm). The error
+    // shows the TYPED spelling, dash separators and all.
+    if !entry.scope.allows(&args.proxy_type) {
+        return Err(format!("unknown flag: --{name}"));
+    }
+    let canon = entry.canon;
     match inline_value {
         // `--flag=value`. An explicitly empty value IS applied (and can
         // fail) — Go runs strconv on it too.
         Some(value) => {
             apply_flag_value(args, canon, value)?;
+            Ok(i)
+        }
+        None if is_bool_flag(canon) => {
+            // FIX 3 (Go pflag bool NoOptDefVal="true"): a bare bool applies
+            // true and NEVER consumes the next token — `--use_encryption
+            // --proxy_name x` parses as use_encryption=true plus the proxy
+            // flag, and `--use_encryption false` leaves "false" as an
+            // ignored positional (use_encryption stays TRUE, exactly as Go
+            // parses it — the only way to pass false is `--use_encryption
+            // =false`/`--use_encryption=false`).
+            apply_flag_value(args, canon, "true")?;
             Ok(i)
         }
         None => {
@@ -191,7 +233,7 @@ fn parse_short_flags(
         return Ok(i);
     };
     let rest = &cluster[c.len_utf8()..];
-    let Some(canon) = short_flag_target(c) else {
+    let Some(entry) = short_flag_target(c) else {
         if c == 'h' {
             // pflag: an unregistered `-h` prints the usage (ErrHelp).
             return Err(ssh_gateway_usage());
@@ -200,6 +242,13 @@ fn parse_short_flags(
         // remainder after the unknown letter (parseSingleShortArg).
         return Err(format!("unknown shorthand flag: '{c}' in -{cluster}"));
     };
+    // Per-type gate (FIX 2c): a Go shorthand registered only for other
+    // proxy types is reported exactly like an unknown shorthand — Go never
+    // registers it for this type (pflag parseShortArg unknown arm).
+    if !entry.scope.allows(&args.proxy_type) {
+        return Err(format!("unknown shorthand flag: '{c}' in -{cluster}"));
+    }
+    let canon = entry.canon;
     if let Some(value) = rest.strip_prefix('=') {
         // `-n=web`.
         apply_flag_value(args, canon, value)?;
@@ -221,80 +270,280 @@ fn parse_short_flags(
     }
 }
 
-/// Canonical (underscore) spelling of a registered long-flag name, if any.
-///
-/// `_` and `-` are treated as equivalent separators — the intent of Go's
-/// pflag `WordSepNormalizeFunc` (frp registers SSH-mode flags as
-/// `--proxy_name`; both spellings must parse). Go only folds the FIRST
-/// separator; folding every separator is a deliberate frp-rs simplification:
-/// no registered flag differs from its dash form by anything but separator
-/// placement, so both forms accept the same flag set.
-const FLAG_SPELLINGS: &[(&str, &str)] = &[
-    ("proxy_name", "proxy_name"),
-    ("remote_port", "remote_port"),
-    ("local_ip", "local_ip"),
-    ("local_port", "local_port"),
-    ("custom_domains", "custom_domains"),
-    ("custom_domain", "custom_domains"), // legacy alias
-    ("subdomain", "subdomain"),
-    ("sk", "sk"),
-    ("multiplexer", "multiplexer"),
-    ("use_encryption", "use_encryption"),
-    ("use_compression", "use_compression"),
-    ("group", "group"),
-    ("group_key", "group_key"),
-    ("http_user", "http_user"),
-    ("http_pwd", "http_pwd"),
-    ("host_header_rewrite", "host_header_rewrite"),
-    ("locations", "locations"),
-    ("bandwidth_limit", "bandwidth_limit"),
-    ("bandwidth_limit_mode", "bandwidth_limit_mode"),
-];
-
-fn canonical_flag_name(raw: &str) -> Option<&'static str> {
-    let folded = raw.replace('-', "_");
-    FLAG_SPELLINGS
-        .iter()
-        .find(|(spelling, _)| folded == **spelling)
-        .map(|(_, canonical)| *canonical)
+/// Scope of a long-flag spelling — which proxy types Go frp registers it
+/// for in SSH mode (FIX 2, pkg/config/flags.go RegisterProxyFlags +
+/// RegisterClientCommonConfigFlags + registerProxyDomainConfigFlags).
+/// A Go type-specific flag used on another type errors as pflag's
+/// `unknown flag: --x` — the flag is simply not registered for that type.
+/// [`FlagScope::Any`] covers both the Go base/common flags (registered for
+/// every type: proxy_name/metadatas/annotations and the persistent
+/// user/token/client-id) and the frp-rs extension spellings below, which
+/// Go's SSH mode does NOT register (registerProxyBaseConfigFlags gates
+/// local_ip/local_port/use_encryption/use_compression/bandwidth_* behind
+/// `!options.sshMode`; group/group_key/subdomain/multiplexer are never
+/// SSH flags in Go). frp-rs keeps them as a documented superset: a Go frps
+/// rejects each with the same `unknown flag` error, so no command written
+/// for Go frp relies on them.
+#[derive(Clone, Copy)]
+enum FlagScope {
+    Any,
+    Types(&'static [&'static str]),
 }
 
-/// Short-flag targets. Go frp registers only these shorthands in SSH mode
-/// (pkg/config/flags.go): `-n` proxy_name, `-r` remote_port, `-d`
-/// custom_domains.
-fn short_flag_target(c: char) -> Option<&'static str> {
+impl FlagScope {
+    fn allows(self, proxy_type: &str) -> bool {
+        match self {
+            FlagScope::Any => true,
+            FlagScope::Types(types) => types.contains(&proxy_type),
+        }
+    }
+}
+
+/// A registered long-flag spelling.
+struct FlagSpelling {
+    /// Separator-folded spelling used for lookup: `_` and `-` are treated as
+    /// equivalent separators (the intent of Go's pflag
+    /// `WordSepNormalizeFunc`, pkg/config/flags.go:31-36 — Go folds `_` to
+    /// `-` on registration AND lookup, so every separator mix resolves to
+    /// the registered name; folding every separator is the frp-rs
+    /// equivalent). Folded form must stay unique — the typed name is what
+    /// the per-type gate and the `unknown flag: --x` error report, and
+    /// `custom_domain` (Go, gated) must stay distinct from `custom_domains`
+    /// (frp-rs extension, ungated).
+    folded: &'static str,
+    /// Canonical field name passed to `apply_flag_value` (also the
+    /// registered-flag name Go quotes in `invalid argument` errors).
+    canon: &'static str,
+    /// Proxy types this spelling is registered for (Go registration set).
+    scope: FlagScope,
+}
+
+/// Go frp SSH-mode flag surface (pkg/config/flags.go + pkg/ssh/server.go),
+/// plus the documented frp-rs extension spellings. Bandwidth flags are
+/// deliberately ABSENT: Go gates `bandwidth_limit`/`bandwidth_limit_mode`
+/// behind `!options.sshMode` (flags.go:112-119), so an SSH-mode frps
+/// answers `--bandwidth_limit` with `unknown flag: --bandwidth_limit` —
+/// exactly what the missing table entry produces.
+const FLAG_SPELLINGS: &[FlagSpelling] = &[
+    // Go base flags (registerProxyBaseConfigFlags) — every proxy type.
+    FlagSpelling {
+        folded: "proxy_name",
+        canon: "proxy_name",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "metadatas",
+        canon: "metadatas",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "annotations",
+        canon: "annotations",
+        scope: FlagScope::Any,
+    },
+    // Go persistent client-common flags (RegisterClientCommonConfigFlags,
+    // always registered, incl. SSH mode).
+    FlagSpelling {
+        folded: "user",
+        canon: "user",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "token",
+        canon: "token",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "client_id",
+        canon: "client_id",
+        scope: FlagScope::Any,
+    },
+    // Go per-type flags (RegisterProxyFlags switch).
+    FlagSpelling {
+        folded: "remote_port",
+        canon: "remote_port",
+        scope: FlagScope::Types(&["tcp"]),
+    },
+    // Domain flags (registerProxyDomainConfigFlags): http/https/tcpmux.
+    FlagSpelling {
+        folded: "custom_domain",
+        canon: "custom_domains",
+        scope: FlagScope::Types(&["http", "https", "tcpmux"]),
+    },
+    FlagSpelling {
+        folded: "sd",
+        canon: "subdomain",
+        scope: FlagScope::Types(&["http", "https", "tcpmux"]),
+    },
+    FlagSpelling {
+        folded: "locations",
+        canon: "locations",
+        scope: FlagScope::Types(&["http"]),
+    },
+    FlagSpelling {
+        folded: "http_user",
+        canon: "http_user",
+        scope: FlagScope::Types(&["http", "tcpmux"]),
+    },
+    FlagSpelling {
+        folded: "http_pwd",
+        canon: "http_pwd",
+        scope: FlagScope::Types(&["http", "tcpmux"]),
+    },
+    FlagSpelling {
+        folded: "host_header_rewrite",
+        canon: "host_header_rewrite",
+        scope: FlagScope::Types(&["http"]),
+    },
+    FlagSpelling {
+        folded: "mux",
+        canon: "multiplexer",
+        scope: FlagScope::Types(&["tcpmux"]),
+    },
+    FlagSpelling {
+        folded: "sk",
+        canon: "sk",
+        scope: FlagScope::Types(&["stcp"]),
+    },
+    FlagSpelling {
+        folded: "allow_users",
+        canon: "allow_users",
+        scope: FlagScope::Types(&["stcp"]),
+    },
+    // frp-rs extension spellings (ungated superset — Go SSH mode rejects
+    // every one of these with `unknown flag`, see FlagScope::Any doc).
+    FlagSpelling {
+        folded: "local_ip",
+        canon: "local_ip",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "local_port",
+        canon: "local_port",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "custom_domains",
+        canon: "custom_domains",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "subdomain",
+        canon: "subdomain",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "multiplexer",
+        canon: "multiplexer",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "use_encryption",
+        canon: "use_encryption",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "use_compression",
+        canon: "use_compression",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "group",
+        canon: "group",
+        scope: FlagScope::Any,
+    },
+    FlagSpelling {
+        folded: "group_key",
+        canon: "group_key",
+        scope: FlagScope::Any,
+    },
+];
+
+fn flag_spelling(raw: &str) -> Option<&'static FlagSpelling> {
+    let folded = raw.replace('-', "_");
+    FLAG_SPELLINGS.iter().find(|s| folded == s.folded)
+}
+
+/// Short-flag targets (Go pkg/config/flags.go shorthand letters): `-n`
+/// proxy_name, `-r` remote_port, `-d` custom_domain, `-u` user, `-t`
+/// token. Each shorthand resolves to the spelling Go registered it under,
+/// so the per-type gate applies to shorthands too (`-d` is a
+/// custom_domain registration: domain types only; `-r` is tcp only; `-u`/
+/// `-t` are the persistent user/token: all types).
+fn short_flag_target(c: char) -> Option<&'static FlagSpelling> {
     match c {
-        'n' => Some("proxy_name"),
-        'r' => Some("remote_port"),
-        'd' => Some("custom_domains"),
+        'n' => flag_spelling("proxy_name"),
+        'r' => flag_spelling("remote_port"),
+        'd' => flag_spelling("custom_domain"),
+        'u' => flag_spelling("user"),
+        't' => flag_spelling("token"),
         _ => None,
     }
 }
 
+/// True for bool-typed flags. Go registers no bool flags in SSH mode
+/// (use_encryption/use_compression are `!options.sshMode`-gated); the two
+/// frp-rs extension bools keep pflag's bool grammar (FIX 3): NoOptDefVal
+/// "true" — a bare `--use_encryption` applies true and NEVER consumes the
+/// next token — and the full strconv.ParseBool value set.
+fn is_bool_flag(canon: &str) -> bool {
+    matches!(canon, "use_encryption" | "use_compression")
+}
+
 /// Apply a parsed flag value to `args`. Value parse failures produce the
-/// pflag-shaped `invalid argument` error Go surfaces from FlagSet.Set (the
-/// tail is frp-rs wording — Go embeds strconv's message, which has no Rust
-/// equivalent).
+/// pflag-shaped `invalid argument` error Go surfaces from FlagSet.Set:
+/// `invalid argument "{value}" for "{flag}" flag: {set error}` where
+/// "{flag}" is the registered name Go quotes (dash-folded through frp's
+/// WordSepNormalizeFunc — `-r, --remote-port` for the shorthand form,
+/// `--name` otherwise) and {set error} is the strconv/type message
+/// verbatim.
 fn apply_flag_value(args: &mut ParsedProxyArgs, canon: &str, value: &str) -> Result<(), String> {
     match canon {
         "proxy_name" => args.proxy_name = value.to_string(),
-        "remote_port" => args.remote_port = parse_port_value(value, "-r, --remote_port")?,
+        "remote_port" => args.remote_port = parse_port_value(value, "-r, --remote-port")?,
         "local_ip" => args.local_ip = value.to_string(),
         "local_port" => args.local_port = parse_port_value(value, "--local_port")?,
         "custom_domains" => args.custom_domains = split_csv(value),
         "subdomain" => args.subdomain = value.to_string(),
         "sk" => args.sk = value.to_string(),
         "multiplexer" => args.multiplexer = value.to_string(),
-        "use_encryption" => args.use_encryption = matches!(value, "true" | "1"),
-        "use_compression" => args.use_compression = matches!(value, "true" | "1"),
+        "use_encryption" => args.use_encryption = parse_bool_value(value, "--use_encryption")?,
+        "use_compression" => args.use_compression = parse_bool_value(value, "--use_compression")?,
         "group" => args.group = value.to_string(),
         "group_key" => args.group_key = value.to_string(),
         "http_user" => args.http_user = value.to_string(),
         "http_pwd" => args.http_pwd = value.to_string(),
         "host_header_rewrite" => args.host_header_rewrite = value.to_string(),
         "locations" => args.locations = split_csv(value),
-        "bandwidth_limit" => args.bandwidth_limit = value.to_string(),
-        "bandwidth_limit_mode" => args.bandwidth_limit_mode = value.to_string(),
+        "metadatas" => {
+            // pflag wraps the Set error with the flag name (same shape as
+            // parse_bool_value/parse_port_value).
+            for (k, v) in parse_kv_pairs(value).map_err(|e| {
+                format!("invalid argument \"{value}\" for \"--metadatas\" flag: {e}")
+            })? {
+                if let Some(slot) = args.metadatas.iter_mut().find(|(ek, _)| ek == &k) {
+                    // Later same-key pairs win (Go StringToString map Set).
+                    slot.1 = v;
+                } else {
+                    args.metadatas.push((k, v));
+                }
+            }
+        }
+        "annotations" => {
+            for (k, v) in parse_kv_pairs(value).map_err(|e| {
+                format!("invalid argument \"{value}\" for \"--annotations\" flag: {e}")
+            })? {
+                if let Some(slot) = args.annotations.iter_mut().find(|(ek, _)| ek == &k) {
+                    slot.1 = v;
+                } else {
+                    args.annotations.push((k, v));
+                }
+            }
+        }
+        "allow_users" => args.allow_users.extend(split_csv(value)),
+        "user" => args.user = value.to_string(),
+        "token" => args.token = value.to_string(),
+        "client_id" => args.client_id = value.to_string(),
         other => {
             // Defensive: every canonical name is handled above; a future
             // table/arm drift must error, not silently no-op.
@@ -304,9 +553,60 @@ fn apply_flag_value(args: &mut ParsedProxyArgs, canon: &str, value: &str) -> Res
     Ok(())
 }
 
+/// Go strconv.ParseBool parity (FIX 3) — the exact value set Go accepts
+/// for bool flags: 1,t,T,TRUE,true,True,0,f,F,FALSE,false,False. Anything
+/// else is rejected with pflag's error text, whose tail embeds strconv's
+/// message verbatim (`invalid syntax` for every non-bool value; the value
+/// is quoted once for `invalid argument` and once inside `parsing`).
+fn parse_bool_value(value: &str, display: &str) -> Result<bool, String> {
+    match value {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
+        other => Err(format!(
+            "invalid argument \"{value}\" for \"{display}\" flag: strconv.ParseBool: parsing \"{other}\": invalid syntax"
+        )),
+    }
+}
+
+/// Go pflag StringToString parity for `--metadatas`/`--annotations`
+/// (pflag/string_to_string.go): the value is a comma-separated k=v list.
+/// Go's shape rules, mirrored here:
+/// - no `=` at all → `{value} must be formatted as key=value`;
+/// - exactly one `=` → ONE pair, commas included (so a value like `k=v,w`
+///   stores "v,w" — commas need a second `=` elsewhere in the value before
+///   they separate pairs);
+/// - two or more `=` → comma-separated fields, each split on its FIRST `=`;
+///   a field without `=` → `{field} must be formatted as key=value`.
+///
+/// (pflag additionally csv-parses quoted fields in the multi-`=` arm and
+/// trims a fully quoted value in the single-`=` arm; frp-rs strips
+/// surrounding double quotes per field — a documented simplification that
+/// matches Go for every unquoted value.)
+fn parse_kv_pairs(value: &str) -> Result<Vec<(String, String)>, String> {
+    let eq_count = value.matches('=').count();
+    let fields: Vec<&str> = match eq_count {
+        0 => return Err(format!("{value} must be formatted as key=value")),
+        1 => vec![value],
+        _ => value.split(',').collect(),
+    };
+    let mut out = Vec::with_capacity(fields.len());
+    for field in fields {
+        let field = field.trim_matches('"');
+        let Some((k, v)) = field.split_once('=') else {
+            return Err(format!("{field} must be formatted as key=value"));
+        };
+        out.push((k.to_string(), v.to_string()));
+    }
+    Ok(out)
+}
+
 /// Parse a port value (`--remote_port` / `--local_port`, 0 = auto-assign).
-/// The pflag-shaped error carries the flag's canonical display name (Go
-/// formats shorthand flags as "-r, --remote_port").
+/// The pflag-shaped error carries the flag's canonical display name. Go's
+/// pflag normalizes registered names through frp's WordSepNormalizeFunc
+/// (`_` → `-`) before quoting them in errors, so a shorthand flag displays
+/// as "-r, --remote-port" — the dash-folded spelling is what a Go peer
+/// would see. The underscore-free Rust-only names (`--use_encryption`,
+/// `--local_port`, ...) have no Go oracle text and display as registered.
 fn parse_port_value(value: &str, display: &str) -> Result<u16, String> {
     value.parse::<u16>().map_err(|_| {
         format!(
@@ -338,7 +638,11 @@ fn default_proxy_name(proxy_type: &str) -> String {
 
 /// Usage text for `--help` / `-h` and the empty command. Go frp writes the
 /// cobra command usage to the SSH client on ErrHelp and closes; this is the
-/// frp-rs equivalent listing the flags parse_ssh_args accepts.
+/// frp-rs equivalent listing the flags parse_ssh_args accepts. The parenthesized
+/// type list after each flag is Go's registration scope (pkg/config/flags.go);
+/// lines marked [frp-rs] are the extension spellings Go's SSH mode does not
+/// register (see the FlagScope::Any doc) — kept so frp-rs commands that used
+/// them keep working, rejected by a Go frps with `unknown flag`.
 fn ssh_gateway_usage() -> String {
     format!(
         concat!(
@@ -351,30 +655,39 @@ fn ssh_gateway_usage() -> String {
             "\n",
             "Flags:\n",
             "  -n, --proxy_name string            proxy name (empty = auto: sshtunnel-<type>-<random>)\n",
-            "  -r, --remote_port uint16           server listen port, 0 = auto-assign\n",
-            "  -d, --custom_domains stringList    custom domains, comma-separated (http/https)\n",
-            "      --subdomain string             subdomain on the vhost server (http/https)\n",
+            "  -u, --user string                  frpc user (accepted; the SSH virtual client logs in as the ssh user)\n",
+            "  -t, --token string                 frpc auth token (accepted; the gateway authenticates with its own token)\n",
+            "      --client-id string             unique frpc instance id (accepted; unused by the gateway)\n",
+            "      --metadatas stringToString     metadata key=value pairs, comma-separated\n",
+            "      --annotations stringToString   annotation key=value pairs, comma-separated\n",
+            "  -r, --remote_port uint16           server listen port, 0 = auto-assign (tcp)\n",
+            "  -d, --custom_domain stringList     custom domains, comma-separated (http/https/tcpmux)\n",
+            "      --sd string                    subdomain on the vhost server (http/https/tcpmux)\n",
+            "      --locations stringList         vhost locations, comma-separated (http)\n",
+            "      --http_user string             HTTP basic-auth user (http/tcpmux)\n",
+            "      --http_pwd string              HTTP basic-auth password (http/tcpmux)\n",
+            "      --host_header_rewrite string   rewrite the Host header (http)\n",
+            "      --mux string                   multiplexer name (tcpmux)\n",
             "      --sk string                    secret key (stcp)\n",
-            "      --multiplexer string           multiplexer name (tcpmux)\n",
-            "      --local_ip string              local service IP\n",
-            "      --local_port uint16            local service port\n",
-            "      --use_encryption               enable encryption (\"true\" or \"1\")\n",
-            "      --use_compression              enable compression (\"true\" or \"1\")\n",
-            "      --group string                 group name\n",
-            "      --group_key string             group key\n",
-            "      --http_user string             HTTP basic-auth user (http/https)\n",
-            "      --http_pwd string              HTTP basic-auth password (http/https)\n",
-            "      --host_header_rewrite string   rewrite the Host header (http/https)\n",
-            "      --locations stringList         vhost locations, comma-separated (http/https)\n",
-            "      --bandwidth_limit string       bandwidth limit (e.g. 1MB)\n",
-            "      --bandwidth_limit_mode string  bandwidth limit mode: client or server\n",
+            "      --allow_users stringList       allowed visitor users, comma-separated (stcp)\n",
+            "      --local_ip string              local service IP [frp-rs]\n",
+            "      --local_port uint16            local service port [frp-rs]\n",
+            "      --custom_domains stringList    alias of --custom_domain [frp-rs]\n",
+            "      --subdomain string             alias of --sd [frp-rs]\n",
+            "      --multiplexer string           alias of --mux [frp-rs]\n",
+            "      --use_encryption               enable encryption (bare = true) [frp-rs]\n",
+            "      --use_compression              enable compression (bare = true) [frp-rs]\n",
+            "      --group string                 group name [frp-rs]\n",
+            "      --group_key string             group key [frp-rs]\n",
             "  -h, --help                         show this help and exit\n"
         ),
-        types = VALID_PROXY_TYPES.join(", ")
+        types = VALID_PROXY_TYPES.join(" ")
     )
 }
 
-const VALID_PROXY_TYPES: &[&str] = &["tcp", "http", "https", "stcp", "tcpmux"];
+/// Go frp SSH-mode support types, in Go's list order
+/// (pkg/ssh/server.go:274 — the error text below prints this exact order).
+const VALID_PROXY_TYPES: &[&str] = &["tcp", "http", "https", "tcpmux", "stcp"];
 
 /// Split a command string into shell-like tokens, respecting double quotes.
 fn shell_split(cmd: &str) -> Vec<String> {
@@ -693,11 +1006,16 @@ fn build_v1_frame_from_args(
         headers: None,
         response_headers: None,
         route_by_http_user: None,
-        allow_users: None,
-        bandwidth_limit: none_if_empty(&args.bandwidth_limit),
-        bandwidth_limit_mode: none_if_empty(&args.bandwidth_limit_mode),
-        annotations: None,
-        metas: None,
+        allow_users: non_empty_vec(args.allow_users.clone()),
+        // Bandwidth fields are intentionally NOT wired: Go SSH mode does not
+        // register the flags (see the FLAG_SPELLINGS doc), so no parsed arg
+        // can ever reach them — frp-rs SSH-registered proxies are always
+        // unlimited, exactly like Go's (Go omits nil bandwidth_limit fields
+        // from the NewProxy message entirely).
+        bandwidth_limit: None,
+        bandwidth_limit_mode: None,
+        annotations: pairs_to_map(&args.annotations),
+        metas: pairs_to_map(&args.metadatas),
         multiplexer: none_if_empty(&args.multiplexer),
         virtual_net: None,
         proxy_protocol_version: None,
@@ -778,6 +1096,18 @@ fn non_empty_vec(v: Vec<String>) -> Option<Vec<String>> {
         None
     } else {
         Some(v)
+    }
+}
+
+/// Map accumulated `--metadatas`/`--annotations` k=v pairs (last-wins per
+/// key, insertion order preserved) to the NewProxy wire map. None when no
+/// pair was parsed — the field is then skipped on the wire like Go's
+/// nil map.
+fn pairs_to_map(pairs: &[(String, String)]) -> Option<std::collections::HashMap<String, String>> {
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs.iter().cloned().collect())
     }
 }
 
@@ -1055,6 +1385,30 @@ impl Handler for SshSession {
             }
         };
         log_exec_request(&run_id, &args);
+
+        // Go parity gap, documented (FIX 2): Go consumes --user/--token/
+        // --client-id when it builds the virtual client — server.go
+        // parseClientAndConfigurer returns them in the client config, and
+        // Run() hands that config to virtual.NewClient (server.go:104-130),
+        // so they shape the frps LOGIN (user, privilege_key, client_id).
+        // frp-rs establishes that Login in auth_succeeded — BEFORE the exec
+        // payload is parsed — with user "v0", the gateway's own
+        // server_token, and a fresh run_id; the CipherStream key derives
+        // from server_token at VirtualControl::channel, so honoring
+        // per-exec credentials would require re-establishing the whole
+        // control connection (new Login + new derived key) mid-session.
+        // The flags are therefore accepted and parsed (the Go surface stays
+        // green — a Go-authored command line never fails on them) but do
+        // not affect the registration; proxy-level auth keeps working via
+        // the per-proxy flags (--sk/--http_user/...). --user would have no
+        // effect anyway: Go overrides the flag with the SSH username
+        // (server.go:117-119) after parsing.
+        if !args.user.is_empty() || !args.token.is_empty() || !args.client_id.is_empty() {
+            tracing::warn!(
+                run_id = %run_id,
+                "SSH gateway: --user/--token/--client-id accepted but unused (the control login predates the exec payload; Go consumes them at virtual-client login)"
+            );
+        }
 
         // Check per-client port limit (matching Go frp's GetUsedPortsNum logic).
         if self.state.max_ports_per_client > 0 {
@@ -2432,9 +2786,42 @@ mod tests {
 
     #[test]
     fn test_parse_ssh_args_unknown_type() {
+        // FIX 4: Go-verbatim error (pkg/ssh/server.go:275-276), support
+        // types in Go's order.
         let err = parse_ssh_args("smtp --proxy_name test").unwrap_err();
-        assert!(err.contains("unsupported proxy type"));
-        assert!(err.contains("smtp"));
+        assert_eq!(
+            err,
+            "invalid proxy type: smtp, support types: [tcp http https tcpmux stcp]"
+        );
+    }
+
+    #[test]
+    fn test_parse_ssh_args_type_token_exact_match_no_case_folding() {
+        // FIX 4: the type token matches Go's exact Contains after TrimSpace
+        // — NO to_lowercase fold, so any case variant is rejected with the
+        // verbatim Go text (old code folded "TCP" to "tcp" and accepted).
+        for cmd in ["TCP", "Tcp", "Stcp --proxy_name x", "HTTP"] {
+            let err = parse_ssh_args(cmd).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "invalid proxy type: {}, support types: [tcp http https tcpmux stcp]",
+                    cmd.split_whitespace().next().unwrap()
+                ),
+                "cmd {cmd:?}"
+            );
+        }
+        // TrimSpace parity: a quoted token with trailing whitespace is
+        // trimmed before the match (Go TrimSpace(args[0])).
+        let args = parse_ssh_args("\"stcp \" --sk x").unwrap();
+        assert_eq!(args.proxy_type, "stcp");
+        assert_eq!(args.sk, "x");
+        // The support-types list order is Go's
+        // [tcp http https tcpmux stcp] — stcp AFTER tcpmux.
+        assert_eq!(
+            VALID_PROXY_TYPES,
+            &["tcp", "http", "https", "tcpmux", "stcp"]
+        );
     }
 
     #[test]
@@ -2489,6 +2876,234 @@ mod tests {
             parse_ssh_args(r#"tcpmux --proxy_name "mux" --multiplexer "httpconnect""#).unwrap();
         assert_eq!(args.proxy_type, "tcpmux");
         assert_eq!(args.multiplexer, "httpconnect");
+    }
+
+    #[test]
+    fn test_parse_ssh_args_go_spellings_accepted() {
+        // FIX 2a: Go's SSH-mode spellings (pkg/config/flags.go) parse and
+        // map onto the same fields as the frp-rs spellings.
+        // --sd (Go) == --subdomain (frp-rs extension), domain types.
+        let a = parse_ssh_args("http --sd foo --proxy_name h").unwrap();
+        assert_eq!(a.subdomain, "foo");
+        let b = parse_ssh_args("https --sd foo --custom_domain a.com").unwrap();
+        assert_eq!(b.subdomain, "foo");
+        assert_eq!(b.custom_domains, vec!["a.com"]);
+        let c = parse_ssh_args("tcpmux --sd foo --mux httpconnect").unwrap();
+        assert_eq!(c.subdomain, "foo");
+        assert_eq!(c.multiplexer, "httpconnect");
+        // --mux (Go) == --multiplexer (frp-rs extension).
+        let d = parse_ssh_args("tcpmux --multiplexer httpconnect").unwrap();
+        let e = parse_ssh_args("tcpmux --mux httpconnect").unwrap();
+        assert_eq!(d.multiplexer, e.multiplexer);
+        // http-only Go flags.
+        let f = parse_ssh_args(
+            "http --locations /a,/b --http_user u --http_pwd p --host_header_rewrite hh",
+        )
+        .unwrap();
+        assert_eq!(f.locations, vec!["/a", "/b"]);
+        assert_eq!(f.http_user, "u");
+        assert_eq!(f.http_pwd, "p");
+        assert_eq!(f.host_header_rewrite, "hh");
+        // tcpmux takes http_user/http_pwd but NOT host_header_rewrite.
+        let g = parse_ssh_args("tcpmux --http_user u --http_pwd p").unwrap();
+        assert_eq!(g.http_user, "u");
+        assert_eq!(g.http_pwd, "p");
+        // stcp Go flags: --sk + --allow_users.
+        let h = parse_ssh_args("stcp --sk mysecret --allow_users alice,bob").unwrap();
+        assert_eq!(h.sk, "mysecret");
+        assert_eq!(h.allow_users, vec!["alice", "bob"]);
+        // Dash-form of the Go flag names works (pflag normalization).
+        let i = parse_ssh_args("http --custom-domain a.com").unwrap();
+        assert_eq!(i.custom_domains, vec!["a.com"]);
+        let j = parse_ssh_args("stcp --allow-users alice").unwrap();
+        assert_eq!(j.allow_users, vec!["alice"]);
+        // metadatas/annotations on ANY type (Go base flags).
+        let k = parse_ssh_args("tcp --metadatas k1=v1 --annotations a1=b1").unwrap();
+        assert_eq!(k.metadatas, vec![("k1".into(), "v1".into())]);
+        assert_eq!(k.annotations, vec![("a1".into(), "b1".into())]);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_user_token_client_id_flags() {
+        // FIX 2a: Go persistent client-common flags (pkg/ssh/server.go
+        // RegisterClientCommonConfigFlags) parse on every proxy type.
+        let a = parse_ssh_args(
+            "tcp --proxy_name p1 --user alice --token sekrit --client-id abc-123 --remote_port 9090",
+        )
+        .unwrap();
+        assert_eq!(a.user, "alice");
+        assert_eq!(a.token, "sekrit");
+        assert_eq!(a.client_id, "abc-123");
+        // Shorthands -u / -t (all cluster forms) parse to the same args.
+        for cmd in [
+            "tcp --proxy_name p1 -u alice -t sekrit --client_id abc-123 -r 9090",
+            "tcp --proxy_name p1 -u=alice -t=sekrit --client_id=abc-123 -r=9090",
+            "tcp --proxy_name p1 -ualice -tsekrit --client_id abc-123 -r9090",
+        ] {
+            let args = parse_ssh_args(cmd).unwrap_or_else(|e| panic!("cmd {cmd:?}: {e}"));
+            assert_eq!(args, a, "cmd {cmd:?}");
+        }
+        // --client_id (underscore) and --client-id (Go's registered dash
+        // name) are the same flag via separator folding.
+        let e = parse_ssh_args("stcp --client_id c1 --sk s").unwrap();
+        assert_eq!(e.client_id, "c1");
+        let f = parse_ssh_args("stcp --client-id c1 --sk s").unwrap();
+        assert_eq!(f.client_id, "c1");
+        // Values flow into the parsed args; their consumption at the
+        // virtual-client login level is documented in exec_request (the
+        // control Login predates the exec payload).
+    }
+
+    #[test]
+    fn test_parse_ssh_args_per_type_gates_reject_go_flags_on_other_types() {
+        // FIX 2c: Go registers type-specific flags only for their types; on
+        // any other type the flag errors exactly like an unknown one
+        // (pflag unknown-flag arm — Go never registered it for this type).
+        let cases = [
+            // (cmd, expected error)
+            ("tcp --sk s", "unknown flag: --sk"),   // stcp-only
+            ("tcp --sd foo", "unknown flag: --sd"), // domain types only
+            ("tcp --custom_domain a.com", "unknown flag: --custom_domain"),
+            ("tcp --mux httpconnect", "unknown flag: --mux"),
+            ("tcp --allow_users alice", "unknown flag: --allow_users"),
+            ("tcp --metadatas k=v", ""), // metadatas: ALL types — no error
+            ("tcp --user u", ""),        // persistent: ALL types
+            ("http --remote_port 9090", "unknown flag: --remote_port"), // tcp-only
+            ("https --sk s", "unknown flag: --sk"),
+            ("https --http_user u", "unknown flag: --http_user"), // http/tcpmux
+            ("https --http_pwd p", "unknown flag: --http_pwd"),
+            ("https --locations /a", "unknown flag: --locations"), // http-only
+            (
+                "https --host_header_rewrite h",
+                "unknown flag: --host_header_rewrite",
+            ),
+            (
+                "tcpmux --host_header_rewrite h",
+                "unknown flag: --host_header_rewrite",
+            ),
+            ("tcpmux --locations /a", "unknown flag: --locations"),
+            ("tcpmux --sk s", "unknown flag: --sk"),
+            ("stcp --sd foo", "unknown flag: --sd"),
+            (
+                "stcp --custom_domain a.com",
+                "unknown flag: --custom_domain",
+            ),
+            ("stcp --mux m", "unknown flag: --mux"),
+            ("stcp --remote_port 1", "unknown flag: --remote_port"),
+            ("stcp --http_pwd p", "unknown flag: --http_pwd"),
+            // The gate is keyed on the TYPED spelling: the plural frp-rs
+            // extension --custom_domains stays ungated everywhere while the
+            // Go singular --custom_domain is gated.
+            ("tcp --custom_domains a.com", ""),
+        ];
+        for (cmd, expected) in cases {
+            if expected.is_empty() {
+                parse_ssh_args(cmd).unwrap_or_else(|e| panic!("cmd {cmd:?} must parse: {e}"));
+            } else {
+                let err = parse_ssh_args(cmd).unwrap_err();
+                assert_eq!(err, expected, "cmd {cmd:?}");
+            }
+        }
+        // Shorthand gates report pflag's unknown-shorthand text.
+        let err = parse_ssh_args("http -r 9090").unwrap_err();
+        assert_eq!(err, "unknown shorthand flag: 'r' in -r");
+        let err = parse_ssh_args("tcp -d a.com").unwrap_err();
+        assert_eq!(err, "unknown shorthand flag: 'd' in -d");
+        let err = parse_ssh_args("stcp -r 1").unwrap_err();
+        assert_eq!(err, "unknown shorthand flag: 'r' in -r");
+        let err = parse_ssh_args("http -r").unwrap_err();
+        assert_eq!(err, "unknown shorthand flag: 'r' in -r");
+        // ...while the registered shorthands still work on their types.
+        parse_ssh_args("tcp -r 9090 -n web").unwrap();
+        parse_ssh_args("http -d a.com").unwrap();
+        parse_ssh_args("tcpmux -d a.com").unwrap();
+        parse_ssh_args("stcp -n s1").unwrap();
+    }
+
+    #[test]
+    fn test_parse_ssh_args_bandwidth_flags_rejected_like_go() {
+        // FIX 2: Go SSH mode does not register bandwidth_* (flags.go gates
+        // them behind !options.sshMode) — frp-rs rejects them identically
+        // instead of accepting a setting Go would drop.
+        let err = parse_ssh_args("tcp --bandwidth_limit 1MB").unwrap_err();
+        assert_eq!(err, "unknown flag: --bandwidth_limit");
+        let err = parse_ssh_args("tcp --bandwidth_limit_mode client").unwrap_err();
+        assert_eq!(err, "unknown flag: --bandwidth_limit_mode");
+    }
+
+    #[test]
+    fn test_parse_ssh_args_metadatas_annotations_kv_semantics() {
+        // FIX 2a: pflag StringToString semantics — comma-separated k=v
+        // pairs; repeated occurrences ACCUMULATE; later same-key pairs win;
+        // a value with exactly one '=' keeps its commas (Go's single-pair
+        // arm); a pair without '=' is the pflag error text.
+        let args = parse_ssh_args("tcp --metadatas k1=v1,k2=v2").unwrap();
+        assert_eq!(
+            args.metadatas,
+            vec![("k1".into(), "v1".into()), ("k2".into(), "v2".into())]
+        );
+        // Accumulation + last-wins on repeat.
+        let args = parse_ssh_args("tcp --metadatas k1=v1 --metadatas k2=v2,k1=v1b").unwrap();
+        assert_eq!(
+            args.metadatas,
+            vec![("k1".into(), "v1b".into()), ("k2".into(), "v2".into())]
+        );
+        // Exactly one '=' → the whole value is one pair (commas are value).
+        let args = parse_ssh_args("tcp --metadatas k=v,w").unwrap();
+        assert_eq!(args.metadatas, vec![("k".into(), "v,w".into())]);
+        // Multi-'=' values: first '=' splits the pair.
+        let args = parse_ssh_args("tcp --metadatas k=v=w").unwrap();
+        assert_eq!(args.metadatas, vec![("k".into(), "v=w".into())]);
+        // Missing '=' → pflag error text, carried through the flag wrapper.
+        let err = parse_ssh_args("tcp --metadatas novalue").unwrap_err();
+        assert_eq!(
+            err,
+            "invalid argument \"novalue\" for \"--metadatas\" flag: novalue must be formatted as key=value"
+        );
+        // A pair without '=' inside a multi-pair value errors on that pair
+        // (a single-'=' value like "a=b,broken" is ONE legal pair whose
+        // value is "b,broken" — Go's n==1 arm, pinned above).
+        let err = parse_ssh_args("tcp --annotations a=b,c=d,broken").unwrap_err();
+        assert_eq!(
+            err,
+            "invalid argument \"a=b,c=d,broken\" for \"--annotations\" flag: broken must be formatted as key=value"
+        );
+        // Go accepts the single-'=' comma value as one pair; so does frp-rs.
+        let ok = parse_ssh_args("tcp --annotations a=b,broken").unwrap();
+        assert_eq!(ok.annotations, vec![("a".into(), "b,broken".into())]);
+        // annotations accumulate independently of metadatas.
+        let args =
+            parse_ssh_args("tcp --annotations a=1 --metadatas m=2 --annotations a=3").unwrap();
+        assert_eq!(args.annotations, vec![("a".into(), "3".into())]);
+        assert_eq!(args.metadatas, vec![("m".into(), "2".into())]);
+    }
+
+    #[test]
+    fn test_build_v1_frame_carries_metas_annotations_allow_users() {
+        // FIX 2a wire check: the accumulated k=v pairs and the allow_users
+        // list reach the NewProxy frame (msg wire keys metas/annotations/
+        // allow_users, Go msg.go parity); bandwidth fields are gone.
+        let args = parse_ssh_args(
+            "stcp --proxy_name sec --sk x --allow_users alice,bob \
+             --metadatas k1=v1 --annotations a1=b1,a2=b2",
+        )
+        .unwrap();
+        let frame = build_v1_frame_from_args(&args, 0).unwrap();
+        let payload = &frame[9..];
+        let v: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(v["metas"]["k1"], "v1");
+        assert_eq!(v["annotations"]["a1"], "b1");
+        assert_eq!(v["annotations"]["a2"], "b2");
+        assert_eq!(v["allow_users"], serde_json::json!(["alice", "bob"]));
+        assert!(v.get("bandwidth_limit").is_none());
+        assert!(v.get("bandwidth_limit_mode").is_none());
+        // None when no pairs were parsed — the wire fields stay absent.
+        let args = parse_ssh_args("tcp --proxy_name plain --remote_port 1").unwrap();
+        let frame = build_v1_frame_from_args(&args, 1).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&frame[9..]).unwrap();
+        assert!(v.get("metas").is_none());
+        assert!(v.get("annotations").is_none());
+        assert!(v.get("allow_users").is_none());
     }
 
     #[test]
@@ -2552,8 +3167,12 @@ mod tests {
             http_pwd: HTTP_PWD.into(),
             host_header_rewrite: String::new(),
             locations: Vec::new(),
-            bandwidth_limit: String::new(),
-            bandwidth_limit_mode: String::new(),
+            metadatas: Vec::new(),
+            annotations: Vec::new(),
+            allow_users: Vec::new(),
+            user: String::new(),
+            token: String::new(),
+            client_id: String::new(),
         };
 
         let summary = exec_request_log_summary(&args);
@@ -2579,18 +3198,22 @@ mod tests {
 
     #[test]
     fn test_parse_ssh_args_truncated_flags_no_panic() {
-        // Flag at end of command with no value.
-        let args = parse_ssh_args("tcp --proxy_name web --sk").unwrap();
-        assert_eq!(args.proxy_type, "tcp");
+        // Flag at end of command with no value (--sk is stcp-only, so the
+        // truncated-flag tolerance is exercised on the type Go registers
+        // it for).
+        let args = parse_ssh_args("stcp --proxy_name web --sk").unwrap();
+        assert_eq!(args.proxy_type, "stcp");
         assert_eq!(args.proxy_name, "web");
         assert!(args.sk.is_empty());
 
         // A run of value-requiring flags with no values at all.
-        let args = parse_ssh_args("tcp --sk --group_key --http_pwd --remote_port").unwrap();
-        assert_eq!(args.remote_port, 0);
+        let args = parse_ssh_args("stcp --sk --allow_users").unwrap();
         assert!(args.sk.is_empty());
-        assert!(args.group_key.is_empty());
+        assert!(args.allow_users.is_empty());
+        let args = parse_ssh_args("http --http_pwd --locations --sd").unwrap();
         assert!(args.http_pwd.is_empty());
+        assert!(args.locations.is_empty());
+        assert!(args.subdomain.is_empty());
 
         // Flag immediately after the type, nothing else — the truncated
         // value is tolerated (see parse_long_flag) and the empty name gets
@@ -2616,7 +3239,12 @@ mod tests {
         ] {
             let cmd = format!("tcp --proxy_name web --remote_port {bad}");
             let err = parse_ssh_args(&cmd).unwrap_err();
-            let expected = format!("invalid argument \"{bad}\" for \"-r, --remote_port\" flag");
+            // Go quotes the dash-folded registered spelling: pflag's
+            // WordSepNormalizeFunc (`_` → `-`, config/flags.go:30-36, set
+            // in pkg/ssh/server.go) rewrites flag.Name at AddFlag time, so
+            // the Set error shows "-r, --remote-port" (empirically probed
+            // against pflag v1.0.5).
+            let expected = format!("invalid argument \"{bad}\" for \"-r, --remote-port\" flag");
             assert!(
                 err.contains(&expected),
                 "cmd {cmd:?} must be rejected with {expected:?}, got: {err}"
@@ -2625,7 +3253,7 @@ mod tests {
         // An explicitly empty value is rejected too (Go runs strconv on it).
         let err = parse_ssh_args("tcp --remote_port=").unwrap_err();
         assert!(
-            err.contains("invalid argument \"\" for \"-r, --remote_port\" flag"),
+            err.contains("invalid argument \"\" for \"-r, --remote-port\" flag"),
             "got: {err}"
         );
         // A truncated flag (no value at all) still tolerates → 0: the
@@ -2797,27 +3425,76 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ssh_args_boolean_flags_unchanged() {
-        // Value-taking bools keep their legacy grammar ("true"/"1") and gain
-        // the = form.
-        let args = parse_ssh_args("tcp --use_encryption true --use_compression=1").unwrap();
-        assert!(args.use_encryption && args.use_compression);
+    fn test_parse_ssh_args_boolean_flags_bare_true_and_parse_bool_set() {
+        // FIX 3: a bare bool flag (no `=`) applies true (Go pflag
+        // NoOptDefVal="true") and NEVER consumes the next token.
+        let args = parse_ssh_args("tcp --use_encryption --remote_port 9090").unwrap();
+        assert!(args.use_encryption);
+        assert_eq!(
+            args.remote_port, 9090,
+            "the next token is not the bool's value"
+        );
+        let args = parse_ssh_args("http --proxy_name blog --use_compression --sd foo").unwrap();
+        assert!(args.use_compression);
+        assert_eq!(args.subdomain, "foo");
+        // A following non-flag token is an ignored positional, exactly like
+        // Go (a bool with NoOptDefVal never reads the next arg): the bool
+        // stays TRUE even for "--use_encryption false".
         let args = parse_ssh_args("tcp --use_encryption false").unwrap();
-        assert!(!args.use_encryption);
-        // A bare bool followed by another flag stays false (truncation
-        // tolerance — Go/pflag would swallow "--sk" as the bool's value).
-        let args = parse_ssh_args("tcp --use_encryption --sk s").unwrap();
-        assert!(!args.use_encryption);
-        assert_eq!(args.sk, "s");
+        assert!(args.use_encryption);
+        // Explicit = forms: full strconv.ParseBool value set
+        // (1,t,T,TRUE,true,True → true; 0,f,F,FALSE,false,False → false).
+        for v in ["1", "t", "T", "TRUE", "true", "True"] {
+            let args = parse_ssh_args(&format!("tcp --use_encryption={v}")).unwrap();
+            assert!(args.use_encryption, "value {v:?} must parse as true");
+        }
+        for v in ["0", "f", "F", "FALSE", "false", "False"] {
+            let args = parse_ssh_args(&format!("tcp --use_encryption={v}")).unwrap();
+            assert!(!args.use_encryption, "value {v:?} must parse as false");
+        }
+        // Garbage → the parser error path with Go's verbatim strconv text
+        // (both the `=` form and the pflag empty-value form).
+        for v in ["v", "yes", "2", "Truee"] {
+            let err = parse_ssh_args(&format!("tcp --use_encryption={v}")).unwrap_err();
+            let expected = format!(
+                "invalid argument \"{v}\" for \"--use_encryption\" flag: \
+                 strconv.ParseBool: parsing \"{v}\": invalid syntax"
+            );
+            assert_eq!(err, expected, "value {v:?}");
+        }
+        // A quoted value containing whitespace parses as one value (and
+        // fails ParseBool like Go).
+        let err = parse_ssh_args(r#"tcp --use_encryption=" true""#).unwrap_err();
+        assert_eq!(
+            err,
+            "invalid argument \" true\" for \"--use_encryption\" flag: \
+             strconv.ParseBool: parsing \" true\": invalid syntax"
+        );
+        let err = parse_ssh_args("tcp --use_encryption=").unwrap_err();
+        assert_eq!(
+            err,
+            "invalid argument \"\" for \"--use_encryption\" flag: \
+             strconv.ParseBool: parsing \"\": invalid syntax"
+        );
+        // use_compression errors identically with its own flag name.
+        let err = parse_ssh_args("tcp --use_compression=maybe").unwrap_err();
+        assert_eq!(
+            err,
+            "invalid argument \"maybe\" for \"--use_compression\" flag: \
+             strconv.ParseBool: parsing \"maybe\": invalid syntax"
+        );
     }
 
     #[test]
     fn test_parse_ssh_args_truncated_boolean_and_list_flags() {
+        // A bare bool now applies true; value-requiring flags truncated by a
+        // following flag stay at their defaults (deliberate frp-rs
+        // divergence — Go would consume the next flag token as the value).
         let args = parse_ssh_args(
             "http --proxy_name blog --use_encryption --custom_domains --locations --group",
         )
         .unwrap();
-        assert!(!args.use_encryption);
+        assert!(args.use_encryption);
         assert!(args.custom_domains.is_empty());
         assert!(args.locations.is_empty());
         assert!(args.group.is_empty());

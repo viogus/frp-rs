@@ -159,20 +159,37 @@ async fn handle_conn(
     )
     .await?;
 
-    // Connect to HTTPS backend
+    // Connect to HTTPS backend. Every failure from here to the established
+    // backend TLS session answers Go's default ReverseProxy 502 (Go
+    // https2https.go dials + tls.Client + Handshake inline — each error is
+    // a transport.RoundTrip dial error → the bare 502 render; the old code
+    // dropped the TLS conn with nothing). ServerName construction failure
+    // is a dial-class error (no pre-dial validation exists in Go).
     let (host, port) = split_host_port(target);
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|e| format!("invalid host '{host}': {e}"))?;
+    let server_name = match ServerName::try_from(host.to_string()) {
+        Ok(n) => n,
+        Err(e) => {
+            return super::write_go_502(&mut client_tls, format!("invalid host '{host}': {e}"))
+                .await;
+        }
+    };
 
-    let tcp = TcpStream::connect(format!("{host}:{port}"))
-        .await
-        .map_err(|e| format!("connect to {host}:{port}: {e}"))?;
+    let tcp = match TcpStream::connect(format!("{host}:{port}")).await {
+        Ok(s) => s,
+        Err(e) => {
+            return super::write_go_502(&mut client_tls, format!("connect to {host}:{port}: {e}"))
+                .await;
+        }
+    };
     frp_core::transport::set_nodelay(&tcp);
 
-    let mut backend_tls = tls_connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| format!("TLS connect to {target}: {e}"))?;
+    let mut backend_tls = match tls_connector.connect(server_name, tcp).await {
+        Ok(t) => t,
+        Err(e) => {
+            return super::write_go_502(&mut client_tls, format!("TLS connect to {target}: {e}"))
+                .await;
+        }
+    };
 
     backend_tls
         .write_all(fwd.head.as_bytes())

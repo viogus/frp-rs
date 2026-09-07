@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::{mpsc, Notify};
 
-use super::config::KcpConfig;
+use super::config::{KcpConfig, KCP_WIRE_OVERHEAD};
 use super::protocol::{Error as KcpError, Kcp, KCP_WND_RCV};
 use super::socket::{chunk_pool_pop, chunk_pool_push, CHUNK_POOL_CAP, KCP_SND_BACKLOG_THRESHOLD};
 use crate::kcp_compat::Fec;
@@ -63,9 +63,20 @@ struct ShardGroup {
 /// a queued datagram stays in `pending_udp` until sent), and `KcpStream` write
 /// chunks cycle through the same pool. Best-effort like every pool in this
 /// codebase: a full pool just allocates fresh.
+///
+/// FEC sessions (`fec_prefix = KCP_WIRE_OVERHEAD`) reserve the full FEC wire
+/// prefix ahead of the segment: the payload is written at offset 8 with bytes
+/// 0..8 blank, and `fec_encode_output` patches the SEQID/TYPE/SIZE prefix in
+/// place — the pooled chunk itself becomes the FEC datagram (no second wire
+/// Vec per datagram, and the chunk keeps cycling through the pool after the
+/// driver sends it). Non-FEC sessions write at offset 0 with `fec_prefix = 0`,
+/// byte-identical to the pre-headroom layout.
 struct KcpWriter {
     packets: Vec<Vec<u8>>,
     pool: Arc<ArrayQueue<Vec<u8>>>,
+    /// Bytes reserved before each KCP segment: `KCP_WIRE_OVERHEAD` when FEC
+    /// is enabled, 0 otherwise.
+    fec_prefix: usize,
 }
 
 /// Typical number of KCP output packets per tick. Pre-allocating avoids
@@ -73,10 +84,11 @@ struct KcpWriter {
 const PACKET_POOL_CAPACITY: usize = 64;
 
 impl KcpWriter {
-    fn new(pool: Arc<ArrayQueue<Vec<u8>>>) -> Self {
+    fn new(pool: Arc<ArrayQueue<Vec<u8>>>, fec_prefix: usize) -> Self {
         Self {
             packets: Vec::with_capacity(PACKET_POOL_CAPACITY),
             pool,
+            fec_prefix,
         }
     }
 
@@ -93,8 +105,13 @@ impl Write for KcpWriter {
         // frp-rs patch (F3): reuse a pooled datagram buffer instead of a
         // fresh `to_vec()` per KCP output packet. The driver returns the
         // buffer to the pool after `try_send_to`.
-        let mut out = chunk_pool_pop(&self.pool, buf.len());
+        let mut out = chunk_pool_pop(&self.pool, buf.len() + self.fec_prefix);
         out.clear();
+        if self.fec_prefix > 0 {
+            // Blank prefix; `fec_encode_output` patches SEQID/TYPE/SIZE in
+            // place before the chunk is sent.
+            out.resize(self.fec_prefix, 0);
+        }
         out.extend_from_slice(buf);
         self.packets.push(out);
         Ok(buf.len())
@@ -212,7 +229,10 @@ impl KcpSession {
             None
         };
 
-        let writer = KcpWriter::new(chunk_pool.clone());
+        let writer = KcpWriter::new(
+            chunk_pool.clone(),
+            if fec.is_some() { KCP_WIRE_OVERHEAD } else { 0 },
+        );
         let mut kcp = if config.stream {
             Kcp::new_stream(conv, writer)
         } else {
@@ -309,26 +329,36 @@ impl KcpSession {
     fn fec_encode_output(&mut self, output: Vec<Vec<u8>>) -> io::Result<Vec<Vec<u8>>> {
         self.packets.clear();
         if let Some(ref fec) = self.fec {
-            for raw in &output {
-                // Build RS payload: SIZE(2B LE) + raw KCP data.
-                // SIZE = 2 + raw.len(), matching Go's len(b[payloadOffset:]).
-                let size = (2u16 + raw.len() as u16).to_le_bytes();
-                let mut rs_data = Vec::with_capacity(2 + raw.len());
-                rs_data.extend_from_slice(&size);
-                rs_data.extend_from_slice(raw);
-
-                // Data shard wire packet: FEC header(6B) + RS payload.
-                let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + rs_data.len());
-                packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
-                packet.extend_from_slice(&TYPE_DATA.to_le_bytes());
-                packet.extend_from_slice(&rs_data);
-                self.packets.push(packet);
+            for mut raw in output {
+                // `raw` is the pooled chunk KcpWriter filled with the KCP
+                // segment at offset KCP_WIRE_OVERHEAD (bytes 0..8 blank — see
+                // KcpWriter::fec_prefix). Patch the FEC wire prefix in place
+                // (layout per the module header: SEQID(4B LE) | TYPE(2B LE) |
+                // SIZE(2B LE) | KCP segment) so the pooled chunk ITSELF is
+                // the data-shard datagram: no per-datagram rs_data Vec, no
+                // fresh wire Vec, and the chunk cycles back to the pool after
+                // the driver sends it (previously the drained chunk was
+                // dropped here and the datagram was a throwaway allocation).
+                let payload_len = raw.len() - KCP_WIRE_OVERHEAD;
+                raw[0..4].copy_from_slice(&self.fec_seqid.to_le_bytes());
+                raw[4..6].copy_from_slice(&TYPE_DATA.to_le_bytes());
+                // SIZE = 2 + payload len, matching Go's
+                // len(b[payloadOffset:]) — raw[6..] now IS the RS payload.
+                raw[6..8].copy_from_slice(&(2u16 + payload_len as u16).to_le_bytes());
                 self.fec_seqid = self.fec_seqid.wrapping_add(1);
 
-                // Buffer for parity generation.
+                // Buffer for parity generation. The parity-input row
+                // (SIZE + payload = raw[6..]) must outlive the datagram —
+                // the chunk is sent and recycled this tick while the RS
+                // group only completes once data_shards have accumulated
+                // across ticks — so the row keeps its persistence copy.
+                let rs_data = raw[6..].to_vec();
                 let rs_len = rs_data.len();
                 self.pending_shards.push(rs_data);
                 self.pending_max_size = self.pending_max_size.max(rs_len);
+
+                // Emit the data shard (the pooled chunk itself).
+                self.packets.push(raw);
 
                 // When we have dataShards collected, generate parity.
                 if self.pending_shards.len() == self.config.data_shards {
@@ -347,7 +377,8 @@ impl KcpSession {
                     // `encode` would produce are discarded immediately.
                     let parity_shards = fec.encode_parity(&shard_refs[..n]);
 
-                    // Output parity shards (data shards already sent).
+                    // Output parity shards (data shards already sent). Parity
+                    // packets keep their existing allocation behavior.
                     for parity in &parity_shards {
                         let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
                         packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
@@ -363,7 +394,9 @@ impl KcpSession {
             }
             Ok(std::mem::take(&mut self.packets))
         } else {
-            // Non-FEC path: return output directly without going through self.packets.
+            // Non-FEC path: return output directly without going through
+            // self.packets. KcpWriter used fec_prefix = 0 for this session,
+            // so the chunks are plain KCP segments at offset 0.
             Ok(output)
         }
     }
@@ -1203,6 +1236,130 @@ mod tests {
             }
         }
         panic!("timed out waiting for FEC data with trailing zero");
+    }
+
+    /// Direct `fec_encode_output` pin: chunks laid out by KcpWriter under FEC
+    /// (KCP segment at offset KCP_WIRE_OVERHEAD, bytes 0..8 blank) must come
+    /// back with the SEQID/TYPE/SIZE prefix patched into 0..8 in place and
+    /// the segment untouched at 8.. — no rs_data copy, no fresh wire Vec.
+    #[test]
+    fn test_fec_encode_output_patches_prefix_in_place() {
+        let config = fec_config(); // data_shards = 3, parity_shards = 2
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut sender = KcpSession::new(12, "127.0.0.1:9999".parse().unwrap(), config.clone(), tx);
+
+        // Crafted inputs, byte-layout as the writer produces them for FEC
+        // sessions: blank 8-byte prefix + KCP segment (here "seg0..seg2").
+        let segs: [&[u8]; 3] = [b"seg0", b"seg12", b"seg34567"];
+        let crafted: Vec<Vec<u8>> = segs
+            .iter()
+            .map(|seg| {
+                let mut c = vec![0u8; KCP_WIRE_OVERHEAD];
+                c.extend_from_slice(seg);
+                c
+            })
+            .collect();
+        let out = sender.fec_encode_output(crafted).unwrap();
+
+        // 3 data shards (one per input) + 2 parity shards (group completed).
+        assert_eq!(out.len(), 5, "3 data + 2 parity shards");
+        let (data, parity): (Vec<&Vec<u8>>, Vec<&Vec<u8>>) = out
+            .iter()
+            .partition(|p| u16::from_le_bytes([p[4], p[5]]) == TYPE_DATA);
+        assert_eq!(data.len(), 3);
+        assert_eq!(parity.len(), 2);
+
+        // Data shards: prefix patched in place — seqid 0..3 at 0..4, TYPE at
+        // 4..6, SIZE(2 + payload) at 6..8 — and the original payload bytes
+        // preserved verbatim at 8.. .
+        for (i, pkt) in data.iter().enumerate() {
+            assert_eq!(&pkt[0..4], &(i as u32).to_le_bytes(), "seqid {i}");
+            assert_eq!(&pkt[4..6], &TYPE_DATA.to_le_bytes(), "data type {i}");
+            let size = u16::from_le_bytes([pkt[6], pkt[7]]) as usize;
+            assert_eq!(size, pkt.len() - 6, "SIZE = 2 + payload ({i})");
+            assert_eq!(&pkt[8..], segs[i], "segment payload at offset 8 ({i})");
+        }
+
+        // Parity shards keep their existing wire shape: TYPE at 4..6, equal
+        // length (padded RS rows), seqids continuing after the data shards.
+        let expected_parity_len = data.iter().map(|p| p.len()).max().unwrap() - 6;
+        for (j, pkt) in parity.iter().enumerate() {
+            assert_eq!(&pkt[4..6], &TYPE_PARITY.to_le_bytes(), "parity type {j}");
+            assert_eq!(
+                pkt.len() - 6,
+                expected_parity_len,
+                "parity row padded ({j})"
+            );
+            assert_eq!(
+                &pkt[0..4],
+                &(3u32 + j as u32).to_le_bytes(),
+                "parity seqid continues after data ({j})"
+            );
+        }
+        // RS round-trip: parity over the 3 data rows must equal the emitted
+        // parity bytes (decode of data0+data2+parity0 recovers data1).
+        // Rows are ragged here (segs 4/5/8 bytes → rows 6/7/10): decode
+        // zero-extends each row to the group max (kcp_compat Fec::decode
+        // normalizes like the receive path — "Go: zero-extend shorter
+        // shards"), so the recovered row carries that zero padding and is
+        // compared against the padded expectation.
+        let fec = Fec::new(3, 2);
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; 5];
+        shards[0] = Some(data[0][6..].to_vec());
+        shards[2] = Some(data[2][6..].to_vec());
+        shards[3] = Some(parity[0][6..].to_vec());
+        assert!(fec.decode(&mut shards), "RS decode must succeed");
+        let mut expected_row1 = data[1][6..].to_vec();
+        expected_row1.resize(expected_parity_len, 0);
+        assert_eq!(
+            shards[1].as_deref(),
+            Some(&expected_row1[..]),
+            "recovered row 1 (zero-padded to the group max)"
+        );
+    }
+
+    /// Real-path pin: with a pool pre-seeded by an oversized chunk, the
+    /// emitted data shard must BE that pooled chunk (its capacity survives),
+    /// proving the datagram is the pool-cycled buffer, not a fresh wire Vec.
+    #[test]
+    fn test_fec_data_shard_is_pooled_chunk() {
+        let config = fec_config();
+        let pool = Arc::new(ArrayQueue::new(CHUNK_POOL_CAP));
+        pool.push(vec![0x5a; 4096]).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut sender =
+            KcpSession::with_chunk_pool(4242, "127.0.0.1:9001".parse().unwrap(), config, tx, pool);
+
+        // One send = one KCP output segment = one data shard on the first
+        // flush; KCP writer pops the seeded chunk for it.
+        sender.send(b"hello in-place fec").unwrap();
+        let packets = sender.update(10).unwrap();
+        let data: Vec<&Vec<u8>> = packets
+            .iter()
+            .filter(|p| p.len() >= 8 && u16::from_le_bytes([p[4], p[5]]) == TYPE_DATA)
+            .collect();
+        assert!(!data.is_empty(), "first update must flush a data shard");
+        for pkt in &data {
+            // Wire layout: seqid at 0..4, TYPE at 4..6, SIZE at 6..8, KCP
+            // segment (conv first) at 8.. — payload at offset 8 verified
+            // against the session conv.
+            assert_eq!(&pkt[0..4], &0u32.to_le_bytes(), "first data seqid is 0");
+            assert_eq!(&pkt[4..6], &TYPE_DATA.to_le_bytes());
+            let size = u16::from_le_bytes([pkt[6], pkt[7]]) as usize;
+            assert_eq!(size, pkt.len() - 6, "SIZE = 2 + payload");
+            assert_eq!(
+                &pkt[8..12],
+                &4242u32.to_le_bytes(),
+                "KCP segment (conv) must start at offset 8"
+            );
+        }
+        let first = data[0];
+        assert!(
+            first.capacity() >= 4096,
+            "data shard must be the seeded pooled chunk (capacity = {}; a \
+             fresh wire Vec would be ~segment-sized)",
+            first.capacity()
+        );
     }
 
     /// Build one FEC wire datagram: seqid u32 LE + flag u16 LE + body.

@@ -6,7 +6,8 @@
 //! Server sites exercised, each with its exact denial text asserted:
 //!   STCP fresh-conn NewVisitorConn            handlers/dispatch.rs:208   -> "visitor not allowed"
 //!   XTCP control-channel NewVisitorConn       control/nathole.rs:395     -> "auth failed"
-//!   XTCP control-channel NatHoleVisitor       control/nathole.rs:495     -> "access denied" / "access denied: owner only"
+//!   XTCP control-channel NatHoleVisitor       control/nathole.rs pre_check gate -> Go literal "xtcp visitor user [{user}] not allowed for [{proxy}]" (controller.go:163, one text for owner-only + allow-list denials)
+//!   XTCP control-channel NatHoleVisitor full arm -> NO user gate (Go parity, controller.go:169-194: proxy-exists + sign key only) — a valid-sk holder outside allow_users is admitted
 //!   XTCP fresh-conn NatHoleVisitor (precheck) handlers/dispatch.rs:453   -> "access denied: restricted to authenticated users"
 //!   XTCP fresh-conn NatHoleVisitor (full)     handlers/dispatch.rs:577   -> "access denied: use control channel for user-based auth"
 //!
@@ -43,10 +44,16 @@ use common::{allocate_port, login_with_identity, start_test_server, test_auth_cf
 /// server sources above — a refactor of the strings must update these).
 const STCP_FRESH_VISITOR_NOT_ALLOWED: &str = "visitor not allowed";
 const XTCP_CTL_REG_AUTH_FAILED: &str = "auth failed";
-const XTCP_CTL_LIST_DENIED: &str = "access denied";
-const XTCP_CTL_OWNER_ONLY_DENIED: &str = "access denied: owner only";
 const XTCP_FRESH_PRE_CHECK_DENIED: &str = "access denied: restricted to authenticated users";
 const XTCP_FRESH_FULL_DENIED: &str = "access denied: use control channel for user-based auth";
+
+/// Go allow-denial literal for the control-channel NatHoleVisitor pre_check
+/// gate (controller.go:163) — ONE text for the owner-only and the allow-list
+/// denials (Go normalizes empty allow_users to [owner] at registration,
+/// server/proxy/xtcp.go:58-62, so the same gate covers both).
+fn xtcp_ctl_allow_denied(visitor_user: &str, proxy_name: &str) -> String {
+    format!("xtcp visitor user [{visitor_user}] not allowed for [{proxy_name}]")
+}
 
 fn test_addr(port: u16) -> SocketAddr {
     format!("127.0.0.1:{port}").parse().unwrap()
@@ -527,12 +534,17 @@ async fn expect_ctl_nat_hole_verdict(
     }
 }
 
-/// XTCP control-channel site (control/nathole.rs:495 — the path real XTCP
-/// frpc visitors use: registration NewVisitorConn + NatHoleVisitor per user
-/// connection are both sent over the visitor's own control channel):
-///   allow-list proxy: registration "auth failed", NatHoleVisitor (pre_check
-///   and full arms) "access denied"; listed user admitted through both.
-///   owner-only proxy: "access denied: owner only"; owner admitted.
+/// XTCP control-channel site (control/nathole.rs handle_nat_hole_visitor_on_ctl
+/// — the path real XTCP frpc visitors use: registration NewVisitorConn +
+/// NatHoleVisitor per user connection are both sent over the visitor's own
+/// control channel):
+///   allow-list proxy: registration "auth failed"; NatHoleVisitor pre_check
+///   denied with the Go literal `xtcp visitor user [bob] not allowed for
+///   [xcp-l]`; the FULL arm (valid sk) is ADMITTED — Go checks allow_users in
+///   the PreCheck branch only (controller.go:154-167), the full path is
+///   proxy-exists + sign key (:169-194). Listed user admitted through both.
+///   owner-only proxy: pre_check denied with the same Go literal (empty
+///   allow_users normalized to [owner]); owner admitted.
 #[tokio::test]
 async fn xtcp_allow_users_enforced_on_control_channel() {
     let addr = start_two_user_server(allocate_port()).await;
@@ -575,36 +587,60 @@ async fn xtcp_allow_users_enforced_on_control_channel() {
         ),
     }
 
-    // Per-connection NatHoleVisitor, pre_check arm: "access denied".
+    // Per-connection NatHoleVisitor, pre_check arm: denied with the Go
+    // literal (allow-list case).
     expect_ctl_nat_hole_verdict(
         &mut bob_ctl,
         "txn-bob-precheck",
         "xcp-l",
         "sk-xl",
         true,
-        Some(XTCP_CTL_LIST_DENIED),
+        Some(&xtcp_ctl_allow_denied("bob", "xcp-l")),
         "bob pre_check on allow-list xtcp proxy",
     )
     .await;
-    // Full arm (real punch request): same gate, same text.
-    expect_ctl_nat_hole_verdict(
+    // Full arm (real punch request): Go checks allow_users ONLY in the
+    // pre_check branch — bob's VALID sk admits him here (controller.go:
+    // 169-194: proxy-exists + sign key only; the Rust-only owner/allow gate
+    // was moved inside pre_check for parity). The session proceeds: the
+    // provider is notified via InternalMsg and — with an empty work pool —
+    // handle_sid_on_work_conn writes ReqWorkConn on the provider's control
+    // and queues the NatHoleSid.
+    write_msg_v1(
         &mut bob_ctl,
-        "txn-bob-full",
-        "xcp-l",
-        "sk-xl",
-        false,
-        Some(XTCP_CTL_LIST_DENIED),
-        "bob full NatHoleVisitor on allow-list xtcp proxy",
+        &xtcp_visitor_msg("txn-bob-full", "xcp-l", "sk-xl", false),
     )
-    .await;
-    // Owner-only proxy (empty allow_users): the owner-only text.
+    .await
+    .expect("bob full NatHoleVisitor");
+    // The provider control receives the ReqWorkConn the sid queue requested
+    // (raw_login drained the prewarm ReqWorkConn, so this one is fresh).
+    match recv_msg(&mut owner_ctl, "owner ReqWorkConn for bob full admission").await {
+        FrpMessage::ReqWorkConn(_) => {}
+        other => panic!(
+            "expected ReqWorkConn to provider after bob full-path admission, got type byte {:?}",
+            other.v1_type_byte()
+        ),
+    }
+    // And bob's control gets NO NatHoleResp error — bounded silence proves
+    // the admission did not fail (the punch flow waits for the provider's
+    // NatHoleClient, which this test never sends).
+    match tokio::time::timeout(Duration::from_millis(500), read_msg_v1(&mut bob_ctl)).await {
+        Err(_elapsed) => {}
+        Ok(Ok(other)) => panic!(
+            "expected silence on bob_ctl after full-path admission, got type byte {:?}",
+            other.v1_type_byte()
+        ),
+        Ok(Err(e)) => panic!("bob_ctl read error: {e}"),
+    }
+    // Owner-only proxy (empty allow_users → [owner] in Go): the same Go
+    // literal, since the owner-only and allow-list denials share one text.
     expect_ctl_nat_hole_verdict(
         &mut bob_ctl,
         "txn-bob-owneronly",
         "xcp-o",
         "sk-xo",
         true,
-        Some(XTCP_CTL_OWNER_ONLY_DENIED),
+        Some(&xtcp_ctl_allow_denied("bob", "xcp-o")),
         "bob pre_check on owner-only xtcp proxy",
     )
     .await;

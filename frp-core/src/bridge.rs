@@ -344,6 +344,74 @@ async fn write_gateway_timeout_504(user_w: &mut (impl tokio::io::AsyncWriteExt +
     }
 }
 
+/// Go frp v0.71.0 `NotFoundResponse` builtin body (pkg/util/http/http.go)
+/// — served when no `custom_404_page` is configured. 489 bytes; with the
+/// 92-byte head written by [`write_not_found_response`] the full answer is
+/// 581 bytes (probe vs Go v0.71.0).
+///
+/// Shared crate-wide: frp-server's vhost/tcpmux route-miss writers and this
+/// crate's work→user bridge Err arm (Go `httputil.ReverseProxy`
+/// ErrorHandler parity — every non-timeout backend failure answers this
+/// same 404, pkg/util/vhost/http.go:128-138) all write one byte template.
+pub const GO_404_NOT_FOUND_BODY: &str = concat!(
+    "<!DOCTYPE html>\n",
+    "<html>\n",
+    "<head>\n",
+    "<title>Not Found</title>\n",
+    "<style>\n",
+    "    body {\n",
+    "        width: 35em;\n",
+    "        margin: 0 auto;\n",
+    "        font-family: Tahoma, Verdana, Arial, sans-serif;\n",
+    "    }\n",
+    "</style>\n",
+    "</head>\n",
+    "<body>\n",
+    "<h1>The page you requested was not found.</h1>\n",
+    "<p>Sorry, the page you are looking for is currently unavailable.<br/>\n",
+    "Please try again later.</p>\n",
+    "<p>The server is powered by <a href=\"https://github.com/fatedier/frp\">frp</a>.</p>\n",
+    "<p><em>Faithfully yours, frp.</em></p>\n",
+    "</body>\n",
+    "</html>\n",
+);
+
+/// Write Go frp's `NotFoundResponse` (pkg/util/http/http.go) — the 404
+/// answer on a vhost/tcpmux route miss, on a control-gone (Go
+/// connectHandler's CreateConnection error path answers the same 404, not
+/// a 502), and on a malformed/oversize backend response head in the
+/// work→user bridge (Go ErrorHandler parity). Head order is fixed
+/// (Content-Length, Content-Type, Server) and matches the Go literal
+/// byte-for-byte; `custom_body` (custom_404_page) replaces the builtin
+/// HTML when non-empty, with Content-Length tracking the custom body. Go's
+/// stdlib http.Server-layer additions (Date, Connection: close, charset)
+/// that http.Error-based handlers would emit are absent from frp's own
+/// pre-built response — the raw write sites emit NotFoundResponse
+/// verbatim, like the Go CONNECT path. Write failures mean the client
+/// disconnected; logged at debug so a hung client stays observable.
+pub async fn write_not_found_response(
+    stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    custom_body: &str,
+) {
+    let body: &[u8] = if custom_body.is_empty() {
+        GO_404_NOT_FOUND_BODY.as_bytes()
+    } else {
+        custom_body.as_bytes()
+    };
+    let head = format!(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nContent-Type: text/html\r\nServer: frp/{}\r\n\r\n",
+        body.len(),
+        crate::VERSION
+    );
+    if let Err(e) = stream.write_all(head.as_bytes()).await {
+        tracing::debug!(error = %e, "failed to write HTTP error response header");
+        return;
+    }
+    if let Err(e) = stream.write_all(body).await {
+        tracing::debug!(error = %e, "failed to write HTTP error response body");
+    }
+}
+
 /// Bridge work→user direction: read from work (plain or via CipherReader),
 /// decompress, apply the shared per-proxy bandwidth limit, write to user.
 ///
@@ -352,7 +420,20 @@ async fn write_gateway_timeout_504(user_w: &mut (impl tokio::io::AsyncWriteExt +
 /// bytes before the deadline (Go frp VhostHTTPTimeout / ResponseHeaderTimeoutS
 /// semantics), a body-less `504 Gateway Timeout` is written to the user and
 /// the direction ends. First byte arrival is taken as the (approximate) start
-/// of the response head; subsequent reads are never timed out.
+/// of the response head; subsequent reads are never timed out. (The
+/// frp-server ResponseHeaderInjector arms its own absolute deadline instead
+/// and passes `None` here — its TimedOut errors surface through the read-Err
+/// mapping below.)
+///
+/// Read errors end the direction with a Go-shaped answer, mirroring Go
+/// frp v0.71.0's vhost ErrorHandler (pkg/util/vhost/http.go:128-138):
+/// `TimedOut` (an upstream absolute head deadline that fired after interim
+/// bytes were served) writes the bare 504; `InvalidData` (an upstream head
+/// parser rejected the backend head — no status line, or over its size
+/// cap) writes Go's NotFoundResponse 404 page
+/// ([`write_not_found_response`]). Other error kinds are logged and the
+/// direction ends silently (Go would also 404 them — scope-limited
+/// follow-up, none are produced on this read path today).
 ///
 /// `decompress_read` controls whether bytes read from `work_r` are decoded as
 /// a Snappy stream. It is independent of the opposite direction's compression
@@ -380,6 +461,20 @@ async fn bridge_work_to_user(
     };
     let mut decompressor = make_decompressor(decompress_read);
     let mut header_timeout = header_timeout;
+    // Gateway error heads (404/504 below) are safe to write only while no
+    // FINAL response head has reached the user — Go's vhost ErrorHandler
+    // runs solely on a RoundTrip failure and a mid-body error merely aborts
+    // the transport copy (reverseproxy.go). That phase is owned by the
+    // caller's reader, not by this function: on http legs frp-server wraps
+    // work_r in ResponseHeaderInjector, which (a) never emits error kinds
+    // once an injectable final head has been served — a mid-body decode
+    // failure after the head is swallowed there and surfaced as clean EOF —
+    // and (b) converts a pre-head inner EOF into Err(UnexpectedEof) so the
+    // 404 arm below answers it. Interim 1xx relays are a legal prefix to a
+    // late 404/504 (an Expect:100 backend that answers 100 and then stalls
+    // or dies still gets the gateway head Go would have sent). Non-http
+    // legs (no injector) produce none of the three error kinds below — raw
+    // sockets error ConnectionReset-class and their clean close is Ok(0).
     'read_loop: loop {
         let read_res = match header_timeout.take() {
             Some(timeout) => {
@@ -397,6 +492,13 @@ async fn bridge_work_to_user(
             None => work_r.read(buf.as_mut_slice()).await,
         };
         let n = match read_res {
+            // Clean EOF. After a complete head — or on any leg without an
+            // injector — this is normal end-of-stream (backend closed) and
+            // stays silent. A pre-head EOF on an http leg never reaches
+            // this arm: the ResponseHeaderInjector converts it to
+            // Err(UnexpectedEof) so the 404 arm below answers it (Go
+            // readResponse errors on an unterminated head → ErrorHandler
+            // 404; nothing is relayed).
             Ok(0) => break,
             Ok(n) => {
                 trace_hex!(n, first_hex = %crate::hex_encode(&buf.raw_buf()[..n.min(32)]), "bridge work_to_user: read {} bytes", n);
@@ -417,7 +519,42 @@ async fn bridge_work_to_user(
                         "bridge work_to_user: response-head deadline hit, writing 504"
                     );
                     write_gateway_timeout_504(&mut user_w).await;
+                } else if e.kind() == std::io::ErrorKind::InvalidData
+                    || e.kind() == std::io::ErrorKind::UnexpectedEof
+                {
+                    // The backend never produced a usable response head —
+                    // both kinds are emitted only by the injector's
+                    // head-gather phase, which ends the moment a final head
+                    // is served (after that the injector passes reads
+                    // through raw and swallows a mid-body decode failure as
+                    // clean EOF — the contract note above), so no final
+                    // head can be in flight here. InvalidData = the head was rejected as
+                    // malformed (no status line, or past the 64 KiB injector
+                    // cap); UnexpectedEof = the backend closed before
+                    // completing a head (the injector converts its pre-head
+                    // Ok(0); a partial unterminated head is dropped, never
+                    // relayed raw). Go frp v0.71.0: every non-timeout
+                    // reverse-proxy failure answers the 404 NotFoundResponse
+                    // page (vhost ErrorHandler http.go:128-138 — undecodable
+                    // and oversize heads land here; Go's cap is the 10 MiB
+                    // `maxHeaderResponseSize` default, transport.go:2106-2112 —
+                    // frp-rs's 64 KiB injector cap is a documented Rust
+                    // hardening divergence). Write the 404, then end this
+                    // direction.
+                    tracing::debug!(
+                        error = %e,
+                        "bridge work_to_user: no usable response head, writing 404"
+                    );
+                    write_not_found_response(&mut user_w, "").await;
                 } else {
+                    // Any other read failure (conn reset, EOF race, ...).
+                    // Go's ErrorHandler answers the same 404
+                    // NotFoundResponse for every non-timeout error;
+                    // frp-rs only logs and ends the direction here — a
+                    // scope-limited follow-up, since these error kinds are
+                    // not currently produced on the work->user read path
+                    // (TimedOut, InvalidData and UnexpectedEof above are
+                    // the three the injector can surface).
                     tracing::debug!(error = %e, "bridge work_to_user: read error");
                 }
                 break;
@@ -2683,5 +2820,74 @@ mod tests {
         // Keep test_a_w alive until the error check is done; the failed
         // direction owns the a_w half via BiLock split.
         drop(test_a_w);
+    }
+
+    /// Work reader whose first read fails with InvalidData — the error
+    /// shape frp-server's ResponseHeaderInjector produces when it rejects
+    /// the backend response head (no status line, or the head exceeds the
+    /// 64 KiB cap).
+    struct InvalidDataWorkReader;
+
+    impl tokio::io::AsyncRead for InvalidDataWorkReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "backend response head has no status line",
+            )))
+        }
+    }
+
+    /// Work→user bridge: a rejected backend response head (InvalidData) must
+    /// answer the Go-shaped 404 NotFoundResponse on the user side — the
+    /// fixed head (Content-Length of the body, Content-Type: text/html,
+    /// Server: frp/version) plus the 489-byte builtin page — then end the
+    /// direction. Mirrors Go frp v0.71.0's vhost ErrorHandler
+    /// (pkg/util/vhost/http.go:128-138): every non-timeout reverse-proxy
+    /// failure writes the NotFound 404 page (undecodable and oversize
+    /// backend heads land here; Go's head cap is the 10 MiB
+    /// maxHeaderResponseSize default, transport.go:2106-2112).
+    #[tokio::test]
+    async fn test_bridge_work_to_user_invalid_data_writes_go_404() {
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            bridge_work_to_user(
+                InvalidDataWorkReader,
+                u_w_bridge,
+                false, // plaintext passthrough — the error surfaces before any decode
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let mut received = Vec::new();
+        // Bounded collection: a regression that never writes the 404 (or
+        // never ends the direction) must fail this test, not hang the suite.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let n = u_r_test.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("bridge must write the 404 and end the direction within 5s");
+        let expected_head = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nContent-Type: text/html\r\nServer: frp/{}\r\n\r\n",
+            GO_404_NOT_FOUND_BODY.len(),
+            crate::VERSION
+        );
+        let mut expected = expected_head.into_bytes();
+        expected.extend_from_slice(GO_404_NOT_FOUND_BODY.as_bytes());
+        assert_eq!(received, expected);
     }
 }

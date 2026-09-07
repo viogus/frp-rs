@@ -551,69 +551,16 @@ impl VhostManager {
         self.lookup_wildcard(domain, path, http_user, scheme).await
     }
 }
-/// Go frp v0.71.0 `NotFoundResponse` builtin body (pkg/util/http/http.go)
-/// — served when no `custom_404_page` is configured. 489 bytes; with the
-/// 92-byte head written by [`write_not_found_response`] the full answer is
-/// 581 bytes (probe vs Go v0.71.0).
-pub const GO_404_NOT_FOUND_BODY: &str = concat!(
-    "<!DOCTYPE html>\n",
-    "<html>\n",
-    "<head>\n",
-    "<title>Not Found</title>\n",
-    "<style>\n",
-    "    body {\n",
-    "        width: 35em;\n",
-    "        margin: 0 auto;\n",
-    "        font-family: Tahoma, Verdana, Arial, sans-serif;\n",
-    "    }\n",
-    "</style>\n",
-    "</head>\n",
-    "<body>\n",
-    "<h1>The page you requested was not found.</h1>\n",
-    "<p>Sorry, the page you are looking for is currently unavailable.<br/>\n",
-    "Please try again later.</p>\n",
-    "<p>The server is powered by <a href=\"https://github.com/fatedier/frp\">frp</a>.</p>\n",
-    "<p><em>Faithfully yours, frp.</em></p>\n",
-    "</body>\n",
-    "</html>\n",
-);
-
-/// Write Go frp's `NotFoundResponse` (pkg/util/http/http.go) — the 404
-/// answer on a vhost/tcpmux route miss and on a control-gone (Go
-/// connectHandler's CreateConnection error path answers the same 404, not
-/// a 502). Head order is fixed (Content-Length, Content-Type, Server) and
-/// matches the Go literal byte-for-byte; `custom_body` (custom_404_page)
-/// replaces the builtin HTML when non-empty, with Content-Length tracking
-/// the custom body. Go's stdlib http.Server-layer additions (Date,
-/// Connection: close, charset) that http.Error-based handlers would emit
-/// are absent from frp's own pre-built response — the vhost GET path
-/// writes NotFoundResponse raw, like the CONNECT path.
-pub(crate) async fn write_not_found_response(
-    stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
-    custom_body: &str,
-) {
-    let body: &[u8] = if custom_body.is_empty() {
-        GO_404_NOT_FOUND_BODY.as_bytes()
-    } else {
-        custom_body.as_bytes()
-    };
-    // Write failures here mean the client disconnected before receiving the
-    // error response — there is no recovery path, so we silently drop them.
-    // They are still logged at debug so a hung client that never reads the
-    // error response remains observable in traces (audit-round4 H5).
-    let head = format!(
-        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nContent-Type: text/html\r\nServer: frp/{}\r\n\r\n",
-        body.len(),
-        frp_core::VERSION
-    );
-    if let Err(e) = stream.write_all(head.as_bytes()).await {
-        tracing::debug!(error = %e, "failed to write HTTP error response header");
-        return;
-    }
-    if let Err(e) = stream.write_all(body).await {
-        tracing::debug!(error = %e, "failed to write HTTP error response body");
-    }
-}
+/// Go frp v0.71.0 `NotFoundResponse` writer (pkg/util/http/http.go) —
+/// re-exported from frp-core so the work→user bridge Err arm (Go
+/// ErrorHandler parity: non-timeout backend failures answer this same 404,
+/// pkg/util/vhost/http.go:128-138) and the vhost/tcpmux route-miss +
+/// control-gone writers share one byte template (and one builtin body,
+/// `frp_core::bridge::GO_404_NOT_FOUND_BODY`). See frp-core for the doc:
+/// 489-byte builtin body (probe vs Go v0.71.0), head order fixed
+/// (Content-Length, Content-Type, Server), `custom_body`
+/// (custom_404_page) replacing the builtin HTML when non-empty.
+pub(crate) use frp_core::bridge::write_not_found_response;
 
 /// Write the Go `http.Error` auth-fail render (pkg/util/vhost/http.go
 /// ServeHTTP: `rw.Header().Set(...); http.Error(rw, http.StatusText(code),
@@ -1011,6 +958,34 @@ async fn handle_http1_request<S>(
     {
         write_go_server_error(&mut stream, "400 Bad Request: missing required Host header").await;
         return;
+    }
+    // FIX 6 (audit round 14): Go conn.readRequest's server-layer head
+    // validation (server.go:1061-1072) — dup-Host → 505 → missing-Host
+    // keep their Go order above, then Go validates the Host value
+    // (ValidHostHeader) and the per-header name bytes. Runs for EVERY
+    // parse-Ok request — CONNECT and absolute-form included (Go validates
+    // the wire headers regardless of routing). Render classes verified
+    // byte-for-byte with probes vs go1.25.0: textproto read-time classes
+    // (CTL in a value, non-token non-space name bytes) answer the GENERIC
+    // 400 (e.g. "Host: a.co\x01m" never reaches the malformed-Host gate);
+    // a space-containing name reaches the http layer and answers the
+    // DETAILED "invalid header name"; an invalid single Host value (e.g.
+    // "Host: a.com b.com") answers the DETAILED "malformed Host header".
+    // Residual ordering nuance (documented, not fixed): Go's read-time
+    // classes fire BEFORE the dup-Host/505/missing-Host gates, so a
+    // multi-defect head that trips one of those arms can take that arm's
+    // render here where Go's read-time error would win (both 400s, except
+    // an HTTP/2.0 + read-time-defect head: 505 vs Go's 400).
+    match validate_vhost_head_lines(request_text) {
+        HeadLineVerdict::Ok => {}
+        HeadLineVerdict::Malformed => {
+            write_go_server_error(&mut stream, "400 Bad Request").await;
+            return;
+        }
+        HeadLineVerdict::Detailed(text) => {
+            write_go_server_error(&mut stream, text).await;
+            return;
+        }
     }
     // No usable Host value (no Host line on a gate-exempt request, or an
     // empty-valued "Host:") routes on "" — Go's req.Host == "" fallback;
@@ -1742,6 +1717,214 @@ pub async fn run_vhost_https_listener(
     Err("TLS feature not enabled".into())
 }
 
+/// RFC 7230 tchar (ALPHA / DIGIT / "!#$%&'*+-.^_`|~") — Go's method and
+/// header-name byte set (httpguts `ValidHeaderFieldName` / textproto
+/// `validHeaderFieldByte`). 0x80+ obs-text is never tchar; lossy-converted
+/// heads (U+FFFD = EF BF BD) are rejected for names exactly like Go rejects
+/// obs-text names.
+fn is_vhost_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// textproto `validHeaderValueByte` complement: a value byte is a parse
+/// error when it is a CTL other than HTAB (< 0x20, != 0x09) or DEL (0x7f).
+/// obs-text (0x80+) is legal.
+fn is_bad_vhost_value_byte(b: u8) -> bool {
+    (b < b' ' && b != b'\t') || b == 0x7f
+}
+
+/// httpguts `validHostByte` (httplex.go:225-263) — the lenient
+/// `ValidHostHeader` byte set: RFC 3986 unreserved + sub-delims plus
+/// ':' '[' ']' and '%' (pct-encoding / IPv6 zones).
+fn is_valid_vhost_host_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'$'
+                | b'%'
+                | b'&'
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b'-'
+                | b'.'
+                | b':'
+                | b';'
+                | b'='
+                | b'['
+                | b'\''
+                | b']'
+                | b'_'
+                | b'~'
+        )
+}
+
+/// Verdict of the FIX-6 head-line validation (Go conn.readRequest's
+/// server-layer checks, server.go:1061-1072). PartialEq/Eq/Debug for the
+/// verdict unit tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadLineVerdict {
+    /// No defect in the prescribed classes.
+    Ok,
+    /// Generic 400 render ("400 Bad Request") — Go textproto read-time
+    /// classes (they precede the dup-Host/505/missing-Host gates in Go;
+    /// see the caller comment for the residual ordering nuance).
+    Malformed,
+    /// Go statusError — carries the FULL status text (detail appended on
+    /// the status line AND the body: "400 Bad Request: malformed Host
+    /// header"), ready for write_go_server_error.
+    Detailed(&'static str),
+}
+
+/// FIX 6 (audit round 14): Go conn.readRequest's post-gate head
+/// validation (server.go:1061-1072), verified byte-for-byte with probes
+/// against go1.25.0. The caller keeps the Go order of the earlier arms
+/// (dup-Host → 505 → missing-Host); this function covers the classes that
+/// follow them in Go's flow, over the RAW wire lines (textproto merges
+/// obs-fold continuations into the preceding header's value with a single
+/// SP per fold after TrimSpace — readContinuedLineSlice):
+///
+/// 1. CTL/DEL in any header VALUE — the group-first line's after-colon
+///    bytes AND every obs-fold continuation of that group (Go's value
+///    byte check runs on the MERGED line) → `Malformed` (generic 400).
+///    This class includes a CTL byte in the Host value: probe
+///    "Host: a.co\x01m" answers the GENERIC 400 — textproto rejects at
+///    read time, before the ValidHostHeader gate would ever see it.
+/// 2. A header NAME byte that is neither tchar nor SPACE — parens, tab,
+///    DEL, obs-text — or an empty name (" : x") → `Malformed` (generic
+///    400): textproto `canonicalMIMEHeaderKey` accepts ONLY SPACE in a
+///    name (go.dev/issue/34540 — probe: "Bad Name: x" reaches the http
+///    layer while "Bad(Name: x" errors at read time). SPACE in a name is
+///    deliberately NOT a generic error.
+/// 3. The single Host value (fold-merged) failing httpguts
+///    `ValidHostHeader` → `Detailed("malformed Host header")`. Any
+///    obs-fold after the Host line fails: the merge inserts a SP into
+///    the value (probe: "Host: a.com b.com" → malformed-Host detail).
+///    Empty value passes (ValidHostHeader("") == true).
+/// 4. A SPACE-containing header name → `Detailed("invalid header name")`
+///    (server.go:1065 — textproto stored the line; the http layer
+///    rejects the non-token key).
+///
+/// Render precedence inside this function mirrors Go: the read-time
+/// generic classes (1/2) beat the statusError details (3/4), and the Host
+/// check (3) precedes the name check (4). The textproto read-time classes
+/// actually fire BEFORE Go's dup-Host/505/missing-Host gates — the
+/// prescription keeps those arms' earlier order, so a multi-defect head
+/// that also trips a gate can take the gate's render here where Go's
+/// read-time error would win (both 400s except the 505 class).
+fn validate_vhost_head_lines(request: &str) -> HeadLineVerdict {
+    let mut lines = request.lines().skip(1).peekable();
+    let mut malformed = false;
+    let mut space_name = false;
+    // First Host group's merged value (Go Header map: first Host line
+    // wins — extract_host_header uses the same .find() order).
+    let mut host_value: Option<String> = None;
+    while let Some(first) = lines.next() {
+        if first.starts_with(' ') || first.starts_with('\t') {
+            // obs-fold continuation directly after the REQUEST line: Go
+            // textproto "malformed MIME header initial line" — generic.
+            // (A fold after a real header group is consumed inside the
+            // group loop below; its bytes face the value CTL check there.)
+            malformed = true;
+            continue;
+        }
+        let Some(colon) = first.find(':') else {
+            // Group-first line without a colon — Go textproto's
+            // missing-colon error (generic). Not one of the FIX-6
+            // prescribed classes; the pre-existing router forwards such
+            // heads unchanged.
+            continue;
+        };
+        let name = &first[..colon];
+        let value = &first[colon + 1..];
+        // Class 2: name bytes. textproto accepts SPACE (no
+        // canonicalization — go.dev/issue/34540) and rejects everything
+        // else that is not tchar, including an empty name.
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.iter().any(|b| !is_vhost_tchar(*b) && *b != b' ') {
+            malformed = true;
+        } else if name_bytes.contains(&b' ') {
+            space_name = true;
+        }
+        // Class 1 + obs-fold merge: the group's value is the first line's
+        // after-colon bytes plus each continuation line (" " + TrimSpace
+        // per fold, Go readContinuedLineSlice); CTL/DEL anywhere in the
+        // merged value is a generic read-time error (probe: CTL inside a
+        // fold → ERR). Go TrimSpaces every PHYSICAL line before the merge,
+        // so the scan runs on the tail-trimmed first-line value and the
+        // fully trimmed fold contents (only SP/HTAB/other whitespace can
+        // be trimmed away — interior CTL bytes always survive the scan).
+        let mut value_has_ctl = value.trim_end().bytes().any(is_bad_vhost_value_byte);
+        let mut merged: Option<String> =
+            if name.eq_ignore_ascii_case("host") && host_value.is_none() {
+                // Go stored value: readContinuedLineSlice trim()s the whole
+                // PHYSICAL line first (SP/HTAB at BOTH ends — reader.go
+                // trim), so trailing "Host: a.com  " OWS is gone before
+                // readMIMEHeader's TrimLeft(v, " \t") keeps the value
+                // (probe vs go1.25: trailing-OWS Host is served, 200).
+                Some(String::from(value.trim_matches([' ', '\t'])))
+            } else {
+                None
+            };
+        while let Some(fold) = lines.next_if(|l| l.starts_with(' ') || l.starts_with('\t')) {
+            let fold = fold.trim();
+            if fold.bytes().any(is_bad_vhost_value_byte) {
+                value_has_ctl = true;
+            }
+            if let Some(m) = merged.as_mut() {
+                m.push(' ');
+                m.push_str(fold);
+            }
+        }
+        if value_has_ctl {
+            // Read-time textproto class — beats every statusError detail
+            // (Go rejects the head during ReadMIMEHeader, before the
+            // dup-Host / 505 / missing-Host / host / name gates).
+            malformed = true;
+        }
+        if host_value.is_none() {
+            host_value = merged;
+        }
+    }
+    if malformed {
+        return HeadLineVerdict::Malformed;
+    }
+    // Class 3: the single Host value — Go conn.readRequest runs this
+    // after the missing-Host gate, before the per-name loop (the caller
+    // already rejected >1 Host lines with the dup-Host 400). Fold-merging
+    // puts a SP into the value → always invalid (probe: "Host: a.com
+    // b.com" → malformed Host detail); an empty value passes
+    // (ValidHostHeader("") == true).
+    if let Some(host) = host_value {
+        if !host.bytes().all(is_valid_vhost_host_byte) {
+            return HeadLineVerdict::Detailed("400 Bad Request: malformed Host header");
+        }
+    }
+    if space_name {
+        return HeadLineVerdict::Detailed("400 Bad Request: invalid header name");
+    }
+    HeadLineVerdict::Ok
+}
+
 /// Outcome of parsing the HTTP request line with Go net/http semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestLine<'a> {
@@ -1812,6 +1995,18 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
     let Some(version) = parts.next() else {
         return RequestLine::BadRequest;
     };
+
+    // Go readRequest parity — validMethod (request.go:1101-1103), which
+    // runs right after the parseRequestLine shape gate and BEFORE
+    // ParseHTTPVersion: the method must be a non-empty RFC 7230 token
+    // (Go httpguts.ValidHeaderFieldName, which rejects "" — probes vs
+    // go1.25: "GET( ..." / "GET\tFOO ..." / " / HTTP/1.1" all answer the
+    // same generic 400). The generic-400 class is preserved even when the
+    // version token alone would 505: "GET( / HTTP/2.0" is a 400 in Go,
+    // never a 505 — the version-shape/505 checks below must not run first.
+    if method.is_empty() || !method.bytes().all(is_vhost_tchar) {
+        return RequestLine::BadRequest;
+    }
 
     // ParseHTTPVersion: exactly 8 chars "HTTP/X.Y", single digits.
     let valid_shape = version.len() == 8
@@ -5699,6 +5894,137 @@ mod tests {
         assert!(
             matches!(res, Err(VhostResolveError::NotFound)),
             "non-printable upgrade protocol must be a 404 route-miss (Go ascii.IsPrint gate)"
+        );
+    }
+
+    /// FIX 5: Go readRequest `validMethod` — a non-empty RFC 7230 token.
+    /// All shapes below answer Go's generic 400 (probes vs go1.25: same
+    /// 103 bytes as the parse-failure render), so every one maps to
+    /// `BadRequest`. The leading-space line fails on its version token
+    /// (shape gate) and the empty-method " / HTTP/1.1" on the token check —
+    /// Go rejects "" via httpguts.ValidHeaderFieldName.
+    #[test]
+    fn test_parse_vhost_request_line_method_token() {
+        // Paren method — validMethod fails (probe: generic 400).
+        assert_eq!(
+            parse_vhost_request_line("GET( / HTTP/1.1\r\nHost: a.com\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        // Tab-joined method — isToken fails on \t (probe: generic 400).
+        assert_eq!(
+            parse_vhost_request_line("GET\tFOO / HTTP/1.1\r\nHost: a.com\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        // Empty method (leading-space line — probe: generic 400).
+        assert_eq!(
+            parse_vhost_request_line(" / HTTP/1.1\r\nHost: a.com\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        // Leading-space line with a real method — the version token is
+        // contaminated ("/ HTTP/1.1") → shape gate (probe: generic 400).
+        assert_eq!(
+            parse_vhost_request_line(" GET / HTTP/1.1\r\nHost: a.com\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        // A non-token method 400s even when the version would 505 (Go's
+        // validMethod runs before ParseHTTPVersion — request.go:1101-1104).
+        assert_eq!(
+            parse_vhost_request_line("GET( / HTTP/2.0\r\nHost: a.com\r\n\r\n"),
+            RequestLine::BadRequest
+        );
+        // Method token bounds: all-tchar extension methods route.
+        let RequestLine::Ok { .. } =
+            parse_vhost_request_line("M-SEARCH * HTTP/1.1\r\nHost: a.com\r\n\r\n")
+        else {
+            panic!("tchar-only method must route");
+        };
+    }
+
+    /// FIX 6: Go conn.readRequest server-layer head validation classes
+    /// (server.go:1061-1072), probe-verified vs go1.25.
+    #[test]
+    fn test_validate_vhost_head_lines_verdicts() {
+        // Clean head (the common case) validates Ok.
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\nX-A: v\r\n\r\n"),
+            HeadLineVerdict::Ok
+        );
+        // obs-text (0x80+) in a value is legal — textproto + httpguts both
+        // allow it (probe: 200 served). Multi-byte chars model the lossy
+        // path's obs-text bytes (every byte >= 0x20, never a CTL).
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\nX-A: aé b\r\n\r\n"),
+            HeadLineVerdict::Ok
+        );
+        // Class 3: a space in the single Host value → detailed malformed
+        // Host (probe: ": malformed Host header" on status line + body).
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com b.com\r\n\r\n"),
+            HeadLineVerdict::Detailed("400 Bad Request: malformed Host header")
+        );
+        // obs-fold after the Host line merges a SP into the value → the
+        // same detailed malformed Host (Go readContinuedLineSlice joins
+        // with a single space).
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\n folded\r\n\r\n"),
+            HeadLineVerdict::Detailed("400 Bad Request: malformed Host header")
+        );
+        // A trailing-OWS Host value is trimmed first — no false detail
+        // (Go line-level TrimSpace runs before the ValidHostHeader gate).
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com  \r\n\r\n"),
+            HeadLineVerdict::Ok
+        );
+        // Empty-valued Host passes (ValidHostHeader("") == true).
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost:\r\n\r\n"),
+            HeadLineVerdict::Ok
+        );
+        // Class 4: a SPACE-containing name reaches the http layer →
+        // detailed invalid header name (probe: Go textproto stores
+        // "Bad Name" verbatim, server.go:1065 rejects the non-token key).
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\nBad Name: x\r\n\r\n"),
+            HeadLineVerdict::Detailed("400 Bad Request: invalid header name")
+        );
+        // Class 1 + class 2 generics: CTL bytes in values and non-token
+        // non-space name bytes are textproto read-time errors → generic
+        // (probes: CTL-in-host-value / paren-name / DEL-in-name all
+        // answer the bare generic 400, never a detail).
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.co\x01m\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\nBad(Name: x\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\nX-A: a\x7fb\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\n: x\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        assert_eq!(
+            validate_vhost_head_lines(
+                "GET / HTTP/1.1\r\nHost: a.com\r\nX-Bad: v\r\n\tfold\x01c\r\n\r\n"
+            ),
+            HeadLineVerdict::Malformed
+        );
+        // Generic read-time classes beat the statusError details (Go
+        // rejects during ReadMIMEHeader, before the host/name gates):
+        // a space-name head that ALSO carries a CTL value answers generic.
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\nBad Name: a\x01b\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        // obs-fold continuation after the REQUEST line — Go textproto
+        // "malformed MIME header initial line" → generic.
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\n Host: a.com\r\n\r\n"),
+            HeadLineVerdict::Malformed
         );
     }
 }

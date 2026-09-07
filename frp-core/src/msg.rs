@@ -1328,17 +1328,22 @@ mod tests {
 
     #[test]
     fn test_new_visitor_conn_roundtrip() {
+        // Wire shape pin: Go NewVisitorConn bools are `json:",omitempty"`
+        // (pkg/msg/msg.go:168-169), so a false flag is OMITTED — the
+        // `"use_compression":false` form can never appear from a Go peer.
+        // The builder (frp-client proxy.rs `create_visitor_conn_msg`) emits
+        // conditional-Some, so this roundtrip pins the Go-emittable shape.
         let nvc = NewVisitorConn {
             proxy_name: "stcp1".into(),
             sign_key: Some("sk".into()),
             timestamp: Some(99),
             run_id: Some("rid".into()),
             use_encryption: Some(true),
-            use_compression: Some(false),
+            use_compression: None,
         };
         roundtrip(
             &nvc,
-            r#"{"proxy_name":"stcp1","sign_key":"sk","timestamp":99,"run_id":"rid","use_encryption":true,"use_compression":false}"#,
+            r#"{"proxy_name":"stcp1","sign_key":"sk","timestamp":99,"run_id":"rid","use_encryption":true}"#,
         );
     }
 

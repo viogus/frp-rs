@@ -922,3 +922,185 @@ async fn test_ssh_gateway_preauth_released_on_auth_success_ninth_concurrent() {
             .ok();
     }
 }
+
+/// Connect to the SSH gateway, authenticate with the shared test token
+/// (username "v0"), and return the ready client Handle.
+async fn connect_ssh_auth(addr: SocketAddr) -> russh::client::Handle<TestSshClient> {
+    let mut client = None;
+    for _ in 0..20 {
+        if let Ok(c) = russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr,
+            TestSshClient { local_target: None },
+        )
+        .await
+        {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut client = client.expect("SSH client should connect");
+    let auth = client
+        .authenticate_password("v0", common::TEST_TOKEN)
+        .await
+        .expect("password auth should succeed");
+    assert!(auth.success(), "SSH password auth failed");
+    client
+}
+
+/// Open a session channel, run `cmd` through exec, and read the channel
+/// until `needle` appears or the session closes (error paths write the
+/// error text then close — pkg/ssh/server.go writeToClient). Returns
+/// everything read.
+async fn exec_and_read_until(
+    client: &mut russh::client::Handle<TestSshClient>,
+    cmd: &str,
+    needle: &str,
+) -> String {
+    let mut channel = client
+        .channel_open_session()
+        .await
+        .expect("open session channel");
+    channel
+        .exec(true, cmd.to_string())
+        .await
+        .expect("exec accepted");
+    let mut reader = channel.make_reader();
+    let mut got = String::new();
+    let mut buf = [0u8; 256];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if got.contains(needle) {
+            return got;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "exec output never contained {needle:?}; got so far: {got:?}"
+        );
+        let n = timeout(Duration::from_millis(500), reader.read(&mut buf))
+            .await
+            .expect("reading the exec channel must not stall")
+            .expect("exec channel read error");
+        if n == 0 {
+            // Session closed (error text is delivered before the close).
+            return got;
+        }
+        got.push_str(std::str::from_utf8(&buf[..n]).expect("exec output must be UTF-8"));
+    }
+}
+
+/// FIX 2/4 e2e: the exec surface speaks Go flag semantics. The proxy type
+/// token is an exact match after TrimSpace against Go's supportTypes list
+/// (pkg/ssh/server.go:274) — "TCP" is rejected with Go's verbatim error
+/// text (the old code lowercased the token and accepted it); the per-type
+/// flag gates reject a domain flag on tcp exactly like pflag answers an
+/// unregistered flag (`unknown flag: --sd` / shorthand `-d`); stcp accepts
+/// Go's own --allow_users/--sk and reaches the Running state (success
+/// banner), proving the parsed flags ride the NewProxy wire frame.
+#[tokio::test]
+async fn test_ssh_gateway_exec_go_parity_errors_and_stcp_accept() {
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let cfg = ssh_test_config(ssh_port, bind_port);
+    let (_handle, _port) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
+
+    // Case-sensitive type token: "TCP" is NOT in Go's supportTypes list.
+    let mut client = connect_ssh_auth(addr).await;
+    let got = exec_and_read_until(
+        &mut client,
+        "TCP",
+        "invalid proxy type: TCP, support types: [tcp http https tcpmux stcp]",
+    )
+    .await;
+    assert!(
+        got.contains("invalid proxy type: TCP, support types: [tcp http https tcpmux stcp]"),
+        "{got:?}"
+    );
+    client
+        .disconnect(russh::Disconnect::ByApplication, "TCP rejected", "")
+        .await
+        .ok();
+
+    // Per-type gate, long form: --sd is registered only on domain types.
+    let mut client = connect_ssh_auth(addr).await;
+    let got = exec_and_read_until(&mut client, "tcp --sd webx", "unknown flag: --sd").await;
+    assert!(got.contains("unknown flag: --sd"), "{got:?}");
+    client
+        .disconnect(russh::Disconnect::ByApplication, "gate rejected", "")
+        .await
+        .ok();
+
+    // Per-type gate, shorthand form: -d is remote_domain's shorthand.
+    let mut client = connect_ssh_auth(addr).await;
+    let got = exec_and_read_until(
+        &mut client,
+        "tcp -d webx",
+        "unknown shorthand flag: 'd' in -d",
+    )
+    .await;
+    assert!(got.contains("unknown shorthand flag: 'd' in -d"), "{got:?}");
+    client
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "shorthand gate rejected",
+            "",
+        )
+        .await
+        .ok();
+
+    // stcp with Go's own flags registers and reaches Running (banner).
+    let mut client = connect_ssh_auth(addr).await;
+    let got =
+        exec_and_read_until(&mut client, "stcp --allow_users alice --sk x", "Type: stcp").await;
+    assert!(
+        got.contains("\nfrp (via SSH) (Ctrl+C to quit)\n"),
+        "{got:?}"
+    );
+    assert!(got.contains("ProxyName: sshtunnel-stcp-"), "{got:?}");
+    assert!(got.contains("Type: stcp\n"), "{got:?}");
+    client
+        .disconnect(russh::Disconnect::ByApplication, "stcp registered", "")
+        .await
+        .ok();
+}
+
+/// FIX 2/3 e2e: Go's http-type spellings (--sd/--user/--token/--client-id)
+/// parse and the registration reaches Running; the bare `--use_encryption`
+/// (no `=value`) applies true WITHOUT consuming the next token (pflag
+/// NoOptDefVal="true") — had it eaten `--sd`, the parse would die on
+/// `--sd` as a bool value and no banner would ever arrive. The success
+/// banner pins the whole surface at once.
+#[tokio::test]
+async fn test_ssh_gateway_exec_http_go_spellings_and_bare_bool() {
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+    let vhost_http_port = allocate_port();
+
+    let mut cfg = ssh_test_config(ssh_port, bind_port);
+    cfg.vhost_http_port = vhost_http_port;
+    cfg.sub_domain_host = "example.com".into();
+
+    let (_handle, _port) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
+
+    let mut client = connect_ssh_auth(addr).await;
+    let got = exec_and_read_until(
+        &mut client,
+        "http --use_encryption --sd web1 --user alice --token tok123 --client-id cid456 --local_port 8080",
+        "Type: http",
+    )
+    .await;
+    assert!(
+        got.contains("\nfrp (via SSH) (Ctrl+C to quit)\n"),
+        "{got:?}"
+    );
+    assert!(got.contains("ProxyName: sshtunnel-http-"), "{got:?}");
+    assert!(got.contains("Type: http\n"), "{got:?}");
+    client
+        .disconnect(russh::Disconnect::ByApplication, "http registered", "")
+        .await
+        .ok();
+}

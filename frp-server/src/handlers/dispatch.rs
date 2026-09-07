@@ -389,9 +389,11 @@ pub(crate) async fn handle_nat_hole_visitor(
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
                 return;
             };
+            // Go literal — precheck (controller.go:159) and full path (:187)
+            // share it.
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
-                error: Some("proxy not found".into()),
+                error: Some(format!("xtcp server for [{proxy_name}] doesn't exist")),
                 ..Default::default()
             }));
             let _ = write_msg(&mut writer, &resp, v2).await;
@@ -409,6 +411,8 @@ pub(crate) async fn handle_nat_hole_visitor(
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
                 return;
             };
+            // Rust-only arm — Go sends no response here (session timeout at
+            // controller.go:215-220).
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider offline".into()),
@@ -432,6 +436,8 @@ pub(crate) async fn handle_nat_hole_visitor(
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
                 return;
             };
+            // Rust-only arm — Go sends no response here (session timeout at
+            // controller.go:215-220).
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider disconnected".into()),
@@ -500,7 +506,9 @@ pub(crate) async fn handle_nat_hole_visitor(
         // Require sign_key for non-pre_check requests on fresh connections.
         // The sign_key must equal MD5(proxy_sk + timestamp), verified with
         // constant-time comparison and timestamp freshness check to prevent
-        // replay attacks.
+        // replay attacks. A missing sign_key fails Go's ConstantTimeEqString
+        // (controller.go:189-191) like a wrong one, so both arms share the Go
+        // literal.
         if sign_key.is_empty() {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key, rejecting");
             let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
@@ -509,7 +517,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
-                error: Some("auth required".into()),
+                error: Some(format!("xtcp connection of [{proxy_name}] auth failed")),
                 ..Default::default()
             }));
             let _ = write_msg(&mut writer, &resp, v2).await;
@@ -518,8 +526,10 @@ pub(crate) async fn handle_nat_hole_visitor(
 
         let proxy_sk = proxy_info.sk.as_deref().unwrap_or("");
         if proxy_sk.is_empty() {
-            // XTCP proxy without a shared secret: no way to authenticate
-            // visitors on fresh connections. Reject.
+            // Rust-only arm — Go's ConstantTimeEqString runs against
+            // authKey(sk, ts) with no empty-sk gate, so its signKey path
+            // differs for shared-secret-less proxies; on fresh connections a
+            // sk-less XTCP proxy cannot authenticate the visitor.
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has no sk configured — rejecting fresh connection");
             let Ok((_, mut writer)) = split_work_conn_halves(stream) else {
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor: cannot split visitor stream, dropping");
@@ -535,6 +545,10 @@ pub(crate) async fn handle_nat_hole_visitor(
         }
 
         // Validate timestamp freshness (replay attack prevention).
+        //
+        // Rust-only hardening: Go controller.go:189-191 accepts any timestamp
+        // (ConstantTimeEqString only); a clock-skewed Go frpc beyond
+        // authentication_timeout is rejected here but admitted by Go frps.
         let auth_timeout = state.reloadable.read_ok().auth_cfg.authentication_timeout;
         if let Err(freshness_err) =
             frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
@@ -561,7 +575,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             };
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
-                error: Some("auth failed".into()),
+                error: Some(format!("xtcp connection of [{proxy_name}] auth failed")),
                 ..Default::default()
             }));
             let _ = write_msg(&mut writer, &resp, v2).await;
@@ -683,6 +697,8 @@ pub(crate) async fn handle_nat_hole_visitor(
         // without holding the tokio::sync::Mutex guard.
         let mut taken_writer = session.visitor_writer.lock().await.take();
         if let Some(ref mut w) = taken_writer {
+            // Rust-only arm — Go sends no response here (session timeout at
+            // controller.go:215-220).
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider NAT detection timeout".into()),

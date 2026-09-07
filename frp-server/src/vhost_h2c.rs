@@ -253,6 +253,10 @@ async fn handle_stream(
     // ProxyUserConn below carries the same verdict to the bridge's
     // injector gate.
     let is_connect = request.method() == http::Method::CONNECT;
+    // Captured BEFORE `into_body()` below: a HEAD request's response never
+    // carries a body no matter what the backend head declares — the relay
+    // must end the h2 stream with the response head itself (FIX 1).
+    let is_head = request.method() == http::Method::HEAD;
     tracing::debug!(host = %host, path = %path, peer = %peer, "HTTP VHost (h2c) request for '{}' path '{}' from {}", host, path, peer);
 
     // Re-encode as an HTTP/1.1 request head. Go's reverse proxy forwards to
@@ -269,6 +273,15 @@ async fn handle_stream(
         .and_then(|s| s.parse().ok());
     let has_content_length = request.headers().contains_key("content-length");
     let request_head = build_http1_request_head(&request);
+
+    // The 404 body every non-timeout backend failure answers with (FIX 2):
+    // the configured custom_404_page when non-empty, else the builtin HTML —
+    // the same selection the HTTP/1.1 surface makes in
+    // `write_not_found_response` (Go ErrorHandler → getNotFoundPageContent,
+    // pkg/util/vhost/resource.go). Computed once here because both the
+    // route-miss arm above and the backend-failure arms inside
+    // `stream_h2_response` need it.
+    let not_found_page = h2c_not_found_body(&state.custom_404_page);
 
     let forward = match resolve_vhost_request(
         &state,
@@ -293,34 +306,43 @@ async fn handle_stream(
         Ok(f) => f,
         Err(VhostResolveError::Unauthorized { proxy_form: true }) => {
             // Absolute-form → Go checkRouteAuthByRequest answers 407 +
-            // Proxy-Authenticate (http.go:272-274).
+            // Proxy-Authenticate (http.go:272-274). The render is Go's
+            // `http.Error` (ServeHTTP sets Proxy-Authenticate, then
+            // http.Error(rw, http.StatusText(407), 407)): Content-Type
+            // text/plain; charset=utf-8 + X-Content-Type-Options: nosniff +
+            // the status text with a trailing newline as body — the h2
+            // mirror of the HTTP/1.1 write_http_error_auth_response shape
+            // (vhost.rs). `send_h2_error` only defaults to text/html when
+            // the caller set no Content-Type (FIX 3).
             return send_h2_error(
                 &mut respond,
                 407,
-                &[("proxy-authenticate", "Basic realm=\"Restricted\"")],
-                Bytes::new(),
+                &[
+                    ("proxy-authenticate", "Basic realm=\"Restricted\""),
+                    ("content-type", "text/plain; charset=utf-8"),
+                    ("x-content-type-options", "nosniff"),
+                ],
+                Bytes::from_static(b"Proxy Authentication Required\n"),
             )
             .await;
         }
         Err(VhostResolveError::Unauthorized { proxy_form: false }) => {
             // Origin-form → Go answers 401 + WWW-Authenticate
-            // (http.go:275-277).
+            // (http.go:275-277), same http.Error render.
             return send_h2_error(
                 &mut respond,
                 401,
-                &[("www-authenticate", "Basic realm=\"Restricted\"")],
-                Bytes::new(),
+                &[
+                    ("www-authenticate", "Basic realm=\"Restricted\""),
+                    ("content-type", "text/plain; charset=utf-8"),
+                    ("x-content-type-options", "nosniff"),
+                ],
+                Bytes::from_static(b"Unauthorized\n"),
             )
             .await;
         }
         Err(VhostResolveError::NotFound) => {
-            return send_h2_error(
-                &mut respond,
-                404,
-                &[],
-                Bytes::from(state.custom_404_page.clone()),
-            )
-            .await;
+            return send_h2_404(&mut respond, &not_found_page).await;
         }
     };
 
@@ -332,7 +354,13 @@ async fn handle_stream(
         .map(|v| v.tx.clone());
     let Some(ctl_tx) = internal_tx else {
         tracing::warn!(host = %host, path = %path, "HTTP VHost (h2c) route for '{}' path '{}' found but control handler gone", host, path);
-        return send_h2_error(&mut respond, 502, &[], Bytes::new()).await;
+        // FIX 2: the backend connection cannot be established — the Go
+        // vhost's ErrorHandler class for non-timeout transport errors is
+        // 404 + the not-found page (pkg/util/vhost/http.go:128-138), the
+        // same answer the HTTP/1.1 surface gives a control-gone route
+        // (Go connectHandler CreateConnection errors write NotFoundResponse,
+        // not 502).
+        return send_h2_404(&mut respond, &not_found_page).await;
     };
 
     // Bridge the h2 stream to the byte-level work-conn machinery through an
@@ -346,7 +374,8 @@ async fn handle_stream(
     // not silently drop a user connection (the HTTP/1.1 path uses the same
     // pattern). Bounded (vhost.rs:748-764 parity): a control handler that
     // stops draining must not pin this task + fd + permit forever; after
-    // CTL_SEND_TIMEOUT the send is abandoned and the h2 stream answers 502.
+    // CTL_SEND_TIMEOUT the send is abandoned and the h2 stream answers the
+    // backend-unreachable 404 (FIX 2, see the timeout arm below).
     match tokio::time::timeout(
         crate::state::CTL_SEND_TIMEOUT,
         ctl_tx.send(InternalMsg::ProxyUserConn {
@@ -366,13 +395,20 @@ async fn handle_stream(
         Ok(Ok(())) => {}
         Ok(Err(_)) => {
             // Channel closed: control handler died between lookup and
-            // dispatch — answer 502.
+            // dispatch — the backend connection can no longer be
+            // established, so the Go ErrorHandler 404 class (FIX 2).
             tracing::warn!(host = %host, path = %path, "h2c route for '{}' path '{}' found but control channel closed", host, path);
-            return send_h2_error(&mut respond, 502, &[], Bytes::new()).await;
+            return send_h2_404(&mut respond, &not_found_page).await;
         }
         Err(_elapsed) => {
-            tracing::warn!(host = %host, path = %path, "h2c route for '{}' path '{}' found but control channel send timed out; answering 502", host, path);
-            return send_h2_error(&mut respond, 502, &[], Bytes::new()).await;
+            // CTL_SEND_TIMEOUT fired: the control handler stopped draining.
+            // A local dispatch bound, NOT Go's response-head deadline — Go's
+            // net.Error timeout 504 gate (http.go:131-133) applies only to
+            // the reverse-proxy response-head wait, so this arm is the
+            // backend-unreachable 404 class, like the other dispatch
+            // failures (FIX 2).
+            tracing::warn!(host = %host, path = %path, "h2c route for '{}' path '{}' found but control channel send timed out; answering 404", host, path);
+            return send_h2_404(&mut respond, &not_found_page).await;
         }
     }
 
@@ -467,7 +503,13 @@ async fn handle_stream(
             respond.send_reset(h2::Reason::PROTOCOL_ERROR);
             return Ok(());
         }
-        r = stream_h2_response(&mut client_r, &mut respond, head_timeout) => r,
+        r = stream_h2_response(
+            &mut client_r,
+            &mut respond,
+            head_timeout,
+            is_head,
+            &not_found_page,
+        ) => r,
     };
 
     // Once the response is fully relayed the bridge has served its purpose —
@@ -766,11 +808,43 @@ async fn send_h2_error(
         respond.send_response(resp, true)?;
         return Ok(());
     }
-    resp.headers_mut()
-        .insert("content-type", http::HeaderValue::from_static("text/html"));
+    // FIX 3: default to text/html ONLY when the caller set no Content-Type.
+    // The 404-page arms rely on this default (Go serves the not-found HTML
+    // as text/html); the 401/407 arms pass Go's http.Error Content-Type
+    // (text/plain; charset=utf-8) via `extra` and must not have it
+    // overwritten. (Go's own default would sniff the page — the html
+    // default keeps the byte shape deterministic.)
+    if !resp.headers().contains_key("content-type") {
+        resp.headers_mut()
+            .insert("content-type", http::HeaderValue::from_static("text/html"));
+    }
     let mut send = respond.send_response(resp, false)?;
     send.send_data(body, true)?;
     Ok(())
+}
+
+/// The 404 answer Go frp's vhost ErrorHandler gives every non-timeout
+/// backend failure (pkg/util/vhost/http.go:128-138: `WriteHeader(404)` +
+/// `Write(getNotFoundPageContent())`): the custom_404_page when configured,
+/// else the builtin HTML — byte-for-byte the same body the HTTP/1.1
+/// surface's `write_not_found_response` serves.
+async fn send_h2_404(
+    respond: &mut SendResponse<Bytes>,
+    not_found_page: &Bytes,
+) -> Result<(), h2::Error> {
+    send_h2_error(respond, 404, &[], not_found_page.clone()).await
+}
+
+/// Body selection for the h2c 404 arms: `custom_404_page` when non-empty,
+/// else the crate-wide builtin (frp-core's `GO_404_NOT_FOUND_BODY`, the
+/// mirror of Go frp's builtin NotFound HTML). Empty-bodied 404s are a
+/// divergence from the Go shape — every Go 404 carries the page.
+fn h2c_not_found_body(custom_404_page: &str) -> Bytes {
+    if custom_404_page.is_empty() {
+        Bytes::from_static(frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes())
+    } else {
+        Bytes::from(custom_404_page.to_owned())
+    }
 }
 
 /// Read bytes until the end of the HTTP/1.1 response head, returning head +
@@ -839,7 +913,7 @@ fn trim_ascii_ws(mut b: &[u8]) -> &[u8] {
 fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
     // Head end under Go textproto semantics (same helper as read_until_head),
     // so LF-only / mixed-EOL backends parse instead of falling through to the
-    // caller's malformed-head 502.
+    // caller's malformed-head 404.
     let head_end = frp_core::textproto::head_end(head)?;
     let head_bytes = &head[..head_end];
     // Status line = first line under the same textproto rule: up to the next
@@ -860,8 +934,8 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
     // Go http.ReadResponse gates (response.go — round-3 review): the
     // version token must be one of ParseHTTPVersion's exact-match set and
     // the code token exactly 3 digits BEFORE conversion, so "HTTP/9.9 200"
-    // / "HTTP/1.1 0200 OK" / "FOO 200 OK" are all malformed → 502, never
-    // forwarded.
+    // / "HTTP/1.1 0200 OK" / "FOO 200 OK" are all malformed → 404 (the
+    // ErrorHandler non-timeout class), never forwarded.
     let version = parts.next()?;
     if !frp_core::textproto::is_valid_http_version(version) {
         return None;
@@ -1169,8 +1243,9 @@ async fn stream_chunked_body(
 
 /// One response-head read bounded by an absolute deadline, continuing from
 /// `seed` (bytes of a consumed interim head's leftover). Head-read failures
-/// map to `HeadReadError`; the caller answers 502/504 — this leg's own
-/// mapping (it is a Rust-only extension, see `stream_h2_response`).
+/// map to `HeadReadError`; the caller maps Closed → the Go ErrorHandler
+/// non-timeout 404 and TimedOut → 504 (see `stream_h2_response` — the
+/// ErrorHandler's net.Error Timeout gate, pkg/util/vhost/http.go:128-138).
 enum HeadReadError {
     Closed,
     TimedOut,
@@ -1207,28 +1282,44 @@ async fn read_backend_head<R: AsyncRead + Unpin>(
 /// stalling parked the head read without bound, one fresh timeout per head).
 /// On timeout a body-less `504 Gateway Timeout` is sent, mirroring the Go
 /// vhost `ErrorHandler` mapping a `ResponseHeaderTimeout` to 504
-/// (pkg/util/vhost/http.go); a backend that closes before the head produces
-/// `502 Bad Gateway` (this leg's own choice — it is a Rust-only extension:
-/// Go frp has no h2c vhost surface to be byte-compatible with).
+/// (pkg/util/vhost/http.go:131-133, `net.Error` Timeout gate); every OTHER
+/// backend failure — close before the head, malformed head, 101, invalid
+/// status — answers `404` + the not-found page (FIX 2), the ErrorHandler's
+/// non-timeout class, exactly as it does on Go frp's HTTP/1.1 vhost surface
+/// (Go frp v0.71.0 serves h2c from the same net/http listener — module
+/// doc above — and its ErrorHandler is transport-agnostic).
+///
+/// `is_head` marks a HEAD request: its response never carries a body, and
+/// statuses 204/304 never do either (FIX 1 — see the tail of this fn).
+/// `not_found_page` is the pre-resolved 404 body (custom_404_page or the
+/// builtin HTML) shared by the failure arms below.
 async fn stream_h2_response<R: AsyncRead + Unpin>(
     r: &mut R,
     respond: &mut SendResponse<Bytes>,
     head_timeout: Option<std::time::Duration>,
+    is_head: bool,
+    not_found_page: &Bytes,
 ) -> Result<(), h2::Error> {
     let deadline = head_timeout.map(|d| tokio::time::Instant::now() + d);
     let mut head = match read_backend_head(r, Vec::new(), deadline).await {
         Ok(h) => h,
         Err(HeadReadError::Closed) => {
             // Backend closed (or no work conn was ever assigned) before the
-            // response head. 502 is this leg's own answer — Go frp's vhost
-            // ErrorHandler never writes 502 (it answers 404 + its not-found
-            // page for non-timeout transport errors, http.go), and the raw
-            // HTTP/1.1 vhost surface has no wire answer either (the bridge
-            // just ends); an h2 stream, though, must terminate with a status.
-            tracing::debug!("h2c backend closed before response head, sending 502");
-            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+            // response head. Go frp's vhost ErrorHandler answers every
+            // non-timeout transport error with 404 + its not-found page
+            // (pkg/util/vhost/http.go:128-138 — only a `net.Error`
+            // Timeout() maps to 504), and h2c rides the same handler on the
+            // same net/http listener, so this h2 leg mirrors that 404 class
+            // instead of inventing a 502 (FIX 2).
+            tracing::debug!("h2c backend closed before response head, sending 404");
+            return send_h2_404(respond, not_found_page).await;
         }
         Err(HeadReadError::TimedOut) => {
+            // The one net.Error-equivalent arm: Go maps a
+            // ResponseHeaderTimeout to a bare 504 (WriteHeader only —
+            // http.go:130-133). The h2c translation read IS clocked by
+            // vhost_http_timeout (clamp_vhost_timeout doc), so a deadline
+            // expiry here is the exact mirror of Go's response-head timer.
             tracing::debug!("h2c backend response-head timeout, sending 504");
             return send_h2_error(respond, 504, &[], Bytes::new()).await;
         }
@@ -1238,13 +1329,15 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     // consumed internally and never surface as the response — keep reading
     // until a final head ends the exchange. Without the skip the interim
     // head was sent to the h2 client as `:status 100` and the pipelined
-    // final head streamed as its body. (This h2c leg is a Rust-only
-    // extension — Go frp has no h2c vhost — modeled on the Go client
-    // transport, which consumes 1xx the same way.)
+    // final head streamed as its body. Go frp serves h2c from the same
+    // net/http vhost listener as h1, and its reverse proxy consumes 1xx
+    // the same way on both transports.
     let parsed = loop {
         let Some(parsed) = parse_response_head(&head) else {
-            tracing::debug!("h2c backend sent a malformed response head, sending 502");
-            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+            // Malformed backend head — a Go transport readResponse error,
+            // i.e. a non-timeout ErrorHandler class → 404 (FIX 2).
+            tracing::debug!("h2c backend sent a malformed response head, sending 404");
+            return send_h2_404(respond, not_found_page).await;
         };
         if (100..=199).contains(&parsed.status) {
             if parsed.status == 101 {
@@ -1256,13 +1349,14 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
                 // connection PROTOCOL_ERROR — the h2 crate's client
                 // answers with a whole-connection GOAWAY, killing every
                 // concurrent stream on the h2 conn (round-13 review B2).
-                // Answer 502 in this leg's unsupported-backend class
-                // (like the 0/>999 status arm below) instead of leaking a
-                // conn-killing head; there is no final head to wait for.
+                // Answer the non-timeout ErrorHandler 404 (like the
+                // malformed-head/status arms below) instead of leaking a
+                // conn-killing head; there is no final head to wait for
+                // (FIX 2).
                 tracing::debug!(
-                    "h2c backend answered 101 Switching Protocols (unsupported over HTTP/2), sending 502"
+                    "h2c backend answered 101 Switching Protocols (unsupported over HTTP/2), sending 404"
                 );
-                return send_h2_error(respond, 502, &[], Bytes::new()).await;
+                return send_h2_404(respond, not_found_page).await;
             }
             // A non-101 1xx head carries no body — bytes after its blank
             // line are the next head's start (possibly already complete).
@@ -1271,8 +1365,11 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
             head = match read_backend_head(r, seed, deadline).await {
                 Ok(h) => h,
                 Err(HeadReadError::Closed) => {
-                    tracing::debug!("h2c backend closed between response heads, sending 502");
-                    return send_h2_error(respond, 502, &[], Bytes::new()).await;
+                    // Interim head answered, then the backend closed before
+                    // a final head — a truncated-response transport error →
+                    // the 404 ErrorHandler class (FIX 2).
+                    tracing::debug!("h2c backend closed between response heads, sending 404");
+                    return send_h2_404(respond, not_found_page).await;
                 }
                 Err(HeadReadError::TimedOut) => {
                     tracing::debug!("h2c backend response-head timeout, sending 504");
@@ -1294,10 +1391,11 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         Err(_) => {
             // The status comes from the backend head; a broken/malicious
             // backend can send a value the builder rejects (e.g. 0 or >999).
-            // Degrade to 502 like the other malformed-head cases instead of
-            // panicking the request-serving task.
-            tracing::debug!("h2c backend sent invalid status code {status}, sending 502");
-            return send_h2_error(respond, 502, &[], Bytes::new()).await;
+            // Degrade to the 404 ErrorHandler class like the other
+            // malformed-head cases instead of panicking the request-serving
+            // task (FIX 2).
+            tracing::debug!("h2c backend sent invalid status code {status}, sending 404");
+            return send_h2_404(respond, not_found_page).await;
         }
     };
     for (n, v) in &headers {
@@ -1308,6 +1406,27 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         // headers (e.g. multiple Set-Cookie) must preserve ALL values —
         // `insert` collapses duplicates and the last one wins.
         resp.headers_mut().append(n.clone(), v.clone());
+    }
+
+    // FIX 1: responses to HEAD requests and the no-body statuses 204/304
+    // never carry a DATA body — Go's net/http sets Body = NoBody for all of
+    // them (noBodyAllowedStatuses 204/304 + the HEAD method; transport
+    // response.go `bodyAllowedForStatus`), so the h2 relay must end the
+    // stream with the response head. The body legs below would otherwise
+    // park forever on a backend that DECLARES a Content-Length on such an
+    // answer and then holds the connection open with no body bytes (a lie
+    // for these statuses — HEAD says so by definition, 204/304 by RFC) —
+    // the FIX-1 hang: `read_exact_into` waits for bytes that can never
+    // come. RFC 9113 §8.6.1: a 204 (and any 1xx) MUST NOT carry
+    // Content-Length, and Go drops it from 304 answers too — strip it for
+    // both; a HEAD answer KEEPS its Content-Length (it truthfully describes
+    // the GET the client would receive).
+    if is_head || status == 204 || status == 304 {
+        if !is_head {
+            resp.headers_mut().remove("content-length");
+        }
+        respond.send_response(resp, true)?;
+        return Ok(());
     }
 
     let content_length = header_value(&headers, "content-length")
@@ -1510,7 +1629,7 @@ mod tests {
             "value"
         );
 
-        // Malformed heads → None (caller answers 502).
+        // Malformed heads → None (the caller answers the ErrorHandler 404).
         assert!(parse_response_head(b"").is_none());
         assert!(parse_response_head(b"HTTP/1.1 200 OK\r\n").is_none()); // no blank line
         assert!(parse_response_head(b"not-http\r\n\r\n").is_none()); // no status token
@@ -1990,5 +2109,277 @@ mod tests {
             .await
             .expect_err("no terminator bytes after the truncation");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Mock backend response reader for the FIX-1/FIX-2 unit pins: serves
+    /// `head` bytes, then PANICS on any further poll. The pre-FIX-1 relay
+    /// read a never-arriving body after a HEAD/204/304 head (the hang under
+    /// test) — a reader that just returns EOF would let the old code break
+    /// out of its body loop and end the stream, passing the pin; a panic
+    /// makes the regression a deterministic test failure.
+    struct HeadThenPanicMock {
+        data: &'static [u8],
+    }
+
+    impl HeadThenPanicMock {
+        fn new(data: &'static [u8]) -> Self {
+            Self { data }
+        }
+    }
+
+    impl tokio::io::AsyncRead for HeadThenPanicMock {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.data.is_empty() {
+                panic!(
+                    "mock backend polled after its head bytes were consumed — \
+                     a response-body leg must not run for HEAD/204/304 (FIX 1)"
+                );
+            }
+            let n = self.data.len().min(buf.remaining());
+            buf.put_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// EOF-from-the-start backend — a `0` read is the clean-EOF signal
+    /// `read_until_head_from` maps to `HeadReadError::Closed`.
+    struct EofMock;
+
+    impl tokio::io::AsyncRead for EofMock {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Drive one h2 request/response exchange: `serve` runs server-side with
+    /// the accepted request's `respond` handle and returns the
+    /// client-observed (status, headers, body). The h2 connection lives in a
+    /// driver task so the send side flushes while `serve` answers — the
+    /// `with_h2_request` pattern, extended to full responses.
+    async fn h2c_test_roundtrip<F, Fut>(method: &str, serve: F) -> (u16, http::HeaderMap, Vec<u8>)
+    where
+        F: FnOnce(SendResponse<Bytes>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), h2::Error>> + Send + 'static,
+    {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io)
+                .await
+                .expect("server h2 handshake");
+            let (request, respond) = conn.accept().await.expect("accept").expect("request");
+            let _request = request;
+            let driver =
+                tokio::spawn(async move { while let Some(Ok(_)) = conn.accept().await {} });
+            let result = serve(respond).await;
+            // Response frames written via `respond` only reach the wire when
+            // the driver task polls the connection. `serve` can run to
+            // completion without yielding (mock backend reads are
+            // immediately ready, and h2's send_response/send_data are sync
+            // enqueues), in which case the driver never gets polled before
+            // the abort below drops the conn with the response still queued
+            // — the h2 client then reads a clean EOF and every open stream
+            // errors with h2's own "stream closed because of a broken pipe"
+            // (proto/streams/state.rs recv_eof). Yield once so the driver
+            // flushes the queued response frames into the duplex first.
+            tokio::task::yield_now().await;
+            driver.abort();
+            result
+        });
+        let (mut client, client_conn) = h2::client::handshake(client_io)
+            .await
+            .expect("client h2 handshake");
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+        client.clone().ready().await.expect("client ready");
+
+        let request = http::Request::builder()
+            .method(method)
+            .uri("http://h2c.example.com/")
+            .body(())
+            .unwrap();
+        let (response_fut, stream) = client.send_request(request, true).expect("send_request");
+        let _stream = stream; // keep the client send half open while the server answers
+        let response = response_fut.await.expect("h2 response head");
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let mut body = Vec::new();
+        let mut recv = response.into_body();
+        while let Some(Ok(chunk)) = recv.data().await {
+            body.extend_from_slice(&chunk);
+        }
+        server_task
+            .await
+            .expect("server task panicked")
+            .expect("serve returned an error");
+        (status, headers, body)
+    }
+
+    #[tokio::test]
+    async fn test_h2_head_204_304_end_stream_without_body_legs() {
+        // FIX 1 regression: a backend that DECLARES a Content-Length on a
+        // HEAD / 204 / 304 answer and holds the connection open never sends
+        // the declared body bytes (a HEAD response has no body by
+        // definition; 204/304 have none by RFC) — the old relay parked its
+        // body leg forever (read_exact_into on the length class, the
+        // read-to-EOF leg on the no-length class). The relay must end the
+        // stream with the response head; the panicking mock turns the
+        // pre-fix read into a test failure instead of a hang.
+        //
+        // HEAD → 200 keeps its truthful Content-Length (it describes the
+        // GET the client would receive).
+        let (status, headers, body) = h2c_test_roundtrip("HEAD", |respond| async move {
+            let mut respond = respond;
+            let mut backend =
+                HeadThenPanicMock::new(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+            let page = h2c_not_found_body("");
+            stream_h2_response(&mut backend, &mut respond, None, true, &page).await
+        })
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers.get("content-length").and_then(|v| v.to_str().ok()),
+            Some("100"),
+            "a HEAD response keeps the declared Content-Length"
+        );
+        assert!(body.is_empty(), "a HEAD response must have no DATA body");
+
+        // 204 with a declared (lying) Content-Length — the CL body-leg shape.
+        let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {
+            let mut respond = respond;
+            let mut backend =
+                HeadThenPanicMock::new(b"HTTP/1.1 204 No Content\r\nContent-Length: 50\r\n\r\n");
+            let page = h2c_not_found_body("");
+            stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+        })
+        .await;
+        assert_eq!(status, 204);
+        assert!(
+            !headers.contains_key("content-length"),
+            "204 must not carry Content-Length (RFC 9113 §8.6.1)"
+        );
+        assert!(body.is_empty());
+
+        // 304 with NO length framing — the read-to-EOF body-leg shape.
+        let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {
+            let mut respond = respond;
+            let mut backend = HeadThenPanicMock::new(b"HTTP/1.1 304 Not Modified\r\n\r\n");
+            let page = h2c_not_found_body("");
+            stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+        })
+        .await;
+        assert_eq!(status, 304);
+        assert!(
+            !headers.contains_key("content-length"),
+            "304 must not carry Content-Length (Go drops it with Body = NoBody)"
+        );
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_h2_backend_failures_answer_404_with_page() {
+        // FIX 2 pins: the non-timeout backend-failure arms answer Go's
+        // ErrorHandler 404 — status 404, Content-Type text/html (send_h2_error's
+        // default for the page body), body byte-identical to the builtin
+        // page the HTTP/1.1 surface serves (GO_404_NOT_FOUND_BODY).
+        let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {
+            let mut respond = respond;
+            let page = h2c_not_found_body("");
+            stream_h2_response(&mut EofMock, &mut respond, None, false, &page).await
+        })
+        .await;
+        assert_eq!(status, 404, "backend close before the head → Go 404 class");
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/html")
+        );
+        assert_eq!(
+            body,
+            frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes(),
+            "the 404 body must be the not-found page, not an empty body"
+        );
+
+        let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {
+            let mut respond = respond;
+            let mut backend = HeadThenPanicMock::new(b"not-http\r\n\r\n");
+            let page = h2c_not_found_body("");
+            stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+        })
+        .await;
+        assert_eq!(status, 404, "malformed head → Go 404 class");
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/html")
+        );
+        assert_eq!(body, frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_h2_error_render_content_type_nosniff_and_default() {
+        // FIX 3: the 401/407 arms render Go's http.Error shape — explicit
+        // Content-Type text/plain; charset=utf-8 + X-Content-Type-Options:
+        // nosniff + the StatusText body with a trailing newline. The h2
+        // error helper must NOT overwrite the caller's Content-Type with
+        // its text/html default (pre-fix: every non-empty-bodied error was
+        // text/html — the 401/407 arms answered with the wrong type and no
+        // body).
+        for (expected, want_body) in [
+            (401u16, "Unauthorized\n"),
+            (407u16, "Proxy Authentication Required\n"),
+        ] {
+            let (status, headers, body) = h2c_test_roundtrip("GET", move |respond| {
+                let want_body = want_body.to_owned();
+                async move {
+                    let mut respond = respond;
+                    send_h2_error(
+                        &mut respond,
+                        expected,
+                        &[
+                            ("content-type", "text/plain; charset=utf-8"),
+                            ("x-content-type-options", "nosniff"),
+                        ],
+                        Bytes::from(want_body),
+                    )
+                    .await
+                }
+            })
+            .await;
+            assert_eq!(status, expected);
+            assert_eq!(
+                headers.get("content-type").and_then(|v| v.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+                "the caller's Content-Type must survive (not be text/html)"
+            );
+            assert_eq!(
+                headers
+                    .get("x-content-type-options")
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff")
+            );
+            assert_eq!(body.as_slice(), want_body.as_bytes());
+        }
+        // The text/html default stays for the 404-page class (no
+        // Content-Type passed).
+        let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {
+            let mut respond = respond;
+            let page = h2c_not_found_body("");
+            send_h2_404(&mut respond, &page).await
+        })
+        .await;
+        assert_eq!(status, 404);
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/html")
+        );
+        assert_eq!(body, frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes());
     }
 }

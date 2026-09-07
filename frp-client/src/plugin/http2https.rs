@@ -83,21 +83,37 @@ async fn handle_conn(
     )
     .await?;
 
-    // Extract hostname from target for SNI
+    // Extract hostname from target for SNI. Every failure from here to the
+    // established backend TLS session answers Go's default ReverseProxy 502
+    // (Go http2https.go dials + tls.Client + Handshake inline — each error
+    // is a transport.RoundTrip dial error → the bare 502 render; the old
+    // code dropped the client conn with nothing). ServerName construction
+    // failure is a dial-class error (Go's r.Host would fail in
+    // net.Dial/url parsing; there is no pre-dial validation).
     let (host, port) = split_host_port(target);
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|e| format!("invalid host '{host}': {e}"))?;
+    let server_name = match ServerName::try_from(host.to_string()) {
+        Ok(n) => n,
+        Err(e) => {
+            return super::write_go_502(&mut client, format!("invalid host '{host}': {e}")).await;
+        }
+    };
 
     // Connect to backend via TLS
-    let tcp = TcpStream::connect(format!("{host}:{port}"))
-        .await
-        .map_err(|e| format!("connect to {host}:{port}: {e}"))?;
+    let tcp = match TcpStream::connect(format!("{host}:{port}")).await {
+        Ok(s) => s,
+        Err(e) => {
+            return super::write_go_502(&mut client, format!("connect to {host}:{port}: {e}"))
+                .await;
+        }
+    };
     frp_core::transport::set_nodelay(&tcp);
 
-    let mut tls = tls_connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| format!("TLS connect to {target}: {e}"))?;
+    let mut tls = match tls_connector.connect(server_name, tcp).await {
+        Ok(t) => t,
+        Err(e) => {
+            return super::write_go_502(&mut client, format!("TLS connect to {target}: {e}")).await;
+        }
+    };
 
     tls.write_all(fwd.head.as_bytes())
         .await
@@ -153,5 +169,104 @@ mod tests {
             }
         };
         assert!(handle.local_addr.port() > 0);
+    }
+
+    /// Audit FIX 3 pin: a refused backend (the connection-refused dial
+    /// arm) answers with frp-rs's bare ReverseProxy 502 — 47 bytes —
+    /// before the client conn closes (Go's defaultErrorHandler 502 picks
+    /// up a net/http Date header and keep-alive on the wire; the bare
+    /// close-after-write is the documented frp-rs divergence). The old
+    /// code closed with nothing.
+    #[tokio::test]
+    async fn test_http2https_backend_refused_answers_go_502() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        // Bind then drop: the port is closed, so the backend dial is a
+        // deterministic ECONNREFUSED.
+        let refused = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let refused_addr = refused.local_addr().unwrap();
+        drop(refused);
+
+        let cfg = PluginConfig {
+            plugin_type: "http2https".into(),
+            local_addr: refused_addr.to_string(),
+            ..Default::default()
+        };
+        let handle = match start_http2https_plugin(&cfg).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+                return;
+            }
+        };
+        let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(
+            resp,
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+            "refused backend must render Go's 502, got: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    /// Audit FIX 3 pin: a backend that accepts TCP but dies before the TLS
+    /// handshake (Go: tls.Client Handshake error → ReverseProxy dial error
+    /// → 502) renders the same bare 502.
+    #[tokio::test]
+    async fn test_http2https_backend_tls_fail_answers_go_502() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let backend = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let backend_addr = backend.local_addr().unwrap();
+        // Accept one conn and drop it instantly — the client TLS handshake
+        // sees EOF and errors.
+        tokio::spawn(async move {
+            if let Ok((_conn, _)) = backend.accept().await {
+                // dropped
+            }
+        });
+
+        let cfg = PluginConfig {
+            plugin_type: "http2https".into(),
+            local_addr: backend_addr.to_string(),
+            ..Default::default()
+        };
+        let handle = match start_http2https_plugin(&cfg).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+                return;
+            }
+        };
+        let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(
+            resp,
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+            "TLS-failed backend must render Go's 502, got: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
     }
 }
