@@ -1876,10 +1876,12 @@ fn validate_vhost_head_lines(request: &str) -> HeadLineVerdict {
         let mut value_has_ctl = value.trim_end().bytes().any(is_bad_vhost_value_byte);
         let mut merged: Option<String> =
             if name.eq_ignore_ascii_case("host") && host_value.is_none() {
-                // TrimLeft(v, " \t") — Go's stored value; the whole physical
-                // line was already trimmed at read time, so only the
-                // after-colon OWS can remain.
-                Some(String::from(value.trim_start_matches([' ', '\t'])))
+                // Go stored value: readContinuedLineSlice trim()s the whole
+                // PHYSICAL line first (SP/HTAB at BOTH ends — reader.go
+                // trim), so trailing "Host: a.com  " OWS is gone before
+                // readMIMEHeader's TrimLeft(v, " \t") keeps the value
+                // (probe vs go1.25: trailing-OWS Host is served, 200).
+                Some(String::from(value.trim_matches([' ', '\t'])))
             } else {
                 None
             };

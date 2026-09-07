@@ -1011,7 +1011,11 @@ fn is_bad_value_byte(b: u8) -> bool {
 /// 2. Any group-first header line without a colon — "malformed MIME
 ///    header: missing colon". obs-fold continuation lines (SP/HTAB
 ///    leading) are EXEMPT: they merge into the previous header's value
-///    and need no colon of their own.
+///    and need no colon of their own. An EMPTY group-first line is the
+///    head's terminating blank line: `ReadMIMEHeader` returns on the
+///    first blank line (reader.go:543-545 `len(kv) == 0` return) before
+///    `mustHaveFieldNameColon` ever runs, so it is always legal — a head
+///    with zero header lines is the same shape.
 /// 3. A header NAME byte that is neither tchar nor SPACE, or an empty
 ///    name (": x") — textproto `canonicalMIMEHeaderKey` accepts SPACE in
 ///    a name without canonicalizing (go.dev/issue/34540), so
@@ -1032,9 +1036,16 @@ fn validate_connect_head_shape(request: &str) -> bool {
     let Some(first_header) = lines.nth(1) else {
         return true;
     };
-    let mut lines = lines.peekable();
-    // Shape 1: the first header line must not open with SP/HTAB. A
+    // A blank first header line is the head's terminating blank line — a
     // CONNECT head with NO header lines at all is legal (ReadRequest OK).
+    // `str::lines()` yields the `\r\n\r\n` terminator as a final "" line,
+    // so this also ends the scan below instead of feeding the blank line
+    // to the missing-colon check (Go returns on the first blank line).
+    if first_header.is_empty() {
+        return true;
+    }
+    let mut lines = lines.peekable();
+    // Shape 1: the first header line must not open with SP/HTAB.
     if first_header.starts_with(' ') || first_header.starts_with('\t') {
         return false;
     }
@@ -1044,6 +1055,11 @@ fn validate_connect_head_shape(request: &str) -> bool {
     // Every later group-first line is non-fold by construction (folds are
     // consumed inside valid_connect_header_group).
     while let Some(first) = lines.next() {
+        if first.is_empty() {
+            // The head's terminating blank line: the header block ends
+            // here, legal (Go ReadMIMEHeader `len(kv) == 0` return).
+            return true;
+        }
         if !valid_connect_header_group(first, &mut lines) {
             return false;
         }

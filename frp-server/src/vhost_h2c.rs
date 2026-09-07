@@ -2180,6 +2180,17 @@ mod tests {
             let driver =
                 tokio::spawn(async move { while let Some(Ok(_)) = conn.accept().await {} });
             let result = serve(respond).await;
+            // Response frames written via `respond` only reach the wire when
+            // the driver task polls the connection. `serve` can run to
+            // completion without yielding (mock backend reads are
+            // immediately ready, and h2's send_response/send_data are sync
+            // enqueues), in which case the driver never gets polled before
+            // the abort below drops the conn with the response still queued
+            // — the h2 client then reads a clean EOF and every open stream
+            // errors with h2's own "stream closed because of a broken pipe"
+            // (proto/streams/state.rs recv_eof). Yield once so the driver
+            // flushes the queued response frames into the duplex first.
+            tokio::task::yield_now().await;
             driver.abort();
             result
         });

@@ -3239,7 +3239,12 @@ mod tests {
         ] {
             let cmd = format!("tcp --proxy_name web --remote_port {bad}");
             let err = parse_ssh_args(&cmd).unwrap_err();
-            let expected = format!("invalid argument \"{bad}\" for \"-r, --remote_port\" flag");
+            // Go quotes the dash-folded registered spelling: pflag's
+            // WordSepNormalizeFunc (`_` → `-`, config/flags.go:30-36, set
+            // in pkg/ssh/server.go) rewrites flag.Name at AddFlag time, so
+            // the Set error shows "-r, --remote-port" (empirically probed
+            // against pflag v1.0.5).
+            let expected = format!("invalid argument \"{bad}\" for \"-r, --remote-port\" flag");
             assert!(
                 err.contains(&expected),
                 "cmd {cmd:?} must be rejected with {expected:?}, got: {err}"
@@ -3248,7 +3253,7 @@ mod tests {
         // An explicitly empty value is rejected too (Go runs strconv on it).
         let err = parse_ssh_args("tcp --remote_port=").unwrap_err();
         assert!(
-            err.contains("invalid argument \"\" for \"-r, --remote_port\" flag"),
+            err.contains("invalid argument \"\" for \"-r, --remote-port\" flag"),
             "got: {err}"
         );
         // A truncated flag (no value at all) still tolerates → 0: the
