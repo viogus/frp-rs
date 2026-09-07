@@ -1222,8 +1222,8 @@ mod tests {
         let key = crate::encryption::derive_key("enc_decomp_read_key_a1");
 
         let (mut u_w_test, u_r_bridge) = tokio::io::duplex(256 * 1024);
-        let (mut w_w_test, w_r_bridge) = tokio::io::duplex(256 * 1024);
-        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(256 * 1024);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (w_w_bridge, w_r_test) = tokio::io::duplex(256 * 1024);
         let (u_w_bridge, mut u_r_test) = tokio::io::duplex(256 * 1024);
 
         // Same stack the frp-server encrypted injector arm builds

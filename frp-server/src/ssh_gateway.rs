@@ -3904,7 +3904,7 @@ mod preauth_tests {
         };
         // A fresh permit on the new entry.
         let fresh = {
-            let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = map.lock().unwrap_or_else(|e| e.into_inner());
             let sem = guard.get(&ip).unwrap().clone();
             PreauthPermit {
                 ip,

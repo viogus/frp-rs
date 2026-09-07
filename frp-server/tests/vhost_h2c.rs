@@ -1218,7 +1218,7 @@ async fn test_h2c_duplicate_response_headers_all_values_preserved() {
 /// per interim head (each fresh per-head timeout would park the head read
 /// without bound across N heads). These tests pin the swallow behavior and
 /// the failure arms of the shared deadline.
-
+///
 /// 100 → (split write) 200: the interim is consumed internally — the h2
 /// client must see only the final 200 + body, never a `:status 100`.
 #[tokio::test]
