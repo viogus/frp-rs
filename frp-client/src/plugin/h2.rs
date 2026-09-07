@@ -1291,9 +1291,16 @@ mod tests {
         let status = resp.status();
         let mut body = resp.into_body();
         let mut out = Vec::new();
-        while let Some(Ok(d)) = body.data().await {
-            out.extend_from_slice(&d);
-        }
+        // Bounded body drain: a no-response regression that keeps the
+        // stream open would hang an unbounded data() loop forever (the 5s
+        // cap above bounds only the response HEAD, not the body).
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(Ok(d)) = body.data().await {
+                out.extend_from_slice(&d);
+            }
+        })
+        .await
+        .expect("timed out draining the h2 response body — regression?");
         (status, out)
     }
 

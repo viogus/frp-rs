@@ -2317,12 +2317,19 @@ mod tests {
     async fn test_h2_backend_failures_answer_404_with_page() {
         // FIX 2 pins: the non-timeout backend-failure arms answer Go's
         // ErrorHandler 404 — status 404, Content-Type text/html (send_h2_error's
-        // default for the page body), body byte-identical to the builtin
-        // page the HTTP/1.1 surface serves (GO_404_NOT_FOUND_BODY).
-        let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {
-            let mut respond = respond;
-            let page = h2c_not_found_body("");
-            stream_h2_response(&mut EofMock, &mut respond, None, false, &page).await
+        // default for the page body). The page body follows
+        // `h2c_not_found_body`: the CONFIGURED custom_404_page when
+        // non-empty (round-15 gap — every prior call passed ""), else the
+        // builtin page the HTTP/1.1 surface serves byte-identical
+        // (GO_404_NOT_FOUND_BODY). First arm pins the custom branch (:846),
+        // second arm the builtin branch.
+        let custom_page = "<html><body>custom 404</body></html>";
+        let (status, headers, body) = h2c_test_roundtrip("GET", move |respond| {
+            let page = h2c_not_found_body(custom_page);
+            async move {
+                let mut respond = respond;
+                stream_h2_response(&mut EofMock, &mut respond, None, false, &page).await
+            }
         })
         .await;
         assert_eq!(status, 404, "backend close before the head → Go 404 class");
@@ -2332,8 +2339,9 @@ mod tests {
         );
         assert_eq!(
             body,
-            frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes(),
-            "the 404 body must be the not-found page, not an empty body"
+            custom_page.as_bytes(),
+            "a configured custom_404_page must replace the builtin 404 body \
+             (h2c_not_found_body custom branch)"
         );
 
         let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {

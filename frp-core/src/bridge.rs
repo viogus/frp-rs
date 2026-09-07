@@ -2811,4 +2811,133 @@ mod tests {
         expected.extend_from_slice(GO_404_NOT_FOUND_BODY.as_bytes());
         assert_eq!(received, expected);
     }
+
+    /// Work reader whose first read fails with UnexpectedEof — the error
+    /// shape frp-server's ResponseHeaderInjector produces when the backend
+    /// closes before completing a response head (a pre-head EOF is
+    /// converted to this kind by the injector; the partial unterminated
+    /// head is dropped, never relayed).
+    struct UnexpectedEofWorkReader;
+
+    impl tokio::io::AsyncRead for UnexpectedEofWorkReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "backend closed before completing a response head",
+            )))
+        }
+    }
+
+    /// Work→user bridge: a pre-head UnexpectedEof (backend closed without
+    /// a usable response head) must answer the same Go-shaped 404
+    /// NotFoundResponse as the InvalidData arm — Go frp v0.71.0's vhost
+    /// ErrorHandler answers the NotFound 404 page for every non-timeout
+    /// reverse-proxy failure, and the injector emits both kinds only from
+    /// its head-gather phase (pkg/util/vhost/http.go:128-138).
+    #[tokio::test]
+    async fn test_bridge_work_to_user_unexpected_eof_writes_go_404() {
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            bridge_work_to_user(
+                UnexpectedEofWorkReader,
+                u_w_bridge,
+                false, // plaintext passthrough — the error surfaces before any decode
+                None,
+                None,
+            )
+            .await;
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let mut received = Vec::new();
+        // Bounded collection: a regression that never writes the 404 (or
+        // never ends the direction) must fail this test, not hang the suite.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let n = u_r_test.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("bridge must write the 404 and end the direction within 5s");
+        let expected_head = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nContent-Type: text/html\r\nServer: frp/{}\r\n\r\n",
+            GO_404_NOT_FOUND_BODY.len(),
+            crate::VERSION
+        );
+        let mut expected = expected_head.into_bytes();
+        expected.extend_from_slice(GO_404_NOT_FOUND_BODY.as_bytes());
+        assert_eq!(received, expected);
+    }
+
+    /// Work reader whose first read fails with TimedOut — the error shape
+    /// frp-server's ResponseHeaderInjector surfaces when its absolute
+    /// response-head deadline fires (after interim 1xx bytes may already
+    /// have been served).
+    struct TimedOutWorkReader;
+
+    impl tokio::io::AsyncRead for TimedOutWorkReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "response-head deadline fired",
+            )))
+        }
+    }
+
+    /// Work→user bridge: a TimedOut read error (the upstream absolute
+    /// response-head deadline fired — Go's transport errors the whole
+    /// response and the vhost ErrorHandler answers 504, vhost http.go:128)
+    /// must write the bare Go-shaped 504 head
+    /// (`HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n`) and
+    /// end the direction.
+    #[tokio::test]
+    async fn test_bridge_work_to_user_timed_out_writes_go_504() {
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            bridge_work_to_user(
+                TimedOutWorkReader,
+                u_w_bridge,
+                false, // plaintext passthrough — the error surfaces before any decode
+                None,
+                None,
+            )
+            .await;
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let mut received = Vec::new();
+        // Bounded collection: a regression that never writes the 504 (or
+        // never ends the direction) must fail this test, not hang the suite.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let n = u_r_test.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("bridge must write the 504 and end the direction within 5s");
+        assert_eq!(
+            received,
+            GATEWAY_TIMEOUT_504,
+            "response-head deadline must render Go's bare 504, got: {:?}",
+            String::from_utf8_lossy(&received)
+        );
+    }
 }

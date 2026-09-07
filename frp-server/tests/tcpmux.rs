@@ -507,6 +507,74 @@ async fn test_tcpmux_connect_without_host_closes_silently() {
     drop(client);
 }
 
+/// The four textproto ReadMIMEHeader parse-error shapes (FIX 4, audit round
+/// 14) on the WIRE: each malformed CONNECT head is a Go http.ReadRequest
+/// error → readHTTPConnectRequest err → vhost handle `_ = c.Close()` —
+/// ZERO bytes before EOF, per malformed shape. The classifier itself is
+/// unit-pinned (tcpmux.rs test_validate_connect_head_shape_textproto_errors,
+/// all shapes + the legal counter-shapes); this pins the silent-close wire
+/// behavior through a real frps listener, one fresh conn per shape:
+///   1. the FIRST header line opens with SP / HTAB (textproto "malformed
+///      MIME header initial line" — a fold with no header to continue);
+///   2. a group-first header line without a colon ("malformed MIME header:
+///      missing colon" — obs-fold continuations are exempt, these are not);
+///   3. a non-tchar header NAME byte (paren here; SPACE in a name is LEGAL,
+///      go.dev/issue/34540 — so "Bad Name: v" must NOT be used);
+///   4. a CTL byte in a header VALUE (Go checks the obs-fold-merged line).
+#[tokio::test]
+async fn test_tcpmux_mime_shape_errors_close_silently() {
+    let bind_port = allocate_port();
+    let tcpmux_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        tcpmux_httpconnect_port: tcpmux_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
+
+    // No proxy registration needed: the shape gate fires before routing.
+    // Each head has a legal CONNECT request line (the authority routes in
+    // Go) and a single Host line where one is present — only the header
+    // block below the request line is malformed.
+    let heads: [&[u8]; 5] = [
+        // Shape 1: first header line opens with SP.
+        b"CONNECT mime.example.com:80 HTTP/1.1\r\n Host: mime.example.com:80\r\n\r\n",
+        // Shape 1: first header line opens with HTAB.
+        b"CONNECT mime.example.com:80 HTTP/1.1\r\n\tHost: mime.example.com:80\r\n\r\n",
+        // Shape 2: colonless group-first header line.
+        b"CONNECT mime.example.com:80 HTTP/1.1\r\nHost: mime.example.com:80\r\nNoColonHere\r\n\r\n",
+        // Shape 3: non-tchar name byte (paren).
+        b"CONNECT mime.example.com:80 HTTP/1.1\r\nBad(Name: v\r\n\r\n",
+        // Shape 4: CTL byte inside a header value.
+        b"CONNECT mime.example.com:80 HTTP/1.1\r\nX-V: a\x01b\r\n\r\n",
+    ];
+    for head in heads {
+        let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
+            .await
+            .expect("connect to tcpmux port");
+        client.write_all(head).await.expect("send malformed head");
+
+        let mut buf = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("timeout waiting for close")
+            .expect("read after malformed CONNECT head");
+        assert_eq!(
+            n,
+            0,
+            "textproto-malformed CONNECT head must close with zero bytes \
+             (got {:?} for head {:?})",
+            String::from_utf8_lossy(&buf[..n]),
+            String::from_utf8_lossy(head)
+        );
+        drop(client);
+    }
+}
+
 /// Duplicate Host headers: Go net/http readRequest errors ("too many Host
 /// headers", RFC 7230 §5.4) → readHTTPConnectRequest err → vhost handle
 /// `_ = c.Close()` — silent close, ZERO bytes (probe vs Go v0.71.0; the old

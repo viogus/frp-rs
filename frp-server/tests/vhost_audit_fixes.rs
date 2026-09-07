@@ -772,6 +772,107 @@ async fn test_vhost_blank_first_line_400() {
 }
 
 // ---------------------------------------------------------------
+// Round-15 e2e pins: the request-line version gate (505) and the
+// method-token gate that precedes it (400, never 505) on the wire
+// ---------------------------------------------------------------
+
+/// Go conn.readRequest's http1ServerSupportsRequest gate, e2e: a request
+/// line carrying a non-1.x HTTP version ("HTTP/2.0" — valid 8-char
+/// ParseHTTPVersion shape, major != 1) answers the Go 505 statusError
+/// render — the status line AND the body carry the detail
+/// ("505 HTTP Version Not Supported: unsupported protocol version", probe
+/// EXPL20 vs go1.25) — then close. The unit pin
+/// (vhost.rs test_vhost_http1_error_shapes_match_go) asserts the render
+/// bytes in-process; this pins the same bytes on the wire through a real
+/// frps. The host IS registered, so the answer cannot be the route-miss
+/// 404 — only the version gate can produce these bytes.
+#[tokio::test]
+async fn test_vhost_http2_request_line_505_exact_bytes_e2e() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, _run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "v505",
+            vec!["v505.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(b"GET / HTTP/2.0\r\nHost: v505.example.com\r\n\r\n")
+        .await
+        .expect("send request");
+
+    let bytes = read_until_eof(&mut client).await;
+    assert_eq!(
+        bytes,
+        b"HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version\r\n\
+          Content-Type: text/plain; charset=utf-8\r\n\
+          Connection: close\r\n\
+          \r\n\
+          505 HTTP Version Not Supported: unsupported protocol version",
+        "HTTP/2.0 on the vhost port must answer Go's 505 statusError render \
+         (detail on the status line AND the body), got: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    drop(client);
+}
+
+/// Go readRequest validMethod-before-ParseHTTPVersion order, e2e: a method
+/// that is not an RFC 7230 token 400s even when the version alone would
+/// 505 — "GET( / HTTP/2.0" answers the generic 400 render, NEVER the 505
+/// (request.go:1101-1104; the unit pin
+/// test_parse_vhost_request_line_method_token asserts the classifier
+/// verdict in-process). Same shape as the parse-failure render: no detail
+/// on either the status line or the body.
+#[tokio::test]
+async fn test_vhost_invalid_method_token_400_precedes_505_e2e() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, _run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "v400",
+            vec!["v400.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(b"GET( / HTTP/2.0\r\nHost: v400.example.com\r\n\r\n")
+        .await
+        .expect("send request");
+
+    let bytes = read_until_eof(&mut client).await;
+    assert_eq!(
+        bytes,
+        b"HTTP/1.1 400 Bad Request\r\n\
+          Content-Type: text/plain; charset=utf-8\r\n\
+          Connection: close\r\n\
+          \r\n\
+          400 Bad Request",
+        "a non-token method must answer the generic 400 even with a \
+         would-505 version (Go's validMethod runs before ParseHTTPVersion), \
+         got: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    drop(client);
+}
+
+// ---------------------------------------------------------------
 // T1: HTTP/1.1 vhost oversized-head 431 (h2c had coverage; the
 // HTTP/1.1 branch of the 4096-byte head cap had none)
 // ---------------------------------------------------------------

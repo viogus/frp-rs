@@ -3461,4 +3461,98 @@ mod tests {
             .expect_err("blank-first-line head must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
+
+    /// Audit round-15 gap pin: a mid-body decode failure AFTER a legal final
+    /// response head was already served must be swallowed as a CLEAN EOF —
+    /// the `complete` arm (:394-403) turns a post-head inner read error of
+    /// kind InvalidData into `Ok(())`, because frp-core would answer a
+    /// gateway head (404/502) for bytes the client already accepted as the
+    /// response (Go's ErrorHandler never runs once RoundTrip returned).
+    /// Producer shape pinned here is the real compressed-arm wiring
+    /// (`comp_key` → the work reader is wrapped in `SnappyStreamReader`
+    /// before the injector): a valid Snappy stream for the head + body,
+    /// then a garbage frame mid-body (a "compressed data" chunk header
+    /// declaring 0xFFFFFF bytes — far past the decoder's per-chunk cap, so
+    /// it errors the moment it is processed, never buffered as a partial
+    /// tail). Regression shape: without the swallow arm the read after the
+    /// body surfaces Err(InvalidData) instead of a clean EOF.
+    #[tokio::test]
+    async fn injector_mid_body_snappy_decode_failure_after_head_is_clean_eof() {
+        use frp_core::encryption::SnappyCompressor;
+        use tokio::io::AsyncWriteExt;
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+
+        // Compress the whole backend response (head + body) into one
+        // Snappy stream chunk, then append the corrupt frame.
+        let mut comp = SnappyCompressor::new();
+        let mut wire = Vec::new();
+        comp.compress(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            &mut wire,
+        )
+        .expect("compress backend response");
+        wire.extend_from_slice(&[0x00, 0xFF, 0xFF, 0xFF]);
+        assert!(
+            wire.len() < 32 * 1024,
+            "payload must fit one SnappyStreamReader read chunk"
+        );
+
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        // The compressed-arm wiring (bridge.rs comp_key → injector inner is
+        // a SnappyStreamReader over the work stream).
+        let mut injector = ResponseHeaderInjector::new(
+            frp_core::snappy_stream::SnappyStreamReader::new(inner_r),
+            headers,
+            None,
+        );
+        inner_w.write_all(&wire).await.expect("write wire");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        // Every read must succeed — the corruption may only shorten the
+        // stream to a clean EOF, never surface as an error kind frp-core
+        // would answer with a gateway head.
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 7]; // small caller buffer (injector tail path)
+        let saw_eof = loop {
+            match injector.read(&mut chunk).await {
+                Ok(0) => break true,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(e) => panic!(
+                    "mid-body decode failure after head served must be swallowed as clean EOF, got Err({e})"
+                ),
+            }
+        };
+        assert!(
+            saw_eof,
+            "the corruption must end the stream with a clean EOF"
+        );
+
+        let s = String::from_utf8_lossy(&out);
+        // The head was relayed/injected EXACTLY once, before the corruption.
+        assert_eq!(
+            s.matches("HTTP/1.1 200 OK").count(),
+            1,
+            "exactly one response head on the wire, got: {s:?}"
+        );
+        assert_eq!(
+            s.matches("X-Injected: yes").count(),
+            1,
+            "injected header present exactly once, got: {s:?}"
+        );
+        assert!(
+            s.starts_with("HTTP/1.1 200 OK\r\n"),
+            "status line first, got: {s:?}"
+        );
+        // The legal body survived up to the corruption point...
+        assert!(s.ends_with("hello"), "body must survive, got: {s:?}");
+        // ...and the corrupt tail was never relayed (no second response /
+        // garbage bytes after the body).
+        assert!(
+            !out.windows(4).any(|w| w == [0x00, 0xFF, 0xFF, 0xFF]),
+            "corrupt frame bytes must never reach the wire: {out:?}"
+        );
+    }
 }

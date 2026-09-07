@@ -4,12 +4,14 @@
 //! and every e2e fixture registered proxies with `allow_users: None`.
 //!
 //! Server sites exercised, each with its exact denial text asserted:
-//!   STCP fresh-conn NewVisitorConn            handlers/dispatch.rs:208   -> "visitor not allowed"
-//!   XTCP control-channel NewVisitorConn       control/nathole.rs:395     -> "auth failed"
+//!   STCP fresh-conn NewVisitorConn            handlers/dispatch.rs:212   -> "visitor not allowed"
+//!   XTCP control-channel NewVisitorConn       control/nathole.rs:450     -> "auth failed"
 //!   XTCP control-channel NatHoleVisitor       control/nathole.rs pre_check gate -> Go literal "xtcp visitor user [{user}] not allowed for [{proxy}]" (controller.go:163, one text for owner-only + allow-list denials)
 //!   XTCP control-channel NatHoleVisitor full arm -> NO user gate (Go parity, controller.go:169-194: proxy-exists + sign key only) — a valid-sk holder outside allow_users is admitted
-//!   XTCP fresh-conn NatHoleVisitor (precheck) handlers/dispatch.rs:453   -> "access denied: restricted to authenticated users"
-//!   XTCP fresh-conn NatHoleVisitor (full)     handlers/dispatch.rs:577   -> "access denied: use control channel for user-based auth"
+//!   XTCP control-channel NatHoleVisitor ghost (unregistered proxy name) control/nathole.rs:480 -> Go literal "xtcp server for [{proxy}] doesn't exist" (controller.go:159/187)
+//!   XTCP control-channel NatHoleVisitor full path, wrong sk control/nathole.rs:543/554 -> Go literal "xtcp connection of [{proxy}] auth failed" (controller.go:189-191)
+//!   XTCP fresh-conn NatHoleVisitor (precheck) handlers/dispatch.rs:455-473 -> "access denied: restricted to authenticated users"
+//!   XTCP fresh-conn NatHoleVisitor (full)     handlers/dispatch.rs:586-599 -> "access denied: use control channel for user-based auth"
 //!
 //! The gate semantics asserted e2e (Go frp visitor/visitor.go:83 + proxy.go:204):
 //!   empty `allow_users`  -> owner only
@@ -53,6 +55,21 @@ const XTCP_FRESH_FULL_DENIED: &str = "access denied: use control channel for use
 /// server/proxy/xtcp.go:58-62, so the same gate covers both).
 fn xtcp_ctl_allow_denied(visitor_user: &str, proxy_name: &str) -> String {
     format!("xtcp visitor user [{visitor_user}] not allowed for [{proxy_name}]")
+}
+
+/// Go literal for a NatHoleVisitor naming a proxy this server never
+/// registered (control/nathole.rs:480 — controller.go:159/187 both check
+/// proxy-exists with this text before any user/sk auth).
+fn xtcp_ctl_ghost_does_not_exist(proxy_name: &str) -> String {
+    format!("xtcp server for [{proxy_name}] doesn't exist")
+}
+
+/// Go literal for a full-path (non-pre_check) NatHoleVisitor whose sign_key
+/// does not match the registered proxy's sk (control/nathole.rs:543/554 —
+/// controller.go:189-191 ConstantTimeEqString parity; a missing sign_key
+/// fails the equality just like a wrong one).
+fn xtcp_ctl_full_auth_failed(proxy_name: &str) -> String {
+    format!("xtcp connection of [{proxy_name}] auth failed")
 }
 
 fn test_addr(port: u16) -> SocketAddr {
@@ -286,7 +303,7 @@ async fn start_two_user_server(port: u16) -> SocketAddr {
     test_addr(port)
 }
 
-/// STCP allow-list ([alice]) on the fresh-conn site (dispatch.rs:208):
+/// STCP allow-list ([alice]) on the fresh-conn site (dispatch.rs:212):
 /// 1. bob (logged-in user, claiming his own control run_id) -> denied
 ///    with the exact "visitor not allowed" text — a logged-in foreign user
 ///    is refused even with a valid sk sign_key.
@@ -545,6 +562,10 @@ async fn expect_ctl_nat_hole_verdict(
 ///   proxy-exists + sign key (:169-194). Listed user admitted through both.
 ///   owner-only proxy: pre_check denied with the same Go literal (empty
 ///   allow_users normalized to [owner]); owner admitted.
+///   round-15 pins: full path with a WRONG sign_key -> Go literal "xtcp
+///   connection of [xcp-l] auth failed" (:543/554, controller.go:189-191);
+///   NatHoleVisitor naming a never-registered proxy -> Go literal "xtcp
+///   server for [no-such-xtcp] doesn't exist" (:480, controller.go:159/187).
 #[tokio::test]
 async fn xtcp_allow_users_enforced_on_control_channel() {
     let addr = start_two_user_server(allocate_port()).await;
@@ -645,6 +666,37 @@ async fn xtcp_allow_users_enforced_on_control_channel() {
     )
     .await;
 
+    // Audit round-15 pin (control/nathole.rs:543/554, Go controller.go:
+    // 189-191): the FULL path (pre_check=false) verifies proxy-exists +
+    // sign key only — a wrong sign_key (here: a key generated from a
+    // different sk) is rejected with the exact Go literal. (The valid-sk
+    // full-path admission was proven above with the silence arm.)
+    expect_ctl_nat_hole_verdict(
+        &mut bob_ctl,
+        "txn-bob-full-wrongsk",
+        "xcp-l",
+        "sk-wrong",
+        false,
+        Some(&xtcp_ctl_full_auth_failed("xcp-l")),
+        "bob full NatHoleVisitor with wrong sign_key on xcp-l",
+    )
+    .await;
+
+    // Audit round-15 pin (control/nathole.rs:480, Go controller.go:159/187):
+    // a NatHoleVisitor naming a proxy this server never registered is
+    // answered with the exact Go ghost literal — no user/sk auth involved
+    // (the provider's server has no such proxy under ANY run).
+    expect_ctl_nat_hole_verdict(
+        &mut bob_ctl,
+        "txn-bob-ghost",
+        "no-such-xtcp",
+        "sk-any",
+        false,
+        Some(&xtcp_ctl_ghost_does_not_exist("no-such-xtcp")),
+        "bob NatHoleVisitor for an unregistered proxy name",
+    )
+    .await;
+
     // alice: listed user. Registration succeeds (Go parity ack = ReqWorkConn)
     // and her pre_check passes the gate (error None).
     let (mut alice_ctl, _) = login_with_identity(addr, "alice", HashMap::new())
@@ -688,10 +740,10 @@ async fn xtcp_allow_users_enforced_on_control_channel() {
     drop(owner_ctl);
 }
 
-/// XTCP fresh-conn site (handlers/dispatch.rs:453 + :577): a fresh TCP
-/// NatHoleVisitor carries no user identity (""), so a restricted proxy
-/// refuses it with the fresh-path texts — restricted proxies must be reached
-/// over the control channel instead.
+/// XTCP fresh-conn site (handlers/dispatch.rs:455-473 pre_check + :586-599
+/// full): a fresh TCP NatHoleVisitor carries no user identity (""), so a
+/// restricted proxy refuses it with the fresh-path texts — restricted
+/// proxies must be reached over the control channel instead.
 #[tokio::test]
 async fn xtcp_fresh_conn_restricted_proxy_refused() {
     let addr = start_two_user_server(allocate_port()).await;

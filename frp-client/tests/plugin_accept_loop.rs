@@ -48,11 +48,16 @@ async fn test_plugin_accept_loop_survives_connection_churn() {
             .unwrap_or_else(|e| {
                 panic!("churn iteration {i}: connect failed — accept loop dead: {e}")
             });
-        // Garbage request, then half-close: the handler fails to parse it
-        // and closes the connection — EOF proves accepted + handled.
+        // Garbage request line, then half-close: the handler's head read ends
+        // in EOF mid-head with partial bytes, so Go-parity (http.Server
+        // conn.serve) renders its 400 errorHeaders before closing — any
+        // response at all proves the connection was accepted AND handled. A
+        // dead accept loop would leave the connection unaccepted in the
+        // kernel queue and the read would hang. (Pre-round-15 the plain arm
+        // closed silently; the render changed, the close did not.)
         client.write_all(b"not-an-http-request\r\n").await.unwrap();
         client.shutdown().await.unwrap();
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 32];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf))
             .await
             .unwrap_or_else(|_| {
@@ -61,10 +66,26 @@ async fn test_plugin_accept_loop_survives_connection_churn() {
                 )
             })
             .expect("read");
-        assert_eq!(
-            n, 0,
-            "churn iteration {i}: handler must close the connection, got {n} bytes"
+        assert!(
+            n > 0 && buf[..n].starts_with(b"HTTP/1.1 400"),
+            "churn iteration {i}: handler must answer the Go 400 render then close, \
+             got {n} bytes"
         );
+        // The handler closes right after the render — drain to EOF (bounded)
+        // so the close is observed too.
+        let mut rest = [0u8; 16];
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let m = client.read(&mut rest).await.expect("read");
+                if m == 0 {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("churn iteration {i}: handler did not close after the 400 render")
+        });
     }
 
     // Shutdown must still terminate the loop: breaking ONLY on the shutdown
