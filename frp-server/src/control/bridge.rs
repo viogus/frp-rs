@@ -99,20 +99,48 @@ impl Drop for ActiveGuard {
 
 /// Wraps an AsyncRead, buffering HTTP response headers on first read
 /// and injecting configured headers before passing through.
+///
+/// Go parity model (go1.25 httputil.ReverseProxy + v0.71.0 vhost
+/// ModifyResponse): the injector must fire on the FIRST final response
+/// head (status >= 200) and on a 101 Switching Protocols (Go runs
+/// modifyResponse on 101 before handleUpgradeResponse), but NEVER on an
+/// interim 1xx head other than 101 — Go's Transport consumes those heads
+/// internally and modifyResponse never sees them — nor on a MALFORMED
+/// first line (unparseable version token or code: Go errors the whole
+/// response and the reverse proxy answers 502, see head_status_code).
+/// Interim heads are still
+/// real bytes on this raw pipe (an `Expect: 100-continue` backend waits
+/// for its 100 head to reach the client before sending the body), so they
+/// are served through UNINJECTED and promptly, not withheld until a final
+/// head shows up (withholding would deadlock the Expect handshake).
+/// Malformed heads pass through uninjected too — never manufacture
+/// configured headers into a head Go would reject outright.
 struct ResponseHeaderInjector<R> {
     inner: R,
     headers: std::collections::HashMap<String, String>,
+    /// Emission content: the injected final/101 head (spliced headers,
+    /// trailing body bytes attached), a raw interim 1xx head, or the
+    /// truncated post-EOF tail. Never emitted before its boundary is in
+    /// the buffer (M3: a head spanning several internal reads must not
+    /// leak fragment-first).
     buffer: Vec<u8>,
     buffer_offset: usize,
-    /// True once the response head ended — the first blank line under Go
-    /// `textproto.ReadLine` rules (CRLF, bare-LF, or mixed line endings)
-    /// was seen — and the configured headers were injected. Until this is
-    /// true (or the inner stream hit EOF), `poll_read` never emits bytes
-    /// to the caller: emission before the head end is known would corrupt
-    /// the stream for headers spanning multiple internal reads.
+    /// The emission content carries the injected configured headers (final
+    /// head or 101). Once drained, the rest of the response passes through
+    /// raw (`complete`).
     injected: bool,
-    /// True once the inner stream hit EOF before the head ended — the
-    /// buffered partial header is served (no injection), then EOF.
+    /// The emission content is exactly one complete interim 1xx head
+    /// (status 100..=199, NOT 101) served raw — Go's Transport consumes
+    /// these and modifyResponse never runs, and Expect:100-continue
+    /// deadlocks if they are withheld. Once drained, head accumulation
+    /// resumes from `tail`.
+    raw_head: bool,
+    /// Bytes read past an interim head's blank line (the next head's
+    /// start, possibly already complete) while the interim head is being
+    /// emitted. Taken back into `buffer` when the emission drains.
+    tail: Option<Vec<u8>>,
+    /// True once the inner stream hit EOF before an injectable head ended —
+    /// the buffered partial header is served (no injection), then EOF.
     eof: bool,
     /// True once every buffered byte is served and no further buffering is
     /// possible — the rest of the response passes through raw.
@@ -122,7 +150,7 @@ struct ResponseHeaderInjector<R> {
 }
 
 // SAFETY: All fields of ResponseHeaderInjector are Unpin when R: Unpin.
-// HashMap, Vec, usize, bool, and [u8; 4096] are all Unpin types.
+// HashMap, Vec, Option<Vec>, usize, bool, and [u8; 4096] are all Unpin.
 impl<R: Unpin> Unpin for ResponseHeaderInjector<R> {}
 
 impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
@@ -133,9 +161,122 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
             buffer: Vec::new(),
             buffer_offset: 0,
             injected: false,
+            raw_head: false,
+            tail: None,
             eof: false,
             complete: false,
             read_buf: [0u8; 4096],
+        }
+    }
+
+    /// True when the version token parses like Go `http.ParseHTTPVersion`
+    /// — `HTTP/` + one or more digits + `.` + one or more digits
+    /// (response.go:183-185 — the version is validated BEFORE the code, so
+    /// a first token like `FOO 200 OK` errors the whole response).
+    fn is_http_version(v: &[u8]) -> bool {
+        let Some(rest) = v.strip_prefix(b"HTTP/") else {
+            return false;
+        };
+        let Some(dot) = rest.iter().position(|&b| b == b'.') else {
+            return false;
+        };
+        dot > 0
+            && rest[..dot].iter().all(u8::is_ascii_digit)
+            && !rest[dot + 1..].is_empty()
+            && rest[dot + 1..].iter().all(u8::is_ascii_digit)
+    }
+
+    /// Status code of the head's first line, or None when the line is not
+    /// a parseable `HTTP/x.y <3-digit-code>` status line. Round-13 review
+    /// (3 independent reviewers): the version token must parse (Go
+    /// ParseHTTPVersion) and the remainder is trimmed of ASCII SPACES only
+    /// (Go TrimLeft(" ", ...) — a TAB before the code keeps the token
+    /// `\t100`, 4 chars, malformed, exactly like Go; trimming TAB was
+    /// classifying `HTTP/1.1 \t100 Continue` as interim when Go 502s it).
+    fn head_status_code(head: &[u8]) -> Option<u16> {
+        let line_end = head.iter().position(|&b| b == b'\n')?;
+        let line = &head[..line_end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // Go ReadResponse parseStatusLine parity: the version token is cut
+        // at the FIRST literal space, the remainder is TrimLeft'd of
+        // spaces (extra spaces legal — "HTTP/1.1  100 Continue"), then the
+        // code is the next space-delimited token, exactly 3 ASCII digits
+        // (checked before Atoi — "0200" rejected).
+        let mut sp = line.splitn(2, |&b| b == b' ');
+        let version = sp.next()?;
+        let rest = sp.next()?;
+        if !Self::is_http_version(version) {
+            return None;
+        }
+        let mut rest = rest;
+        while let Some(stripped) = rest.strip_prefix(b" ") {
+            rest = stripped;
+        }
+        let code = rest.split(|&b| b == b' ').next()?;
+        if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            code.iter()
+                .fold(0u16, |acc, &b| acc * 10 + u16::from(b - b'0')),
+        )
+    }
+
+    /// Copy the status + header lines of a backend response head
+    /// (`head_region` EXCLUDES the terminating blank line) into `out`,
+    /// dropping any header whose name matches a configured response header
+    /// (case-insensitive, Go canonicalization), folded obs-fold
+    /// continuation lines included — Go `Header.Set` semantics: the
+    /// configured value replaces the backend value; both never reach the
+    /// wire. A continuation AFTER a kept line stays with its parent (bytes
+    /// preserved verbatim).
+    fn splice_head_deduplicated(
+        head_region: &[u8],
+        headers: &std::collections::HashMap<String, String>,
+        out: &mut Vec<u8>,
+    ) {
+        let mut pos = 0;
+        while pos < head_region.len() {
+            let (line, next) = match head_region[pos..].iter().position(|&b| b == b'\n') {
+                Some(p) => (&head_region[pos..pos + p + 1], pos + p + 1),
+                None => (&head_region[pos..], head_region.len()),
+            };
+            let body = line.strip_suffix(b"\n").unwrap_or(line);
+            let body = body.strip_suffix(b"\r").unwrap_or(body);
+            let is_continuation = matches!(body.first(), Some(b' ' | b'\t'));
+            if !is_continuation {
+                if let Some(colon) = body.iter().position(|&b| b == b':') {
+                    let name = &body[..colon];
+                    if headers
+                        .keys()
+                        .any(|k| k.as_bytes().eq_ignore_ascii_case(name))
+                    {
+                        // Drop this header AND its folded continuation
+                        // lines (they belong to it — a leftover fold tail
+                        // would obs-fold onto the PRECEDING kept header at
+                        // the client).
+                        let mut after = next;
+                        while after < head_region.len() {
+                            let (c_line, c_next) =
+                                match head_region[after..].iter().position(|&b| b == b'\n') {
+                                    Some(p) => (&head_region[after..after + p + 1], after + p + 1),
+                                    None => (&head_region[after..], head_region.len()),
+                                };
+                            let c_body = c_line.strip_suffix(b"\n").unwrap_or(c_line);
+                            let c_body = c_body.strip_suffix(b"\r").unwrap_or(c_body);
+                            if matches!(c_body.first(), Some(b' ' | b'\t')) {
+                                after = c_next;
+                            } else {
+                                break;
+                            }
+                        }
+                        pos = after;
+                        continue;
+                    }
+                }
+            }
+            out.extend_from_slice(line);
+            pos = next;
         }
     }
 }
@@ -155,25 +296,38 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
             return Pin::new(&mut this.inner).poll_read(cx, buf);
         }
 
-        // Serve buffered bytes — only ever POST-injection (the head with
-        // the injected headers appended) or post-EOF (a truncated response:
-        // emit the partial header bytes, inject nothing). M3: the old code
-        // served pre-boundary fragments to the caller, so a header spanning
-        // several internal reads (e.g. a big Set-Cookie set over 4 KiB)
-        // leaked out fragment-first and the configured headers were never
-        // injected — the drain path even raised `complete` before the
-        // boundary existed, silently disabling injection for the rest of
-        // the response.
-        if this.buffer_offset < this.buffer.len() {
-            debug_assert!(this.injected || this.eof);
+        // Serve buffered emission content. Three shapes, all emitted only
+        // post-boundary: the injected final/101 head, a raw interim 1xx
+        // head, or the post-EOF truncated tail. M3: nothing pre-boundary
+        // is ever served — a header spanning several internal reads (e.g.
+        // a big Set-Cookie set over 4 KiB) must not leak fragment-first.
+        //
+        // The flag gate: a drained interim head hands accumulation back to
+        // its split-off tail, which may already hold the pipelined final
+        // head (100 + 200 in one backend segment). That swapped-in tail is
+        // flagless; it must NOT be served raw (which would skip injection)
+        // and must not trip the debug_assert below — a flagless non-empty
+        // buffer falls through to the gather loop, which re-resolves the
+        // head boundary and re-enters classification.
+        if (this.injected || this.eof || this.raw_head) && this.buffer_offset < this.buffer.len() {
+            debug_assert!(this.injected || this.eof || this.raw_head);
             let remaining = this.buffer.len() - this.buffer_offset;
             let to_copy = remaining.min(buf.remaining());
             buf.put_slice(&this.buffer[this.buffer_offset..this.buffer_offset + to_copy]);
             this.buffer_offset += to_copy;
             if this.buffer_offset >= this.buffer.len() {
-                // The injected head (or truncated tail) is fully out; the
-                // remainder of the response is raw pass-through.
-                this.complete = true;
+                if this.raw_head {
+                    // Raw head (interim 1xx, or malformed — neither is
+                    // injected) fully served — resume accumulating the
+                    // next head from the split-off tail.
+                    this.raw_head = false;
+                    this.buffer = this.tail.take().unwrap_or_default();
+                    this.buffer_offset = 0;
+                } else {
+                    // Injected head (or truncated tail) is fully out; the
+                    // remainder of the response is raw pass-through.
+                    this.complete = true;
+                }
             }
             return Poll::Ready(Ok(()));
         }
@@ -185,12 +339,106 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
             return Poll::Ready(Ok(()));
         }
 
-        // Buffer empty and the head has not ended yet — gather more of the
-        // response header from the backend. Bytes are held (never served)
-        // until the first blank line ends the head (Go `textproto.ReadLine`
+        // Buffer empty and the injectable head has not ended yet — gather
+        // more of the response from the backend. Bytes are held (never
+        // served) until a blank line ends a head (Go `textproto.ReadLine`
         // semantics: CRLF, bare-LF, or mixed line endings all legal) or the
         // backend closes.
         loop {
+            // A split-off tail may already hold a complete head (the
+            // backend pipelined interim + final heads in one segment) —
+            // resolve it before reading more.
+            if !this.buffer.is_empty() {
+                if let Some(end) = frp_core::textproto::head_end(&this.buffer) {
+                    let blank_start = if end >= 2 && this.buffer[end - 2] == b'\r' {
+                        end - 2
+                    } else {
+                        end - 1
+                    };
+                    // Go http.ReadResponse rejects a head whose FIRST line
+                    // is empty (the head starting with its own blank line
+                    // means no status line exists) — such a backend answer
+                    // is malformed, and splicing configured headers in
+                    // front of it would manufacture a plausible response
+                    // out of garbage. Fail the read like Go's reverse
+                    // proxy would (round-3 review finding).
+                    if blank_start == 0 {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "backend response head has no status line",
+                        )));
+                    }
+                    // Go ReadResponse parity: an interim 1xx head (not
+                    // 101) is consumed internally by Go's Transport and
+                    // modifyResponse never runs on it, and a MALFORMED
+                    // first line (unparseable version token or code — Go
+                    // errors the response, the reverse proxy answers 502)
+                    // never reaches modifyResponse either. Both are served
+                    // through this raw pipe UNINJECTED — never manufacture
+                    // configured headers into a head Go would swallow or
+                    // reject (round-13 review, 3 independent reviewers).
+                    let served_raw = match Self::head_status_code(&this.buffer[..end]) {
+                        Some(c) if (100..=199).contains(&c) && c != 101 => true,
+                        None => true,
+                        Some(_) => false,
+                    };
+                    if served_raw {
+                        // Serve the head raw NOW (an Expect:100-continue
+                        // backend waits for its 100 head to reach the
+                        // client before sending the body); bytes past the
+                        // blank line are the next head's start and go back
+                        // into `buffer` once the emission drains.
+                        this.tail = Some(this.buffer.split_off(end));
+                        this.buffer_offset = 0;
+                        this.raw_head = true;
+                        break;
+                    }
+                    // Final head (>= 200) or 101 — the one head Go's
+                    // modifyResponse runs on: inject configured headers
+                    // before the blank line. `end` is past the terminating
+                    // blank line, which is exactly "\n" or "\r\n" (a line
+                    // textproto deemed empty keeps at most one trailing
+                    // "\r") and stays attached to the head: the configured
+                    // headers must go out BEFORE it — bytes after the
+                    // blank line are the backend's entity body and pass
+                    // verbatim.
+                    let mut injected = Vec::with_capacity(this.buffer.len() + 512);
+                    // Go ModifyResponse `Header.Set(k, v)` REPLACES a
+                    // backend-sent value for a configured name — the wire
+                    // must never carry both lines (round-13 review finding:
+                    // a backend `X-Custom: a` + configured `X-Custom: b`
+                    // previously shipped both, backend's first, breaking a
+                    // first-value-wins security header). Backend lines whose
+                    // name matches a configured key are dropped,
+                    // case-insensitively, folded continuations included.
+                    Self::splice_head_deduplicated(
+                        &this.buffer[..blank_start],
+                        &this.headers,
+                        &mut injected,
+                    );
+                    for (k, v) in &this.headers {
+                        // Sanitize header names/values to prevent HTTP
+                        // header injection.
+                        let safe_k: String =
+                            k.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                        let safe_v: String =
+                            v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                        // Configured headers always go out CRLF (Go
+                        // net/http renders every response header CRLF,
+                        // whatever the backend wrote) — a backend LF-only
+                        // head intentionally ends up mixed-EOL; the
+                        // injected lines remain parseable and the trailing
+                        // blank keeps the backend's own EOL.
+                        injected
+                            .extend_from_slice(format!("{}: {}\r\n", safe_k, safe_v).as_bytes());
+                    }
+                    injected.extend_from_slice(&this.buffer[blank_start..]);
+                    this.buffer = injected;
+                    this.buffer_offset = 0;
+                    this.injected = true;
+                    break;
+                }
+            }
             let mut temp_buf = ReadBuf::new(&mut this.read_buf);
             match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
                 Poll::Ready(Ok(())) => {
@@ -221,85 +469,40 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                     }
                     this.buffer.extend_from_slice(&this.read_buf[..n]);
                     // The head end may span internal reads — the search
-                    // covers the whole buffer.
-                    if let Some(end) = frp_core::textproto::head_end(&this.buffer) {
-                        // `end` is past the terminating blank line. The
-                        // blank line itself is exactly "\n" or "\r\n" (a
-                        // line textproto deemed empty keeps at most one
-                        // trailing "\r") and stays attached to the head:
-                        // the configured headers must go out BEFORE it —
-                        // bytes after the blank line are the backend's
-                        // entity body and pass verbatim.
-                        let blank_start = if end >= 2 && this.buffer[end - 2] == b'\r' {
-                            end - 2
-                        } else {
-                            end - 1
-                        };
-                        // Go http.ReadResponse rejects a head whose FIRST
-                        // line is empty (the head starting with its own
-                        // blank line means no status line exists) — such a
-                        // backend answer is malformed, and splicing
-                        // configured headers in front of it would
-                        // manufacture a plausible response out of garbage.
-                        // Fail the read like Go's reverse proxy would
-                        // (round-3 review finding).
-                        if blank_start == 0 {
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "backend response head has no status line",
-                            )));
-                        }
-                        let mut injected = Vec::with_capacity(this.buffer.len() + 512);
-                        injected.extend_from_slice(&this.buffer[..blank_start]);
-                        for (k, v) in &this.headers {
-                            // Sanitize header names/values to prevent HTTP
-                            // header injection.
-                            let safe_k: String =
-                                k.chars().filter(|&c| c != '\r' && c != '\n').collect();
-                            let safe_v: String =
-                                v.chars().filter(|&c| c != '\r' && c != '\n').collect();
-                            // Configured headers always go out CRLF (Go
-                            // net/http renders every response header CRLF,
-                            // whatever the backend wrote) — a backend
-                            // LF-only head intentionally ends up mixed-EOL;
-                            // the injected lines remain parseable and the
-                            // trailing blank keeps the backend's own EOL.
-                            injected.extend_from_slice(
-                                format!("{}: {}\r\n", safe_k, safe_v).as_bytes(),
-                            );
-                        }
-                        injected.extend_from_slice(&this.buffer[blank_start..]);
-                        this.buffer = injected;
-                        this.injected = true;
-                        break;
-                    }
-                    // Still a partial header — withhold it from the caller
-                    // (injection happens at the boundary) and keep pulling
-                    // while the inner stream is ready. Returning Pending
-                    // straight after a Ready inner read would park the
-                    // caller with no registered waker (a Ready poll does
-                    // not register one) — deadlock; the loop below only
-                    // returns Pending once the inner poll itself went
-                    // Pending, so its waker is set.
+                    // covers the whole buffer; the loop re-checks at the
+                    // top.
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {
                     // Data will arrive later; that inner poll registered
-                    // the waker — park until then.
+                    // the waker — park until then. Returning Pending
+                    // straight after a Ready inner read would park the
+                    // caller with no registered waker (a Ready poll does
+                    // not register one) — deadlock; the loop only returns
+                    // Pending once the inner poll itself went Pending, so
+                    // its waker is set.
                     return Poll::Pending;
                 }
             }
         }
 
-        // Boundary found (and headers injected) in this poll: serve what
-        // fits; the tail goes out on subsequent polls and `complete` is
-        // raised only once the buffer is fully drained.
+        // A head boundary was found in this poll (interim → raw serve,
+        // final/101 → injected serve): emit what fits; the tail goes out
+        // on subsequent polls. `complete` is raised only once the buffer
+        // is fully drained, and a drained interim head hands the
+        // accumulation back to the split-off tail.
         let remaining = this.buffer.len() - this.buffer_offset;
         let to_copy = remaining.min(buf.remaining());
         buf.put_slice(&this.buffer[this.buffer_offset..this.buffer_offset + to_copy]);
         this.buffer_offset += to_copy;
         if this.buffer_offset >= this.buffer.len() {
-            this.complete = true;
+            if this.raw_head {
+                this.raw_head = false;
+                this.buffer = this.tail.take().unwrap_or_default();
+                this.buffer_offset = 0;
+            } else {
+                this.complete = true;
+            }
         }
 
         Poll::Ready(Ok(()))
@@ -1204,14 +1407,26 @@ async fn run_work_bridge(
         .as_ref()
         .and_then(|p| p.bandwidth_limiter.clone());
 
-    // The response-header injector only fires for HTTP-family proxies
-    // with configured headers; clone the HashMap at bridge time instead
-    // of deep-cloning it into every pending request at enqueue time.
-    // Uses the resolved metadata (bridge-time re-fetch when the
-    // enqueue-time snapshot was None).
+    // The response-header injector only fires for PLAIN-HTTP proxies
+    // (`proxy_type == "http"`, NOT `starts_with("http")`) with configured
+    // headers; clone the HashMap at bridge time instead of deep-cloning it
+    // into every pending request at enqueue time. Uses the resolved
+    // metadata (bridge-time re-fetch when the enqueue-time snapshot was
+    // None).
+    //
+    // The two exclusions mirror Go v0.71.0 exactly:
+    //   * https tunnels: HTTPSProxyConfig (pkg/config/v1/proxy.go:369) has
+    //     no ResponseHeaders field — a wire-declared response_headers on an
+    //     https proxy is silently dropped by Go, and the bridge here sees
+    //     raw TLS bytes anyway (injecting would corrupt the ciphertext).
+    //   * CONNECT tunnels on an http proxy: Go's connectHandler joins raw
+    //     (http.go:282-285) — no host rewrite, no ModifyResponse — so the
+    //     injector must not splice into the tunnel stream. `request_is_connect`
+    //     is set by the two vhost HTTP send sites (h1 + h2c) and rides the
+    //     PendingRequest, including across run_id group forwarders.
     let injector_headers = proxy_info
         .as_ref()
-        .filter(|p| p.proxy_type.starts_with("http"))
+        .filter(|p| p.proxy_type == "http" && !req.request_is_connect)
         .map(|p| p.response_headers.clone())
         .filter(|h| !h.is_empty());
 
@@ -2300,6 +2515,7 @@ mod tests {
                     1,
                 ),
             )),
+            request_is_connect: false,
         };
         let spawn_res = assign_work_to_proxy(
             IoStream::Tcp(work),
@@ -2509,5 +2725,190 @@ mod tests {
                 "an empty first line must error, not forward: {garbage:?}"
             );
         }
+    }
+
+    /// Round-13 (F1#2): a backend head of status 1xx (NOT 101) must be
+    /// served RAW, promptly, with no injection — Go's Transport consumes
+    /// interim responses and ModifyResponse never runs on them, and an
+    /// Expect:100-continue backend deadlocks if its 100 head is withheld
+    /// while the injector keeps gathering the (never-arriving) final head.
+    /// A final head pipelined in the SAME backend segment as the 100 must
+    /// still get the injection (the split-off tail is re-accumulated once
+    /// the raw emission drains).
+    #[tokio::test]
+    async fn injector_interim_1xx_served_raw_final_pipelined_injected() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+
+        // One backend segment: interim 100 head + final 200 head + body.
+        let response =
+            "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello";
+        inner_w.write_all(response.as_bytes()).await.expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        // Byte-exact: the 100 head verbatim, then the 200 head WITH the
+        // configured header injected before its blank line, body intact.
+        let expected = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Injected: yes\r\n\r\nhello";
+        assert_eq!(
+            &out[..],
+            expected,
+            "interim head must pass raw, final head must be injected"
+        );
+    }
+
+    /// Round-13 (F1#2): interim head arriving on a SEPARATE write (the
+    /// Expect:100-continue shape — backend waits for the 100 to reach the
+    /// client before sending the final head) must be emitted before the
+    /// final head exists, not withheld while the injector waits for a
+    /// second head it cannot see.
+    #[tokio::test]
+    async fn injector_interim_1xx_emitted_before_final_arrives() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+
+        // Phase 1: only the 100 head. A single read must return it in full.
+        inner_w
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .expect("write 100");
+        let mut first = [0u8; 64];
+        let n = tokio::io::AsyncReadExt::read(&mut injector, &mut first)
+            .await
+            .expect("read 100 head");
+        assert_eq!(
+            &first[..n],
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            "the interim head must be served raw before the final head exists"
+        );
+
+        // Phase 2: final head + body, then EOF.
+        inner_w
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello")
+            .await
+            .expect("write final");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+        let mut rest = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut injector, &mut rest)
+            .await
+            .expect("read rest");
+        assert_eq!(
+            &rest[..],
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Injected: yes\r\n\r\nhello",
+            "the final head must still get the injection"
+        );
+    }
+
+    /// Round-13 (F1#2): 101 is NOT interim — Go runs modifyResponse on a
+    /// 101, so the configured headers are injected into the 101 head, and
+    /// the raw upgrade bytes after it pass through verbatim.
+    #[tokio::test]
+    async fn injector_101_switching_protocols_gets_injection() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+
+        let response =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n\x81\xfeRAW-UPGRADE-BYTES";
+        inner_w.write_all(response).await.expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        let expected = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nX-Injected: yes\r\n\r\n\x81\xfeRAW-UPGRADE-BYTES";
+        assert_eq!(
+            &out[..],
+            expected,
+            "101 must be injected, upgrade bytes must pass verbatim"
+        );
+    }
+
+    /// Round-13 (F1#2): 100 head then backend EOF with no final head ever
+    /// arriving — the raw 100 passes through and the stream ends cleanly
+    /// (no injected headers, no error, no hang).
+    #[tokio::test]
+    async fn injector_100_only_passthrough_clean_eof() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+
+        inner_w
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .expect("write 100");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(
+            &out[..],
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            "the lone interim head must pass raw with a clean EOF"
+        );
+    }
+
+    /// Round-13 review (3 independent reviewers): a head whose first line
+    /// does not parse as `HTTP/x.y <3-digit-code>` is malformed — Go errors
+    /// the whole response and the reverse proxy answers 502, ModifyResponse
+    /// never runs. The injector must serve such heads raw and NEVER
+    /// manufacture configured headers into them. Pins the strict status
+    /// line: tab separator, unparseable version token, and a 4-digit code
+    /// are all malformed (space-TrimLeft is spaces-only, "0200" rejected
+    /// before Atoi), while extra SPACES stay legal and DO inject.
+    #[tokio::test]
+    async fn injector_malformed_first_line_served_raw_never_injected() {
+        use tokio::io::AsyncWriteExt;
+        let headers = || {
+            let mut h = std::collections::HashMap::new();
+            h.insert("X-Injected".to_string(), String::from("yes"));
+            h
+        };
+        for (name, head) in [
+            ("tab separator", &b"HTTP/1.1\t100 Continue\r\n\r\n"[..]),
+            ("bad version token", &b"HTTP/1.x 200 OK\r\n\r\n"[..]),
+            ("4-digit code", &b"HTTP/1.1 0200 OK\r\n\r\n"[..]),
+            ("no code", &b"HTTP/1.1 \r\n\r\n"[..]),
+        ] {
+            let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+            let mut injector = ResponseHeaderInjector::new(inner_r, headers());
+            inner_w.write_all(head).await.expect("write head");
+            inner_w.shutdown().await.expect("shutdown");
+            drop(inner_w);
+            let out = injector_read_all(&mut injector).await;
+            assert_eq!(
+                &out[..],
+                head,
+                "[{name}] malformed first line must pass through byte-exact, uninjected"
+            );
+        }
+        // Extra spaces between version and code are legal (Go TrimLeft): the
+        // head IS final (200) and MUST be injected.
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers());
+        inner_w
+            .write_all(b"HTTP/1.1   200 OK\r\nContent-Type: text/plain\r\n\r\nhello")
+            .await
+            .expect("write 200");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+        let out = injector_read_all(&mut injector).await;
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("X-Injected: yes"),
+            "multi-space first line is a valid final head and must inject, got: {s:?}"
+        );
+        assert!(s.ends_with("hello"), "body must survive, got: {s:?}");
     }
 }

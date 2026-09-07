@@ -891,6 +891,20 @@ async fn run_udp_work_conn(
                                     let remote = match up.remote_addr {
                                         Some(ref ra) => match ra.ip.parse::<IpAddr>() {
                                             Ok(ip) => SocketAddr::new(ip, ra.port),
+                                            // The `%zone` scope suffix can never
+                                            // appear here: the wire format carries
+                                            // the zone in the SEPARATE `Zone` field
+                                            // (msg.rs UdpAddr mirrors Go
+                                            // net.UDPAddr marshal), so `ra.ip` is
+                                            // always zone-free and this arm is
+                                            // dead code — kept as defense-in-depth
+                                            // (round-13 audit note: the real
+                                            // zoned-v6 loss is the `Zone` field
+                                            // being dropped below — Rust std
+                                            // SocketAddr cannot carry a scope id,
+                                            // and Go's own V2 binary codec drops
+                                            // zones in Go↔Go too, so this is
+                                            // parity, not a regression).
                                             Err(_) => {
                                                 warn!(ip = %ra.ip, port = ra.port,
                                                     "UDP packet: unparseable remote IP, dropping");

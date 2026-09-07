@@ -93,6 +93,15 @@ pub enum InternalMsg {
         /// (the manager-level round-robin counter makes every hop pick the
         /// next member) when the group spans run_ids without a group_key.
         group_selected: bool,
+        /// The routed request method was CONNECT (HTTP/1.1 vhost
+        /// connectHandler + h2c CONNECT arms). Go's connectHandler joins
+        /// the tunnel RAW after the 200 — ModifyResponse never runs, so
+        /// configured response_headers must not be injected into the
+        /// tunnel's byte stream (round-13 audit F1). Only the two vhost
+        /// HTTP send sites set this; every other producer (tcpmux, tcp
+        /// accept, STCP/XTCP, groups) sends false — the injector is gated
+        /// on `proxy_type == "http"` anyway.
+        request_is_connect: bool,
     },
     /// UDP proxy needs a work connection for data forwarding
     /// (Go frp v0.69.1 uses work connections, not control connection).

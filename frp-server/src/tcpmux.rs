@@ -656,6 +656,8 @@ pub async fn run_tcpmux_listener(
                         user_conn_permit: None,
                         // Local sender — no group selection was done.
                         group_selected: false,
+                        // tcpmux routes raw TCP — never an HTTP request.
+                        request_is_connect: false,
                     }),
                 )
                 .await

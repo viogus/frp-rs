@@ -2833,6 +2833,8 @@ pub(crate) async fn listen_and_proxy(
                         user_conn_permit,
                         // Local sender — no group selection was done.
                         group_selected: false,
+                        // Raw TCP listener — never an HTTP request.
+                        request_is_connect: false,
                     }),
                 )
                 .await
@@ -3372,6 +3374,9 @@ async fn tcp_group_listener(
                                         // selection (would bounce the conn
                                         // between members forever).
                                         group_selected: true,
+                                        // Raw TCP group member — never an
+                                        // HTTP request.
+                                        request_is_connect: false,
                                     }),
                                 )
                                 .await

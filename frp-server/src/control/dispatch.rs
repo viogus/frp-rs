@@ -51,6 +51,7 @@ fn match_internal_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
             pre_read,
             user_conn_permit,
             group_selected,
+            request_is_connect,
         } => Box::pin(super::pool::handle_proxy_user_conn(
             ctx,
             ctl,
@@ -60,6 +61,7 @@ fn match_internal_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
             pre_read,
             user_conn_permit,
             group_selected,
+            request_is_connect,
         )),
         InternalMsg::UdpNeedsWorkConn { proxy_name } => Box::pin(
             super::pool::handle_udp_work_conn(ctx, ctl, writer, proxy_name),
