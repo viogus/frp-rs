@@ -361,7 +361,6 @@ impl Service {
                                             vec![],
                                             None,
                                             None,
-                                            None,
                                             false,
                                         )
                                         .await;
@@ -373,7 +372,6 @@ impl Service {
                                             p2p_w,
                                             use_comp,
                                             vec![],
-                                            None,
                                             None,
                                         )
                                         .await;

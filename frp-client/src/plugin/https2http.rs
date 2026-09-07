@@ -293,4 +293,95 @@ mod tests {
             ),
         }
     }
+
+    /// Connect a skip-verify TLS client to the plugin's listener (the
+    /// listener presents the self-signed test cert, so verification must be
+    /// off) and return the established TLS stream. The client offers no
+    /// ALPN, so the plugin's listener stays on the HTTP/1.1 face and never
+    /// negotiates h2.
+    async fn connect_tls_client(
+        addr: std::net::SocketAddr,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let connector =
+            frp_core::transport::build_tls_connector_skip_verify(None, None, None, false)
+                .expect("tls connector");
+        let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+        connector
+            .connect(server_name, tcp)
+            .await
+            .expect("client TLS handshake")
+    }
+
+    /// Read the plugin's answer over the client TLS stream until the
+    /// connection ends (the handler writes its final head and drops the
+    /// conn; the close may surface as clean EOF or a TLS error, never as
+    /// data). Bounded: a regression that keeps the conn open must fail this
+    /// test, not hang the suite.
+    async fn read_until_tls_close(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut resp = Vec::new();
+        let mut chunk = [0u8; 512];
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match tls.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => resp.extend_from_slice(&chunk[..n]),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the plugin's answer — regression?");
+        resp
+    }
+
+    /// Audit pin: the https2http connect-refused arm (`handle_conn` — the
+    /// plain-HTTP backend dial failure answers Go's default ReverseProxy
+    /// 502, the bare 47-byte head, before the conn closes; the old code
+    /// dropped the TLS conn with nothing). Driven through the REAL
+    /// https2http listener with a client TLS leg.
+    #[tokio::test]
+    async fn test_https2http_backend_refused_answers_go_502() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        // Bind then drop: the port is closed, so the backend dial is a
+        // deterministic ECONNREFUSED.
+        let refused = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let refused_addr = refused.local_addr().unwrap();
+        drop(refused);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (crt_file, key_file) = write_self_signed_pem(&dir);
+        let cfg = PluginConfig {
+            plugin_type: "https2http".into(),
+            local_addr: refused_addr.to_string(),
+            crt_file,
+            key_file,
+            ..Default::default()
+        };
+        let handle = match start_https2http_plugin(&cfg).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Skipping test: plugin start failed (sandboxed?): {e}");
+                return;
+            }
+        };
+        let mut tls = connect_tls_client(handle.local_addr).await;
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = read_until_tls_close(&mut tls).await;
+        assert_eq!(
+            resp,
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+            "refused backend must render Go's 502, got: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
 }

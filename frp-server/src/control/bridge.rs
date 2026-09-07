@@ -143,12 +143,18 @@ struct ResponseHeaderInjector<R> {
     /// The last head served raw was MALFORMED (unparseable first line)
     /// rather than a legal interim 1xx. Round-13 serves malformed heads raw
     /// — Go would 404 before relaying anything — so once one is out it IS
-    /// the response: a following EOF ends the stream cleanly instead of
-    /// signaling a missing final head (never append a 404 head after
-    /// relayed garbage). Cleared whenever a legal interim is served.
+    /// the response: no configured headers are ever spliced into it, and
+    /// nothing after it is relayed. Round-15: draining it is TERMINAL
+    /// (pipelined bytes after an unparseable head must not re-enter the
+    /// gather loop as a second injectable response) — `complete` plus this
+    /// flag serves permanent EOF. Cleared whenever a legal interim is
+    /// served.
     malformed_raw: bool,
     /// True once every buffered byte is served and no further buffering is
-    /// possible — the rest of the response passes through raw.
+    /// possible — the rest of the response passes through raw. With
+    /// `malformed_raw` set it instead means the malformed raw head was the
+    /// response and the stream ends at EOF (the `complete` arm never
+    /// polls the inner reader in that state).
     complete: bool,
     /// Persistent read buffer to avoid per-poll_read allocation.
     read_buf: [u8; 4096],
@@ -168,6 +174,35 @@ struct ResponseHeaderInjector<R> {
 impl<R: Unpin> Unpin for ResponseHeaderInjector<R> {}
 
 impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
+    /// A raw-served head (interim 1xx, or a MALFORMED first line — neither
+    /// is injected) has been fully emitted. An interim 1xx head hands the
+    /// accumulation back to its split-off tail, which may already hold the
+    /// pipelined final head (100 + 200 in one backend segment) — the
+    /// caller's next poll re-resolves it and re-enters classification.
+    ///
+    /// A MALFORMED head (status None — version/code garbage Go's
+    /// ReadResponse errors) is the TERMINAL response: Go errors the whole
+    /// response and the reverse proxy closes the backend connection, so
+    /// bytes after it are never a legal continuation. Round-15 security
+    /// review: the pre-fix drain resumed the gather loop on the tail, and
+    /// a pipelined valid-looking final head (a hostile or buggy backend
+    /// writing `HTTP/1.1 200 OK` after its unparseable head) was injected
+    /// and served as a SECOND response on one user connection — a
+    /// double-response (smuggling-adjacent shape) through the injector.
+    /// Drop the tail and mark complete: the `complete` arm with
+    /// `malformed_raw` set serves permanent EOF, never pass-through reads.
+    fn raw_head_fully_served(&mut self) {
+        if self.malformed_raw {
+            self.tail = None;
+            self.buffer.clear();
+            self.buffer_offset = 0;
+            self.complete = true;
+            return;
+        }
+        self.buffer = self.tail.take().unwrap_or_default();
+        self.buffer_offset = 0;
+    }
+
     fn new(
         inner: R,
         headers: std::collections::HashMap<String, String>,
@@ -332,10 +367,22 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
     ) -> Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
 
-        // Everything buffered has been served and the head phase is over
-        // (a final/101 head was injected or a malformed head was served
-        // raw) — the rest of the response passes through untouched.
+        // Everything buffered has been served and the head phase is over:
+        // a final/101 head was injected (the rest passes through
+        // untouched), or a malformed head was served raw — which is
+        // TERMINAL, never pass-through (see `raw_head_fully_served`).
         if this.complete {
+            if this.malformed_raw {
+                // Round-15 security review: the raw-served MALFORMED head
+                // (status-None first line) was the response. Go errors the
+                // whole response at ReadResponse and the reverse proxy
+                // closes the backend connection, so no further backend
+                // bytes are a legal continuation — a hostile backend could
+                // otherwise stream an endless second "response" here that
+                // would be relayed raw after a head the client already
+                // rejected. Permanent EOF; the consumer ends the bridge.
+                return Poll::Ready(Ok(()));
+            }
             // Round-14 review fix: a mid-body read failure AFTER the final
             // head went out must never surface as an error kind frp-core
             // answers with a gateway head — Go's ErrorHandler never runs
@@ -382,11 +429,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
             if this.buffer_offset >= this.buffer.len() {
                 if this.raw_head {
                     // Raw head (interim 1xx, or malformed — neither is
-                    // injected) fully served — resume accumulating the
-                    // next head from the split-off tail.
+                    // injected) fully served — an interim head resumes
+                    // accumulating the next head from the split-off tail;
+                    // a MALFORMED head is terminal (Go errors the whole
+                    // response; nothing after it is relayed).
                     this.raw_head = false;
-                    this.buffer = this.tail.take().unwrap_or_default();
-                    this.buffer_offset = 0;
+                    this.raw_head_fully_served();
                 } else {
                     // Injected head is fully out; the remainder of the
                     // response is raw pass-through.
@@ -619,8 +667,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
         if this.buffer_offset >= this.buffer.len() {
             if this.raw_head {
                 this.raw_head = false;
-                this.buffer = this.tail.take().unwrap_or_default();
-                this.buffer_offset = 0;
+                this.raw_head_fully_served();
             } else {
                 this.complete = true;
             }
@@ -1621,7 +1668,6 @@ async fn run_work_bridge(
                 req.pre_read,
                 bw_limiter.as_ref(),
                 Some(metrics.clone()),
-                None,
             )
             .await;
             // Matches the original inline closure: the injector path skips
@@ -1638,7 +1684,6 @@ async fn run_work_bridge(
             req.pre_read,
             bw_limiter.as_ref(),
             Some(metrics.clone()),
-            header_timeout,
             false,
         )
         .await;
@@ -1724,7 +1769,6 @@ async fn run_work_bridge(
                     bridge_pre_read,
                     bw_limiter.as_ref(),
                     Some(metrics.clone()),
-                    None,
                 )
                 .await;
             } else {
@@ -1737,7 +1781,6 @@ async fn run_work_bridge(
                     bridge_pre_read,
                     bw_limiter.as_ref(),
                     Some(metrics.clone()),
-                    header_timeout,
                 )
                 .await;
             }
@@ -1785,7 +1828,6 @@ async fn run_work_bridge(
                     comp_key,
                     bridge_pre_read,
                     Some(metrics.clone()),
-                    None,
                 )
                 .await;
             } else {
@@ -1797,7 +1839,6 @@ async fn run_work_bridge(
                     comp_key,
                     bridge_pre_read,
                     Some(metrics.clone()),
-                    header_timeout,
                 )
                 .await;
             }
@@ -3419,5 +3460,99 @@ mod tests {
             .await
             .expect_err("blank-first-line head must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Audit round-15 gap pin: a mid-body decode failure AFTER a legal final
+    /// response head was already served must be swallowed as a CLEAN EOF —
+    /// the `complete` arm (:394-403) turns a post-head inner read error of
+    /// kind InvalidData into `Ok(())`, because frp-core would answer a
+    /// gateway head (404/502) for bytes the client already accepted as the
+    /// response (Go's ErrorHandler never runs once RoundTrip returned).
+    /// Producer shape pinned here is the real compressed-arm wiring
+    /// (`comp_key` → the work reader is wrapped in `SnappyStreamReader`
+    /// before the injector): a valid Snappy stream for the head + body,
+    /// then a garbage frame mid-body (a "compressed data" chunk header
+    /// declaring 0xFFFFFF bytes — far past the decoder's per-chunk cap, so
+    /// it errors the moment it is processed, never buffered as a partial
+    /// tail). Regression shape: without the swallow arm the read after the
+    /// body surfaces Err(InvalidData) instead of a clean EOF.
+    #[tokio::test]
+    async fn injector_mid_body_snappy_decode_failure_after_head_is_clean_eof() {
+        use frp_core::encryption::SnappyCompressor;
+        use tokio::io::AsyncWriteExt;
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+
+        // Compress the whole backend response (head + body) into one
+        // Snappy stream chunk, then append the corrupt frame.
+        let mut comp = SnappyCompressor::new();
+        let mut wire = Vec::new();
+        comp.compress(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            &mut wire,
+        )
+        .expect("compress backend response");
+        wire.extend_from_slice(&[0x00, 0xFF, 0xFF, 0xFF]);
+        assert!(
+            wire.len() < 32 * 1024,
+            "payload must fit one SnappyStreamReader read chunk"
+        );
+
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        // The compressed-arm wiring (bridge.rs comp_key → injector inner is
+        // a SnappyStreamReader over the work stream).
+        let mut injector = ResponseHeaderInjector::new(
+            frp_core::snappy_stream::SnappyStreamReader::new(inner_r),
+            headers,
+            None,
+        );
+        inner_w.write_all(&wire).await.expect("write wire");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        // Every read must succeed — the corruption may only shorten the
+        // stream to a clean EOF, never surface as an error kind frp-core
+        // would answer with a gateway head.
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 7]; // small caller buffer (injector tail path)
+        let saw_eof = loop {
+            match injector.read(&mut chunk).await {
+                Ok(0) => break true,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(e) => panic!(
+                    "mid-body decode failure after head served must be swallowed as clean EOF, got Err({e})"
+                ),
+            }
+        };
+        assert!(
+            saw_eof,
+            "the corruption must end the stream with a clean EOF"
+        );
+
+        let s = String::from_utf8_lossy(&out);
+        // The head was relayed/injected EXACTLY once, before the corruption.
+        assert_eq!(
+            s.matches("HTTP/1.1 200 OK").count(),
+            1,
+            "exactly one response head on the wire, got: {s:?}"
+        );
+        assert_eq!(
+            s.matches("X-Injected: yes").count(),
+            1,
+            "injected header present exactly once, got: {s:?}"
+        );
+        assert!(
+            s.starts_with("HTTP/1.1 200 OK\r\n"),
+            "status line first, got: {s:?}"
+        );
+        // The legal body survived up to the corruption point...
+        assert!(s.ends_with("hello"), "body must survive, got: {s:?}");
+        // ...and the corrupt tail was never relayed (no second response /
+        // garbage bytes after the body).
+        assert!(
+            !out.windows(4).any(|w| w == [0x00, 0xFF, 0xFF, 0xFF]),
+            "corrupt frame bytes must never reach the wire: {out:?}"
+        );
     }
 }

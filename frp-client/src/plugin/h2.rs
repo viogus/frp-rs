@@ -814,22 +814,34 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     // the stream ends (mirror of frp-server vhost_h2c's GOAWAY-rationale
     // handling). Read errors between heads are 502s like a missing first
     // head (Go: the RoundTrip error mid-1xx-loop is a transport error).
-    // Byte budget (audit round-7 finding): the swallow loop is otherwise
-    // unbounded across heads — each head is capped at 1 MiB but the count
-    // and the total are not, so an endless-1xx backend parks this h2
-    // stream forever. Go's Transport caps the SAME loop:
-    // maxHeaderResponseSize (10 MiB default, go1.25 transport.go:2106-2112)
-    // bounds the cumulative bytes across the interim re-reads (readLoop
-    // re-arms pc.readLimit per response at transport.go:2274; interim
-    // heads inside one readResponse share the bucket). Past the budget
-    // the response fails the way an oversized single head fails — 502. Every wire byte counts exactly once: `head` always
-    // starts with the carried seed (read_until_head only appends), so
-    // `head.len() - carried` is the new bytes, and bytes past the
-    // terminator that rode in the read buffer are counted here and never
-    // re-counted (the next iteration's seed subtraction removes them).
+    // Byte budget (audit round-7 finding + round-15 FIX 4): the swallow
+    // loop is otherwise unbounded across heads. Go's Transport caps EACH
+    // ReadResponse head parse — interim AND final alike — at
+    // maxHeaderResponseSize (10 MiB default, go1.25 transport.go:2106-2112;
+    // readLoop re-arms pc.readLimit per response, transport.go:2274), so a
+    // single giant FINAL head is also capped there. frp-rs is bounded on
+    // both axes: the FINAL head never reaches this budget because
+    // read_until_head caps every head (interim and final, one per call) at
+    // its own 1 MiB read cap (+ one 4 KiB read slack) — far under Go's
+    // 10 MiB — so a giant final head already fails that cap and answers
+    // 502. What remains unbounded in Go is the COUNT and CUMULATIVE size
+    // of interim heads (each re-read re-arms the 10 MiB limit), and that is
+    // what INTERIM_HEAD_BUDGET closes here: an endless-1xx backend parks
+    // this h2 stream forever without it. Past the budget the response
+    // fails the way an oversized single head fails — 502. Every wire byte
+    // counts exactly once: `head` always starts with the carried seed
+    // (read_until_head only appends), so `head.len() - carried` is the new
+    // bytes, and bytes past the terminator that rode in the read buffer
+    // are counted here and never re-counted (the next iteration's seed
+    // subtraction removes them).
     let mut seed: Vec<u8> = Vec::new();
     let mut interim_bytes: usize = 0;
-    const INTERIM_HEAD_BUDGET: usize = 10 * 1024 * 1024; // Go maxHeaderResponseSize
+    // Rust-only hardening, same magnitude as Go's per-head
+    // maxHeaderResponseSize (10 MiB) but CUMULATIVE across interim heads:
+    // Go re-arms that limit per ReadResponse, so an endless-1xx backend is
+    // unbounded there; the final head is separately bounded by
+    // read_until_head's 1 MiB cap and never charged to this budget.
+    const INTERIM_HEAD_BUDGET: usize = 10 * 1024 * 1024;
     let (head, parsed) = loop {
         let carried = seed.len();
         let head = match read_until_head(r, seed).await {
@@ -1279,9 +1291,16 @@ mod tests {
         let status = resp.status();
         let mut body = resp.into_body();
         let mut out = Vec::new();
-        while let Some(Ok(d)) = body.data().await {
-            out.extend_from_slice(&d);
-        }
+        // Bounded body drain: a no-response regression that keeps the
+        // stream open would hang an unbounded data() loop forever (the 5s
+        // cap above bounds only the response HEAD, not the body).
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(Ok(d)) = body.data().await {
+                out.extend_from_slice(&d);
+            }
+        })
+        .await
+        .expect("timed out draining the h2 response body — regression?");
         (status, out)
     }
 
@@ -1420,6 +1439,53 @@ mod tests {
         assert!(
             body.is_empty(),
             "endless-interim backend must answer 502, body: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_backend_giant_final_head_answers_502() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        // Audit FIX 4 pin: the 10 MiB INTERIM_HEAD_BUDGET only accounts
+        // interim 1xx heads, but the FINAL head is separately bounded —
+        // read_until_head caps EVERY head (interim and final alike) at its
+        // 1 MiB per-call cap — so a single giant final head (no 1xx at
+        // all) must answer 502 exactly like any other oversized backend
+        // head, never stream through unbounded. (Go parity direction: Go's
+        // Transport caps each head parse at 10 MiB; frp-rs's 1 MiB
+        // per-head cap is the stricter pre-existing bound.)
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut conn, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            // Drain the forwarded request head (backend read before replying).
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf).await;
+            // ~1.2 MiB final head, terminator only at the very end. Written
+            // in 64 KiB slices so the plugin's 4 KiB reads keep draining the
+            // socket; once the 1 MiB cap trips the plugin sends 502 and
+            // drops the conn — the remaining writes error and we return.
+            let mut head = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+            head.resize(1200 * 1024, b'A');
+            head.extend_from_slice(b"\r\n\r\n");
+            for chunk in head.chunks(64 * 1024) {
+                if conn.write_all(chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let (status, body) = h2_round_trip(addr).await;
+        assert_eq!(status, http::StatusCode::BAD_GATEWAY);
+        assert!(
+            body.is_empty(),
+            "giant single final head must answer 502, body: {body:?}"
         );
     }
 }

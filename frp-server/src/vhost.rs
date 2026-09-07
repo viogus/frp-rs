@@ -1839,6 +1839,19 @@ fn validate_vhost_head_lines(request: &str) -> HeadLineVerdict {
     // wins — extract_host_header uses the same .find() order).
     let mut host_value: Option<String> = None;
     while let Some(first) = lines.next() {
+        // The blank line that terminated the head. The caller slices the
+        // head at its blank line, so this normally does not appear — but a
+        // terminator that is part of the input (unit fixtures, and the
+        // tcpmux-style raw shapes) yields `""` elements from `str::lines()`
+        // (two for a CRLFCRLF terminator), and a blank must END the header
+        // block like Go's textproto: `readMIMEHeader` returns at the first
+        // empty line and never parses past it. Without the break, the
+        // blank's `""` would fall through to the missing-colon class below
+        // and reject every legal terminated head (the round-14
+        // tcpmux 9ff87ca trap, mirrored here).
+        if first.is_empty() {
+            break;
+        }
         if first.starts_with(' ') || first.starts_with('\t') {
             // obs-fold continuation directly after the REQUEST line: Go
             // textproto "malformed MIME header initial line" — generic.
@@ -1849,9 +1862,13 @@ fn validate_vhost_head_lines(request: &str) -> HeadLineVerdict {
         }
         let Some(colon) = first.find(':') else {
             // Group-first line without a colon — Go textproto's
-            // missing-colon error (generic). Not one of the FIX-6
-            // prescribed classes; the pre-existing router forwards such
-            // heads unchanged.
+            // missing-colon class (reader.go:543-545: the group-start
+            // physical line must carry a colon or readMIMEHeader returns
+            // the ProtocolError → conn.serve generic 400, the FIX-6 probe
+            // shape). Round-15 W1: this used to `continue` (route the head
+            // unchanged) — a colonless line is a read-time rejection, not
+            // a legal header.
+            malformed = true;
             continue;
         };
         let name = &first[..colon];
@@ -6024,6 +6041,41 @@ mod tests {
         // "malformed MIME header initial line" → generic.
         assert_eq!(
             validate_vhost_head_lines("GET / HTTP/1.1\r\n Host: a.com\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        // Round-15 W1: a group-first line without a colon is Go
+        // textproto's missing-colon read-time error (reader.go:543-545) —
+        // generic 400, never routed. This used to `continue` (forwarded).
+        assert_eq!(
+            validate_vhost_head_lines(
+                "GET / HTTP/1.1\r\nHost: a.com\r\nno colon here\r\nX-A: v\r\n\r\n"
+            ),
+            HeadLineVerdict::Malformed
+        );
+        // The blank terminator itself never reaches the missing-colon
+        // class: CRLFCRLF (two `""` elements from str::lines), LF-only,
+        // and a pipelined next-request body past the blank all validate
+        // the head and stop at the first empty line (the round-14 tcpmux
+        // 9ff87ca trap, mirrored — a blank ends the header block like Go
+        // textproto readMIMEHeader).
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\n\r\n"),
+            HeadLineVerdict::Ok
+        );
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\nHost: a.com\n\n"),
+            HeadLineVerdict::Ok
+        );
+        assert_eq!(
+            validate_vhost_head_lines(
+                "GET / HTTP/1.1\r\nHost: a.com\r\n\r\nGET / HTTP/1.1\r\nX-A: v\r\n\r\n"
+            ),
+            HeadLineVerdict::Ok
+        );
+        // A colonless line between blank-terminated halves is still read
+        // (headers precede the blank).
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nno colon here\r\n\r\n"),
             HeadLineVerdict::Malformed
         );
     }

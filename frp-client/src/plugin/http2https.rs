@@ -211,7 +211,15 @@ mod tests {
             .await
             .unwrap();
         let mut resp = Vec::new();
-        client.read_to_end(&mut resp).await.unwrap();
+        // Bounded: a regression that never writes the 502 and never closes
+        // the conn would hang an unbounded read_to_end forever.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_end(&mut resp),
+        )
+        .await
+        .expect("timed out waiting for the 502 response — regression?")
+        .unwrap();
         assert_eq!(
             resp,
             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
@@ -261,7 +269,15 @@ mod tests {
             .await
             .unwrap();
         let mut resp = Vec::new();
-        client.read_to_end(&mut resp).await.unwrap();
+        // Bounded: a regression that never writes the 502 and never closes
+        // the conn would hang an unbounded read_to_end forever.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_end(&mut resp),
+        )
+        .await
+        .expect("timed out waiting for the 502 response — regression?")
+        .unwrap();
         assert_eq!(
             resp,
             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",

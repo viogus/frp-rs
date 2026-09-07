@@ -443,6 +443,238 @@ async fn test_h2c_404_unmapped_host() {
     );
 }
 
+// ---------------------------------------------------------------
+// Round-15 e2e pins: the no-body response classes (HEAD/204/304) end
+// the h2 stream at the head, and a configured custom_404_page replaces
+// the builtin 404 body
+// ---------------------------------------------------------------
+
+/// Round-15 FIX 1 e2e: the h2c relay ends the response at the head for the
+/// no-body classes (HEAD requests, 204, 304) even when the backend lies
+/// about a body — a HEAD answer that DECLARES a Content-Length and then
+/// holds the connection open sends nothing, so a body-reading leg would
+/// park the bridge forever. The lib unit
+/// (test_h2_head_204_304_end_stream_without_body_legs) pins the relay with
+/// an in-process mock; this pins the wire behavior through a real frps +
+/// h2 client:
+/// - HEAD 200: END_STREAM on the head frame, no DATA; the truthful
+///   declared Content-Length is preserved (it describes the GET);
+/// - 204: Content-Length stripped (RFC 9110 §8.6 forbids it on ANY 204),
+///   no body, even though the backend declared one and sent junk;
+/// - 304: same strip, no body.
+#[tokio::test]
+async fn test_h2c_head_204_304_no_body_end_stream_wire_behavior() {
+    // Case 1 — HEAD + lying Content-Length (100 declared, 11 sent, then
+    // the backend holds the conn open): the relay must end the stream at
+    // the head, not park on the unread body.
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-nb-head", "nbhead.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("HEAD")
+        .uri("http://nbhead.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    let head = read_request_bytes(&mut work_conn).await;
+    assert!(
+        String::from_utf8_lossy(&head).starts_with("HEAD / HTTP/1.1\r\n"),
+        "the HEAD method must be forwarded verbatim: {}",
+        String::from_utf8_lossy(&head)
+    );
+    work_conn
+        .write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Length: 100\r\n\
+              \r\n\
+              hello world",
+        )
+        .await
+        .expect("write lying HEAD backend response");
+
+    timeout(Duration::from_secs(5), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response.headers()["content-length"].to_str().unwrap(),
+            "100",
+            "a HEAD 200 keeps the declared Content-Length (it truthfully \
+             describes the GET the client would receive)"
+        );
+        let recv = response.into_body();
+        assert!(
+            recv.is_end_stream(),
+            "the HEAD response must carry END_STREAM on the head frame — \
+             no body leg may wait for the 100 declared bytes"
+        );
+        let body = read_h2_body(recv).await;
+        assert!(
+            body.is_empty(),
+            "no DATA frames may follow a HEAD response head, got {body:?}"
+        );
+    })
+    .await
+    .expect("HEAD response never completed (body leg parked?)");
+    drop(client);
+    drop(_provider);
+
+    // Case 2 — 204 with a declared (lying) Content-Length + junk body
+    // bytes: the stream ends at the head with the CL stripped.
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-nb-204", "nb204.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://nb204.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    read_request_bytes(&mut work_conn).await;
+    work_conn
+        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 50\r\n\r\nx")
+        .await
+        .expect("write 204 backend response");
+
+    timeout(Duration::from_secs(5), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(response.status().as_u16(), 204);
+        assert!(
+            !response.headers().contains_key("content-length"),
+            "204 must not carry Content-Length (RFC 9110 §8.6)"
+        );
+        let recv = response.into_body();
+        assert!(recv.is_end_stream(), "the 204 must end at the head frame");
+        let body = read_h2_body(recv).await;
+        assert!(
+            body.is_empty(),
+            "no DATA frames may follow a 204 head, got {body:?}"
+        );
+    })
+    .await
+    .expect("204 response never completed (body leg parked?)");
+    drop(client);
+    drop(_provider);
+
+    // Case 3 — 304 with a declared (lying) Content-Length + junk body:
+    // same strip-and-end.
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-nb-304", "nb304.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://nb304.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    read_request_bytes(&mut work_conn).await;
+    work_conn
+        .write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 50\r\n\r\nx")
+        .await
+        .expect("write 304 backend response");
+
+    timeout(Duration::from_secs(5), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(response.status().as_u16(), 304);
+        assert!(
+            !response.headers().contains_key("content-length"),
+            "304 must not carry Content-Length (the h2 relay strips it — \
+             documented fail-closed divergence from Go's h2 pass-through, \
+             matching the h1 front frp-rs serves)"
+        );
+        let recv = response.into_body();
+        assert!(recv.is_end_stream(), "the 304 must end at the head frame");
+        let body = read_h2_body(recv).await;
+        assert!(
+            body.is_empty(),
+            "no DATA frames may follow a 304 head, got {body:?}"
+        );
+    })
+    .await
+    .expect("304 response never completed (body leg parked?)");
+    drop(client);
+    drop(_provider);
+}
+
+/// A CONFIGURED custom_404_page must replace the builtin not-found HTML on
+/// the h2c route-miss 404 — the same getNotFoundPageContent selection the
+/// HTTP/1.1 surface makes (vhost_h2c.rs `h2c_not_found_body`, fed from
+/// state.custom_404_page; never pinned e2e — every h2c 404 test ran with
+/// the default empty string and asserted the builtin page). The config
+/// value is treated as inline HTML when no such file exists (service.rs
+/// Go-compat fallback).
+#[tokio::test]
+async fn test_h2c_route_miss_custom_404_page_body() {
+    let bind_port = allocate_port();
+    let vhost_port = allocate_port();
+    let mut cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        vhost_http_port: vhost_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    cfg.web_server.custom_404_page = "<html><body>custom miss page</body></html>".into();
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+    let vhost_addr: SocketAddr = format!("127.0.0.1:{vhost_port}").parse().unwrap();
+
+    // Register a mapped host so the router is live; request an unmapped one.
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
+    let _run_id = resp.run_id.expect("run_id");
+    let np = FrpMessage::NewProxy(Box::new(http_proxy(
+        "h2c-custom-404",
+        vec!["mapped.example.com".into()],
+        None,
+        None,
+        None,
+    )));
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
+    match read_msg_v1(&mut provider).await.expect("NewProxyResp") {
+        FrpMessage::NewProxyResp(ref r) => {
+            assert!(r.error.is_none(), "registration failed: {:?}", r.error);
+        }
+        other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+    }
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://nope.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(response.status().as_u16(), 404);
+        assert_eq!(
+            response.headers()["content-type"].to_str().unwrap(),
+            "text/html",
+            "the 404 page is served as text/html"
+        );
+        let body = read_h2_body(response.into_body()).await;
+        assert_eq!(
+            body, b"<html><body>custom miss page</body></html>",
+            "the configured custom_404_page must replace the builtin \
+             not-found body"
+        );
+    })
+    .await
+    .expect("404 never answered (wedged route-miss?)");
+    drop(provider);
+}
+
 #[tokio::test]
 async fn test_h2c_preface_then_silence_dropped_at_timeout() {
     let bind_port = allocate_port();

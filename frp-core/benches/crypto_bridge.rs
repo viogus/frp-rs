@@ -386,7 +386,6 @@ fn bench_bridge_pipeline(c: &mut Criterion) {
                             false,
                             vec![],
                             None,
-                            None,
                         )
                         .await;
                     });
@@ -420,7 +419,6 @@ fn bench_bridge_pipeline(c: &mut Criterion) {
                             &key,
                             false,
                             vec![],
-                            None,
                             None,
                             None,
                             false,
@@ -457,7 +455,6 @@ fn bench_bridge_pipeline(c: &mut Criterion) {
                             &key,
                             true,
                             vec![],
-                            None,
                             None,
                             None,
                             false,
