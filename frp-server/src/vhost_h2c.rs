@@ -403,7 +403,7 @@ async fn handle_stream(
         Err(_elapsed) => {
             // CTL_SEND_TIMEOUT fired: the control handler stopped draining.
             // A local dispatch bound, NOT Go's response-head deadline — Go's
-            // net.Error timeout 504 gate (http.go:129-134) applies only to
+            // net.Error timeout 504 gate (http.go:131-133) applies only to
             // the reverse-proxy response-head wait, so this arm is the
             // backend-unreachable 404 class, like the other dispatch
             // failures (FIX 2).
@@ -1282,7 +1282,7 @@ async fn read_backend_head<R: AsyncRead + Unpin>(
 /// stalling parked the head read without bound, one fresh timeout per head).
 /// On timeout a body-less `504 Gateway Timeout` is sent, mirroring the Go
 /// vhost `ErrorHandler` mapping a `ResponseHeaderTimeout` to 504
-/// (pkg/util/vhost/http.go:129-134, `net.Error` Timeout gate); every OTHER
+/// (pkg/util/vhost/http.go:131-133, `net.Error` Timeout gate); every OTHER
 /// backend failure — close before the head, malformed head, 101, invalid
 /// status — answers `404` + the not-found page (FIX 2), the ErrorHandler's
 /// non-timeout class, exactly as it does on Go frp's HTTP/1.1 vhost surface

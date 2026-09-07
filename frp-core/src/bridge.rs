@@ -461,6 +461,20 @@ async fn bridge_work_to_user(
     };
     let mut decompressor = make_decompressor(decompress_read);
     let mut header_timeout = header_timeout;
+    // Gateway error heads (404/504 below) are safe to write only while no
+    // FINAL response head has reached the user — Go's vhost ErrorHandler
+    // runs solely on a RoundTrip failure and a mid-body error merely aborts
+    // the transport copy (reverseproxy.go). That phase is owned by the
+    // caller's reader, not by this function: on http legs frp-server wraps
+    // work_r in ResponseHeaderInjector, which (a) never emits error kinds
+    // once an injectable final head has been served — a mid-body decode
+    // failure after the head is swallowed there and surfaced as clean EOF —
+    // and (b) converts a pre-head inner EOF into Err(UnexpectedEof) so the
+    // 404 arm below answers it. Interim 1xx relays are a legal prefix to a
+    // late 404/504 (an Expect:100 backend that answers 100 and then stalls
+    // or dies still gets the gateway head Go would have sent). Non-http
+    // legs (no injector) produce none of the three error kinds below — raw
+    // sockets error ConnectionReset-class and their clean close is Ok(0).
     'read_loop: loop {
         let read_res = match header_timeout.take() {
             Some(timeout) => {
@@ -478,6 +492,13 @@ async fn bridge_work_to_user(
             None => work_r.read(buf.as_mut_slice()).await,
         };
         let n = match read_res {
+            // Clean EOF. After a complete head — or on any leg without an
+            // injector — this is normal end-of-stream (backend closed) and
+            // stays silent. A pre-head EOF on an http leg never reaches
+            // this arm: the ResponseHeaderInjector converts it to
+            // Err(UnexpectedEof) so the 404 arm below answers it (Go
+            // readResponse errors on an unterminated head → ErrorHandler
+            // 404; nothing is relayed).
             Ok(0) => break,
             Ok(n) => {
                 trace_hex!(n, first_hex = %crate::hex_encode(&buf.raw_buf()[..n.min(32)]), "bridge work_to_user: read {} bytes", n);
@@ -498,22 +519,31 @@ async fn bridge_work_to_user(
                         "bridge work_to_user: response-head deadline hit, writing 504"
                     );
                     write_gateway_timeout_504(&mut user_w).await;
-                } else if e.kind() == std::io::ErrorKind::InvalidData {
-                    // Backend response head was rejected as malformed —
-                    // frp-server's ResponseHeaderInjector errors
-                    // InvalidData when the head has no status line
-                    // (blank_start == 0) or exceeds the 64 KiB head cap.
-                    // Go frp v0.71.0: every non-timeout reverse-proxy
-                    // failure answers the 404 NotFoundResponse page
-                    // (vhost ErrorHandler http.go:128-138 — undecodable
-                    // and oversize heads land here; Go's cap is 10 MiB
-                    // `maxResponseHeaderBytes`, transport.go:2108-2113 —
+                } else if e.kind() == std::io::ErrorKind::InvalidData
+                    || e.kind() == std::io::ErrorKind::UnexpectedEof
+                {
+                    // The backend never produced a usable response head —
+                    // both kinds are emitted only by the injector's
+                    // head-gather phase, which ends the moment a final head
+                    // is served (after that the injector passes reads
+                    // through raw and swallows a mid-body decode failure as
+                    // clean EOF — the contract note above), so no final
+                    // head can be in flight here. InvalidData = the head was rejected as
+                    // malformed (no status line, or past the 64 KiB injector
+                    // cap); UnexpectedEof = the backend closed before
+                    // completing a head (the injector converts its pre-head
+                    // Ok(0); a partial unterminated head is dropped, never
+                    // relayed raw). Go frp v0.71.0: every non-timeout
+                    // reverse-proxy failure answers the 404 NotFoundResponse
+                    // page (vhost ErrorHandler http.go:128-138 — undecodable
+                    // and oversize heads land here; Go's cap is the 10 MiB
+                    // `maxHeaderResponseSize` default, transport.go:2106-2112 —
                     // frp-rs's 64 KiB injector cap is a documented Rust
-                    // hardening divergence). Write the Go-shaped 404,
-                    // then end this direction.
+                    // hardening divergence). Write the 404, then end this
+                    // direction.
                     tracing::debug!(
                         error = %e,
-                        "bridge work_to_user: response head malformed, writing 404"
+                        "bridge work_to_user: no usable response head, writing 404"
                     );
                     write_not_found_response(&mut user_w, "").await;
                 } else {
@@ -523,8 +553,8 @@ async fn bridge_work_to_user(
                     // frp-rs only logs and ends the direction here — a
                     // scope-limited follow-up, since these error kinds are
                     // not currently produced on the work->user read path
-                    // (TimedOut and InvalidData above are the two the
-                    // injector can surface).
+                    // (TimedOut, InvalidData and UnexpectedEof above are
+                    // the three the injector can surface).
                     tracing::debug!(error = %e, "bridge work_to_user: read error");
                 }
                 break;
@@ -2819,7 +2849,7 @@ mod tests {
     /// (pkg/util/vhost/http.go:128-138): every non-timeout reverse-proxy
     /// failure writes the NotFound 404 page (undecodable and oversize
     /// backend heads land here; Go's head cap is the 10 MiB
-    /// maxResponseHeaderBytes default, transport.go:2108-2113).
+    /// maxHeaderResponseSize default, transport.go:2106-2112).
     #[tokio::test]
     async fn test_bridge_work_to_user_invalid_data_writes_go_404() {
         let (u_w_bridge, mut u_r_test) = tokio::io::duplex(65536);

@@ -172,8 +172,11 @@ mod tests {
     }
 
     /// Audit FIX 3 pin: a refused backend (the connection-refused dial
-    /// arm) answers Go's bare ReverseProxy 502 — byte-exact 47 bytes —
-    /// before the client conn closes. The old code closed with nothing.
+    /// arm) answers with frp-rs's bare ReverseProxy 502 — 47 bytes —
+    /// before the client conn closes (Go's defaultErrorHandler 502 picks
+    /// up a net/http Date header and keep-alive on the wire; the bare
+    /// close-after-write is the documented frp-rs divergence). The old
+    /// code closed with nothing.
     #[tokio::test]
     async fn test_http2https_backend_refused_answers_go_502() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

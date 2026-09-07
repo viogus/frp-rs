@@ -950,18 +950,24 @@ pub(super) const GO_400_RENDER: &str = "HTTP/1.1 400 Bad Request\r\nContent-Type
 /// Same shape as [`GO_400_RENDER`], for request-header-block overflow (Go
 /// MaxHeaderBytes breach).
 pub(super) const GO_431_RENDER: &str = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large";
-/// Go `httputil.ReverseProxy` default backend-dial-failure render — the
-/// exact 47 bytes Go writes when a backend dial/TLS connect fails and no
-/// ErrorHandler is set (probe-captured: no Content-Type, no body).
+/// ReverseProxy-style 502 render for backend dial/TLS failures. NOT
+/// byte-exact Go parity: go1.25's `httputil.ReverseProxy` defaultErrorHandler
+/// (reverseproxy.go:319-322) only logs and calls `WriteHeader(502)` when no
+/// ErrorHandler is set — net/http then adds a Date header on the wire and
+/// KEEPS the client connection alive. frp-rs deliberately diverges: the bare
+/// head below (no Content-Type, no body, no Date — every frp-rs manual
+/// response writer omits Date by convention), followed by a close.
 pub(super) const GO_502_RENDER: &str = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
 /// Go `http.NotFound` render — probe-captured from go1.25.12 (CL-first
 /// repo order, Date omitted by convention; body is exactly
 /// "404 page not found\n").
 pub(super) const GO_404_NOT_FOUND_RENDER: &str = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 19\r\nConnection: close\r\n\r\n404 page not found\n";
 
-/// Write the Go ReverseProxy 502 render ([`GO_502_RENDER`]) to a peer, then
-/// return `Err(e)` — the 502 is the final byte on the connection (Go's
-/// ReverseProxy closes the client conn after the error response).
+/// Write the ReverseProxy-style 502 render ([`GO_502_RENDER`]) to a peer,
+/// then return `Err(e)` — the 502 is the final byte frp-rs writes before the
+/// caller drops the connection. Deliberate divergence: Go's ReverseProxy
+/// does NOT close — its defaultErrorHandler only WriteHeaders the 502 and
+/// the client connection keep-alives on.
 pub(super) async fn write_go_502<W>(peer: &mut W, err: String) -> Result<(), String>
 where
     W: tokio::io::AsyncWrite + Unpin,

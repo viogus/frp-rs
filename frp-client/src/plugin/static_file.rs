@@ -100,26 +100,24 @@ async fn handle_static_file_conn(
     // accept-where-Go-rejects. A malformed line renders Go's generic server
     // 400 (same byte shape as http.rs's plain arm), never a silent close.
     let request_line = lines.next().ok_or("empty request")?;
-    let Some((method, url_path, _version)) = super::parse_request_line(request_line) else {
+    let Some((method, target, _version)) = super::parse_request_line(request_line) else {
         if let Err(e) = client.write_all(super::GO_400_RENDER.as_bytes()).await {
             tracing::debug!(error = %e, "plugin relay error: {}", e);
         }
         return Err(format!("bad request line: {request_line}"));
     };
 
-    // Method gate. gorilla Methods("GET") matches HEAD requests too (mux.go
-    // rewrites HEAD onto a GET-only route), so HEAD serves below (Audit
-    // FIX 10: same 200 head — Content-Length included — no body). Other
-    // methods are gorilla route misses (Go would 404); the pre-existing 405
-    // divergence is kept.
-    if method != "GET" && method != "HEAD" {
-        let resp =
-            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        if let Err(e) = client.write_all(resp).await {
-            tracing::debug!(error = %e, "plugin relay error: {}", e);
-        }
-        return Err(format!("method not allowed: {method}"));
-    }
+    // Go url.Parse parity (audit round-7 finding): the request target
+    // splits at the FIRST '?'. The path is decoded and resolved below;
+    // the query stays RAW — never decoded into the path, never part of
+    // file resolution — and survives verbatim into a 301 Location (Go
+    // fs.go localRedirect appends RawQuery). The old code let the query
+    // ride along into file resolution, so every ?-request looked up a
+    // "name?query"-shaped filename and 404'd.
+    let (url_path, raw_query) = match target.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (target, None),
+    };
 
     // Check auth (Authorization header with Basic scheme). Audit FIX 10:
     // the same single header pass collects If-Modified-Since for the 304
@@ -164,8 +162,8 @@ async fn handle_static_file_conn(
     // miss → http.NotFound) renders Go's 404 page — byte-exact — then
     // closes. Never a silent close, and never the old code's
     // prefix-passthrough that served "/staticx/y" as "x/y".
-    let rel_path = match resolve_static_path(url_path, strip_prefix) {
-        Ok(p) => p,
+    let (rel_path, url_remainder) = match resolve_static_path(url_path, strip_prefix) {
+        Ok(parts) => parts,
         Err(e) => {
             if let Err(we) = client
                 .write_all(super::GO_404_NOT_FOUND_RENDER.as_bytes())
@@ -196,7 +194,69 @@ async fn handle_static_file_conn(
         full_path = full_path.join(&rel_path);
     }
 
-    // If directory, try index.html
+    // Go http.FileServer localRedirect parity (audit round-7 finding): a
+    // directory URL that does not end in '/' answers 301 Moved Permanently
+    // with Location = path.Base(stripped URL path) + "/" — RELATIVE, so it
+    // stays correct under the strip prefix (Go fs.go:709-712, "./" for
+    // .../index.html and dirList included) — plus "?" + RawQuery when the
+    // request has a query (fs.go localRedirect appends it verbatim). Go
+    // redirects BEFORE index.html is served: the relative links inside a
+    // served index.html would otherwise resolve against the slash-less
+    // URL. The redirect is also method-agnostic — http.FileServer serves
+    // every method, and gorilla's GET gate is what limits Go frp to
+    // GET/HEAD — so it fires for any method that reaches this point (the
+    // 405 gate below is deliberately after it). Auth still precedes it
+    // (Go frp's middleware wraps the whole FileServer handler: 401 first,
+    // then the redirect). Render is frp-rs-shaped: Go's wire adds a Date
+    // header and keep-alives the conn, this plugin closes after every
+    // response (repo convention, no Date anywhere).
+    let slash_terminated = url_remainder.is_empty() || url_remainder.ends_with('/');
+    if full_path.is_dir() && !slash_terminated {
+        // Go path.Base of the stripped URL path: last non-empty segment
+        // ("." for a bare trailing "/." — path.Base("") is unreachable:
+        // an empty remainder only follows an exact-boundary request like
+        // "/static/", which is slash-terminated).
+        let base = url_remainder
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(".");
+        let mut location = format!("{base}/");
+        if let Some(q) = raw_query {
+            location.push('?');
+            location.push_str(q);
+        }
+        let resp = format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        if let Err(e) = client.write_all(resp.as_bytes()).await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
+        return Err(format!("directory without trailing slash: {url_path}"));
+    }
+
+    // Method gate. gorilla Methods("GET") matches HEAD requests too (mux.go
+    // rewrites HEAD onto a GET-only route), so HEAD serves below (Audit
+    // FIX 10: same 200 head — Content-Length included — no body). Other
+    // methods are gorilla route misses (Go would 404); the pre-existing 405
+    // divergence is kept. The gate sits BELOW the directory redirect and
+    // the auth check: Go FileServer's localRedirect answers the
+    // slash-less-dir 301 for any method (audit round-7 finding), and Go
+    // frp's auth middleware wraps the handler — so a wrong-creds
+    // non-GET/HEAD request now answers 401 where the old pre-auth gate
+    // answered 405 (both diverge from Go's 404 route miss; 401 matches
+    // Go's auth-before-handler ordering).
+    if method != "GET" && method != "HEAD" {
+        let resp =
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        if let Err(e) = client.write_all(resp).await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
+        return Err(format!("method not allowed: {method}"));
+    }
+
+    // If directory (slash-terminated, or just redirected above), try index.html
     if full_path.is_dir() {
         full_path = full_path.join("index.html");
     }
@@ -350,6 +410,19 @@ async fn handle_static_file_conn(
 ///   returned ".." components for the caller to reject (403); Go serves the
 ///   anchored result (200).
 fn resolve_static_path(url_path: &str, strip_prefix: Option<&str>) -> Result<String, String> {
+    Ok(resolve_static_parts(url_path, strip_prefix)?.0)
+}
+
+/// Shared resolver body: returns (cleaned relative path, decoded remainder
+/// of the URL path after the strip boundary). The remainder is the UNcleaned
+/// path Go's serveFile/localRedirect reason over (audit round-7 finding):
+/// fs.go uses url = r.URL.Path — after StripPrefix, i.e. the decoded path
+/// minus the prefix — for both the trailing-slash test and the
+/// path.Base(url) redirect target, never the cleaned name.
+fn resolve_static_parts(
+    url_path: &str,
+    strip_prefix: Option<&str>,
+) -> Result<(String, String), String> {
     // URL-decode
     let decoded = urlencoding_decode(url_path);
 
@@ -380,7 +453,7 @@ fn resolve_static_path(url_path: &str, strip_prefix: Option<&str>) -> Result<Str
             c => components.push(c),
         }
     }
-    Ok(components.join("/"))
+    Ok((components.join("/"), stripped.to_string()))
 }
 
 /// Detect MIME type from file extension.
@@ -498,20 +571,37 @@ fn format_http_date(unix_secs: u64) -> String {
 /// ("Mon, 02 Jan 2006 15:04:05 GMT") — into whole unix seconds.
 ///
 /// Mirrors Go's checkIfModifiedSince path: a value that fails to parse is
-/// condNone (serve 200, no 400/403). The weekday must match the date
-/// (Go's RFC1123 layout parses it), the zone must be the literal "GMT"
+/// condNone (serve 200, no 400/403). The weekday token must be one of the
+/// seven abbreviated names — Go time.Parse looks it up case-insensitively
+/// but NEVER cross-checks it against the date ("ignore weekday except for
+/// error checking", format.go): "Fri, 01 Jan 2000 00:00:00 GMT" parses
+/// clean in Go though 2000-01-01 was a Saturday, and Go answers 304
+/// (probe-verified against go1.25.12). The zone must be the literal "GMT"
 /// (RFC 1123 mandates GMT; Go's layout would also tolerate any other
 /// 3-letter abbreviation at zero offset — accepting GMT only is
 /// byte-identical for every client echoing a server-emitted date), and the
 /// calendar date must exist (Feb 30 normalizes → rejected — Go time.Parse
-/// errors the same way). A single-digit day is accepted (Go's "2" layout
-/// element, e.g. "Mon,  2 Jan 2006 ...").
+/// errors the same way). One documented leniency: a space-padded
+/// single-digit day is accepted ("Mon,  2 Jan 2006 ...") — Go's RFC1123
+/// layout element is '02', which requires TWO digits, so that shape errors
+/// in Go and Go re-serves 200 where frp-rs answers 304. The divergence is
+/// RFC 7232-safe (a 304 only ever revalidates a copy the client holds) and
+/// answers stale only for clients that never see Go servers.
 fn parse_if_modified_since(value: &str) -> Option<u64> {
     let v = value.trim();
-    // "Weekday, day month year clock GMT" — the weekday is validated below
-    // against the parsed date; anything without the comma shape fails
-    // (Go's layout needs the comma too).
+    // "Weekday, day month year clock GMT" — the weekday must be one of the
+    // seven abbreviated names (Go's layout needs a real name: time.Parse
+    // does a case-insensitive lookup and fails the whole parse otherwise),
+    // but it is never cross-checked against the date (see the fn doc — Go
+    // answers 304 for a wrong-but-valid weekday). Anything without the
+    // comma shape fails (Go's layout needs the comma too).
     let (weekday, rest) = v.split_once(',')?;
+    if !HTTP_WEEKDAYS
+        .iter()
+        .any(|&w| w.eq_ignore_ascii_case(weekday))
+    {
+        return None;
+    }
     let mut parts = rest.split_whitespace();
     let day: u32 = parts.next()?.parse().ok()?;
     let month_name = parts.next()?;
@@ -533,14 +623,14 @@ fn parse_if_modified_since(value: &str) -> Option<u64> {
         return None;
     }
     let days = civil_to_days(year, month, day);
-    // Calendar validity + weekday match (Feb 30 rolls to Mar 2 → mismatch;
-    // a wrong weekday fails Go's layout parse too).
+    // Calendar validity: the civil date must round-trip (Feb 30 rolls to
+    // Mar 1 → rejected; Go time.Parse errors on an out-of-range
+    // day-of-month the same way). No weekday-vs-date consistency check
+    // here — Go never validates that (audit round-7 finding, probe: "Fri,
+    // 01 Jan 2000" parses and answers 304 though 2000-01-01 was a
+    // Saturday).
     let (y2, m2, d2) = civil_from_days(days);
     if y2 != year || m2 != month || d2 != day {
-        return None;
-    }
-    let wd = HTTP_WEEKDAYS[((days + 4).rem_euclid(7)) as usize];
-    if weekday != wd {
         return None;
     }
     Some(days as u64 * 86400 + hour * 3600 + minute * 60 + second)
@@ -685,24 +775,43 @@ mod tests {
             parse_if_modified_since("Sat, 01 Jan 2000 00:00:00 GMT"),
             Some(946684800)
         );
-        // Space-padded single-digit day (Go's "2" layout element).
+        // Space-padded single-digit day. Documented leniency divergence:
+        // Go's RFC1123 layout element is '02' (two digits), so Go
+        // time.Parse errors on this shape → condNone → Go re-serves 200;
+        // frp-rs answers 304 (RFC 7232-safe — a 304 only revalidates).
         assert_eq!(
             parse_if_modified_since("Sat,  1 Jan 2000 00:00:00 GMT"),
             Some(946684800)
         );
-        // Wrong weekday → parse fail → condNone → 200 (Go time.Parse rejects).
+        // Wrong-but-valid weekday → accepted: Go time.Parse validates the
+        // weekday NAME only ("ignore weekday except for error checking")
+        // and never cross-checks it against the date — "Fri, 01 Jan 2000"
+        // parses clean in Go (2000-01-01 was a Saturday) and answers 304.
         assert_eq!(
             parse_if_modified_since("Fri, 01 Jan 2000 00:00:00 GMT"),
-            None
+            Some(946684800)
         );
-        // Nonexistent calendar date (Feb 30 rolls to Mar 2) → None.
-        assert_eq!(
-            parse_if_modified_since("Wed, 30 Feb 2000 00:00:00 GMT"),
-            None
-        );
+        // Same date, different wrong weekday — 2000-02-29 was a Tuesday
+        // (see test_feb_29_2000_oracle below) yet "Wed" parses (Go parity).
         assert_eq!(
             parse_if_modified_since("Wed, 29 Feb 2000 00:00:00 GMT"),
             Some(951782400)
+        );
+        // Not a weekday NAME at all → parse fail → condNone → 200 (Go's
+        // layout lookup rejects; unlike a wrong-but-valid name).
+        assert_eq!(
+            parse_if_modified_since("Xyz, 01 Jan 2000 00:00:00 GMT"),
+            None
+        );
+        // Case-insensitive weekday lookup (Go's match() folds ASCII case).
+        assert_eq!(
+            parse_if_modified_since("sat, 01 Jan 2000 00:00:00 GMT"),
+            Some(946684800)
+        );
+        // Nonexistent calendar date (Feb 30 normalizes to Mar 1) → None.
+        assert_eq!(
+            parse_if_modified_since("Wed, 30 Feb 2000 00:00:00 GMT"),
+            None
         );
         // Garbage / wrong zone / extra tokens → None (200).
         assert_eq!(parse_if_modified_since("garbage"), None);
@@ -978,6 +1087,112 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\
              Last-Modified: Sat, 01 Jan 2000 00:00:00 GMT\r\n\
              Content-Length: 12\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    /// Audit round-7 e2e: Go http.FileServer localRedirect parity — a
+    /// directory URL without the trailing slash answers 301 with the
+    /// RELATIVE Location path.Base(stripped URL path) + "/" (RawQuery
+    /// appended verbatim), for ANY method (FileServer's redirect precedes
+    /// any method handling; frp-rs's 405 gate sits below it). The
+    /// slash-terminated form serves index.html directly, and a query never
+    /// reaches file resolution (Go url.Parse: Path vs RawQuery).
+    #[tokio::test]
+    async fn test_static_file_e2e_dir_redirect_and_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "sub/index.html", b"index-body");
+        write_file(dir.path(), "sub/deep/inner.html", b"inner-body");
+        write_file(dir.path(), "plain.txt", b"plain-body");
+        let Some(handle) = start_static(dir.path(), None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+
+        // Slash-less dir → 301, relative Location = last path segment + "/".
+        assert_eq!(
+            raw_get(addr, b"GET /sub HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: sub/\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // Deeper dir: base of the FULL stripped path, not just the request.
+        assert_eq!(
+            raw_get(addr, b"GET /sub/deep HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: deep/\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // RawQuery survives into the Location (Go localRedirect appends it).
+        assert_eq!(
+            raw_get(addr, b"GET /sub?x=1 HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: sub/?x=1\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // HEAD and POST redirect too (FileServer redirects any method; the
+        // 405 gate below never sees a slash-less directory URL).
+        assert!(raw_get(addr, b"HEAD /sub HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .starts_with(b"HTTP/1.1 301 Moved Permanently\r\nLocation: sub/\r\n"));
+        assert_eq!(
+            raw_get(addr, b"POST /sub HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: sub/\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // Non-directory target keeps the method gate (405 divergence vs
+        // Go frp's gorilla route miss → 404).
+        assert_eq!(
+            raw_get(addr, b"POST /plain.txt HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\
+              Connection: close\r\n\r\n",
+        );
+        // Slash-terminated dir → 200 index.html, no redirect.
+        let ok = raw_get(addr, b"GET /sub/ HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            ok.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "got: {}",
+            String::from_utf8_lossy(&ok)
+        );
+        assert!(ok.ends_with(b"index-body"));
+        // "%2F" decodes to a real slash (url.Parse decodes Path) → 200 too.
+        let enc = raw_get(addr, b"GET /sub%2F HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            enc.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "got: {}",
+            String::from_utf8_lossy(&enc)
+        );
+        // A query never reaches file resolution: /plain.txt?x=1 serves the
+        // file (Go url.Parse splits RawQuery off Path — the old code
+        // looked up a "plain.txt?x=1" filename and 404'd).
+        let q = raw_get(addr, b"GET /plain.txt?x=1 HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            q.starts_with(b"HTTP/1.1 200 OK\r\n") && q.ends_with(b"plain-body"),
+            "got: {}",
+            String::from_utf8_lossy(&q)
+        );
+
+        // Prefix mode: Location stays relative to the STRIPPED path — the
+        // browser resolves "sub/" against /static/ itself.
+        let Some(pref) = start_static(dir.path(), Some("static")).await else {
+            return;
+        };
+        let addr = pref.local_addr;
+        assert_eq!(
+            raw_get(addr, b"GET /static/sub HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: sub/\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let ok = raw_get(addr, b"GET /static/sub/ HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            ok.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "got: {}",
+            String::from_utf8_lossy(&ok)
+        );
+        assert!(ok.ends_with(b"index-body"));
+        // The exact-boundary "/static/" is slash-terminated (remainder is
+        // empty) → root dir serves, never redirected.
+        let root = raw_get(addr, b"GET /static/ HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            root.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "got: {}",
+            String::from_utf8_lossy(&root)
         );
     }
 }

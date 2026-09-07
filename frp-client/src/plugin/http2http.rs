@@ -214,10 +214,13 @@ mod tests {
         assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "expected 200 OK");
     }
 
-    /// Audit FIX 3 pin: a refused backend answers Go's bare ReverseProxy
-    /// 502 — byte-exact 47 bytes — before the client conn closes (Go
+    /// Audit FIX 3 pin: a refused backend answers with frp-rs's bare
+    /// ReverseProxy 502 — 47 bytes — before the client conn closes (Go
     /// http2http.go's forward proxy is a plain ReverseProxy with no
-    /// ErrorHandler). The old code closed with nothing.
+    /// ErrorHandler; its 502 travels through net/http, which adds a Date
+    /// header and keeps the conn alive — the Date-less close-after-write
+    /// here is the documented frp-rs divergence, same as `write_go_502`).
+    /// The old code closed with nothing.
     #[tokio::test]
     async fn test_http2http_backend_refused_answers_go_502() {
         // Bind then drop: the port is closed, so the backend dial is a

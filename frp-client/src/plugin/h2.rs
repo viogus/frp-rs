@@ -814,8 +814,24 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     // the stream ends (mirror of frp-server vhost_h2c's GOAWAY-rationale
     // handling). Read errors between heads are 502s like a missing first
     // head (Go: the RoundTrip error mid-1xx-loop is a transport error).
+    // Byte budget (audit round-7 finding): the swallow loop is otherwise
+    // unbounded across heads — each head is capped at 1 MiB but the count
+    // and the total are not, so an endless-1xx backend parks this h2
+    // stream forever. Go's Transport caps the SAME loop:
+    // maxHeaderResponseSize (10 MiB default, go1.25 transport.go:2106-2112)
+    // bounds the cumulative bytes across the interim re-reads (readLoop
+    // re-arms pc.readLimit per response at transport.go:2274; interim
+    // heads inside one readResponse share the bucket). Past the budget
+    // the response fails the way an oversized single head fails — 502. Every wire byte counts exactly once: `head` always
+    // starts with the carried seed (read_until_head only appends), so
+    // `head.len() - carried` is the new bytes, and bytes past the
+    // terminator that rode in the read buffer are counted here and never
+    // re-counted (the next iteration's seed subtraction removes them).
     let mut seed: Vec<u8> = Vec::new();
+    let mut interim_bytes: usize = 0;
+    const INTERIM_HEAD_BUDGET: usize = 10 * 1024 * 1024; // Go maxHeaderResponseSize
     let (head, parsed) = loop {
+        let carried = seed.len();
         let head = match read_until_head(r, seed).await {
             Ok(h) => h,
             Err(_e) => {
@@ -832,6 +848,15 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
                 debug!(
                     "https plugin backend sent 101 Switching Protocols, sending 502 \
                      (h2 cannot represent a raw 101 upgrade)"
+                );
+                return send_h2_error(respond, 502, &[], Bytes::new()).await;
+            }
+            interim_bytes += head.len() - carried;
+            if interim_bytes > INTERIM_HEAD_BUDGET {
+                debug!(
+                    interim_bytes,
+                    "https plugin backend exceeded the 10 MiB interim-1xx head budget, \
+                     sending 502"
                 );
                 return send_h2_error(respond, 502, &[], Bytes::new()).await;
             }
@@ -1350,6 +1375,51 @@ mod tests {
         assert!(
             body.is_empty(),
             "backend-death-after-1xx must answer 502, body: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_backend_endless_1xx_over_budget_answers_502() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        // An endless stream of interim 1xx heads. Go's http.Transport caps
+        // the CUMULATIVE interim-head bytes at maxHeaderResponseSize (10 MiB,
+        // transport.go:2106-2112, enforced per response through pc.readLimit);
+        // the plugin mirrors that with INTERIM_HEAD_BUDGET. Pre-budget code
+        // swallowed 1xx forever — the backend here never EOFs, so that code
+        // went red only via the 5 s round-trip timeout below; the budget
+        // trip answers 502 deterministically.
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut conn, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            // Drain the forwarded request head (backend read before replying).
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf).await;
+            // ~934 B per head: far under the 1 MiB per-head cap, so only the
+            // cumulative 10 MiB budget can stop the stream. Emit forever —
+            // the conn drops only when the plugin stops reading (502 sent).
+            let mut interim = b"HTTP/1.1 100 Continue\r\nX-Pad: ".to_vec();
+            interim.extend_from_slice(&[b'A'; 900]);
+            interim.extend_from_slice(b"\r\n\r\n");
+            loop {
+                if conn.write_all(&interim).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let (status, body) = h2_round_trip(addr).await;
+        assert_eq!(status, http::StatusCode::BAD_GATEWAY);
+        assert!(
+            body.is_empty(),
+            "endless-interim backend must answer 502, body: {body:?}"
         );
     }
 }

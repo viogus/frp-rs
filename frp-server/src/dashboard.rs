@@ -751,6 +751,11 @@ async fn handle_clients(
 ) -> Json<Vec<ClientEntry>> {
     let registry = state.client_registry.list();
     let mut clients = Vec::with_capacity(registry.len());
+    // Go: `status := strings.ToLower(ctx.Query("status"))` before the
+    // filter (server/http/controller.go:95) — matchStatusFilter then
+    // fail-opens on anything but the exact online/offline tokens, so an
+    // uppercase "ONLINE" must narrow to online like the lowercase form.
+    let status = query.status.to_lowercase();
     for info in registry {
         // Go filter semantics: `info.ClientID()` (resolved raw-or-run id),
         // `info.User`, `info.RunID` — case-sensitive; status lowercased on
@@ -764,7 +769,7 @@ async fn handle_clients(
         if !query.run_id.is_empty() && info.run_id != query.run_id {
             continue;
         }
-        if !match_status_filter(info.online, &query.status) {
+        if !match_status_filter(info.online, &status) {
             continue;
         }
         let ctl = if info.run_id.is_empty() {

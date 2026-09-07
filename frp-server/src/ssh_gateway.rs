@@ -493,13 +493,14 @@ fn is_bool_flag(canon: &str) -> bool {
 /// Apply a parsed flag value to `args`. Value parse failures produce the
 /// pflag-shaped `invalid argument` error Go surfaces from FlagSet.Set:
 /// `invalid argument "{value}" for "{flag}" flag: {set error}` where
-/// "{flag}" is the registered name Go quotes (`-r, --remote_port` when the
-/// flag has that shorthand, `--name` otherwise) and {set error} is the
-/// strconv/type message verbatim.
+/// "{flag}" is the registered name Go quotes (dash-folded through frp's
+/// WordSepNormalizeFunc — `-r, --remote-port` for the shorthand form,
+/// `--name` otherwise) and {set error} is the strconv/type message
+/// verbatim.
 fn apply_flag_value(args: &mut ParsedProxyArgs, canon: &str, value: &str) -> Result<(), String> {
     match canon {
         "proxy_name" => args.proxy_name = value.to_string(),
-        "remote_port" => args.remote_port = parse_port_value(value, "-r, --remote_port")?,
+        "remote_port" => args.remote_port = parse_port_value(value, "-r, --remote-port")?,
         "local_ip" => args.local_ip = value.to_string(),
         "local_port" => args.local_port = parse_port_value(value, "--local_port")?,
         "custom_domains" => args.custom_domains = split_csv(value),
@@ -599,8 +600,12 @@ fn parse_kv_pairs(value: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 /// Parse a port value (`--remote_port` / `--local_port`, 0 = auto-assign).
-/// The pflag-shaped error carries the flag's canonical display name (Go
-/// formats shorthand flags as "-r, --remote_port").
+/// The pflag-shaped error carries the flag's canonical display name. Go's
+/// pflag normalizes registered names through frp's WordSepNormalizeFunc
+/// (`_` → `-`) before quoting them in errors, so a shorthand flag displays
+/// as "-r, --remote-port" — the dash-folded spelling is what a Go peer
+/// would see. The underscore-free Rust-only names (`--use_encryption`,
+/// `--local_port`, ...) have no Go oracle text and display as registered.
 fn parse_port_value(value: &str, display: &str) -> Result<u16, String> {
     value.parse::<u16>().map_err(|_| {
         format!(

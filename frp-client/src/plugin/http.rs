@@ -138,13 +138,18 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     // task + fd + plugin listener slot indefinitely (audit round-8 F8; the
     // shared const PLUGIN_HEADER_READ_TIMEOUT has the same absolute-window
     // semantics).
-    // The cap is Go's http.Server MaxHeaderBytes DEFAULT: 1 MiB (audit: the
-    // old 64 KiB cap rejected request heads Go serves — 100+ KiB Cookie or
-    // Authorization headers are legal HTTP). A breach is not a read error:
-    // the buffer is carried back so the arm sniff below can answer 431 on
-    // the plain arm the way Go's server would (it errors the read itself
-    // and writes the render BEFORE the handler — http_proxy.go's plain arm
-    // never sees the giant head at all).
+    // The 1 MiB cap below is Go's http.Server MaxHeaderBytes DEFAULT on the
+    // PLAIN arm (audit: the old 64 KiB cap rejected request heads Go serves
+    // — 100+ KiB Cookie or Authorization headers are legal HTTP). On the
+    // CONNECT arm it is a fail-closed Rust-only divergence: frp http_proxy
+    // sniffs the method prefix and then calls http.ReadRequest directly,
+    // which has NO size cap (bounded only by the ReadHeaderTimeout window).
+    // The sniff runs after this read loop, so the cap cannot know the arm
+    // yet — a breach is not a read error: the buffer is carried back so the
+    // arm classification below can answer 431 on the plain arm the way Go's
+    // server would (it errors the read itself and writes the render BEFORE
+    // the handler — http_proxy.go's plain arm never sees the giant head at
+    // all), while the CONNECT arm closes silently (see the arm notes below).
     enum HeadRead {
         Done(Vec<u8>),
         TooLarge(Vec<u8>),
@@ -183,6 +188,11 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     // behavior of everything downstream:
     //   - CONNECT arm (sniff true): http.ReadRequest errors close silently
     //     — the handler has no response writer for a head it never parsed.
+    //     Go-parity for EOF / deadline / malformed heads. For the 1 MiB cap
+    //     this arm is NOT Go parity (Go's ReadRequest is uncapped): the
+    //     silent close on a too-large CONNECT head is deliberate fail-closed
+    //     hardening on this operator-local 127.0.0.1 listener surface — Go
+    //     would read on until the 60s window or a body-less head end.
     //   - Plain arm (sniff false): the head goes through PutConn into the
     //     http.Server, which renders its own error (400 malformed request,
     //     431 header block over the cap) before ServeHTTP ever runs.
@@ -881,9 +891,13 @@ mod tests {
     }
 
     /// Audit FIX 5 pin: the CONNECT arm of an oversized head closes
-    /// SILENTLY (Go's http_proxy.go sniffed CONNECT, then http.ReadRequest
-    /// failed on the cap — the handler has no writer for a head it never
-    /// parsed; no 431 exists on this arm). Mirrors ReadFull-short EOFs.
+    /// SILENTLY. Note the divergence carefully: Go's http_proxy.go sniffs
+    /// CONNECT and then hands the stream to http.ReadRequest, which has NO
+    /// size cap (only the ReadHeaderTimeout window) — a giant CONNECT head
+    /// never fails in Go. The 1 MiB cap here is fail-closed Rust-only
+    /// hardening on the operator-local 127.0.0.1 surface; the silent close
+    /// (no 431 exists on this arm — no parsed head, no writer) mirrors the
+    /// ReadFull-short EOF behavior.
     #[tokio::test]
     async fn http_proxy_oversized_connect_head_closes_silently() {
         let cfg = PluginConfig::default();
