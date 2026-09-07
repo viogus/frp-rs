@@ -333,6 +333,17 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
     }
 }
 
+/// Write the Go-shaped 504 head (`GATEWAY_TIMEOUT_504`) to the user side
+/// when the response head never arrived in time, then flush.
+async fn write_gateway_timeout_504(user_w: &mut (impl tokio::io::AsyncWriteExt + Unpin)) {
+    if let Err(e) = user_w.write_all(GATEWAY_TIMEOUT_504).await {
+        tracing::debug!(error = %e, "bridge 504 write failed (peer disconnected)");
+    }
+    if let Err(e) = user_w.flush().await {
+        tracing::debug!(error = %e, "bridge flush failed (peer disconnected)");
+    }
+}
+
 /// Bridge work→user direction: read from work (plain or via CipherReader),
 /// decompress, apply the shared per-proxy bandwidth limit, write to user.
 ///
@@ -378,12 +389,7 @@ async fn bridge_work_to_user(
                         tracing::debug!(
                             "bridge work_to_user: backend response header timeout, writing 504"
                         );
-                        if let Err(e) = user_w.write_all(GATEWAY_TIMEOUT_504).await {
-                            tracing::debug!(error = %e, "bridge 504 write failed (peer disconnected)");
-                        }
-                        if let Err(e) = user_w.flush().await {
-                            tracing::debug!(error = %e, "bridge flush failed (peer disconnected)");
-                        }
+                        write_gateway_timeout_504(&mut user_w).await;
                         break 'read_loop;
                     }
                 }
@@ -397,7 +403,23 @@ async fn bridge_work_to_user(
                 n
             }
             Err(e) => {
-                tracing::debug!(error = %e, "bridge work_to_user: read error");
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    // The response-head deadline fired AFTER interim 1xx
+                    // bytes were already served (frp-server
+                    // ResponseHeaderInjector's absolute deadline, A2) —
+                    // Go's transport errors the whole response and the
+                    // vhost ErrorHandler answers 504 (vhost http.go:128,
+                    // net.Error Timeout gate); write the same final head
+                    // here. A 100 already relayed is a legal interim
+                    // prefix to it.
+                    tracing::debug!(
+                        error = %e,
+                        "bridge work_to_user: response-head deadline hit, writing 504"
+                    );
+                    write_gateway_timeout_504(&mut user_w).await;
+                } else {
+                    tracing::debug!(error = %e, "bridge work_to_user: read error");
+                }
                 break;
             }
         };
