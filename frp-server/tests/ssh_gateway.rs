@@ -837,3 +837,88 @@ async fn test_ssh_gateway_unreadable_authorized_keys_file_fails_closed() {
     drop(by_password);
     std::fs::set_permissions(&keys_path, std::fs::Permissions::from_mode(0o600)).ok();
 }
+
+/// Round-13 (B3): the per-IP pre-auth slot must be released once a session
+/// AUTHENTICATES. An authenticated tunnel is a trusted connection that
+/// counts against the global conn caps like any other — one client's 9th+
+/// concurrent session must not be blocked by its own earlier tunnels still
+/// holding per-IP pre-auth slots (SSH_PREAUTH_PER_IP_CAP = 8) for the
+/// session's lifetime. Pre-fix shape: the permit dropped only with the
+/// session task, so 8 held authenticated sessions from one IP exhausted the
+/// cap and the 9th conn was cut at the accept gate before its handshake.
+/// Post-fix (ssh_gateway.rs "Auth settled" block): auth success drops the
+/// permit, so all 9 authenticate and stay up concurrently.
+#[tokio::test]
+async fn test_ssh_gateway_preauth_released_on_auth_success_ninth_concurrent() {
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let cfg = ssh_test_config(ssh_port, bind_port);
+    let (_handle, _port) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
+
+    let connect = || async {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match russh::client::connect(
+                Arc::new(russh::client::Config::default()),
+                addr,
+                TestSshClient { local_target: None },
+            )
+            .await
+            {
+                Ok(c) => return c,
+                Err(e) => last_err = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("SSH client should connect; last error: {last_err:?}");
+    };
+
+    // Phase 1: 8 authenticated sessions from one IP (127.0.0.1), held open.
+    // Each starts by holding one per-IP pre-auth slot through its handshake,
+    // then must release it on USERAUTH_SUCCESS. If a session kept its slot,
+    // the 8 sessions below would pin all 8 permits.
+    let mut held: Vec<russh::client::Handle<TestSshClient>> = Vec::new();
+    for i in 0..8 {
+        let mut client = connect().await;
+        let auth = timeout(
+            Duration::from_secs(10),
+            client.authenticate_password("v0", common::TEST_TOKEN),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("authenticated session {i} password auth timed out"))
+        .expect("password auth should succeed");
+        assert!(
+            auth.success(),
+            "authenticated session {i} must authenticate (slot released on success)"
+        );
+        held.push(client);
+    }
+
+    // Phase 2: the 9th concurrent conn from the same IP authenticates too.
+    // Pre-fix it was dropped at the accept gate (no handshake, like the
+    // overflow conn in test_ssh_gateway_preauth_per_ip_cap_drops_overflow_conn);
+    // post-fix the 8 earlier sessions released their slots on auth success.
+    let mut ninth = connect().await;
+    let auth = timeout(
+        Duration::from_secs(10),
+        ninth.authenticate_password("v0", common::TEST_TOKEN),
+    )
+    .await
+    .expect("9th concurrent authenticated session must not hang")
+    .expect("password auth should succeed");
+    assert!(
+        auth.success(),
+        "9th concurrent session from an IP with 8 authenticated sessions must be admitted"
+    );
+    held.push(ninth);
+
+    // Phase 3: tear down — each held session disconnects cleanly.
+    for client in held.drain(..) {
+        client
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .ok();
+    }
+}

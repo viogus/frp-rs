@@ -443,9 +443,16 @@ async fn handle_stream(
     });
 
     // Read the backend's HTTP/1.1 response and re-encode it as HTTP/2. The
-    // response-head read is bounded by vhost_http_timeout — Go parity
-    // (pkg/util/vhost/http.go ResponseHeaderTimeout → 504 Gateway Timeout),
-    // `<= 0` floors at 60s (shared clamp in vhost.rs).
+    // response-head exchange is bounded by vhost_http_timeout — the Go vhost
+    // maps the same config to `ResponseHeaderTimeout` and answers 504 via its
+    // ErrorHandler (pkg/util/vhost/http.go), and `<= 0` floors at 60s (shared
+    // clamp in vhost.rs). This leg arms its one deadline at the first
+    // response-head read; Go arms the timer once the request body is fully
+    // written (transport.go writeErrCh), which the response-read side cannot
+    // observe — the same narrow anchor divergence documented on the
+    // HTTP/1.1 ResponseHeaderInjector. The deadline is shared across the
+    // whole exchange: interim 1xx heads do not re-arm it
+    // (see stream_h2_response).
     let head_timeout = Some(std::time::Duration::from_secs(super::clamp_vhost_timeout(
         state.vhost_http_timeout,
     )));
@@ -1160,9 +1167,10 @@ async fn stream_chunked_body(
     }
 }
 
-/// One bounded response-head read continuing from `seed` (bytes of a
-/// consumed interim head's leftover). Head-read failures map to
-/// `HeadReadError` — the caller answers 502/504 like the Go reverse proxy.
+/// One response-head read bounded by an absolute deadline, continuing from
+/// `seed` (bytes of a consumed interim head's leftover). Head-read failures
+/// map to `HeadReadError`; the caller answers 502/504 — this leg's own
+/// mapping (it is a Rust-only extension, see `stream_h2_response`).
 enum HeadReadError {
     Closed,
     TimedOut,
@@ -1171,14 +1179,19 @@ enum HeadReadError {
 async fn read_backend_head<R: AsyncRead + Unpin>(
     r: &mut R,
     seed: Vec<u8>,
-    head_timeout: Option<std::time::Duration>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vec<u8>, HeadReadError> {
-    match head_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, read_until_head_from(r, seed)).await {
-            Ok(Ok(h)) => Ok(h),
-            Ok(Err(_e)) => Err(HeadReadError::Closed),
-            Err(_elapsed) => Err(HeadReadError::TimedOut),
-        },
+    match deadline {
+        // timeout_at, not timeout: the caller arms ONE absolute deadline for
+        // the whole response-head exchange, so each interim 1xx head consumed
+        // along the way cannot restart the clock (round-13 review A3/C2).
+        Some(deadline) => {
+            match tokio::time::timeout_at(deadline, read_until_head_from(r, seed)).await {
+                Ok(Ok(h)) => Ok(h),
+                Ok(Err(_e)) => Err(HeadReadError::Closed),
+                Err(_elapsed) => Err(HeadReadError::TimedOut),
+            }
+        }
         None => read_until_head_from(r, seed)
             .await
             .map_err(|_e| HeadReadError::Closed),
@@ -1187,19 +1200,31 @@ async fn read_backend_head<R: AsyncRead + Unpin>(
 
 /// Read the backend HTTP/1.1 response from `r`, send the HTTP/2 response head,
 /// then stream the body (decoding chunked transfer-encoding) as HTTP/2 DATA
-/// frames. When `head_timeout` is `Some`, each response-head read is bounded —
-/// on timeout a body-less `504 Gateway Timeout` is sent (Go semantics); a
-/// backend that closes before the head produces `502 Bad Gateway`.
+/// frames. When `head_timeout` is `Some`, the WHOLE response-head exchange is
+/// bounded by one absolute deadline armed here at entry — interim 1xx heads
+/// consumed before the final head (the loop below) do not restart the clock
+/// (round-13 review A3/C2; without this, a backend answering `100` then
+/// stalling parked the head read without bound, one fresh timeout per head).
+/// On timeout a body-less `504 Gateway Timeout` is sent, mirroring the Go
+/// vhost `ErrorHandler` mapping a `ResponseHeaderTimeout` to 504
+/// (pkg/util/vhost/http.go); a backend that closes before the head produces
+/// `502 Bad Gateway` (this leg's own choice — it is a Rust-only extension:
+/// Go frp has no h2c vhost surface to be byte-compatible with).
 async fn stream_h2_response<R: AsyncRead + Unpin>(
     r: &mut R,
     respond: &mut SendResponse<Bytes>,
     head_timeout: Option<std::time::Duration>,
 ) -> Result<(), h2::Error> {
-    let mut head = match read_backend_head(r, Vec::new(), head_timeout).await {
+    let deadline = head_timeout.map(|d| tokio::time::Instant::now() + d);
+    let mut head = match read_backend_head(r, Vec::new(), deadline).await {
         Ok(h) => h,
         Err(HeadReadError::Closed) => {
-            // Backend closed (or no work conn was ever assigned) before
-            // the response head — Go's reverse proxy answers 502.
+            // Backend closed (or no work conn was ever assigned) before the
+            // response head. 502 is this leg's own answer — Go frp's vhost
+            // ErrorHandler never writes 502 (it answers 404 + its not-found
+            // page for non-timeout transport errors, http.go), and the raw
+            // HTTP/1.1 vhost surface has no wire answer either (the bridge
+            // just ends); an h2 stream, though, must terminate with a status.
             tracing::debug!("h2c backend closed before response head, sending 502");
             return send_h2_error(respond, 502, &[], Bytes::new()).await;
         }
@@ -1211,22 +1236,39 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     // Go Transport readResponse parity (round-13 review finding): non-101
     // 1xx heads (a 100 Continue answering `Expect: 100-continue`) are
     // consumed internally and never surface as the response — keep reading
-    // until a final/101 head ends the exchange. Without the skip the
-    // interim head was sent to the h2 client as `:status 100` and the
-    // pipelined final head streamed as its body. (This h2c leg is a
-    // Rust-only extension — Go frp has no h2c vhost — modeled on the Go
-    // client transport, which consumes 1xx the same way.)
+    // until a final head ends the exchange. Without the skip the interim
+    // head was sent to the h2 client as `:status 100` and the pipelined
+    // final head streamed as its body. (This h2c leg is a Rust-only
+    // extension — Go frp has no h2c vhost — modeled on the Go client
+    // transport, which consumes 1xx the same way.)
     let parsed = loop {
         let Some(parsed) = parse_response_head(&head) else {
             tracing::debug!("h2c backend sent a malformed response head, sending 502");
             return send_h2_error(respond, 502, &[], Bytes::new()).await;
         };
-        if parsed.status != 101 && (100..=199).contains(&parsed.status) {
-            // A 1xx head carries no body — bytes after its blank line are
-            // the next head's start (possibly already complete).
+        if (100..=199).contains(&parsed.status) {
+            if parsed.status == 101 {
+                // A backend `101 Switching Protocols` cannot be represented
+                // over HTTP/2 — h2 has no protocol switch; its 1xx are
+                // informational only, and an h2 client treats a 101 head
+                // that way too. Streaming the post-switch bytes as the
+                // body would be DATA before the final response head, a
+                // connection PROTOCOL_ERROR — the h2 crate's client
+                // answers with a whole-connection GOAWAY, killing every
+                // concurrent stream on the h2 conn (round-13 review B2).
+                // Answer 502 in this leg's unsupported-backend class
+                // (like the 0/>999 status arm below) instead of leaking a
+                // conn-killing head; there is no final head to wait for.
+                tracing::debug!(
+                    "h2c backend answered 101 Switching Protocols (unsupported over HTTP/2), sending 502"
+                );
+                return send_h2_error(respond, 502, &[], Bytes::new()).await;
+            }
+            // A non-101 1xx head carries no body — bytes after its blank
+            // line are the next head's start (possibly already complete).
             tracing::trace!("h2c consuming backend interim {} head", parsed.status);
             let seed = head[parsed.body_offset..].to_vec();
-            head = match read_backend_head(r, seed, head_timeout).await {
+            head = match read_backend_head(r, seed, deadline).await {
                 Ok(h) => h,
                 Err(HeadReadError::Closed) => {
                     tracing::debug!("h2c backend closed between response heads, sending 502");

@@ -418,3 +418,180 @@ async fn test_http_group_route_cleaned_when_last_member_leaves() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
+
+/// Round-13 review B4: a CONNECT request dispatched to a group member on a
+/// DIFFERENT run_id must stay raw across the cross-run_id hop. The group LB
+/// (`frp-server/src/control/pool.rs` forward-to-backend) carries
+/// `request_is_connect` in the `ProxyUserConn` it sends to the member's
+/// control (pool.rs:784) — if that flag were dropped on the hop, the
+/// receiving bridge would treat the tunnel as a plain GET and run the full
+/// injection path (requestHeaders, host_header_rewrite, X-Forwarded-*,
+/// response_headers) on a raw CONNECT. Go's connectHandler writes the
+/// request verbatim and never injects (pkg/util/vhost/http.go connect path).
+#[tokio::test]
+async fn test_http_group_cross_run_id_connect_stays_raw() {
+    let bind_port = allocate_port();
+    let vhost_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        vhost_http_port: vhost_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+    let vhost: SocketAddr = format!("127.0.0.1:{vhost_port}").parse().unwrap();
+
+    // Member A: first member — owns the shared vhost route.
+    let (mut ctl_a, resp_a) = login_with_test_token(addr).await.expect("login A");
+    let run_id_a = resp_a.run_id.expect("run_id A");
+    let err = register_proxy(
+        &mut ctl_a,
+        http_group_proxy("raw-conn-a", "rawgrp", "raw-key", "rawgrp.example.com"),
+    )
+    .await;
+    assert!(err.is_none(), "member A rejected: {err:?}");
+
+    // Member B: same group/domain but carries rewrite + requestHeaders +
+    // response_headers — configs that MUST be skipped on its CONNECTs. The
+    // group-param conflict check covers only group/domain/location, so B's
+    // per-member injection config registers fine.
+    let mut np_b = http_group_proxy("raw-conn-b", "rawgrp", "raw-key", "rawgrp.example.com");
+    np_b.host_header_rewrite = Some("rewritten.internal".into());
+    np_b.headers = Some(std::collections::HashMap::from([(
+        "X-Override".to_string(),
+        "new".to_string(),
+    )]));
+    np_b.response_headers = Some(std::collections::HashMap::from([(
+        "X-Inject-Resp".to_string(),
+        "must-not-appear".to_string(),
+    )]));
+    let (mut ctl_b, resp_b) = login_with_test_token(addr).await.expect("login B");
+    let run_id_b = resp_b.run_id.expect("run_id B");
+    let err = register_proxy(&mut ctl_b, np_b).await;
+    assert!(err.is_none(), "member B rejected: {err:?}");
+
+    // Request 1: a plain GET — round-robin index 0 → member A (the route
+    // owner). Warms the wheel to index 1 (→ B) so the CONNECT below takes
+    // the cross-run_id hop; also proves GETs to A still work.
+    let mut work_a = open_work_conn(addr, &run_id_a).await;
+    let get = tokio::spawn(http_request(vhost, "rawgrp.example.com"));
+    let head_a = read_work_head(&mut work_a).await;
+    assert!(head_a.is_some(), "warm GET must reach member A");
+    let text_a = String::from_utf8_lossy(head_a.as_deref().unwrap());
+    assert!(
+        text_a.contains("X-Forwarded-For"),
+        "warm GET must carry the XFF chain (injection path alive): {text_a}"
+    );
+    let body = "warm-A";
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+        len = body.len()
+    );
+    work_a.write_all(resp.as_bytes()).await.expect("serve warm");
+    let got = get.await.expect("warm GET task");
+    assert!(got.contains("warm-A"), "warm GET body: {got:?}");
+    drop(work_a);
+
+    // Request 2: CONNECT — round-robin index 1 → member B on run_id B, a
+    // cross-run_id hop from A's control. Pool B's conn first.
+    let mut work_b = open_work_conn(addr, &run_id_b).await;
+    let mut client = tokio::net::TcpStream::connect(vhost)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(
+            b"CONNECT rawgrp.example.com:443 HTTP/1.1\r\n\
+              Host: rawgrp.example.com\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send CONNECT");
+
+    // The member-B work conn must see StartWorkConn, then the raw CONNECT
+    // head byte-identical to the wire request: no rewrite, no
+    // requestHeaders, no X-Forwarded-* — even though B's config would
+    // inject all of them on a plain GET.
+    match read_msg_v1(&mut work_b).await.expect("StartWorkConn") {
+        FrpMessage::StartWorkConn(swc) => {
+            assert_eq!(swc.proxy_name, "raw-conn-b");
+            assert!(swc.error.is_none(), "{:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+    let fwd = read_work_head(&mut work_b)
+        .await
+        .expect("forwarded CONNECT");
+    let fwd_text = String::from_utf8_lossy(&fwd);
+    assert!(
+        fwd_text.starts_with("CONNECT rawgrp.example.com:443 HTTP/1.1\r\n"),
+        "request line must be forwarded verbatim across the run_id hop: {fwd_text}"
+    );
+    assert!(
+        fwd_text.contains("Host: rawgrp.example.com\r\n"),
+        "original Host must survive the hop: {fwd_text}"
+    );
+    assert!(
+        !fwd_text.contains("rewritten.internal"),
+        "host_header_rewrite must not apply to a hopped CONNECT: {fwd_text}"
+    );
+    assert!(
+        !fwd_text.contains("X-Override"),
+        "requestHeaders must not apply to a hopped CONNECT: {fwd_text}"
+    );
+    assert!(
+        !fwd_text.contains("X-Forwarded"),
+        "no X-Forwarded-* injection on a hopped CONNECT: {fwd_text}"
+    );
+
+    // Response direction: backend bytes must pass through B's bridge
+    // un-injected (the response_headers injector is gated on
+    // `!request_is_connect`, bridge.rs). Serve a plain head+body, drop the
+    // conn, and read everything the client sees.
+    let payload = "hopped-raw";
+    let backend_resp = format!(
+        "HTTP/1.1 200 OK\r\nX-Backend: b\r\nContent-Length: {len}\r\n\r\n{payload}",
+        len = payload.len()
+    );
+    work_b
+        .write_all(backend_resp.as_bytes())
+        .await
+        .expect("serve CONNECT");
+    drop(work_b);
+
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 1024];
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        loop {
+            match client.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+    .await
+    .expect("client tunnel must close after the backend conn drops");
+    let seen_text = String::from_utf8_lossy(&seen);
+    assert!(
+        seen_text.contains("HTTP/1.1 200 OK\r\n"),
+        "client must see the CONNECT success before the tunnel: {seen_text:?}"
+    );
+    assert!(
+        seen_text.contains("X-Backend: b\r\n"),
+        "backend response head must pass through byte-identical: {seen_text:?}"
+    );
+    assert!(
+        !seen_text.contains("X-Inject-Resp"),
+        "response_headers must not inject into a hopped CONNECT response: {seen_text:?}"
+    );
+    assert!(
+        seen_text.ends_with(payload),
+        "backend body must reach the client verbatim: {seen_text:?}"
+    );
+
+    drop(client);
+    drop(ctl_a);
+    drop(ctl_b);
+}

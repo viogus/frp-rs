@@ -1211,3 +1211,281 @@ async fn test_h2c_duplicate_response_headers_all_values_preserved() {
     .await
     .expect("h2 response + body never completed (wedged forward path?)");
 }
+
+/// Round-13 review A3/C2 pins: the response-head exchange is bounded by ONE
+/// absolute vhost_http_timeout deadline across the interim-1xx swallow loop —
+/// a backend answering `100 Continue` then stalling must not re-arm the clock
+/// per interim head (each fresh per-head timeout would park the head read
+/// without bound across N heads). These tests pin the swallow behavior and
+/// the failure arms of the shared deadline.
+///
+/// 100 → (split write) 200: the interim is consumed internally — the h2
+/// client must see only the final 200 + body, never a `:status 100`.
+#[tokio::test]
+async fn test_h2c_interim_100_swallowed_final_200_split_writes() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-i100", "i100.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://i100.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    read_request_bytes(&mut work_conn).await;
+
+    // Interim head alone first (its own segment — the swallow loop must
+    // re-enter the backend read), then the final head after a pause.
+    work_conn
+        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+        .await
+        .expect("write interim head");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    work_conn
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfinal")
+        .await
+        .expect("write final head");
+
+    timeout(Duration::from_secs(10), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the interim 100 must never surface as the h2 response status"
+        );
+        let body = read_h2_body(response.into_body()).await;
+        assert_eq!(body, b"final");
+    })
+    .await
+    .expect("h2 response + body never completed (wedged forward path?)");
+}
+
+/// 100 → backend EOF: the swallow loop's next read sees the close and the
+/// caller answers 502.
+#[tokio::test]
+async fn test_h2c_interim_100_then_backend_close_answers_502() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-i100eof", "i100eof.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://i100eof.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    read_request_bytes(&mut work_conn).await;
+    work_conn
+        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+        .await
+        .expect("write interim head");
+    work_conn.shutdown().await.expect("half-close backend");
+
+    timeout(Duration::from_secs(10), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(
+            response.status().as_u16(),
+            502,
+            "backend closed between interim and final head must answer 502"
+        );
+        read_h2_body(response.into_body()).await;
+    })
+    .await
+    .expect("502 never forwarded (wedged forward path?)");
+}
+
+/// 100 → silence: the ONE absolute deadline (vhost_http_timeout, 2s here)
+/// armed when the head exchange started fires even though the interim head
+/// arrived shortly after — the swallow re-read must NOT restart the clock.
+/// (Per-head re-arm would wait another full 2s after the interim, so the
+/// 504 must land by ~2s, not ~4s.)
+#[tokio::test]
+async fn test_h2c_interim_100_then_silence_504_at_absolute_deadline() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup_auth("h2c-i100t", "i100t.example.com", None, None, 2).await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://i100t.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    read_request_bytes(&mut work_conn).await;
+    work_conn
+        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+        .await
+        .expect("write interim head");
+    // No further backend bytes — the shared absolute deadline must fire.
+
+    let started = std::time::Instant::now();
+    timeout(Duration::from_secs(8), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(response.status().as_u16(), 504);
+        read_h2_body(response.into_body()).await;
+    })
+    .await
+    .expect("504 never forwarded (wedged forward path?)");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(3900),
+        "504 arrived after {elapsed:?} — the interim 100 must not restart \
+         the head deadline (2s deadline, got a ~4s re-armed window)"
+    );
+}
+
+/// A multi-interim chain (100 → 103 Early Hints → 200) in ONE backend
+/// segment: each interim is consumed, its headers discarded (the client must
+/// not see the 103's headers merged into the final response), and only the
+/// final 200 + body surface.
+#[tokio::test]
+async fn test_h2c_interim_chain_100_103_200_single_segment() {
+    let (_bind, vhost_addr, _provider, _run_id, mut work_conn) =
+        setup("h2c-chain", "chain.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://chain.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    read_request_bytes(&mut work_conn).await;
+    work_conn
+        .write_all(
+            b"HTTP/1.1 100 Continue\r\n\r\n\
+              HTTP/1.1 103 Early Hints\r\n\
+              Link: </style.css>; rel=preload\r\n\
+              \r\n\
+              HTTP/1.1 200 OK\r\n\
+              Content-Length: 4\r\n\
+              \r\n\
+              body",
+        )
+        .await
+        .expect("write chained heads");
+
+    timeout(Duration::from_secs(10), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the interim 100/103 heads must never surface as the response"
+        );
+        assert!(
+            !response.headers().contains_key("link"),
+            "the 103's headers must be discarded with the interim head"
+        );
+        let body = read_h2_body(response.into_body()).await;
+        assert_eq!(body, b"body");
+    })
+    .await
+    .expect("h2 response + body never completed (wedged forward path?)");
+}
+
+/// A backend `101 Switching Protocols` is NOT an interim and NOT a final
+/// this leg can forward: h2 has no protocol switch, and streaming the
+/// post-switch bytes as the body would be DATA before a final head — the
+/// h2 crate's client answers that with a whole-connection GOAWAY
+/// (PROTOCOL_ERROR), killing every concurrent stream. The leg must answer
+/// 502 (unsupported-backend class) WITHOUT waiting for a final head that
+/// never comes, and the h2 connection must survive for the next request.
+#[tokio::test]
+async fn test_h2c_interim_101_switching_answers_502_conn_survives() {
+    let (_bind, vhost_addr, mut provider, run_id, mut work_conn) =
+        setup("h2c-101", "switch.example.com").await;
+
+    let mut client = h2_connect(vhost_addr).await;
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://switch.example.com/")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+
+    read_start_work_conn(&mut work_conn).await;
+    read_request_bytes(&mut work_conn).await;
+    work_conn
+        .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: myproto\r\n\r\n")
+        .await
+        .expect("write 101 head");
+    work_conn
+        .write_all(b"post-switch payload")
+        .await
+        .expect("write upgrade payload");
+
+    timeout(Duration::from_secs(10), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(
+            response.status().as_u16(),
+            502,
+            "a backend protocol switch must degrade to 502 — h2 cannot \
+             carry 101, and forwarding the upgrade stream as a body \
+             GOAWAYs the whole connection"
+        );
+        read_h2_body(response.into_body()).await;
+    })
+    .await
+    .expect("502 never forwarded (wedged forward path?)");
+
+    // The h2 connection must be alive (no GOAWAY): a second request over
+    // the same connection reaches a normal 200 backend exchange.
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://switch.example.com/after")
+        .body(())
+        .unwrap();
+    let (response_fut, _stream) = client.send_request(request, true).unwrap();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_msg_v1(&mut provider),
+    )
+    .await
+    .expect("ReqWorkConn within 10s")
+    .expect("read ReqWorkConn")
+    {
+        FrpMessage::ReqWorkConn(_) => {}
+        other => panic!("expected ReqWorkConn, got {:?}", other.v1_type_byte()),
+    }
+    let mut work_conn2 = tokio::net::TcpStream::connect(_bind)
+        .await
+        .expect("second work conn");
+    write_msg_v1(
+        &mut work_conn2,
+        &FrpMessage::NewWorkConn(msg::NewWorkConn {
+            run_id: Some(run_id),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+    read_start_work_conn(&mut work_conn2).await;
+    read_request_bytes(&mut work_conn2).await;
+    work_conn2
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nafter")
+        .await
+        .expect("write backend response");
+    timeout(Duration::from_secs(10), async {
+        let response = response_fut.await.expect("h2 response");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the 101 must not GOAWAY the h2 connection — the next request \
+             must still succeed"
+        );
+        let body = read_h2_body(response.into_body()).await;
+        assert_eq!(body, b"after");
+    })
+    .await
+    .expect("second exchange never completed (wedged forward path?)");
+}

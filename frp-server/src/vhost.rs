@@ -2257,10 +2257,14 @@ fn inject_vhost_request_headers(
 
     // Collect header lines, dropping ones that request_headers will override
     // (case-insensitive Set semantics), X-Forwarded-For (re-emitted with
-    // the peer appended), and the X-Forwarded-Host / X-Forwarded-Proto /
-    // Forwarded lines go1.25's ReverseProxy deletes before the Rewrite hook
-    // (reverseproxy.go:434-437 — SetXForwarded re-Sets the two X-Forwarded
-    // names to canonical values below; `Forwarded` is never re-added).
+    // the peer appended), and the forwarding lines go1.25's ReverseProxy
+    // deletes before the Rewrite hook — all FOUR of Forwarded,
+    // X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto, one Del each at
+    // reverseproxy.go:434-437. The XFF branch re-emits what Go frp's Rewrite
+    // rebuilds (pkg/util/vhost/http.go:59-61 copies the inbound chain across,
+    // then SetXForwarded — reverseproxy.go:80-93 — appends the real peer);
+    // X-Forwarded-Host / X-Forwarded-Proto are re-Set to canonical values
+    // below, and `Forwarded` is never re-added.
     let mut lines: Vec<&[u8]> = Vec::new();
     let mut existing_xff: Vec<u8> = Vec::new();
     // Precompute override prefixes once (case-insensitive ASCII set semantics):
@@ -2375,8 +2379,11 @@ fn inject_vhost_request_headers(
             continue;
         }
         // Go go1.25 reverseproxy.go:434-437 deletes every client-supplied
-        // `Forwarded`, `X-Forwarded-Host`, and `X-Forwarded-Proto` line
-        // from the outbound request BEFORE the Rewrite hook runs;
+        // `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, and
+        // `X-Forwarded-Proto` line from the outbound request BEFORE the
+        // Rewrite hook runs (`X-Forwarded-For` left this head through the
+        // branch above — Go frp's Rewrite copies the inbound chain across
+        // and SetXForwarded appends the peer, pkg/util/vhost/http.go:59-61);
         // SetXForwarded then re-Sets X-Forwarded-Host / X-Forwarded-Proto
         // to single canonical values (emitted below) and Go never re-adds
         // `Forwarded` at all. Exact-name + ':' compare — an invented
@@ -4994,6 +5001,42 @@ mod tests {
         );
         assert!(text.contains("X-Forwarded-For: 192.0.2.55\r\n"), "{text:?}");
         assert!(text.contains("X-Forwarded-Proto: http\r\n"), "{text:?}");
+    }
+
+    /// An EMPTY-VALUED inbound `X-Forwarded-For:` line survives into the
+    /// chain — Go `SetXForwarded` joins the prior value slice with ", " and
+    /// an empty element is not skipped (`["", ip]` → ", ip"), so the
+    /// re-emitted line keeps its leading ", ". Round-13 review B8: the
+    /// empty-value shape had no pin.
+    #[test]
+    fn inject_xff_empty_value_kept_in_chain() {
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 55], 4242));
+
+        // Single empty-valued line → ", peer" (empty element + separator).
+        let head =
+            b"GET / HTTP/1.1\r\nHost: app.example.com\r\nX-Forwarded-For:\r\n\r\nbody".to_vec();
+        let out = inject_vhost_request_headers(head, peer, "app.example.com", &[]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("X-Forwarded-For: , 192.0.2.55\r\n"),
+            "empty XFF value must survive as a leading empty element: {text:?}"
+        );
+        assert!(
+            text.ends_with("\r\n\r\nbody"),
+            "body must survive: {text:?}"
+        );
+
+        // Empty first line + non-empty second → ", 203.0.113.1, peer"
+        // (Go Header.Get / Join element order).
+        let multi = b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\
+              X-Forwarded-For:\r\nX-Forwarded-For: 203.0.113.1\r\n\r\nbody"
+            .to_vec();
+        let out = inject_vhost_request_headers(multi, peer, "app.example.com", &[]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("X-Forwarded-For: , 203.0.113.1, 192.0.2.55\r\n"),
+            "element order must follow the inbound lines: {text:?}"
+        );
     }
 
     /// Client-supplied X-Forwarded-Host / X-Forwarded-Proto / Forwarded

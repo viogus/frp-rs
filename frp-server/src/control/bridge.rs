@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -147,14 +148,27 @@ struct ResponseHeaderInjector<R> {
     complete: bool,
     /// Persistent read buffer to avoid per-poll_read allocation.
     read_buf: [u8; 4096],
+    /// Absolute deadline for the FIRST injectable head (Go
+    /// ResponseHeaderTimeout analog, A2). Armed once at construction; an
+    /// interim 1xx raw serve does NOT extend it. When it fires while a head
+    /// is still being gathered, poll_read errors with TimedOut. Boxed-pinned
+    /// Sleep registered once (no per-poll wheel churn); `Pin<Box<T>>` is
+    /// Unpin regardless of `T`, so the manual Unpin impl above stays valid.
+    deadline_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 // SAFETY: All fields of ResponseHeaderInjector are Unpin when R: Unpin.
-// HashMap, Vec, Option<Vec>, usize, bool, and [u8; 4096] are all Unpin.
+// HashMap, Vec, Option<Vec>, usize, bool, [u8; 4096], and
+// Option<Pin<Box<tokio::time::Sleep>>> (Pin<Box<T>> is Unpin for any T) are
+// all Unpin.
 impl<R: Unpin> Unpin for ResponseHeaderInjector<R> {}
 
 impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
-    fn new(inner: R, headers: std::collections::HashMap<String, String>) -> Self {
+    fn new(
+        inner: R,
+        headers: std::collections::HashMap<String, String>,
+        header_timeout: Option<std::time::Duration>,
+    ) -> Self {
         Self {
             inner,
             headers,
@@ -166,42 +180,45 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
             eof: false,
             complete: false,
             read_buf: [0u8; 4096],
+            deadline_sleep: header_timeout.map(|d| Box::pin(tokio::time::sleep(d))),
         }
     }
 
     /// True when the version token parses like Go `http.ParseHTTPVersion`
-    /// — `HTTP/` + one or more digits + `.` + one or more digits
-    /// (response.go:183-185 — the version is validated BEFORE the code, so
-    /// a first token like `FOO 200 OK` errors the whole response).
+    /// (go1.25 request.go:819-838): `HTTP/1.1`/`HTTP/1.0` exact, otherwise
+    /// `HTTP/` + exactly ONE digit + `.` + exactly ONE digit — the generic
+    /// arm length-checks `len(vers) != len("HTTP/X.Y")` and parses single
+    /// bytes at [5:6]/[7:8]. "HTTP/1.10" and "HTTP/01.1" fail the length
+    /// check, "HTTP/9.9" passes. (ReadResponse validates the status code
+    /// BEFORE the version — response.go:173-186 — but either failure errors
+    /// the whole response, so the order does not change the outcome.)
     fn is_http_version(v: &[u8]) -> bool {
         let Some(rest) = v.strip_prefix(b"HTTP/") else {
             return false;
         };
-        let Some(dot) = rest.iter().position(|&b| b == b'.') else {
-            return false;
-        };
-        dot > 0
-            && rest[..dot].iter().all(u8::is_ascii_digit)
-            && !rest[dot + 1..].is_empty()
-            && rest[dot + 1..].iter().all(u8::is_ascii_digit)
+        rest.len() == 3 && rest[1] == b'.' && rest[0].is_ascii_digit() && rest[2].is_ascii_digit()
     }
 
     /// Status code of the head's first line, or None when the line is not
-    /// a parseable `HTTP/x.y <3-digit-code>` status line. Round-13 review
+    /// a parseable `HTTP/x.y <status-code>` status line. Round-13 review
     /// (3 independent reviewers): the version token must parse (Go
     /// ParseHTTPVersion) and the remainder is trimmed of ASCII SPACES only
     /// (Go TrimLeft(" ", ...) — a TAB before the code keeps the token
     /// `\t100`, 4 chars, malformed, exactly like Go; trimming TAB was
     /// classifying `HTTP/1.1 \t100 Continue` as interim when Go 502s it).
+    /// The code token is 3 bytes with Go Atoi semantics (see below) —
+    /// there is no 100..=199 membership check here; classification happens
+    /// at the call site.
     fn head_status_code(head: &[u8]) -> Option<u16> {
         let line_end = head.iter().position(|&b| b == b'\n')?;
         let line = &head[..line_end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         // Go ReadResponse parseStatusLine parity: the version token is cut
-        // at the FIRST literal space, the remainder is TrimLeft'd of
-        // spaces (extra spaces legal — "HTTP/1.1  100 Continue"), then the
-        // code is the next space-delimited token, exactly 3 ASCII digits
-        // (checked before Atoi — "0200" rejected).
+        // at the FIRST literal space, the remainder is TrimLeft'd of spaces
+        // only (extra spaces legal — "HTTP/1.1  100 Continue"), then the
+        // code is the next space-delimited token. Go validates the code
+        // BEFORE the version (response.go:173-186), but the outcome is
+        // order-independent — either failure rejects the whole response.
         let mut sp = line.splitn(2, |&b| b == b' ');
         let version = sp.next()?;
         let rest = sp.next()?;
@@ -213,13 +230,35 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
             rest = stripped;
         }
         let code = rest.split(|&b| b == b' ').next()?;
-        if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
+        // Go strconv.Atoi parity (response.go:173-186): the code token is
+        // length-gated at 3 BYTES ("0200" is a 4-byte token → malformed),
+        // then parsed as a SIGNED decimal — "+20" and "-00" are legal
+        // status codes (Atoi gives 20 / 0) and only `err || value < 0`
+        // rejects: "-01" fails, "-00" passes with 0. No 100..=199
+        // membership check here — the caller classifies interim vs final.
+        if code.len() != 3 {
             return None;
         }
-        Some(
-            code.iter()
-                .fold(0u16, |acc, &b| acc * 10 + u16::from(b - b'0')),
-        )
+        let (has_sign, negative, digits) = match code[0] {
+            b'+' => (true, false, &code[1..]),
+            b'-' => (true, true, &code[1..]),
+            _ => (false, false, code),
+        };
+        if digits.len() != 3 - usize::from(has_sign) || digits.iter().any(|&b| !b.is_ascii_digit())
+        {
+            return None;
+        }
+        let mut value: i64 = 0;
+        for &b in digits {
+            value = value * 10 + i64::from(b - b'0');
+        }
+        if negative {
+            value = -value;
+        }
+        if value < 0 {
+            return None;
+        }
+        Some(value as u16)
     }
 
     /// Copy the status + header lines of a backend response head
@@ -416,7 +455,27 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         &this.headers,
                         &mut injected,
                     );
-                    for (k, v) in &this.headers {
+                    // A6 (round-13 review): Go frp applies the configured
+                    // headers with Header.Set (vhost http.go modifyResponse)
+                    // — keys canonicalize, so "X-Custom" + "x-custom" in the
+                    // config are ONE header and the wire carries ONE line
+                    // (which value wins is Go map-iteration luck). Emit
+                    // deterministically: original keys sorted, a
+                    // case-insensitive collision resolves to the LAST key in
+                    // sorted order (one of Go's possible outcomes) — never
+                    // both lines, which would read as two headers to the
+                    // client and break first-value-wins security headers.
+                    let mut sorted: Vec<(&String, &String)> = this.headers.iter().collect();
+                    sorted.sort_by(|a, b| a.0.cmp(b.0));
+                    let mut prev_key: Option<&[u8]> = None;
+                    let mut prev_start = 0usize;
+                    for (k, v) in sorted {
+                        if prev_key.is_some_and(|pk| pk.eq_ignore_ascii_case(k.as_bytes())) {
+                            // Same canonical header as the previous (sorted)
+                            // key — rewind the whole previous emitted line
+                            // and let this entry replace it.
+                            injected.truncate(prev_start);
+                        }
                         // Sanitize header names/values to prevent HTTP
                         // header injection.
                         let safe_k: String =
@@ -429,14 +488,40 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         // head intentionally ends up mixed-EOL; the
                         // injected lines remain parseable and the trailing
                         // blank keeps the backend's own EOL.
+                        prev_start = injected.len();
                         injected
                             .extend_from_slice(format!("{}: {}\r\n", safe_k, safe_v).as_bytes());
+                        prev_key = Some(k.as_bytes());
                     }
                     injected.extend_from_slice(&this.buffer[blank_start..]);
                     this.buffer = injected;
                     this.buffer_offset = 0;
                     this.injected = true;
                     break;
+                }
+            }
+            // A2 (round-13 review): Go ResponseHeaderTimeout is ONE
+            // absolute deadline — armed once, never extended by interim 1xx
+            // heads (go1.25 transport.go:2842-2853: the timer starts when
+            // the request body is fully written; the respHeaderTimer case
+            // is never re-armed). An Expect:100-continue backend that
+            // answers 100 and then stalls must not park this bridge
+            // unbounded — the frp-core one-shot timeout was consumed by the
+            // raw interim serve above. Poll a sleep to the absolute
+            // deadline before each inner read: Pending registers the timer
+            // waker alongside the inner read's; a fire errors the read
+            // (TimedOut), which frp-core maps to a Go-shaped 504. The
+            // deadline is anchored at construction (bridge spawn, head
+            // already forwarded) — Go arms at request-body-complete, which
+            // this read layer cannot observe; a slow Expect upload counts
+            // against the budget where Go's timer would not (same anchor as
+            // the pre-existing first-read timeout).
+            if let Some(deadline_sleep) = this.deadline_sleep.as_mut() {
+                if deadline_sleep.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for response headers",
+                    )));
                 }
             }
             let mut temp_buf = ReadBuf::new(&mut this.read_buf);
@@ -1450,14 +1535,28 @@ async fn run_work_bridge(
         // not unified here yet — this change is encryption-focused.
         let comp_key = req.use_compression && !is_sudp;
         if let Some(headers) = injector_headers {
-            // Response-header injection MUST observe plaintext (#2): the
-            // work conn carries AES-128-CFB ciphertext, so decrypt FIRST via
-            // CipherReader, THEN wrap in the injector. Passing this to
-            // bridge_encrypted with `read_is_decrypted=true` stops the bridge
-            // from re-wrapping (which would double-decrypt/corrupt).
-            let decrypted = CipherReader::new(w_r, key);
-            let injector = ResponseHeaderInjector::new(decrypted, headers);
-            frp_core::bridge::bridge_encrypted(
+            // Response-header injection MUST observe plaintext: the work
+            // conn carries AES-128-CFB ciphertext, so decrypt FIRST via
+            // CipherReader, THEN wrap in the injector. Audit round-14 A1:
+            // with use_compression the decrypted stream is STILL
+            // Snappy-encoded — the bridge's own decompressor runs below any
+            // reader passed as work_r — so a `SnappyStreamReader` goes
+            // between the CipherReader and the injector, and the
+            // `_decompressed_read` bridge variant skips its read-side decode
+            // (the user→work write side keeps compressing). Go parity: frp's
+            // vhost ReverseProxy/ModifyResponse sits ABOVE the transport's
+            // snappy layer and always injects into plaintext. Without this a
+            // compressed http proxy + response_headers would splice into
+            // Snappy bytes (corrupt stream) or silently never inject.
+            let decrypted: Box<dyn AsyncRead + Unpin + Send> =
+                Box::new(CipherReader::new(w_r, key));
+            let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
+                Box::new(frp_core::snappy_stream::SnappyStreamReader::new(decrypted))
+            } else {
+                decrypted
+            };
+            let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+            frp_core::bridge::bridge_encrypted_decompressed_read(
                 u_r,
                 u_w,
                 injector,
@@ -1468,7 +1567,6 @@ async fn run_work_bridge(
                 bw_limiter.as_ref(),
                 Some(metrics.clone()),
                 header_timeout,
-                true,
             )
             .await;
             // Matches the original inline closure: the injector path skips
@@ -1551,8 +1649,15 @@ async fn run_work_bridge(
                 return;
             };
             if let Some(headers) = injector_headers {
-                let injector = ResponseHeaderInjector::new(w_r, headers);
-                frp_core::bridge::bridge_plain_rate_limited(
+                // A1: decompress the work stream before the injector when the
+                // proxy uses compression (see the encrypted arm above).
+                let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
+                    Box::new(frp_core::snappy_stream::SnappyStreamReader::new(w_r))
+                } else {
+                    w_r
+                };
+                let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                frp_core::bridge::bridge_plain_rate_limited_decompressed_read(
                     u_r,
                     u_w,
                     injector,
@@ -1603,8 +1708,15 @@ async fn run_work_bridge(
                 return;
             };
             if let Some(headers) = injector_headers {
-                let injector = ResponseHeaderInjector::new(w_r, headers);
-                frp_core::bridge::bridge_plain(
+                // A1: decompress the work stream before the injector when the
+                // proxy uses compression (see the encrypted arm above).
+                let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
+                    Box::new(frp_core::snappy_stream::SnappyStreamReader::new(w_r))
+                } else {
+                    w_r
+                };
+                let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                frp_core::bridge::bridge_plain_decompressed_read(
                     u_r,
                     u_w,
                     injector,
@@ -2589,7 +2701,7 @@ mod tests {
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Injected".to_string(), String::from("yes"));
-        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
 
         // Build a response whose header block is larger than the injector's
         // 4096-byte read buffer, so the boundary lands in the second read.
@@ -2626,7 +2738,7 @@ mod tests {
         for i in 0..20 {
             headers.insert(format!("X-{i}"), String::from("value-value-value-value"));
         }
-        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
 
         let response = "HTTP/1.1 200 OK\r\n\r\nhello-body";
         inner_w.write_all(response.as_bytes()).await.expect("write");
@@ -2651,7 +2763,7 @@ mod tests {
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Injected".to_string(), String::from("yes"));
-        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
 
         inner_w
             .write_all(b"no-header-terminator-here")
@@ -2680,7 +2792,7 @@ mod tests {
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Injected".to_string(), String::from("yes"));
-        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
 
         let response = "HTTP/1.1 200 OK\nContent-Type: text/plain\n\nhello";
         inner_w.write_all(response.as_bytes()).await.expect("write");
@@ -2714,7 +2826,7 @@ mod tests {
             "\nHTTP/1.1 200 OK\n\nbody",
         ] {
             let (mut w, r) = tokio::io::duplex(64 * 1024);
-            let mut injector = ResponseHeaderInjector::new(r, headers.clone());
+            let mut injector = ResponseHeaderInjector::new(r, headers.clone(), None);
             w.write_all(garbage.as_bytes()).await.expect("write");
             w.shutdown().await.expect("shutdown");
             drop(w);
@@ -2741,7 +2853,7 @@ mod tests {
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Injected".to_string(), String::from("yes"));
-        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
 
         // One backend segment: interim 100 head + final 200 head + body.
         let response =
@@ -2772,7 +2884,7 @@ mod tests {
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Injected".to_string(), String::from("yes"));
-        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
 
         // Phase 1: only the 100 head. A single read must return it in full.
         inner_w
@@ -2816,7 +2928,7 @@ mod tests {
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Injected".to_string(), String::from("yes"));
-        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
 
         let response =
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n\x81\xfeRAW-UPGRADE-BYTES";
@@ -2842,7 +2954,7 @@ mod tests {
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Injected".to_string(), String::from("yes"));
-        let mut injector = ResponseHeaderInjector::new(inner_r, headers);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
 
         inner_w
             .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
@@ -2882,7 +2994,7 @@ mod tests {
             ("no code", &b"HTTP/1.1 \r\n\r\n"[..]),
         ] {
             let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
-            let mut injector = ResponseHeaderInjector::new(inner_r, headers());
+            let mut injector = ResponseHeaderInjector::new(inner_r, headers(), None);
             inner_w.write_all(head).await.expect("write head");
             inner_w.shutdown().await.expect("shutdown");
             drop(inner_w);
@@ -2896,7 +3008,7 @@ mod tests {
         // Extra spaces between version and code are legal (Go TrimLeft): the
         // head IS final (200) and MUST be injected.
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
-        let mut injector = ResponseHeaderInjector::new(inner_r, headers());
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers(), None);
         inner_w
             .write_all(b"HTTP/1.1   200 OK\r\nContent-Type: text/plain\r\n\r\nhello")
             .await
@@ -2910,5 +3022,309 @@ mod tests {
             "multi-space first line is a valid final head and must inject, got: {s:?}"
         );
         assert!(s.ends_with("hello"), "body must survive, got: {s:?}");
+    }
+
+    // A4 (round-13 review): the version token must be exactly `HTTP/X.Y`
+    // single-digit — Go ParseHTTPVersion length-checks to 8 bytes and
+    // parses single bytes (request.go:819-838).
+    #[test]
+    fn head_status_go_version_token_matrix() {
+        let v = ResponseHeaderInjector::<tokio::io::DuplexStream>::is_http_version;
+        for ok in [
+            "HTTP/1.1", "HTTP/1.0", "HTTP/0.9", "HTTP/1.9", "HTTP/2.0", "HTTP/9.9",
+        ] {
+            assert!(v(ok.as_bytes()), "{ok} must parse (Go ParseHTTPVersion)");
+        }
+        for bad in [
+            "HTTP/1.10",
+            "HTTP/01.1",
+            "HTTP/10.0",
+            "HTTP/1.x",
+            "HTTP/x.1",
+            "HTTP/1",
+            "HTTP/1.",
+            "HTTP//1.1",
+            "HTTP/1.1 ",
+            "1.1",
+            "FOO",
+        ] {
+            assert!(!v(bad.as_bytes()), "{bad} must NOT parse");
+        }
+    }
+
+    // A7 (round-13 review): the code token is 3 BYTES with Go strconv.Atoi
+    // semantics — a leading sign is legal ("+20" → 20, "-00" → 0) and only
+    // a parse error or negative VALUE rejects ("-01") — and there is no
+    // 100..=199 membership check here (response.go:173-186).
+    #[test]
+    fn head_status_go_code_atoi_matrix() {
+        let code =
+            |head: &[u8]| ResponseHeaderInjector::<tokio::io::DuplexStream>::head_status_code(head);
+        let ok = [
+            (&b"HTTP/1.1 200 OK\r\n\r\n"[..], 200u16),
+            (&b"HTTP/1.1 +20 Weird\r\n\r\n"[..], 20u16),
+            (&b"HTTP/1.1 -00 Weird\r\n\r\n"[..], 0u16),
+            (&b"HTTP/1.1 000 Weird\r\n\r\n"[..], 0u16),
+            (&b"HTTP/1.1 099 X\r\n\r\n"[..], 99u16),
+            (&b"HTTP/1.1 599 X\r\n\r\n"[..], 599u16),
+            (&b"HTTP/1.1 600 X\r\n\r\n"[..], 600u16),
+            (&b"HTTP/1.1 999 X\r\n\r\n"[..], 999u16),
+            (&b"HTTP/1.1 100 Continue\r\n\r\n"[..], 100u16),
+            (&b"HTTP/1.0 101 Switching Protocols\r\n\r\n"[..], 101u16),
+        ];
+        for (head, want) in ok {
+            assert_eq!(
+                code(head),
+                Some(want),
+                "head: {}",
+                String::from_utf8_lossy(head)
+            );
+        }
+        let bad: &[&[u8]] = &[
+            b"HTTP/1.1 -01 X\r\n\r\n",   // Atoi(-1) < 0 → malformed
+            b"HTTP/1.1 +2a X\r\n\r\n",   // Atoi error
+            b"HTTP/1.1 20a X\r\n\r\n",   // Atoi error
+            b"HTTP/1.1 0200 X\r\n\r\n",  // 4-byte token
+            b"HTTP/1.1 20 X\r\n\r\n",    // 2-byte token
+            b"HTTP/1.1 + X\r\n\r\n",     // sign with no digits
+            b"HTTP/1.10 200 OK\r\n\r\n", // A4: multi-digit minor
+            b"HTTP/01.1 200 OK\r\n\r\n", // A4: multi-digit major
+            b"FOO 200 OK\r\n\r\n",       // no HTTP/ prefix
+        ];
+        for head in bad {
+            assert_eq!(code(head), None, "head: {}", String::from_utf8_lossy(head));
+        }
+    }
+
+    // A7 end-to-end shape: a "+20"-coded head is FINAL (not interim) in Go
+    // — modifyResponse runs and the injector must inject.
+    #[tokio::test]
+    async fn injector_signed_code_heads_are_final_and_injected() {
+        use tokio::io::AsyncWriteExt;
+        let headers = || {
+            let mut h = std::collections::HashMap::new();
+            h.insert("X-Injected".to_string(), String::from("yes"));
+            h
+        };
+        for head in [
+            &b"HTTP/1.1 +20 Whimsy\r\n\r\nok"[..],
+            &b"HTTP/1.1 -00 Whimsy\r\n\r\nok"[..],
+        ] {
+            let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+            let mut injector = ResponseHeaderInjector::new(inner_r, headers(), None);
+            inner_w.write_all(head).await.expect("write head");
+            inner_w.shutdown().await.expect("shutdown");
+            drop(inner_w);
+            let out = injector_read_all(&mut injector).await;
+            let s = String::from_utf8_lossy(&out);
+            assert!(
+                s.contains("X-Injected: yes"),
+                "signed code is a legal final head and must inject, got: {s:?}"
+            );
+            assert!(s.ends_with("ok"), "body must survive, got: {s:?}");
+        }
+        // The multi-digit version head, by contrast, is malformed in Go —
+        // served raw, byte-exact, uninjected.
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers(), None);
+        let raw = b"HTTP/1.10 200 OK\r\n\r\n";
+        inner_w.write_all(raw).await.expect("write head");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(&out[..], raw, "HTTP/1.10 must pass through raw, uninjected");
+    }
+
+    // A2 (round-13 review): the response-head deadline is ONE absolute
+    // deadline — an interim 1xx raw serve does NOT extend it. A backend
+    // that answers 100 then stalls errors TimedOut instead of parking the
+    // bridge forever.
+    #[tokio::test(start_paused = true)]
+    async fn injector_interim_1xx_does_not_extend_the_head_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let headers = std::collections::HashMap::new();
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector =
+            ResponseHeaderInjector::new(inner_r, headers, Some(std::time::Duration::from_secs(5)));
+        inner_w
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .expect("write 100");
+        let mut buf = [0u8; 4096];
+        // The interim head is served raw...
+        let n = injector.read(&mut buf).await.expect("interim read");
+        assert_eq!(&buf[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
+        // ...then the final head never arrives: the absolute deadline fires
+        // (the paused clock auto-advances while the read parks).
+        let err = injector
+            .read(&mut buf)
+            .await
+            .expect_err("deadline must fire");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    // A2 companion: a final head that ARRIVES within the deadline injects
+    // normally (the deadline must not cut healthy responses short).
+    #[tokio::test(start_paused = true)]
+    async fn injector_head_within_deadline_injects_normally() {
+        use tokio::io::AsyncWriteExt;
+        let headers = || {
+            let mut h = std::collections::HashMap::new();
+            h.insert("X-Injected".to_string(), String::from("yes"));
+            h
+        };
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::new(
+            inner_r,
+            headers(),
+            Some(std::time::Duration::from_secs(60)),
+        );
+        inner_w
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .expect("write 200");
+        let mut buf = [0u8; 4096];
+        let n = injector.read(&mut buf).await.expect("read");
+        let out = String::from_utf8_lossy(&buf[..n]);
+        assert!(out.contains("X-Injected: yes"), "injected, got: {out:?}");
+        // Deadline NOT armed on the body path: the drain below is bounded by
+        // the inner EOF, and nothing after `complete` consults the timer.
+        assert!(out.ends_with("ok"), "body attached, got: {out:?}");
+    }
+
+    // A6 (round-13 review): case-insensitive duplicate config keys are ONE
+    // canonical header on the wire — keys sorted, the LAST same-name key
+    // wins (deterministic stand-in for Go's random map-iteration winner);
+    // never two lines. Backend-sent lines under either spelling are dropped
+    // with their folded continuations.
+    #[tokio::test]
+    async fn injector_config_case_duplicate_keys_emit_single_line() {
+        use tokio::io::AsyncWriteExt;
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Custom".to_string(), "first".to_string());
+        headers.insert("x-custom".to_string(), "second".to_string());
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
+        inner_w
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nX-Custom: backend\r\n  backend-fold\r\nContent-Length: 2\r\n\r\nok",
+            )
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+        let out = injector_read_all(&mut injector).await;
+        let s = String::from_utf8_lossy(&out);
+        let custom_lines: Vec<&str> = s
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("x-custom:"))
+            .collect();
+        assert_eq!(
+            custom_lines.len(),
+            1,
+            "exactly one X-Custom line on the wire, got: {s:?}"
+        );
+        // Sorted ascending, "X-Custom" < "x-custom" (uppercase first) — the
+        // later key wins deterministically.
+        assert_eq!(custom_lines[0], "x-custom: second", "got: {s:?}");
+        assert!(
+            !s.contains("backend"),
+            "backend value must be dropped: {s:?}"
+        );
+        assert!(
+            !s.contains("backend-fold"),
+            "fold must go with its parent: {s:?}"
+        );
+        assert!(s.ends_with("ok"), "body must survive: {s:?}");
+    }
+
+    // B1 (round-13 review): a backend header whose lowercase spelling
+    // matches a configured key is dropped WITH its obs-fold tail; the
+    // configured value goes out alone.
+    #[tokio::test]
+    async fn injector_drops_lowercase_backend_header_under_config_key() {
+        use tokio::io::AsyncWriteExt;
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Frame-Options".to_string(), "DENY".to_string());
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
+        inner_w
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nx-frame-options: SAMEORIGIN\r\n  folded-tail\r\nContent-Length: 2\r\n\r\nok",
+            )
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+        let out = injector_read_all(&mut injector).await;
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("X-Frame-Options: DENY\r\n"),
+            "configured value must be injected, got: {s:?}"
+        );
+        assert!(
+            !s.contains("SAMEORIGIN"),
+            "backend value must be dropped: {s:?}"
+        );
+        assert!(
+            !s.contains("folded-tail"),
+            "fold tail must go with its parent: {s:?}"
+        );
+        assert!(s.ends_with("ok"), "body must survive: {s:?}");
+    }
+
+    // B6 (round-13 review): a raw interim head, then a TRUNCATED second
+    // head ("HTTP/1.1 20" cut mid-code) followed by EOF — the interim goes
+    // out raw, the partial goes out raw, clean EOF, and nothing is ever
+    // injected.
+    #[tokio::test]
+    async fn injector_truncated_second_head_after_interim_served_raw() {
+        use tokio::io::AsyncWriteExt;
+        let headers = || {
+            let mut h = std::collections::HashMap::new();
+            h.insert("X-Injected".to_string(), String::from("yes"));
+            h
+        };
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers(), None);
+        inner_w
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 20")
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(
+            &out[..],
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 20",
+            "interim + truncated head must pass through byte-exact, uninjected"
+        );
+    }
+
+    // B7 (round-13 review): a head whose FIRST line is blank (no status
+    // line) after an interim raw serve fails the read like Go's reverse
+    // proxy — it must not be spliced into a plausible response.
+    #[tokio::test]
+    async fn injector_blank_line_head_after_interim_is_invalid() {
+        use tokio::io::AsyncWriteExt;
+        let headers = || {
+            let mut h = std::collections::HashMap::new();
+            h.insert("X-Injected".to_string(), String::from("yes"));
+            h
+        };
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers(), None);
+        inner_w
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n\r\n200 OK\r\n\r\n")
+            .await
+            .expect("write");
+        let mut buf = [0u8; 4096];
+        let n = injector.read(&mut buf).await.expect("interim read");
+        assert_eq!(&buf[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
+        let err = injector
+            .read(&mut buf)
+            .await
+            .expect_err("blank-first-line head must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
