@@ -455,6 +455,22 @@ pub async fn run_tcpmux_listener(
                 return;
             }
 
+            // FIX 4 (audit round 14): the textproto ReadMIMEHeader parse
+            // shapes Go's readHTTPConnectRequest fails on — first header
+            // line opening with SP/HTAB, a colonless group-first line,
+            // non-token non-space name bytes, CTL/DEL in a value (obs-fold
+            // continuations exempt from the colon rule, space-names legal).
+            // Each is a Go http.ReadRequest error → vhost handle closes
+            // with ZERO bytes (probes vs go1.25 + Go frp v0.71.0) — the
+            // same silent close as the CONNECT-gate and dup-Host arms
+            // above. The head had a terminator (read_http_headers) and a
+            // single Host line (dup arm), so obs-fold groups here are
+            // well-formed.
+            if !validate_connect_head_shape(&request_text) {
+                warn!(peer = %peer, "TCPMux: malformed CONNECT head from {} (closing silently)", peer);
+                return;
+            }
+
             debug!(
                 target = %target, host = %host, peer = %peer,
                 "TCPMux CONNECT target='{}' host='{}' from {}",
@@ -946,6 +962,123 @@ fn extract_proxy_auth(request: &str) -> Option<(String, String)> {
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;
     Some((user.to_string(), pwd.to_string()))
+}
+
+/// RFC 7230 tchar (ALPHA / DIGIT / "!#$%&'*+-.^_`|~") — Go textproto
+/// `validHeaderFieldByte` / httpguts `ValidHeaderFieldName` byte set,
+/// shared by the method gate and header field names. 0x80+ obs-text is
+/// never tchar; a lossy-converted head (U+FFFD = EF BF BD) rejects an
+/// obs-text name exactly like Go.
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// textproto `validHeaderValueByte` complement: a value byte is a parse
+/// error when it is a CTL other than HTAB (< 0x20, != 0x09) or DEL (0x7f).
+/// obs-text (0x80+) is legal.
+fn is_bad_value_byte(b: u8) -> bool {
+    (b < b' ' && b != b'\t') || b == 0x7f
+}
+
+/// FIX 4 (audit round 14): the textproto `ReadMIMEHeader` parse-error
+/// shapes behind Go's tcpmux path — pkg/util/tcpmux/httpconnect.go reads
+/// the CONNECT request with `http.ReadRequest`, and a parse error reaches
+/// vhost handle as `_ = c.Close()`: a silent ZERO-byte close (probe vs
+/// go1.25 `http.ReadRequest`, every shape below → err; probes vs Go
+/// v0.71.0 tcpmux: the same zero bytes on the wire as the other
+/// malformed-head closes in this accept loop). Returns false → the caller
+/// closes silently.
+///
+/// 1. The FIRST header line opens with SP/HTAB — textproto's "malformed
+///    MIME header initial line" (a fold with no header to continue).
+/// 2. Any group-first header line without a colon — "malformed MIME
+///    header: missing colon". obs-fold continuation lines (SP/HTAB
+///    leading) are EXEMPT: they merge into the previous header's value
+///    and need no colon of their own.
+/// 3. A header NAME byte that is neither tchar nor SPACE, or an empty
+///    name (": x") — textproto `canonicalMIMEHeaderKey` accepts SPACE in
+///    a name without canonicalizing (go.dev/issue/34540), so
+///    "Bad Name: x" parses OK exactly like Go, while a paren/tab/DEL/
+///    obs-text name byte errors.
+/// 4. CTL (< 0x20 except HTAB) or DEL (0x7f) in any header VALUE — Go
+///    checks the obs-fold-MERGED line, so fold continuation bytes face
+///    the same check (probe: CTL inside a fold → err); the leading SP
+///    the merge inserts is legal. obs-text values pass (probe: OK).
+///    Go TrimSpaces every physical line before the merge, so the scan
+///    runs on the tail-trimmed first-line value and the fully trimmed
+///    fold contents — only whitespace can be trimmed away, never an
+///    interior CTL byte.
+fn validate_connect_head_shape(request: &str) -> bool {
+    // Skip the request line itself (`nth(1)`, keeping the plain `Lines`
+    // iterator type for the shared group validator below).
+    let mut lines = request.lines();
+    let Some(first_header) = lines.nth(1) else {
+        return true;
+    };
+    let mut lines = lines.peekable();
+    // Shape 1: the first header line must not open with SP/HTAB. A
+    // CONNECT head with NO header lines at all is legal (ReadRequest OK).
+    if first_header.starts_with(' ') || first_header.starts_with('\t') {
+        return false;
+    }
+    if !valid_connect_header_group(first_header, &mut lines) {
+        return false;
+    }
+    // Every later group-first line is non-fold by construction (folds are
+    // consumed inside valid_connect_header_group).
+    while let Some(first) = lines.next() {
+        if !valid_connect_header_group(first, &mut lines) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate one header group starting at a non-fold line, consuming its
+/// obs-fold continuations. Shapes 2-4 of the FIX 4 comment above.
+fn valid_connect_header_group(
+    first: &str,
+    lines: &mut std::iter::Peekable<std::str::Lines<'_>>,
+) -> bool {
+    // Shape 2: group-first lines must carry a colon (mustHaveFieldNameColon
+    // — the fold-merge validation runs on the FIRST physical line only).
+    let Some(colon) = first.find(':') else {
+        return false;
+    };
+    let name = &first[..colon];
+    let value = &first[colon + 1..];
+    // Shape 3: name bytes — empty or non-(tchar|SP) → error.
+    let name_bytes = name.as_bytes();
+    if name_bytes.is_empty() || name_bytes.iter().any(|b| !is_token_byte(*b) && *b != b' ') {
+        return false;
+    }
+    // Shape 4: CTL/DEL in the merged value (first line + folds). The
+    // fold-merge inserts a SP before each continuation (" " + TrimSpace
+    // per fold, readContinuedLineSlice).
+    let mut value_has_ctl = value.trim_end().bytes().any(is_bad_value_byte);
+    while let Some(fold) = lines.next_if(|l| l.starts_with(' ') || l.starts_with('\t')) {
+        if fold.trim().bytes().any(is_bad_value_byte) {
+            value_has_ctl = true;
+        }
+    }
+    !value_has_ctl
 }
 
 #[cfg(test)]
@@ -1958,5 +2091,64 @@ mod tests {
             .lookup("x.shared.example.com", "")
             .await
             .is_some_and(|r| r.proxy_name == "p2"));
+    }
+
+    /// FIX 4: the textproto ReadMIMEHeader parse-error shapes that make Go
+    /// http.ReadRequest fail (probes vs go1.25: every shape below ERR,
+    /// obs-fold and space-names OK). A false return closes the tcpmux conn
+    /// with ZERO bytes — Go's readHTTPConnectRequest error path.
+    #[test]
+    fn test_validate_connect_head_shape_textproto_errors() {
+        // Clean CONNECT head — valid.
+        assert!(validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nHost: a.com\r\nProxy-Authorization: Basic Zm9vOmJhcg==\r\n\r\n"
+        ));
+        // No headers at all is legal (blank line right after the line).
+        assert!(validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\n\r\n"
+        ));
+        // Shape 1: first header line opens with SP or HTAB → err.
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\n Host: a.com\r\n\r\n"
+        ));
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\n\tHost: a.com\r\n\r\n"
+        ));
+        // Shape 2: group-first line without a colon → err; an obs-fold
+        // continuation after a real header is exempt and merges.
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: v\r\nNoColonHere\r\n\r\n"
+        ));
+        assert!(validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: v\r\n folded cont\r\nY: 2\r\n\r\n"
+        ));
+        // Shape 3: name bytes — paren/tab/DEL/obs-text/empty name → err;
+        // a SPACE in the name is legal (go.dev/issue/34540).
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nBad(Name: x\r\n\r\n"
+        ));
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nBad\tName: x\r\n\r\n"
+        ));
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\n: x\r\n\r\n"
+        ));
+        assert!(validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nBad Name: x\r\n\r\n"
+        ));
+        // Shape 4: CTL/DEL in a value → err, including inside an obs-fold
+        // (Go checks the merged line); obs-text values pass.
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: a\x01b\r\n\r\n"
+        ));
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: a\x7fb\r\n\r\n"
+        ));
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: v\r\n\tfolded\x01c\r\n\r\n"
+        ));
+        assert!(validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: aé b\r\n\r\n"
+        ));
     }
 }

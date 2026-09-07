@@ -545,7 +545,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                     // Guard against memory exhaustion from backends that
                     // never terminate the head with a blank line (the cap
                     // still bounds a backend that sends no blank line at
-                    // all, whatever EOL convention it uses).
+                    // all, whatever EOL convention it uses). Documented
+                    // Rust hardening divergence: Go's cap is the 10 MiB
+                    // `maxResponseHeaderBytes` default
+                    // (transport.go:2108-2113) — a backend head between
+                    // 64 KiB and 10 MiB is answered 404 by frp-rs (bridge
+                    // Err-arm InvalidData → NotFoundResponse, Go
+                    // ErrorHandler parity) where Go would forward it.
                     if this.buffer.len() + n > 65536 {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1492,12 +1498,24 @@ async fn run_work_bridge(
         .as_ref()
         .and_then(|p| p.bandwidth_limiter.clone());
 
-    // The response-header injector only fires for PLAIN-HTTP proxies
-    // (`proxy_type == "http"`, NOT `starts_with("http")`) with configured
-    // headers; clone the HashMap at bridge time instead of deep-cloning it
-    // into every pending request at enqueue time. Uses the resolved
-    // metadata (bridge-time re-fetch when the enqueue-time snapshot was
-    // None).
+    // The response-header injector runs for EVERY plain-HTTP non-CONNECT
+    // leg (`proxy_type == "http"`, NOT `starts_with("http")`); clone the
+    // HashMap at bridge time instead of deep-cloning it into every pending
+    // request at enqueue time. Uses the resolved metadata (bridge-time
+    // re-fetch when the enqueue-time snapshot was None).
+    //
+    // The empty-map case is deliberate: when
+    // `response_headers` is not configured the injector carries NO headers
+    // and is a pure deadline-only pass-through — splice no-ops over the
+    // empty map, the head is copied verbatim, and the response bytes are
+    // byte-identical to the injector-less bridge. But the leg still gets Go
+    // ResponseHeaderTimeout parity: the injector's absolute deadline
+    // (armed at construction, never extended by interim 1xx) must run for
+    // http non-CONNECT legs even with no headers configured — Go's
+    // ReverseProxy arms ResponseHeaderTimeoutS from the transport config,
+    // independent of any ModifyResponse. Routing these legs through the
+    // injector also removes the duplicate one-shot first-read timeout in
+    // the frp-core bridge (see the injector arms below).
     //
     // The two exclusions mirror Go v0.71.0 exactly:
     //   * https tunnels: HTTPSProxyConfig (pkg/config/v1/proxy.go:369) has
@@ -1505,15 +1523,15 @@ async fn run_work_bridge(
     //     https proxy is silently dropped by Go, and the bridge here sees
     //     raw TLS bytes anyway (injecting would corrupt the ciphertext).
     //   * CONNECT tunnels on an http proxy: Go's connectHandler joins raw
-    //     (http.go:282-285) — no host rewrite, no ModifyResponse — so the
-    //     injector must not splice into the tunnel stream. `request_is_connect`
+    //     (http.go:282-285) — no host rewrite, no ModifyResponse, no
+    //     ResponseHeaderTimeout — so the injector must not splice into the
+    //     tunnel stream nor arm a head deadline on it. `request_is_connect`
     //     is set by the two vhost HTTP send sites (h1 + h2c) and rides the
     //     PendingRequest, including across run_id group forwarders.
     let injector_headers = proxy_info
         .as_ref()
         .filter(|p| p.proxy_type == "http" && !req.request_is_connect)
-        .map(|p| p.response_headers.clone())
-        .filter(|h| !h.is_empty());
+        .map(|p| p.response_headers.clone());
 
     // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
     // which writes them through the CipherWriter (matching Go frp streaming CFB).
@@ -1556,6 +1574,13 @@ async fn run_work_bridge(
                 decrypted
             };
             let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+            // The injector owns the absolute response-head deadline (armed
+            // at construction above); the frp-core bridge gets NO one-shot
+            // header_timeout here — a duplicate would consume on the first
+            // read (an interim 100 already served raw would burn it, and a
+            // backend stalling after interim bytes would park the bridge
+            // task + conns forever). The injector's TimedOut errors through
+            // the bridge Err arm into the Go-shaped 504.
             frp_core::bridge::bridge_encrypted_decompressed_read(
                 u_r,
                 u_w,
@@ -1566,7 +1591,7 @@ async fn run_work_bridge(
                 req.pre_read,
                 bw_limiter.as_ref(),
                 Some(metrics.clone()),
-                header_timeout,
+                None,
             )
             .await;
             // Matches the original inline closure: the injector path skips
@@ -1657,6 +1682,9 @@ async fn run_work_bridge(
                     w_r
                 };
                 let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                // No one-shot header_timeout to the bridge: the injector
+                // owns the absolute response-head deadline (see the
+                // encrypted arm above).
                 frp_core::bridge::bridge_plain_rate_limited_decompressed_read(
                     u_r,
                     u_w,
@@ -1666,7 +1694,7 @@ async fn run_work_bridge(
                     bridge_pre_read,
                     bw_limiter.as_ref(),
                     Some(metrics.clone()),
-                    header_timeout,
+                    None,
                 )
                 .await;
             } else {
@@ -1716,6 +1744,9 @@ async fn run_work_bridge(
                     w_r
                 };
                 let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                // No one-shot header_timeout to the bridge: the injector
+                // owns the absolute response-head deadline (see the
+                // encrypted arm above).
                 frp_core::bridge::bridge_plain_decompressed_read(
                     u_r,
                     u_w,
@@ -1724,7 +1755,7 @@ async fn run_work_bridge(
                     comp_key,
                     bridge_pre_read,
                     Some(metrics.clone()),
-                    header_timeout,
+                    None,
                 )
                 .await;
             } else {
@@ -2152,12 +2183,20 @@ pub(crate) async fn assign_work_to_proxy(
 
     // HTTP vhost backend response-header timeout (Go frp compat:
     // VhostHTTPTimeout drives httputil.ReverseProxy.ResponseHeaderTimeoutS).
-    // Only HTTP-family proxies get the timeout; TCP/STCP/XTCP bridges have no
-    // such semantic. 0 (unset) disables the timeout, matching Go where the
-    // ReverseProxy transport never arms a header deadline.
+    // Exactly `proxy_type == "http"` on a NON-CONNECT request — the two
+    // gates mirror Go v0.71.0's vhost architecture:
+    //   * CONNECT: http.go:229-234 + 282-285 route CONNECT to
+    //     connectHandler, which hijacks the conn and joins raw — the
+    //     ReverseProxy transport (and with it ResponseHeaderTimeout) never
+    //     arms, and the server never answers 504 on a silent backend.
+    //   * https tunnels: the HTTPS Muxer's registryRouter serves raw TLS
+    //     bytes (SNI routing only) — no ReverseProxy, no header deadline.
+    // TCP/STCP/XTCP bridges have no such semantic either. 0 (unset)
+    // disables the timeout, matching Go where the ReverseProxy transport
+    // never arms a header deadline.
     let header_timeout = if proxy_info
         .as_ref()
-        .is_some_and(|p| p.proxy_type.starts_with("http"))
+        .is_some_and(|p| p.proxy_type == "http" && !req.request_is_connect)
         && state.vhost_http_timeout > 0
     {
         Some(std::time::Duration::from_secs(state.vhost_http_timeout))
