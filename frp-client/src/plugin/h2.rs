@@ -458,8 +458,15 @@ async fn send_h2_error(
 /// `http.ReadResponse`): each line ends at the next `\n` with ONE trailing
 /// `\r` stripped, and the first empty line ends the head — so LF-only and
 /// mixed-EOL backends are legal, not just `\r\n\r\n`.
-async fn read_until_head(r: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+///
+/// `buf` seeds the read: after swallowing an interim 1xx head, the bytes
+/// past ITS terminator may already hold the final head (or its body) and
+/// must replay — the loop scans the seeded buffer before touching the
+/// stream (mirror of frp-server vhost_h2c's `read_until_head_from`).
+async fn read_until_head(
+    r: &mut (impl AsyncRead + Unpin),
+    mut buf: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
     let mut tmp = [0u8; 4096];
     loop {
         if frp_core::textproto::head_end(&buf).is_some() {
@@ -795,16 +802,50 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     r: &mut R,
     mut respond: SendResponse<Bytes>,
 ) -> Result<(), h2::Error> {
-    let head = match read_until_head(r).await {
-        Ok(h) => h,
-        Err(_e) => {
-            debug!("https plugin backend closed before response head, sending 502");
+    // Interim 1xx heads (100 Continue / 102 / 103) are swallowed and the
+    // read continues to the FINAL head — Go's Transport readResponse loop
+    // (go1.25 transport.go: `for` over readResponse, 1xx and 101 excluded
+    // from `resp`; the old code forwarded the first 1xx head as THE
+    // response, truncating every real response a backend sends after an
+    // interim). 101 Switching Protocols is NOT swallowable: h2 has no raw
+    // 101 representation (an upgrade handshake cannot map onto an h2
+    // stream — a 101 forwarded as an h2 response is a protocol error that
+    // would kill the whole h2 session), so a backend 101 answers 502 and
+    // the stream ends (mirror of frp-server vhost_h2c's GOAWAY-rationale
+    // handling). Read errors between heads are 502s like a missing first
+    // head (Go: the RoundTrip error mid-1xx-loop is a transport error).
+    let mut seed: Vec<u8> = Vec::new();
+    let (head, parsed) = loop {
+        let head = match read_until_head(r, seed).await {
+            Ok(h) => h,
+            Err(_e) => {
+                debug!("https plugin backend closed before response head, sending 502");
+                return send_h2_error(respond, 502, &[], Bytes::new()).await;
+            }
+        };
+        let Some(parsed) = parse_response_head(&head) else {
+            debug!("https plugin backend sent a malformed response head, sending 502");
             return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        };
+        if (100..=199).contains(&parsed.status) {
+            if parsed.status == 101 {
+                debug!(
+                    "https plugin backend sent 101 Switching Protocols, sending 502 \
+                     (h2 cannot represent a raw 101 upgrade)"
+                );
+                return send_h2_error(respond, 502, &[], Bytes::new()).await;
+            }
+            debug!(
+                status = parsed.status,
+                "https plugin backend sent an interim 1xx, reading on to the final head"
+            );
+            // Bytes past the interim head's terminator may already hold the
+            // final head — replay them (the seed's head_end scan must not
+            // lose them).
+            seed = head[parsed.body_offset..].to_vec();
+            continue;
         }
-    };
-    let Some(parsed) = parse_response_head(&head) else {
-        debug!("https plugin backend sent a malformed response head, sending 502");
-        return send_h2_error(respond, 502, &[], Bytes::new()).await;
+        break (head, parsed);
     };
     let ParsedHead {
         status,
@@ -882,8 +923,11 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
 mod tests {
     use super::{
         build_http1_request_head, cap_chunk, header_value, parse_hex, parse_response_head,
+        serve_h2_connection, Backend,
     };
     use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn parse_hex_rejects_go_invalid_chunk_sizes() {
@@ -1133,6 +1177,179 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "3"
+        );
+    }
+
+    // --- Audit FIX 2: interim 1xx heads are swallowed, the FINAL head is
+    // the h2 response (Go Transport readResponse loop parity). Harness: a
+    // scripted HTTP/1.1 backend + serve_h2_connection on one duplex end + a
+    // real h2 client on the other — the full h2 path the plugins serve.
+
+    /// Scripted backend: accept one conn, drain the forwarded request head,
+    /// then emit `staged` byte chunks with `delay_ms` between them; the conn
+    /// drops when the script ends.
+    fn spawn_scripted_backend(
+        listener: TcpListener,
+        staged: Vec<Vec<u8>>,
+        delay_ms: u64,
+    ) -> std::net::SocketAddr {
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut conn, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            // Drain the request head the plugin forwards (the backend then
+            // behaves like a server that read before replying).
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf).await;
+            for (i, chunk) in staged.iter().enumerate() {
+                if conn.write_all(chunk).await.is_err() {
+                    return;
+                }
+                if i + 1 < staged.len() && delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+            // conn drops here — the scripted end.
+        });
+        addr
+    }
+
+    /// One request/response round through the real h2 plugin chain. Returns
+    /// (status, body bytes).
+    async fn h2_round_trip(backend_addr: std::net::SocketAddr) -> (http::StatusCode, Vec<u8>) {
+        let (client_io, plugin_io) = tokio::io::duplex(1 << 17);
+        let backend_host = backend_addr.ip().to_string();
+        let backend_port = backend_addr.port();
+        tokio::spawn(async move {
+            let _ = serve_h2_connection(
+                plugin_io,
+                String::new(),
+                String::new(),
+                HashMap::new(),
+                Backend::Plain {
+                    host: backend_host,
+                    port: backend_port,
+                },
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await;
+        });
+        let (mut send_request, connection) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/probe")
+            .body(())
+            .unwrap();
+        let (response, _) = send_request.send_request(req, true).unwrap();
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(5), response).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => panic!("h2 request failed: {e}"),
+            Err(_) => panic!("h2 request timed out"),
+        };
+        let status = resp.status();
+        let mut body = resp.into_body();
+        let mut out = Vec::new();
+        while let Some(Ok(d)) = body.data().await {
+            out.extend_from_slice(&d);
+        }
+        (status, out)
+    }
+
+    #[tokio::test]
+    async fn h2_backend_1xx_then_final_same_write_serves_final() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        // Interim head + final head + body in ONE backend write: the
+        // leftover-bytes-after-interim seed path (the final head must
+        // replay from the seeded buffer, not be lost).
+        let addr = spawn_scripted_backend(
+            listener,
+            vec![b"HTTP/1.1 100 Continue\r\n\r\n\
+                  HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+                .to_vec()],
+            0,
+        );
+        let (status, body) = h2_round_trip(addr).await;
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn h2_backend_interim_1xx_split_writes_serves_final() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        // 103 head, then (separate write, real delay) the final head — the
+        // empty-seed second read path.
+        let addr = spawn_scripted_backend(
+            listener,
+            vec![
+                b"HTTP/1.1 103 Early Hints\r\nLink: </x.css>; rel=preload\r\n\r\n".to_vec(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye".to_vec(),
+            ],
+            100,
+        );
+        let (status, body) = h2_round_trip(addr).await;
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(body, b"bye");
+    }
+
+    #[tokio::test]
+    async fn h2_backend_101_answers_502() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let addr = spawn_scripted_backend(
+            listener,
+            vec![
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                    .to_vec(),
+            ],
+            0,
+        );
+        let (status, body) = h2_round_trip(addr).await;
+        assert_eq!(status, http::StatusCode::BAD_GATEWAY);
+        assert!(body.is_empty(), "101 must answer 502, body: {body:?}");
+    }
+
+    #[tokio::test]
+    async fn h2_backend_close_after_1xx_answers_502() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        // 100 head then the backend dies before the final head: the read
+        // error mid-1xx-loop is a transport error — 502 (Go RoundTrip
+        // semantics; the old code would have delivered the 100 to the
+        // client as the response).
+        let addr =
+            spawn_scripted_backend(listener, vec![b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()], 0);
+        let (status, body) = h2_round_trip(addr).await;
+        assert_eq!(status, http::StatusCode::BAD_GATEWAY);
+        assert!(
+            body.is_empty(),
+            "backend-death-after-1xx must answer 502, body: {body:?}"
         );
     }
 }

@@ -600,6 +600,56 @@ fn parse_content_length_value(value: &str) -> Result<Option<usize>, String> {
     Ok(Some(n as usize))
 }
 
+/// Go `ParseHTTPVersion` (net/http/request.go, go1.25) restricted to
+/// major 1. ParseHTTPVersion is NOT an exact-match switch: HTTP/1.0 and
+/// HTTP/1.1 short-circuit, but every other version parses when it is
+/// exactly 8 chars "HTTP/X.Y" with single ASCII digits (HTTP/1.2 ..
+/// HTTP/9.9 all parse — verified against the go1.25.0 stdlib). The major-1
+/// restriction mirrors where the frpc plugins sit in the stack: the frps
+/// vhost front 505s every request whose version token is not HTTP/1.x (Go
+/// conn.readRequest's http1ServerSupportsRequest), and Go's plugin arms
+/// serve/tunnel every parseable 1.x (non-CONNECT: `ProtoMajor == 1` passes
+/// the supports-request gate; CONNECT: `http.ReadRequest` accepts the token
+/// and the tunnel ignores the minor). Rejecting HTTP/1.2..1.9 closed conns
+/// that Go forwards; malformed shapes and major != 1 tokens still reject.
+/// (Moved here from plugin/http.rs when the request-line parser became
+/// shared — audit round: strict request-line parse across the h1 plugins.)
+pub(super) fn go_parse_http_version_ok(version: &str) -> bool {
+    match version {
+        "HTTP/1.0" | "HTTP/1.1" => true,
+        _ => {
+            let b = version.as_bytes();
+            b.len() == 8
+                && b.starts_with(b"HTTP/")
+                && b[5] == b'1'
+                && b[6] == b'.'
+                && b[7].is_ascii_digit()
+        }
+    }
+}
+
+/// Strict HTTP request-line parse shared by every HTTP/1.1 plugin inbound
+/// path. Go net/http parseRequestLine splits on literal SPACE only (two
+/// `Cut(line, " ")`), so every other whitespace run — a tab-separated
+/// "GET\tURL\tHTTP/1.1" in particular — never yields the required second
+/// space and the whole line is malformed (ReadRequest error). Returns
+/// (method, request-target, version) when the line has exactly three
+/// non-empty space-separated parts and the version token passes
+/// [`go_parse_http_version_ok`] (request-side Go ParseHTTPVersion
+/// semantics). The old split_whitespace collapsed every whitespace run, so
+/// tab-joined tokens parsed and multi-space request lines were forwarded —
+/// accept-where-Go-rejects.
+pub(super) fn parse_request_line(line: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = line.splitn(3, ' ');
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if method.is_empty() || target.is_empty() || !go_parse_http_version_ok(version) {
+        return None;
+    }
+    Some((method, target, version))
+}
+
 /// Read an HTTP request head from `stream` (chunked until the first empty
 /// line — Go textproto semantics, LF-only and mixed-EOL heads legal — with
 /// the 64 KiB cap), parse the request line, and build the forwarded HTTP/1.1
@@ -678,14 +728,15 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     let headers_str = String::from_utf8_lossy(&buf[..header_end]);
     let mut lines = headers_str.lines();
 
-    // Parse request line: METHOD URL HTTP/1.x
+    // Parse request line: METHOD URL HTTP/1.x — strict Go parseRequestLine
+    // semantics via the shared helper (literal-space splitn(3), every part
+    // non-empty, version token a parseable request-side HTTP/1.x). A
+    // malformed line fails the read here — this arm's failure handling
+    // (silent close) is unchanged.
     let request_line = lines.next().ok_or("empty request")?;
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
+    let Some((method, path, _version)) = parse_request_line(request_line) else {
         return Err(format!("bad request line: {request_line}"));
-    }
-    let method = parts[0];
-    let path = parts[1];
+    };
 
     // Body framing is parsed from the original headers — Transfer-Encoding
     // is stripped below as hop-by-hop and re-added only when the request is
@@ -889,6 +940,50 @@ pub(super) const CHUNK_LINE_MAX: usize = 64 * 1024;
 /// unbounded (Go parity: a body may stream for the life of the connection).
 pub(super) const PLUGIN_HEADER_READ_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(60);
+
+/// Go http.Server generic error render — probe-captured byte-exact from
+/// go1.25.12 (net/http server.go: the fixed errorHeaders CT text/plain +
+/// Connection: close, status-text body, NO Content-Length, no trailing CRLF
+/// after the body). Used where the plugins render what Go's http.Server
+/// would for a malformed request head (audit: 400/431 arms).
+pub(super) const GO_400_RENDER: &str = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request";
+/// Same shape as [`GO_400_RENDER`], for request-header-block overflow (Go
+/// MaxHeaderBytes breach).
+pub(super) const GO_431_RENDER: &str = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large";
+/// Go `httputil.ReverseProxy` default backend-dial-failure render — the
+/// exact 47 bytes Go writes when a backend dial/TLS connect fails and no
+/// ErrorHandler is set (probe-captured: no Content-Type, no body).
+pub(super) const GO_502_RENDER: &str = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+/// Go `http.NotFound` render — probe-captured from go1.25.12 (CL-first
+/// repo order, Date omitted by convention; body is exactly
+/// "404 page not found\n").
+pub(super) const GO_404_NOT_FOUND_RENDER: &str = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 19\r\nConnection: close\r\n\r\n404 page not found\n";
+
+/// Write the Go ReverseProxy 502 render ([`GO_502_RENDER`]) to a peer, then
+/// return `Err(e)` — the 502 is the final byte on the connection (Go's
+/// ReverseProxy closes the client conn after the error response).
+pub(super) async fn write_go_502<W>(peer: &mut W, err: String) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let _ = peer
+        .write_all(GO_502_RENDER.as_bytes())
+        .await
+        .map_err(|e| format!("write 502: {e}"))?;
+    Err(err)
+}
+
+/// Whether a raw head buffer starts with an ASCII-case-insensitive
+/// "CONNECT" — mirrors Go http_proxy.go's arm split, which reads the FIRST
+/// 7 stream bytes via `io.ReadFull` and `strings.EqualFold`s them against
+/// "CONNECT" before any head parsing. Used to pick the CONNECT arm's
+/// failure behavior (silent close) when the head parse itself failed, and to
+/// classify a head read that breached the cap (http.rs; static_file.rs never
+/// sees CONNECT — Go gorilla's method gate for the FileServer route is
+/// GET-only).
+pub(super) fn head_starts_connect(buf: &[u8]) -> bool {
+    buf.len() >= 7 && buf[..7].eq_ignore_ascii_case(b"CONNECT")
+}
 
 /// Bound on a TLS listener handshake in the TLS-terminating plugins
 /// (tls2raw/https2http/https2https; audit round-8 F6). A peer that sends a
@@ -1207,7 +1302,15 @@ fn is_blank_line(b: &[u8]) -> bool {
     b.iter().all(|&c| matches!(c, b'\r' | b'\n' | b' ' | b'\t'))
 }
 
-/// Simple percent-decode (application/x-www-form-urlencoded style).
+/// Percent-decode of a URL PATH (audit round: '+' stays LITERAL). Go's
+/// URL decoding happens in url.Parse, where PlusToSpace is a query-only
+/// rule (net/url: `parseQuery` applies it, path decoding never does) — a
+/// request-target "/a+b" decodes to "/a+b", exactly like the raw bytes.
+/// The old x-www-form-urlencoded-style '+' → ' ' translation served "a b"
+/// when the client asked for the file "a+b". Only decode the percent
+/// escapes; every other byte (including '+' and '%' with no valid hex
+/// pair) passes through untouched, mirroring Go's lax path decoder
+/// (invalid escapes survive verbatim).
 pub(super) fn urlencoding_decode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -1222,10 +1325,6 @@ pub(super) fn urlencoding_decode(input: &str) -> String {
                     out.push('%');
                     i += 1;
                 }
-            }
-            b'+' => {
-                out.push(' ');
-                i += 1;
             }
             b => {
                 out.push(b as char);
@@ -1571,8 +1670,101 @@ mod tests {
         assert_eq!(urlencoding_decode("hello%20world"), "hello world");
         assert_eq!(urlencoding_decode("%2Fetc%2Fpasswd"), "/etc/passwd");
         assert_eq!(urlencoding_decode("noencoding"), "noencoding");
-        assert_eq!(urlencoding_decode("a+b"), "a b");
+        // '+' is LITERAL in path decoding — Go's PlusToSpace is query-only
+        // (url.Parse decodes paths without it). Flip: the old x-www-form
+        // behavior served "a b" for "/a+b".
+        assert_eq!(urlencoding_decode("a+b"), "a+b");
         assert_eq!(urlencoding_decode("%gg"), "%gg"); // invalid hex
+    }
+
+    /// Matrix for the shared request-side version gate — moved from
+    /// plugin/http.rs when the request-line parser became shared. Request
+    /// side: ParseHTTPVersion accepts every 8-char "HTTP/X.Y" with a single
+    /// ASCII digit (go1.25 request.go:817-838; "HTTP/1.0"/"HTTP/1.1"
+    /// short-circuit), and the plugin gate additionally requires major 1
+    /// (the frps vhost front 505s everything else — HTTP/2.0 tokens never
+    /// reach the plugin legs in either ecosystem).
+    #[test]
+    fn test_go_parse_http_version_ok_matrix() {
+        // Lenient-but-parseable: single-digit minor, majors 2..9 parse in
+        // Go ParseHTTPVersion but the major-1 gate rejects them.
+        assert!(go_parse_http_version_ok("HTTP/1.0"));
+        assert!(go_parse_http_version_ok("HTTP/1.1"));
+        assert!(go_parse_http_version_ok("HTTP/1.2"));
+        assert!(go_parse_http_version_ok("HTTP/1.9"));
+        assert!(!go_parse_http_version_ok("HTTP/2.0"));
+        assert!(!go_parse_http_version_ok("HTTP/3.0"));
+        assert!(!go_parse_http_version_ok("HTTP/9.9"));
+        // Malformed tokens.
+        assert!(!go_parse_http_version_ok("HTTP/1.10")); // 9 bytes
+        assert!(!go_parse_http_version_ok("HTTP/1.1 "));
+        assert!(!go_parse_http_version_ok("HTTP/.1"));
+        assert!(!go_parse_http_version_ok("http/1.1"));
+        assert!(!go_parse_http_version_ok(""));
+        assert!(!go_parse_http_version_ok("HTTP/1\t1"));
+        assert!(!go_parse_http_version_ok("HTTP/10.1"));
+        assert!(!go_parse_http_version_ok("HTTP/1.1."));
+    }
+
+    #[test]
+    fn test_parse_request_line() {
+        // Well-formed three-part lines.
+        assert_eq!(
+            parse_request_line("GET /path HTTP/1.1"),
+            Some(("GET", "/path", "HTTP/1.1"))
+        );
+        assert_eq!(
+            parse_request_line("CONNECT host:443 HTTP/1.1"),
+            Some(("CONNECT", "host:443", "HTTP/1.1"))
+        );
+        assert_eq!(
+            parse_request_line("GET /x HTTP/1.2"),
+            Some(("GET", "/x", "HTTP/1.2"))
+        );
+        // Go parseRequestLine: literal-space cuts only, so a 2-token line
+        // ("GET /x", HTTP/0.9-style — Go dropped the 0.9 fallback), a
+        // tab-joined "GET\t/x\tHTTP/1.1" (no literal second space), an empty
+        // version slot ("GET /x " — splitn finds nothing after the last
+        // space), and an empty target ("GET  HTTP/1.1") all malformed.
+        assert_eq!(parse_request_line("GET /x"), None);
+        assert_eq!(parse_request_line("GET\t/x\tHTTP/1.1"), None);
+        assert_eq!(parse_request_line("GET /x "), None);
+        assert_eq!(parse_request_line("GET  HTTP/1.1"), None);
+        assert_eq!(parse_request_line(" HTTP/1.1"), None);
+        // The two-Cut parse leaves the SECOND space as an empty slot:
+        // "GET  /x HTTP/1.1" → requestURI "" (Go: url.ParseRequestURI("")
+        // fails "empty url"), "GET /x  HTTP/1.1" → proto " HTTP/1.1"
+        // (leading space — ParseHTTPVersion fails). Both malformed in Go.
+        assert_eq!(parse_request_line("GET  /x HTTP/1.1"), None);
+        assert_eq!(parse_request_line("GET /x  HTTP/1.1"), None);
+        // Version gate.
+        assert_eq!(parse_request_line("GET /x HTTP/2.0"), None);
+        assert_eq!(parse_request_line("GET /x garbage"), None);
+        assert_eq!(parse_request_line("GET /x HTTP/1.1 trailing"), None);
+        assert_eq!(parse_request_line(""), None);
+    }
+
+    #[test]
+    fn test_go_render_shapes() {
+        // Exact Go probe captures — any future edit to these renders changes
+        // the bytes peers see.
+        assert_eq!(
+            GO_502_RENDER,
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert_eq!(GO_502_RENDER.len(), 47);
+        assert!(!GO_400_RENDER.contains("Content-Length"));
+        assert!(GO_400_RENDER.ends_with("400 Bad Request"));
+        assert!(!GO_431_RENDER.contains("Content-Length"));
+        assert!(GO_431_RENDER.starts_with("HTTP/1.1 431 Request Header Fields Too Large"));
+        assert!(GO_404_NOT_FOUND_RENDER.ends_with("404 page not found\n"));
+        assert!(GO_404_NOT_FOUND_RENDER.contains("Content-Length: 19"));
+        assert!(!head_starts_connect(GO_400_RENDER.as_bytes()));
+        assert!(head_starts_connect(b"CONNECT host:443 HTTP/1.1"));
+        assert!(head_starts_connect(b"connect"));
+        assert!(head_starts_connect(b"Connect"));
+        assert!(!head_starts_connect(b"GET / HTTP/1.1"));
+        assert!(!head_starts_connect(b"CONNEC")); // 6 bytes: short of the 7-byte read
     }
 
     #[test]

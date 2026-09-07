@@ -73,13 +73,18 @@ pub fn create_visitor_conn_msg(
     // - Else if client user is non-empty: {user}.{server_name}
     // - Otherwise: {server_name}
     let proxy_name = visitor_wire_name(server_user, user, server_name);
+    // Go NewVisitorConn carries plain bools with `json:",omitempty"`
+    // (pkg/msg/msg.go:168-169) — false flags are ABSENT from the wire, not
+    // `"use_encryption":false`. Conditional-Some (same shape as
+    // `create_new_proxy_msg`) keeps the frp-rs wire byte-identical to Go
+    // frpc for off flags.
     FrpMessage::NewVisitorConn(msg::NewVisitorConn {
         proxy_name,
         sign_key,
         timestamp: Some(timestamp),
         run_id: run_id.map(|s| s.to_string()),
-        use_encryption: Some(use_encryption),
-        use_compression: Some(use_compression),
+        use_encryption: if use_encryption { Some(true) } else { None },
+        use_compression: if use_compression { Some(true) } else { None },
     })
 }
 
@@ -784,6 +789,47 @@ mod tests {
                     sig.chars().all(|c| c.is_ascii_hexdigit()),
                     "all chars must be hex digits"
                 );
+            }
+            _ => panic!("expected NewVisitorConn variant"),
+        }
+    }
+
+    #[test]
+    fn test_create_visitor_conn_msg_omits_false_flags() {
+        // Go NewVisitorConn has `json:",omitempty"` bools (pkg/msg/msg.go
+        // 168-169): false flags are ABSENT from the wire, never
+        // `"use_encryption":false`. The builder must emit the
+        // conditional-Some shape (like create_new_proxy_msg), not
+        // unconditional Some(false).
+        let off = create_visitor_conn_msg("stcp-proxy", "", false, false, None, None, None);
+        match off {
+            FrpMessage::NewVisitorConn(ref nvc) => {
+                assert_eq!(
+                    nvc.use_encryption, None,
+                    "false use_encryption must be omitted from the wire"
+                );
+                assert_eq!(
+                    nvc.use_compression, None,
+                    "false use_compression must be omitted from the wire"
+                );
+            }
+            _ => panic!("expected NewVisitorConn variant"),
+        }
+        // On flags still serialize as Some(true).
+        let on = create_visitor_conn_msg("stcp-proxy", "", true, true, None, None, None);
+        match on {
+            FrpMessage::NewVisitorConn(ref nvc) => {
+                assert_eq!(nvc.use_encryption, Some(true));
+                assert_eq!(nvc.use_compression, Some(true));
+            }
+            _ => panic!("expected NewVisitorConn variant"),
+        }
+        // Mixed arm: only the on flag is Some.
+        let mixed = create_visitor_conn_msg("stcp-proxy", "", true, false, None, None, None);
+        match mixed {
+            FrpMessage::NewVisitorConn(ref nvc) => {
+                assert_eq!(nvc.use_encryption, Some(true));
+                assert_eq!(nvc.use_compression, None);
             }
             _ => panic!("expected NewVisitorConn variant"),
         }

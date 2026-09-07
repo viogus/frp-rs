@@ -260,6 +260,15 @@ struct SessionCtx {
     quic_conn: Option<std::sync::Arc<QuicConnection>>,
     /// Heartbeat ping interval, armed at login. None disables heartbeats.
     ping_interval: Option<tokio::time::Interval>,
+    /// Delay for the next heartbeat attempt after a ping whose auth setup
+    /// failed (OIDC token fetch / token source). None = no consecutive
+    /// failure in flight and the ping runs on the normal interval cadence.
+    /// When set, the ping arm re-arms `ping_interval` via
+    /// `Interval::reset_after(delay)` so the retry fires on Go frp's
+    /// exponential backoff schedule instead of the next interval tick
+    /// (client/control.go heartbeatWorker → wait.BackoffUntil). Cleared by
+    /// the next non-skipped ping attempt.
+    ping_retry_backoff: Option<Duration>,
     /// Last Pong receive time; the watchdog fires if no Pong arrives within
     /// heartbeat_timeout (also bounds the registration phase).
     last_pong: Instant,
@@ -677,6 +686,31 @@ fn reg_frame_payload_read(
             frp_core::protocol::deserialize_v1(hdr.v1_type, &payload)
         }
     })
+}
+
+/// Delay before the next heartbeat attempt after a consecutive
+/// auth-skipped ping, mirroring the Go frp v0.71.0 client heartbeat
+/// backoff exactly (client/control.go heartbeatWorker runs sendHeartBeat
+/// through wait.BackoffUntil with wait.FastBackoffOptions{
+/// InitDurationIfFail: 1s, Factor: 2, MaxDuration: heartbeat interval,
+/// Jitter: 0.1} — pkg/util/wait/backoff.go). Go's manager doubles
+/// InitDurationIfFail too (fastBackoffImpl: on the FIRST consecutive
+/// error, duration = InitDurationIfFail, then `duration * Factor`), so
+/// the retry sequence is 2s, 4s, 8s, … capped at the heartbeat interval
+/// — a long outage still probes at most every interval after reaching
+/// the cap. The 0.1 jitter is skipped (wire-invisible, and it exists
+/// only to desynchronize independent Go processes).
+///
+/// `prev` is the previous consecutive failure's delay; None means the
+/// last attempt succeeded (or no failure has happened yet) and this is
+/// the first failure of a streak.
+fn next_ping_backoff(prev: Option<Duration>, interval: Duration) -> Duration {
+    let next = match prev {
+        // First failure: InitDurationIfFail(1s) × Factor(2) = 2s.
+        None => Duration::from_secs(2),
+        Some(prev) => prev.saturating_mul(2),
+    };
+    next.min(interval)
 }
 
 impl Service {
@@ -1685,6 +1719,7 @@ impl Service {
             #[cfg(feature = "quic")]
             quic_conn,
             ping_interval,
+            ping_retry_backoff: None,
             last_pong,
             hb_timeout,
             hb_timeout_dur,
@@ -3283,6 +3318,21 @@ impl Service {
                         }
                     }
                     if skip_ping {
+                        // Go parity (client/control.go:253-265): a ping whose
+                        // auth setup failed is retried on a fast exponential
+                        // backoff instead of at the next interval tick — a
+                        // token outage is probed within ~2s, not after a full
+                        // heartbeat_interval (+watchdog). Go's
+                        // wait.BackoffUntil re-arms the ticker itself, so the
+                        // retry REPLACES the next interval tick: reset_after
+                        // points the existing interval at now + backoff. The
+                        // session stays up (skip, not teardown — a reconnect
+                        // is wasted when the control link is healthy).
+                        if let Some(interval) = ctx.ping_interval.as_mut() {
+                            let delay = next_ping_backoff(ctx.ping_retry_backoff, interval.period());
+                            ctx.ping_retry_backoff = Some(delay);
+                            interval.reset_after(delay);
+                        }
                         continue;
                     }
                     let ping = FrpMessage::Ping(ping_msg);
@@ -3292,6 +3342,12 @@ impl Service {
                     } else {
                         debug!("Ping sent");
                     }
+                    // A non-skipped attempt ends the failure streak (Go's
+                    // sendHeartBeat returns no error here — even a failed
+                    // Send is swallowed with `_ =`, so only auth failures
+                    // engage the backoff). The next attempt runs on the
+                    // interval cadence again.
+                    ctx.ping_retry_backoff = None;
                 }
 
                 _ = ctx
@@ -4843,6 +4899,48 @@ mod tests {
         assert!(!crate::backoff::heartbeat_requires_auth(&[], &unrelated));
     }
 
+    #[test]
+    fn heartbeat_ping_backoff_progression() {
+        // Mirror of the Go v0.71.0 client heartbeat backoff
+        // (client/control.go heartbeatWorker, wait.FastBackoffOptions
+        // InitDurationIfFail=1s Factor=2 MaxDuration=heartbeat interval):
+        // the FIRST consecutive failure re-arms at InitDurationIfFail ×
+        // Factor = 2s (fastBackoffImpl doubles the init too), then the
+        // delay doubles per consecutive failure, capped at the interval.
+        let interval = Duration::from_secs(10);
+        assert_eq!(
+            next_ping_backoff(None, interval),
+            Duration::from_secs(2),
+            "first failure of a streak re-arms at InitDurationIfFail(1s) x Factor(2)"
+        );
+        assert_eq!(
+            next_ping_backoff(Some(Duration::from_secs(2)), interval),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_ping_backoff(Some(Duration::from_secs(4)), interval),
+            Duration::from_secs(8)
+        );
+        // 16s would be the next doubling — capped at the interval so a long
+        // outage still probes at most every heartbeat_interval.
+        assert_eq!(
+            next_ping_backoff(Some(Duration::from_secs(8)), interval),
+            interval
+        );
+        assert_eq!(
+            next_ping_backoff(Some(interval), interval),
+            interval,
+            "cap holds at the interval"
+        );
+        // An interval shorter than the 2s init caps the very first retry
+        // (Go's MaxDuration clamp behaves identically).
+        let small = Duration::from_millis(500);
+        assert_eq!(next_ping_backoff(None, small), small);
+        // A success ends the streak (the ping arm clears the state): the
+        // next failure restarts at 2s again.
+        assert_eq!(next_ping_backoff(None, interval), Duration::from_secs(2));
+    }
+
     #[cfg(feature = "vnet")]
     #[test]
     fn virtual_net_visitor_route_advertisement() {
@@ -5616,6 +5714,7 @@ mod tests {
             #[cfg(feature = "quic")]
             quic_conn: None,
             ping_interval: None,
+            ping_retry_backoff: None,
             last_pong: Instant::now(),
             hb_timeout: 30,
             hb_timeout_dur: Duration::from_secs(30),
@@ -5749,6 +5848,7 @@ mod tests {
             #[cfg(feature = "quic")]
             quic_conn: None,
             ping_interval: None,
+            ping_retry_backoff: None,
             last_pong: Instant::now(),
             hb_timeout: 30,
             hb_timeout_dur: Duration::from_secs(30),
@@ -5870,6 +5970,7 @@ mod tests {
             #[cfg(feature = "quic")]
             quic_conn: None,
             ping_interval: None,
+            ping_retry_backoff: None,
             last_pong: Instant::now(),
             hb_timeout: 30,
             hb_timeout_dur: Duration::from_secs(30),
