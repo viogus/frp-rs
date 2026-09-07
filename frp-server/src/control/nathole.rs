@@ -469,13 +469,15 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     let transaction_id = nhv.transaction_id.clone();
     let proxy_name = nhv.proxy_name.clone();
 
-    // Validate proxy exists and capture info for auth
+    // Validate proxy exists and capture info for auth. Go checks
+    // proxy-exists in BOTH branches with the same literal — precheck
+    // (controller.go:159) and full path (:187).
     let proxy_info = match ctx.state.proxy_manager.get(&proxy_name).await {
         Some(info) => info,
         None => {
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
-                error: Some("proxy not found".into()),
+                error: Some(format!("xtcp server for [{proxy_name}] doesn't exist")),
                 ..Default::default()
             }));
             // Write failure — peer disconnected, non-recoverable at this point
@@ -484,39 +486,35 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         }
     };
 
-    // --- Auth: verify visitor is authorized to access this proxy ---
-    // Go frp v0.70 allowUsers semantics:
-    //   - Empty: only the proxy owner can be a visitor
-    //   - ["*"]: all authenticated users
-    //   - Specific list: only those users
-    // Auth is enforced BEFORE pre_check response so Go frp's
-    // pre_check permission model is preserved.
-
-    if !crate::handlers::visitor_user_allowed(login_user, &proxy_info.user, &proxy_info.allow_users)
-    {
-        let error = if proxy_info.allow_users.is_empty() {
-            let owner = &proxy_info.user;
-            warn!(proxy_name = %proxy_name, user = %login_user, owner = %owner, "NatHoleVisitor: user '{}' not proxy owner '{}' for proxy '{}'", login_user, owner, proxy_name);
-            "access denied: owner only"
-        } else {
-            warn!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor: user '{}' not in allow_users for proxy '{}'", login_user, proxy_name);
-            "access denied"
-        };
-        let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
-            transaction_id: transaction_id.clone(),
-            error: Some(error.into()),
-            ..Default::default()
-        }));
-        // Write failure — peer disconnected, non-recoverable at this point
-        let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
-        return Ok(());
-    }
-
-    // Go frp v0.70 pre_check compat: validate proxy and permissions,
-    // return OK without sign_key/timestamp auth or creating a session.
-    // Must be BEFORE the sign_key block — precheck skips shared-secret auth.
-    // Go frp controller.go only checks m.PreCheck with no extra conditions.
+    // Go frp v0.71.0 pre_check compat (controller.go:154-167): the
+    // allow_users gate lives ONLY in the PreCheck branch. The full path
+    // (:169-194) verifies proxy-exists + sign key only — a full-path
+    // visitor holding the valid sk but outside allow_users is admitted
+    // (Go parity). Rust XTCP proxies normalize exactly like Go's
+    // registration (server/proxy/xtcp.go:58-62: empty allowUsers →
+    // [owner]); the pre_check response returns OK without sign_key/timestamp
+    // auth or session creation.
     if nhv.pre_check {
+        if !crate::handlers::visitor_user_allowed(
+            login_user,
+            &proxy_info.user,
+            &proxy_info.allow_users,
+        ) {
+            // Go controller.go:163: ONE literal for both the owner-only and
+            // the allow-list denial (Go's empty-allowUsers case was already
+            // normalized to [owner] at registration).
+            warn!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor pre_check denied for user '{}' on proxy '{}'", login_user, proxy_name);
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some(format!(
+                    "xtcp visitor user [{login_user}] not allowed for [{proxy_name}]"
+                )),
+                ..Default::default()
+            }));
+            // Write failure — peer disconnected, non-recoverable at this point
+            let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
+            return Ok(());
+        }
         debug!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
         let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),
@@ -528,12 +526,12 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         return Ok(());
     }
 
-    // Verify sign_key if the proxy has a shared secret.
-    // Uses constant-time comparison (verify_token) and timestamp
-    // freshness check to prevent timing side-channel and replay attacks.
-    // Token is verified before freshness so an unauthenticated caller cannot
-    // probe the freshness window, and a missing timestamp (0) skips the
-    // window entirely (legacy/Go clients may omit it).
+    // Full path: verify sign_key if the proxy has a shared secret (Go
+    // controller.go:189-191 — ConstantTimeEqString(m.SignKey,
+    // GetAuthKey(sk, ts)); the ONLY full-path checks are proxy-exists +
+    // sign key). Uses constant-time comparison (verify_token). A missing
+    // sign_key fails the Go equality just like a wrong one, so both arms
+    // carry the same Go literal.
     let sign_key = nhv.sign_key.as_deref().unwrap_or("");
     let timestamp = nhv.timestamp.unwrap_or(0);
     match proxy_info.sk.as_deref().filter(|s| !s.is_empty()) {
@@ -542,7 +540,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key for protected proxy '{}'", proxy_name);
                 let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                     transaction_id: transaction_id.clone(),
-                    error: Some("auth required".into()),
+                    error: Some(format!("xtcp connection of [{proxy_name}] auth failed")),
                     ..Default::default()
                 }));
                 // Write failure — peer disconnected, non-recoverable at this point
@@ -553,7 +551,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed on ctl for proxy '{}'", proxy_name);
                 let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                     transaction_id: transaction_id.clone(),
-                    error: Some("auth failed".into()),
+                    error: Some(format!("xtcp connection of [{proxy_name}] auth failed")),
                     ..Default::default()
                 }));
                 // Write failure — peer disconnected, non-recoverable at this point
@@ -563,6 +561,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             // Freshness only when the client sent a timestamp (a MISSING
             // timestamp skips the window for legacy/Go parity; a present
             // ts=0 is validated and rejected as stale).
+            //
+            // Rust-only hardening: Go controller.go:189-191 accepts any
+            // timestamp (ConstantTimeEqString only, no window); a
+            // clock-skewed Go frpc beyond authentication_timeout is rejected
+            // here but admitted by Go frps.
             if nhv.timestamp.is_some() {
                 let auth_timeout = ctx
                     .state
@@ -587,9 +590,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK (constant-time) on ctl for proxy '{}'", proxy_name);
         }
         None => {
-            // No sk configured — Go frp parity: admit the visitor (the
-            // owner/allow_users check above already ran). Warn when the
-            // proxy is open to anonymous frps clients.
+            // No sk configured — Go frp parity: admit the visitor. The
+            // allow_users gate applies to pre_check only (Go model above),
+            // so the full path admits any visitor who can name the proxy —
+            // matching Go, whose PreCheck branch is the only user check.
+            // Warn when the proxy is open to anonymous frps clients.
             if proxy_info.allow_users.is_empty() && proxy_info.user.is_empty() {
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' has no sk and no visitor authorization — anyone with frps access can connect (configure secret_key or allow_users)", proxy_name);
             }
@@ -600,6 +605,8 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     let provider_run_id = match ctx.state.proxy_manager.get_run_id(&proxy_name).await {
         Some(id) => id,
         None => {
+            // Rust-only arm — Go sends no response here (session timeout at
+            // controller.go:215-220).
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider offline".into()),
@@ -619,6 +626,8 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     let provider_ctl = match provider_ctl {
         Some(ctl) => ctl,
         None => {
+            // Rust-only arm — Go sends no response here (session timeout at
+            // controller.go:215-220).
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider disconnected".into()),

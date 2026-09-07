@@ -345,6 +345,21 @@ struct ProxiesQuery {
     proxy_type: String,
 }
 
+/// Query filters for GET /api/clients (Go v1 casing: `clientId`/`runId`).
+/// Mirrors Go `APIClientList` (`server/http/controller.go:94-97`) — each
+/// filter applies only when non-empty.
+#[derive(Deserialize, Default)]
+struct ClientsQuery {
+    #[serde(default)]
+    user: String,
+    #[serde(rename = "clientId", default)]
+    client_id: String,
+    #[serde(rename = "runId", default)]
+    run_id: String,
+    #[serde(default)]
+    status: String,
+}
+
 #[derive(Deserialize)]
 struct DeleteProxiesBody {
     #[serde(default)]
@@ -721,12 +736,37 @@ async fn handle_proxy_by_name(
     handle_proxy_detail(State(state), Path(name)).await
 }
 
-async fn handle_clients(State(state): State<Arc<AppState>>) -> Json<Vec<ClientEntry>> {
-    // Go compat: /api/clients lists the registry (online AND offline clients,
-    // with a pruning policy), not just the live control connections.
+/// GET /api/clients — Go `APIClientList` parity (`server/http/controller.go:
+/// 92-129`). Registry-backed (online AND offline clients, with a pruning
+/// policy). Query filters `user`/`clientId`/`runId`/`status` each apply only
+/// when non-empty; the clientId filter resolves against `ClientID()`
+/// (raw_client_id with run_id fallback, registry.go); the status filter is
+/// Go `matchStatusFilter` ("" / "all" / unknown → pass, online → Online only,
+/// offline → !Online only — note this DIFFERS from the v2
+/// `validate_status`, which 400s unknown values). Result sorted ascending by
+/// (User, ClientID, Key) like the Go slices.SortFunc.
+async fn handle_clients(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ClientsQuery>,
+) -> Json<Vec<ClientEntry>> {
     let registry = state.client_registry.list();
     let mut clients = Vec::with_capacity(registry.len());
     for info in registry {
+        // Go filter semantics: `info.ClientID()` (resolved raw-or-run id),
+        // `info.User`, `info.RunID` — case-sensitive; status lowercased on
+        // the query side only.
+        if !query.user.is_empty() && info.user != query.user {
+            continue;
+        }
+        if !query.client_id.is_empty() && info.client_id() != query.client_id {
+            continue;
+        }
+        if !query.run_id.is_empty() && info.run_id != query.run_id {
+            continue;
+        }
+        if !match_status_filter(info.online, &query.status) {
+            continue;
+        }
         let ctl = if info.run_id.is_empty() {
             None
         } else {
@@ -769,7 +809,38 @@ async fn handle_clients(State(state): State<Arc<AppState>>) -> Json<Vec<ClientEn
             pending_requests: pending,
         });
     }
+    // Go slices.SortFunc: cmp (User, ClientID, Key). ClientID here is the
+    // resolved identifier (raw_client_id or run_id fallback) — matches the
+    // serialized `clientID` field only when raw_client_id is set, but sorts
+    // by the same resolved value Go's resp carries.
+    clients.sort_by(|a, b| {
+        a.user
+            .cmp(&b.user)
+            .then_with(|| resolved_client_id(a).cmp(resolved_client_id(b)))
+            .then_with(|| a.key.cmp(&b.key))
+    });
     Json(clients)
+}
+
+/// Resolved client identifier: `raw_client_id` when set, else `run_id`
+/// (mirrors `ClientInfo::client_id`, registry.go).
+fn resolved_client_id(c: &ClientEntry) -> &str {
+    c.client_id.as_deref().unwrap_or(&c.run_id)
+}
+
+/// Go `matchStatusFilter` (`server/http/controller.go:312-323`): the query
+/// value was already lowercased at extraction; "" and "all" pass everything,
+/// any unknown value passes everything (fail-open — mirrors Go's
+/// switch-with-no-default-rejection), online → only online, offline → only
+/// offline.
+fn match_status_filter(online: bool, status: &str) -> bool {
+    match status {
+        "" | "all" => true,
+        "online" => online,
+        "offline" => !online,
+        // Unknown status passes, like Go.
+        _ => true,
+    }
 }
 
 async fn handle_client_detail(
@@ -2081,11 +2152,19 @@ mod v2 {
 
     /// Percent-decode a URL-encoded path segment (Go `url.PathUnescape`
     /// parity). Go's PathUnescape: only `%XX` escapes are decoded, `+` is a
-    /// literal plus (no space translation — that is QueryUnescape), and the
-    /// decoded bytes must form valid UTF-8 (Go `utf8.Valid` check inside
-    /// unescape → ErrInvalidEncoding; the old frp-rs decoder translated `+`
-    /// to space and cast each byte to a Latin-1 char, mojibaking non-ASCII).
-    fn percent_decode_path(s: &str) -> Result<String, (StatusCode, Json<V2Error>)> {
+    /// literal plus (no space translation — that is QueryUnescape), and only
+    /// malformed escapes error (EscapeError); the decoded bytes are NOT
+    /// UTF-8-validated (url.go:203-268 has no utf8 check — `%FF%FE` decodes
+    /// to raw bytes without error and the later registry lookup 404s).
+    /// frp-rs mirrors the malformed-escape 400 but keeps a UTF-8 check on
+    /// the decoded bytes (fail-closed divergence: Go returns raw bytes for
+    /// `%FF%FE` and 404s on the lookup miss; frp-rs 400s on non-UTF-8 — the
+    /// old decoder also translated `+` to space and cast each byte to a
+    /// Latin-1 char, mojibaking non-ASCII). `label` renders the Go
+    /// `decodeV2PathParam` 400 text (`invalid {label}` — labels "client
+    /// key"/"proxy name", controller_v2.go:297-306).
+    fn percent_decode_path(label: &str, s: &str) -> Result<String, (StatusCode, Json<V2Error>)> {
+        let invalid = || err(StatusCode::BAD_REQUEST, format!("invalid {label}"));
         let bytes = s.as_bytes();
         let mut out = Vec::with_capacity(s.len());
         let mut i = 0;
@@ -2093,14 +2172,14 @@ mod v2 {
             if bytes[i] == b'%' {
                 // Go: a trailing '%' without two hex digits → ErrInvalidEncoding.
                 if i + 2 >= bytes.len() {
-                    return Err(err(StatusCode::BAD_REQUEST, "invalid percent-encoding"));
+                    return Err(invalid());
                 }
                 match (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
                     (Some(hi), Some(lo)) => {
                         out.push(hi << 4 | lo);
                         i += 3;
                     }
-                    _ => return Err(err(StatusCode::BAD_REQUEST, "invalid percent-encoding")),
+                    _ => return Err(invalid()),
                 }
             } else {
                 // Includes '+': literal (Go PathUnescape parity).
@@ -2108,7 +2187,9 @@ mod v2 {
                 i += 1;
             }
         }
-        String::from_utf8(out).map_err(|_| err(StatusCode::BAD_REQUEST, "invalid percent-encoding"))
+        // Fail-closed divergence — Go returns the raw bytes here (no UTF-8
+        // validation in unescape); see the doc comment above.
+        String::from_utf8(out).map_err(|_| invalid())
     }
 
     fn hex_nibble(b: u8) -> Option<u8> {
@@ -2310,7 +2391,7 @@ mod v2 {
         Path(name): Path<String>,
         V2JsonBody(req): V2JsonBody<UpdateProxyRequest>,
     ) -> Result<Json<ProxyResp>, (StatusCode, Json<V2Error>)> {
-        let name = percent_decode_path(&name)?;
+        let name = percent_decode_path("proxy name", &name)?;
 
         let provider_field = req.local_ip.is_some()
             || req.local_port.is_some()
@@ -2539,7 +2620,7 @@ mod v2 {
         State(state): State<Arc<AppState>>,
         Path(key): Path<String>,
     ) -> Result<Json<ClientDetailResp>, (StatusCode, Json<V2Error>)> {
-        let key = percent_decode_path(&key)?;
+        let key = percent_decode_path("client key", &key)?;
 
         // Go looks up by composite key `{user}.{clientID}`. As a frp-rs
         // compatibility extension we also accept a bare run_id.
@@ -2707,7 +2788,7 @@ mod v2 {
         State(state): State<Arc<AppState>>,
         Path(name): Path<String>,
     ) -> Result<Json<ProxyResp>, (StatusCode, Json<V2Error>)> {
-        let name = percent_decode_path(&name)?;
+        let name = percent_decode_path("proxy name", &name)?;
 
         let p = state
             .proxy_manager
@@ -2723,7 +2804,7 @@ mod v2 {
         State(state): State<Arc<AppState>>,
         Path(name): Path<String>,
     ) -> Result<Json<ProxyTrafficResp>, (StatusCode, Json<V2Error>)> {
-        let name = percent_decode_path(&name)?;
+        let name = percent_decode_path("proxy name", &name)?;
 
         let p = state
             .proxy_manager
@@ -3414,35 +3495,59 @@ mod v2 {
 
         #[test]
         fn percent_decode_path_go_parity() {
-            // Go url.PathUnescape parity: '+' stays a literal plus, %XX decodes
-            // to its byte (assembled into UTF-8), invalid escapes and invalid
-            // UTF-8 are rejected.
+            // Go url.PathUnescape parity: '+' stays a literal plus, %XX
+            // decodes to its byte; only malformed escapes error (EscapeError),
+            // and the error text mirrors Go decodeV2PathParam labels
+            // (controller_v2.go:297-306: `invalid {label}`).
             // Plus is literal (PathUnescape, NOT QueryUnescape).
-            assert_eq!(percent_decode_path("a+b").unwrap(), "a+b");
+            assert_eq!(percent_decode_path("client key", "a+b").unwrap(), "a+b");
             // ASCII escape.
-            assert_eq!(percent_decode_path("a%20b").unwrap(), "a b");
+            assert_eq!(percent_decode_path("client key", "a%20b").unwrap(), "a b");
             // Non-ASCII: %C3%A9 = é (UTF-8) — the old Latin-1 cast mojibaked
             // this into two chars.
-            assert_eq!(percent_decode_path("caf%C3%A9").unwrap(), "café");
+            assert_eq!(
+                percent_decode_path("client key", "caf%C3%A9").unwrap(),
+                "café"
+            );
             // Raw non-ASCII bytes pass through.
-            assert_eq!(percent_decode_path("café").unwrap(), "café");
+            assert_eq!(percent_decode_path("client key", "café").unwrap(), "café");
             // Empty is fine.
-            assert_eq!(percent_decode_path("").unwrap(), "");
+            assert_eq!(percent_decode_path("client key", "").unwrap(), "");
             // Missing hex digits → invalid (Go EscapeError).
-            let e = expect_err(percent_decode_path("%zz"), "bad escape must fail");
+            let e = expect_err(
+                percent_decode_path("proxy name", "%zz"),
+                "bad escape must fail",
+            );
             assert_eq!(e.0, StatusCode::BAD_REQUEST);
-            assert!(e.1 .0.error.contains("invalid percent-encoding"));
+            assert_eq!(e.1 .0.error, "invalid proxy name");
             // Trailing lone '%' → invalid (Go: i+2 >= len → EscapeError).
-            let e = expect_err(percent_decode_path("abc%"), "lone % must fail");
+            let e = expect_err(
+                percent_decode_path("proxy name", "abc%"),
+                "lone % must fail",
+            );
             assert_eq!(e.0, StatusCode::BAD_REQUEST);
-            let e = expect_err(percent_decode_path("100%"), "lone % must fail");
+            let e = expect_err(
+                percent_decode_path("proxy name", "100%"),
+                "lone % must fail",
+            );
             assert_eq!(e.0, StatusCode::BAD_REQUEST);
-            // %XX bytes that are not valid UTF-8 → invalid (Go ErrInvalidEncoding).
-            let e = expect_err(percent_decode_path("%FF%FE"), "invalid UTF-8 must fail");
+            // Client-key label on the same malformed escapes.
+            let e = expect_err(
+                percent_decode_path("client key", "%zz"),
+                "bad escape must fail",
+            );
+            assert_eq!(e.1 .0.error, "invalid client key");
+            // %FF%FE bytes are NOT valid UTF-8: fail-closed divergence — Go's
+            // unescape performs no UTF-8 check and returns the raw bytes (the
+            // later registry lookup 404s on them); frp-rs 400s on non-UTF-8.
+            let e = expect_err(
+                percent_decode_path("client key", "%FF%FE"),
+                "invalid UTF-8 must fail",
+            );
             assert_eq!(e.0, StatusCode::BAD_REQUEST);
-            assert!(e.1 .0.error.contains("invalid percent-encoding"));
+            assert_eq!(e.1 .0.error, "invalid client key");
             // Lowercase hex accepted.
-            assert_eq!(percent_decode_path("%e2%82%ac").unwrap(), "€");
+            assert_eq!(percent_decode_path("client key", "%e2%82%ac").unwrap(), "€");
         }
     }
 }

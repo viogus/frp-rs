@@ -1,4 +1,3 @@
-use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------
@@ -131,11 +130,17 @@ pub struct ServerConfig {
     #[serde(default, alias = "tcpmuxPassthrough")]
     pub tcp_mux_passthrough: bool,
     /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
-    /// proxy datagrams. Default: 1500 (Go frp compat).
+    /// proxy datagrams. Default: 1500 (Go frp compat). An EXPLICIT 0 also
+    /// normalizes to 1500 at load — Go `util.EmptyOr` parity
+    /// (pkg/config/v1/server.go:123): a Go-authored `udp_packet_size = 0`
+    /// runs at 1500 on Go frps.
     /// Go frp compat: udp_packet_size.
     /// Clamped at load like the client-side field (client.rs): the UDP bridge
     /// allocates `vec![0u8; udp_packet_size]` per proxy (bridge.rs), so an
     /// unclamped hostile value (2^31) would allocate a multi-GiB buffer.
+    /// Negative values cannot reach the clamp — the field is usize, so they
+    /// fail deserialization on their own (Rust-only reject-early divergence;
+    /// Go's int64 leaves negatives unvalidated until runtime breakage).
     #[serde(
         default = "default_udp_packet_size",
         alias = "udpPacketSize",
@@ -259,15 +264,14 @@ where
     D: serde::Deserializer<'de>,
 {
     let v = usize::deserialize(d)?;
-    // Explicit 0 rejected at load (audit round 3, LOW): the bridge allocates
-    // `vec![0u8; udp_packet_size]` recv buffers, and a zero-length recvfrom
-    // makes the kernel discard every datagram — silent total UDP proxy loss
-    // from an operator typo. Go frp accepts 0 and breaks the same way;
-    // fail-fast is the deliberate divergence (poolCount precedent).
+    // Go parity: `UDPPacketSize = util.EmptyOr(UDPPacketSize, 1500)`
+    // (pkg/config/v1/server.go:123 Complete(); helper EmptyOr at
+    // pkg/util/util/types.go) — an EXPLICIT 0 swaps for the 1500 default
+    // at load. A Go-authored config with `udp_packet_size = 0` loads on Go
+    // frps and runs at 1500, so it must load here too: the old load-time
+    // rejection (audit round 3) failed valid Go configs.
     if v == 0 {
-        return Err(D::Error::custom(
-            "udp_packet_size must be > 0 (0 would discard every UDP datagram)",
-        ));
+        return Ok(default_udp_packet_size());
     }
     Ok(v.min(MAX_UDP_PACKET_SIZE))
 }
@@ -1101,19 +1105,22 @@ mod udp_packet_size_tests {
         assert_eq!(cfg.udp_packet_size, 65507);
         let cfg = parse(serde_json::json!({ "bind_port": 7000 }));
         assert_eq!(cfg.udp_packet_size, 1500, "server default 1500 pinned");
-        // Zero → rejected at load (round 3): a zero-length recv buffer makes
-        // the kernel discard every datagram — silent total UDP proxy loss.
-        // (The field is usize, so negatives fail deserialization on their
-        // own before this check.)
-        let err = serde_json::from_value::<ServerConfig>(serde_json::json!({
-            "bind_port": 7000,
-            "udp_packet_size": 0
-        }))
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("udp_packet_size must be > 0"),
-            "unexpected error: {err}"
+        // Explicit 0 → Go `util.EmptyOr` swap to the 1500 default
+        // (pkg/config/v1/server.go:123): a Go-authored `udp_packet_size = 0`
+        // loads on Go frps and runs at 1500 — the old load-time rejection
+        // failed valid Go configs.
+        let cfg = parse(serde_json::json!({ "bind_port": 7000, "udp_packet_size": 0 }));
+        assert_eq!(
+            cfg.udp_packet_size, 1500,
+            "explicit 0 must normalize to the 1500 default"
         );
+        // Negative fails usize deserialization on its own (Rust-only
+        // reject-early divergence; Go's int64 never validates negatives).
+        assert!(serde_json::from_value::<ServerConfig>(serde_json::json!({
+            "bind_port": 7000,
+            "udp_packet_size": -5
+        }))
+        .is_err());
         // Non-integer still fails deserialization.
         assert!(serde_json::from_value::<ServerConfig>(serde_json::json!({
             "bind_port": 7000,

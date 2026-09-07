@@ -272,7 +272,10 @@ async fn test_xtcp_visitor_without_provider_rejects_user_connections() {
     });
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
-    // Visitor targets "ghost-xtcp" — pre_check fails with "proxy not found".
+    // Visitor targets "ghost-xtcp" — pre_check fails with the Go literal
+    // "xtcp server for [ghost-xtcp] doesn't exist" (controller.go:159); any
+    // NatHoleResp error closes the visitor conn, which is what this test
+    // asserts.
     let visitor_service = start_visitor(server_port, visitor_port, "ghost-xtcp", STCP_PROXY).await;
     let _visitor_handle = tokio::spawn(async move {
         let _ = visitor_service.run().await;

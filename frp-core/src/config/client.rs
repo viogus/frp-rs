@@ -22,15 +22,24 @@ where
     D: serde::Deserializer<'de>,
 {
     let v = i64::deserialize(d)?;
-    // Explicit 0 (or negative) rejected at load (audit round 3, LOW): the
-    // work-conn recv loop would otherwise truncate every inbound datagram to
-    // 1 byte (`vec![0u8; udp_packet_size.max(1)]`) and forward the corrupted
-    // remainder — Go frp's zero-length buffer discards instead, so the
-    // failure modes would diverge silently. Fail-fast at load (poolCount
-    // precedent) beats either runtime behavior.
-    if v <= 0 {
+    // Go parity: `UDPPacketSize = util.EmptyOr(UDPPacketSize, 1500)`
+    // (pkg/config/v1/client.go:98 Complete(); helper EmptyOr at
+    // pkg/util/util/types.go) — an EXPLICIT 0 swaps for the 1500 default
+    // at load. A Go-authored config with `udp_packet_size = 0` loads on Go
+    // frps and runs at 1500, so it must load here too: the old load-time
+    // rejection (audit round 3) failed valid Go configs.
+    if v == 0 {
+        return Ok(default_udp_packet_size_i64());
+    }
+    // Negative values keep the load-time rejection — DOCUMENTED Rust-only
+    // divergence: Go's int64 is never validated and only breaks later at
+    // runtime (the work-conn recv loop would truncate every inbound
+    // datagram to 1 byte, `vec![0u8; udp_packet_size.max(1)]`). Fail-fast
+    // at load (poolCount precedent) beats the divergent runtime behavior.
+    if v < 0 {
         return Err(D::Error::custom(
-            "udp_packet_size must be > 0 (0 would truncate every UDP datagram)",
+            "udp_packet_size must not be negative (Go leaves negatives \
+             unvalidated and breaks at runtime; frp-rs rejects at load)",
         ));
     }
     Ok(v.min(MAX_UDP_PACKET_SIZE))
@@ -328,10 +337,14 @@ pub struct ClientConfig {
     #[serde(default, alias = "featureGates")]
     pub feature: FeatureConfig,
     /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
-    /// proxy datagrams. Default: 1500 (Go frp compat). Clamped to
-    /// [0, 65507] at load — the max UDP payload — so a hostile config value
-    /// cannot force a multi-GiB per-proxy allocation at runtime (the
-    /// use-sites in work_conn.rs size their buffers from this value).
+    /// proxy datagrams. Default: 1500 (Go frp compat). An EXPLICIT 0 also
+    /// normalizes to 1500 at load — Go `util.EmptyOr` parity
+    /// (pkg/config/v1/client.go:98): a Go-authored `udp_packet_size = 0`
+    /// runs at 1500 on Go frps. Clamped to ≤ 65507 at load — the max UDP
+    /// payload — so a hostile config value cannot force a multi-GiB
+    /// per-proxy allocation at runtime (the use-sites in work_conn.rs size
+    /// their buffers from this value). Negative values are rejected at load
+    /// (documented Rust-only divergence; see `clamp_udp_packet_size`).
     /// Go frp compat: udpPacketSize / UDPPacketSize.
     #[serde(
         default = "default_udp_packet_size_i64",
@@ -848,20 +861,37 @@ mod tests {
         // allocate a multi-GiB receive buffer per UDP proxy).
         assert_eq!(parse(r#"{"v": 2147483647}"#), 65507);
         assert_eq!(parse(r#"{"v": 999999999}"#), 65507);
+        assert_eq!(parse(r#"{"v": 65508}"#), 65507);
         assert_eq!(parse(r#"{"v": 65507}"#), 65507);
         // In-range values pass through untouched.
         assert_eq!(parse(r#"{"v": 2048}"#), 2048);
         assert_eq!(parse(r#"{"v": 1500}"#), 1500);
-        // Zero / negative → rejected at load (round 3): a zero-length recv
-        // buffer would truncate every datagram to 1 byte at runtime.
-        for bad in [r#"{"v": 0}"#, r#"{"v": -5}"#] {
-            let err = serde_json::from_str::<Wrapper>(bad).unwrap_err();
-            assert!(
-                err.to_string().contains("udp_packet_size must be > 0"),
-                "unexpected error: {err}"
-            );
-        }
+        // Explicit 0 → Go `util.EmptyOr` swap to the 1500 default
+        // (pkg/config/v1/client.go:98): a Go-authored `udp_packet_size = 0`
+        // loads on Go frps and runs at 1500 — rejecting it failed valid Go
+        // configs at load.
+        assert_eq!(
+            parse(r#"{"v": 0}"#),
+            1500,
+            "explicit 0 must normalize to the 1500 default"
+        );
+        // Negative → rejected at load (documented Rust-only divergence: Go
+        // never validates negatives and only breaks later at runtime).
+        let err = serde_json::from_str::<Wrapper>(r#"{"v": -5}"#).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("udp_packet_size must not be negative"),
+            "unexpected error: {err}"
+        );
         // Non-integer still fails deserialization.
         assert!(serde_json::from_str::<Wrapper>(r#"{"v": "big"}"#).is_err());
+    }
+
+    #[test]
+    fn udp_packet_size_absent_defaults_to_1500() {
+        // Absent key → the serde default fn (1500) — Go's zero value after
+        // `util.EmptyOr(0, 1500)`.
+        let cfg: super::ClientConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.udp_packet_size, 1500);
     }
 }
