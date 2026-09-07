@@ -161,6 +161,16 @@ async fn test_static_file_plugin_rejects_path_traversal() {
         .await
         .expect("start static_file plugin");
     let (status, _) = http_get(handle.local_addr, "/../etc/passwd", None).await;
-    assert_eq!(status, 403, "path traversal must be rejected");
+    // Go FileServer parity: the FileServer chain (fileHandler → serveFile
+    // → http.Dir.Open, src/net/http/fs.go) passes `path.Clean("/../etc/
+    // passwd")` = "/etc/passwd" to Dir.Open, which joins inside the root —
+    // the ".." never escapes, so a non-existent cleaned path is a plain
+    // 404. (The containsDotDot 400 arm lives only in the ServeFile/
+    // ServeFileFS helpers, NOT in the FileServer handler this plugin
+    // uses.) Probe vs go1.25.12 FileServer: /../etc/passwd and
+    // /sub/../../etc/passwd both answer 404 Not Found. The old 403 pin
+    // predates the anchored path.Clean (".." clamped at root instead of
+    // rejected outright).
+    assert_eq!(status, 404, "path traversal must 404 like Go FileServer");
     let _ = std::fs::remove_dir_all(&dir);
 }
