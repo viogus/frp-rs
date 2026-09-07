@@ -180,8 +180,7 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
             eof: false,
             complete: false,
             read_buf: [0u8; 4096],
-            deadline_sleep: header_timeout
-                .map(|d| Box::pin(tokio::time::sleep(d))),
+            deadline_sleep: header_timeout.map(|d| Box::pin(tokio::time::sleep(d))),
         }
     }
 
@@ -197,10 +196,7 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
         let Some(rest) = v.strip_prefix(b"HTTP/") else {
             return false;
         };
-        rest.len() == 3
-            && rest[1] == b'.'
-            && rest[0].is_ascii_digit()
-            && rest[2].is_ascii_digit()
+        rest.len() == 3 && rest[1] == b'.' && rest[0].is_ascii_digit() && rest[2].is_ascii_digit()
     }
 
     /// Status code of the head's first line, or None when the line is not
@@ -3034,7 +3030,9 @@ mod tests {
     #[test]
     fn head_status_go_version_token_matrix() {
         let v = ResponseHeaderInjector::<tokio::io::DuplexStream>::is_http_version;
-        for ok in ["HTTP/1.1", "HTTP/1.0", "HTTP/0.9", "HTTP/1.9", "HTTP/2.0", "HTTP/9.9"] {
+        for ok in [
+            "HTTP/1.1", "HTTP/1.0", "HTTP/0.9", "HTTP/1.9", "HTTP/2.0", "HTTP/9.9",
+        ] {
             assert!(v(ok.as_bytes()), "{ok} must parse (Go ParseHTTPVersion)");
         }
         for bad in [
@@ -3060,9 +3058,8 @@ mod tests {
     // 100..=199 membership check here (response.go:173-186).
     #[test]
     fn head_status_go_code_atoi_matrix() {
-        let code = |head: &[u8]| {
-            ResponseHeaderInjector::<tokio::io::DuplexStream>::head_status_code(head)
-        };
+        let code =
+            |head: &[u8]| ResponseHeaderInjector::<tokio::io::DuplexStream>::head_status_code(head);
         let ok = [
             (&b"HTTP/1.1 200 OK\r\n\r\n"[..], 200u16),
             (&b"HTTP/1.1 +20 Weird\r\n\r\n"[..], 20u16),
@@ -3076,15 +3073,20 @@ mod tests {
             (&b"HTTP/1.0 101 Switching Protocols\r\n\r\n"[..], 101u16),
         ];
         for (head, want) in ok {
-            assert_eq!(code(head), Some(want), "head: {}", String::from_utf8_lossy(head));
+            assert_eq!(
+                code(head),
+                Some(want),
+                "head: {}",
+                String::from_utf8_lossy(head)
+            );
         }
         let bad: &[&[u8]] = &[
-            b"HTTP/1.1 -01 X\r\n\r\n",  // Atoi(-1) < 0 → malformed
-            b"HTTP/1.1 +2a X\r\n\r\n",  // Atoi error
-            b"HTTP/1.1 20a X\r\n\r\n",  // Atoi error
-            b"HTTP/1.1 0200 X\r\n\r\n", // 4-byte token
-            b"HTTP/1.1 20 X\r\n\r\n",   // 2-byte token
-            b"HTTP/1.1 + X\r\n\r\n",    // sign with no digits
+            b"HTTP/1.1 -01 X\r\n\r\n",   // Atoi(-1) < 0 → malformed
+            b"HTTP/1.1 +2a X\r\n\r\n",   // Atoi error
+            b"HTTP/1.1 20a X\r\n\r\n",   // Atoi error
+            b"HTTP/1.1 0200 X\r\n\r\n",  // 4-byte token
+            b"HTTP/1.1 20 X\r\n\r\n",    // 2-byte token
+            b"HTTP/1.1 + X\r\n\r\n",     // sign with no digits
             b"HTTP/1.10 200 OK\r\n\r\n", // A4: multi-digit minor
             b"HTTP/01.1 200 OK\r\n\r\n", // A4: multi-digit major
             b"FOO 200 OK\r\n\r\n",       // no HTTP/ prefix
@@ -3142,11 +3144,8 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let headers = std::collections::HashMap::new();
         let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
-        let mut injector = ResponseHeaderInjector::new(
-            inner_r,
-            headers,
-            Some(std::time::Duration::from_secs(5)),
-        );
+        let mut injector =
+            ResponseHeaderInjector::new(inner_r, headers, Some(std::time::Duration::from_secs(5)));
         inner_w
             .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
             .await
@@ -3157,7 +3156,10 @@ mod tests {
         assert_eq!(&buf[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
         // ...then the final head never arrives: the absolute deadline fires
         // (the paused clock auto-advances while the read parks).
-        let err = injector.read(&mut buf).await.expect_err("deadline must fire");
+        let err = injector
+            .read(&mut buf)
+            .await
+            .expect_err("deadline must fire");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
@@ -3225,8 +3227,14 @@ mod tests {
         // Sorted ascending, "X-Custom" < "x-custom" (uppercase first) — the
         // later key wins deterministically.
         assert_eq!(custom_lines[0], "x-custom: second", "got: {s:?}");
-        assert!(!s.contains("backend"), "backend value must be dropped: {s:?}");
-        assert!(!s.contains("backend-fold"), "fold must go with its parent: {s:?}");
+        assert!(
+            !s.contains("backend"),
+            "backend value must be dropped: {s:?}"
+        );
+        assert!(
+            !s.contains("backend-fold"),
+            "fold must go with its parent: {s:?}"
+        );
         assert!(s.ends_with("ok"), "body must survive: {s:?}");
     }
 
@@ -3254,8 +3262,14 @@ mod tests {
             s.contains("X-Frame-Options: DENY\r\n"),
             "configured value must be injected, got: {s:?}"
         );
-        assert!(!s.contains("SAMEORIGIN"), "backend value must be dropped: {s:?}");
-        assert!(!s.contains("folded-tail"), "fold tail must go with its parent: {s:?}");
+        assert!(
+            !s.contains("SAMEORIGIN"),
+            "backend value must be dropped: {s:?}"
+        );
+        assert!(
+            !s.contains("folded-tail"),
+            "fold tail must go with its parent: {s:?}"
+        );
         assert!(s.ends_with("ok"), "body must survive: {s:?}");
     }
 

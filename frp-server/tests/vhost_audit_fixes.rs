@@ -910,7 +910,12 @@ async fn test_vhost_response_headers_injected_with_compression() {
     let (addr, vhost_addr, cfg) = vhost_pair();
     let (_handle, _) = start_test_server(cfg).await;
 
-    let mut np = http_proxy("resp-headers-comp", vec!["comp.example.com".into()], None, None);
+    let mut np = http_proxy(
+        "resp-headers-comp",
+        vec!["comp.example.com".into()],
+        None,
+        None,
+    );
     np.use_compression = Some(true);
     let mut response_headers = std::collections::HashMap::new();
     response_headers.insert("X-Backend-Resp".into(), "injected".into());
@@ -940,13 +945,10 @@ async fn test_vhost_response_headers_injected_with_compression() {
     let mut req_plain = Vec::new();
     let mut wire = [0u8; 8192];
     while !req_plain.windows(4).any(|w| w == b"\r\n\r\n") {
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            work_conn.read(&mut wire),
-        )
-        .await
-        .expect("request within 5s")
-        .expect("read request stream");
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), work_conn.read(&mut wire))
+            .await
+            .expect("request within 5s")
+            .expect("read request stream");
         assert!(n > 0, "work conn closed before the request head arrived");
         let out = dec
             .feed(&wire[..n])
@@ -973,6 +975,115 @@ async fn test_vhost_response_headers_injected_with_compression() {
     // The client sees the plaintext response WITH the injected header —
     // the server-side chain decompresses the tunnel stream BEFORE the
     // injector splices `response_headers` in.
+    let mut resp = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut chunk))
+            .await
+            .expect("response within 5s")
+            .expect("read response");
+        assert!(n > 0, "client conn closed before the response arrived");
+        resp.extend_from_slice(&chunk[..n]);
+        if resp.windows(4).any(|w| w == b"\r\n\r\n") && resp.ends_with(b"hello") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK\r\n"),
+        "backend status line first, got: {text:?}"
+    );
+    assert!(
+        text.contains("X-Backend-Resp: injected\r\n"),
+        "injected header missing from client response: {text:?}"
+    );
+    assert!(
+        text.contains("\r\n\r\nhello"),
+        "body must follow the (injected) head: {text:?}"
+    );
+    drop(client);
+    drop(_provider);
+}
+
+/// Audit round-13 B5: the injector must observe the PLAINTEXT response even
+/// when the proxy uses encryption. With `use_encryption` the work-conn
+/// tunnel leg is an AES-128-CFB stream (the real frpc encrypts outbound
+/// tunnel bytes), so this harness plays frpc: it wraps its work-conn halves
+/// in `CipherReader`/`CipherWriter` (same `derive_key(token)` the server
+/// uses) and decrypts the forwarded request / encrypts the backend
+/// response. The client must still see the status line + injected header +
+/// body — the response_headers injector runs ABOVE the bridge's decrypt
+/// layer (`control/bridge.rs` selects the injector on the decrypted side).
+#[tokio::test]
+async fn test_vhost_response_headers_injected_with_encryption() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let mut np = http_proxy(
+        "resp-headers-enc",
+        vec!["enc.example.com".into()],
+        None,
+        None,
+    );
+    np.use_encryption = Some(true);
+    let mut response_headers = std::collections::HashMap::new();
+    response_headers.insert("X-Backend-Resp".into(), "injected".into());
+    np.response_headers = Some(response_headers);
+    let (_provider, run_id) = register_proxy(addr, FrpMessage::NewProxy(Box::new(np))).await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: enc.example.com\r\n\r\n")
+        .await
+        .expect("send request");
+
+    // The StartWorkConn frame is plaintext V1; the tunnel data AFTER the
+    // frame boundary is ciphertext (the server's CipherWriter emits its
+    // random IV as the first bytes of the encrypted stream).
+    match read_msg_v1(&mut work_conn).await.expect("StartWorkConn") {
+        FrpMessage::StartWorkConn(swc) => {
+            assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+    let key = frp_core::encryption::derive_key(common::TEST_TOKEN);
+    let (read_half, write_half) = work_conn.into_split();
+    let mut decrypted = frp_core::cipher_stream::CipherReader::new(read_half, key);
+    let mut encrypted =
+        frp_core::cipher_stream::CipherWriter::new(write_half, key).expect("cipher writer rng");
+
+    // The forwarded request arrives encrypted; decrypt frame by frame until
+    // the head terminator is visible.
+    let mut req_plain = Vec::new();
+    let mut wire = [0u8; 8192];
+    while !req_plain.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), decrypted.read(&mut wire))
+            .await
+            .expect("request within 5s")
+            .expect("read request stream");
+        assert!(n > 0, "work conn closed before the request head arrived");
+        req_plain.extend_from_slice(&wire[..n]);
+    }
+    assert!(
+        String::from_utf8_lossy(&req_plain).starts_with("GET / HTTP/1.1\r\n"),
+        "request head must reach the backend (decrypted), got: {:?}",
+        String::from_utf8_lossy(&req_plain)
+    );
+
+    // Backend answers; as a real frpc would, the harness encrypts the
+    // plaintext response before writing it into the tunnel.
+    let backend_resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    encrypted
+        .write_all(backend_resp)
+        .await
+        .expect("backend response");
+
+    // The client sees the plaintext response WITH the injected header —
+    // the server-side chain decrypts the tunnel stream BEFORE the injector
+    // splices `response_headers` in.
     let mut resp = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {

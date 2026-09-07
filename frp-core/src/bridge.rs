@@ -1148,7 +1148,14 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             bridge_plain_decompressed_read(
-                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge, true, Vec::new(), None, None,
+                u_r_bridge,
+                u_w_bridge,
+                w_r_bridge,
+                w_w_bridge,
+                true,
+                Vec::new(),
+                None,
+                None,
             )
             .await;
         });
@@ -1156,8 +1163,7 @@ mod tests {
         // Work → User: the test sends PLAINTEXT (no snappy) on the work side
         // — the read half of a `_decompressed_read` bridge is a plaintext
         // pipe. It must arrive at the user side byte-exact.
-        let resp =
-            b"HTTP/1.1 200 OK\r\nX-Injected: yes\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let resp = b"HTTP/1.1 200 OK\r\nX-Injected: yes\r\nContent-Length: 5\r\n\r\nhello".to_vec();
         w_w_test.write_all(&resp).await.unwrap();
         drop(w_w_test);
 
@@ -1228,8 +1234,16 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             bridge_encrypted_decompressed_read(
-                u_r_bridge, u_w_bridge, pre_decompressed, w_w_bridge, &key, true, Vec::new(), None,
-                None, None,
+                u_r_bridge,
+                u_w_bridge,
+                pre_decompressed,
+                w_w_bridge,
+                &key,
+                true,
+                Vec::new(),
+                None,
+                None,
+                None,
             )
             .await;
         });
@@ -1254,7 +1268,10 @@ mod tests {
             }
             got.extend_from_slice(&buf[..n]);
         }
-        assert_eq!(got, resp, "encrypted+compressed work→user must arrive plaintext");
+        assert_eq!(
+            got, resp,
+            "encrypted+compressed work→user must arrive plaintext"
+        );
 
         // User → Work: must still be compressed AND encrypted on the wire.
         u_w_test.write_all(b"ping payload").await.unwrap();
