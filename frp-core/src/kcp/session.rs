@@ -1298,16 +1298,23 @@ mod tests {
         }
         // RS round-trip: parity over the 3 data rows must equal the emitted
         // parity bytes (decode of data0+data2+parity0 recovers data1).
+        // Rows are ragged here (segs 4/5/8 bytes → rows 6/7/10): decode
+        // zero-extends each row to the group max (kcp_compat Fec::decode
+        // normalizes like the receive path — "Go: zero-extend shorter
+        // shards"), so the recovered row carries that zero padding and is
+        // compared against the padded expectation.
         let fec = Fec::new(3, 2);
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; 5];
         shards[0] = Some(data[0][6..].to_vec());
         shards[2] = Some(data[2][6..].to_vec());
         shards[3] = Some(parity[0][6..].to_vec());
         assert!(fec.decode(&mut shards), "RS decode must succeed");
+        let mut expected_row1 = data[1][6..].to_vec();
+        expected_row1.resize(expected_parity_len, 0);
         assert_eq!(
             shards[1].as_deref(),
-            Some(&data[1][6..][..]),
-            "recovered row 1"
+            Some(&expected_row1[..]),
+            "recovered row 1 (zero-padded to the group max)"
         );
     }
 

@@ -237,12 +237,33 @@ impl Fec {
         if !self.enabled() {
             return true; // no-op
         }
+        // Block size = the LONGEST present row, not the first: GF(2^8) row
+        // math needs uniform lengths, and decode of a ragged group must
+        // zero-extend like the production receive path does (session.rs
+        // resizes every row to the group max before decode — "Go:
+        // zero-extend shorter shards"). Truncating to the first row's
+        // length would silently drop the tail of every longer recovered
+        // row. Direct callers (tests) may pass ragged input; uniform rows
+        // (production) are unaffected.
         let block_size = shards
             .iter()
-            .find_map(|s| s.as_ref().map(|v| v.len()))
+            .filter_map(|s| s.as_ref().map(|v| v.len()))
+            .max()
             .unwrap_or(0);
         if block_size == 0 {
             return false;
+        }
+
+        // Normalize ragged rows to the group max (zero-extension): the
+        // encoder padded every data row to max before computing parity, so
+        // GF(2^8) row math over zero-extended short rows is exact — and the
+        // per-byte indexing below never runs past a short row's end.
+        // Production (session.rs) resizes before decode ("Go: zero-extend
+        // shorter shards"); direct callers may pass ragged input.
+        for s in shards.iter_mut().flatten() {
+            if s.len() < block_size {
+                s.resize(block_size, 0);
+            }
         }
 
         let present: Vec<usize> = shards
