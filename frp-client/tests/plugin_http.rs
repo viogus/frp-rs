@@ -1998,15 +1998,20 @@ async fn test_http_proxy_connect_dial_failure_400_exact() {
 
 /// B4 (Go net/http parseRequestLine parity): the request line splits on
 /// literal SPACE only (two `Cut(line, " ")`), so a tab-joined
-/// "GET\tURL\tHTTP/1.1" is malformed and the connection closes with ZERO
-/// bytes — no forward, no response. The old split_whitespace collapsed
-/// every whitespace run, so tab-joined tokens parsed and the request was
-/// dialed and forwarded. (Go's own plain path answers http.Error 400 with
-/// an HTML body; this plugin's parse failures close silently per its
-/// established reject policy — documented divergence. The silent close
-/// matches the CONNECT arm, where Go reads the request directly and closes
-/// on ReadRequest error.) RED: the request is forwarded, the backend
-/// answers 200, and the empty-response assert fails.
+/// "GET\tURL\tHTTP/1.1" is malformed. The response depends on the arm:
+/// this is the PLAIN (non-CONNECT) arm, where the head lands in the
+/// plugin's http.Server and the server renders its own error BEFORE the
+/// handler runs — go1.25 conn.serve answers the malformed line with the
+/// raw `400 Bad Request` render (src/net/http/server.go, readRequest error
+/// switch: `errorHeaders` = Content-Type: text/plain + Connection: close,
+/// bytes written straight to the conn, so NO Date header) and then drops
+/// the conn. frp-rs's plain arm mirrors that render byte-exact
+/// (GO_400_RENDER). The old split_whitespace collapsed every whitespace
+/// run, so tab-joined tokens parsed and the request was dialed and
+/// forwarded. (The CONNECT arm is the SILENT one: there Go reads the
+/// request directly via ReadRequest in the plugin Handle and closes on its
+/// error — no http.Server in the path.) RED: the request is forwarded,
+/// the backend answers 200, and the render assert fails.
 #[tokio::test]
 async fn test_http_proxy_tab_joined_request_line_rejected() {
     let backend = match TcpListener::bind("127.0.0.1:0").await {
@@ -2051,12 +2056,13 @@ async fn test_http_proxy_tab_joined_request_line_rejected() {
         client.read_to_end(&mut resp),
     )
     .await
-    .expect("plugin must close the conn on a malformed request line")
+    .expect("plugin must close the conn after rendering the Go 400")
     .unwrap();
-    assert!(
-        resp.is_empty(),
-        "tab-joined request line must be rejected with a silent close (Go \
-         parseRequestLine splits on literal space only), got: {:?}",
+    assert_eq!(
+        resp.as_slice(),
+        b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+        "tab-joined request line must render Go's http.Server conn.serve \
+         400 byte-exact (no Date header — raw write), got: {:?}",
         String::from_utf8_lossy(&resp)
     );
     assert!(

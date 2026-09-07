@@ -972,8 +972,7 @@ pub(super) async fn write_go_502<W>(peer: &mut W, err: String) -> Result<(), Str
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let _ = peer
-        .write_all(GO_502_RENDER.as_bytes())
+    peer.write_all(GO_502_RENDER.as_bytes())
         .await
         .map_err(|e| format!("write 502: {e}"))?;
     Err(err)

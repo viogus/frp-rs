@@ -2002,7 +2002,7 @@ fn parse_vhost_request_line(request: &str) -> RequestLine<'_> {
     // same generic 400). The generic-400 class is preserved even when the
     // version token alone would 505: "GET( / HTTP/2.0" is a 400 in Go,
     // never a 505 — the version-shape/505 checks below must not run first.
-    if method.is_empty() || !method.bytes().all(|b| is_vhost_tchar(b)) {
+    if method.is_empty() || !method.bytes().all(is_vhost_tchar) {
         return RequestLine::BadRequest;
     }
 

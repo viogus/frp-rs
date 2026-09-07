@@ -162,7 +162,7 @@ async fn handle_static_file_conn(
     // miss → http.NotFound) renders Go's 404 page — byte-exact — then
     // closes. Never a silent close, and never the old code's
     // prefix-passthrough that served "/staticx/y" as "x/y".
-    let (rel_path, url_remainder) = match resolve_static_path(url_path, strip_prefix) {
+    let (rel_path, url_remainder) = match resolve_static_parts(url_path, strip_prefix) {
         Ok(parts) => parts,
         Err(e) => {
             if let Err(we) = client
@@ -409,6 +409,7 @@ async fn handle_static_file_conn(
 ///   cleans to "/x" and can never escape (Audit FIX 9). The old code
 ///   returned ".." components for the caller to reject (403); Go serves the
 ///   anchored result (200).
+#[cfg(test)]
 fn resolve_static_path(url_path: &str, strip_prefix: Option<&str>) -> Result<String, String> {
     Ok(resolve_static_parts(url_path, strip_prefix)?.0)
 }
@@ -1100,6 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn test_static_file_e2e_dir_redirect_and_index() {
         let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "index.html", b"root-body");
         write_file(dir.path(), "sub/index.html", b"index-body");
         write_file(dir.path(), "sub/deep/inner.html", b"inner-body");
         write_file(dir.path(), "plain.txt", b"plain-body");

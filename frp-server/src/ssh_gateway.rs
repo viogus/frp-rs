@@ -577,6 +577,7 @@ fn parse_bool_value(value: &str, display: &str) -> Result<bool, String> {
 ///   they separate pairs);
 /// - two or more `=` → comma-separated fields, each split on its FIRST `=`;
 ///   a field without `=` → `{field} must be formatted as key=value`.
+///
 /// (pflag additionally csv-parses quoted fields in the multi-`=` arm and
 /// trims a fully quoted value in the single-`=` arm; frp-rs strips
 /// surrounding double quotes per field — a documented simplification that
