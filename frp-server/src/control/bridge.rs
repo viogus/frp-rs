@@ -1450,14 +1450,28 @@ async fn run_work_bridge(
         // not unified here yet — this change is encryption-focused.
         let comp_key = req.use_compression && !is_sudp;
         if let Some(headers) = injector_headers {
-            // Response-header injection MUST observe plaintext (#2): the
-            // work conn carries AES-128-CFB ciphertext, so decrypt FIRST via
-            // CipherReader, THEN wrap in the injector. Passing this to
-            // bridge_encrypted with `read_is_decrypted=true` stops the bridge
-            // from re-wrapping (which would double-decrypt/corrupt).
-            let decrypted = CipherReader::new(w_r, key);
-            let injector = ResponseHeaderInjector::new(decrypted, headers);
-            frp_core::bridge::bridge_encrypted(
+            // Response-header injection MUST observe plaintext: the work
+            // conn carries AES-128-CFB ciphertext, so decrypt FIRST via
+            // CipherReader, THEN wrap in the injector. Audit round-14 A1:
+            // with use_compression the decrypted stream is STILL
+            // Snappy-encoded — the bridge's own decompressor runs below any
+            // reader passed as work_r — so a `SnappyStreamReader` goes
+            // between the CipherReader and the injector, and the
+            // `_decompressed_read` bridge variant skips its read-side decode
+            // (the user→work write side keeps compressing). Go parity: frp's
+            // vhost ReverseProxy/ModifyResponse sits ABOVE the transport's
+            // snappy layer and always injects into plaintext. Without this a
+            // compressed http proxy + response_headers would splice into
+            // Snappy bytes (corrupt stream) or silently never inject.
+            let decrypted: Box<dyn AsyncRead + Unpin + Send> =
+                Box::new(CipherReader::new(w_r, key));
+            let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
+                Box::new(frp_core::snappy_stream::SnappyStreamReader::new(decrypted))
+            } else {
+                decrypted
+            };
+            let injector = ResponseHeaderInjector::new(injector_r, headers);
+            frp_core::bridge::bridge_encrypted_decompressed_read(
                 u_r,
                 u_w,
                 injector,
@@ -1468,7 +1482,6 @@ async fn run_work_bridge(
                 bw_limiter.as_ref(),
                 Some(metrics.clone()),
                 header_timeout,
-                true,
             )
             .await;
             // Matches the original inline closure: the injector path skips
@@ -1551,8 +1564,15 @@ async fn run_work_bridge(
                 return;
             };
             if let Some(headers) = injector_headers {
-                let injector = ResponseHeaderInjector::new(w_r, headers);
-                frp_core::bridge::bridge_plain_rate_limited(
+                // A1: decompress the work stream before the injector when the
+                // proxy uses compression (see the encrypted arm above).
+                let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
+                    Box::new(frp_core::snappy_stream::SnappyStreamReader::new(w_r))
+                } else {
+                    w_r
+                };
+                let injector = ResponseHeaderInjector::new(injector_r, headers);
+                frp_core::bridge::bridge_plain_rate_limited_decompressed_read(
                     u_r,
                     u_w,
                     injector,
@@ -1603,8 +1623,15 @@ async fn run_work_bridge(
                 return;
             };
             if let Some(headers) = injector_headers {
-                let injector = ResponseHeaderInjector::new(w_r, headers);
-                frp_core::bridge::bridge_plain(
+                // A1: decompress the work stream before the injector when the
+                // proxy uses compression (see the encrypted arm above).
+                let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
+                    Box::new(frp_core::snappy_stream::SnappyStreamReader::new(w_r))
+                } else {
+                    w_r
+                };
+                let injector = ResponseHeaderInjector::new(injector_r, headers);
+                frp_core::bridge::bridge_plain_decompressed_read(
                     u_r,
                     u_w,
                     injector,

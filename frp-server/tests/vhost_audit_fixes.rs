@@ -897,6 +897,112 @@ async fn test_vhost_response_headers_injected_end_to_end() {
     drop(_provider);
 }
 
+/// Audit round-14 A1: the injector must observe the PLAINTEXT response even
+/// when the proxy uses compression. With `use_compression` the work-conn
+/// tunnel leg is a Snappy stream (the real frpc compresses outbound tunnel
+/// bytes), so this harness plays frpc: it snappy-decodes the forwarded
+/// request and snappy-encodes the backend response. The client must still
+/// see the status line + injected header + body — pre-fix, the injector
+/// parsed Snappy bytes as an HTTP head and the response arrived corrupted
+/// or never (injector sat below the bridge's snappy decode).
+#[tokio::test]
+async fn test_vhost_response_headers_injected_with_compression() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let mut np = http_proxy("resp-headers-comp", vec!["comp.example.com".into()], None, None);
+    np.use_compression = Some(true);
+    let mut response_headers = std::collections::HashMap::new();
+    response_headers.insert("X-Backend-Resp".into(), "injected".into());
+    np.response_headers = Some(response_headers);
+    let (_provider, run_id) = register_proxy(addr, FrpMessage::NewProxy(Box::new(np))).await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: comp.example.com\r\n\r\n")
+        .await
+        .expect("send request");
+
+    match read_msg_v1(&mut work_conn).await.expect("StartWorkConn") {
+        FrpMessage::StartWorkConn(swc) => {
+            assert!(swc.error.is_none(), "StartWorkConn error: {:?}", swc.error);
+        }
+        other => panic!("expected StartWorkConn, got {:?}", other.v1_type_byte()),
+    }
+
+    // The forwarded request arrives as a Snappy stream (server compressed
+    // the browser's plaintext head before writing it to the work conn).
+    // Decompress frame by frame until the head terminator is visible.
+    let mut dec = frp_core::encryption::SnappyDecompressor::new();
+    let mut req_plain = Vec::new();
+    let mut wire = [0u8; 8192];
+    while !req_plain.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            work_conn.read(&mut wire),
+        )
+        .await
+        .expect("request within 5s")
+        .expect("read request stream");
+        assert!(n > 0, "work conn closed before the request head arrived");
+        let out = dec
+            .feed(&wire[..n])
+            .unwrap_or_else(|e| panic!("request stream decompress failed: {e}"));
+        req_plain.extend_from_slice(&out);
+    }
+    assert!(
+        String::from_utf8_lossy(&req_plain).starts_with("GET / HTTP/1.1\r\n"),
+        "request head must reach the backend (decoded), got: {:?}",
+        String::from_utf8_lossy(&req_plain)
+    );
+
+    // Backend answers; as a real frpc would, the harness compresses the
+    // response before writing it into the tunnel.
+    let backend_resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    let mut comp = frp_core::encryption::SnappyCompressor::new();
+    let mut comp_resp = Vec::new();
+    comp.compress(backend_resp, &mut comp_resp).unwrap();
+    work_conn
+        .write_all(&comp_resp)
+        .await
+        .expect("backend response");
+
+    // The client sees the plaintext response WITH the injected header —
+    // the server-side chain decompresses the tunnel stream BEFORE the
+    // injector splices `response_headers` in.
+    let mut resp = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut chunk))
+            .await
+            .expect("response within 5s")
+            .expect("read response");
+        assert!(n > 0, "client conn closed before the response arrived");
+        resp.extend_from_slice(&chunk[..n]);
+        if resp.windows(4).any(|w| w == b"\r\n\r\n") && resp.ends_with(b"hello") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK\r\n"),
+        "backend status line first, got: {text:?}"
+    );
+    assert!(
+        text.contains("X-Backend-Resp: injected\r\n"),
+        "injected header missing from client response: {text:?}"
+    );
+    assert!(
+        text.contains("\r\n\r\nhello"),
+        "body must follow the (injected) head: {text:?}"
+    );
+    drop(client);
+    drop(_provider);
+}
+
 // ---------------------------------------------------------------
 // Audit-r7: Go NotFoundResponse parity + textproto EOL heads
 // ---------------------------------------------------------------

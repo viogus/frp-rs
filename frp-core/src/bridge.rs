@@ -342,10 +342,17 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
 /// semantics), a body-less `504 Gateway Timeout` is written to the user and
 /// the direction ends. First byte arrival is taken as the (approximate) start
 /// of the response head; subsequent reads are never timed out.
+///
+/// `decompress_read` controls whether bytes read from `work_r` are decoded as
+/// a Snappy stream. It is independent of the opposite direction's compression
+/// (see `bridge_user_to_work`): callers that supply an ALREADY-decompressed
+/// read stream (e.g. frp-server's response-header injector over a
+/// `SnappyDecompressReader`) pass false while the user→work direction keeps
+/// compressing.
 async fn bridge_work_to_user(
     mut work_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
-    use_compression: bool,
+    decompress_read: bool,
     limiter: Option<&SharedBandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     header_timeout: Option<Duration>,
@@ -353,14 +360,14 @@ async fn bridge_work_to_user(
     let mut buf = PoolGuard::acquire();
     let cap = buf.as_mut_slice().len();
     // Pre-size the decompression batch buffer to the bridge chunk size only
-    // when compression is on — the plaintext path never touches it, so a
+    // when decompression is on — the plaintext path never touches it, so a
     // pre-sized Vec there is a 32 KiB dead allocation per bridge.
-    let mut batch_buf = if use_compression {
+    let mut batch_buf = if decompress_read {
         Vec::with_capacity(cap)
     } else {
         Vec::new()
     };
-    let mut decompressor = make_decompressor(use_compression);
+    let mut decompressor = make_decompressor(decompress_read);
     let mut header_timeout = header_timeout;
     'read_loop: loop {
         let read_res = match header_timeout.take() {
@@ -574,6 +581,80 @@ pub async fn bridge_encrypted(
     header_timeout: Option<Duration>,
     read_is_decrypted: bool,
 ) {
+    bridge_encrypted_core(
+        user_r,
+        user_w,
+        work_r,
+        work_w,
+        key,
+        use_compression,
+        pre_read,
+        limiter,
+        metrics,
+        header_timeout,
+        read_is_decrypted,
+        use_compression,
+    )
+    .await;
+}
+
+/// Like [`bridge_encrypted`], but the work→user read stream is assumed to be
+/// ALREADY decompressed by the caller (in addition to being decrypted).
+/// `decompress_read` is therefore forced off while the user→work write
+/// direction still compresses per `use_compression`.
+///
+/// Audit round-14 A1: frp-server's response-header injector must observe
+/// DECOMPRESSED plaintext — Go frp's vhost ReverseProxy/ModifyResponse sits
+/// above the transport's snappy layer, so it always injects into plaintext.
+/// When a compressed http proxy carries `response_headers`, frp-server wraps
+/// the decrypted stream in a [`SnappyDecompressReader`] before the injector
+/// and calls this variant; without it the injector would parse Snappy bytes
+/// (corrupt splices / silent injection loss).
+#[allow(clippy::too_many_arguments)]
+pub async fn bridge_encrypted_decompressed_read(
+    user_r: impl AsyncReadExt + Unpin,
+    user_w: impl AsyncWriteExt + Unpin,
+    work_r: impl tokio::io::AsyncRead + Unpin + Send,
+    work_w: impl AsyncWriteExt + Unpin,
+    key: &[u8; 16],
+    use_compression: bool,
+    pre_read: Vec<u8>,
+    limiter: Option<&SharedBandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
+) {
+    bridge_encrypted_core(
+        user_r,
+        user_w,
+        work_r,
+        work_w,
+        key,
+        use_compression,
+        pre_read,
+        limiter,
+        metrics,
+        header_timeout,
+        true,
+        false,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bridge_encrypted_core(
+    user_r: impl AsyncReadExt + Unpin,
+    user_w: impl AsyncWriteExt + Unpin,
+    work_r: impl tokio::io::AsyncRead + Unpin + Send,
+    work_w: impl AsyncWriteExt + Unpin,
+    key: &[u8; 16],
+    use_compression: bool,
+    pre_read: Vec<u8>,
+    limiter: Option<&SharedBandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
+    read_is_decrypted: bool,
+    decompress_read: bool,
+) {
     tracing::debug!(use_compression, "bridge_encrypted: starting");
     // Audit B2: OS-RNG failure surfaces as an error, not a process abort.
     let mut enc_work_w = match CipherWriter::new(work_w, *key) {
@@ -617,7 +698,7 @@ pub async fn bridge_encrypted(
     let work_to_user = bridge_work_to_user(
         work_r,
         user_w,
-        use_compression,
+        decompress_read,
         limiter,
         metrics,
         header_timeout,
@@ -638,6 +719,65 @@ pub async fn bridge_plain(
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     header_timeout: Option<Duration>,
 ) {
+    bridge_plain_core(
+        user_r,
+        user_w,
+        work_r,
+        work_w,
+        use_compression,
+        pre_read,
+        None,
+        metrics,
+        header_timeout,
+        use_compression,
+    )
+    .await;
+}
+
+/// Like [`bridge_plain`], but the work→user read stream is assumed to be
+/// ALREADY decompressed by the caller (frp-server's response-header injector
+/// over a [`SnappyDecompressReader`]); only the user→work write direction
+/// compresses. See [`bridge_encrypted_decompressed_read`] for the audit
+/// round-14 A1 rationale.
+#[allow(clippy::too_many_arguments)]
+pub async fn bridge_plain_decompressed_read(
+    user_r: impl AsyncReadExt + Unpin,
+    user_w: impl AsyncWriteExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin,
+    work_w: impl AsyncWriteExt + Unpin,
+    use_compression: bool,
+    pre_read: Vec<u8>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
+) {
+    bridge_plain_core(
+        user_r,
+        user_w,
+        work_r,
+        work_w,
+        use_compression,
+        pre_read,
+        None,
+        metrics,
+        header_timeout,
+        false,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bridge_plain_core(
+    user_r: impl AsyncReadExt + Unpin,
+    user_w: impl AsyncWriteExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin,
+    work_w: impl AsyncWriteExt + Unpin,
+    use_compression: bool,
+    pre_read: Vec<u8>,
+    limiter: Option<&SharedBandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
+    decompress_read: bool,
+) {
     let had_pre_read = !pre_read.is_empty();
     tracing::debug!(
         had_pre_read,
@@ -650,14 +790,14 @@ pub async fn bridge_plain(
         WorkWriter::Plain(work_w),
         use_compression,
         pre_read,
-        None,
+        limiter,
         metrics.clone(),
     );
     let work_to_user = bridge_work_to_user(
         work_r,
         user_w,
-        use_compression,
-        None,
+        decompress_read,
+        limiter,
         metrics,
         header_timeout,
     );
@@ -745,6 +885,67 @@ pub async fn bridge_plain_rate_limited(
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     header_timeout: Option<Duration>,
 ) {
+    bridge_plain_rate_limited_core(
+        user_r,
+        user_w,
+        work_r,
+        work_w,
+        use_compression,
+        pre_read,
+        limiter,
+        metrics,
+        header_timeout,
+        use_compression,
+    )
+    .await;
+}
+
+/// Like [`bridge_plain_rate_limited`], but the work→user read stream is
+/// assumed to be ALREADY decompressed by the caller (frp-server's
+/// response-header injector over a [`SnappyDecompressReader`]); only the
+/// user→work write direction compresses. See
+/// [`bridge_encrypted_decompressed_read`] for the audit round-14 A1
+/// rationale.
+#[allow(clippy::too_many_arguments)]
+pub async fn bridge_plain_rate_limited_decompressed_read(
+    user_r: impl AsyncReadExt + Unpin,
+    user_w: impl AsyncWriteExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin,
+    work_w: impl AsyncWriteExt + Unpin,
+    use_compression: bool,
+    pre_read: Vec<u8>,
+    limiter: Option<&SharedBandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
+) {
+    bridge_plain_rate_limited_core(
+        user_r,
+        user_w,
+        work_r,
+        work_w,
+        use_compression,
+        pre_read,
+        limiter,
+        metrics,
+        header_timeout,
+        false,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bridge_plain_rate_limited_core(
+    user_r: impl AsyncReadExt + Unpin,
+    user_w: impl AsyncWriteExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin,
+    work_w: impl AsyncWriteExt + Unpin,
+    use_compression: bool,
+    pre_read: Vec<u8>,
+    limiter: Option<&SharedBandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    header_timeout: Option<Duration>,
+    decompress_read: bool,
+) {
     let user_to_work = bridge_user_to_work(
         user_r,
         WorkWriter::Plain(work_w),
@@ -756,7 +957,7 @@ pub async fn bridge_plain_rate_limited(
     let work_to_user = bridge_work_to_user(
         work_r,
         user_w,
-        use_compression,
+        decompress_read,
         limiter,
         metrics,
         header_timeout,
@@ -906,6 +1107,161 @@ mod tests {
         let mut resp_buf = vec![0u8; 1024];
         let n = u_r_test.read(&mut resp_buf).await.unwrap();
         assert_eq!(&resp_buf[..n], &resp[..]);
+
+        handle.await.unwrap();
+    }
+
+    /// Audit round-14 A1: `bridge_plain_decompressed_read` decouples the two
+    /// directions' compression. The work→user side is fed ALREADY-DECOMPRESSED
+    /// bytes (frp-server's injector path) and must forward them verbatim,
+    /// while the user→work side still compresses into a Snappy stream.
+    /// (Regression shape: a single `use_compression` bool would either
+    /// double-decode the read side or stop compressing the write side.)
+    #[tokio::test]
+    async fn test_bridge_plain_decompressed_read_direction_split() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(256 * 1024);
+        let (mut w_w_test, w_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(256 * 1024);
+
+        let handle = tokio::spawn(async move {
+            bridge_plain_decompressed_read(
+                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge, true, Vec::new(), None, None,
+            )
+            .await;
+        });
+
+        // Work → User: the test sends PLAINTEXT (no snappy) on the work side
+        // — the read half of a `_decompressed_read` bridge is a plaintext
+        // pipe. It must arrive at the user side byte-exact.
+        let resp =
+            b"HTTP/1.1 200 OK\r\nX-Injected: yes\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        w_w_test.write_all(&resp).await.unwrap();
+        drop(w_w_test);
+
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = u_r_test.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, resp, "work→user plaintext must pass through verbatim");
+
+        // User → Work: writes on the user side must STILL be compressed into
+        // a Snappy stream on the work side (write direction untouched).
+        u_w_test.write_all(b"request body").await.unwrap();
+        drop(u_w_test);
+
+        let mut dec = crate::encryption::SnappyDecompressor::new();
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = w_r_test.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let out = dec
+                .feed(&buf[..n])
+                .unwrap_or_else(|e| panic!("work side decompress failed: {e}"));
+            received.extend_from_slice(&out);
+        }
+        loop {
+            let out = dec
+                .feed(&[])
+                .unwrap_or_else(|e| panic!("work side decompress drain failed: {e}"));
+            if out.is_empty() {
+                break;
+            }
+            received.extend_from_slice(&out);
+        }
+        assert_eq!(received, b"request body");
+
+        handle.await.unwrap();
+    }
+
+    /// Audit round-14 A1 encrypted analog: `SnappyStreamReader` under the
+    /// injector — the full pre-decompressed read stack. The wire carries
+    /// AES-128-CFB(snappy(plaintext)); the frp-server arm unwraps both layers
+    /// OUTSIDE the bridge (CipherReader → SnappyStreamReader), so the bridge
+    /// receives an already-decompressed plaintext stream and must not
+    /// decrypt/decompress it again, while its user→work write direction
+    /// still compresses AND encrypts.
+    #[tokio::test]
+    async fn test_bridge_encrypted_decompressed_read_direction_split() {
+        let key = crate::encryption::derive_key("enc_decomp_read_key_a1");
+
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (mut w_w_test, w_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(256 * 1024);
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(256 * 1024);
+
+        // Same stack the frp-server encrypted injector arm builds
+        // (frp-server/src/control/bridge.rs): decompression now happens
+        // BELOW the bridge's read position.
+        let decrypted = crate::cipher_stream::CipherReader::new(w_r_bridge, key);
+        let pre_decompressed = crate::snappy_stream::SnappyStreamReader::new(decrypted);
+
+        let handle = tokio::spawn(async move {
+            bridge_encrypted_decompressed_read(
+                u_r_bridge, u_w_bridge, pre_decompressed, w_w_bridge, &key, true, Vec::new(), None,
+                None, None,
+            )
+            .await;
+        });
+
+        // Work → User: emit the wire form of a compressed+encrypted proxy
+        // response — AES-128-CFB(snappy(plaintext)) via CipherWriter.
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let mut comp = crate::encryption::SnappyCompressor::new();
+        let mut comp_resp = Vec::new();
+        comp.compress(&resp, &mut comp_resp).unwrap();
+        let mut enc_w = crate::cipher_stream::CipherWriter::new(w_w_test, key).expect("rng");
+        enc_w.write_all(&comp_resp).await.unwrap();
+        enc_w.flush().await.unwrap();
+        drop(enc_w); // EOF on the chain above
+
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = u_r_test.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, resp, "encrypted+compressed work→user must arrive plaintext");
+
+        // User → Work: must still be compressed AND encrypted on the wire.
+        u_w_test.write_all(b"ping payload").await.unwrap();
+        drop(u_w_test);
+
+        let mut dec_r = crate::cipher_stream::CipherReader::new(w_r_test, key);
+        let mut dec = crate::encryption::SnappyDecompressor::new();
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = dec_r.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let out = dec
+                .feed(&buf[..n])
+                .unwrap_or_else(|e| panic!("decrypted stream decompress failed: {e}"));
+            received.extend_from_slice(&out);
+        }
+        loop {
+            let out = dec
+                .feed(&[])
+                .unwrap_or_else(|e| panic!("decrypted stream decompress drain failed: {e}"));
+            if out.is_empty() {
+                break;
+            }
+            received.extend_from_slice(&out);
+        }
+        assert_eq!(received, b"ping payload");
 
         handle.await.unwrap();
     }
