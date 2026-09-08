@@ -862,8 +862,20 @@ async fn read_until_head_from(
     mut buf: Vec<u8>,
 ) -> std::io::Result<Vec<u8>> {
     let mut tmp = [0u8; 4096];
+    // Round-18 finding C2: the per-iteration `head_end` full-buffer rescan
+    // is O(n²) for a head that arrives in many small chunks (each read
+    // re-scans every byte of every earlier chunk). The incremental
+    // scanner is byte-identical for the feed-until-`Some` pattern (same
+    // first-blank-line semantics as `head_end`, frp-core textproto).
+    // `buf` is monotonic within this function (seeded once, only
+    // extended), so one scanner created at entry — its first feed scans
+    // the seed — is safe across reads.
+    let mut scanner = frp_core::textproto::HeadEndScanner::new();
     loop {
-        if frp_core::textproto::head_end(&buf).is_some() {
+        // Terminator scan before the cap check (round-16 readLimit model:
+        // a terminated head up to ~1 MiB + 4096 serves; only an
+        // unterminated one errors TooLarge).
+        if scanner.feed(&buf).is_some() {
             return Ok(buf);
         }
         // Guard against a malicious backend with unbounded headers.

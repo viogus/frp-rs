@@ -785,13 +785,23 @@ async fn serve_vhost_request<S>(
 /// mixed line endings are legal), extract Host/path/auth, resolve the route,
 /// and forward the stream via InternalMsg::ProxyUserConn.
 ///
-/// The 4096-byte head cap is a deliberate hardening divergence from Go frp
-/// (http.Server defaultMaxHeaderBytes = 1 MiB — a hostile client can send a
-/// ~1 MiB head per request slot); the h2c surface is capped at 4096 the same
-/// way while Go's h2 default is 16 MiB. Policy split-surface rationale lives
-/// in CLAUDE.md (round-13/14 hardening rows). An unterminated head is never
-/// forwarded: if it fills the cap it gets a 431 below (Go's errTooLarge
-/// analog); if the deadline expires or the peer closes mid-head with fewer
+/// The 4096-byte head cap is a deliberate hardening divergence from Go frp.
+/// Head-cap values are NOT uniform across the frp-rs surfaces (audit round
+/// 18 C4); the matrix: this HTTP/1.1 vhost front and the tcpmux CONNECT
+/// front cap the client head at 4096 and answer 431 at the cap (fail-closed
+/// hardening); the h2c vhost front caps the h2-frame header block at 4096
+/// too (vhost_h2c.rs max_header_list_size — Go's h2 default is 16 MiB); the
+/// backend-response/plugin faces read with the 1 MiB + 4096 readLimit model
+/// instead — a terminated head up to ~1 MiB + 4096 serves, only an
+/// unterminated one errors (vhost_h2c.rs read_until_head_from + the plugin
+/// read_until_head sites; Go MaxHeaderBytes + bufio slop). Go's own fronts
+/// are looser: http.Server reads to defaultMaxHeaderBytes = 1 MiB per
+/// request slot (net/http server.go — the 431 arm below is the errTooLarge
+/// analog) and the tcpmux CONNECT reader (http.ReadRequest in
+/// pkg/util/tcpmux/httpconnect.go) has NO cap at all, while Go's Transport
+/// bounds a backend response head at 10 MiB (maxHeaderResponseSize). An
+/// unterminated head is never forwarded: if it fills the cap it gets a 431
+/// below; if the deadline expires or the peer closes mid-head with fewer
 /// than 4096 bytes buffered, the connection is closed with no response
 /// (audit round 8 F7 — Go's isCommonNetReadError silent close).
 async fn handle_http1_request<S>(
@@ -995,7 +1005,14 @@ async fn handle_http1_request<S>(
     // classes fire BEFORE the dup-Host/505/missing-Host gates, so a
     // multi-defect head that trips one of those arms can take that arm's
     // render here where Go's read-time error would win (both 400s, except
-    // an HTTP/2.0 + read-time-defect head: 505 vs Go's 400).
+    // an HTTP/2.0 + read-time-defect head: 505 vs Go's 400). The arm order
+    // here otherwise mirrors Go conn.readRequest's classification chain
+    // (net/http server.go:1043-1073): the head-cap error — hitReadLimit →
+    // errTooLarge at 1043-1047, the analog of the unterminated-at-cap 431
+    // arm above — is classified before the version gate
+    // (http1ServerSupportsRequest, 1049-1052) and the missing-Host /
+    // malformed-Host / name-value gates (1057-1073) that the parse arms
+    // above mirror in the same order.
     match validate_vhost_head_lines(request_text) {
         HeadLineVerdict::Ok => {}
         HeadLineVerdict::Malformed => {

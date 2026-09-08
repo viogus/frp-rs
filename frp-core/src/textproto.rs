@@ -68,23 +68,60 @@ pub struct HeadEndScanner {
     /// Byte offset where the current (possibly empty) line starts — the
     /// byte right after the previous line's `\n`.
     line_start: usize,
+    /// Watermark for the mid-line case (audit round-18 finding C1): when a
+    /// `feed` ends inside a line (no `\n` after `line_start`), everything
+    /// from `line_start` to the old end of the buffer was just scanned and
+    /// found `\n`-free. `scanned` records that end so the next `feed` —
+    /// which sees the same bytes plus appended ones, since the buffer only
+    /// grows between feeds — resumes the `\n` hunt past them instead of
+    /// re-scanning the whole unterminated line. Without the watermark a
+    /// 1-byte drip feed was O(n²): every feed re-scanned the full
+    /// accumulated buffer. `scanned` never exceeds `line_start` except
+    /// transiently in this mid-line state, so `max(line_start, scanned)`
+    /// is the resume point.
+    scanned: usize,
 }
 
 impl HeadEndScanner {
     pub fn new() -> Self {
-        Self { line_start: 0 }
+        Self {
+            line_start: 0,
+            scanned: 0,
+        }
     }
 
     /// Check `buf` (the accumulated buffer; must only ever grow between
     /// feeds) for the terminating blank line, resuming where the previous
     /// feed stopped. Same result as [`head_end`] on the accumulated
     /// buffer for the feed-until-`Some` pattern.
+    ///
+    /// Amortized O(1) per drip byte: the `\n` hunt restarts at
+    /// `max(line_start, scanned)` — everything before it was either
+    /// already judged part of non-blank lines or, in the mid-line case,
+    /// scanned `\n`-free by the previous feed. When the hunt finds the
+    /// next `\n` at `nl >= scanned` the line under test still starts at
+    /// `line_start` (the mid-line state never has a `\n` between
+    /// `line_start` and `scanned`, so the whole line is
+    /// `buf[line_start..nl]` — non-blank in that state since
+    /// `line_start < scanned <= nl`), so blankness and the single
+    /// trailing-`\r` strip are judged exactly as [`head_end`] judges
+    /// them.
     pub fn feed(&mut self, buf: &[u8]) -> Option<usize> {
         while self.line_start < buf.len() {
-            let nl = buf[self.line_start..]
+            let from = self.line_start.max(self.scanned);
+            let nl = buf[from..]
                 .iter()
                 .position(|b| *b == b'\n')
-                .map(|i| self.line_start + i)?; // still mid-line
+                .map(|i| from + i);
+            let Some(nl) = nl else {
+                // Still mid-line: no '\n' from line_start to the end of
+                // the buffer. Remember where the scan stopped so the next
+                // feed (extended buffer) resumes past these bytes instead
+                // of re-scanning them; line_start stays put because the
+                // current line is still unterminated.
+                self.scanned = buf.len();
+                return None;
+            };
             let mut line = &buf[self.line_start..nl];
             if line.last() == Some(&b'\r') {
                 line = &line[..line.len() - 1];
@@ -326,6 +363,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Round-18 finding C1: `feed` was O(n²) under a 1-byte drip — the
+    /// mid-line early return left `line_start` unmoved, so each feed
+    /// re-scanned the whole accumulated buffer hunting a '\n' that the
+    /// previous feed had already proven absent. This test drips one
+    /// enormous single-line head (the worst case: no blank line until the
+    /// very end, so every pre-fix feed scanned from byte 0) one byte at a
+    /// time. Pre-fix that was ~n²/2 byte comparisons (~2e9 at 64 KiB,
+    /// multiple seconds; ~3e10 at 256 KiB, tens of seconds); the
+    /// watermark makes each drip O(1), so the test now runs in
+    /// milliseconds and a regression to the full-rescan shape stalls it
+    /// well past any sane test timeout.
+    #[test]
+    fn head_end_scanner_drip_feed_is_incremental() {
+        use super::HeadEndScanner;
+        let mut head = Vec::with_capacity(256 * 1024);
+        head.extend_from_slice(b"GET / HTTP/1.1\r\n");
+        head.resize(head.len() + 256 * 1024, b'a');
+        head.extend_from_slice(b"\r\n\r\n");
+        let expected_end = head.len(); // past the terminating blank line
+
+        let mut scan = HeadEndScanner::new();
+        let mut got = None;
+        let mut fed = 0;
+        while fed < head.len() {
+            fed += 1; // 1-byte drip
+            if let Some(nl) = scan.feed(&head[..fed]) {
+                got = Some(nl);
+                break;
+            }
+        }
+        assert_eq!(got, Some(expected_end), "drip must terminate the head");
+        // The drip consumed the whole buffer byte-by-byte; a partial feed
+        // (the read loop may also hand a fresh scanner a pre-read seed)
+        // must agree with head_end on the same bytes.
+        assert_eq!(head_end(&head), Some(expected_end));
     }
 
     /// `canonicalize_eol_crlf` input is the head region only (what

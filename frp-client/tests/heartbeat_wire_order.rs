@@ -20,8 +20,12 @@
 //!               first poll), and a second Ping must follow ~1s later.
 //!
 //! Oracles: (1) no frame in the pre-LoginResp window; (2) the first frame
-//! after NewProxyResp is a Ping; (3) a second Ping arrives ~1s after the
-//! first; (4) exactly one Login over the whole session.
+//! after NewProxyResp is a Ping, on the wire within 750ms of the
+//! NewProxyResp write (immediacy bound — tick 1 fires on the message loop's
+//! first poll, ms after registration; a first tick that waited out its full
+//! 1s period would land ~1s late and must RED; rationale in the mock
+//! below); (3) a second Ping arrives ~1s after the first; (4) exactly one
+//! Login over the whole session.
 
 mod common;
 
@@ -106,6 +110,23 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
         .await
         .expect("write NewProxyResp");
 
+        // Oracle-2 immediacy anchor: registration is complete from the
+        // mock's side here; the client finishes processing this
+        // NewProxyResp within ms and only then starts the message loop
+        // (service.rs: register_proxies Phase 4 -> run_message_loop
+        // Phase 6 — pings physically cannot leave before this point, the
+        // writer task is not spawned until Phase 5). The heartbeat interval
+        // is armed at login success (service.rs:1690, tokio `interval()`:
+        // tick 1's deadline is the arm instant) and polled for the first
+        // time at loop start, so tick 1 fires immediately: Ping#1 must
+        // reach the wire ~ms after this write.
+        // Bound 750ms: above the ~500ms registration-path jitter the
+        // cadence oracle below already tolerates, below the ~1000ms a first
+        // tick that waited out its full 1s period (e.g. an `interval_at`
+        // arm, or an eager `tick()` consumed at arm time) would land —
+        // indistinguishable from prompt within the old 3s read timeout.
+        let reg_complete_at = Instant::now();
+
         // Oracles 2-3: the message loop starts at registration completion;
         // the first frame must be a Ping (interval first tick), then a
         // second Ping ~1s later.
@@ -116,6 +137,15 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
         assert!(
             matches!(f1, FrpMessage::Ping(_)),
             "first post-registration frame must be a Ping, got {f1:?}"
+        );
+        let first_ping_gap = reg_complete_at.elapsed();
+        assert!(
+            first_ping_gap <= Duration::from_millis(750),
+            "first Ping arrived {}ms after the NewProxyResp write (expected \
+             ~ms: tick 1 fires immediately on the message loop's first poll; \
+             a first tick that waited out its full 1s period arrives ~1000ms \
+             — RED)",
+            first_ping_gap.as_millis()
         );
         let first_ping_at = Instant::now();
         let f2 = tokio::time::timeout(Duration::from_secs(3), enc.read_v1_frame())
@@ -251,7 +281,13 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
 ///
 /// Oracles (all anchored at P1 — the mock's own wire observation, never at
 /// test start):
-///   (1) the first frame after LoginResp is a Ping (Ping#1);
+///   (1) the first frame after LoginResp is a Ping (Ping#1), arriving
+///       within 1s of the LoginResp write (immediacy bound: the interval's
+///       first tick fires on the message loop's first poll, ms after login
+///       success — a first tick that waited out its full 6s period would
+///       land ~6000ms late, well inside the old 10s read timeout, so the
+///       absolute bound is asserted separately);
+///   (2) Ping#2 − Ping#1 ∈ [7.4s, 9.0s] — skip at ~6s + one 2s backoff. A
 ///   (2) Ping#2 − Ping#1 ∈ [7.4s, 9.0s] — skip at ~6s + one 2s backoff. A
 ///       tick that waited out the full interval lands at ~12s (RED), as does
 ///       a second 2s doubling (the re-armed tick firing before the restore);
@@ -295,7 +331,8 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
 
     let login_count = Arc::new(AtomicUsize::new(0));
     let count = login_count.clone();
-    // Signals the mock verified all three wire-timing oracles.
+    // Signals the mock verified all wire-timing oracles (immediacy bound +
+    // skip/re-arm cadence).
     let (pings_ok_tx, pings_ok_rx) = tokio::sync::oneshot::channel::<()>();
     let mock_token_path = token_path.clone();
     let mock = tokio::spawn(async move {
@@ -312,6 +349,21 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
             .write_v1_frame(&login_resp)
             .await
             .expect("write LoginResp");
+
+        // Oracle-1 immediacy anchor: the client arms its heartbeat interval
+        // when it processes this LoginResp (service.rs:1690, tokio
+        // `interval()`: tick 1's deadline is the arm instant). This session
+        // has no proxies or visitors, so the registration phase
+        // (service.rs register_proxies — nothing pending) and the loop
+        // start follow within ms; the interval is polled for the first time
+        // at loop start, tick 1 fires immediately, and Ping#1 must reach
+        // the wire ~ms after this write.
+        // Bound 1s: above the ~500ms jitter envelope this file tolerates
+        // elsewhere (the [7.4s, 9.0s] / [5.0s, 7.5s] windows below), below
+        // the ~6000ms a first tick that waited out its full 6s period
+        // (e.g. an `interval_at` arm, or an eager `tick()` consumed at arm
+        // time) would land — invisible to the old 10s read timeout alone.
+        let login_resp_at = Instant::now();
         let mut enc = stream
             .into_encrypted(enc_key)
             .expect("plain test stream is encryptable");
@@ -326,6 +378,14 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         assert!(
             matches!(f1, FrpMessage::Ping(_)),
             "first frame after LoginResp must be a Ping, got {f1:?}"
+        );
+        let first_ping_gap = login_resp_at.elapsed();
+        assert!(
+            first_ping_gap <= Duration::from_secs(1),
+            "first Ping arrived {}ms after LoginResp (expected ~ms: tick 1 \
+             fires immediately on the message loop's first poll; a first \
+             tick that waited out its full 6s period arrives ~6000ms — RED)",
+            first_ping_gap.as_millis()
         );
         let p1_at = Instant::now();
         enc.write_v1_frame(&pong).await.expect("write Pong");
