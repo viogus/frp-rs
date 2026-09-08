@@ -674,8 +674,11 @@ pub(super) fn go_valid_method_ok(method: &str) -> bool {
 /// before any routing/auth; probe vs go1.25.12 http.Server: /x%zz, /x%
 /// and /x%2 in the PATH all answer 400. The check stops at the first '?':
 /// url.Parse cuts the query RAW and never unescape-validates it, so
-/// query-only escapes like ?q=%zz serve — see [`target_has_invalid_escape`]),
-/// and the
+/// query-only escapes like ?q=%zz serve — see [`target_has_invalid_escape`].
+/// Review round: a CONNECT authority-form target is additionally
+/// host-mode-gated — a well-formed escape decoding to an ASCII byte is
+/// an error there unless it is the literal "%25" — see
+/// [`request_target_has_invalid_escape`]), and the
 /// version token passes [`go_parse_http_version_ok`] (request-side Go
 /// ParseHTTPVersion semantics). The old split_whitespace collapsed every
 /// whitespace run, so tab-joined tokens parsed and multi-space request
@@ -686,7 +689,7 @@ pub(super) fn parse_request_line(line: &str) -> Option<(&str, &str, &str)> {
     let target = parts.next()?;
     let version = parts.next()?;
     if target.is_empty()
-        || target_has_invalid_escape(target)
+        || request_target_has_invalid_escape(method, target)
         || !go_parse_http_version_ok(version)
         || !go_valid_method_ok(method)
     {
@@ -695,8 +698,83 @@ pub(super) fn parse_request_line(line: &str) -> Option<(&str, &str, &str)> {
     Some((method, target, version))
 }
 
+/// Mode-aware %-escape gate over the pre-'?' portion of a request-target.
+/// Go parses request targets with url.ParseRequestURI (net/url/url.go
+/// parse, viaRequest=true) before routing. The '?' query cut happens
+/// FIRST (`rest, RawQuery = strings.Cut(rest, "?")` — the query is kept
+/// RAW and never unescape-validated), then an authority-form target —
+/// "CONNECT host[:port]" lines, which Go's readRequest justAuthority
+/// rewrites to "http://" + target (request.go): the fixed scheme makes
+/// the authority run from the target's start to its FIRST '/', and the
+/// remainder (from that '/' on) is the path — is split into a host
+/// region (parseHost → unescape in encodeHost mode) and a path region
+/// (setPath → path mode). Non-CONNECT targets — origin-form "/x" and
+/// absolute-form "http://h/x" — are pure paths and stay in path mode
+/// throughout (the absolute-form HOST is a documented divergence: Go
+/// host-modes it too — probe vs go1.25 http.Server: GET
+/// http://h%41st/x answers 400 — but the fix-list scope for the host
+/// gate is the CONNECT authority; see target_has_invalid_escape).
+fn request_target_has_invalid_escape(method: &str, target: &str) -> bool {
+    let pre = target.split_once('?').map_or(target, |(p, _q)| p);
+    if method == "CONNECT" && !pre.starts_with('/') {
+        // justAuthority applies only to non-'/'-prefixed CONNECT targets;
+        // "CONNECT //x/y" is path-form in Go (HasPrefix check fails).
+        match pre.find('/') {
+            // Authority region: host-mode. Path region (the '/' and
+            // everything after): path-mode (setPath over the remainder).
+            Some(fs) => {
+                authority_has_invalid_escape(&pre[..fs]) || target_has_invalid_escape(&pre[fs..])
+            }
+            None => authority_has_invalid_escape(pre),
+        }
+    } else {
+        target_has_invalid_escape(pre)
+    }
+}
+
+/// Whether a CONNECT authority region carries an invalid %-escape under
+/// Go's HOST-mode unescape (net/url/url.go unescape, encodeHost — the
+/// `unhex(s[i+1]) < 8 && s[i:i+3] != "%25"` carve-out at url.go:226):
+/// a WELL-FORMED escape that decodes to an ASCII byte (first hex digit
+/// below 8) is an error unless it is the literal "%25" (the RFC 6874
+/// zone-escape exemption — "%25" decodes to '%', so "h%25st" is the
+/// host "h%st"), while escapes decoding to obs-text (first hex digit
+/// 8 or more, e.g. "%C3%A9" → 'é') are legal and DECODE in URL.Host.
+/// A malformed escape (non-hex digit, truncated) is an error in every
+/// mode. Probe vs go1.25 http.Server CONNECT: h%41st/h%2Fst/h%zzst →
+/// 400, h%25st/h%C3%A9st → 200 (the port gate — validOptionalPort —
+/// only accepts digit-or-empty ports, so "h:4%31" is rejected before
+/// the escape gate even runs: parseHost's port check is not an escape
+/// question, both rejected). The old shared scan was PATH-mode — it
+/// accepted every well-formed escape, so a CONNECT h%41st:443 head
+/// parsed and hit the dial (400 render); Go's conn.errors the head in
+/// ReadRequest (silent close on the http_proxy CONNECT arm).
+fn authority_has_invalid_escape(authority: &str) -> bool {
+    let b = authority.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if i + 2 >= b.len() || hex_val(b[i + 1]).is_none() || hex_val(b[i + 2]).is_none() {
+                return true;
+            }
+            let first_hex = hex_val(b[i + 1]).unwrap();
+            // %25's hex digits are case-invariant (2 and 5 are digits),
+            // so the literal comparison needs no fold.
+            if first_hex < 8 && &authority[i..i + 3] != "%25" {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Whether the pre-'?' portion of a request-target contains a '%' that
-/// does not begin a valid two-hex-digit escape. Go url.Parse splits the
+/// does not begin a valid two-hex-digit escape (PATH mode — the mode
+/// for every region that is not a CONNECT authority, see
+/// [`request_target_has_invalid_escape`]). Go url.Parse splits the
 /// target at the FIRST '?' BEFORE any unescape validation — `rest,
 /// RawQuery = Cut(rest, "?")` (net/url/url.go parse) — and the query is
 /// kept RAW: nothing downstream ever unescape-decodes it server-side, so
@@ -719,7 +797,11 @@ pub(super) fn parse_request_line(line: &str) -> Option<(&str, &str, &str)> {
 /// escapes byte-clean) — an invalid escape never reaches the decoder,
 /// url.Parse has already rejected the target. (Post-fix round: the scan
 /// covers only the pre-'?' slice — the round-16 wave scanned the WHOLE
-/// target and rejected query-only escapes like ?q=%zz that Go serves.)
+/// target and rejected query-only escapes like ?q=%zz that Go serves.
+/// Review round: path-mode still applies to the whole pre-'?' slice of
+/// CONNECT targets whose FIRST '/' begins the path region, so "%41" in
+/// an origin-form path and in an absolute-form host both stay accepted
+/// — the host-mode gate above covers only the CONNECT authority.)
 fn target_has_invalid_escape(target: &str) -> bool {
     let path = target.split_once('?').map_or(target, |(p, _q)| p);
     let b = path.as_bytes();
@@ -1933,6 +2015,82 @@ mod tests {
         assert_eq!(
             parse_request_line("GET /100%25done HTTP/1.1"),
             Some(("GET", "/100%25done", "HTTP/1.1"))
+        );
+        // Absolute-form target (non-CONNECT): path mode over the whole
+        // pre-'?' slice. A WELL-FORMED ASCII escape in the absolute-form
+        // HOST parses here — documented divergence, kept per the review
+        // scope (the host-mode gate below covers the CONNECT authority
+        // only): Go host-modes that region too (probe vs go1.25
+        // http.Server: "GET http://h%41st/x HTTP/1.1" answers 400), and
+        // frp-rs dials absolute-form hosts verbatim, so a %41 host fails
+        // the dial anyway. Malformed escapes in the absolute-form host
+        // reject here exactly like Go ("GET http://h%zzst/x" → 400 —
+        // url.Parse errors before routing, both modes).
+        assert_eq!(
+            parse_request_line("GET http://h%41st/x HTTP/1.1"),
+            Some(("GET", "http://h%41st/x", "HTTP/1.1"))
+        );
+        assert_eq!(parse_request_line("GET http://h%zzst/x HTTP/1.1"), None);
+    }
+
+    /// Review-round fix: a CONNECT authority-form target is validated
+    /// with Go's HOST-mode unescape (net/url/url.go:226 — parseHost over
+    /// the authority of readRequest justAuthority's "http://" + target
+    /// rewrite): a well-formed escape that decodes to an ASCII byte
+    /// (first hex digit < 8) is an error UNLESS it is the literal "%25"
+    /// (the RFC 6874 zone exemption — "%25" decodes to '%'), while
+    /// escapes decoding to obs-text (first hex digit >= 8, "%C3%A9") and
+    /// the "%25" literal pass. Malformed escapes reject in every mode.
+    /// The region split mirrors Go's parse: the authority runs to the
+    /// target's FIRST '/', the remainder (from the '/' on) is the path
+    /// (path mode), the query stays raw. Probe vs go1.25 http.Server:
+    /// "CONNECT h%41st:443" / h%2Fst / h%zzst → 400; h%25st / h%C3%A9st
+    /// → 200 (the "h:4%31" port shape rejects earlier in Go — parseHost's
+    /// validOptionalPort digits-only gate — but same ReadRequest-error
+    /// class). RED on pre-fix code: the escape scan was path-mode over
+    /// the whole target, so the well-formed ASCII escapes (%41/%2F/%40)
+    /// parsed and reached the CONNECT dial — only malformed %zz
+    /// rejected.
+    #[test]
+    fn test_parse_request_line_connect_host_mode_escapes() {
+        // ASCII-decoding escapes in the authority: host-mode rejects
+        // (Go: "invalid URL escape", ReadRequest → 400 → silent close
+        // on the http_proxy CONNECT arm).
+        assert_eq!(parse_request_line("CONNECT h%41st:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h%2Fst:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h%5Bst:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h%40st:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h%7Fst:443 HTTP/1.1"), None);
+        // Port-region escape: same rejection class (Go's validOptionalPort
+        // digit gate fires first there — either way a ReadRequest error).
+        assert_eq!(parse_request_line("CONNECT h:4%31 HTTP/1.1"), None);
+        // Malformed escapes reject (both modes agree).
+        assert_eq!(parse_request_line("CONNECT h%zzst:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h%2:443 HTTP/1.1"), None);
+        // "%25" (the exemption — decodes to '%') and obs-text decodes
+        // ("%C3%A9" → 'é') pass.
+        assert_eq!(
+            parse_request_line("CONNECT h%25st:443 HTTP/1.1"),
+            Some(("CONNECT", "h%25st:443", "HTTP/1.1"))
+        );
+        assert_eq!(
+            parse_request_line("CONNECT h%C3%A9st:443 HTTP/1.1"),
+            Some(("CONNECT", "h%C3%A9st:443", "HTTP/1.1"))
+        );
+        // Region split at the first '/': authority host-mode, path (from
+        // the '/') path-mode, query raw.
+        assert_eq!(
+            parse_request_line("CONNECT h%25st:443/a%41?q=%zz HTTP/1.1"),
+            Some(("CONNECT", "h%25st:443/a%41?q=%zz", "HTTP/1.1"))
+        );
+        assert_eq!(parse_request_line("CONNECT h%25st:443/a%zz HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h%41st:443/a HTTP/1.1"), None);
+        // '/'-prefixed CONNECT targets are path-form in Go (justAuthority
+        // only applies when the target does NOT start with '/') — path
+        // mode throughout.
+        assert_eq!(
+            parse_request_line("CONNECT /rpc%41 HTTP/1.1"),
+            Some(("CONNECT", "/rpc%41", "HTTP/1.1"))
         );
     }
 

@@ -831,10 +831,16 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     // head — interim and final alike, one per call — at its own 1 MiB read
     // cap (+ one 4 KiB read slack), far under Go's 10 MiB. A giant final
     // head therefore fails the per-head cap and answers 502 without ever
-    // touching the interim budget; the worst-case cumulative (~11 MiB) is
-    // equivalent-or-tighter than Go's 10 MiB single bucket. Past the
-    // budget the response fails the way an oversized single head fails —
-    // 502. Every wire byte counts exactly once: `head` always starts with
+    // touching the interim budget; the worst-case cumulative (~11 MiB =
+    // 10 MiB of interim heads + one 1 MiB final head) is slightly LARGER
+    // than Go's 10 MiB single bucket — deliberate: this listener binds
+    // the operator's own 127.0.0.1 port and serves only their local
+    // browser, the same operator-local face that keeps the plugin-h2
+    // max_header_list_size at Go's 16 MiB default (see the round-13
+    // note in plugin/h2.rs) — the tight 10 MiB budget exists on the
+    // untrusted public vhost surface, not here. Past the budget the
+    // response fails the way an oversized single head fails — 502.
+    // Every wire byte counts exactly once: `head` always starts with
     // the carried seed (read_until_head only appends), so `head.len() -
     // carried` is the new bytes, and bytes past the terminator that rode
     // in the read buffer are counted here and never re-counted (the next

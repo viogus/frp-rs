@@ -1409,10 +1409,12 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     }
 
     // FIX 1: responses to HEAD requests and the no-body statuses 204/304
-    // never carry a DATA body — Go's net/http sets Body = NoBody for all of
-    // them (noBodyAllowedStatuses 204/304 + the HEAD method; transport
-    // response.go `bodyAllowedForStatus`), so the h2 relay must end the
-    // stream with the response head. The body legs below would otherwise
+    // never carry a DATA body — Go's net/http server suppress gate is
+    // server.go:1513 (`req.Method == "HEAD" || !bodyAllowedForStatus(code)`
+    // || code == StatusNoContent), with `bodyAllowedForStatus` at
+    // transfer.go:459-461 returning false for 204/304/1xx — so the h2 relay
+    // must end the stream with the response head. The body legs below would
+    // otherwise
     // park forever on a backend that DECLARES a Content-Length on such an
     // answer and then holds the connection open with no body bytes (a lie
     // for these statuses — HEAD says so by definition, 204/304 by RFC) —

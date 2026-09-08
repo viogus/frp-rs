@@ -2187,7 +2187,7 @@ async fn run_sudp_message_bridge(
 /// `httputil.ReverseProxy.ResponseHeaderTimeoutS`. Pure wrapper over
 /// [`crate::vhost::clamp_vhost_timeout`] so the floor/cap semantics have a
 /// unit pin without spawning a bridge: a `<= 0` config floors to 60s — Go's
-/// own `NewHTTPReverseProxy` does this floor (pkg/util/vhost/http.go:47-49:
+/// own `NewHTTPReverseProxy` does this floor (pkg/util/vhost/http.go:50-52:
 /// `if option.ResponseHeaderTimeoutS <= 0 { option.ResponseHeaderTimeoutS =
 /// 60 }`), so an unset value is 60s, never "no deadline" — and positive
 /// values cap at 24h (Rust-only hardening against hostile huge configs; Go
