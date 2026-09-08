@@ -439,8 +439,8 @@ pub async fn write_not_found_response(
 /// a Snappy stream. It is independent of the opposite direction's compression
 /// (see `bridge_user_to_work`): callers that supply an ALREADY-decompressed
 /// read stream (e.g. frp-server's response-header injector over a
-/// `SnappyDecompressReader`) pass false while the user→work direction keeps
-/// compressing.
+/// [`SnappyStreamReader`](crate::snappy_stream::SnappyStreamReader)) pass
+/// false while the user→work direction keeps compressing.
 async fn bridge_work_to_user(
     mut work_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
@@ -746,9 +746,10 @@ pub async fn bridge_encrypted(
 /// DECOMPRESSED plaintext — Go frp's vhost ReverseProxy/ModifyResponse sits
 /// above the transport's snappy layer, so it always injects into plaintext.
 /// When a compressed http proxy carries `response_headers`, frp-server wraps
-/// the decrypted stream in a [`SnappyDecompressReader`] before the injector
-/// and calls this variant; without it the injector would parse Snappy bytes
-/// (corrupt splices / silent injection loss).
+/// the decrypted stream in a
+/// [`SnappyStreamReader`](crate::snappy_stream::SnappyStreamReader) before
+/// the injector and calls this variant; without it the injector would parse
+/// Snappy bytes (corrupt splices / silent injection loss).
 #[allow(clippy::too_many_arguments)]
 pub async fn bridge_encrypted_decompressed_read(
     user_r: impl AsyncReadExt + Unpin,
@@ -863,9 +864,11 @@ pub async fn bridge_plain(
 
 /// Like [`bridge_plain`], but the work→user read stream is assumed to be
 /// ALREADY decompressed by the caller (frp-server's response-header injector
-/// over a [`SnappyDecompressReader`]); only the user→work write direction
-/// compresses. See [`bridge_encrypted_decompressed_read`] for the audit
-/// round-14 A1 rationale.
+/// over a
+/// [`SnappyStreamReader`](crate::snappy_stream::SnappyStreamReader)); only the
+/// user→work write direction compresses. See
+/// [`bridge_encrypted_decompressed_read`] for the audit round-14 A1
+/// rationale.
 #[allow(clippy::too_many_arguments)]
 pub async fn bridge_plain_decompressed_read(
     user_r: impl AsyncReadExt + Unpin,
@@ -1017,8 +1020,9 @@ pub async fn bridge_plain_rate_limited(
 
 /// Like [`bridge_plain_rate_limited`], but the work→user read stream is
 /// assumed to be ALREADY decompressed by the caller (frp-server's
-/// response-header injector over a [`SnappyDecompressReader`]); only the
-/// user→work write direction compresses. See
+/// response-header injector over a
+/// [`SnappyStreamReader`](crate::snappy_stream::SnappyStreamReader)); only
+/// the user→work write direction compresses. See
 /// [`bridge_encrypted_decompressed_read`] for the audit round-14 A1
 /// rationale.
 #[allow(clippy::too_many_arguments)]

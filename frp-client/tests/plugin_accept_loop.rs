@@ -57,22 +57,38 @@ async fn test_plugin_accept_loop_survives_connection_churn() {
         // closed silently; the render changed, the close did not.)
         client.write_all(b"not-an-http-request\r\n").await.unwrap();
         client.shutdown().await.unwrap();
-        let mut buf = [0u8; 32];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf))
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "churn iteration {i}: read timed out — connection was never accepted/handled"
-                )
-            })
-            .expect("read");
+        // A single TCP read may return only a partial prefix of the render
+        // (TCP has no message boundaries), so gather until the status-line
+        // prefix "HTTP/1.1 400" (12 bytes) is complete or the handler closed
+        // (EOF) — a partial-read must not false-RED a correct handler.
+        let mut head = Vec::with_capacity(32);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while head.len() < 12 {
+                let mut chunk = [0u8; 16];
+                let m = client.read(&mut chunk).await.expect("read");
+                if m == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..m]);
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "churn iteration {i}: read timed out before the status line was complete \
+                 — connection was never accepted/handled"
+            )
+        });
         assert!(
-            n > 0 && buf[..n].starts_with(b"HTTP/1.1 400"),
+            head.starts_with(b"HTTP/1.1 400"),
             "churn iteration {i}: handler must answer the Go 400 render then close, \
-             got {n} bytes"
+             got {} bytes: {:?}",
+            head.len(),
+            String::from_utf8_lossy(&head)
         );
         // The handler closes right after the render — drain to EOF (bounded)
-        // so the close is observed too.
+        // so the close is observed too (also consumes any bytes of the render
+        // that arrived after the status-line prefix above).
         let mut rest = [0u8; 16];
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {

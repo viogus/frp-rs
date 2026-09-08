@@ -25,6 +25,14 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
     }
     let auth = HttpProxyAuth::from_config(cfg);
     let local_path = cfg.local_path.clone();
+    // Round-16 FIX 14 (comment only): Go frp's router registers the strip
+    // route as `PathPrefix("/" + StripPrefix + "/")` VERBATIM
+    // (pkg/plugin/client/static_file.go): a config value carrying its own
+    // slashes — "static/", "/static", "/static/" — produces the prefix
+    // "/static//" or "//static/" in Go, and every real request then 404s.
+    // frp-rs TRIMS the slashes and serves "static/" configs exactly like
+    // "static" — a documented, deliberate divergence (friendlier; the byte
+    // difference exists only for configs Go cannot serve at all).
     let strip_prefix: Option<String> = if cfg.strip_prefix.is_empty() {
         None
     } else {
@@ -55,16 +63,22 @@ async fn handle_static_file_conn(
     strip_prefix: Option<&str>,
 ) -> Result<(), String> {
     // Deliberate divergence — gorilla's router-level cleanPath 301 is NOT
-    // replicated. Go frp's router (gorilla mux ServeHTTP, mux.go:175-200)
-    // rewrites dot-segment / duplicate-slash request paths with a canonical
-    // 301 BEFORE route matching, auth, and the method gate: "/static/../x"
-    // answers 301 -> "/x" (probe-verified vs gorilla v1.8.1: Location is the
-    // cleaned absolute path with the query preserved). frp-rs instead
-    // resolves dot-segments and duplicate slashes internally via the
+    // replicated in full. Go frp's router (gorilla mux ServeHTTP,
+    // mux.go:175-200) rewrites dot-segment / duplicate-slash request paths
+    // with a canonical 301 BEFORE route matching, auth, and the method gate:
+    // "/static/../x" answers 301 -> "/x" (probe-verified vs gorilla v1.8.1:
+    // Location is the cleaned absolute path with the query preserved). frp-rs
+    // instead resolves dot-segments and duplicate slashes internally via the
     // root-anchored clean in `resolve_static_parts` and serves the canonical
-    // file directly — no redirect round-trip. Same final content, different
-    // wire (200 where Go sends 301); the method/auth gates here still run in
-    // the gorilla order on the RAW path.
+    // FILE directly — no redirect round-trip: same final content, different
+    // wire (200 where Go sends 301). The DIRECTORY redirect arms below must
+    // then redirect from a canonical Location (round-16 FIX 11): when the
+    // decoded path is non-canonical (gorilla would have cleanPath-301'd at
+    // the router), they emit the single-hop ABSOLUTE Location of the cleaned
+    // path + "/" (Go's two-hop chain folded into one — the second hop lands
+    // on the same canonical listing); canonical paths keep Go FileServer's
+    // relative path.Base + "/" Location. The method/auth gates here still
+    // run in the gorilla order on the RAW path.
     //
     // Read the request head in chunks. Head end follows Go textproto
     // semantics (the engine behind http.ReadRequest): each line ends at the
@@ -73,14 +87,70 @@ async fn handle_static_file_conn(
     // \r\n\r\n. Stop at the first empty line anywhere in the buffer (not
     // only at its end): a pipelined or body-carrying request may follow the
     // head terminator with more bytes, and the tail-only check would read
-    // past it into the next request until the 64 KiB cap.
+    // past it into the next request.
     // Go parity: http.Server ReadHeaderTimeout (60s) — one absolute deadline
     // over the whole header read, so a slowloris "trickle" cannot park the
     // task + fd + plugin listener slot indefinitely.
+    // The 1 MiB cap below is Go's http.Server MaxHeaderBytes DEFAULT on
+    // this gorilla-mux/http.Server face (Go frp static_file.go serves
+    // through gorilla on a stock http.Server) — the same default the
+    // http.rs plugin plain arm uses. The old 64 KiB cap rejected request
+    // heads Go serves: 100+ KiB Cookie or Authorization headers are legal
+    // HTTP. Go enforces the cap as a READ LIMIT, not a size gate:
+    // conn.readRequest sets c.r.setReadLimit(initialReadLimitSize) =
+    // maxHeaderBytes + 4096 bufio slop (server.go), and the parser only
+    // errors when the limit is consumed with the head still INCOMPLETE — a
+    // head whose empty-line terminator arrived within the limit parses and
+    // serves (the http.rs mirror loop documents the probe: a terminated
+    // ~1 MiB+64 head answers 200 in go1.25). The loop below mirrors that
+    // model exactly like http.rs: the terminator scan runs BEFORE the cap
+    // check, so a completed head serves no matter how large the buffer
+    // grew, and the 4096-byte reads reproduce Go's bufio slack — the
+    // buffer can overshoot the cap by one chunk, and a terminator inside
+    // that overshoot still serves (boundary parity with Go: served
+    // <= ~1 MiB+4096, 431 above). Unlike http.rs there is no CONNECT arm
+    // to classify — every static_file face is the plain http.Server one —
+    // so a breach renders Go's 431 page (Go errTooLarge writes the render
+    // before the handler runs) and errors. A truncated render is possible
+    // only when the 60 s drip deadline fires mid-write — accepted: the
+    // peer that overflows the cap is by definition misbehaving.
+    // History (why the loop reads the way it does): before this round the
+    // 64 KiB cap check sat AFTER the terminator break — a TERMINATED head
+    // of any size broke out on the head_end scan and served (the cap never
+    // ran on the terminator path; the old comment's claim that such heads
+    // "grew unbounded" was wrong — they broke out and were served), while
+    // an UNTERMINATED head hit the cap only on the loop iteration after
+    // crossing 64 KiB and errored silently. The round-16-wave intermediate
+    // then moved the cap check BEFORE the terminator scan and 431'd every
+    // terminated head past 64 KiB — the divergence this read-limit model
+    // fixes: a 70 KiB terminated head is Go-served and must serve here
+    // (pin test_static_file_e2e_oversize_head_431 was flipped to prove
+    // it). The old loop also re-scanned the whole buffer per 512 B chunk
+    // (quadratic); the 4 KiB chunk below keeps the rescans bounded.
     let buf = tokio::time::timeout(Duration::from_secs(60), async {
         let mut buf = Vec::new();
-        let mut chunk = [0u8; 512];
+        // 4 KiB chunks: the cap check runs after the terminator scan, so
+        // the buffer can overshoot 1 MiB by up to one chunk before the
+        // breach is detected — Go's bufio slack is the same 4096
+        // (initialReadLimitSize = MaxHeaderBytes + 4096), keeping the
+        // served/431 boundary byte-aligned with Go.
+        let mut chunk = [0u8; 4096];
         loop {
+            // Terminator scan FIRST: Go's read limit only errors when the
+            // limit is consumed with the head still incomplete — a head
+            // whose empty line is already in the buffer was completed in
+            // time and parses. Only an overshoot that contains NO
+            // terminator is a breach (431 — Go errTooLarge renders before
+            // the handler runs).
+            if frp_core::textproto::head_end(&buf).is_some() {
+                break;
+            }
+            if buf.len() > 1024 * 1024 {
+                if let Err(we) = client.write_all(super::GO_431_RENDER.as_bytes()).await {
+                    tracing::debug!(error = %we, "plugin relay error: {}", we);
+                }
+                return Err("request head too large".into());
+            }
             let n = client
                 .read(&mut chunk)
                 .await
@@ -89,12 +159,6 @@ async fn handle_static_file_conn(
                 return Err("connection closed".into());
             }
             buf.extend_from_slice(&chunk[..n]);
-            if frp_core::textproto::head_end(&buf).is_some() {
-                break;
-            }
-            if buf.len() > 65536 {
-                return Err("request too large".into());
-            }
         }
         Ok::<Vec<u8>, String>(buf)
     })
@@ -149,7 +213,14 @@ async fn handle_static_file_conn(
     //      already stopped at the bare 405 above.
     //   4. http.FileServer → 301 localRedirect / index.html / dirList /
     //      file serve.
-    let (rel_path, url_remainder) = match resolve_static_parts(url_path, strip_prefix) {
+    // Decode the URL path to BYTES (round-16 FIX 2 — byte-level decode, see
+    // urlencoding_decode; non-ASCII names must survive as bytes, not as
+    // Latin-1 chars) and compute the gorilla cleanPath canonical form of the
+    // FULL decoded path (prefix included — gorilla cleans at the router,
+    // before StripPrefix). The dir-301 arm uses both below.
+    let decoded_path = urlencoding_decode(url_path);
+    let canonical_full = clean_path_canonical(&decoded_path);
+    let (rel_components, url_remainder) = match resolve_static_parts(&decoded_path, strip_prefix) {
         Ok(parts) => parts,
         Err(e) => {
             // Audit FIX 6: a URL outside the route (Go: gorilla PathPrefix
@@ -196,31 +267,41 @@ async fn handle_static_file_conn(
     // auth — one pass, one trim, same result). Runs after the route and
     // method gates (Go: the middleware wraps only fully-matched routes) and
     // before every FileServer-internal response below.
-    let mut authorization = String::new();
+    let mut authorization: Option<String> = None;
     let mut if_modified_since = None;
     for line in lines {
         if let Some((key, value)) = line.split_once(':') {
             let key = key.trim();
             let value = value.trim();
-            if key.eq_ignore_ascii_case("authorization") {
-                authorization = value.to_string();
-            } else if key.eq_ignore_ascii_case("if-modified-since") {
+            // Go Header.Get FIRST-value semantics (net/textproto: duplicate
+            // rows accumulate into a slice; Header.Get returns v[0]) — the
+            // first row wins, an empty-value row included (round-16 FIX 7;
+            // the old last-wins assignment mirrored nothing in Go).
+            if key.eq_ignore_ascii_case("authorization") && authorization.is_none() {
+                authorization = Some(value.to_string());
+            } else if key.eq_ignore_ascii_case("if-modified-since") && if_modified_since.is_none() {
                 if_modified_since = Some(value.to_string());
             }
         }
     }
 
-    if !auth.check(&authorization) {
+    if !auth.check(authorization.as_deref().unwrap_or("")) {
         // Go frp compat: 200ms delay to slow brute-force attacks.
         sleep(Duration::from_millis(200)).await;
         // Go frp static_file.go wraps NewHTTPAuthMiddleware
         // (pkg/util/net/http.go:45-59): realm "Restricted" + http.Error →
         // text/plain body "Unauthorized\n", nosniff, no Connection header.
         // (Probe-verified against Go v0.71.0; Go also adds net/http's Date.)
+        // Round-16 FIX 12: the header name on the wire is Go-canonicalized
+        // — net/http writes "Www-Authenticate:", never the registry casing
+        // "WWW-Authenticate:" (probe vs go1.25.12 and Go frp v0.71.0 both
+        // emit Www-Authenticate). The old pin at the integration test
+        // frp-client/tests/plugin_static_file.rs:133 asserted the uncased
+        // spelling and must flip with it (out of scope here — reported).
         let resp = b"HTTP/1.1 401 Unauthorized\r\n\
                        Content-Length: 13\r\n\
                        Content-Type: text/plain; charset=utf-8\r\n\
-                       WWW-Authenticate: Basic realm=\"Restricted\"\r\n\
+                       Www-Authenticate: Basic realm=\"Restricted\"\r\n\
                        X-Content-Type-Options: nosniff\r\n\
                        \r\n\
                        Unauthorized\n";
@@ -230,92 +311,224 @@ async fn handle_static_file_conn(
         return Err("auth failed".into());
     }
 
-    // Rust-only hardening (Go has no equivalent — see the symlink arm
-    // below): reject path traversal (component-level check). Audit FIX 9:
-    // resolve_static_path cleans root-anchored (Go path.Clean), so no
-    // ".."/empty/"." component can survive — this is unreachable defense
-    // kept for depth (Go needs no equivalent: the cleaned name cannot
-    // escape http.Dir either).
-    if !validate_rel_path(&rel_path) {
+    // Build the full filesystem path from the CLEANED relative components.
+    // join_components is cfg(unix) byte-capable (OsStringExt), so non-UTF-8
+    // names survive all the way to the open (round-16 FIX 2). Path traversal
+    // needs no runtime check: the components come from the root-anchored
+    // clean below, which admits no empty / "." / ".." member, and the
+    // open-handle guard that follows is the real defense.
+    let full_path = join_components(local_path, &rel_components);
+
+    // ----------------------------------------------------------------
+    // Go http.FileServer-equivalent arms (serveFile, fs.go:679-762),
+    // preceded by the Rust-only guard — round-16 FIX 6: the guard runs
+    // BEFORE every FileServer arm. The old order ran the directory arms
+    // (dir-301, index swap, dirList) ahead of the canonicalize + fd check,
+    // so a symlink-to-outside-directory 301'd and then dirListed outside
+    // `local_path`. The one arm the guard does not precede is the
+    // index.html-suffix redirect below — it does no file I/O and leaks
+    // nothing (its refetch of the directory is itself guarded).
+    // ----------------------------------------------------------------
+
+    // Round-16 FIX 3: Go serveFile's FIRST arm (fs.go:682-688) — a URL
+    // path ending in "/index.html" answers 301 Location: ./ REGARDLESS of
+    // existence, before fs.Open (probe vs go1.25.12: served AND deleted
+    // index.html both redirect; ?query preserved). The redirect keeps the
+    // relative links inside a served index.html resolvable against the
+    // directory. The suffix test runs on the Go equivalent of the STRIPPED
+    // URL.Path — Go's StripPrefix hands FileServer "/index.html" (leading
+    // slash kept); the prefix-stripped remainder lacks it, so the "/" is
+    // re-attached only for the test.
+    let suffix_probe: std::borrow::Cow<'_, [u8]> = if url_remainder.starts_with(b"/") {
+        std::borrow::Cow::Borrowed(&url_remainder)
+    } else {
+        let mut p = Vec::with_capacity(url_remainder.len() + 1);
+        p.push(b'/');
+        p.extend_from_slice(&url_remainder);
+        std::borrow::Cow::Owned(p)
+    };
+    if suffix_probe.ends_with(b"/index.html") {
+        // Go localRedirect(w, r, "./") — query appended only when non-empty
+        // (fs.go:785-791; round-16 FIX 10).
+        let mut location = Vec::with_capacity(3);
+        location.extend_from_slice(b"./");
+        append_raw_query(&mut location, raw_query);
+        let resp = render_301(&location);
+        if let Err(e) = client.write_all(&resp).await {
+            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        }
+        return Err(format!("index.html suffix redirect: {url_path}"));
+    }
+
+    // Rust-only hardening (Go's http.Dir cleans the joined name — path.Clean
+    // clamps "..", so traversal cannot escape — then deliberately FOLLOWS
+    // symlinks wherever they point; escaping the root is a documented Go
+    // footgun this plugin declines to copy): canonicalize the base directory
+    // per request (a startup cache went stale when a base-dir symlink
+    // retargeted — versioned deploys — and 403'd every file; round-17
+    // review LOW), open the target, then verify via the ALREADY-OPEN handle
+    // that it stays within the base. The verification must resolve the open
+    // fd's inode, not re-resolve the path: re-canonicalizing the path after
+    // open() lets a symlink swap between the two make the check disagree
+    // with the opened inode (TOCTOU). Cost: a short path walk per request,
+    // not per byte.
+    let base = std::fs::canonicalize(local_path)
+        .map_err(|e| format!("failed to resolve base directory '{}': {e}", local_path))?;
+
+    let file = match std::fs::File::open(&full_path) {
+        Ok(f) => f,
+        Err(e) => {
+            // An open miss renders Go's 404 page — serveError/toHTTPError
+            // (fs.go:680-696) maps IsNotExist → 404 page, IsPermission →
+            // 403 page, anything else → 500, all via http.Error; the
+            // frp-rs arm collapses all three to the shared 404 page.
+            if let Err(we) = client
+                .write_all(super::GO_404_NOT_FOUND_RENDER.as_bytes())
+                .await
+            {
+                tracing::debug!(error = %we, "plugin relay error: {}", we);
+            }
+            return Err(format!("failed to open {}: {e}", full_path.display()));
+        }
+    };
+    let resolved = open_handle_canonical(&file, &full_path)?;
+    if !resolved.starts_with(&base) {
+        // Escaping target — 403, redirects and listings included
+        // (round-16 FIX 6). Content-Length: 0 head, repo shape.
         let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         if let Err(e) = client.write_all(resp).await {
             tracing::debug!(error = %e, "plugin relay error: {}", e);
         }
         return Err("path traversal rejected".into());
     }
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", full_path.display()))?;
 
-    // Build full filesystem path
-    let mut full_path = std::path::PathBuf::from(local_path);
-    if !rel_path.is_empty() {
-        full_path = full_path.join(&rel_path);
-    }
+    // Go serveFile keeps (f, d) as a mutable pair and swaps BOTH on an
+    // index.html hit (fs.go:742-744) — the metadata a later arm reads must
+    // describe the SWAPPED target. frp-rs mirrors with a triple (handle,
+    // metadata, canonical path); `resolved` doubles as the symlink-free
+    // path the listing arms read from (an escaping target already 403'd,
+    // so reading `resolved` never leaves the base).
+    let mut f = file;
+    let mut f_meta = meta;
+    let mut f_canon = resolved;
 
-    // Go http.FileServer localRedirect parity (audit round-7 finding): a
-    // directory URL that does not end in '/' answers 301 Moved Permanently
-    // with Location = path.Base(stripped URL path) + "/" — RELATIVE, so it
-    // stays correct under the strip prefix (Go fs.go:705-715, "./" for
-    // .../index.html and dirList included) — plus "?" + RawQuery when the
-    // request has a query (fs.go localRedirect appends it verbatim). Go
-    // redirects BEFORE index.html is served: the relative links inside a
-    // served index.html would otherwise resolve against the slash-less
-    // URL. The arm sits INSIDE http.FileServer — after Go frp's auth
-    // middleware (401 first, then the redirect) and unreachable for
-    // non-GET (the route method gate above already answered 405 — gorilla
-    // never hands another method to FileServer; probe: POST on a
-    // slash-less dir is 405, never this 301). Render is frp-rs-shaped: Go's
-    // wire adds a Date header and keep-alives the conn, this plugin closes
-    // after every response (repo convention, no Date anywhere).
-    let slash_terminated = url_remainder.is_empty() || url_remainder.ends_with('/');
-    if full_path.is_dir() && !slash_terminated {
-        // Go path.Base of the stripped URL path: last non-empty segment
-        // ("." for a bare trailing "/." — path.Base("") is unreachable:
-        // an empty remainder only follows an exact-boundary request like
-        // "/static/", which is slash-terminated).
-        let base = url_remainder
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(".");
-        let mut location = format!("{base}/");
-        if let Some(q) = raw_query {
-            location.push('?');
-            location.push_str(q);
+    // Directory handling — serveFile's redirect block (fs.go:705-725) runs
+    // inside http.FileServer: after Go frp's auth middleware (401 first,
+    // then the redirect) and unreachable for non-GET (the route method gate
+    // above already answered 405 — gorilla never hands another method to
+    // FileServer; probe: POST on a slash-less dir is 405, never this 301).
+    // Round-16 FIX 11: the arm fires only for in-base targets (guard-first).
+    let slash_terminated = url_remainder.is_empty() || url_remainder.ends_with(b"/");
+    if f_meta.is_dir() {
+        // A directory URL that does not end in '/' answers 301 with a
+        // Location derived from the CLEANED path:
+        //   * canonical request path → Go FileServer localRedirect:
+        //     RELATIVE Location = path.Base(stripped URL path) + "/"
+        //     (fs.go:705-713) — relative stays correct under the strip
+        //     prefix. Query appended verbatim.
+        //   * non-canonical path (dot-segments / duplicate slashes —
+        //     gorilla cleanPath would have 301'd at the ROUTER, pre-auth
+        //     and pre-strip) → ABSOLUTE single-hop Location: escaped
+        //     cleaned FULL path + "/" (Go's chain is two hops — router 301
+        //     to the canonical path, then the FileServer redirect above;
+        //     the fold redirects once to the canonical slash-terminated
+        //     URL). A relative Location from the UNCLEANED remainder would
+        //     send the client back to the non-canonical URL (handler-head
+        //     note; round-16 FIX 11 — the old code derived every Location
+        //     from the uncleaned remainder, so "/static//sub" 301'd back to
+        //     "/static//sub/" and never converged).
+        if !slash_terminated {
+            let mut location: Vec<u8>;
+            if canonical_full != decoded_path {
+                location = Vec::with_capacity(canonical_full.len() + 8);
+                location.extend_from_slice(url_escape_bytes(&canonical_full).as_bytes());
+                if canonical_full.len() > 1 {
+                    location.push(b'/');
+                }
+            } else {
+                // Canonical: Go path.Base of the stripped URL path — last
+                // non-empty cleaned component. (A bare trailing "/."
+                // cleaning to the root is non-canonical and took the arm
+                // above; "." is unreachable here but mirrors Go's
+                // path.Base("") fallback shape.)
+                location = Vec::with_capacity(8);
+                match rel_components.last() {
+                    Some(base) => location.extend_from_slice(base),
+                    None => location.extend_from_slice(b"."),
+                }
+                location.push(b'/');
+            }
+            append_raw_query(&mut location, raw_query);
+            let resp = render_301(&location);
+            if let Err(e) = client.write_all(&resp).await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
+            return Err(format!("directory without trailing slash: {url_path}"));
         }
-        let resp = format!(
-            "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\n\
-             Content-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        if let Err(e) = client.write_all(resp.as_bytes()).await {
-            tracing::debug!(error = %e, "plugin relay error: {}", e);
-        }
-        return Err(format!("directory without trailing slash: {url_path}"));
-    }
 
-    // Go serveFile directory handling (fs.go:713-741): an existing
-    // directory swaps to index.html when the index entry opens+stats
-    // cleanly — an entry that exists but is itself a directory stays
-    // swapped (Go then lists ITS contents below). A missing index leaves
-    // the directory as the target.
-    if full_path.is_dir() {
-        let index = full_path.join("index.html");
-        if std::fs::metadata(&index).is_ok() {
-            full_path = index;
+        // Go serveFile index.html swap (fs.go:735-745): OPEN-based — when
+        // the index entry opens and stats cleanly, the target swaps to it,
+        // even when the index entry is ITSELF a directory (Go then lists
+        // ITS contents below). Round-16 FIX 7: the old code probed with
+        // std::fs::metadata — a mode-000 index.html stats cleanly but fails
+        // to OPEN, so Go skips the swap and dirLists the directory (200);
+        // the metadata probe swapped, and the later open 404'd. A missing
+        // index leaves the directory as the target.
+        let index_path = f_canon.join("index.html");
+        if let Ok(ix) = std::fs::File::open(&index_path) {
+            // Rust-only: an index.html symlink escaping the base is denied
+            // (Go would serve the outside file).
+            let ix_canon = open_handle_canonical(&ix, &index_path)?;
+            if !ix_canon.starts_with(&base) {
+                let resp =
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                if let Err(e) = client.write_all(resp).await {
+                    tracing::debug!(error = %e, "plugin relay error: {}", e);
+                }
+                return Err("path traversal rejected".into());
+            }
+            if let Ok(im) = ix.metadata() {
+                f = ix;
+                f_meta = im;
+                f_canon = ix_canon;
+            }
+            // Stat error (raced deletion): keep the directory — Go's
+            // `ff, err := fs.Open(index); if err != nil { return }` arm
+            // likewise leaves d/f untouched.
         }
-    }
+        // Swapped target may now be a FILE — Go re-tests `d.IsDir()` after
+        // the swap and serves the swapped file via serveContent when it is;
+        // the listing arm below is the still-a-directory case (an index
+        // entry that is itself a directory, or no openable index at all).
+        if !f_meta.is_dir() {
+            return serve_open_file(
+                &mut client,
+                f,
+                &f_meta,
+                &f_canon,
+                if_modified_since.as_deref(),
+            )
+            .await;
+        }
 
-    // Go serveFile "still a directory" arm (fs.go:728-741): no index.html
-    // (or the index entry was itself a directory — see the swap above), so
-    // answer Go's dirList page. Precondition order mirrors Go:
-    // If-Modified-Since is evaluated against the DIRECTORY mtime first — a
-    // hit answers 304 with no Last-Modified, no Content-Type, no CL (Go's
-    // setLastModified for the listing runs only after the IMS gate passes;
-    // probe-verified go1.25: dir 304 wire is status + Date + Connection
-    // only — the frp-rs no-LM 304 shape is exact parity on this arm) —
-    // then the 200 listing carries Last-Modified of the directory.
-    if full_path.is_dir() {
-        let meta =
-            std::fs::metadata(&full_path).map_err(|e| format!("failed to stat directory: {e}"))?;
-        let mtime = mtime_secs(&meta);
+        // Go serveFile "still a directory" arm (fs.go:748-756): no
+        // openable index.html (or the index entry was itself a directory —
+        // see the swap above), so answer Go's dirList page. Precondition
+        // order mirrors Go: If-Modified-Since is evaluated against the
+        // CURRENT target's mtime first (possibly the swapped index-dir) — a
+        // hit answers 304 with no Last-Modified, no Content-Type, no CL.
+        // Round-16 FIX 15 (citation): Go's setLastModified for the listing
+        // runs only after the IMS gate passes (probe-verified go1.25: dir
+        // 304 wire = status + Date) — the frp-rs no-LM 304 head is the same
+        // header SET minus Go's Date plus the repo's Connection: close.
+        // "Exact parity" was previously claimed here — overstated: Go
+        // stamps Date and keep-alives the connection; frp-rs closes after
+        // every response, no Date anywhere (repo convention). Then the 200
+        // listing carries Last-Modified of the current target.
+        let mtime = mtime_secs(&f_meta);
         if let Some(ims) = if_modified_since
             .as_deref()
             .and_then(parse_if_modified_since)
@@ -331,7 +544,7 @@ async fn handle_static_file_conn(
                 }
             }
         }
-        let body = match render_dir_listing(&full_path) {
+        let body = match render_dir_listing(&f_canon) {
             Ok(b) => b,
             Err(e) => {
                 // Go dirList read error (fs.go:158-161): log +
@@ -352,7 +565,7 @@ async fn handle_static_file_conn(
                 if let Err(we) = client.write_all(err_body.as_bytes()).await {
                     tracing::debug!(error = %we, "plugin relay error: {}", we);
                 }
-                return Err(format!("dirList failed for {}: {e}", full_path.display()));
+                return Err(format!("dirList failed for {}: {e}", f_canon.display()));
             }
         };
         let mut head =
@@ -373,104 +586,117 @@ async fn handle_static_file_conn(
             .await
             .map_err(|e| format!("write body: {e}"))?;
         return Ok(());
-    }
-
-    // Defense-in-depth: canonicalize the base directory, then open the file
-    // and verify via the ALREADY-OPENED handle that it stays within the base.
-    // The verification must resolve the open fd's inode, not re-resolve the
-    // path: re-canonicalizing the path after open() lets a symlink swap
-    // between the two make the check disagree with the opened inode (TOCTOU).
-    // Round-17 audit F: the base is canonicalized per request — a startup
-    // cache went stale when a base-dir symlink retargeted (versioned deploys)
-    // and 403'd every file (round-17 review LOW). Rust-only hardening: Go's
-    // http.Dir cleans the joined name (path.Clean clamps "..", so traversal
-    // cannot reach any equivalent check) and then deliberately FOLLOWS
-    // symlinks wherever they point — escaping the root without per-request
-    // canonicalization is a documented Go footgun this plugin declines to
-    // copy. Dot-segment / duplicate-slash requests that gorilla would have
-    // answered with a cleanPath 301 (handler-head note) never reach this arm
-    // either: frp-rs resolved them root-anchored in resolve_static_parts and
-    // serves the canonical file directly. The cost of the check is a short
-    // path walk per request, not per byte.
-    let base = std::fs::canonicalize(local_path)
-        .map_err(|e| format!("failed to resolve base directory '{}': {e}", local_path))?;
-
-    // Open the file first, then check the canonical path on the open handle.
-    let file = match std::fs::File::open(&full_path) {
-        Ok(f) => f,
-        Err(e) => {
-            // An open miss renders Go's 404 page — serveError/toHTTPError
-            // (fs.go:704, 680-696) maps IsNotExist → 404 page, IsPermission
-            // → 403 page, anything else → 500, all via http.Error; the
-            // frp-rs arm collapses all three to the shared 404 page. The
-            // old code's bare CL:0 404 head is gone.
-            if let Err(we) = client
-                .write_all(super::GO_404_NOT_FOUND_RENDER.as_bytes())
-                .await
-            {
-                tracing::debug!(error = %we, "plugin relay error: {}", we);
+    } else if slash_terminated {
+        // Round-16 FIX 4: Go serveFile's file-with-trailing-slash redirect
+        // (fs.go:714-724) — a FILE URL ending in '/' answers 301 Location:
+        // "../" + path.Base(url) (the base resolves one directory UP out of
+        // the slash-suffixed URL; probe vs go1.25.12: GET /plain.txt/ →
+        // 301 Location: ../plain.txt). Degenerate: the URL's last path
+        // element is "/" or "." — the root path itself maps to a file —
+        // which Go answers with a 500 "http: attempting to traverse a
+        // non-directory" (fs.go:716-721: `base := path.Base(url); if base
+        // == "/" || base == "."`), rendered here in the repo shape
+        // (http.Error for 5xx: text/plain + nosniff + CL + msg "\n" body).
+        // Round-16 post-fix note (gate equivalence, no code change): Go
+        // gates on the RAW path.Base(url) while this arm gates on
+        // cleaned-components-empty (`rel_components.last()` == None), and
+        // the two are PROVABLY equal on every shape reachable here. The
+        // arm is reachable only when local_path points at a FILE (a
+        // misconfiguration — a directory target with a trailing slash
+        // took the listing/index arms above) and the URL ends in '/'. Go's
+        // FileServer re-slash-prefixes every stripped path and cleans it
+        // (path.Clean) before serveFile, so its url is always "/"-leading:
+        // path.Base(url) == "/" exactly when Clean(url) == "/" — the same
+        // root condition as an empty component list — and the "."-base
+        // shape (path.Base("") == ".") is unreachable because the
+        // request-target "" never reaches this arm (parse_request_line
+        // rejects empty targets; the resolve below strips the prefix, it
+        // never empties a non-empty target). The gate shape is therefore
+        // Go-equivalent on every input; only the misconfig probe e2e
+        // (GET / against a file local_path) exercises it.
+        let Some(base) = rel_components.last() else {
+            const BODY: &str = "http: attempting to traverse a non-directory\n";
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\
+                 X-Content-Type-Options: nosniff\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                BODY.len(),
+                BODY
+            );
+            if let Err(e) = client.write_all(resp.as_bytes()).await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
             }
-            return Err(format!("failed to open {}: {e}", full_path.display()));
-        }
-    };
-
-    // Linux: canonicalize via /proc/self/fd/<fd> — the fd symlink resolves to
-    // the inode the handle is pinned to, closing the TOCTOU window (a symlink
-    // swap after open() cannot change what the fd points at).
-    #[cfg(target_os = "linux")]
-    let resolved = {
-        use std::os::unix::io::AsRawFd;
-        std::fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| format!("failed to resolve path: {e}"))?
-    };
-    // Non-Linux: no /proc/self/fd — re-canonicalize the path. The residual
-    // race (a symlink swap between open() and canonicalize() making the
-    // check disagree with the opened inode) is accepted here; the check
-    // remains defense-in-depth on top of the component-level path validation.
-    #[cfg(not(target_os = "linux"))]
-    let resolved =
-        std::fs::canonicalize(&full_path).map_err(|e| format!("failed to resolve path: {e}"))?;
-    if !resolved.starts_with(&base) {
-        let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        if let Err(e) = client.write_all(resp).await {
+            return Err(format!("file root target: {url_path}"));
+        };
+        let mut location = Vec::with_capacity(base.len() + 4);
+        location.extend_from_slice(b"../");
+        location.extend_from_slice(base);
+        append_raw_query(&mut location, raw_query);
+        let resp = render_301(&location);
+        if let Err(e) = client.write_all(&resp).await {
             tracing::debug!(error = %e, "plugin relay error: {}", e);
         }
-        return Err("path traversal rejected".into());
+        return Err(format!("file target with trailing slash: {url_path}"));
     }
 
-    // Stream the file body in bounded chunks instead of buffering it whole:
-    // the old path blocked the async task on std::fs::read_to_end and
-    // truncated at 64 MiB (Content-Length then lied). Go's http.FileServer
-    // streams the file — so do we, from the already-open, inode-verified
-    // handle (tokio::fs::File wraps the same fd; position is still 0).
-    let mut file = tokio::fs::File::from_std(file);
-    let meta = file
-        .metadata()
-        .await
-        .map_err(|e| format!("failed to stat file: {e}"))?;
-    let size = meta.len();
-    let mtime = mtime_secs(&meta);
-    let mime = mime_from_path(&full_path);
+    // File arm — Go serveContent (fs.go:759-761). The body lives in
+    // `serve_open_file` below, shared with the index-swap-to-file path
+    // inside the directory block above (Go re-tests `d.IsDir()` after the
+    // swap and serves a swapped index FILE here; the listing arm there is
+    // the still-a-directory case).
+    serve_open_file(
+        &mut client,
+        f,
+        &f_meta,
+        &f_canon,
+        if_modified_since.as_deref(),
+    )
+    .await
+}
 
-    // Audit FIX 10: If-Modified-Since precondition — Go serveContent
-    // checkPreconditions. The mtime is truncated to whole seconds (the
-    // header has 1 s resolution); mtime <= IMS → 304, rendered BEFORE the
-    // entity headers and with NO body, NO Content-Length, NO Last-Modified
-    // (the frp-rs render prescribed by the audit; Go's writeNotModified
-    // drops Last-Modified only when an ETag is set — FileServer never sets
-    // one). An unparsable IMS is condNone → serve 200 (Go http.ParseTime
-    // error). A None mtime (platform cannot report it, pre-epoch clock)
-    // disables both Last-Modified and the precondition — Go's zero modtime
-    // behaves the same.
-    if let Some(ims) = if_modified_since
-        .as_deref()
-        .and_then(parse_if_modified_since)
-    {
+/// Go serveContent tail (fs.go:759-761): IMS precondition + bounded-chunk
+/// body stream for an already-open, inode-verified file handle. Streams the
+/// body instead of buffering it whole: the old path blocked the async task
+/// on std::fs::read_to_end and truncated at 64 MiB (Content-Length then
+/// lied). Go's http.FileServer streams the file — so do we, from the
+/// already-open handle (tokio::fs::File wraps the same fd; position is
+/// still 0). `mime_path` is the served FILE's path (the swapped index.html
+/// for the dir-request case — Go names serveContent after the file).
+async fn serve_open_file(
+    client: &mut TcpStream,
+    file: std::fs::File,
+    meta: &std::fs::Metadata,
+    mime_path: &std::path::Path,
+    if_modified_since: Option<&str>,
+) -> Result<(), String> {
+    let size = meta.len();
+    let mtime = mtime_secs(meta);
+    let mime = mime_from_path(mime_path);
+
+    // If-Modified-Since precondition — Go serveContent checkPreconditions.
+    // The mtime is truncated to whole seconds (the header has 1 s
+    // resolution); mtime <= IMS → 304. Round-16 FIX 5: the FILE 304 keeps
+    // its Last-Modified — Go runs setLastModified BEFORE
+    // checkPreconditions, and writeNotModified deletes Last-Modified only
+    // when an ETag is set; FileServer never sets one (probe vs go1.25.12:
+    // file 304 carries Last-Modified). The dir arm above differs: its
+    // setLastModified runs after the IMS gate, hence the no-LM dir 304.
+    // Round-16 FIX 9: a zero-time (epoch) mtime is None here — no
+    // Last-Modified is emitted and the precondition never fires (Go
+    // isZeroTime → condNone → always 200). An unparsable IMS is condNone →
+    // serve 200 (Go http.ParseTime error). A None mtime (platform cannot
+    // report it, pre-epoch clock, zero time) disables both Last-Modified
+    // and the precondition.
+    if let Some(ims) = if_modified_since.and_then(parse_if_modified_since) {
         if let Some(mt) = mtime {
             if mt <= ims {
-                let resp = b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n";
+                let resp = format!(
+                    "HTTP/1.1 304 Not Modified\r\nLast-Modified: {}\r\nConnection: close\r\n\r\n",
+                    format_http_date(mt)
+                );
                 client
-                    .write_all(resp)
+                    .write_all(resp.as_bytes())
                     .await
                     .map_err(|e| format!("write 304: {e}"))?;
                 return Ok(());
@@ -478,9 +704,9 @@ async fn handle_static_file_conn(
         }
     }
 
-    // Audit FIX 10: the 200 arm gains Last-Modified: <mtime as RFC 1123 GMT>
-    // (Go serveContent setLastModified). Method is exactly "GET" when this
-    // arm runs — the gorilla route gate above (Methods("GET") exact-string
+    // The 200 arm gains Last-Modified: <mtime as RFC 1123 GMT> (Go
+    // serveContent setLastModified). Method is exactly "GET" when this arm
+    // runs — the gorilla route gate above (Methods("GET") exact-string
     // match, NO HEAD rewrite) already answered every other method with a
     // bare 405, so no HEAD body-skip is needed here. Go's own
     // `if r.Method == "HEAD" { return }` arm in serveContent is likewise
@@ -501,6 +727,7 @@ async fn handle_static_file_conn(
     // (Documented gaps vs Go FileServer: no gzip compression of served
     // files, no Range/206 handling, no If-None-Match — the audit scoped
     // Last-Modified/304 only.)
+    let mut file = tokio::fs::File::from_std(file);
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let n = file
@@ -527,7 +754,10 @@ async fn handle_static_file_conn(
 /// - The URL path is URL-DECODED first — url.Parse decodes URL.Path before
 ///   the gorilla PathPrefix regexp matches and StripPrefix runs, so "%2F"
 ///   acts as a real "/" (audit round-8 FIX 8 keeps "+" literal — PlusToSpace
-///   is query-only).
+///   is query-only). Round-16 FIX 2: the decode is byte-level — "%C3%AF" is
+///   the two bytes C3 AF (a UTF-8 "ï"), never two Latin-1 characters; a
+///   decoded path is raw BYTES, not necessarily UTF-8, and every consumer
+///   converts explicitly (OsStringExt on unix, lossy elsewhere).
 /// - The strip_prefix route matches ONLY at a component boundary: gorilla
 ///   registers PathPrefix("/{prefix}/"), so "/static", "/staticx/y" and
 ///   "/staticx" are route misses (Audit FIX 6) while "/static/..." strips
@@ -535,55 +765,176 @@ async fn handle_static_file_conn(
 /// - The remainder is cleaned ANCHORED AT THE URL ROOT — Go path.Clean over
 ///   the root-joined name (serveFile: `path.Clean(upath)`): "//" and "/./"
 ///   collapse, "/a/../b" is "b", and ".." clamps at the root — "/../x"
-///   cleans to "/x" and can never escape (Audit FIX 9). The old code
-///   returned ".." components for the caller to reject (403); Go serves the
+///   cleans to "/x" and can never escape (Audit FIX 9). Go serves the
 ///   anchored result (200).
 #[cfg(test)]
 fn resolve_static_path(url_path: &str, strip_prefix: Option<&str>) -> Result<String, String> {
-    Ok(resolve_static_parts(url_path, strip_prefix)?.0)
+    let decoded = urlencoding_decode(url_path);
+    let (components, _remainder) = resolve_static_parts(&decoded, strip_prefix)?;
+    let mut out = String::new();
+    for (i, c) in components.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(&String::from_utf8_lossy(c));
+    }
+    Ok(out)
 }
 
-/// Shared resolver body: returns (cleaned relative path, decoded remainder
-/// of the URL path after the strip boundary). The remainder is the UNcleaned
-/// path Go's serveFile/localRedirect reason over (audit round-7 finding):
-/// fs.go uses url = r.URL.Path — after StripPrefix, i.e. the decoded path
-/// minus the prefix — for both the trailing-slash test and the
-/// path.Base(url) redirect target, never the cleaned name.
+/// Shared resolver body over DECODED BYTES (round-16 FIX 2): returns
+/// (cleaned relative components, decoded remainder of the URL path after the
+/// strip boundary). A component is a raw byte slice — empty / "." / ".."
+/// never survive the clean. The remainder is the UNcleaned path Go's
+/// serveFile/localRedirect reason over (audit round-7 finding): fs.go uses
+/// url = r.URL.Path — after StripPrefix, i.e. the decoded path minus the
+/// prefix — for both the trailing-slash test and the path.Base(url)
+/// redirect target, never the cleaned name.
 fn resolve_static_parts(
-    url_path: &str,
+    decoded: &[u8],
     strip_prefix: Option<&str>,
-) -> Result<(String, String), String> {
-    // URL-decode
-    let decoded = urlencoding_decode(url_path);
-
-    let stripped: &str = match strip_prefix {
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+    let stripped: &[u8] = match strip_prefix {
         Some(prefix) => {
             let boundary = format!("/{prefix}/");
-            match decoded.strip_prefix(&boundary) {
+            match decoded.strip_prefix(boundary.as_bytes()) {
                 Some(rest) => rest,
                 None => {
                     return Err(format!(
-                        "prefix '/{prefix}/' not at a path boundary in '{decoded}'"
+                        "prefix '/{prefix}/' not at a path boundary in '{}'",
+                        String::from_utf8_lossy(decoded)
                     ));
                 }
             }
         }
-        None => decoded.as_str(),
+        None => decoded,
     };
 
     // Root-anchored clean (Go path.Clean): empty and "." components vanish,
     // ".." pops the previous component and clamps at the root.
-    let mut components: Vec<&str> = Vec::new();
-    for part in stripped.split('/') {
+    let mut components: Vec<Vec<u8>> = Vec::new();
+    for part in stripped.split(|&b| b == b'/') {
         match part {
-            "" | "." => {}
-            ".." => {
+            b"" | b"." => {}
+            b".." => {
+                components.pop();
+            }
+            c => components.push(c.to_vec()),
+        }
+    }
+    Ok((components, stripped.to_vec()))
+}
+
+/// gorilla cleanPath (mux.go:280-301) over the decoded path: path.Clean,
+/// then a trailing '/' restored when the original had one — operating on
+/// BYTES (round-16 FIX 2: decoded paths are raw bytes; "/" is the only
+/// byte class that matters to the clean). Used to detect router-level
+/// non-canonical paths: `canonical != decoded` means gorilla would have
+/// 301'd at the router and the FileServer arms must redirect from the
+/// canonical form (round-16 FIX 11).
+fn clean_path_canonical(p: &[u8]) -> Vec<u8> {
+    // gorilla cleanPath identity cases: "" maps to "/", Clean("/") == "/".
+    if p.is_empty() || p == b"/" {
+        return vec![b'/'];
+    }
+    let trailing = p.last() == Some(&b'/');
+    // Root-anchored clean (Go path.Clean over a rooted path — URL paths are
+    // always rooted): empty and "." components vanish, ".." pops the
+    // previous component and clamps at the root.
+    let mut components: Vec<&[u8]> = Vec::new();
+    for part in p.split(|&b| b == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
                 components.pop();
             }
             c => components.push(c),
         }
     }
-    Ok((components.join("/"), stripped.to_string()))
+    let mut out: Vec<u8> = Vec::with_capacity(p.len());
+    out.push(b'/');
+    for c in components {
+        if out.len() > 1 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(c);
+    }
+    if trailing && out.len() > 1 {
+        out.push(b'/');
+    }
+    out
+}
+
+/// Build the target filesystem path from the configured base and the
+/// cleaned relative BYTE components. cfg(unix): components join via
+/// OsString, so non-UTF-8 names survive to the open (round-16 FIX 2);
+/// elsewhere names decode lossily (the lossy path is compile-time only —
+/// Windows/macOS filesystem names are not guaranteed UTF-8 either, but
+/// unix byte-exactness is where the audit found the mojibake).
+#[cfg(unix)]
+fn join_components(base: &str, components: &[Vec<u8>]) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let mut joined = std::ffi::OsString::from(base);
+    for c in components {
+        joined.push("/");
+        joined.push(std::ffi::OsString::from_vec(c.clone()));
+    }
+    std::path::PathBuf::from(joined)
+}
+
+#[cfg(not(unix))]
+fn join_components(base: &str, components: &[Vec<u8>]) -> std::path::PathBuf {
+    let mut joined = std::path::PathBuf::from(base);
+    for c in components {
+        joined.push(String::from_utf8_lossy(c).as_ref());
+    }
+    joined
+}
+
+/// Go 301 render in the repo shape (Location row first, fixed CL:0 +
+/// Connection: close; Go's wire adds Date and keep-alives — documented
+/// divergence, no Date anywhere in this plugin).
+fn render_301(location: &[u8]) -> Vec<u8> {
+    let mut head = Vec::with_capacity(location.len() + 64);
+    head.extend_from_slice(b"HTTP/1.1 301 Moved Permanently\r\nLocation: ");
+    head.extend_from_slice(location);
+    head.extend_from_slice(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    head
+}
+
+/// Go localRedirect query append (fs.go:785-791): "?" + RawQuery is
+/// appended only when RawQuery is NON-EMPTY — a bare "?" (Some("")) must
+/// not leave a stray '?' dangling in the Location (round-16 FIX 10; probe
+/// vs go1.25.12: GET /sub? → Location: sub/ with no '?').
+fn append_raw_query(location: &mut Vec<u8>, raw_query: Option<&str>) {
+    if let Some(q) = raw_query {
+        if !q.is_empty() {
+            location.push(b'?');
+            location.extend_from_slice(q.as_bytes());
+        }
+    }
+}
+
+/// Canonical path of an open handle's inode. Linux: /proc/self/fd/<fd> —
+/// the fd symlink resolves to the inode the handle is pinned to, closing
+/// the TOCTOU window (a symlink swap after open() cannot change what the
+/// fd points at). Elsewhere: canonicalize of `path` — the residual race (a
+/// swap between open() and canonicalize() making the check disagree with
+/// the opened inode) is accepted; the check remains defense-in-depth on
+/// top of the component-level clean.
+fn open_handle_canonical(
+    file: &std::fs::File,
+    _path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        std::fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|e| format!("failed to resolve path: {e}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::fs::canonicalize(_path).map_err(|e| format!("failed to resolve path: {e}"))
+    }
 }
 
 /// Render a directory listing matching Go's dirList (go1.25
@@ -612,42 +963,64 @@ fn resolve_static_parts(
 /// set), everything else — space, '#', '%', non-ASCII — is
 /// percent-encoded byte-wise with uppercase hex. Link-text escaping =
 /// htmlReplacer (net/http server.go): & < > " ' -> &amp; &lt; &gt; &#34;
-/// &#39;. Non-UTF-8 file names are rendered lossily (documented
-/// divergence: Go writes the raw bytes).
+/// &#39;. Entries are sorted byte-wise over the RAW names (Go fs.ReadDir
+/// pre-sorts the same way — lossy-string sorting would misorder invalid
+/// UTF-8 names). Round-16 FIX 2: the href escapes the RAW name bytes, so a
+/// non-UTF-8 name lists as a fetchable %XX href exactly like Go; only the
+/// link TEXT is rendered lossily (documented divergence — Go writes the
+/// raw bytes into the HTML body; the body is a UTF-8 String here).
 fn render_dir_listing(dir: &std::path::Path) -> Result<String, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
-    let mut entries: Vec<(String, bool)> = Vec::new();
+    let mut entries: Vec<(Vec<u8>, bool)> = Vec::new();
     for ent in rd {
         let ent = ent.map_err(|e| format!("read_dir entry in {}: {e}", dir.display()))?;
         let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        entries.push((ent.file_name().to_string_lossy().into_owned(), is_dir));
+        // Raw name BYTES — cfg(unix) without any lossy hop (OsStringExt);
+        // elsewhere names decode lossily at the platform boundary
+        // (compile-time-only path — same rule as join_components).
+        #[cfg(unix)]
+        let name_bytes = {
+            use std::os::unix::ffi::OsStringExt;
+            ent.file_name().into_vec()
+        };
+        #[cfg(not(unix))]
+        let name_bytes = ent.file_name().to_string_lossy().as_bytes().to_vec();
+        entries.push((name_bytes, is_dir));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = String::from(
         "<!doctype html>\n<meta name=\"viewport\" content=\"width=device-width\">\n<pre>\n",
     );
     for (name, is_dir) in entries {
-        let display = if is_dir { format!("{name}/") } else { name };
-        out.push_str(&format!(
-            "<a href=\"{}\">{}</a>\n",
-            url_escape_path(&display),
-            html_escape_text(&display)
-        ));
+        let mut display = name;
+        if is_dir {
+            display.push(b'/');
+        }
+        out.push_str("<a href=\"");
+        out.push_str(&url_escape_bytes(&display));
+        out.push_str("\">");
+        out.push_str(&html_escape_text(&String::from_utf8_lossy(&display)));
+        out.push_str("</a>\n");
     }
     out.push_str("</pre>\n");
     Ok(out)
 }
 
-/// Percent-encode a URL path component exactly like Go's
-/// url.URL{Path: p}.String() encodePath mode (net/url/url.go shouldEscape):
-/// the path is escaped as a whole, so the RFC 2396 reserved set that is
-/// meaningful per-segment but harmless whole-path ($ & + , / : ; = @ plus
-/// the unreserved - _ . ~ and alnum) stays literal, and only '?' is
-/// additionally escaped. Everything else is %XX with uppercase hex, one
-/// byte at a time.
-fn url_escape_path(s: &str) -> String {
+/// Percent-encode a URL path exactly like Go's url.URL{Path: p}.String()
+/// encodePath mode (net/url/url.go shouldEscape): the path is escaped as a
+/// whole, so the RFC 2396 reserved set that is meaningful per-segment but
+/// harmless whole-path ($ & + , / : ; = @ plus the unreserved - _ . ~ and
+/// alnum) stays literal, and only '?' is additionally escaped. Everything
+/// else is %XX with uppercase hex, one byte at a time. Byte-level
+/// (round-16 FIX 2): decoded paths are raw bytes, so the escape operates on
+/// BYTES — the gorilla-canonical 301 Location arm and the dirList href arm
+/// escape possibly non-UTF-8 paths this way (Go hexEscapeNonASCII over
+/// url.String() lands on the same encodePath for >= 0x80). Operates on
+/// bytes, so any caller passing a Rust &str slices its UTF-8 bytes first
+/// (s.as_bytes()) — byte-exact for every valid-UTF-8 input.
+fn url_escape_bytes(s: &[u8]) -> String {
     let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
+    for &b in s {
         match b {
             b'A'..=b'Z'
             | b'a'..=b'z'
@@ -725,26 +1098,24 @@ fn mime_from_path(path: &std::path::Path) -> &'static str {
     }
 }
 
-/// Validate a relative path for path traversal attempts.
-/// Returns true if the path is safe to use (no empty components, no `.`, no `..`).
-fn validate_rel_path(path: &str) -> bool {
-    if path.is_empty() {
-        return true;
-    }
-    !path
-        .split('/')
-        .any(|c| c.is_empty() || c == "." || c == "..")
-}
-
 /// Whole-second unix mtime of a file metadata, or None when the platform
-/// cannot report one (Go: a zero modtime disables Last-Modified and the 304
-/// precondition — same outcome).
+/// cannot report one OR the mtime is the zero time. Go isZeroTime
+/// (fs.go:606-609) treats BOTH time.Time zero and time.Unix(0, 0) as zero:
+/// no Last-Modified is emitted and any If-Modified-Since is condNone
+/// (always 200). Round-16 FIX 9: Some(0) is exactly time.Unix(0,0) — an
+/// mtime pinned to the epoch (`touch -d @0`, std's
+/// set_modified(UNIX_EPOCH)) must not emit "Last-Modified: Thu, 01 Jan 1970
+/// 00:00:00 GMT" nor ever answer 304. (The pre-FIX code treated Some(0) as
+/// a real mtime; its doc's claim that "Go's zero modtime behaves the same"
+/// was wrong for the epoch value.)
 fn mtime_secs(meta: &std::fs::Metadata) -> Option<u64> {
-    meta.modified()
+    let secs = meta
+        .modified()
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
-        .map(|d| d.as_secs())
+        .map(|d| d.as_secs())?;
+    (secs != 0).then_some(secs)
 }
 
 const HTTP_WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -801,34 +1172,57 @@ fn format_http_date(unix_secs: u64) -> String {
     )
 }
 
-/// Parse an If-Modified-Since value — the IMF-fixdate / RFC 1123 shape
-/// ("Mon, 02 Jan 2006 15:04:05 GMT") — into whole unix seconds.
+/// Parse an If-Modified-Since value into whole unix seconds, mirroring Go's
+/// checkIfModifiedSince path: a value that fails to parse is condNone (serve
+/// 200, no 400/403).
 ///
-/// Mirrors Go's checkIfModifiedSince path: a value that fails to parse is
-/// condNone (serve 200, no 400/403). The weekday token must be one of the
-/// seven abbreviated names — Go time.Parse looks it up case-insensitively
-/// but NEVER cross-checks it against the date ("ignore weekday except for
-/// error checking", format.go): "Fri, 01 Jan 2000 00:00:00 GMT" parses
-/// clean in Go though 2000-01-01 was a Saturday, and Go answers 304
-/// (probe-verified against go1.25.12). The zone must be the literal "GMT"
-/// (RFC 1123 mandates GMT; Go's layout would also tolerate any other
-/// 3-letter abbreviation at zero offset — accepting GMT only is
-/// byte-identical for every client echoing a server-emitted date), and the
-/// calendar date must exist (Feb 30 normalizes → rejected — Go time.Parse
-/// errors the same way). One documented leniency: a space-padded
+/// Go http.ParseTime tries THREE layouts in order (net/http parseTime.go):
+/// TimeFormat / IMF-fixdate / RFC 1123 ("Mon, 02 Jan 2006 15:04:05 GMT" —
+/// the shape Last-Modified is emitted in), time.RFC850 ("Sunday, 06-Jan-02
+/// 15:04:05 MST") and time.ANSIC ("Mon Jan _2 15:04:05 2006"). Round-16
+/// FIX 8: the old parser knew only the IMF shape, so an RFC 850 or ANSIC
+/// If-Modified-Since — which Go parses and can answer 304 against — fell
+/// through to a plain 200 here.
+///
+/// Common rules (all three layouts): the weekday token must be a valid name
+/// for the layout — Go time.Parse looks the word up in the layout's day-name
+/// list, case-insensitively, but NEVER cross-checks it against the date
+/// ("ignore weekday except for error checking", format.go): "Fri, 01 Jan
+/// 2000 00:00:00 GMT" parses clean in Go though 2000-01-01 was a Saturday,
+/// and Go answers 304 (probe-verified against go1.25.12). The calendar date
+/// must exist (Feb 30 normalizes → rejected — Go time.Parse errors the same
+/// way). Numeric tokens are ASCII-only (Go atoi accepts no Unicode digits,
+/// no sign). Dates before 1970 parse in Go too, but an IMS older than any
+/// real file's mtime answers condTrue — byte-identical to a parse failure
+/// here — so rejecting pre-1970 years is behaviorally Go-identical (the IMF
+/// parser has always done it). Zones: Go's layout words accept any
+/// alphabetic abbreviation at zero offset (time.Parse knows no zone
+/// database). The IMF arm keeps the strict literal "GMT" (RFC 1123
+/// mandates GMT; strictness is byte-identical for every client echoing a
+/// server-emitted date — the established, documented divergence).
+fn parse_if_modified_since(value: &str) -> Option<u64> {
+    let v = value.trim();
+    parse_imf_fixdate(v)
+        .or_else(|| parse_rfc850(v))
+        .or_else(|| parse_ansic(v))
+}
+
+/// IMF-fixdate / RFC 1123 — "Weekday, day month year clock GMT": comma
+/// after the (short) weekday, space-separated day / 3-letter month /
+/// 4-digit year / clock / zone. The 3-letter month lookup is
+/// case-insensitive (Go). One documented leniency: a space-padded
 /// single-digit day is accepted ("Mon,  2 Jan 2006 ...") — Go's RFC1123
 /// layout element is '02', which requires TWO digits, so that shape errors
 /// in Go and Go re-serves 200 where frp-rs answers 304. The divergence is
 /// RFC 7232-safe (a 304 only ever revalidates a copy the client holds) and
 /// answers stale only for clients that never see Go servers.
-fn parse_if_modified_since(value: &str) -> Option<u64> {
-    let v = value.trim();
-    // "Weekday, day month year clock GMT" — the weekday must be one of the
-    // seven abbreviated names (Go's layout needs a real name: time.Parse
-    // does a case-insensitive lookup and fails the whole parse otherwise),
-    // but it is never cross-checked against the date (see the fn doc — Go
-    // answers 304 for a wrong-but-valid weekday). Anything without the
-    // comma shape fails (Go's layout needs the comma too).
+fn parse_imf_fixdate(v: &str) -> Option<u64> {
+    // The weekday must be one of the seven abbreviated names (Go's layout
+    // needs a real name: time.Parse does a case-insensitive lookup and
+    // fails the whole parse otherwise), but it is never cross-checked
+    // against the date (see the fn doc — Go answers 304 for a
+    // wrong-but-valid weekday). Anything without the comma shape fails
+    // (Go's layout needs the comma too).
     let (weekday, rest) = v.split_once(',')?;
     if !HTTP_WEEKDAYS
         .iter()
@@ -837,32 +1231,160 @@ fn parse_if_modified_since(value: &str) -> Option<u64> {
         return None;
     }
     let mut parts = rest.split_whitespace();
-    let day: u32 = parts.next()?.parse().ok()?;
+    let day_tok = parts.next()?;
     let month_name = parts.next()?;
-    let year: i64 = parts.next()?.parse().ok()?;
+    let year_tok = parts.next()?;
     let clock = parts.next()?;
     let zone = parts.next()?;
     if parts.next().is_some() || zone != "GMT" {
         return None;
     }
-    let month = HTTP_MONTHS.iter().position(|&m| m == month_name)? as u32 + 1;
+    // Go layout "2006": exactly four ASCII digits.
+    if year_tok.len() != 4 || !ascii_digits(year_tok) || !ascii_digits(day_tok) {
+        return None;
+    }
+    let year: i64 = year_tok.parse().ok()?;
+    let day: u32 = day_tok.parse().ok()?;
+    let month = HTTP_MONTHS
+        .iter()
+        .position(|&m| m.eq_ignore_ascii_case(month_name))? as u32
+        + 1;
+    parse_clock_date(year, month, day, clock)
+}
+
+/// RFC 850 / RFC 1036 — "FullWeekday, dd-Mon-yy HH:MM:SS Zone": comma after
+/// the FULL weekday name (Go layout element "Monday"), dash-separated
+/// 2-digit day / 3-letter month / 2-digit year, clock, alphabetic zone.
+/// Go's 2-digit-year pivot (format.go): 69-99 → 1969-1999, 00-68 →
+/// 2000-2068.
+fn parse_rfc850(v: &str) -> Option<u64> {
+    const RFC850_WEEKDAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    let (weekday, rest) = v.split_once(',')?;
+    if !RFC850_WEEKDAYS
+        .iter()
+        .any(|&w| w.eq_ignore_ascii_case(weekday))
+    {
+        return None;
+    }
+    let mut parts = rest.split_whitespace();
+    let date_tok = parts.next()?;
+    let clock = parts.next()?;
+    let zone = parts.next()?;
+    if parts.next().is_some() || zone.len() < 3 || !zone.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    // The date token is dash-separated exactly — Go layout
+    // "02-Jan-06": literal '-' delimiters (time.Parse matches
+    // delimiters exactly), so "02 Jan 06" fails in Go and must fail
+    // here (split_whitespace alone would erase the dash/space
+    // distinction). Go layouts "02" (zero-padded two digits) and "06".
+    let mut date = date_tok.split('-');
+    let day_tok = date.next()?;
+    let month_name = date.next()?;
+    let year_tok = date.next()?;
+    if date.next().is_some() {
+        return None;
+    }
+    if day_tok.len() != 2
+        || year_tok.len() != 2
+        || !ascii_digits(day_tok)
+        || !ascii_digits(year_tok)
+    {
+        return None;
+    }
+    let day: u32 = day_tok.parse().ok()?;
+    let year2: i64 = year_tok.parse().ok()?;
+    let year: i64 = if year2 >= 69 {
+        1900 + year2
+    } else {
+        2000 + year2
+    };
+    let month = HTTP_MONTHS
+        .iter()
+        .position(|&m| m.eq_ignore_ascii_case(month_name))? as u32
+        + 1;
+    parse_clock_date(year, month, day, clock)
+}
+
+/// ANSIC / asctime() — "Wkd Mmm _d HH:MM:SS YYYY": abbreviated weekday,
+/// abbreviated month, SPACE-PADDED day (1-2 digits), clock, 4-digit year,
+/// NO zone — the layout carries no zone element, so any trailing token
+/// fails the parse in Go (matches are delimiter-exact) and the result is
+/// UTC.
+fn parse_ansic(v: &str) -> Option<u64> {
+    let mut parts = v.split_whitespace();
+    let weekday = parts.next()?;
+    let month_name = parts.next()?;
+    let day_tok = parts.next()?;
+    let clock = parts.next()?;
+    let year_tok = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !HTTP_WEEKDAYS
+        .iter()
+        .any(|&w| w.eq_ignore_ascii_case(weekday))
+    {
+        return None;
+    }
+    // Go layout "2006": exactly four ASCII digits.
+    if year_tok.len() != 4 || !ascii_digits(year_tok) || !ascii_digits(day_tok) {
+        return None;
+    }
+    let year: i64 = year_tok.parse().ok()?;
+    let day: u32 = day_tok.parse().ok()?;
+    let month = HTTP_MONTHS
+        .iter()
+        .position(|&m| m.eq_ignore_ascii_case(month_name))? as u32
+        + 1;
+    parse_clock_date(year, month, day, clock)
+}
+
+/// ASCII-only digit token check (Go atoi parity — no Unicode digits, no
+/// sign, no empty).
+fn ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Clock + calendar validation shared by all three layouts: "HH:MM:SS"
+/// with ASCII digits and in-range fields, then the civil-date round-trip
+/// (Feb 30 etc. rejected — Go time.Parse errors the same way). No
+/// weekday-vs-date consistency check — Go never validates that (audit
+/// round-7 finding, probe: "Fri, 01 Jan 2000" parses and answers 304
+/// though 2000-01-01 was a Saturday). Returns whole unix seconds.
+fn parse_clock_date(year: i64, month: u32, day: u32, clock: &str) -> Option<u64> {
     if !(1970..=9999).contains(&year) || day == 0 || day > 31 {
         return None;
     }
     let mut clock_parts = clock.split(':');
-    let hour: u64 = clock_parts.next()?.parse().ok()?;
-    let minute: u64 = clock_parts.next()?.parse().ok()?;
-    let second: u64 = clock_parts.next()?.parse().ok()?;
-    if clock_parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+    let hour_tok = clock_parts.next()?;
+    let minute_tok = clock_parts.next()?;
+    let second_tok = clock_parts.next()?;
+    if clock_parts.next().is_some()
+        || !ascii_digits(hour_tok)
+        || !ascii_digits(minute_tok)
+        || !ascii_digits(second_tok)
+    {
+        return None;
+    }
+    let hour: u64 = hour_tok.parse().ok()?;
+    let minute: u64 = minute_tok.parse().ok()?;
+    let second: u64 = second_tok.parse().ok()?;
+    if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     let days = civil_to_days(year, month, day);
     // Calendar validity: the civil date must round-trip (Feb 30 rolls to
     // Mar 1 → rejected; Go time.Parse errors on an out-of-range
-    // day-of-month the same way). No weekday-vs-date consistency check
-    // here — Go never validates that (audit round-7 finding, probe: "Fri,
-    // 01 Jan 2000" parses and answers 304 though 2000-01-01 was a
-    // Saturday).
+    // day-of-month the same way).
     let (y2, m2, d2) = civil_from_days(days);
     if y2 != year || m2 != month || d2 != day {
         return None;
@@ -953,9 +1475,11 @@ mod tests {
     fn test_resolve_static_path_anchors_dotdot() {
         // Audit FIX 9: the remainder is cleaned anchored at the URL root
         // (Go path.Clean("/"+name)) — ".." clamps at the root and can never
-        // escape; it never reaches validate_rel_path. The old code returned
-        // "../etc/passwd" for the caller to reject (403); Go serves the
-        // anchored result (200).
+        // escape; the old code returned "../etc/passwd" for the caller to
+        // reject (403); Go serves the anchored result (200). (The
+        // component-level validate_rel_path that once backed the 403 was
+        // removed in the round-16 rework — the clean is constructive and
+        // the open-handle guard is the real defense.)
         assert_eq!(
             resolve_static_path("/../etc/passwd", None).unwrap(),
             "etc/passwd"
@@ -1066,6 +1590,103 @@ mod tests {
             parse_if_modified_since("Sat, 01 Jan 2000 00:61:00 GMT"),
             None
         );
+
+        // Round-16 FIX 8: the other two layouts Go http.ParseTime tries —
+        // RFC 850 (full weekday, dd-Mon-yy, any alphabetic zone) and ANSIC
+        // (abbreviated weekday + month, space-padded day, no zone).
+        // Oracle: 1136239445 = 2006-01-02 22:04:05 UTC (Monday).
+        assert_eq!(
+            parse_if_modified_since("Monday, 02-Jan-06 22:04:05 GMT"),
+            Some(1136239445)
+        );
+        // Zone word: Go's layout "MST" accepts ANY alphabetic abbreviation
+        // at zero offset (time.Parse knows no zone database) — "UTC" parses.
+        assert_eq!(
+            parse_if_modified_since("Monday, 02-Jan-06 22:04:05 UTC"),
+            Some(1136239445)
+        );
+        // 2-digit-year pivot (Go format.go): 69-99 → 19xx, 00-68 → 20xx.
+        assert_eq!(
+            parse_if_modified_since("Saturday, 01-Jan-00 00:00:00 GMT"),
+            Some(946684800)
+        );
+        // 2068-01-01 00:00:00 UTC = 35794 days after the epoch (98 years,
+        // 24 leaps) = 3092601600; 2068-01-01 was a Sunday — "Monday" here
+        // is a wrong-but-valid weekday name, which Go never cross-checks
+        // (same as the IMF pins above).
+        assert_eq!(
+            parse_if_modified_since("Monday, 01-Jan-68 00:00:00 GMT"),
+            Some(3092601600)
+        );
+        // ...68 is the LAST in-range year of the 20xx arm; 69 pivots to
+        // 1969 which this parser rejects (pre-1970 — behaviorally
+        // Go-identical: an IMS before every real mtime answers 200 either
+        // way, see the fn doc).
+        assert_eq!(
+            parse_if_modified_since("Sunday, 01-Jan-69 00:00:00 GMT"),
+            None
+        );
+        // Full weekday NAME is required by the RFC 850 layout — the
+        // abbreviated shape belongs to the IMF layout above.
+        assert_eq!(parse_if_modified_since("Sun, 02-Jan-06 22:04:05 GMT"), None);
+        assert_eq!(
+            parse_if_modified_since("Monday, 02 Jan 06 22:04:05 GMT"),
+            None
+        );
+        // ANSIC — "Wkd Mmm _d HH:MM:SS YYYY", no zone, trailing token or
+        // zone word fails (Go delimiters are exact). Oracle: the same
+        // Monday instant with the layout's double-space day padding.
+        assert_eq!(
+            parse_if_modified_since("Mon Jan  2 22:04:05 2006"),
+            Some(1136239445)
+        );
+        assert_eq!(
+            parse_if_modified_since("Sat Jan  1 00:00:00 2000"),
+            Some(946684800)
+        );
+        assert_eq!(
+            parse_if_modified_since("Mon Jan  2 22:04:05 2006 GMT"),
+            None
+        );
+        assert_eq!(parse_if_modified_since("Mon Jan  2 22:04:05"), None);
+        assert_eq!(parse_if_modified_since("Mon 02 Jan 22:04:05 2006"), None);
+        // Wrong-but-valid weekday accepted here too (Go never cross-checks).
+        assert_eq!(
+            parse_if_modified_since("Sun Jan  1 00:00:00 2000"),
+            Some(946684800)
+        );
+    }
+
+    /// gorilla cleanPath oracles (mux.go:280-301 — path.Clean plus the
+    /// trailing-slash restore) over DECODED bytes (round-16 FIX 11): the
+    /// canonical form the dir-301 arms redirect from when the request path
+    /// is non-canonical.
+    #[test]
+    fn test_clean_path_canonical_go_oracles() {
+        let c = |s: &str| {
+            String::from_utf8_lossy(clean_path_canonical(s.as_bytes()).as_slice()).into_owned()
+        };
+        assert_eq!(c("/"), "/");
+        assert_eq!(c(""), "/");
+        assert_eq!(c("/sub"), "/sub");
+        assert_eq!(c("/sub/"), "/sub/");
+        assert_eq!(c("/sub/deep"), "/sub/deep");
+        assert_eq!(c("/sub/deep/"), "/sub/deep/");
+        // "." components vanish; ".." pops and clamps at the root.
+        assert_eq!(c("/./sub"), "/sub");
+        assert_eq!(c("/sub/../sub"), "/sub");
+        assert_eq!(c("/a/.."), "/");
+        assert_eq!(c("/a/../sub/"), "/sub/");
+        assert_eq!(c("/.."), "/");
+        assert_eq!(c("/../x"), "/x");
+        // Repeated slashes collapse; the trailing slash is restored when the
+        // cleaned result lost one the original had (gorilla cleanPath).
+        assert_eq!(c("/static//sub"), "/static/sub");
+        assert_eq!(c("//static"), "/static");
+        assert_eq!(c("/static///sub/"), "/static/sub/");
+        assert_eq!(c("/sub/./"), "/sub/");
+        assert_eq!(c("/."), "/");
+        assert_eq!(c("/sub/.."), "/");
     }
 
     /// Whole-second validation of the Feb 29 2000 pin above: 2000 was a leap
@@ -1073,31 +1694,6 @@ mod tests {
     #[test]
     fn test_feb_29_2000_oracle() {
         assert_eq!(format_http_date(951782400), "Tue, 29 Feb 2000 00:00:00 GMT");
-    }
-
-    #[test]
-    fn test_validate_rel_path_rejects_traversal() {
-        assert!(!validate_rel_path(".."));
-        assert!(!validate_rel_path("../etc/passwd"));
-        assert!(!validate_rel_path("foo/../../bar"));
-        assert!(!validate_rel_path("."));
-        assert!(!validate_rel_path("./config"));
-        assert!(!validate_rel_path("foo/./bar"));
-        assert!(!validate_rel_path("foo//bar"));
-        assert!(!validate_rel_path("foo///bar"));
-        // urlencoding_decode would decode %2F to /, which would produce
-        // an empty component and be rejected
-        assert!(!validate_rel_path("foo//bar"));
-    }
-
-    #[test]
-    fn test_validate_rel_path_allows_normal() {
-        assert!(validate_rel_path(""));
-        assert!(validate_rel_path("index.html"));
-        assert!(validate_rel_path("css/style.css"));
-        assert!(validate_rel_path("a/b/c.html"));
-        assert!(validate_rel_path("file.with..dots"));
-        assert!(validate_rel_path("something..test"));
     }
 
     // ---- Audit FIX 6-10 e2e pins (real plugin listener + temp dir) ----
@@ -1128,9 +1724,38 @@ mod tests {
     /// closes (every static_file response is Connection: close).
     async fn raw_get(addr: std::net::SocketAddr, req: &[u8]) -> Vec<u8> {
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(req).await.unwrap();
+        // A cap-close (431/400) can RST the conn while unrequested-overflow
+        // bytes still sit in the server's receive buffer — the server closes
+        // without draining. Bytes already sent are delivered; a reset on the
+        // write or on a later read is the response end, not a failure.
+        if let Err(e) = c.write_all(req).await {
+            assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ),
+                "write: {e}"
+            );
+        }
         let mut resp = Vec::new();
-        c.read_to_end(&mut resp).await.unwrap();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match c.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => resp.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => panic!("read: {e}"),
+            }
+        }
         resp
     }
 
@@ -1258,6 +1883,43 @@ mod tests {
             raw_get(addr, b"GET /x\r\n\r\n").await,
             super::super::GO_400_RENDER.as_bytes(),
         );
+
+        // Round-16 FIX 13 (shared parse_request_line validation): an
+        // invalid %-escape in the request target's PRE-'?' portion is a
+        // 400 — Go url.Parse errors "invalid URL escape" inside
+        // ReadRequest, before routing (probe vs go1.25.12: GET /x%zz →
+        // 400). Incomplete escapes and escapes inside CONNECT authorities
+        // are equally rejected; a literal "%25" is fine (it is the
+        // encoded '%'). Query-only escapes parse and serve (post-fix
+        // round): url.Parse Cuts the query RAW at the first '?' and never
+        // unescape-validates it (probe vs go1.25.12: GET /x?q=%zz → 200).
+        for bad in ["/x%zz", "/x%2", "/x%", "/sub/%zq", "/%GG", "http://h/x%zz"] {
+            let req = format!("GET {bad} HTTP/1.1\r\nHost: t\r\n\r\n");
+            assert_eq!(
+                raw_get(addr, req.as_bytes()).await,
+                super::super::GO_400_RENDER.as_bytes(),
+                "invalid escape target {bad}"
+            );
+        }
+        let ok_esc = raw_get(addr, b"GET /x%25zz HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            ok_esc.starts_with(b"HTTP/1.1 404 Not Found\r\n"),
+            "a valid escape clears the parse gate and reaches the open miss, got: {}",
+            String::from_utf8_lossy(&ok_esc)
+        );
+        // A garbage escape in the QUERY never reaches the escape gate — the
+        // file serves byte-identically to the same request without the
+        // query (Go keeps the query raw end to end).
+        let base = raw_get(addr, b"GET /x HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(base.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let qresp = raw_get(addr, b"GET /x?q=%zz HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert_eq!(
+            qresp,
+            base,
+            "a query-only invalid escape must serve the file like the baseline, \
+             got: {}",
+            String::from_utf8_lossy(&qresp[..qresp.len().min(80)])
+        );
     }
 
     /// Audit FIX 10 e2e: Last-Modified on 200, If-Modified-Since → 304
@@ -1293,13 +1955,18 @@ mod tests {
         );
         assert!(ok.ends_with(b"hello-static"));
 
-        // IMS == mtime → 304: status + Connection only — no body, no
-        // Content-Length, no Last-Modified.
+        // IMS == mtime → 304 — carries Last-Modified (round-16 FIX 5: Go
+        // serveContent runs setLastModified BEFORE checkPreconditions, and
+        // writeNotModified deletes Last-Modified only when an ETag is set —
+        // FileServer never sets one, so the file 304 keeps it; probe vs
+        // go1.25.12). No body, no Content-Length.
         let eq = "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
                   If-Modified-Since: Sat, 01 Jan 2000 00:00:00 GMT\r\n\r\n";
         assert_eq!(
             raw_get(addr, eq.as_bytes()).await,
-            b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n"
+            b"HTTP/1.1 304 Not Modified\r\n\
+              Last-Modified: Sat, 01 Jan 2000 00:00:00 GMT\r\n\
+              Connection: close\r\n\r\n"
         );
 
         // IMS one second AFTER the mtime → 304 as well (mtime <= IMS).
@@ -1308,7 +1975,9 @@ mod tests {
             format!("GET /doc.txt HTTP/1.1\r\nHost: t\r\nIf-Modified-Since: {later}\r\n\r\n");
         assert_eq!(
             raw_get(addr, after.as_bytes()).await,
-            b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n"
+            b"HTTP/1.1 304 Not Modified\r\n\
+              Last-Modified: Sat, 01 Jan 2000 00:00:00 GMT\r\n\
+              Connection: close\r\n\r\n"
         );
 
         // IMS BEFORE the mtime (truncated whole seconds: 946684798) → 200
@@ -1382,6 +2051,15 @@ mod tests {
         assert_eq!(
             raw_get(addr, b"GET /sub?x=1 HTTP/1.1\r\nHost: t\r\n\r\n").await,
             b"HTTP/1.1 301 Moved Permanently\r\nLocation: sub/?x=1\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // A BARE '?' (empty RawQuery) appends nothing — Go localRedirect
+        // gates on `if r.URL.RawQuery != ""`, so the Location carries no
+        // stray '?' (round-16 FIX 10; probe vs go1.25.12: GET /sub? →
+        // Location: sub/).
+        assert_eq!(
+            raw_get(addr, b"GET /sub? HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: sub/\r\n\
               Content-Length: 0\r\nConnection: close\r\n\r\n",
         );
         // HEAD and POST never reach FileServer's redirect: gorilla's
@@ -1515,8 +2193,12 @@ mod tests {
         assert!(head_s.contains("Last-Modified: "), "got: {head_s}");
         assert_eq!(resp_body, body);
 
-        // The hrefs are fetchable: /q%3Fr.txt decodes to the q?r.txt FILE
-        // (a raw '?' in the URL would split the query — Go parity).
+        // The ASCII hrefs are fetchable: /q%3Fr.txt decodes to the q?r.txt
+        // FILE (a raw '?' in the URL would split the query — Go parity).
+        // (Round-16 FIX 2: this "hrefs fetchable" claim was false for
+        // non-ASCII names under the old Latin-1 `as char` decode — the
+        // non-ASCII round-trip is pinned separately below in
+        // test_static_file_e2e_non_ascii_round_trip.)
         let q = raw_get(addr, b"GET /q%3Fr.txt HTTP/1.1\r\nHost: t\r\n\r\n").await;
         assert!(
             q.starts_with(b"HTTP/1.1 200 OK\r\n"),
@@ -1585,6 +2267,612 @@ mod tests {
         );
     }
 
+    /// Round-16 post-fix e2e (the flip): a terminated request head that
+    /// exceeds 64 KiB is SERVED byte-identically to the same request
+    /// without the big header — Go's cap is a READ LIMIT
+    /// (MaxHeaderBytes 1 MiB + 4096 bufio slop) that errors only when the
+    /// limit is consumed with the head still INCOMPLETE, so a head whose
+    /// empty-line terminator arrived parses and serves at ANY size up to
+    /// ~1 MiB+4096 (probe vs go1.25.12: a terminated ~1 MiB+64 head
+    /// answers 200). RED on the old code twice over: the round-15 order
+    /// (cap check after the terminator break) served this head only
+    /// because the 64 KiB cap never ran on the terminator path — the
+    /// round-16-wave order (cap check before the terminator scan) 431'd
+    /// it. The baseline-equality assert proves the parse + file-serve
+    /// path ran end to end (the big header was consumed, the request line
+    /// parsed, the file opened and served) — not just "not 431".
+    #[tokio::test]
+    async fn test_static_file_e2e_oversize_head_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "x", b"x");
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+
+        let base = raw_get(addr, b"GET /x HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            base.starts_with(b"HTTP/1.1 200 OK"),
+            "baseline must serve the file, got: {:?}",
+            String::from_utf8_lossy(&base[..base.len().min(80)])
+        );
+        let mut req = Vec::from(b"GET /x HTTP/1.1\r\nHost: t\r\nX-Big: ".as_slice());
+        req.resize(req.len() + 70000, b'a');
+        req.extend_from_slice(b"\r\n\r\n");
+        assert!(
+            req.len() > 65536,
+            "fixture must exceed the old 64 KiB cap (len {})",
+            req.len()
+        );
+        let resp = raw_get(addr, &req).await;
+        assert_eq!(
+            resp,
+            base,
+            "a TERMINATED head past 64 KiB must be served byte-identically to the \
+             baseline (Go read-limit model), got {} bytes: {:?}",
+            resp.len(),
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+    }
+
+    /// Round-16 post-fix e2e (arm b): a terminated head whose terminator
+    /// lies PAST the serve boundary — total ~1 MiB + 8226, terminator far
+    /// beyond the 1 MiB + 4096 slack — still renders Go's 431 page
+    /// byte-exact. Go's errTooLarge fires when the limit is consumed
+    /// mid-head; a terminator that far out never completes the head in
+    /// time (probe: same class as the http.rs plain-arm 431). RED on the
+    /// round-15 order (the 64 KiB cap sat after the terminator break and
+    /// this head served): the fixture breaches the read limit only at
+    /// ~1 MiB, which the 64 KiB era never enforced on unterminated
+    /// buffers beyond a silent error. The breach fires as soon as the
+    /// buffer passes 1 MiB without an empty line, so the client-side
+    /// write outruns the read: the payload is written from a spawned
+    /// task (it errors when the server closes mid-send — expected,
+    /// ignored) while this task reads the render, bounded by a 10 s
+    /// deadline.
+    #[tokio::test]
+    async fn test_static_file_e2e_terminated_past_slack_head_answers_go_431() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "x", b"x");
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let client = TcpStream::connect(handle.local_addr).await.unwrap();
+        let (mut rd, mut wr) = tokio::io::split(client);
+        let mut head = Vec::with_capacity(1024 * 1024 + 16 * 1024);
+        head.extend_from_slice(b"GET /x HTTP/1.1\r\nHost: t\r\nX-Big: ");
+        head.resize(1024 * 1024 + 8192, b'A');
+        head.extend_from_slice(b"\r\n\r\n");
+        tokio::spawn(async move {
+            // The server breaches at ~1 MiB + one chunk and closes; the
+            // rest of the payload is never consumed. The write errors —
+            // that is the expected outcome, ignored here.
+            let _ = wr.write_all(&head).await;
+        });
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            rd.read_to_end(&mut resp),
+        )
+        .await
+        .expect("timed out waiting for the 431 render — regression?");
+        assert_eq!(
+            resp,
+            super::super::GO_431_RENDER.as_bytes(),
+            "a terminated head past the serve boundary must render Go's 431, \
+             got {} bytes: {:?}",
+            resp.len(),
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+    }
+
+    /// Round-16 post-fix e2e (arm c): an UNTERMINATED head past the cap —
+    /// ~1 MiB + 32 of header bytes, no empty line ever sent — renders Go's
+    /// 431 page byte-exact. No terminator is ever in the buffer, so the
+    /// read limit is the only way the read can end; an unfinished head is
+    /// errTooLarge in Go (the render fires before the handler runs).
+    /// Go's limit carries 4096 bufio slop on top of MaxHeaderBytes, so Go
+    /// would only breach after ~1 MiB+4096 consumed; frp-rs fires up to
+    /// one 4096 chunk earlier (same 431 class, slack margin as documented
+    /// on the read loop). The head size keeps the whole client payload
+    /// consumed before the breach fires, so the close is clean and the
+    /// render always arrives. RED on the old code: the round-15 order
+    /// errored this shape SILENTLY at 64 KiB (no render) and the
+    /// round-16-wave order 431'd it at 64 KiB with a different cap.
+    #[tokio::test]
+    async fn test_static_file_e2e_unterminated_oversized_head_answers_go_431() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "x", b"x");
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+        let mut head = Vec::with_capacity(1024 * 1024 + 64);
+        head.extend_from_slice(b"GET /x HTTP/1.1\r\nHost: t\r\nX-Big: ");
+        head.resize(1024 * 1024 + 32, b'A');
+        // No terminator: the head stays unterminated past the cap.
+        let _ = client.write_all(&head).await;
+        let mut resp = Vec::new();
+        let _ = client.read_to_end(&mut resp).await;
+        assert_eq!(
+            resp,
+            super::super::GO_431_RENDER.as_bytes(),
+            "an unterminated head past the cap must render Go's 431, \
+             got {} bytes: {:?}",
+            resp.len(),
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+    }
+
+    /// Round-16 FIX 3 e2e: Go serveFile's FIRST arm — a URL path ending in
+    /// "/index.html" answers 301 Location: ./ BEFORE any file I/O, so it
+    /// fires for a deleted index.html too, and the query survives
+    /// (fs.go:682-688 + localRedirect; probe vs go1.25.12: served AND
+    /// deleted index.html both redirect). The relative "./" resolves against
+    /// the requesting directory, so links inside a served index.html stay
+    /// resolvable under a strip prefix as well.
+    #[tokio::test]
+    async fn test_static_file_e2e_index_suffix_redirect() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "sub/index.html", b"index-body");
+        // sub2 has NO index.html — the suffix redirect fires anyway.
+        std::fs::create_dir_all(dir.path().join("sub2")).unwrap();
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+
+        // Exists → 301 ./; missing → same 301 ./ (no 404 — the arm runs
+        // before fs.Open).
+        assert_eq!(
+            raw_get(addr, b"GET /sub/index.html HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ./\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(
+            raw_get(addr, b"GET /sub2/index.html HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ./\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // Query preserved (localRedirect appends RawQuery when non-empty).
+        assert_eq!(
+            raw_get(addr, b"GET /sub/index.html?x=1 HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ./?x=1\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // Root-level /index.html (no such file here) → same arm, same 301.
+        assert_eq!(
+            raw_get(addr, b"GET /index.html HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ./\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // A trailing slash kills the suffix match ("/index.html/" ends in
+        // "/", not "/index.html") → normal file handling: an open miss on
+        // the nonexistent root index.html renders the 404 page.
+        assert_eq!(
+            raw_get(addr, b"GET /index.html/ HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            super::super::GO_404_NOT_FOUND_RENDER.as_bytes(),
+        );
+
+        // Prefix mode: same relative "./" — the browser resolves it against
+        // /static/sub/, which serves the very index.html that was requested.
+        let Some(pref) = start_static(dir.path(), Some("static"), None).await else {
+            return;
+        };
+        let pa = pref.local_addr;
+        assert_eq!(
+            raw_get(
+                pa,
+                b"GET /static/sub/index.html HTTP/1.1\r\nHost: t\r\n\r\n"
+            )
+            .await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ./\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+    }
+
+    /// Round-16 FIX 4 e2e: Go serveFile's file-with-trailing-slash redirect
+    /// (fs.go:714-724) — a FILE URL ending in '/' answers 301 Location:
+    /// "../" + path.Base(url), the base resolving one directory UP out of
+    /// the slash-suffixed URL (probe vs go1.25.12: GET /plain.txt/ → 301
+    /// Location: ../plain.txt). Degenerate: local_path pointing AT a file —
+    /// the root URL then maps to the file with an empty base, which Go
+    /// answers with the 500 "http: attempting to traverse a non-directory"
+    /// (fs.go:716-721).
+    #[tokio::test]
+    async fn test_static_file_e2e_file_with_slash_301() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "plain.txt", b"plain-body");
+        write_file(dir.path(), "sub/deep/inner.html", b"inner-body");
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+
+        assert_eq!(
+            raw_get(addr, b"GET /plain.txt/ HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ../plain.txt\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // Query preserved into the "../"-Location.
+        assert_eq!(
+            raw_get(addr, b"GET /plain.txt/?x=1 HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ../plain.txt?x=1\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // Deep file: base = path.Base of the FULL slash-suffixed URL.
+        assert_eq!(
+            raw_get(
+                addr,
+                b"GET /sub/deep/inner.html/ HTTP/1.1\r\nHost: t\r\n\r\n"
+            )
+            .await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ../inner.html\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // Prefix mode: "../plain.txt" resolves against /static/ — the
+        // slash-less URL that serves the file.
+        let Some(pref) = start_static(dir.path(), Some("static"), None).await else {
+            return;
+        };
+        let pa = pref.local_addr;
+        assert_eq!(
+            raw_get(pa, b"GET /static/plain.txt/ HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ../plain.txt\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+
+        // Degenerate 500: local_path IS a file → GET / maps the root URL to
+        // the file with an empty base (Go path.Base("/") == "/" → the
+        // traverse-a-non-directory http.Error).
+        let file_path = {
+            let p = dir.path().join("standalone.txt");
+            std::fs::write(&p, b"file-as-root").unwrap();
+            p
+        };
+        let Some(fh) = start_static(&file_path, None, None).await else {
+            return;
+        };
+        let resp = raw_get(fh.local_addr, b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert_eq!(
+            String::from_utf8_lossy(&resp),
+            "HTTP/1.1 500 Internal Server Error\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             X-Content-Type-Options: nosniff\r\n\
+             Content-Length: 45\r\nConnection: close\r\n\r\n\
+             http: attempting to traverse a non-directory\n",
+        );
+    }
+
+    /// Round-16 FIX 9 e2e: an epoch (zero) mtime is Go's isZeroTime — no
+    /// Last-Modified is emitted on the 200 and the If-Modified-Since
+    /// precondition never fires (Go condNone → always 200). The old code
+    /// treated Some(0) as a real mtime: it emitted "Thu, 01 Jan 1970" and
+    /// answered 304 against any IMS.
+    #[tokio::test]
+    async fn test_static_file_e2e_epoch_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("epoch.txt");
+        std::fs::write(&p, b"epoch-body").unwrap();
+        std::fs::File::open(&p)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .expect("set_modified(UNIX_EPOCH) on temp file");
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+
+        let ok = raw_get(addr, b"GET /epoch.txt HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        let ok_s = String::from_utf8_lossy(&ok);
+        assert!(
+            ok_s.starts_with(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                 Content-Length: 10\r\nConnection: close\r\n\r\n"
+            ),
+            "no Last-Modified for an epoch mtime, got: {ok_s}"
+        );
+        assert!(!ok_s.contains("Last-Modified"), "got: {ok_s}");
+        assert!(ok.ends_with(b"epoch-body"));
+
+        // IMS any date → 200, never 304 (epoch mtime is None → the
+        // precondition arm is skipped entirely).
+        let ims = "GET /epoch.txt HTTP/1.1\r\nHost: t\r\n\
+                   If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n";
+        let ims_resp = raw_get(addr, ims.as_bytes()).await;
+        assert!(
+            ims_resp.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "epoch mtime must never 304, got: {}",
+            String::from_utf8_lossy(&ims_resp)
+        );
+    }
+
+    /// Round-16 FIX 8 e2e: If-Modified-Since in Go's two ALTERNATE accepted
+    /// layouts — RFC 850 and ANSIC — parses (Go http.ParseTime tries all
+    /// three; the old parser knew only IMF-fixdate, so both fell through to
+    /// a 200). File mtime pinned at 946684800 (2000-01-01 00:00:00 UTC).
+    #[tokio::test]
+    async fn test_static_file_e2e_ims_alternate_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("doc.txt");
+        std::fs::write(&p, b"alternate").unwrap();
+        std::fs::File::open(&p)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(946684800))
+            .expect("set_modified on temp file");
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+
+        // RFC 850 (full weekday, dd-Mon-yy): "Saturday, 01-Jan-00" ==
+        // 2000-01-01 == the mtime → 304. The file 304 keeps Last-Modified
+        // (round-16 FIX 5 shape).
+        let rfc850 = "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
+                      If-Modified-Since: Saturday, 01-Jan-00 00:00:00 GMT\r\n\r\n";
+        assert_eq!(
+            raw_get(addr, rfc850.as_bytes()).await,
+            b"HTTP/1.1 304 Not Modified\r\n\
+              Last-Modified: Sat, 01 Jan 2000 00:00:00 GMT\r\n\
+              Connection: close\r\n\r\n"
+        );
+
+        // ANSIC (abbreviated weekday + month, space-padded day, no zone):
+        // "Sat Jan  1 00:00:00 2000" → same 304.
+        let ansic = "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
+                     If-Modified-Since: Sat Jan  1 00:00:00 2000\r\n\r\n";
+        assert_eq!(
+            raw_get(addr, ansic.as_bytes()).await,
+            b"HTTP/1.1 304 Not Modified\r\n\
+              Last-Modified: Sat, 01 Jan 2000 00:00:00 GMT\r\n\
+              Connection: close\r\n\r\n"
+        );
+
+        // An RFC 850 IMS one second AFTER the mtime → 304 too (mtime <=
+        // IMS; 2-digit year "00" pivots to 2000).
+        let later = "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
+                     If-Modified-Since: Saturday, 01-Jan-00 00:00:01 GMT\r\n\r\n";
+        assert_eq!(
+            raw_get(addr, later.as_bytes()).await,
+            b"HTTP/1.1 304 Not Modified\r\n\
+              Last-Modified: Sat, 01 Jan 2000 00:00:00 GMT\r\n\
+              Connection: close\r\n\r\n"
+        );
+
+        // A trailing zone word after an ANSIC date fails the ANSIC layout
+        // (no zone element — Go delimiters exact) → condNone → 200.
+        let bad = "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
+                   If-Modified-Since: Sat Jan  1 00:00:00 2000 GMT\r\n\r\n";
+        let resp = raw_get(addr, bad.as_bytes()).await;
+        assert!(
+            resp.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "got: {}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    /// Round-16 FIX 7 e2e: duplicate headers use Go Header.Get FIRST-value
+    /// semantics — the first If-Modified-Since row decides the precondition
+    /// (an empty-value row included), and the first Authorization row is the
+    /// one the auth middleware checks. The old last-wins assignment
+    /// mirrored nothing in Go (textproto appends; Get returns v[0]).
+    #[tokio::test]
+    async fn test_static_file_e2e_dup_header_first_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("doc.txt");
+        std::fs::write(&p, b"dup-header-body").unwrap();
+        std::fs::File::open(&p)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(946684800))
+            .expect("set_modified on temp file");
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+
+        // IMS rows: the mtime (== 304 candidate) first, an EARLIER date
+        // (== 200 candidate) second → the FIRST row wins → 304. (Last-wins
+        // would answer 200.)
+        let a = "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
+                 If-Modified-Since: Sat, 01 Jan 2000 00:00:00 GMT\r\n\
+                 If-Modified-Since: Fri, 31 Dec 1999 23:00:00 GMT\r\n\r\n";
+        assert_eq!(
+            raw_get(addr, a.as_bytes()).await,
+            b"HTTP/1.1 304 Not Modified\r\n\
+              Last-Modified: Sat, 01 Jan 2000 00:00:00 GMT\r\n\
+              Connection: close\r\n\r\n"
+        );
+        // Reversed: the earlier (200-candidate) row first, the mtime row
+        // second → the first row wins → 200. (Last-wins would answer 304.)
+        let b = "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
+                 If-Modified-Since: Fri, 31 Dec 1999 23:00:00 GMT\r\n\
+                 If-Modified-Since: Sat, 01 Jan 2000 00:00:00 GMT\r\n\r\n";
+        let resp_b = raw_get(addr, b.as_bytes()).await;
+        assert!(
+            resp_b.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "got: {}",
+            String::from_utf8_lossy(&resp_b)
+        );
+
+        // Authorization rows (creds u/p): good-then-bad → the FIRST row
+        // wins → 200.
+        let Some(authd) = start_static(dir.path(), None, Some(("u", "p"))).await else {
+            return;
+        };
+        let aa = authd.local_addr;
+        let good = basic_auth("u", "p");
+        let bad = basic_auth("u", "wrong");
+        let c = format!(
+            "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
+             Authorization: {good}\r\nAuthorization: {bad}\r\n\r\n"
+        );
+        let resp_c = raw_get(aa, c.as_bytes()).await;
+        assert!(
+            resp_c.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "first Authorization row wins, got: {}",
+            String::from_utf8_lossy(&resp_c)
+        );
+        // Bad-then-good → 401 (first row is what auth checks).
+        let d = format!(
+            "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
+             Authorization: {bad}\r\nAuthorization: {good}\r\n\r\n"
+        );
+        let resp_d = raw_get(aa, d.as_bytes()).await;
+        assert!(
+            resp_d.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"),
+            "first row bad → 401, got: {}",
+            String::from_utf8_lossy(&resp_d)
+        );
+        // Empty-value row first shadows a later valid row (Header.Get
+        // returns v[0] even when empty) → 401.
+        let e = format!(
+            "GET /doc.txt HTTP/1.1\r\nHost: t\r\n\
+             Authorization:\r\nAuthorization: {good}\r\n\r\n"
+        );
+        let resp_e = raw_get(aa, e.as_bytes()).await;
+        assert!(
+            resp_e.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"),
+            "empty first row shadows the valid one, got: {}",
+            String::from_utf8_lossy(&resp_e)
+        );
+    }
+
+    /// Round-16 FIX 11 e2e: a non-canonical request path resolving to a
+    /// DIRECTORY redirects from the gorilla-cleanPath canonical form with an
+    /// ABSOLUTE Location (single-hop fold of Go's router-301 +
+    /// FileServer-301 chain) — the old relative Location derived from the
+    /// UNCLEANED remainder sent "/static//sub" back to "/static//sub/",
+    /// which never converged. Canonical paths keep the relative
+    /// path.Base + "/" Location (pinned above). Follow-ups land on the
+    /// canonical slash-terminated URL and serve.
+    #[tokio::test]
+    async fn test_static_file_e2e_dir_noncanonical_absolute_301() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "sub/index.html", b"index-body");
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+
+        let redirects = [
+            ("GET /./sub HTTP/1.1\r\nHost: t\r\n\r\n", "/sub/"),
+            ("GET /sub/../sub HTTP/1.1\r\nHost: t\r\n\r\n", "/sub/"),
+            ("GET /nope/../sub HTTP/1.1\r\nHost: t\r\n\r\n", "/sub/"),
+        ];
+        for (req, location) in redirects {
+            let want = format!(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            assert_eq!(
+                raw_get(addr, req.as_bytes()).await,
+                want.as_bytes(),
+                "request {req}"
+            );
+        }
+        // The absolute Location is directly fetchable → canonical listing.
+        let follow = raw_get(addr, b"GET /sub/ HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            follow.starts_with(b"HTTP/1.1 200 OK\r\n") && follow.ends_with(b"index-body"),
+            "got: {}",
+            String::from_utf8_lossy(&follow)
+        );
+
+        // Prefix mode: the doubled-slash shape that never converged before —
+        // "/static//sub" → absolute "/static/sub/" (canonical-full includes
+        // the prefix; gorilla cleans at the router, pre-strip).
+        let Some(pref) = start_static(dir.path(), Some("static"), None).await else {
+            return;
+        };
+        let pa = pref.local_addr;
+        assert_eq!(
+            raw_get(pa, b"GET /static//sub HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: /static/sub/\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let pfollow = raw_get(pa, b"GET /static/sub/ HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            pfollow.starts_with(b"HTTP/1.1 200 OK\r\n") && pfollow.ends_with(b"index-body"),
+            "got: {}",
+            String::from_utf8_lossy(&pfollow)
+        );
+        // The slash-terminated non-canonical form serves DIRECTLY (no
+        // redirect — only slash-less dirs redirect).
+        let term = raw_get(pa, b"GET /static//sub/ HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            term.starts_with(b"HTTP/1.1 200 OK\r\n") && term.ends_with(b"index-body"),
+            "got: {}",
+            String::from_utf8_lossy(&term)
+        );
+    }
+
+    /// Round-16 FIX 2 e2e: non-ASCII file names round-trip through the
+    /// listing and the file arms — the dirList href percent-encodes the
+    /// UTF-8 bytes ("na%C3%AFve.txt"), the href is fetchable, and a raw
+    /// UTF-8 request path serves the same file. (The old Latin-1 `as char`
+    /// decode re-encoded %C3%AF as C3 83 C2 AF — a mojibake name that
+    /// 404'd. cfg(unix): names that are not valid UTF-8 at all round-trip
+    /// byte-exactly too.)
+    #[tokio::test]
+    async fn test_static_file_e2e_non_ascii_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "naïve.txt", "naïve-content".as_bytes());
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+
+        // The listing href escapes the UTF-8 bytes; the anchor text shows
+        // the raw name.
+        let listing = raw_get(addr, b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        let ls = String::from_utf8_lossy(&listing);
+        assert!(
+            ls.contains("<a href=\"na%C3%AFve.txt\">naïve.txt</a>"),
+            "listing must escape href but keep the text, got: {ls}"
+        );
+
+        // Fetching the escaped href → 200, byte-exact body.
+        let via_href = raw_get(addr, b"GET /na%C3%AFve.txt HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            via_href.starts_with(b"HTTP/1.1 200 OK\r\n")
+                && via_href.ends_with(b"na\xc3\xafve-content"),
+            "got: {}",
+            String::from_utf8_lossy(&via_href)
+        );
+        // A raw UTF-8 request path decodes to the same bytes → same file.
+        let via_raw = raw_get(
+            addr,
+            "GET /naïve.txt HTTP/1.1\r\nHost: t\r\n\r\n".as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            via_raw, via_href,
+            "raw UTF-8 and %-escaped paths must agree"
+        );
+
+        // cfg(unix): a name that is NOT valid UTF-8 — %FF — escapes as
+        // "%FF", fetches, and serves byte-exactly (OsStringExt join; the
+        // lossy path is compile-time-only elsewhere).
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw_name = std::ffi::OsString::from_vec(b"raw\xff.txt".to_vec());
+            std::fs::write(dir.path().join(&raw_name), b"raw-ff-body").unwrap();
+            let listing2 = raw_get(addr, b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+            let ls2 = String::from_utf8_lossy(&listing2);
+            assert!(
+                ls2.contains("<a href=\"raw%FF.txt\">"),
+                "non-UTF-8 name must list byte-escaped, got: {ls2}"
+            );
+            let via = raw_get(addr, b"GET /raw%FF.txt HTTP/1.1\r\nHost: t\r\n\r\n").await;
+            assert!(
+                via.starts_with(b"HTTP/1.1 200 OK\r\n") && via.ends_with(b"raw-ff-body"),
+                "got: {}",
+                String::from_utf8_lossy(&via)
+            );
+        }
+    }
+
     /// Route-gate order e2e: with a credentials-configured listener,
     /// gorilla's route gates precede the auth middleware — prefix miss →
     /// 404 page (auth never runs, with OR without valid credentials),
@@ -1642,7 +2930,9 @@ mod tests {
 
         // 3. Matched GET with wrong creds → the Go frp 401 page (the
         // 200ms anti-brute-force delay is inside the handler, already
-        // covered by the auth unit tests elsewhere).
+        // covered by the auth unit tests elsewhere). Header name is
+        // Go-canonicalized on the wire (round-16 FIX 12: net/http writes
+        // "Www-Authenticate:", probe vs go1.25.12 + Go frp v0.71.0).
         let unauth =
             format!("GET /static/plain.txt HTTP/1.1\r\nHost: t\r\nAuthorization: {bad}\r\n\r\n");
         assert_eq!(
@@ -1650,7 +2940,7 @@ mod tests {
             b"HTTP/1.1 401 Unauthorized\r\n\
               Content-Length: 13\r\n\
               Content-Type: text/plain; charset=utf-8\r\n\
-              WWW-Authenticate: Basic realm=\"Restricted\"\r\n\
+              Www-Authenticate: Basic realm=\"Restricted\"\r\n\
               X-Content-Type-Options: nosniff\r\n\
               \r\n\
               Unauthorized\n",
@@ -1689,14 +2979,23 @@ mod tests {
         // url.URL{Path}.String() encodePath mode: the unreserved set plus
         // $&+,/:;=@ stay literal — ONLY '?' is additionally escaped — and
         // everything else percent-encodes byte-wise with uppercase hex
-        // (href oracles probe-verified against go1.25.0 dirList).
-        assert_eq!(url_escape_path("a b?c#d%&e:f/g"), "a%20b%3Fc%23d%25&e:f/g");
-        assert_eq!(url_escape_path("plain.txt"), "plain.txt");
-        assert_eq!(url_escape_path("sub/"), "sub/");
-        assert_eq!(url_escape_path("q?r.txt"), "q%3Fr.txt");
-        assert_eq!(url_escape_path("x\"&'<>.txt"), "x%22&%27%3C%3E.txt");
-        // Non-ASCII percent-encodes byte-wise (ï = C3 AF).
-        assert_eq!(url_escape_path("naïve.txt"), "na%C3%AFve.txt");
+        // (href oracles probe-verified against go1.25.0 dirList). The fn
+        // operates on BYTES (round-16 FIX 2) — non-ASCII inputs are their
+        // UTF-8 bytes, and arbitrary bytes escape identically.
+        assert_eq!(
+            url_escape_bytes(b"a b?c#d%&e:f/g"),
+            "a%20b%3Fc%23d%25&e:f/g"
+        );
+        assert_eq!(url_escape_bytes(b"plain.txt"), "plain.txt");
+        assert_eq!(url_escape_bytes(b"sub/"), "sub/");
+        assert_eq!(url_escape_bytes(b"q?r.txt"), "q%3Fr.txt");
+        assert_eq!(url_escape_bytes(b"x\"&'<>.txt"), "x%22&%27%3C%3E.txt");
+        // Non-ASCII percent-encodes byte-wise (ï = C3 AF) — and so does a
+        // byte that is NOT valid UTF-8 at all (%FF), like Go hexEscapeNon-
+        // ASCII over a raw name.
+        assert_eq!(url_escape_bytes("naïve.txt".as_bytes()), "na%C3%AFve.txt");
+        assert_eq!(url_escape_bytes(b"raw\xff.txt"), "raw%FF.txt");
+        assert_eq!(url_escape_bytes(b"\xff"), "%FF");
         // htmlReplacer (net/http server.go): & < > " '.
         assert_eq!(
             html_escape_text("x\"&'<>.txt"),

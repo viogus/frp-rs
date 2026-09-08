@@ -294,46 +294,10 @@ mod tests {
         }
     }
 
-    /// Connect a skip-verify TLS client to the plugin's listener (the
-    /// listener presents the self-signed test cert, so verification must be
-    /// off) and return the established TLS stream. The client offers no
-    /// ALPN, so the plugin's listener stays on the HTTP/1.1 face and never
-    /// negotiates h2.
-    async fn connect_tls_client(
-        addr: std::net::SocketAddr,
-    ) -> tokio_rustls::client::TlsStream<TcpStream> {
-        let tcp = TcpStream::connect(addr).await.unwrap();
-        let connector =
-            frp_core::transport::build_tls_connector_skip_verify(None, None, None, false)
-                .expect("tls connector");
-        let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
-        connector
-            .connect(server_name, tcp)
-            .await
-            .expect("client TLS handshake")
-    }
-
-    /// Read the plugin's answer over the client TLS stream until the
-    /// connection ends (the handler writes its final head and drops the
-    /// conn; the close may surface as clean EOF or a TLS error, never as
-    /// data). Bounded: a regression that keeps the conn open must fail this
-    /// test, not hang the suite.
-    async fn read_until_tls_close(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> Vec<u8> {
-        use tokio::io::AsyncReadExt;
-        let mut resp = Vec::new();
-        let mut chunk = [0u8; 512];
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                match tls.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => resp.extend_from_slice(&chunk[..n]),
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for the plugin's answer — regression?");
-        resp
-    }
+    // FIX 5: `connect_tls_client` / `read_until_tls_close` were byte-identical
+    // to the https2https test copies — the https2https versions are the
+    // shared ones now (imported below); these duplicates deleted.
+    use crate::plugin::https2https::tests::{connect_tls_client, read_until_tls_close};
 
     /// Audit pin: the https2http connect-refused arm (`handle_conn` — the
     /// plain-HTTP backend dial failure answers Go's default ReverseProxy
@@ -367,9 +331,12 @@ mod tests {
         };
         let handle = match start_https2http_plugin(&cfg).await {
             Ok(h) => h,
+            // FIX 4: this test REQUIRES plugin start success — the refused
+            // backend port is what arms the per-request dial. A skip would
+            // pass vacuously and hide a regression that breaks listener
+            // startup, so fail loudly instead.
             Err(e) => {
-                eprintln!("Skipping test: plugin start failed (sandboxed?): {e}");
-                return;
+                panic!("https2http plugin start failed — regression or environment break: {e}")
             }
         };
         let mut tls = connect_tls_client(handle.local_addr).await;

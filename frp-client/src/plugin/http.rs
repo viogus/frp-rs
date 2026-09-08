@@ -124,6 +124,231 @@ impl HttpProxyAuth {
     }
 }
 
+/// Go conn.serve statusError render for the version gate (server.go —
+/// http1ServerSupportsRequest, "unsupported protocol version"; wire shape
+/// probe-verified against go1.25): a DETAILED errorHeaders render ("HTTP/
+/// 1.1 %d %s: %s" + headers + the reason echoed in the body), unlike the
+/// no-detail GO_400_RENDER/GO_431_RENDER from the default arm.
+const GO_505_RENDER: &str =
+    "HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version\r\n\
+    Content-Type: text/plain; charset=utf-8\r\n\
+    Connection: close\r\n\
+    \r\n\
+    505 HTTP Version Not Supported: unsupported protocol version";
+
+/// Go `ParseHTTPVersion` (net/http/request.go) shape gate: `HTTP/1.0` and
+/// `HTTP/1.1` short-circuit; every other version parses only when it is
+/// exactly 8 chars `HTTP/X.Y` with single ASCII digits. Returns the major.
+/// (Not the mod.rs `go_parse_http_version_ok`: that one accepts only major
+/// 1 — this shape gate must classify every major to find the 505 class.)
+fn parseable_version_major(version: &str) -> Option<u8> {
+    match version {
+        "HTTP/1.0" | "HTTP/1.1" => Some(1),
+        _ => {
+            let b = version.as_bytes();
+            (b.len() == 8
+                && b.starts_with(b"HTTP/")
+                && b[5].is_ascii_digit()
+                && b[6] == b'.'
+                && b[7].is_ascii_digit())
+            .then(|| b[5] - b'0')
+        }
+    }
+}
+
+/// True when Go's plain-arm face (http.Server conn) would render 505 for
+/// this request line: the 3-part literal-space shape parses, the method
+/// token is valid, and the version token is a parseable `HTTP/X.Y` with
+/// major != 1 (http1ServerSupportsRequest passes only ProtoMajor==1 plus
+/// the PRI-*-HTTP/2.0 h2c-prior-knowledge upgrade special case, which the
+/// exemption below implements unconditionally — request.go
+/// `http1ServerSupportsRequest`: `req.Method == "PRI" &&
+/// req.URL.Path == "*" && req.Proto == "HTTP/2.0"`, no h2c feature gate).
+/// Malformed shapes never reach the gate in Go —
+/// parseRequestLine/validMethod/ParseHTTPVersion failures are
+/// badStringError, which the conn.serve default arm renders as the
+/// no-detail 400 — matching the false return here.
+/// Residual divergence (documented, deliberate): Go's server, having
+/// accepted the upgrade shape, lets the conn machinery serve the request
+/// (the handler answers it — probe: 2xx-class — and an h2c-enabled
+/// listener would switch protocols on the conn); frp-rs has no h2 server
+/// on the plain plugin face, so the exempted shape falls to the no-detail
+/// 400 arm below. Round-16-wave behavior (no exemption) rendered 505 for
+/// it — Go does not.
+fn go_505_request_line(line: Option<&str>) -> bool {
+    let Some(line) = line else {
+        return false;
+    };
+    let mut parts = line.splitn(3, ' ');
+    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if target.is_empty() || !super::go_valid_method_ok(method) {
+        return false;
+    }
+    // The classification runs on the raw head bytes (`lines()` keeps the
+    // trailing `\r` of a CRLF line) — Go's textproto strips ONE trailing
+    // `\r` before ParseHTTPVersion sees the token, so strip it here too.
+    // Any other trailing character (a stray space, extra token) must keep
+    // failing the 8-char shape the way Go's version-token length check does.
+    let version = version.strip_suffix('\r').unwrap_or(version);
+    // http1ServerSupportsRequest's unconditional PRI exemption: the exact
+    // 3-token "PRI * HTTP/2.0" upgrade shape passes the version gate at
+    // any major (Go checks Method/PATH/Proto on the parsed request).
+    if method == "PRI" && target == "*" && version == "HTTP/2.0" {
+        return false;
+    }
+    parseable_version_major(version).is_some_and(|maj| maj != 1)
+}
+
+/// Round-16 post-fix FIX 4: Go `textproto.ReadMIMEHeader` error semantics
+/// over the header block (everything after the request line, up to the
+/// first empty line) — http.Server readRequest parses the WHOLE head
+/// (request line, then ReadMIMEHeader) BEFORE http1ServerSupportsRequest
+/// runs, so a 505-classified request line (checked by the caller) must
+/// still face header validation: malformed header content on a
+/// 505-shaped line answers the no-detail 400, never 505. Mirror of the
+/// frp-server vhost.rs/tcpmux.rs walker (`validate_connect_head_shape`,
+/// tcpmux.rs FIX-4 comment, shapes 1-4) — the four error shapes:
+///  1. the FIRST header line opens with SP/HTAB — textproto's "malformed
+///     MIME header initial line" (a fold with no header to continue);
+///  2. any group-first header line without a colon — "malformed MIME
+///     header: missing colon". obs-fold continuation lines (SP/HTAB
+///     leading) are EXEMPT: they merge into the previous header's value
+///     and need no colon of their own. A blank group-first line is the
+///     head's terminating blank line — ReadMIMEHeader returns on the
+///     first blank line (reader.go:543-545), so a head with zero header
+///     lines is the same legal shape;
+///  3. a header NAME byte that is neither tchar nor SPACE, or an empty
+///     name (": x") — textproto canonicalMIMEHeaderKey accepts SPACE in
+///     a name without canonicalizing (go.dev/issue/34540), so "Bad
+///     Name: x" parses OK exactly like Go, while a paren/tab/DEL/
+///     obs-text name byte errors;
+///  4. CTL (< 0x20 except HTAB) or DEL (0x7f) in any header VALUE, over
+///     the obs-fold-MERGED line (fold continuation bytes face the same
+///     check). Each physical line is trimmed of SP/HTAB ONLY at both
+///     ends before the merge (Go reader.go trim; bufio elides just the
+///     \r\n/\n terminator) — an EDGE CTL byte (the second `\r` of a
+///     `\r\r\n`-terminated line, a trailing \x0b/\x0c, a fold-opening
+///     `\r`) survives into the scan exactly like Go.
+///
+/// Per-line EOL: `str::lines()` keeps the trailing `\r` of a CRLF line,
+/// so ONE trailing `\r` is stripped per physical line before every check
+/// (Go textproto ReadLine strips it; the lossy-converted head's obs-text
+/// — U+FFFD = EF BF BD — rejects an obs-text name byte exactly like Go,
+/// the same non-tchar argument as the tcpmux walker).
+fn go_505_arm_headers_parse(head: &str) -> bool {
+    // Skip the request line itself (`nth(1)` — the caller classified it;
+    // the plain `Lines` iterator type keeps the shared group validator
+    // usable below, the same construction the frp-server tcpmux walker
+    // uses). A Done head always carries its terminating blank line, so
+    // the walk ends at an empty line; the None arm below is unreachable
+    // on the caller's path (defensive true — no header lines to
+    // validate).
+    let mut lines = head.lines();
+    let Some(first) = lines.nth(1) else {
+        return true;
+    };
+    let first = first.strip_suffix('\r').unwrap_or(first);
+    // A blank first header line is the terminating blank line of a
+    // zero-header head — legal (ReadMIMEHeader returns on it).
+    if first.is_empty() {
+        return true;
+    }
+    let mut lines = lines.peekable();
+    // Shape 1: the first header line must not open with SP/HTAB.
+    if first.starts_with(' ') || first.starts_with('\t') {
+        return false;
+    }
+    if !go_505_arm_header_group_valid(first, &mut lines) {
+        return false;
+    }
+    // Every later group-first line is non-fold by construction (folds are
+    // consumed inside go_505_arm_header_group_valid).
+    while let Some(group_first) = lines.next() {
+        let group_first = group_first.strip_suffix('\r').unwrap_or(group_first);
+        if group_first.is_empty() {
+            // The head's terminating blank line: the header block ends
+            // here, legal.
+            return true;
+        }
+        if !go_505_arm_header_group_valid(group_first, &mut lines) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate one header group starting at a non-fold line, consuming its
+/// obs-fold continuations. Shapes 2-4 of the FIX 4 comment above.
+fn go_505_arm_header_group_valid(
+    first: &str,
+    lines: &mut std::iter::Peekable<std::str::Lines<'_>>,
+) -> bool {
+    // Shape 2: group-first lines must carry a colon (mustHaveFieldNameColon
+    // — the fold-merge validation runs on the FIRST physical line only).
+    let Some(colon) = first.find(':') else {
+        return false;
+    };
+    let name = &first[..colon];
+    let value = &first[colon + 1..];
+    // Shape 3: name bytes — empty or non-(tchar|SP) → error.
+    if name.is_empty() || name.bytes().any(|b| !is_token_byte(b) && b != b' ') {
+        return false;
+    }
+    // Shape 4: CTL/DEL in the merged value (first line + folds; Go checks
+    // the obs-fold-MERGED line). SP/HTAB trimmed ONLY at the ends (see the
+    // FIX 4 comment — an edge CTL survives into the scan like Go).
+    let mut value_has_ctl = value
+        .trim_end_matches([' ', '\t'])
+        .bytes()
+        .any(is_bad_value_byte);
+    while let Some(fold) = lines.next_if(|l| l.starts_with(' ') || l.starts_with('\t')) {
+        let fold = fold.strip_suffix('\r').unwrap_or(fold);
+        if fold
+            .trim_matches([' ', '\t'])
+            .bytes()
+            .any(is_bad_value_byte)
+        {
+            value_has_ctl = true;
+        }
+    }
+    !value_has_ctl
+}
+
+/// RFC 7230 tchar (ALPHA / DIGIT / "!#$%&'*+-.^_`|~") — Go textproto
+/// `validHeaderFieldByte` / httpguts `ValidHeaderFieldName` byte set (the
+/// frp-server tcpmux.rs `is_token_byte` twin; the method gate in mod.rs
+/// inlines the same set).
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// textproto `validHeaderValueByte` complement: a value byte is a parse
+/// error when it is a CTL other than HTAB (< 0x20, != 0x09) or DEL (0x7f).
+/// obs-text (0x80+) is legal.
+fn is_bad_value_byte(b: u8) -> bool {
+    (b < b' ' && b != b'\t') || b == 0x7f
+}
+
 async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> Result<(), String> {
     // Read the request head in chunks. Head end follows Go textproto
     // semantics (the engine behind http.ReadRequest): each line ends at the
@@ -140,22 +365,37 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     // semantics).
     // The 1 MiB cap below is Go's http.Server MaxHeaderBytes DEFAULT on the
     // PLAIN arm (audit: the old 64 KiB cap rejected request heads Go serves
-    // — 100+ KiB Cookie or Authorization headers are legal HTTP). On the
-    // CONNECT arm it is a fail-closed Rust-only divergence: frp http_proxy
-    // sniffs the method prefix and then calls http.ReadRequest directly,
-    // which has NO size cap (bounded only by the ReadHeaderTimeout window).
-    // The sniff runs after this read loop, so the cap cannot know the arm
-    // yet — a breach is not a read error: the buffer is carried back so the
-    // arm classification below can answer 431 on the plain arm the way Go's
-    // server would (it errors the read itself and writes the render BEFORE
-    // the handler — http_proxy.go's plain arm never sees the giant head at
-    // all), while the CONNECT arm closes silently (see the arm notes below).
+    // — 100+ KiB Cookie or Authorization headers are legal HTTP). Go
+    // enforces it as a READ LIMIT, not a size gate: conn.readRequest sets
+    // c.r.setReadLimit(initialReadLimitSize) = maxHeaderBytes + 4096 bufio
+    // slop (server.go), and the parser only errors when the limit is
+    // consumed with the head still INCOMPLETE — a head whose empty-line
+    // terminator arrived within the limit parses and serves (probed: a
+    // terminated ~1 MiB+64 head answers 200; only a terminator beyond the
+    // limit — or no terminator at all — trips the 431). The loop below
+    // mirrors that: the terminator scan runs BEFORE the cap check, so a
+    // completed head serves no matter how large the buffer grew, and the
+    // 4096-byte reads reproduce Go's bufio slack — the buffer can overshoot
+    // the cap by one chunk, and a terminator inside that overshoot still
+    // serves (boundary parity with Go: served <= ~1 MiB+4096, 431 above).
+    // On the CONNECT arm the cap stays a fail-closed Rust-only divergence:
+    // frp http_proxy.go sniffs the method prefix and then calls
+    // http.ReadRequest directly, which has NO size cap (bounded only by the
+    // ReadHeaderTimeout window). The sniff runs after this read loop, so
+    // the cap cannot know the arm yet — a breach is not a read error: the
+    // buffer is carried back so the arm classification below can answer 431
+    // on the plain arm the way Go's server would (it errors the read itself
+    // and writes the render BEFORE the handler — http_proxy.go's plain arm
+    // never sees the giant head at all), while the CONNECT arm closes
+    // silently (see the arm notes below).
     enum HeadRead {
         /// Head ended at the first empty line (Go textproto semantics).
         Done(Vec<u8>),
-        /// Over the 1 MiB cap below — terminator arrived or not (Go
-        /// MaxHeaderBytes breaches regardless of whether the terminator
-        /// appeared).
+        /// Past the 1 MiB cap with NO empty line in the buffer (Go's
+        /// readLimit model: the limit ran out mid-head — errTooLarge). A
+        /// completed head is never "too large"; only an unterminated one
+        /// breaches (frp-rs fires up to one 4096 chunk before Go's
+        /// 1 MiB+4096 limit — same 431 class, slack-size margin).
         TooLarge(Vec<u8>),
         /// EOF mid-head: the client closed before any empty line. Not a
         /// hard read error — the partial head is carried back so the arm
@@ -165,10 +405,31 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
         /// and the CONNECT arm all close silently.
         Eof(Vec<u8>),
     }
-    let head = tokio::time::timeout(super::PLUGIN_HEADER_READ_TIMEOUT, async {
+    // The match arms pin the closure's error type to String (the `Err(e) =>
+    // return Err(e)` arm unifies with this fn's `Result<(), String>`), so
+    // the inner `?`s on the read error resolve without annotation.
+    let head = match tokio::time::timeout(super::PLUGIN_HEADER_READ_TIMEOUT, async {
         let mut buf = Vec::new();
-        let mut chunk = [0u8; 512];
+        // 4 KiB chunks: the cap check runs after the terminator scan, so
+        // the buffer can overshoot 1 MiB by up to one chunk before the
+        // breach is detected — Go's bufio slack is the same 4096
+        // (initialReadLimitSize = MaxHeaderBytes + 4096), keeping the
+        // served/431 boundary byte-aligned with Go.
+        let mut chunk = [0u8; 4096];
         loop {
+            // Terminator scan FIRST: Go's read limit only errors when the
+            // limit is consumed with the head still incomplete — a head
+            // whose empty line is already in the buffer was completed in
+            // time and parses (probed: terminated ~1 MiB+64 is served).
+            // Only an overshoot that contains NO terminator is a breach
+            // (431 on the plain arm — Go errTooLarge renders before the
+            // handler runs).
+            if frp_core::textproto::head_end(&buf).is_some() {
+                return Ok(HeadRead::Done(buf));
+            }
+            if buf.len() > 1024 * 1024 {
+                return Ok(HeadRead::TooLarge(buf));
+            }
             let n = client
                 .read(&mut chunk)
                 .await
@@ -177,23 +438,14 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
                 return Ok(HeadRead::Eof(buf));
             }
             buf.extend_from_slice(&chunk[..n]);
-            // The cap fires BEFORE the terminator scan: Go MaxHeaderBytes
-            // rejects a head whose TOTAL accumulated size breaches the cap
-            // even when the empty-line terminator arrived in the same read
-            // (the breach is detected while lines are still being
-            // consumed) — a terminated-but-oversized head is a 431, never
-            // a forwardable request.
-            if buf.len() > 1024 * 1024 {
-                return Ok(HeadRead::TooLarge(buf));
-            }
-            if frp_core::textproto::head_end(&buf).is_some() {
-                break;
-            }
         }
-        Ok::<HeadRead, String>(HeadRead::Done(buf))
     })
     .await
-    .map_err(|_| "read headers timed out".to_string())??;
+    {
+        Ok(Ok(head)) => head,
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => return Err("read headers timed out".to_string()),
+    };
     let (buf, head_too_large, head_eof) = match head {
         HeadRead::Done(buf) => (buf, false, false),
         HeadRead::TooLarge(buf) => (buf, true, false),
@@ -231,23 +483,43 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     // non-empty, the method token gated by Go's validMethod (a non-tchar
     // "G@T" is a 400 before routing — request.go readRequest), request-side
     // Go ParseHTTPVersion semantics restricted to major 1 — see plugin/
-    // mod.rs `parse_request_line`; the version gate is the request-side
-    // form because the frps vhost front has already 505-gated every request
-    // it forwards, so only HTTP/1.x tokens can reach this plugin, and Go
-    // serves/tunnels every parseable 1.x (HTTP/1.2..1.9 included). The old
+    // mod.rs `parse_request_line`). The major-1 restriction is NOT a
+    // network-position claim: it holds only under http/https-typed frps
+    // entries, whose vhost front has already 505-gated every request it
+    // tunnels. Under tcp/tcpmux/xtcp-typed entries this listener receives
+    // RAW client bytes, and its own face is the full http.Server conn
+    // machinery (frp http_proxy.go PutConns the plain arm into an
+    // http.Server): conn.readRequest's http1ServerSupportsRequest gate
+    // (server.go) renders 505 for a fully parsed head whose version token
+    // is a parseable non-1.x HTTP/X.Y, while Go serves every parseable 1.x
+    // (HTTP/1.2..1.9 included — ProtoMajor 1 passes). The old
     // split_whitespace collapsed every whitespace run, so tab-joined tokens
     // parsed and the request was dialed/forwarded — accept-where-Go-
     // rejects.
-    // A failed head (malformed line, a mid-head EOF carrying partial bytes,
-    // or a too-large block whose line never gets validated — Go's server
-    // trips the cap before reading further) renders Go's server error on
-    // the plain arm, then closes. Silent arms (CONNECT sniff / fewer than
-    // 7 bytes, mirroring ReadFull) close without a byte. TooLarge and Eof
-    // heads skip the parse entirely: the CAP is the error (431 either way,
-    // line valid or not), and an EOF head is INCOMPLETE by construction —
-    // Eof is only returned when no empty line was seen, so even a buffer
-    // whose first line parses cleanly ("GET / HTTP/1.1\r\nHost: ..." then
-    // EOF) must never be forwarded (Go errors the read and renders 400).
+    // A failed head renders Go's server error on the plain arm, then
+    // closes; silent arms (CONNECT sniff / fewer than 7 bytes, mirroring
+    // ReadFull) close without a byte. Three distinct renders, ordered as
+    // Go classifies them:
+    //   - a TooLarge head renders Go's 431 — the read limit ran out
+    //     mid-head, which in Go errors the read before any line is
+    //     validated (431 either way, line valid or not — the version gate
+    //     is never reached);
+    //   - a TERMINATED head whose first line carries a parseable non-1.x
+    //     version token renders Go's 505 — Go parses the whole head first
+    //     (request line, then ReadMIMEHeader over the header block), and
+    //     only then does http1ServerSupportsRequest reject the version.
+    //     The header block must PARSE for the 505 to fire: malformed
+    //     header content on a 505-shaped line (missing-colon line, CTL in
+    //     a value, bad field name) errors the head in Go and answers the
+    //     no-detail 400, not 505 — the go_505_arm_headers_parse gate below
+    //     mirrors that (round-16 post-fix FIX 4; the same raw-legs
+    //     exposure that makes the 1.x gate necessary here);
+    //   - every other parse failure (malformed line, method gate, version
+    //     shape — Go badStringError, the no-detail default arm) and Eof
+    //     heads (INCOMPLETE by construction — Eof is only returned when no
+    //     empty line was seen, so even a buffer whose first line parses
+    //     cleanly ("GET / HTTP/1.1\r\nHost: ..." then EOF) must never be
+    //     forwarded: Go errors the read and renders 400) render Go's 400.
     let mut parsed_line = None;
     if !head_too_large && !head_eof {
         parsed_line = lines.next().and_then(super::parse_request_line);
@@ -258,6 +530,14 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
             if !is_connect && !head_short {
                 let render = if head_too_large {
                     super::GO_431_RENDER
+                } else if !head_eof
+                    && go_505_request_line(headers_str.lines().next())
+                    // Go parses the whole head before the version gate —
+                    // malformed header content on a 505-shaped request
+                    // line answers 400, not 505 (round-16 post-fix FIX 4).
+                    && go_505_arm_headers_parse(&headers_str)
+                {
+                    GO_505_RENDER
                 } else {
                     super::GO_400_RENDER
                 };
@@ -881,12 +1161,16 @@ mod tests {
         );
     }
 
-    /// Audit FIX 5 pin: a plain-arm head over the 1 MiB cap (Go
-    /// http.Server MaxHeaderBytes default; the old 64 KiB cap rejected
-    /// legal heads) renders Go's 431 before the connection closes. The
-    /// send has no blank line so the head can only end by breaching the
-    /// cap — the client write may error (server closes mid-send) and is
-    /// ignored.
+    /// Audit pin (round-16 FIX 1, arm a): an UNTERMINATED plain-arm head
+    /// past the 1 MiB cap renders Go's 431 — the read-limit model: the
+    /// terminator scan never fires (no blank line is ever sent), so the
+    /// cap is the only way the read can end, and an unfinished head is
+    /// errTooLarge in Go. Go's limit carries 4096 bufio slop on top of
+    /// MaxHeaderBytes, so Go would only breach after ~1 MiB+4096 consumed;
+    /// frp-rs fires up to one 4096 chunk earlier (same 431 class, slack
+    /// margin documented on HeadRead::TooLarge). The head size keeps the
+    /// whole client payload consumed before the breach fires, so the close
+    /// is clean and the render always arrives.
     #[tokio::test]
     async fn http_proxy_oversized_plain_head_answers_go_431() {
         let cfg = PluginConfig::default();
@@ -1033,42 +1317,234 @@ mod tests {
         );
     }
 
-    /// Audit FIX 2 pin: a plain-arm head whose TERMINATOR arrived but whose
-    /// TOTAL accumulated size exceeds the 1 MiB cap renders Go's 431 — Go
-    /// http.Server MaxHeaderBytes breaches are detected while lines are
-    /// still being consumed, so a completed-but-oversized head is a 431,
-    /// never a forwardable request. The old code scanned for the empty line
-    /// BEFORE the cap check and forwarded the head to the backend.
+    /// Round-16 FIX 1 pin (the flip): a plain-arm head whose TERMINATOR
+    /// arrived is SERVED even when its total size exceeds 1 MiB — Go's cap
+    /// is a READ LIMIT (MaxHeaderBytes + 4096 bufio slop) that errors only
+    /// when the limit is consumed with the head still incomplete
+    /// (probe-verified: a terminated ~1 MiB+64 head answers 200 in Go).
+    /// The head targets a bind-then-drop refused port, so "served" shows
+    /// up as the plugin's dial-fail 500 render: the head reached the parse
+    /// + forward path (no 431), the backend dial was attempted, and the
+    /// conn closed after the render. RED on the old cap-before-scan order
+    /// (it 431'd this exact head).
     #[tokio::test]
-    async fn http_proxy_terminated_oversized_plain_head_answers_go_431() {
+    async fn http_proxy_terminated_oversized_plain_head_is_served() {
+        use tokio::net::TcpListener;
+        // Bind then drop: the port is closed, so the backend dial is a
+        // deterministic ECONNREFUSED (a live backend would have to drain
+        // ~1 MiB of forwarded head before answering — the refused-port
+        // 500 proves the forward path ran without that machinery).
+        let refused = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                return;
+            }
+        };
+        let refused_addr = refused.local_addr().unwrap();
+        drop(refused);
+
         let cfg = PluginConfig::default();
-        let handle = match start_http_proxy(&cfg).await {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("Skipping test: plugin start failed (sandboxed?): {e}");
-                return;
-            }
-        };
-        let mut client = match TcpStream::connect(handle.local_addr).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Skipping test: cannot connect (sandboxed?): {e}");
-                return;
-            }
-        };
+        let handle = start_http_proxy(&cfg)
+            .await
+            .expect("plugin start failed — test-environment or regression signal, not a skip");
+        let mut client = TcpStream::connect(handle.local_addr)
+            .await
+            .expect("cannot connect to the plugin listener (sandboxed?)");
         let mut head = Vec::with_capacity(1024 * 1024 + 128);
-        head.extend_from_slice(b"GET / HTTP/1.1\r\nHost: x\r\nX-Big: ");
+        head.extend_from_slice(
+            format!("GET http://{refused_addr}/ HTTP/1.1\r\nHost: x\r\nX-Big: ").as_bytes(),
+        );
+        // ~1 MiB + 64 of header content plus the prefix: the terminator
+        // ends ~1 MiB + 125 bytes in — inside the 1 MiB + 4096 serve
+        // boundary (Go serves a terminated head at this size; probe).
         head.resize(1024 * 1024 + 64, b'A');
-        // Terminated — but far past the cap, so it must still 431.
         head.extend_from_slice(b"\r\n\r\n");
         let _ = client.write_all(&head).await;
         let mut resp = Vec::new();
         let _ = client.read_to_end(&mut resp).await;
+        assert!(
+            resp.starts_with(b"HTTP/1.1 500 Internal Server Error"),
+            "terminated oversized plain head must be SERVED (dial-fail 500 on \
+             the refused target proves the head was parsed and forwarded, not \
+             431'd), got {} bytes: {:?}",
+            resp.len(),
+            String::from_utf8_lossy(&resp[..resp.len().min(120)])
+        );
+    }
+
+    /// Round-16 FIX 1 pin (arm b): a terminated head whose terminator lies
+    /// PAST the serve boundary (total ~1 MiB + 8192, terminator far beyond
+    /// 1 MiB + 4096) still 431s — Go's errTooLarge fires when the limit is
+    /// consumed mid-head; the terminator never arrives in time to complete
+    /// it. The breach fires as soon as the buffer passes 1 MiB without an
+    /// empty line, so the client-side write outruns the read: the payload
+    /// is written from a spawned task (it may error when the server closes
+    /// mid-send) while this task reads the render, bounded by a 10 s
+    /// deadline.
+    #[tokio::test]
+    async fn http_proxy_terminated_past_slack_plain_head_answers_go_431() {
+        let cfg = PluginConfig::default();
+        let handle = start_http_proxy(&cfg)
+            .await
+            .expect("plugin start failed — test-environment or regression signal, not a skip");
+        let client = TcpStream::connect(handle.local_addr)
+            .await
+            .expect("cannot connect to the plugin listener (sandboxed?)");
+        let (mut rd, mut wr) = tokio::io::split(client);
+        let mut head = Vec::with_capacity(1024 * 1024 + 16 * 1024);
+        head.extend_from_slice(b"GET / HTTP/1.1\r\nHost: x\r\nX-Big: ");
+        head.resize(1024 * 1024 + 8192, b'A');
+        head.extend_from_slice(b"\r\n\r\n");
+        tokio::spawn(async move {
+            // The server breaches at ~1 MiB + one chunk and closes; the
+            // rest of the payload is never consumed. The write errors —
+            // that is the expected outcome, ignored here.
+            let _ = wr.write_all(&head).await;
+        });
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            rd.read_to_end(&mut resp),
+        )
+        .await
+        .expect("timed out waiting for the 431 render — regression?");
         assert_eq!(
             resp,
             super::super::GO_431_RENDER.as_bytes(),
-            "terminated oversized plain head must render Go's 431, got {} bytes",
-            resp.len()
+            "terminated head past the serve boundary must render Go's 431, \
+             got {} bytes: {:?}",
+            resp.len(),
+            String::from_utf8_lossy(&resp[..resp.len().min(120)])
         );
+    }
+
+    /// Round-16 FIX 2 pin: on the PLAIN arm a TERMINATED head whose first
+    /// line carries a parseable non-1.x version token renders Go's 505 —
+    /// the http.Server conn face frp http_proxy.go PutConns plain heads
+    /// into answers 505 via http1ServerSupportsRequest only AFTER the
+    /// whole head parsed (probe-verified wire bytes for HTTP/2.0 / HTTP/0.9
+    /// / HTTP/9.9). This face is reachable with raw bytes under
+    /// tcp/tcpmux/xtcp-typed frps entries (the vhost front's 505 gate only
+    /// covers http/https entries). Lenient version SHAPES (HTTP/1.10) stay
+    /// Go's no-detail 400 — badStringError renders before the gate.
+    /// Round-16 post-fix (FIX 3): the "PRI * HTTP/2.0" h2c-prior-knowledge
+    /// shape is EXEMPT from the 505 class — http1ServerSupportsRequest
+    /// passes it unconditionally (request.go, no feature gate) — and the
+    /// fall-through here is the no-detail 400 (Go then serves the request
+    /// on its conn machinery; frp-rs has no h2 server on this face —
+    /// documented residual divergence).
+    #[tokio::test]
+    async fn http_proxy_plain_head_non_1x_version_answers_go_505() {
+        let cfg = PluginConfig::default();
+        let handle = start_http_proxy(&cfg)
+            .await
+            .expect("plugin start failed — test-environment or regression signal, not a skip");
+        for (line, expect) in [
+            ("GET /x HTTP/2.0", GO_505_RENDER.as_bytes()),
+            ("GET /x HTTP/0.9", GO_505_RENDER.as_bytes()),
+            ("GET /x HTTP/9.9", GO_505_RENDER.as_bytes()),
+            // Lenient version shape: parseable as neither 1.x nor any
+            // HTTP/X.Y — Go's malformed-version 400 (no-detail).
+            ("GET /x HTTP/1.10", super::super::GO_400_RENDER.as_bytes()),
+            ("GET /x HTTP/2", super::super::GO_400_RENDER.as_bytes()),
+            // The h2c-prior-knowledge upgrade shape passes the version
+            // gate in Go (505-exempt) and renders 400 here (no h2 server
+            // on this plain face). RED on the round-16-wave code, which
+            // 505'd the shape via the plain major!=1 classify.
+            ("PRI * HTTP/2.0", super::super::GO_400_RENDER.as_bytes()),
+            // Not the exact PRI shape: a different target or version must
+            // keep classifying by version major (Go: only Method PRI +
+            // Path "*" + Proto HTTP/2.0 together pass the exemption).
+            ("PRI /x HTTP/2.0", GO_505_RENDER.as_bytes()),
+            ("PRI * HTTP/3.0", GO_505_RENDER.as_bytes()),
+        ] {
+            let mut client = TcpStream::connect(handle.local_addr)
+                .await
+                .expect("cannot connect to the plugin listener (sandboxed?)");
+            let head = format!("{line}\r\nHost: x\r\n\r\n");
+            client.write_all(head.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            let _ = client.read_to_end(&mut resp).await;
+            assert_eq!(
+                resp,
+                expect,
+                "request line {line:?} must render Go's error, got: {:?}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+    }
+
+    /// Round-16 post-fix FIX 4 pin: a 505-shaped request line whose
+    /// HEADER BLOCK is malformed answers Go's no-detail 400, never 505 —
+    /// http.Server readRequest parses the whole head (request line, then
+    /// ReadMIMEHeader over the header lines) before
+    /// http1ServerSupportsRequest runs, so header-content errors
+    /// (missing-colon line, initial obs-fold, CTL/DEL in a value) fire
+    /// first and render the badStringError 400. Headers that PARSE keep
+    /// the 505. RED on the round-16-wave code, which rendered 505 from
+    /// the request line alone.
+    #[tokio::test]
+    async fn http_proxy_505_classified_head_validates_header_block_first() {
+        let cfg = PluginConfig::default();
+        let handle = start_http_proxy(&cfg)
+            .await
+            .expect("plugin start failed — test-environment or regression signal, not a skip");
+        // (request line, expected render) — every fixture carries a
+        // 505-classified first line (parseable HTTP/2.0).
+        for (head, expect) in [
+            // Colonless group-first header line (missing colon).
+            (
+                "GET /x HTTP/2.0\r\nBadHeader\r\n\r\n",
+                super::super::GO_400_RENDER.as_bytes(),
+            ),
+            // obs-fold continuation with nothing to continue (textproto's
+            // "malformed MIME header initial line").
+            (
+                "GET /x HTTP/2.0\r\n Host: x\r\n\r\n",
+                super::super::GO_400_RENDER.as_bytes(),
+            ),
+            // Empty header name (": x").
+            (
+                "GET /x HTTP/2.0\r\n: x\r\n\r\n",
+                super::super::GO_400_RENDER.as_bytes(),
+            ),
+            // CTL byte in a header value.
+            (
+                "GET /x HTTP/2.0\r\nX-A: ok\x01bad\r\n\r\n",
+                super::super::GO_400_RENDER.as_bytes(),
+            ),
+            // DEL in a header value.
+            (
+                "GET /x HTTP/2.0\r\nX-A: ok\x7f\r\n\r\n",
+                super::super::GO_400_RENDER.as_bytes(),
+            ),
+            // CTL in an obs-fold continuation (merged-line check).
+            (
+                "GET /x HTTP/2.0\r\nX-A: ok\r\n \x01fold\r\n\r\n",
+                super::super::GO_400_RENDER.as_bytes(),
+            ),
+            // An obs-fold that PARSES (legal continuation) keeps the 505.
+            (
+                "GET /x HTTP/2.0\r\nX-A: one\r\n two\r\n\r\n",
+                GO_505_RENDER.as_bytes(),
+            ),
+            // A legal zero-header head keeps the 505.
+            ("GET /x HTTP/2.0\r\n\r\n", GO_505_RENDER.as_bytes()),
+        ] {
+            let mut client = TcpStream::connect(handle.local_addr)
+                .await
+                .expect("cannot connect to the plugin listener (sandboxed?)");
+            client.write_all(head.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            let _ = client.read_to_end(&mut resp).await;
+            assert_eq!(
+                resp,
+                expect,
+                "head {:?} must render Go's error, got: {:?}",
+                head,
+                String::from_utf8_lossy(&resp)
+            );
+        }
     }
 }

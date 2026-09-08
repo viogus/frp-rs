@@ -638,18 +638,35 @@ const VHOST_TIMEOUT_CAP_SECS: u64 = 24 * 60 * 60;
 /// `<= 0` value floors at 60s (Go parity for the floor), positive values
 /// pass through unchanged.
 ///
-/// Role divergence from Go frp (documented, audit-r7): in Go, `vhost_http_timeout`
-/// feeds ONLY the backend response-head wait — `ResponseHeaderTimeoutS` in
-/// pkg/util/vhost/http.go `NewHTTPReverseProxy`, floored at 60s, a slow
-/// backend head answers 504 — while the client-side head window is a
+/// Role split of `vhost_http_timeout` (Go-mirrored since rounds 13/14;
+/// the audit-r7 "plain HTTP/1.1 bridge is raw forward" reading is stale):
+/// Go's config feeds the ReverseProxy backend response-head wait —
+/// `ResponseHeaderTimeoutS` in pkg/util/vhost/http.go `NewHTTPReverseProxy`,
+/// a slow backend head answers 504 — while the client-side head window is a
 /// HARDCODED `ReadHeaderTimeout: 60 * time.Second` http.Server literal in
-/// server/service.go that the config never reaches. frp-rs has one config
-/// and spends it on the client-head window instead (the plain HTTP/1.1
-/// bridge is raw forward with no backend response-head wait — Go's CONNECT
-/// path has none either). The h2c frontend is the exception on both sides:
-/// its backend response-head translation read (vhost_h2c.rs) IS clocked by
-/// this config and answers 504 on expiry, the exact mirror of Go's
-/// ResponseHeaderTimeoutS semantics for that path.
+/// server/service.go that the config never reaches. frp-rs now mirrors
+/// BOTH halves with its one config. The backend-response-head half runs on
+/// EVERY `proxy_type == "http"` non-CONNECT leg, h1 AND h2c: on the h1 legs
+/// the wait lives in frp-server's ResponseHeaderInjector
+/// (frp-server/src/control/bridge.rs), which arms an absolute
+/// `vhost_http_timeout` deadline on exactly the Go gate (http non-CONNECT
+/// only), sits UPSTREAM of the transport snappy decode — the layer where Go
+/// runs ModifyResponse — and maps expiry to a 504 through the frp-core
+/// read-error arms (TimedOut → bare 504, the Go ErrorHandler shape;
+/// frp-core/src/bridge.rs documents the round-15 model). The h2c frontend
+/// is the same leg family, not an exception: its backend response-head
+/// translation read (vhost_h2c.rs) is clocked by this config and answers
+/// 504 on expiry, the exact mirror of Go's ResponseHeaderTimeoutS
+/// semantics. CONNECT and https legs raw-forward with NO response-head
+/// wait (Go connectHandler hijacks and joins raw — the ReverseProxy never
+/// arms — and the https muxer routes raw TLS bytes); TCP/STCP/XTCP bridges
+/// have no such semantic.
+///
+/// The remaining divergence (audit-r7, still current): frp-rs's one config
+/// ALSO clocks the client-head/preface window of the vhost accept paths
+/// (serve_vhost_request head deadline here, serve_h2c_request handshake
+/// deadline), where Go's hardcoded 60s http.Server literal keeps the
+/// config out.
 ///
 /// Positive values are additionally capped at [`VHOST_TIMEOUT_CAP_SECS`]:
 /// the clamped value feeds `Instant::now() + Duration::from_secs(...)` at
@@ -797,10 +814,13 @@ async fn handle_http1_request<S>(
     // head must arrive within vhost_http_timeout of the first byte. (There
     // is no Go "connReadTimeout" construct behind this window: Go frp's
     // client-head window is the hardcoded 60s ReadHeaderTimeout on its
-    // vhost http.Server, and on this HTTP/1.1 path the config's Go role —
-    // the backend response-head wait — has no counterpart, since the bridge
-    // is raw forward (Go's CONNECT path has none either); the
-    // config-on-client-head divergence is documented on clamp_vhost_timeout.)
+    // vhost http.Server, and the config's Go role — the backend
+    // response-head wait, `ResponseHeaderTimeoutS` — runs on the bridge
+    // leg instead (http_leg_head_deadline in bridge.rs, on every http
+    // non-CONNECT leg), not here on the client-head window; CONNECT and
+    // https legs raw-forward with neither, as does this window's Go
+    // literal. The config-on-client-head divergence is documented on
+    // clamp_vhost_timeout.)
     while pre_read.len() < 4096 && frp_core::textproto::head_end(&pre_read).is_none() {
         let mut buf = [0u8; 4096];
         let m = match tokio::time::timeout_at(head_deadline, stream.read(&mut buf)).await {
@@ -1158,11 +1178,15 @@ async fn handle_http1_request<S>(
             // Origin-form → Go http.Error 401 + WWW-Authenticate, realm
             // "Restricted" (http.go:275-277 — Go frp's realm is NOT the old
             // "frp"), body = http.StatusText(401) + "\n" ("Unauthorized\n",
-            // 12 bytes).
+            // 12 bytes). The header name is written in net/http's
+            // canonical casing "Www-Authenticate" (Header.WriteSubset via
+            // textproto.CanonicalMIMEHeaderKey — probe vs go1.25.12 and Go
+            // frp v0.71.0 both emit Www-Authenticate; registry casing
+            // "WWW-Authenticate" never reaches the wire).
             write_http_error_auth_response(
                 &mut stream,
                 "401 Unauthorized",
-                "WWW-Authenticate: Basic realm=\"Restricted\"",
+                "Www-Authenticate: Basic realm=\"Restricted\"",
                 "Unauthorized\n",
             )
             .await;
@@ -1801,7 +1825,8 @@ enum HeadLineVerdict {
 /// (dup-Host → 505 → missing-Host); this function covers the classes that
 /// follow them in Go's flow, over the RAW wire lines (textproto merges
 /// obs-fold continuations into the preceding header's value with a single
-/// SP per fold after TrimSpace — readContinuedLineSlice):
+/// SP per fold after a SP/HTAB-only trim of each physical line — reader.go
+/// trim, see the value-scan comment below for the edge-CTL consequence):
 ///
 /// 1. CTL/DEL in any header VALUE — the group-first line's after-colon
 ///    bytes AND every obs-fold continuation of that group (Go's value
@@ -1839,16 +1864,18 @@ fn validate_vhost_head_lines(request: &str) -> HeadLineVerdict {
     // wins — extract_host_header uses the same .find() order).
     let mut host_value: Option<String> = None;
     while let Some(first) = lines.next() {
-        // The blank line that terminated the head. The caller slices the
-        // head at its blank line, so this normally does not appear — but a
-        // terminator that is part of the input (unit fixtures, and the
-        // tcpmux-style raw shapes) yields `""` elements from `str::lines()`
-        // (two for a CRLFCRLF terminator), and a blank must END the header
+        // The head's terminating blank line. The caller's head slice
+        // INCLUDES the terminator — head_end returns the index past the
+        // final `\n` — so `str::lines()` yields a final "" element on
+        // EVERY well-formed head (exactly ONE for a CRLFCRLF terminator:
+        // `str::lines()` splits at each `\r\n`/`\n` and drops the empty
+        // tail after the final line ending). A blank must END the header
         // block like Go's textproto: `readMIMEHeader` returns at the first
         // empty line and never parses past it. Without the break, the
-        // blank's `""` would fall through to the missing-colon class below
-        // and reject every legal terminated head (the round-14
-        // tcpmux 9ff87ca trap, mirrored here).
+        // terminal "" would fall through to the missing-colon class below
+        // and reject every legal terminated head — the break firing on the
+        // terminal "" is precisely what keeps the colonless group-first
+        // rule safe (the round-14 tcpmux 9ff87ca trap, mirrored here).
         if first.is_empty() {
             break;
         }
@@ -1883,14 +1910,23 @@ fn validate_vhost_head_lines(request: &str) -> HeadLineVerdict {
             space_name = true;
         }
         // Class 1 + obs-fold merge: the group's value is the first line's
-        // after-colon bytes plus each continuation line (" " + TrimSpace
-        // per fold, Go readContinuedLineSlice); CTL/DEL anywhere in the
-        // merged value is a generic read-time error (probe: CTL inside a
-        // fold → ERR). Go TrimSpaces every PHYSICAL line before the merge,
-        // so the scan runs on the tail-trimmed first-line value and the
-        // fully trimmed fold contents (only SP/HTAB/other whitespace can
-        // be trimmed away — interior CTL bytes always survive the scan).
-        let mut value_has_ctl = value.trim_end().bytes().any(is_bad_vhost_value_byte);
+        // after-colon bytes plus each continuation line (Go
+        // readContinuedLineSlice joins with " " + the fold after trimming
+        // each PHYSICAL line of SP/HTAB ONLY at both ends — reader.go
+        // trim; bufio elides just the \r\n/\n terminator). CTL/DEL
+        // anywhere in the merged value is a generic read-time error
+        // (probe: CTL inside a fold → ERR). The trims below therefore use
+        // Go's SP/HTAB-only charset (round-16 finding: the old Rust
+        // Unicode-whitespace trims stripped \r/\x0b/\x0c at value/fold
+        // EDGES before the scan, and the head routed where Go's read-time
+        // scan rejects). An edge CTL byte survives the trim exactly like
+        // Go: the second `\r` of a `\r\r\n`-terminated line (bufio drops
+        // exactly one), a trailing \x0b/\x0c, a `\r` opening the fold
+        // contents after its leading SP — all generic 400s.
+        let mut value_has_ctl = value
+            .trim_end_matches([' ', '\t'])
+            .bytes()
+            .any(is_bad_vhost_value_byte);
         let mut merged: Option<String> =
             if name.eq_ignore_ascii_case("host") && host_value.is_none() {
                 // Go stored value: readContinuedLineSlice trim()s the whole
@@ -1903,7 +1939,9 @@ fn validate_vhost_head_lines(request: &str) -> HeadLineVerdict {
                 None
             };
         while let Some(fold) = lines.next_if(|l| l.starts_with(' ') || l.starts_with('\t')) {
-            let fold = fold.trim();
+            // SP/HTAB-only, both ends — Go reader.go trim (see the
+            // comment above: an edge CTL byte must survive into the scan).
+            let fold = fold.trim_matches([' ', '\t']);
             if fold.bytes().any(is_bad_vhost_value_byte) {
                 value_has_ctl = true;
             }
@@ -6030,6 +6068,31 @@ mod tests {
             ),
             HeadLineVerdict::Malformed
         );
+        // Round-16 (SP/HTAB-only trims): an EDGE CTL byte survives the
+        // value/fold trim exactly like Go's reader.go trim — bufio elides
+        // only the \r\n terminator, so a `\r\r\n` line keeps its second
+        // `\r` in the value; a trailing \x0b (and \x0c) is CTL; a `\r`
+        // opening the fold contents after its leading SP errors too. All
+        // generic 400s (probe: Go 400). Pre-fix the Rust Unicode-
+        // whitespace trims stripped these edges and the head routed.
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\nX-A: v\r\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\nHost: a.com\nX-A: v\x0b\n\n"),
+            HeadLineVerdict::Malformed
+        );
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\nX-A: v\r\n \rv\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        // The edge-CTL rejection applies to the Host line's own value too —
+        // the generic read-time class beats the ValidHostHeader detail.
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\nHost: a.com\r\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
         // Generic read-time classes beat the statusError details (Go
         // rejects during ReadMIMEHeader, before the host/name gates):
         // a space-name head that ALSO carries a CTL value answers generic.
@@ -6053,11 +6116,12 @@ mod tests {
             HeadLineVerdict::Malformed
         );
         // The blank terminator itself never reaches the missing-colon
-        // class: CRLFCRLF (two `""` elements from str::lines), LF-only,
-        // and a pipelined next-request body past the blank all validate
-        // the head and stop at the first empty line (the round-14 tcpmux
-        // 9ff87ca trap, mirrored — a blank ends the header block like Go
-        // textproto readMIMEHeader).
+        // class: CRLFCRLF (the single terminal `""` element `str::lines()`
+        // yields for a terminated head), LF-only, and a pipelined
+        // next-request body past the blank all validate the head and stop
+        // at the first empty line (the round-14 tcpmux 9ff87ca trap,
+        // mirrored — a blank ends the header block like Go textproto
+        // readMIMEHeader).
         assert_eq!(
             validate_vhost_head_lines("GET / HTTP/1.1\r\n\r\n"),
             HeadLineVerdict::Ok
