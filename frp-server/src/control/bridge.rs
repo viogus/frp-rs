@@ -185,12 +185,16 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
     /// response and the reverse proxy closes the backend connection, so
     /// bytes after it are never a legal continuation. Round-15 security
     /// review: the pre-fix drain resumed the gather loop on the tail, and
-    /// a pipelined valid-looking final head (a hostile or buggy backend
-    /// writing `HTTP/1.1 200 OK` after its unparseable head) was injected
-    /// and served as a SECOND response on one user connection — a
-    /// double-response (smuggling-adjacent shape) through the injector.
-    /// Drop the tail and mark complete: the `complete` arm with
-    /// `malformed_raw` set serves permanent EOF, never pass-through reads.
+    /// whatever the backend wrote next became a SECOND response on one
+    /// user connection — a pipelined valid-looking final head (a hostile
+    /// or buggy backend writing `HTTP/1.1 200 OK` after its unparseable
+    /// head) was INJECTED and served as a second spliced response
+    /// (double-response, smuggling-adjacent shape, through the injector),
+    /// while endless blank-line-terminated garbage went out raw, streamed
+    /// as repeated "responses" after a head the client already rejected
+    /// (the `complete` arm below). Drop the tail and mark complete: the
+    /// `complete` arm with `malformed_raw` set serves permanent EOF, never
+    /// pass-through reads.
     fn raw_head_fully_served(&mut self) {
         if self.malformed_raw {
             self.tail = None;
@@ -308,9 +312,19 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
     /// configured value replaces the backend value; both never reach the
     /// wire. A continuation AFTER a kept line stays with its parent (bytes
     /// preserved verbatim).
+    ///
+    /// `strip_content_length` additionally drops backend `Content-Length`
+    /// lines (folded continuations included) — the round-16 Go write-layer
+    /// parity for a final head whose status forbids a body (204/304; see
+    /// the inject branch below for the suppression-table citation). The
+    /// caller filters its OWN configured Content-Length emission the same
+    /// way when the flag is set: Go's `Header.Set` (ModifyResponse) runs
+    /// BEFORE the write layer's suppression, so a configured Content-Length
+    /// is suppressed on a 204/304 exactly like a backend one.
     fn splice_head_deduplicated(
         head_region: &[u8],
         headers: &std::collections::HashMap<String, String>,
+        strip_content_length: bool,
         out: &mut Vec<u8>,
     ) {
         let mut pos = 0;
@@ -328,6 +342,7 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
                     if headers
                         .keys()
                         .any(|k| k.as_bytes().eq_ignore_ascii_case(name))
+                        || (strip_content_length && name.eq_ignore_ascii_case(b"content-length"))
                     {
                         // Drop this header AND its folded continuation
                         // lines (they belong to it — a leftover fold tail
@@ -377,10 +392,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                 // (status-None first line) was the response. Go errors the
                 // whole response at ReadResponse and the reverse proxy
                 // closes the backend connection, so no further backend
-                // bytes are a legal continuation — a hostile backend could
-                // otherwise stream an endless second "response" here that
-                // would be relayed raw after a head the client already
-                // rejected. Permanent EOF; the consumer ends the bridge.
+                // bytes are a legal continuation. Pre-fix, this drain
+                // resumed the gather loop on the split-off tail and the
+                // backend's next bytes became a SECOND response on one
+                // user connection: a pipelined valid-looking final head
+                // (see `raw_head_fully_served`) went through the INJECTOR
+                // as a spliced second response, and endless
+                // blank-line-terminated garbage was streamed raw. Either
+                // shape is a double-response the client already rejected.
+                // Permanent EOF; the consumer ends the bridge.
                 return Poll::Ready(Ok(()));
             }
             // Round-14 review fix: a mid-body read failure AFTER the final
@@ -518,9 +538,40 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                     // first-value-wins security header). Backend lines whose
                     // name matches a configured key are dropped,
                     // case-insensitively, folded continuations included.
+                    //
+                    // Round-16 (Go write-layer parity): a FINAL 204/304
+                    // must not carry Content-Length on the user-facing wire.
+                    // Go's net/http serialization deletes suppressed headers
+                    // in chunkWriter.writeHeader (go1.25 server.go:1483-1497:
+                    // `for _, k := range suppressedHeaders(code) {
+                    // delHeader(k) }`); `bodyAllowedForStatus` forbids a
+                    // body for both statuses and the suppression tables in
+                    // transfer.go:459-485 are suppressedHeadersNoBody =
+                    // {Content-Length, Transfer-Encoding} (204) and
+                    // suppressedHeaders304 = {Content-Type,
+                    // Content-Length, Transfer-Encoding} (304) — every
+                    // response through the Go frp http vhost ReverseProxy
+                    // passes that layer, so Go never sends CL with a
+                    // 204/304. Narrow divergence kept deliberate: frp-rs
+                    // strips Content-Length ONLY — Transfer-Encoding on a
+                    // no-body status is dropped by Go but relayed here (a
+                    // backend that chunked a 204 is broken; no body parser
+                    // runs on a no-body status), and a 304 keeps its
+                    // Content-Type where Go suppresses it (informational,
+                    // no semantic effect). Trailing bytes a lying backend
+                    // writes after the 204/304 head: Go's proxy body copy
+                    // stops (ErrBodyNotAllowed) while frp-rs raw-relays
+                    // them — the head no longer declares a length, so no
+                    // client frames them as this response's body (pre-fix,
+                    // the relayed CL:16 + body made the client wait for a
+                    // body RFC 9110 §8.6 says a 204 never has; stripping
+                    // the CL is what keeps the user-facing wire
+                    // parseable).
+                    let strip_content_length = matches!(status, Some(204) | Some(304));
                     Self::splice_head_deduplicated(
                         &this.buffer[..blank_start],
                         &this.headers,
+                        strip_content_length,
                         &mut injected,
                     );
                     // A6 (round-13 review): Go frp applies the configured
@@ -533,7 +584,20 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                     // sorted order (one of Go's possible outcomes) — never
                     // both lines, which would read as two headers to the
                     // client and break first-value-wins security headers.
-                    let mut sorted: Vec<(&String, &String)> = this.headers.iter().collect();
+                    //
+                    // Round-16: on a 204/304 the write-layer suppression
+                    // also hits a CONFIGURED Content-Length (Go's
+                    // ModifyResponse Header.Set runs before
+                    // chunkWriter.writeHeader's delHeader sweep) — filter
+                    // it from the emission just like the splice dropped
+                    // backend lines above.
+                    let mut sorted: Vec<(&String, &String)> = this
+                        .headers
+                        .iter()
+                        .filter(|(k, _)| {
+                            !(strip_content_length && k.eq_ignore_ascii_case("content-length"))
+                        })
+                        .collect();
                     sorted.sort_by(|a, b| a.0.cmp(b.0));
                     let mut prev_key: Option<&[u8]> = None;
                     let mut prev_start = 0usize;
@@ -1584,8 +1648,12 @@ async fn run_work_bridge(
     // The empty-map case is deliberate: when
     // `response_headers` is not configured the injector carries NO headers
     // and is a pure deadline-only pass-through — splice no-ops over the
-    // empty map, the head is copied verbatim, and the response bytes are
-    // byte-identical to the injector-less bridge. But the leg still gets Go
+    // empty map and the response bytes are byte-identical to the
+    // injector-less bridge, with ONE deliberate wire mutation (round-16):
+    // a final 204/304 head has its Content-Length lines dropped at the
+    // splice (Go's write-layer suppression — see the inject branch above),
+    // so exactly those two statuses differ from the raw bridge by design.
+    // But the leg still gets Go
     // ResponseHeaderTimeout parity: the injector's absolute deadline
     // (armed at construction, never extended by interim 1xx) must run for
     // http non-CONNECT legs even with no headers configured — Go's
@@ -2114,6 +2182,20 @@ async fn run_sudp_message_bridge(
     debug!(proxy_name = %proxy_name, "SUDP message bridge completed");
 }
 
+/// The backend response-head deadline (seconds) for a `proxy_type == "http"`
+/// non-CONNECT leg — Go frp v0.71.0 `VhostHTTPTimeout` →
+/// `httputil.ReverseProxy.ResponseHeaderTimeoutS`. Pure wrapper over
+/// [`crate::vhost::clamp_vhost_timeout`] so the floor/cap semantics have a
+/// unit pin without spawning a bridge: a `<= 0` config floors to 60s — Go's
+/// own `NewHTTPReverseProxy` does this floor (pkg/util/vhost/http.go:50-52:
+/// `if option.ResponseHeaderTimeoutS <= 0 { option.ResponseHeaderTimeoutS =
+/// 60 }`), so an unset value is 60s, never "no deadline" — and positive
+/// values cap at 24h (Rust-only hardening against hostile huge configs; Go
+/// has no cap).
+fn http_leg_head_deadline(vhost_http_timeout_secs: u64) -> u64 {
+    crate::vhost::clamp_vhost_timeout(vhost_http_timeout_secs)
+}
+
 /// Assign `req` to `work_conn`, starting the bridge.
 ///
 /// Returns `Ok(())` once the bridge task is spawned (work_conn and req are
@@ -2262,15 +2344,24 @@ pub(crate) async fn assign_work_to_proxy(
     //     arms, and the server never answers 504 on a silent backend.
     //   * https tunnels: the HTTPS Muxer's registryRouter serves raw TLS
     //     bytes (SNI routing only) — no ReverseProxy, no header deadline.
-    // TCP/STCP/XTCP bridges have no such semantic either. 0 (unset)
-    // disables the timeout, matching Go where the ReverseProxy transport
-    // never arms a header deadline.
+    // TCP/STCP/XTCP bridges have no such semantic either. The deadline
+    // VALUE goes through the shared vhost clamp (`http_leg_head_deadline`
+    // below, wrapping crate::vhost::clamp_vhost_timeout): a `<= 0` config
+    // FLOORS to 60s and everything caps at 24h. The floor is not frp-rs
+    // hardening — Go frp v0.71.0's NewHTTPReverseProxy floors
+    // `ResponseHeaderTimeoutS <= 0` to 60s itself
+    // (pkg/util/vhost/http.go:50-51), so an unset `vhost_http_timeout`
+    // (config default 60) and an explicit 0 both arm the same 60s deadline;
+    // there is no "0 disables the timeout" in Go (the old `> 0` gate —
+    // arming nothing for a 0 config — carried a false Go citation; round-16
+    // finding).
     let header_timeout = if proxy_info
         .as_ref()
         .is_some_and(|p| p.proxy_type == "http" && !req.request_is_connect)
-        && state.vhost_http_timeout > 0
     {
-        Some(std::time::Duration::from_secs(state.vhost_http_timeout))
+        Some(std::time::Duration::from_secs(http_leg_head_deadline(
+            state.vhost_http_timeout,
+        )))
     } else {
         None
     };
@@ -3153,6 +3244,196 @@ mod tests {
         assert!(s.ends_with("hello"), "body must survive, got: {s:?}");
     }
 
+    /// Round-16 gap-fill pin: a MALFORMED head followed IN THE SAME
+    /// BACKEND SEGMENT by a valid-looking `HTTP/1.1 200 OK` head must
+    /// serve exactly ONE response — the garbage, raw and byte-exact — and
+    /// drop the pipelined valid head (never injected, never relayed), then
+    /// go permanent EOF. Round-15's terminal-drain fix (malformed_raw
+    /// drain: tail cleared, `complete` set, subsequent polls Ready(0))
+    /// already covers this shape; the sibling test above pins only the
+    /// malformed-head-then-EOF arm, so this pin closes the same-segment
+    /// coverage gap. Without the round-15 drain the gather loop resumed on
+    /// the split-off tail and the 200 head was INJECTED and served as a
+    /// second spliced response on one user connection (double-response,
+    /// smuggling-adjacent shape).
+    #[tokio::test]
+    async fn injector_malformed_then_pipelined_valid_head_same_segment_single_raw_serve() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
+
+        // One write, one segment: malformed first line (bad version token →
+        // status None → raw-served, malformed_raw) immediately followed by
+        // a valid-looking final head + body.
+        let segment = b"HTTP/1.x 200 OOPS\r\nServer: bogus\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        inner_w.write_all(segment).await.expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(
+            &out[..],
+            &b"HTTP/1.x 200 OOPS\r\nServer: bogus\r\n\r\n"[..],
+            "only the malformed head may be served — the pipelined valid head must be \
+             dropped with the tail (double-response regression)"
+        );
+        // Permanent EOF after the single raw serve: the drain discarded the
+        // tail and the complete+malformed_raw arm never polls the backend
+        // again (a follow-up read must not surface the 200 head).
+        let mut probe = [0u8; 8];
+        assert_eq!(
+            injector.read(&mut probe).await.expect("read after drain"),
+            0,
+            "stream must be permanently at EOF after the malformed raw serve"
+        );
+    }
+
+    /// Round-16: Go's net/http write layer suppresses Content-Length on
+    /// no-body statuses at user-facing serialization (chunkWriter.writeHeader
+    /// delHeader sweep, go1.25 server.go:1483-1497; suppressedHeadersNoBody =
+    /// {Content-Length, Transfer-Encoding} for 204, transfer.go:459-485) —
+    /// every response through Go frp's h1 http vhost loses its CL. The
+    /// injector owns every http non-CONNECT leg, EMPTY headers map included
+    /// (the deadline-only pass-through), so the strip must run there too: a
+    /// 204 with `Content-Length: 16` goes out without CL. Byte-exact pin:
+    /// kept header lines, the terminating blank line, and any trailing bytes
+    /// the (lying) backend wrote after the head all survive verbatim — only
+    /// the CL line is dropped.
+    #[tokio::test]
+    async fn injector_204_strips_content_length_empty_map_deadline_only_leg() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        // NO configured response_headers: this is the pure deadline-only
+        // pass-through leg — the 204/304 strip must still run.
+        let mut injector = ResponseHeaderInjector::<tokio::io::DuplexStream>::new(
+            inner_r,
+            Default::default(),
+            None,
+        );
+
+        inner_w
+            .write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 16\r\nX-Keep: yes\r\n\r\n0123456789abcdef",
+            )
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(
+            &out[..],
+            &b"HTTP/1.1 204 No Content\r\nX-Keep: yes\r\n\r\n0123456789abcdef"[..],
+            "204 head must lose its Content-Length line; every other byte (kept header, \
+             blank line, trailing body bytes) is verbatim"
+        );
+    }
+
+    /// Round-16: 304 mirrors the 204 strip (Go suppressedHeaders304 =
+    /// {Content-Type, Content-Length, Transfer-Encoding}) but KEEPS its
+    /// Content-Type — frp-rs strips Content-Length only, on both statuses;
+    /// the 304 Content-Type suppression is a documented narrow divergence
+    /// (informational header, no semantic effect).
+    #[tokio::test]
+    async fn injector_304_strips_content_length_keeps_content_type() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
+
+        inner_w
+            .write_all(
+                b"HTTP/1.1 304 Not Modified\r\nContent-Length: 16\r\nContent-Type: text/plain\r\nETag: \"v1\"\r\n\r\n",
+            )
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+            "status line preserved, got: {s:?}"
+        );
+        assert!(
+            !s.to_ascii_lowercase().contains("content-length"),
+            "304 head must not carry Content-Length, got: {s:?}"
+        );
+        assert!(
+            s.contains("Content-Type: text/plain\r\n"),
+            "304 keeps Content-Type (documented narrow divergence), got: {s:?}"
+        );
+        assert!(
+            s.contains("X-Injected: yes"),
+            "configured headers must still inject on a 304, got: {s:?}"
+        );
+        assert!(
+            s.contains("ETag: \"v1\""),
+            "other backend headers preserved, got: {s:?}"
+        );
+    }
+
+    /// Round-16: a body-bearing final status (200) is untouched — its
+    /// Content-Length survives byte-exact, statuses Go's write layer does
+    /// not suppress.
+    #[tokio::test]
+    async fn injector_200_keeps_content_length() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::<tokio::io::DuplexStream>::new(
+            inner_r,
+            Default::default(),
+            None,
+        );
+
+        inner_w
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(
+            &out[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"[..],
+            "200 head must keep its Content-Length verbatim"
+        );
+    }
+
+    /// Round-16: the suppression hits a CONFIGURED Content-Length too — Go's
+    /// ModifyResponse Header.Set runs BEFORE chunkWriter.writeHeader's
+    /// delHeader sweep, so a response_headers entry naming content-length is
+    /// suppressed on a 204 exactly like a backend line, while other
+    /// configured headers still inject.
+    #[tokio::test]
+    async fn injector_204_suppresses_configured_content_length_too() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Content-Length".to_string(), String::from("99"));
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
+
+        inner_w
+            .write_all(b"HTTP/1.1 204 No Content\r\nServer: b\r\n\r\n")
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(
+            &out[..],
+            &b"HTTP/1.1 204 No Content\r\nServer: b\r\nX-Injected: yes\r\n\r\n"[..],
+            "configured Content-Length must be suppressed on a 204 like a backend line"
+        );
+    }
+
     // A4 (round-13 review): the version token must be exactly `HTTP/X.Y`
     // single-digit — Go ParseHTTPVersion length-checks to 8 bytes and
     // parses single bytes (request.go:819-838).
@@ -3223,6 +3504,36 @@ mod tests {
         for head in bad {
             assert_eq!(code(head), None, "head: {}", String::from_utf8_lossy(head));
         }
+    }
+
+    /// Round-16 (false-Go-citation fix): the http-leg response-head
+    /// deadline takes the shared vhost clamp — a `<= 0` `vhost_http_timeout`
+    /// FLOORS to 60s, exactly like Go frp v0.71.0's NewHTTPReverseProxy
+    /// (pkg/util/vhost/http.go:50-51: `if option.ResponseHeaderTimeoutS <= 0
+    /// { option.ResponseHeaderTimeoutS = 60 }`), and everything caps at 24h
+    /// (Rust-only hardening; Go has no cap). The old `> 0` gate armed NO
+    /// deadline for a 0/unset config — a false "0 disables the timeout"
+    /// citation: in Go an unset VhostHTTPTimeout (config default 60) and an
+    /// explicit 0 both arm the same 60s deadline.
+    #[test]
+    fn http_leg_head_deadline_floors_zero_and_caps() {
+        assert_eq!(http_leg_head_deadline(0), 60, "0 must floor to Go's 60s");
+        assert_eq!(http_leg_head_deadline(1), 1);
+        assert_eq!(http_leg_head_deadline(59), 59);
+        assert_eq!(http_leg_head_deadline(60), 60);
+        assert_eq!(http_leg_head_deadline(61), 61);
+        let cap = 24 * 60 * 60;
+        assert_eq!(http_leg_head_deadline(cap), cap);
+        assert_eq!(
+            http_leg_head_deadline(cap + 1),
+            cap,
+            "positive values cap at 24h"
+        );
+        assert_eq!(
+            http_leg_head_deadline(u64::MAX),
+            cap,
+            "hostile huge config must not overflow Instant arithmetic"
+        );
     }
 
     // A7 end-to-end shape: a "+20"-coded head is FINAL (not interim) in Go

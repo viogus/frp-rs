@@ -1025,10 +1025,14 @@ fn is_bad_value_byte(b: u8) -> bool {
 ///    checks the obs-fold-MERGED line, so fold continuation bytes face
 ///    the same check (probe: CTL inside a fold → err); the leading SP
 ///    the merge inserts is legal. obs-text values pass (probe: OK).
-///    Go TrimSpaces every physical line before the merge, so the scan
-///    runs on the tail-trimmed first-line value and the fully trimmed
-///    fold contents — only whitespace can be trimmed away, never an
-///    interior CTL byte.
+///    Go trims each physical line of SP/HTAB ONLY at both ends before the
+///    merge (reader.go trim; bufio elides just the \r\n/\n terminator),
+///    so the scan runs on the tail-trimmed first-line value and the
+///    SP/HTAB-trimmed fold contents — an EDGE CTL byte (a `\r` kept by a
+///    `\r\r\n`-terminated line, a trailing \x0b/\x0c, a fold-opening `\r`)
+///    is NOT trimmed away and errors exactly like an interior CTL
+///    (round-16: the Rust Unicode-whitespace trims once stripped those
+///    edges before the scan; the trims below now match Go's charset).
 fn validate_connect_head_shape(request: &str) -> bool {
     // Skip the request line itself (`nth(1)`, keeping the plain `Lines`
     // iterator type for the shared group validator below).
@@ -1085,12 +1089,26 @@ fn valid_connect_header_group(
     if name_bytes.is_empty() || name_bytes.iter().any(|b| !is_token_byte(*b) && *b != b' ') {
         return false;
     }
-    // Shape 4: CTL/DEL in the merged value (first line + folds). The
-    // fold-merge inserts a SP before each continuation (" " + TrimSpace
-    // per fold, readContinuedLineSlice).
-    let mut value_has_ctl = value.trim_end().bytes().any(is_bad_value_byte);
+    // Shape 4: CTL/DEL in the merged value (first line + folds; Go checks
+    // the obs-fold-MERGED line). The fold-merge inserts a SP before each
+    // continuation, after trimming each physical line of SP/HTAB ONLY at
+    // both ends (Go reader.go trim; bufio elides just the \r\n/\n
+    // terminator) — so an EDGE CTL byte survives the trim into the scan
+    // exactly like Go: the second `\r` of a `\r\r\n`-terminated line, a
+    // trailing \x0b/\x0c, a `\r` opening the fold contents after its
+    // leading SP (round-16 finding: the old Rust Unicode-whitespace trims
+    // stripped those edges and the head routed where Go errs).
+    let mut value_has_ctl = value
+        .trim_end_matches([' ', '\t'])
+        .bytes()
+        .any(is_bad_value_byte);
     while let Some(fold) = lines.next_if(|l| l.starts_with(' ') || l.starts_with('\t')) {
-        if fold.trim().bytes().any(is_bad_value_byte) {
+        // SP/HTAB-only, both ends — Go reader.go trim (see above).
+        if fold
+            .trim_matches([' ', '\t'])
+            .bytes()
+            .any(is_bad_value_byte)
+        {
             value_has_ctl = true;
         }
     }
@@ -2162,6 +2180,22 @@ mod tests {
         ));
         assert!(!validate_connect_head_shape(
             "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: v\r\n\tfolded\x01c\r\n\r\n"
+        ));
+        // Round-16 (SP/HTAB-only trims): EDGE CTL bytes survive the
+        // value/fold trims exactly like Go's reader.go trim — a `\r\r\n`
+        // line keeps its second `\r` in the value (bufio elides one), a
+        // trailing \x0b is CTL, a fold-opening `\r` after the leading SP
+        // errors. Pre-fix the Rust Unicode-whitespace trims stripped
+        // these edges and the head routed where Go's http.ReadRequest
+        // errors → silent close.
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: v\r\r\n\r\n"
+        ));
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\nX-Bad: v\x0b\n\n"
+        ));
+        assert!(!validate_connect_head_shape(
+            "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: v\r\n \rv\r\n\r\n"
         ));
         assert!(validate_connect_head_shape(
             "CONNECT a.com:80 HTTP/1.1\r\nX-Bad: aé b\r\n\r\n"

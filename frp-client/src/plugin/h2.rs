@@ -814,33 +814,46 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     // the stream ends (mirror of frp-server vhost_h2c's GOAWAY-rationale
     // handling). Read errors between heads are 502s like a missing first
     // head (Go: the RoundTrip error mid-1xx-loop is a transport error).
-    // Byte budget (audit round-7 finding + round-15 FIX 4): the swallow
-    // loop is otherwise unbounded across heads. Go's Transport caps EACH
-    // ReadResponse head parse — interim AND final alike — at
-    // maxHeaderResponseSize (10 MiB default, go1.25 transport.go:2106-2112;
-    // readLoop re-arms pc.readLimit per response, transport.go:2274), so a
-    // single giant FINAL head is also capped there. frp-rs is bounded on
-    // both axes: the FINAL head never reaches this budget because
-    // read_until_head caps every head (interim and final, one per call) at
-    // its own 1 MiB read cap (+ one 4 KiB read slack) — far under Go's
-    // 10 MiB — so a giant final head already fails that cap and answers
-    // 502. What remains unbounded in Go is the COUNT and CUMULATIVE size
-    // of interim heads (each re-read re-arms the 10 MiB limit), and that is
-    // what INTERIM_HEAD_BUDGET closes here: an endless-1xx backend parks
-    // this h2 stream forever without it. Past the budget the response
-    // fails the way an oversized single head fails — 502. Every wire byte
-    // counts exactly once: `head` always starts with the carried seed
-    // (read_until_head only appends), so `head.len() - carried` is the new
-    // bytes, and bytes past the terminator that rode in the read buffer
-    // are counted here and never re-counted (the next iteration's seed
-    // subtraction removes them).
+    // Byte budget (audit round-7 finding + round-15 FIX 4 + round-16 FIX 3
+    // comment correction): the swallow loop is otherwise unbounded across
+    // heads. Go's Transport enforces maxHeaderResponseSize (10 MiB default)
+    // as pc.readLimit, set ONCE per readLoop iteration — i.e. per
+    // RoundTrip, not per head (go1.25 transport.go:2274). The only
+    // intra-response re-arm lives in readResponse's 1xx loop, gated on
+    // trace.Got1xxResponse != nil (transport.go:2486-2490: without a trace
+    // hook "we limit the size of all headers (including both 1xx and the
+    // final response) to maxHeaderResponseSize") — and Go frp sets no
+    // trace hook, so a Go frp backend read draws interim AND final heads
+    // from ONE cumulative 10 MiB bucket; an endless-1xx backend exhausts
+    // it and the RoundTrip fails (502). frp-rs is bounded on both axes
+    // with the same magnitude: INTERIM_HEAD_BUDGET mirrors Go's single
+    // bucket restricted to the 1xx class, and read_until_head caps every
+    // head — interim and final alike, one per call — at its own 1 MiB read
+    // cap (+ one 4 KiB read slack), far under Go's 10 MiB. A giant final
+    // head therefore fails the per-head cap and answers 502 without ever
+    // touching the interim budget; the worst-case cumulative (~11 MiB =
+    // 10 MiB of interim heads + one 1 MiB final head) is slightly LARGER
+    // than Go's 10 MiB single bucket — deliberate: this listener binds
+    // the operator's own 127.0.0.1 port and serves only their local
+    // browser, the same operator-local face that keeps the plugin-h2
+    // max_header_list_size at Go's 16 MiB default (see the round-13
+    // note in plugin/h2.rs) — the tight 10 MiB budget exists on the
+    // untrusted public vhost surface, not here. Past the budget the
+    // response fails the way an oversized single head fails — 502.
+    // Every wire byte counts exactly once: `head` always starts with
+    // the carried seed (read_until_head only appends), so `head.len() -
+    // carried` is the new bytes, and bytes past the terminator that rode
+    // in the read buffer are counted here and never re-counted (the next
+    // iteration's seed subtraction removes them).
     let mut seed: Vec<u8> = Vec::new();
     let mut interim_bytes: usize = 0;
-    // Rust-only hardening, same magnitude as Go's per-head
-    // maxHeaderResponseSize (10 MiB) but CUMULATIVE across interim heads:
-    // Go re-arms that limit per ReadResponse, so an endless-1xx backend is
-    // unbounded there; the final head is separately bounded by
-    // read_until_head's 1 MiB cap and never charged to this budget.
+    // Go's own budget shape (transport.go:2274 + 2486-2490): one
+    // maxHeaderResponseSize (10 MiB) readLimit per RoundTrip, covering 1xx
+    // and final heads together when no trace hook is set. frp-rs splits the
+    // same magnitude — interim heads accumulate against this 10 MiB
+    // budget, and the final head is bounded separately by read_until_head's
+    // 1 MiB per-head cap — so no backend can make this h2 stream read more
+    // than ~11 MiB of heads (Go: 10 MiB).
     const INTERIM_HEAD_BUDGET: usize = 10 * 1024 * 1024;
     let (head, parsed) = loop {
         let carried = seed.len();
@@ -1407,9 +1420,15 @@ mod tests {
             }
         };
         // An endless stream of interim 1xx heads. Go's http.Transport caps
-        // the CUMULATIVE interim-head bytes at maxHeaderResponseSize (10 MiB,
-        // transport.go:2106-2112, enforced per response through pc.readLimit);
-        // the plugin mirrors that with INTERIM_HEAD_BUDGET. Pre-budget code
+        // the CUMULATIVE head bytes per RoundTrip at maxHeaderResponseSize
+        // (10 MiB): pc.readLimit is set once per readLoop iteration
+        // (transport.go:2274) and only re-armed inside ReadResponse's 1xx
+        // loop when a trace hook is set (transport.go:2486-2490) — Go frp
+        // sets none, so its single 10 MiB bucket covers interim and final
+        // heads alike and an endless-1xx backend fails the RoundTrip. The
+        // plugin mirrors that magnitude with INTERIM_HEAD_BUDGET (the final
+        // head is bounded separately by read_until_head's 1 MiB per-head
+        // cap — see the giant-final-head pin below). Pre-budget code
         // swallowed 1xx forever — the backend here never EOFs, so that code
         // went red only via the 5 s round-trip timeout below; the budget
         // trip answers 502 deterministically.
@@ -1451,14 +1470,16 @@ mod tests {
                 return;
             }
         };
-        // Audit FIX 4 pin: the 10 MiB INTERIM_HEAD_BUDGET only accounts
-        // interim 1xx heads, but the FINAL head is separately bounded —
-        // read_until_head caps EVERY head (interim and final alike) at its
-        // 1 MiB per-call cap — so a single giant final head (no 1xx at
-        // all) must answer 502 exactly like any other oversized backend
-        // head, never stream through unbounded. (Go parity direction: Go's
-        // Transport caps each head parse at 10 MiB; frp-rs's 1 MiB
-        // per-head cap is the stricter pre-existing bound.)
+        // Audit FIX 4 pin (round-16 FIX 3 comment corrected): the 10 MiB
+        // INTERIM_HEAD_BUDGET only accounts interim 1xx heads, but the
+        // FINAL head is separately bounded — read_until_head caps EVERY
+        // head (interim and final alike) at its 1 MiB per-call cap — so a
+        // single giant final head (no 1xx at all) must answer 502 exactly
+        // like any other oversized backend head, never stream through
+        // unbounded. (Go parity direction: Go's single per-RoundTrip
+        // maxHeaderResponseSize bucket — transport.go:2274, no trace-hook
+        // re-arm in Go frp — would allow one 10 MiB final head; frp-rs's
+        // 1 MiB per-head cap is the stricter pre-existing bound.)
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut conn, _) = match listener.accept().await {

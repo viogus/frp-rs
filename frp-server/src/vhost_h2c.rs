@@ -1409,10 +1409,12 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     }
 
     // FIX 1: responses to HEAD requests and the no-body statuses 204/304
-    // never carry a DATA body — Go's net/http sets Body = NoBody for all of
-    // them (noBodyAllowedStatuses 204/304 + the HEAD method; transport
-    // response.go `bodyAllowedForStatus`), so the h2 relay must end the
-    // stream with the response head. The body legs below would otherwise
+    // never carry a DATA body — Go's net/http server suppress gate is
+    // server.go:1513 (`req.Method == "HEAD" || !bodyAllowedForStatus(code)`
+    // || code == StatusNoContent), with `bodyAllowedForStatus` at
+    // transfer.go:459-461 returning false for 204/304/1xx — so the h2 relay
+    // must end the stream with the response head. The body legs below would
+    // otherwise
     // park forever on a backend that DECLARES a Content-Length on such an
     // answer and then holds the connection open with no body bytes (a lie
     // for these statuses — HEAD says so by definition, 204/304 by RFC) —
@@ -1421,12 +1423,22 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     //
     // Content-Length: stripped for 204 ALWAYS — RFC 9110 §8.6 forbids the
     // header on any 204, HEAD method or not (the pre-round-15 code kept it
-    // on a HEAD + 204 answer), and stripped for 304 (Go h1's
-    // suppressedHeaders304 drops it there; h2's writer has no such
-    // suppression — h2_bundle.go writeChunk moves a declared CL into the
-    // response verbatim — so the strip is a fail-closed RFC/Go-h1-parity
-    // divergence from Go's h2 pass-through, matching the h1 front frp-rs
-    // serves). A HEAD answer to a body-bearing status KEEPS its
+    // on a HEAD + 204 answer), and stripped for 304. This mirrors the h1
+    // net/http write layer every Go frp h1 vhost response passes through —
+    // chunkWriter.writeHeader deletes suppressed headers before
+    // serialization (go1.25 server.go:1483-1497): suppressedHeadersNoBody
+    // = {Content-Length, Transfer-Encoding} for 204,
+    // suppressedHeaders304 = {Content-Type, Content-Length,
+    // Transfer-Encoding} for 304 (transfer.go:459-485). frp-rs's own h1
+    // front does the same on its http non-CONNECT legs (round-16: the
+    // ResponseHeaderInjector in frp-server/src/control/bridge.rs drops
+    // Content-Length from a final 204/304 head at its splice), so the two
+    // fronts are consistent again. Go's H2 writer has no such suppression
+    // (h2_bundle.go writeChunk moves a declared CL into the response
+    // verbatim) — this strip remains a fail-closed RFC/Go-h1-parity
+    // divergence from Go's h2 pass-through, narrow like the h1 sibling:
+    // Content-Length only, Transfer-Encoding/Content-Type left alone.
+    // A HEAD answer to a body-bearing status KEEPS its
     // Content-Length (it truthfully describes the GET the client would
     // receive; RFC 9110 §8.6 allows it).
     if is_head || status == 204 || status == 304 {

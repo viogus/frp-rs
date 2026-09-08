@@ -222,7 +222,7 @@ async fn handle_conn(
 }
 
 #[cfg(all(test, feature = "tls"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -338,7 +338,9 @@ mod tests {
     /// off) and return the established TLS stream. The client offers no
     /// ALPN, so the plugin's listener stays on the HTTP/1.1 face and never
     /// negotiates h2.
-    async fn connect_tls_client(
+    /// Shared test helper: the https2http tests import this pair from here
+    /// (round-16 FIX 5 — the copies in https2http.rs were byte-identical).
+    pub(crate) async fn connect_tls_client(
         addr: std::net::SocketAddr,
     ) -> tokio_rustls::client::TlsStream<TcpStream> {
         let tcp = TcpStream::connect(addr).await.unwrap();
@@ -357,7 +359,9 @@ mod tests {
     /// conn; the close may surface as clean EOF or a TLS error, never as
     /// data). Bounded: a regression that keeps the conn open must fail this
     /// test, not hang the suite.
-    async fn read_until_tls_close(tls: &mut tokio_rustls::client::TlsStream<TcpStream>) -> Vec<u8> {
+    pub(crate) async fn read_until_tls_close(
+        tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    ) -> Vec<u8> {
         use tokio::io::AsyncReadExt;
         let mut resp = Vec::new();
         let mut chunk = [0u8; 512];
@@ -407,9 +411,12 @@ mod tests {
         };
         let handle = match start_https2https_plugin(&cfg).await {
             Ok(h) => h,
+            // FIX 4: this test REQUIRES plugin start success — the refused
+            // backend port is what arms the per-request dial. A skip would
+            // pass vacuously and hide a regression that breaks listener
+            // startup, so fail loudly instead.
             Err(e) => {
-                eprintln!("Skipping test: plugin start failed (sandboxed?): {e}");
-                return;
+                panic!("https2https plugin start failed — regression or environment break: {e}")
             }
         };
         let mut tls = connect_tls_client(handle.local_addr).await;
@@ -459,9 +466,11 @@ mod tests {
         };
         let handle = match start_https2https_plugin(&cfg).await {
             Ok(h) => h,
+            // FIX 4: this test REQUIRES plugin start success — the backend
+            // accept-then-drop is what arms the TLS-failure 502. A skip
+            // would pass vacuously and hide a startup regression.
             Err(e) => {
-                eprintln!("Skipping test: plugin start failed (sandboxed?): {e}");
-                return;
+                panic!("https2https plugin start failed — regression or environment break: {e}")
             }
         };
         let mut tls = connect_tls_client(handle.local_addr).await;
@@ -497,9 +506,11 @@ mod tests {
         };
         let handle = match start_https2https_plugin(&cfg).await {
             Ok(h) => h,
+            // FIX 4: this test REQUIRES plugin start success — the invalid
+            // host is what arms the per-request invalid-host 502. A skip
+            // would pass vacuously and hide a startup regression.
             Err(e) => {
-                eprintln!("Skipping test: plugin start failed (sandboxed?): {e}");
-                return;
+                panic!("https2https plugin start failed — regression or environment break: {e}")
             }
         };
         let mut tls = connect_tls_client(handle.local_addr).await;

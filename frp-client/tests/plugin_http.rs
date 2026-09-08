@@ -1134,10 +1134,11 @@ async fn assert_conflicting_cl_rejects(plugin_type: &str) {
     };
     let backend_addr = backend.local_addr().unwrap();
 
-    // The backend must receive NO bytes: the http2http path rejects before
-    // dialing (no accept at all); the http_proxy path dials before
-    // rejecting, so the connection may be accepted and then closed with 0
-    // bytes. Either way nothing may be forwarded.
+    // The backend must receive NO bytes: both paths reject in the head
+    // classification, before any dial (the round-17 readRequest error
+    // classes render on the http_proxy face; the http2http face closes),
+    // so the accept below never fires or sees an empty read. Either way
+    // nothing may be forwarded.
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         match tokio::time::timeout(std::time::Duration::from_secs(3), backend.accept()).await {
@@ -1184,7 +1185,11 @@ async fn assert_conflicting_cl_rejects(plugin_type: &str) {
         .await
         .unwrap();
 
-    // The plugin must close the connection without writing any response.
+    // Round-17: the http_proxy face (Go conn.serve model) renders the
+    // no-detail 400 for a readRequest error — fixLength's
+    // conflicting-Content-Length rejection — before any dial; the
+    // operator-local http2http face keeps the established silent-close
+    // divergence (Err-to-bare-close policy).
     let mut resp = Vec::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -1193,11 +1198,21 @@ async fn assert_conflicting_cl_rejects(plugin_type: &str) {
     .await
     .expect("conflicting Content-Length must be rejected: connection not closed (regression)")
     .unwrap();
-    assert!(
-        resp.is_empty(),
-        "no response must be sent on a rejected request, got: {:?}",
-        String::from_utf8_lossy(&resp[..resp.len().min(80)])
-    );
+    if plugin_type == "http_proxy" {
+        assert_eq!(
+            resp,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+            "the http_proxy face must render Go's 400 for a conflicting \
+             Content-Length (readRequest error), got: {:?}",
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+    } else {
+        assert!(
+            resp.is_empty(),
+            "no response must be sent on a rejected request, got: {:?}",
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+    }
     let forwarded = rx.await.expect("backend task finished");
     assert!(
         forwarded == Some(0) || forwarded.is_none(),
@@ -1237,10 +1252,11 @@ async fn assert_list_form_cl_rejects(plugin_type: &str, chunked: bool) {
     };
     let backend_addr = backend.local_addr().unwrap();
 
-    // The backend must receive NO bytes: the http2http path rejects before
-    // dialing (no accept at all); the http_proxy path dials before
-    // rejecting, so the connection may be accepted and then closed with 0
-    // bytes. Either way nothing may be forwarded.
+    // The backend must receive NO bytes: both paths reject in the head
+    // classification, before any dial (the round-17 readRequest error
+    // classes render on the http_proxy face; the http2http face closes),
+    // so the accept below never fires or sees an empty read. Either way
+    // nothing may be forwarded.
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         match tokio::time::timeout(std::time::Duration::from_secs(3), backend.accept()).await {
@@ -1289,7 +1305,10 @@ async fn assert_list_form_cl_rejects(plugin_type: &str, chunked: bool) {
         .await
         .unwrap();
 
-    // The plugin must close the connection without writing any response.
+    // The plugin must reject the request: the http_proxy face renders
+    // Go's no-detail 400 (parseContentLength readRequest error — a
+    // comma list is one token to ParseUint, go1.25 has no readRequest
+    // comma split); the operator-local http2http face closes silently.
     let mut resp = Vec::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -1298,11 +1317,21 @@ async fn assert_list_form_cl_rejects(plugin_type: &str, chunked: bool) {
     .await
     .expect("list-form Content-Length must be rejected: connection not closed (regression)")
     .unwrap();
-    assert!(
-        resp.is_empty(),
-        "no response must be sent on a rejected request, got: {:?}",
-        String::from_utf8_lossy(&resp[..resp.len().min(80)])
-    );
+    if plugin_type == "http_proxy" {
+        assert_eq!(
+            resp,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+            "the http_proxy face must render Go's 400 for a list-form \
+             Content-Length (readRequest error), got: {:?}",
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+    } else {
+        assert!(
+            resp.is_empty(),
+            "no response must be sent on a rejected request, got: {:?}",
+            String::from_utf8_lossy(&resp[..resp.len().min(80)])
+        );
+    }
     let forwarded = rx.await.expect("backend task finished");
     assert!(
         forwarded == Some(0) || forwarded.is_none(),
@@ -1433,12 +1462,14 @@ async fn test_http_proxy_head_with_cl_relays_response() {
     assert_head_with_cl_relays_response("http_proxy").await;
 }
 
-/// A header line containing a lone `\r` (malformed client — `lines()` splits
-/// only on `\n`, so the CR would survive into the forwarded request as an
-/// injected request line, request-smuggling shaped) must be sanitized before
-/// forwarding. Go's http.Server rejects control chars in headers, so Go frp
-/// is immune; the http_proxy head builder must filter CR/LF per line like the
-/// shared forward path (`read_request_and_build_forward`) does.
+/// A header value containing a lone `\r` (malformed client — not followed by
+/// `\n`, so it stays inside the stored value where Go textproto's
+/// validHeaderFieldValue rejects the CTL byte) is a readRequest error on the
+/// Go http.Server face: the http_proxy head builder must reject the head
+/// (400 render, no dial) rather than forward it. Go never sanitizes control
+/// chars — the pre-round-17 "strip CR per line and forward" behavior was a
+/// frp-rs invention (request-smuggling shaped if the CR had reached the
+/// backend).
 #[tokio::test]
 async fn test_http_proxy_sanitizes_embedded_cr_in_header_line() {
     let backend = match TcpListener::bind("127.0.0.1:0").await {
@@ -1450,15 +1481,20 @@ async fn test_http_proxy_sanitizes_embedded_cr_in_header_line() {
     };
     let backend_addr = backend.local_addr().unwrap();
 
+    // The backend must never see this head: the rejected request renders
+    // before any dial, so the accept only fires on a regression — a
+    // 3-second bound keeps the assertion from hanging either way.
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        if let Ok((mut conn, _)) = backend.accept().await {
-            let mut buf = vec![0u8; 8192];
-            let n = conn.read(&mut buf).await.unwrap_or(0);
-            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
-            let _ = conn
-                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                .await;
+        match tokio::time::timeout(std::time::Duration::from_secs(3), backend.accept()).await {
+            Ok(Ok((mut conn, _))) => {
+                let mut buf = vec![0u8; 8192];
+                let n = conn.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            }
+            Ok(Err(_)) | Err(_) => {
+                let _ = tx.send(String::new());
+            }
         }
     });
 
@@ -1475,8 +1511,12 @@ async fn test_http_proxy_sanitizes_embedded_cr_in_header_line() {
     };
     let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
 
-    // The lone \r inside the header value is not followed by \n, so it does
-    // not terminate the head — pre-fix it would be forwarded verbatim.
+    // The lone \r inside the header value is not followed by \n, so it
+    // does not terminate the head — it stays INSIDE the stored value, where
+    // Go textproto's validHeaderFieldValue rejects the CTL byte: a
+    // readRequest error, answered by the conn.serve 400 on this face. RED
+    // on round-16 code: the CR was stripped and the head forwarded (a
+    // frp-rs invention — Go never sanitizes, it errors).
     client
         .write_all(
             format!(
@@ -1496,18 +1536,20 @@ async fn test_http_proxy_sanitizes_embedded_cr_in_header_line() {
         client.read_to_end(&mut resp),
     )
     .await
-    .expect("backend never responded (regression)")
+    .expect("connection not closed on the rejected head (regression)")
     .unwrap();
-    assert!(resp.starts_with(b"HTTP/1.0 200 OK"), "got: {:?}", resp);
-
-    let head = rx.await.expect("backend captured request");
-    assert!(
-        head.contains("X-Evil: fooGET /admin HTTP/1.1"),
-        "embedded CR must be stripped — the injected request line must not survive: {head}"
+    assert_eq!(
+        resp,
+        b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+        "an embedded CR in a header value is a readRequest error → Go's \
+         400 render, got: {:?}",
+        String::from_utf8_lossy(&resp[..resp.len().min(80)])
     );
+
+    let forwarded = rx.await.expect("backend task finished");
     assert!(
-        !head.contains("foo\rGET"),
-        "raw CR must not reach the backend: {head}"
+        forwarded.is_empty(),
+        "backend must receive no bytes on a rejected request, got: {forwarded:?}"
     );
 }
 /// R5 e2e: configured X-Forwarded-For + an inbound XFF from the client must

@@ -70,7 +70,7 @@ struct ParsedProxyArgs {
 
 /// Parse SSH remote command args like:
 ///   "tcp --proxy_name \"web\" --remote_port 9090"
-///   "http --proxy_name \"blog\" --custom_domains \"a,b\""
+///   "http --proxy_name \"blog\" --custom_domain \"a,b\""
 fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
     // FIX 4 (Go parity, pkg/ssh/server.go parseClientAndProxyConfigurer):
     // the type token is matched EXACTLY after TrimSpace — no case folding —
@@ -79,12 +79,18 @@ fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
     // client before the connection closes. (`TCP`, `Tcp`, trailing garbage
     // inside a quoted token all land here.)
     //
-    // An EMPTY token answers the same error with a blank type — Go has no
-    // empty-command special case: strings.Split(" ", " ") yields ["", ""]
-    // and args[0]="" fails the support-types Contains check (server.go:
-    // 267-277). An all-whitespace command lands on the identical arm. (The
-    // exec handler above intercepts a truly EMPTY payload with the usage
-    // text before parse_ssh_args is reached; see there for the divergence.)
+    // A whitespace-only command answers the same error with a blank type:
+    // Go has no empty-command special case — strings.Split("   ", " ")
+    // yields ["", "", "", ""] and args[0]="" fails the support-types
+    // Contains check (server.go:267-277), so the whitespace-only path is
+    // genuine Go parity. A truly EMPTY payload, by contrast, never reaches
+    // Go's parse at all: the gateway's addr+payload wait loop breaks only
+    // on extraPayload != "" (server.go:253), so an empty exec payload
+    // stalls the full 3s window and dies server-side with "get addr and
+    // extra payload timeout" (server.go:251) — no client text. frp-rs's
+    // exec handler intercepts the empty (post-trim) payload with the usage
+    // text before parse_ssh_args is reached; the blank-type text below is
+    // thus a direct-call-only invariant here (see exec_request).
     let parts = shell_split(cmd);
     let proxy_type = parts.first().map_or("", |p| p.trim()).to_string();
     if !VALID_PROXY_TYPES.contains(&proxy_type.as_str()) {
@@ -204,11 +210,19 @@ fn parse_long_flag(
         None => {
             // Value from the next token. A flag-like next token leaves the
             // field at its default — a deliberate divergence from Go/pflag,
-            // which consumes the next token as the value unconditionally (a
-            // `--proxy_name --sk` command would register a proxy literally
-            // named "--sk"). A flag at the very END of the command answers
-            // pflag's needs-argument error (flag.go:996), which echoes the
-            // typed token — Go rejects a truncated command the same way.
+            // which consumes the next token as the value unconditionally
+            // (flag.go:990-993: a `--proxy_name --sk` command would
+            // register a proxy literally named "--sk"). Go reaches the
+            // needs-argument arm only when the value-less flag is genuinely
+            // the LAST token: an earlier value-flag in the chain may have
+            // swallowed the flag-like token instead, so a chained shape like
+            // `stcp --sk --allow_users` parses SK="--allow_users" and
+            // SUCCEEDS in Go, where frp-rs skips `--allow_users` as
+            // flag-like, then rejects the orphaned end-of-command flag with
+            // `flag needs an argument: --allow_users`. Both arms fail-safe.
+            // A value-less flag at the very END answers pflag's
+            // needs-argument error (flag.go:996) in both implementations,
+            // echoing the typed token.
             match parts.get(i + 1) {
                 Some(value) if !value.starts_with("--") => {
                     apply_flag_value(args, canon, value)?;
@@ -252,7 +266,16 @@ fn parse_short_flags(
     }
     let canon = entry.canon;
     if let Some(value) = rest.strip_prefix('=') {
-        // `-n=web`.
+        // `-n=web`. Documented-class divergence for the BARE `-x=` shape:
+        // pflag treats `=` as an inline-value separator only when the
+        // cluster is LONGER than the flag plus `=` (parseSingleShortArg,
+        // flag.go:1041-1044 `len(shorthands) > 2 && shorthands[1] == '='`),
+        // so a Go `-n=` never splits — the literal "=" falls through to the
+        // `-farg` arm (flag.go:1048-1051) and becomes the VALUE (`-n=` sets
+        // proxy_name "=", `-r=` fails strconv on "="). frp-rs splits and
+        // yields the empty value (matching what the LONG form `--name=`
+        // produces in both implementations). Same-split agreement holds for
+        // every other cluster (`-n=x` → "x" in both).
         apply_flag_value(args, canon, value)?;
         return Ok(i);
     }
@@ -312,9 +335,15 @@ struct FlagSpelling {
     /// `-` on registration AND lookup, so every separator mix resolves to
     /// the registered name; folding every separator is the frp-rs
     /// equivalent). Folded form must stay unique — the typed name is what
-    /// the per-type gate and the `unknown flag: --x` error report, and
-    /// `custom_domain` (Go, gated) must stay distinct from `custom_domains`
-    /// (frp-rs extension, ungated).
+    /// the per-type gate and the `unknown flag: --x` error report.
+    /// No PLURAL spellings are registered where Go registers a singular:
+    /// frp's WordSepNormalizeFunc folds `_` → `-` on the typed name, so a
+    /// typed `--custom_domains` looks up `custom-domains` against Go's
+    /// registered `custom-domain` (`custom_domain` at AddFlag time) and
+    /// misses — Go SSH mode answers `unknown flag: --custom_domains`
+    /// (echoing the TYPED token, pflag flag.go:978). Leaving the plural out
+    /// of this table reproduces that rejection through the unknown-flag
+    /// gate instead of accepting a spelling Go would refuse.
     folded: &'static str,
     /// Canonical field name passed to `apply_flag_value` (also the
     /// registered-flag name Go quotes in `invalid argument` errors).
@@ -427,11 +456,12 @@ const FLAG_SPELLINGS: &[FlagSpelling] = &[
         canon: "local_port",
         scope: FlagScope::Any,
     },
-    FlagSpelling {
-        folded: "custom_domains",
-        canon: "custom_domains",
-        scope: FlagScope::Any,
-    },
+    // NOTE: no `custom_domains` (plural) entry — Go registers the singular
+    // `custom_domain` only (pkg/config/flags.go:126), so the typed plural is
+    // an unknown flag in Go (`--custom_domains` normalizes to
+    // `custom-domains` ≠ registered `custom-domain`) and must hit the same
+    // gate here. All plural Go registrations (metadatas/annotations/
+    // locations/allow_users) ARE in the table, verbatim.
     FlagSpelling {
         folded: "subdomain",
         canon: "subdomain",
@@ -510,11 +540,16 @@ fn apply_flag_value(args: &mut ParsedProxyArgs, canon: &str, value: &str) -> Res
         "local_port" => args.local_port = parse_port_value(value, "--local_port")?,
         // pflag stringSliceValue.Set APPENDS after the first Set
         // (pflag/string_slice.go readAsCSV + changed flag) — a repeated
-        // `--custom_domains` accumulates in Go, it does not replace. The
-        // field starts empty per parse, so extend == replace for a single
-        // occurrence (this is also the arm both the Go domain spelling
-        // `--custom_domain` and the ungated extension `--custom_domains`
-        // fold to, so an interleaved repeat accumulates across spellings).
+        // occurrence of the SAME Go registration accumulates, it does not
+        // replace. Go registers the singular `custom_domain` only
+        // (pkg/config/flags.go:126, StringSliceVarP(&c.CustomDomains,
+        // "custom_domain", "d", ...)); every separator mix of it
+        // (`--custom_domain` / `--custom-domain` / `-d`) is ONE registration
+        // via WordSepNormalizeFunc, so an interleaved repeat across those
+        // spellings accumulates. The plural `--custom_domains` has no
+        // registration in Go (or this table) and errors as an unknown flag.
+        // The field starts empty per parse, so extend == replace for a
+        // single occurrence.
         "custom_domains" => args.custom_domains.extend(split_csv(value)),
         "subdomain" => args.subdomain = value.to_string(),
         "sk" => args.sk = value.to_string(),
@@ -685,7 +720,6 @@ fn ssh_gateway_usage() -> String {
             "      --allow_users stringList       allowed visitor users, comma-separated (stcp)\n",
             "      --local_ip string              local service IP [frp-rs]\n",
             "      --local_port uint16            local service port [frp-rs]\n",
-            "      --custom_domains stringList    alias of --custom_domain [frp-rs]\n",
             "      --subdomain string             alias of --sd [frp-rs]\n",
             "      --multiplexer string           alias of --mux [frp-rs]\n",
             "      --use_encryption               enable encryption (bare = true) [frp-rs]\n",
@@ -2621,6 +2655,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exec_empty_payload_answers_usage() {
+        // Round-16 pin: a truly EMPTY exec payload is answered instantly
+        // with the usage text, then the connection closes — the documented
+        // frp-rs divergence (see exec_request). Go v0.71.0 never parses an
+        // empty payload: its addr+payload wait loop breaks only on
+        // extraPayload != "" (server.go:253), so the session stalls the
+        // full 3s window and dies with the server-side "get addr and extra
+        // payload timeout" (server.go:251) — no client text at all.
+        let (addr, state, listener_task) =
+            start_test_ssh_listener(std::time::Duration::from_secs(2)).await;
+        let client = auth_test_client(addr).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel.exec(true, "").await.unwrap();
+        let mut reader = channel.make_reader();
+        let mut text = String::new();
+        use tokio::io::AsyncReadExt;
+        // The session disconnects after the text, so the read ends at EOF.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_to_string(&mut text),
+        )
+        .await;
+        assert!(
+            text.contains("Usage:"),
+            "the empty command must yield the usage text, got: {text:?}"
+        );
+        assert!(
+            text.contains("ssh ... <proxy_type> [flags]"),
+            "usage must show the gateway command shape, got: {text:?}"
+        );
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.conn_semaphore.as_ref().unwrap().available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        listener_task.abort();
+    }
+
+    #[tokio::test]
     async fn test_exec_success_writes_banner_and_keeps_session_open() {
         // P6: a successful registration writes the Go createSuccessInfo
         // banner ("Ctrl+C to quit") to the client and KEEPS the session
@@ -2800,7 +2879,7 @@ mod tests {
     #[test]
     fn test_parse_ssh_args_http() {
         let args = parse_ssh_args(
-            r#"http --proxy_name "blog" --custom_domains "a.example.com,b.example.com""#,
+            r#"http --proxy_name "blog" --custom_domain "a.example.com,b.example.com""#,
         )
         .unwrap();
         assert_eq!(args.proxy_type, "http");
@@ -2812,19 +2891,72 @@ mod tests {
     fn test_parse_ssh_args_repeated_list_flags_accumulate() {
         // F3: pflag stringSliceValue.Set APPENDS after the first occurrence
         // (string_slice.go changed flag) — a repeated list flag accumulates
-        // in Go, it does not replace. All three spellings of the domains
-        // flag (-d, the Go --custom_domain registration, the extension
-        // --custom_domains) fold to one field and accumulate together.
-        let args = parse_ssh_args("http -d a.com -d b.com --custom_domains c.com").unwrap();
+        // in Go, it does not replace. Only the SINGULAR custom_domain is
+        // registered in Go (pkg/config/flags.go:126); every separator mix of
+        // that one registration (-d, --custom_domain, --custom-domain) is
+        // the same flag via WordSepNormalizeFunc, so interleaved repeats
+        // accumulate together. The plural --custom_domains is NOT registered
+        // (normalizes to custom-domains ≠ custom-domain) and is pinned as an
+        // unknown flag in test_parse_ssh_args_plural_spelling_rejected.
+        let args = parse_ssh_args("http -d a.com -d b.com --custom_domain c.com").unwrap();
         assert_eq!(args.custom_domains, vec!["a.com", "b.com", "c.com"]);
-        let args = parse_ssh_args("http --custom_domain x.com --custom_domains y.com").unwrap();
-        assert_eq!(args.custom_domains, vec!["x.com", "y.com"]);
+        let args =
+            parse_ssh_args("http --custom_domain x.com --custom-domain y.com -d z.com").unwrap();
+        assert_eq!(args.custom_domains, vec!["x.com", "y.com", "z.com"]);
         let args = parse_ssh_args("http --locations /a --locations /b").unwrap();
         assert_eq!(args.locations, vec!["/a", "/b"]);
         // allow_users is the same pflag stringSlice type and already
         // accumulated.
         let args = parse_ssh_args("stcp --allow_users alice --allow_users bob").unwrap();
         assert_eq!(args.allow_users, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_plural_spelling_rejected() {
+        // Round-16 audit: Go SSH mode registers the SINGULAR --custom_domain
+        // only (pkg/config/flags.go:126). frp's WordSepNormalizeFunc folds
+        // `_` → `-` on the TYPED name, so --custom_domains looks up
+        // `custom-domains` against the registered `custom-domain` and misses
+        // — Go answers `unknown flag: --custom_domains`, echoing the typed
+        // (pre-normalization) token (pflag flag.go:978). frp-rs has no
+        // plural table entry, so the same gate fires on EVERY proxy type
+        // (there is no registration to gate per-type), with the same typed
+        // echo for both separators.
+        for (cmd, expected) in [
+            // Domain types reject the plural too — Go never registered it.
+            (
+                "http --custom_domains a.com",
+                "unknown flag: --custom_domains",
+            ),
+            (
+                "https --custom_domains a.com",
+                "unknown flag: --custom_domains",
+            ),
+            (
+                "tcpmux --custom_domains a.com",
+                "unknown flag: --custom_domains",
+            ),
+            (
+                "tcp --custom_domains a.com",
+                "unknown flag: --custom_domains",
+            ),
+            // The dash-folded plural is equally unknown (custom-domains ≠
+            // custom-domain).
+            (
+                "http --custom-domains a.com",
+                "unknown flag: --custom-domains",
+            ),
+            (
+                "tcp --custom-domains a.com",
+                "unknown flag: --custom-domains",
+            ),
+        ] {
+            let err = parse_ssh_args(cmd).unwrap_err();
+            assert_eq!(err, expected, "cmd {cmd:?}");
+        }
+        // The singular (any separator mix) still parses on domain types.
+        let ok = parse_ssh_args("http --custom-domain a.com --custom_domain b.com").unwrap();
+        assert_eq!(ok.custom_domains, vec!["a.com", "b.com"]);
     }
 
     #[test]
@@ -2893,7 +3025,7 @@ mod tests {
     #[test]
     fn test_parse_ssh_args_default_name_per_type_and_explicit_override() {
         for (cmd, prefix) in [
-            ("http --custom_domains a.example.com", "sshtunnel-http-"),
+            ("http --custom_domain a.example.com", "sshtunnel-http-"),
             ("stcp", "sshtunnel-stcp-"),
             ("tcpmux", "sshtunnel-tcpmux-"),
         ] {
@@ -3040,10 +3172,15 @@ mod tests {
             ("stcp --mux m", "unknown flag: --mux"),
             ("stcp --remote_port 1", "unknown flag: --remote_port"),
             ("stcp --http_pwd p", "unknown flag: --http_pwd"),
-            // The gate is keyed on the TYPED spelling: the plural frp-rs
-            // extension --custom_domains stays ungated everywhere while the
-            // Go singular --custom_domain is gated.
-            ("tcp --custom_domains a.com", ""),
+            // The gate is keyed on the TYPED spelling (unknown-flag echo).
+            // The plural --custom_domains has NO registration anywhere —
+            // Go registers only the singular custom_domain (flags.go:126) —
+            // so it is unknown on domain types AND non-domain types alike
+            // (pinned in test_parse_ssh_args_plural_spelling_rejected).
+            (
+                "tcp --custom_domains a.com",
+                "unknown flag: --custom_domains",
+            ),
         ];
         for (cmd, expected) in cases {
             if expected.is_empty() {
@@ -3157,9 +3294,25 @@ mod tests {
 
     #[test]
     fn test_parse_ssh_args_empty() {
-        // F1: Go has no empty-command special case — strings.Split("", " ")
-        // yields [""], TrimSpace gives "", and the support-types check
-        // answers with the blank-type verbatim error (server.go:267-277).
+        // Round-16 note: this is NOT Go parity for the empty input — a truly
+        // empty exec payload never reaches Go's parse. Go's addr+payload
+        // wait loop breaks only when extraPayload != "" (server.go:253), so
+        // an empty payload stalls the full 3s window and the session dies
+        // server-side with "get addr and extra payload timeout"
+        // (server.go:251) — no client text. frp-rs's exec handler answers
+        // the empty (post-trim) payload with the usage text (documented
+        // divergence, pinned e2e by test_exec_empty_payload_answers_usage)
+        // before parse_ssh_args is ever called.
+        //
+        // parse_ssh_args("") itself is therefore reachable only by direct
+        // call: shell_split yields no parts, the type defaults to "", and
+        // the support-types check answers the blank-type text — the SAME
+        // text a whitespace-only payload gets through Go's genuine parse
+        // path (payload != "" → strings.Split → args[0] == "" →
+        // server.go:267-277), pinned for whitespace-only in
+        // test_parse_ssh_args_empty_or_blank_command_is_error. Kept here as
+        // the parse-level invariant: a truly empty direct call must not
+        // panic and must land on the identical arm.
         let err = parse_ssh_args("").unwrap_err();
         assert_eq!(
             err,
@@ -3335,16 +3488,25 @@ mod tests {
 
     #[test]
     fn test_parse_ssh_args_empty_or_blank_command_is_error() {
-        // F1: empty and whitespace-only commands both produce Go's blank
-        // type-token error (server.go:267-277; shell_split yields no parts,
-        // so the type defaults to "" exactly like Go's [""] split result).
-        for cmd in ["", "   ", "\t", " \n "] {
+        // F1: WHITESPACE-ONLY commands produce Go's blank type-token error
+        // (server.go:267-277). These payloads are non-empty, so Go's
+        // gateway wait loop hands them to strings.Split; args[0] is an
+        // empty field (or trims to ""), and the support-types check answers
+        // the verbatim blank-type text. shell_split yields no parts, so the
+        // type defaults to "" exactly like Go's split result.
+        for cmd in ["   ", "\t", " \n "] {
             let err = parse_ssh_args(cmd).unwrap_err();
             assert_eq!(
                 err, "invalid proxy type: , support types: [tcp http https tcpmux stcp]",
                 "cmd {cmd:?} should be rejected, got: {err}"
             );
         }
+        // A truly EMPTY payload is deliberately NOT in the loop: it is not a
+        // Go-parity input. Go never parses it (wait loop requires
+        // extraPayload != "", server.go:253 → 3s timeout, no client text),
+        // and frp-rs's exec handler intercepts it with the usage text
+        // (documented divergence). The parse-level blank-type text for a
+        // direct-call "" is pinned separately in test_parse_ssh_args_empty.
     }
 
     #[test]
@@ -3399,17 +3561,18 @@ mod tests {
 
     #[test]
     fn test_parse_ssh_args_flag_equals_value_forms() {
-        let args =
-            parse_ssh_args("tcp --proxy_name=web --remote_port=9090 --custom_domains=a.com,b.com")
-                .unwrap();
+        let args = parse_ssh_args("tcp --proxy_name=web --remote_port=9090").unwrap();
         assert_eq!(args.proxy_name, "web");
         assert_eq!(args.remote_port, 9090);
+        // --custom_domain is domain-type-scoped (singular registration,
+        // flags.go:126), so the `=` form is pinned on http.
+        let args = parse_ssh_args("http --custom_domain=a.com,b.com").unwrap();
         assert_eq!(args.custom_domains, vec!["a.com", "b.com"]);
         let args =
             parse_ssh_args("http --proxy_name=blog --use_encryption=true --subdomain=sub").unwrap();
         assert!(args.use_encryption);
         assert_eq!(args.subdomain, "sub");
-        // The legacy --custom_domain alias works in both forms.
+        // The Go --custom_domain registration works in the `=` form too.
         let args = parse_ssh_args("http --custom_domain=a.example.com").unwrap();
         assert_eq!(args.custom_domains, vec!["a.example.com"]);
     }
@@ -3440,6 +3603,21 @@ mod tests {
         // -d maps to custom_domains (Go shorthand).
         let d = parse_ssh_args("http -d a.com,b.com").unwrap();
         assert_eq!(d.custom_domains, vec!["a.com", "b.com"]);
+        // Round-16: the BARE `-x=` shape is a documented-class divergence.
+        // pflag treats `=` as an inline separator only when the cluster is
+        // longer than flag+`=` (parseSingleShortArg flag.go:1041-1044), so
+        // a Go `-n=` never splits: the literal "=" falls through to the
+        // -farg arm and becomes the VALUE (proxy_name "="). frp-rs splits
+        // and yields "" — which then falls back to the generated default
+        // name, matching what the long form `--proxy_name=` produces in
+        // BOTH implementations (see parse_short_flags). Every longer
+        // cluster (-n=x) agrees in both.
+        let e = parse_ssh_args("tcp -n=").unwrap();
+        assert!(
+            e.proxy_name.starts_with("sshtunnel-tcp-"),
+            "-n= yields the empty name in frp-rs → default, got: {}",
+            e.proxy_name
+        );
         // F2: a bare value-taking shorthand at the end of the command
         // errors with pflag's short needs-argument text (flag.go:1058 —
         // `%q` quotes the shorthand, `-%s` echoes the typed cluster).
@@ -3554,11 +3732,12 @@ mod tests {
     fn test_parse_ssh_args_truncated_boolean_and_list_flags() {
         // A bare bool applies true; value-requiring flags followed by a
         // FLAG-LIKE token stay at their defaults (deliberate frp-rs
-        // divergence — Go would consume the next flag token as the value),
-        // and the end-of-command flag errors with pflag's needs-argument
-        // text (F2) instead of silently defaulting.
+        // divergence — Go would consume the next flag token as the value;
+        // see parse_long_flag for the chained-shape bounds of that
+        // divergence), and the end-of-command flag errors with pflag's
+        // needs-argument text (F2) instead of silently defaulting.
         let err = parse_ssh_args(
-            "http --proxy_name blog --use_encryption --custom_domains --locations --group",
+            "http --proxy_name blog --use_encryption --custom_domain --locations --group",
         )
         .unwrap_err();
         assert_eq!(err, "flag needs an argument: --group");
@@ -3566,7 +3745,7 @@ mod tests {
         // applies, the flag-like-truncated list stays empty, and the final
         // flag gets its real value.
         let args = parse_ssh_args(
-            "http --proxy_name blog --use_encryption --custom_domains --locations /a",
+            "http --proxy_name blog --use_encryption --custom_domain --locations /a",
         )
         .unwrap();
         assert!(args.use_encryption);
@@ -3583,7 +3762,7 @@ mod tests {
         // virtual control on read_v1_frame's "invalid V1 msg length".
         let long_domain = format!("{}.example.com", "x".repeat(20_000));
         let args = parse_ssh_args(&format!(
-            "http --proxy_name h --custom_domains {long_domain}"
+            "http --proxy_name h --custom_domain {long_domain}"
         ))
         .expect("parse oversized domain");
         let err = build_v1_frame_from_args(&args, 0)
