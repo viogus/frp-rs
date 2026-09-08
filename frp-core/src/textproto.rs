@@ -47,6 +47,57 @@ pub fn head_end(head: &[u8]) -> Option<usize> {
     None
 }
 
+/// Incremental [`head_end`] for read loops that grow a buffer per chunk
+/// and re-check for the terminating blank line each iteration.
+///
+/// A read loop that calls [`head_end`] on the whole accumulated buffer
+/// per chunk re-scans every byte of every earlier chunk per iteration —
+/// O(n²) total for a head of n chunks (audit round-17 finding D: the
+/// three chunked h1 plugin head loops — frp-client plugin/http.rs,
+/// plugin/static_file.rs and plugin/mod.rs `read_request_and_build_
+/// forward`). This scanner carries the line-start offset across feeds.
+/// A `feed` that finds no blank line ends either mid-line or exactly at
+/// a line boundary (buffer ending at a '\n'); the lines before the
+/// carried offset were already judged non-blank and their bytes never
+/// change, so resuming there is byte-identical to the full rescan of the
+/// accumulated buffer — provided the caller stops feeding at the first
+/// `Some`, which is the pattern every read loop uses ([`head_end`] always
+/// reports the FIRST blank line, and the loops break there).
+#[derive(Default)]
+pub struct HeadEndScanner {
+    /// Byte offset where the current (possibly empty) line starts — the
+    /// byte right after the previous line's `\n`.
+    line_start: usize,
+}
+
+impl HeadEndScanner {
+    pub fn new() -> Self {
+        Self { line_start: 0 }
+    }
+
+    /// Check `buf` (the accumulated buffer; must only ever grow between
+    /// feeds) for the terminating blank line, resuming where the previous
+    /// feed stopped. Same result as [`head_end`] on the accumulated
+    /// buffer for the feed-until-`Some` pattern.
+    pub fn feed(&mut self, buf: &[u8]) -> Option<usize> {
+        while self.line_start < buf.len() {
+            let nl = buf[self.line_start..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map(|i| self.line_start + i)?; // still mid-line
+            let mut line = &buf[self.line_start..nl];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            self.line_start = nl + 1;
+            if line.is_empty() {
+                return Some(nl + 1);
+            }
+        }
+        None
+    }
+}
+
 /// Re-encode a parsed request/response head with CRLF line endings — Go
 /// `net/http` `Request.Write` / `Response.Write` parity
 /// (net/http/request.go: Go re-serializes the parsed head, and every line
@@ -226,6 +277,54 @@ mod tests {
                 "head: {:?}",
                 String::from_utf8_lossy(head)
             );
+        }
+    }
+
+    /// Round-17 finding D: `HeadEndScanner::feed` under the
+    /// feed-until-`Some` pattern the chunked h1 plugin head loops use must
+    /// agree with `head_end` on the full accumulated buffer — for every
+    /// chunk split of every head shape, since the incremental scanner
+    /// never re-scans already-judged lines and a divergence there would
+    /// mis-terminate a real head.
+    #[test]
+    fn head_end_scanner_matches_full_rescan_under_any_chunking() {
+        use super::HeadEndScanner;
+        let heads: Vec<Vec<u8>> = vec![
+            // Terminated heads, mixed EOL conventions (head_case builds the
+            // expected end itself; only the buffer is needed here).
+            head_case(&["GET / HTTP/1.1\r", "Host: a\r"], "\r\n", "body").0,
+            head_case(&["A: b", "C: d\r", "E: f"], "\r\n", "").0,
+            head_case(&["X: y\r\r"], "\r\n", "tail").0,
+            head_case(&[], "\n", "BODY").0,
+            head_case(&["H: v\r"], "\r\n", "GET / HTTP/1.1\r\nHost: x\r\n\r\n").0,
+            // Blank first line.
+            b"\r\n".to_vec(),
+            // Unterminated shapes: scanner must stay None on every prefix.
+            b"GET / HTTP/1.1\nHost: a\n".to_vec(),
+            b"\r".to_vec(),
+            b"".to_vec(),
+        ];
+        for head in heads {
+            let full = head_end(&head);
+            for split in 1..=head.len().max(1) {
+                let mut scan = HeadEndScanner::new();
+                let mut got = None;
+                let mut fed = 0;
+                while fed < head.len() {
+                    let end = (fed + split).min(head.len());
+                    if let Some(nl) = scan.feed(&head[..end]) {
+                        got = Some(nl);
+                        break;
+                    }
+                    fed = end;
+                }
+                assert_eq!(
+                    got,
+                    full,
+                    "chunk {split} of {:?}",
+                    String::from_utf8_lossy(&head)
+                );
+            }
         }
     }
 

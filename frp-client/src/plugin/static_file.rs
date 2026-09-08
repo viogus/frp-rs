@@ -126,7 +126,11 @@ async fn handle_static_file_conn(
     // fixes: a 70 KiB terminated head is Go-served and must serve here
     // (pin test_static_file_e2e_oversize_head_431 was flipped to prove
     // it). The old loop also re-scanned the whole buffer per 512 B chunk
-    // (quadratic); the 4 KiB chunk below keeps the rescans bounded.
+    // (quadratic); round-17 finding D replaced the full-buffer rescan with
+    // the incremental `HeadEndScanner` — byte-identical result, carries
+    // the line offset across feeds, so the loop's per-iteration `head_end`
+    // cost over the accumulated bytes is gone (the 4 KiB chunk size
+    // survives for the Go bufio-slack parity it exists for).
     let buf = tokio::time::timeout(Duration::from_secs(60), async {
         let mut buf = Vec::new();
         // 4 KiB chunks: the cap check runs after the terminator scan, so
@@ -135,6 +139,7 @@ async fn handle_static_file_conn(
         // (initialReadLimitSize = MaxHeaderBytes + 4096), keeping the
         // served/431 boundary byte-aligned with Go.
         let mut chunk = [0u8; 4096];
+        let mut head_scan = frp_core::textproto::HeadEndScanner::new();
         loop {
             // Terminator scan FIRST: Go's read limit only errors when the
             // limit is consumed with the head still incomplete — a head
@@ -142,7 +147,7 @@ async fn handle_static_file_conn(
             // time and parses. Only an overshoot that contains NO
             // terminator is a breach (431 — Go errTooLarge renders before
             // the handler runs).
-            if frp_core::textproto::head_end(&buf).is_some() {
+            if head_scan.feed(&buf).is_some() {
                 break;
             }
             if buf.len() > 1024 * 1024 {
@@ -330,23 +335,37 @@ async fn handle_static_file_conn(
     // nothing (its refetch of the directory is itself guarded).
     // ----------------------------------------------------------------
 
-    // Round-16 FIX 3: Go serveFile's FIRST arm (fs.go:682-688) — a URL
-    // path ending in "/index.html" answers 301 Location: ./ REGARDLESS of
-    // existence, before fs.Open (probe vs go1.25.12: served AND deleted
-    // index.html both redirect; ?query preserved). The redirect keeps the
-    // relative links inside a served index.html resolvable against the
-    // directory. The suffix test runs on the Go equivalent of the STRIPPED
-    // URL.Path — Go's StripPrefix hands FileServer "/index.html" (leading
-    // slash kept); the prefix-stripped remainder lacks it, so the "/" is
-    // re-attached only for the test.
-    let suffix_probe: std::borrow::Cow<'_, [u8]> = if url_remainder.starts_with(b"/") {
-        std::borrow::Cow::Borrowed(&url_remainder)
+    // Round-16 FIX 3 + round-17 finding I: Go serveFile's FIRST arm
+    // (fs.go:682-688) — a URL path ending in "/index.html" answers 301
+    // Location: ./ REGARDLESS of existence, before fs.Open (probe vs
+    // go1.25.12: served AND deleted index.html both redirect; ?query
+    // preserved). The redirect keeps the relative links inside a served
+    // index.html resolvable against the directory. Finding I: the probe
+    // runs on the CLEANED path — gorilla's router cleans URL.Path (path.
+    // Clean + trailing-slash restore, mux.go:175-195/280-301) BEFORE the
+    // route match and StripPrefix, so a path whose "/index.html" suffix is
+    // only there after the clean ("/sub/index.html/." — the trailing "/."
+    // is cleaned away) reaches serveFile as "/sub/index.html" and
+    // redirects, while the uncleaned probe missed it and fell through to
+    // serve the file. The router hop is folded away here (round-16 FIX 11
+    // precedent), so the probe cleans the slash-reattached remainder —
+    // component-boundary equivalent to stripping the prefix from the
+    // cleaned full path (the prefix ends at a component boundary, so the
+    // clean does not move it). Location stays "./" for cleaned and folded
+    // shapes alike: the mandated pin is "/a/./b/index.html must 301 like
+    // its clean form", and the browser resolves "./" from the original URL
+    // onto the canonical directory either way. The reattached "/" mirrors
+    // Go's StripPrefix handing FileServer "/index.html" (leading slash
+    // kept); the prefix-stripped remainder lacks it, so the "/" is
+    // re-attached only for the probe.
+    let mut suffix_probe: Vec<u8> = Vec::with_capacity(url_remainder.len() + 1);
+    if url_remainder.starts_with(b"/") {
+        suffix_probe.extend_from_slice(&url_remainder);
     } else {
-        let mut p = Vec::with_capacity(url_remainder.len() + 1);
-        p.push(b'/');
-        p.extend_from_slice(&url_remainder);
-        std::borrow::Cow::Owned(p)
-    };
+        suffix_probe.push(b'/');
+        suffix_probe.extend_from_slice(&url_remainder);
+    }
+    let suffix_probe = clean_path_canonical(&suffix_probe);
     if suffix_probe.ends_with(b"/index.html") {
         // Go localRedirect(w, r, "./") — query appended only when non-empty
         // (fs.go:785-791; round-16 FIX 10).
@@ -372,20 +391,47 @@ async fn handle_static_file_conn(
     // open() lets a symlink swap between the two make the check disagree
     // with the opened inode (TOCTOU). Cost: a short path walk per request,
     // not per byte.
-    let base = std::fs::canonicalize(local_path)
-        .map_err(|e| format!("failed to resolve base directory '{}': {e}", local_path))?;
-
-    let file = match std::fs::File::open(&full_path) {
-        Ok(f) => f,
+    let base = match std::fs::canonicalize(local_path) {
+        Ok(b) => b,
         Err(e) => {
-            // An open miss renders Go's 404 page — serveError/toHTTPError
-            // (fs.go:680-696) maps IsNotExist → 404 page, IsPermission →
-            // 403 page, anything else → 500, all via http.Error; the
-            // frp-rs arm collapses all three to the shared 404 page.
+            // Round-17 finding G: an unresolvable base directory (deleted or
+            // renamed under the plugin while serving) previously closed the
+            // connection without a response. Go's own open of the joined name
+            // ENOENTs on the same condition and serveError/toHTTPError maps
+            // that to the 404 page — render the same page before closing.
             if let Err(we) = client
                 .write_all(super::GO_404_NOT_FOUND_RENDER.as_bytes())
                 .await
             {
+                tracing::debug!(error = %we, "plugin relay error: {}", we);
+            }
+            return Err(format!(
+                "failed to resolve base directory '{}': {e}",
+                local_path
+            ));
+        }
+    };
+
+    let file = match std::fs::File::open(&full_path) {
+        Ok(f) => f,
+        Err(e) => {
+            // Round-17 finding F: Go serveError → toHTTPError (fs.go:
+            // 680-696) maps IsNotExist → 404 page, IsPermission → 403
+            // page, anything else → 500 — every arm via http.Error
+            // (text/plain body of the status text + "\n", nosniff). The
+            // pre-fix arm collapsed all three to the shared 404 page; now
+            // the io::ErrorKind decides, mirroring os.IsNotExist /
+            // os.IsPermission (a Kind-carrying error maps on kind; a
+            // kind-less error falls to the default 500, like Go's
+            // syscall.Errno-less error).
+            let resp = match e.kind() {
+                std::io::ErrorKind::NotFound => super::GO_404_NOT_FOUND_RENDER.to_string(),
+                std::io::ErrorKind::PermissionDenied => {
+                    http_error_render("403 Forbidden", "403 Forbidden\n")
+                }
+                _ => http_error_render("500 Internal Server Error", "500 Internal Server Error\n"),
+            };
+            if let Err(we) = client.write_all(resp.as_bytes()).await {
                 tracing::debug!(error = %we, "plugin relay error: {}", we);
             }
             return Err(format!("failed to open {}: {e}", full_path.display()));
@@ -914,6 +960,20 @@ fn append_raw_query(location: &mut Vec<u8>, raw_query: Option<&str>) {
     }
 }
 
+/// Go `http.Error` render (net/http server.go errorResponse shape) for the
+/// toHTTPError status arms (round-17 finding F): text/plain body of the
+/// status text + "\n", nosniff, exact Content-Length of that body. The
+/// repo shape adds Connection: close and no Date (documented divergence —
+/// Go's wire adds Date and keep-alives).
+fn http_error_render(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         X-Content-Type-Options: nosniff\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 /// Canonical path of an open handle's inode. Linux: /proc/self/fd/<fd> —
 /// the fd symlink resolves to the inode the handle is pinned to, closing
 /// the TOCTOU window (a symlink swap after open() cannot change what the
@@ -948,8 +1008,8 @@ fn open_handle_canonical(
 /// <pre>
 /// <a href="{escaped}">{html-escaped}</a>   (one line per entry, byte-wise
 ///                                           ascending over the raw names —
-///                                           fs.ReadDir pre-sorts, dirList
-///                                           does not re-sort)
+///                                           dirList sort.Slice's them
+///                                           itself, fs.go:156)
 /// </pre>
 /// ```
 ///
@@ -963,9 +1023,11 @@ fn open_handle_canonical(
 /// set), everything else — space, '#', '%', non-ASCII — is
 /// percent-encoded byte-wise with uppercase hex. Link-text escaping =
 /// htmlReplacer (net/http server.go): & < > " ' -> &amp; &lt; &gt; &#34;
-/// &#39;. Entries are sorted byte-wise over the RAW names (Go fs.ReadDir
-/// pre-sorts the same way — lossy-string sorting would misorder invalid
-/// UTF-8 names). Round-16 FIX 2: the href escapes the RAW name bytes, so a
+/// &#39;. Entries are sorted byte-wise over the RAW names — Go dirList runs
+/// sort.Slice itself (fs.go:156), with the same byte comparison over
+/// Name() strings, so this sort matches Go's and lossy-string sorting
+/// would misorder invalid UTF-8 names. Round-16 FIX 2: the href escapes
+/// the RAW name bytes, so a
 /// non-UTF-8 name lists as a fetchable %XX href exactly like Go; only the
 /// link TEXT is rendered lossily (documented divergence — Go writes the
 /// raw bytes into the HTML body; the body is a UTF-8 String here).
@@ -1195,11 +1257,14 @@ fn format_http_date(unix_secs: u64) -> String {
 /// no sign). Dates before 1970 parse in Go too, but an IMS older than any
 /// real file's mtime answers condTrue — byte-identical to a parse failure
 /// here — so rejecting pre-1970 years is behaviorally Go-identical (the IMF
-/// parser has always done it). Zones: Go's layout words accept any
-/// alphabetic abbreviation at zero offset (time.Parse knows no zone
-/// database). The IMF arm keeps the strict literal "GMT" (RFC 1123
-/// mandates GMT; strictness is byte-identical for every client echoing a
-/// server-emitted date — the established, documented divergence).
+/// parser has always done it). Zones: every accepted zone parses at ZERO
+/// offset — time.Parse knows no zone database, and probe-verified even the
+/// "GMT+5"-style names never shift the instant — so a zone is a
+/// recognition gate, not a correction (IMF gate: the strict literal
+/// "GMT"; RFC 850 gate: Go parseTimeZone, [`rfc850_zone_ok`]; ANSIC: no
+/// zone element at all). The IMF strictness is byte-identical for every
+/// client echoing a server-emitted date — the established, documented
+/// divergence.
 fn parse_if_modified_since(value: &str) -> Option<u64> {
     let v = value.trim();
     parse_imf_fixdate(v)
@@ -1252,11 +1317,115 @@ fn parse_imf_fixdate(v: &str) -> Option<u64> {
     parse_clock_date(year, month, day, clock)
 }
 
+/// Round-17 finding H: Go `time.parseTimeZone` (format.go:1443-1488) +
+/// the stdTZ "UTC" special (format.go:1288-1291) over the WHOLE zone token
+/// of the RFC 850 layout — probe-verified against go1.25.12. Go's layout
+/// consumes the zone by parseTimeZone's returned length, and anything the
+/// zone parser leaves over is "extra text" → parse error; the `n == len`
+/// gate below reproduces that whole-token rule. An accepted zone parses at
+/// ZERO offset (probe: every OK row below yields unix 946684800 — the
+/// "GMT+5" style offsets name the zone but time.Parse never applies them
+/// to the instant), so no offset math follows acceptance.
+fn rfc850_zone_ok(zone: &str) -> bool {
+    // stdTZ special case first: an exact "UTC" is consumed before
+    // parseTimeZone ever runs, so "UTCX"/"UTCT" leave the tail as extra
+    // text (error) instead of falling into the 3-letter-uppercase rule.
+    if zone == "UTC" {
+        return true;
+    }
+    if zone.starts_with("UTC") {
+        return false;
+    }
+    match parse_time_zone_len(zone) {
+        Some(n) => n == zone.len(),
+        None => false,
+    }
+}
+
+/// Go `time.parseTimeZone` — consumed length of a legal zone prefix, or
+/// `None`:
+/// * fewer than 3 bytes → error;
+/// * `ChST`/`MeST` — the only zones with a lower-case letter — match
+///   their 4 bytes exactly (a longer token leaves the tail as extra
+///   text, handled by the caller's whole-token gate);
+/// * `GMT` is special and may carry a signed hour offset (`GMT`,
+///   `GMT+02`, `GMT-5`, `GMT+0` all legal; the offset must be 0-23 —
+///   `GMT+24` fails — and must consume the remainder or the tail is
+///   extra text; `GMTX` consumes only the 3 "GMT" bytes → tail error);
+/// * a leading `+`/`-` names a bare signed offset (`+03`, `-23`; digits
+///   0-23, at least one; a sign with no digits, or > 23, fails);
+/// * otherwise an upper-case run: 3 letters OK, 4 OK only ending in `T`
+///   (or the `WITA` special), 5 OK only ending in `T`, 0/1/2/6+ fail —
+///   a lower-case letter or other byte anywhere in the first 6 ends the
+///   run and rules by the count so far (`aBC`/`ABc` → 0/2 → fail).
+fn parse_time_zone_len(zone: &str) -> Option<usize> {
+    let b = zone.as_bytes();
+    if b.len() < 3 {
+        return None;
+    }
+    // Special case 1: ChST and MeST are the only zones with a lower-case
+    // letter (matched before the upper-case-run count, which would see
+    // only 1 upper-case letter and fail).
+    if b.len() >= 4 && (zone.starts_with("ChST") || zone.starts_with("MeST")) {
+        return Some(4);
+    }
+    // Special case 2: GMT may carry an hour offset (parseGMT: 3 bytes,
+    // then a signed 0-23 offset when present — an absent offset or a
+    // failed offset parse still consumes the 3 "GMT" bytes).
+    if let Some(rest) = zone.strip_prefix("GMT") {
+        if rest.is_empty() {
+            return Some(3);
+        }
+        let signed = parse_signed_offset_len(rest);
+        return Some(signed.map_or(3, |n| 3 + n));
+    }
+    // Special case 3: unnamed zones with a +/-00 shape.
+    if b[0] == b'+' || b[0] == b'-' {
+        return parse_signed_offset_len(zone);
+    }
+    // Upper-case run — need at least three, at most five.
+    let upper = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
+    match upper {
+        3 => Some(3),
+        4 if b[3] == b'T' || zone.starts_with("WITA") => Some(4),
+        5 if b[4] == b'T' => Some(5),
+        _ => None,
+    }
+}
+
+/// Go `parseSignedOffset` (format.go:1514-1530) over the bytes AFTER the
+/// sign: a leadingInt digit run in 0-23 — at least one digit, more than
+/// 23 fails, and only the consumed digits count toward the length (a
+/// colon or other tail is extra text for the caller's whole-token gate).
+fn parse_signed_offset_len(after_sign: &str) -> Option<usize> {
+    let b = after_sign.as_bytes();
+    if !matches!(b.first(), Some(b'+') | Some(b'-')) {
+        return None;
+    }
+    let digits = b[1..].iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let x: u64 = after_sign[1..1 + digits].parse().ok()?;
+    if x > 23 {
+        return None;
+    }
+    Some(1 + digits)
+}
+
 /// RFC 850 / RFC 1036 — "FullWeekday, dd-Mon-yy HH:MM:SS Zone": comma after
 /// the FULL weekday name (Go layout element "Monday"), dash-separated
-/// 2-digit day / 3-letter month / 2-digit year, clock, alphabetic zone.
+/// 2-digit day / 3-letter month / 2-digit year, clock, zone.
 /// Go's 2-digit-year pivot (format.go): 69-99 → 1969-1999, 00-68 →
-/// 2000-2068.
+/// 2000-2068. The zone word parses under Go's `parseTimeZone` rules
+/// ([`rfc850_zone_ok`] — round-17 finding H): names are NOT restricted to
+/// the alphabetic set the pre-fix gate demanded — the full token must be
+/// a legal time-zone shape (uppercase-run names, ChST/MeST, GMT±n,
+/// ±nn) and the token must be consumed WHOLE (a leftover is Go's
+/// "extra text" error). Any accepted zone parses at ZERO offset —
+/// `time.Parse` applies no offset for a layout-zone word (probe: every
+/// accepted zone yields the same instant as a UTC clock) — so no offset
+/// arithmetic happens here.
 fn parse_rfc850(v: &str) -> Option<u64> {
     const RFC850_WEEKDAYS: [&str; 7] = [
         "Sunday",
@@ -1278,7 +1447,7 @@ fn parse_rfc850(v: &str) -> Option<u64> {
     let date_tok = parts.next()?;
     let clock = parts.next()?;
     let zone = parts.next()?;
-    if parts.next().is_some() || zone.len() < 3 || !zone.bytes().all(|b| b.is_ascii_alphabetic()) {
+    if parts.next().is_some() || !rfc850_zone_ok(zone) {
         return None;
     }
     // The date token is dash-separated exactly — Go layout
@@ -1592,15 +1761,18 @@ mod tests {
         );
 
         // Round-16 FIX 8: the other two layouts Go http.ParseTime tries —
-        // RFC 850 (full weekday, dd-Mon-yy, any alphabetic zone) and ANSIC
-        // (abbreviated weekday + month, space-padded day, no zone).
-        // Oracle: 1136239445 = 2006-01-02 22:04:05 UTC (Monday).
+        // RFC 850 (full weekday, dd-Mon-yy, Go parseTimeZone zone — the
+        // round-16-era "any alphabetic zone" claim was broad: the full
+        // parseTimeZone grammar applies, see the zone matrix test below)
+        // and ANSIC (abbreviated weekday + month, space-padded day, no
+        // zone). Oracle: 1136239445 = 2006-01-02 22:04:05 UTC (Monday).
         assert_eq!(
             parse_if_modified_since("Monday, 02-Jan-06 22:04:05 GMT"),
             Some(1136239445)
         );
-        // Zone word: Go's layout "MST" accepts ANY alphabetic abbreviation
-        // at zero offset (time.Parse knows no zone database) — "UTC" parses.
+        // Zone word "UTC": the stdTZ exact-3 special (format.go:1288-1291)
+        // parses before parseTimeZone runs — "UTC" alone is legal even
+        // though the generic 3-uppercase rule would not see it.
         assert_eq!(
             parse_if_modified_since("Monday, 02-Jan-06 22:04:05 UTC"),
             Some(1136239445)
@@ -1654,6 +1826,98 @@ mod tests {
         assert_eq!(
             parse_if_modified_since("Sun Jan  1 00:00:00 2000"),
             Some(946684800)
+        );
+    }
+
+    /// Round-17 finding H: the RFC 850 zone word mirrors Go's
+    /// `parseTimeZone` + stdTZ-UTC special over the WHOLE token — probe
+    /// matrix re-verified against go1.25.12 (/tmp/go, time.Parse with the
+    /// RFC 850 layout, 2026-09-08). Every OK row parses at ZERO offset
+    /// (unix 946684800 — the layout-zone word never shifts the instant),
+    /// which is why the parser gates on shape alone.
+    #[test]
+    fn rfc850_zone_go_parse_time_zone_matrix() {
+        // Rows that time.Parse(time.RFC850, ...) accepts (probe: all OK,
+        // unix 946684800 — zero offset).
+        for ok in [
+            "GMT",    // parseGMT, no offset
+            "GMT+02", // signed offset 0-23, whole token consumed
+            "GMT+5",  // single-digit offset
+            "GMT+23", // 23 is in range
+            "GMT+0",  // zero offset is legal despite the doc comment
+            "GMT-5",  // negative sign
+            "UTC",    // stdTZ exact-3 special, before parseTimeZone
+            "XYZ",    // 3-uppercase run
+            "ABC",    // 3-uppercase run
+            "WITA",   // the 4-letter special (upper run would need a T)
+            "ChST",   // lower-case-letter special
+            "MeST",   // lower-case-letter special
+            "CEST",   // 4-uppercase ending in T
+            "XYZT",   // 4-uppercase ending in T
+            "ABCDT",  // 5-uppercase ending in T
+            "+03",    // bare signed offset
+            "+23",    // 23 is in range
+            "UTX",    // 3-uppercase (rule-derived: not probed)
+        ] {
+            assert!(
+                rfc850_zone_ok(ok),
+                "{ok} must parse (probe: OK at zero offset)"
+            );
+        }
+        // Rows time.Parse rejects — every shape errors ("extra text" or
+        // errBad). Probed except where noted.
+        for bad in [
+            "GMT+02:00", // offset consumed, ":00" is extra text (probe: ERR)
+            "GMT+2:00",  // same, single digit (probe: ERR)
+            "GMT+24:00", // 24 > 23 → offset fails → "GMT" only → extra text
+            "GMT+24",    // rule-derived: x > 23 fails
+            "GMT+024",   // leading zeros parse to 24 → out of range
+            "GMT+",      // sign without digits (probe: ERR)
+            "GMTX",      // "GMT" consumed, "X" extra text (probe: ERR)
+            "GMTX+02",   // same (probe: ERR)
+            "utc",       // lowercase: upper run is 0 (probe: ERR)
+            "UTCX",      // stdTZ consumes "UTC", "X" is extra text
+            "UTCT",      // same — parseTimeZone never runs on a "UTC" head
+            "U",         // < 3 bytes (probe: ERR)
+            "ABCDEF",    // 6-uppercase run (probe: ERR)
+            "ABCDEFG",   // 7-uppercase (probe: ERR)
+            "chst",      // upper run 0 (probe: ERR)
+            "chST",      // upper run 2 (probe: ERR)
+            "ABCD",      // 4-upper not ending in T, not WITA (probe: ERR)
+            "ABCDE",     // 5-upper not ending in T (probe: ERR)
+            "aBC",       // upper run 0 (probe: ERR)
+            "ABCdE",     // upper run 3 OK, "dE" extra text (probe: ERR)
+            "+5",        // < 3 bytes (probe: ERR)
+            "+24",       // rule-derived: x > 23 fails
+        ] {
+            assert!(!rfc850_zone_ok(bad), "{bad} must fail (probe: ERR)");
+        }
+        // Whole-date rows through the IMS parser: the accepted zone shapes
+        // land on the same zero-offset instant as GMT.
+        assert_eq!(
+            parse_if_modified_since("Saturday, 01-Jan-00 00:00:00 GMT+5"),
+            Some(946684800)
+        );
+        assert_eq!(
+            parse_if_modified_since("Saturday, 01-Jan-00 00:00:00 XYZ"),
+            Some(946684800)
+        );
+        assert_eq!(
+            parse_if_modified_since("Saturday, 01-Jan-00 00:00:00 WITA"),
+            Some(946684800)
+        );
+        // The probe-ERR shapes fail the IMS parse too (condNone → 200).
+        assert_eq!(
+            parse_if_modified_since("Saturday, 01-Jan-00 00:00:00 GMT+02:00"),
+            None
+        );
+        assert_eq!(
+            parse_if_modified_since("Saturday, 01-Jan-00 00:00:00 ABCDEF"),
+            None
+        );
+        assert_eq!(
+            parse_if_modified_since("Saturday, 01-Jan-00 00:00:00 +5"),
+            None
         );
     }
 
@@ -2468,6 +2732,98 @@ mod tests {
             .await,
             b"HTTP/1.1 301 Moved Permanently\r\nLocation: ./\r\n\
               Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+    }
+
+    /// Round-17 finding I e2e: the "/index.html" suffix probe runs on the
+    /// CLEANED path. Gorilla's router path.Cleans URL.Path (and 301s the
+    /// absolute cleaned form) BEFORE StripPrefix hands the path to
+    /// FileServer, so the probe serveFile sees is always clean. frp-rs
+    /// folds the router hop away (round-16 FIX 11 precedent) — Location
+    /// "./" answers in one hop where Go needs two (router 301, then the
+    /// fs.go suffix redirect on the refetch) — but the CLEANED probe is
+    /// mandatory: "/a/b/index.html/." reaches Go's serveFile as
+    /// "/a/b/index.html" (the trailing "/." cleaned away) and redirects,
+    /// while a raw-suffix probe fell through and served the file.
+    #[tokio::test]
+    async fn test_static_file_e2e_suffix_probe_on_cleaned_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a/b/index.html", b"index-body");
+        // b2 has NO index.html — the suffix redirect fires anyway (the arm
+        // runs before fs.Open, round-16 FIX 3).
+        std::fs::create_dir_all(dir.path().join("a/b2")).unwrap();
+        let Some(handle) = start_static(dir.path(), None, None).await else {
+            return;
+        };
+        let addr = handle.local_addr;
+        let expect_301 = b"HTTP/1.1 301 Moved Permanently\r\nLocation: ./\r\n\
+                           Content-Length: 0\r\nConnection: close\r\n\r\n";
+
+        // The mandated shape: a mid-path "/./" must 301 like its clean
+        // form ("/a/./b/index.html" ≡ "/a/b/index.html" — gorilla cleans
+        // both to the same path before the probe).
+        assert_eq!(
+            raw_get(addr, b"GET /a/./b/index.html HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            expect_301,
+        );
+        // The divergence shape: the "/index.html" suffix exists only after
+        // the clean. Pre-fix this answered 200 with the file body (raw
+        // probe missed); Go cleans "/a/b/index.html/." → router 301 → the
+        // refetch's probe redirects "./" — the single-hop fold must land
+        // on the same 301.
+        assert_eq!(
+            raw_get(addr, b"GET /a/b/index.html/. HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            expect_301,
+        );
+        // Same hidden-dot shape over a MISSING index.html → still 301
+        // (no existence check in the arm).
+        assert_eq!(
+            raw_get(addr, b"GET /a/b2/index.html/. HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            expect_301,
+        );
+        // Query survives the cleaned probe (RawQuery append after the
+        // split — the dot suffix is in the path, not the query).
+        assert_eq!(
+            raw_get(
+                addr,
+                b"GET /a/b/index.html/.?q=1 HTTP/1.1\r\nHost: t\r\n\r\n"
+            )
+            .await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ./?q=1\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        // A mid-path dot that the RAW probe already caught stays caught
+        // (clean and raw agree on "/a/b/./index.html").
+        assert_eq!(
+            raw_get(addr, b"GET /a/b/./index.html HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            expect_301,
+        );
+        // A trailing slash still kills the suffix match — the cleaned
+        // probe of "/a/b/index.html/" keeps the trailing '/', so it never
+        // ends in "/index.html". The FILE here exists, so Go's fs.go
+        // redirect arm (a non-directory whose URL ends in '/' → 301
+        // "../" + path.Base, fs.go:714-724) answers first — the file body
+        // is never served.
+        assert_eq!(
+            raw_get(addr, b"GET /a/b/index.html/ HTTP/1.1\r\nHost: t\r\n\r\n").await,
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: ../index.html\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+
+        // Prefix mode: the fold cleans the reattached remainder only —
+        // component-boundary equivalent to stripping the prefix from the
+        // cleaned full path.
+        let Some(pref) = start_static(dir.path(), Some("static"), None).await else {
+            return;
+        };
+        let pa = pref.local_addr;
+        assert_eq!(
+            raw_get(
+                pa,
+                b"GET /static/a/b/index.html/. HTTP/1.1\r\nHost: t\r\n\r\n"
+            )
+            .await,
+            expect_301,
         );
     }
 

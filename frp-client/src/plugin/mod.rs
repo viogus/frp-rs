@@ -500,6 +500,37 @@ pub(super) fn parse_request_body_framing<'a>(
     }
 }
 
+/// Whether the Transfer-Encoding header group of a parsed head is
+/// acceptable to Go readTransfer's protoAtLeast(1,1) arm (transfer.go
+/// parseTransferEncoding): a head with NO Transfer-Encoding line is
+/// always fine (`len(raw) == 0` returns nil, no error), a single line
+/// EqualFold-"chunked" is fine, while more than one TE header line is
+/// "too many transfer-encoding values" and a single line that is not
+/// ASCII-case-insensitive "chunked" is "unsupported transfer encoding" —
+/// both readRequest errors (Go http.Server faces render 501; the
+/// Err-to-bare-close policy of the operator-local http2http-family
+/// listeners applies instead). Callers gate on the request version first
+/// — an HTTP/1.0 request ignores its Transfer-Encoding entirely (Issue
+/// 12785) and must not reach this check. Round-17 audit finding E; line
+/// semantics match [`parse_request_body_framing`] (the value is the raw
+/// text after the first ':', trimmed — obs-fold merging is not applied
+/// at this face).
+fn transfer_encoding_group_ok<'a>(headers: impl Iterator<Item = &'a str>) -> bool {
+    let mut values: Vec<&str> = Vec::new();
+    for line in headers {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            values.push(value.trim());
+        }
+    }
+    values.is_empty() || (values.len() == 1 && values[0].eq_ignore_ascii_case("chunked"))
+}
+
 /// True when a Transfer-Encoding value applies the chunked coding. Per RFC
 /// 7230 §3.3.3, chunked must be the FINAL coding of a comma-separated list
 /// ("gzip, chunked" is chunked; "chunkedfoo" or any coding after chunked is
@@ -698,23 +729,35 @@ pub(super) fn parse_request_line(line: &str) -> Option<(&str, &str, &str)> {
     Some((method, target, version))
 }
 
-/// Mode-aware %-escape gate over the pre-'?' portion of a request-target.
-/// Go parses request targets with url.ParseRequestURI (net/url/url.go
-/// parse, viaRequest=true) before routing. The '?' query cut happens
-/// FIRST (`rest, RawQuery = strings.Cut(rest, "?")` — the query is kept
-/// RAW and never unescape-validated), then an authority-form target —
-/// "CONNECT host[:port]" lines, which Go's readRequest justAuthority
-/// rewrites to "http://" + target (request.go): the fixed scheme makes
-/// the authority run from the target's start to its FIRST '/', and the
-/// remainder (from that '/' on) is the path — is split into a host
-/// region (parseHost → unescape in encodeHost mode) and a path region
-/// (setPath → path mode). Non-CONNECT targets — origin-form "/x" and
+/// Mode-aware %-escape gate over a request-target (shared by
+/// [`parse_request_line`] and the http.rs h1 conn classifier). Go parses
+/// request targets with url.ParseRequestURI (net/url/url.go parse,
+/// viaRequest=true) before routing. The CTL sweep happens FIRST over the
+/// WHOLE raw target (`for i := range rawURL`: any byte < 0x20 or == 0x7f
+/// errors "invalid control character in URL" — url.go parse, round-17
+/// audit finding A — a query carrying a CTL byte errors the whole target
+/// even though a query carrying an invalid escape is kept raw and
+/// served); only then comes the '?' query cut
+/// (`rest, RawQuery = strings.Cut(rest, "?")` — the query is kept RAW and
+/// never unescape-validated). An authority-form target — "CONNECT
+/// host[:port]" lines, which Go's readRequest justAuthority rewrites to
+/// "http://" + target (request.go): the fixed scheme makes the authority
+/// run from the target's start to its FIRST '/', and the remainder (from
+/// that '/' on) is the path — is split into a host region
+/// (parseHost → unescape in encodeHost mode) and a path region (setPath
+/// → path mode). Non-CONNECT targets — origin-form "/x" and
 /// absolute-form "http://h/x" — are pure paths and stay in path mode
 /// throughout (the absolute-form HOST is a documented divergence: Go
 /// host-modes it too — probe vs go1.25 http.Server: GET
 /// http://h%41st/x answers 400 — but the fix-list scope for the host
 /// gate is the CONNECT authority; see target_has_invalid_escape).
-fn request_target_has_invalid_escape(method: &str, target: &str) -> bool {
+pub(super) fn request_target_has_invalid_escape(method: &str, target: &str) -> bool {
+    // Round-17 audit finding A: the CTL sweep covers the WHOLE raw target
+    // — query included — before the '?' cut (Go url.go parse, go1.25:
+    // `if c := rawURL[i]; c < 0x20 || c == 0x7f`).
+    if target.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return true;
+    }
     let pre = target.split_once('?').map_or(target, |(p, _q)| p);
     if method == "CONNECT" && !pre.starts_with('/') {
         // justAuthority applies only to non-'/'-prefixed CONNECT targets;
@@ -732,35 +775,167 @@ fn request_target_has_invalid_escape(method: &str, target: &str) -> bool {
     }
 }
 
-/// Whether a CONNECT authority region carries an invalid %-escape under
-/// Go's HOST-mode unescape (net/url/url.go unescape, encodeHost — the
-/// `unhex(s[i+1]) < 8 && s[i:i+3] != "%25"` carve-out at url.go:226):
-/// a WELL-FORMED escape that decodes to an ASCII byte (first hex digit
-/// below 8) is an error unless it is the literal "%25" (the RFC 6874
-/// zone-escape exemption — "%25" decodes to '%', so "h%25st" is the
-/// host "h%st"), while escapes decoding to obs-text (first hex digit
-/// 8 or more, e.g. "%C3%A9" → 'é') are legal and DECODE in URL.Host.
-/// A malformed escape (non-hex digit, truncated) is an error in every
-/// mode. Probe vs go1.25 http.Server CONNECT: h%41st/h%2Fst/h%zzst →
-/// 400, h%25st/h%C3%A9st → 200 (the port gate — validOptionalPort —
-/// only accepts digit-or-empty ports, so "h:4%31" is rejected before
-/// the escape gate even runs: parseHost's port check is not an escape
-/// question, both rejected). The old shared scan was PATH-mode — it
-/// accepted every well-formed escape, so a CONNECT h%41st:443 head
-/// parsed and hit the dial (400 render); Go's conn.errors the head in
-/// ReadRequest (silent close on the http_proxy CONNECT arm).
+/// Whether a CONNECT authority region fails Go's net/url authority
+/// validation (url.go parseAuthority / parseHost / validOptionalPort /
+/// validUserinfo, go1.25 — verified against the stdlib source; round-17
+/// audit finding C). The region splits happen on the RAW bytes exactly
+/// where Go cuts them:
+///
+///   - userinfo — up to the LAST literal '@' (parseAuthority
+///     `LastIndex(authority, "@")`): every byte must be in Go's
+///     validUserinfo set (unreserved + sub-delims + ':' + '%' + '@' — an
+///     inner '@' is legal because the split takes the last one), and
+///     every '%' must begin a well-formed two-hex-digit escape: the
+///     unescape then runs in encodeUserPassword mode, which accepts ANY
+///     well-formed escape (no host-mode ASCII rejection). The old
+///     whole-string host-mode scan rejected "user%41@host", which Go
+///     serves (userinfo is not the host).
+///
+///   - host region — encodeHost-mode escape gate: a well-formed escape
+///     decoding to an ASCII byte (first hex digit < 8) is an error
+///     unless it is the literal "%25" (case-invariant — 2 and 5 are
+///     digits); a malformed escape is an error. Raw ASCII bytes in the
+///     host region are NOT charset-validated (Go's unescape default arm
+///     additionally rejects bytes that shouldEscape under encodeHost,
+///     e.g. a raw '^' — such heads here pass the gate and fail at the
+///     dial instead, a documented divergence; the gate mirrors C's
+///     %-escape rules).
+///
+///   - port region — Go validOptionalPort over the RAW text: bracketed
+///     hosts split after the last ']', unbracketed hosts at the LAST ':'
+///     (the colon is included in the checked text); the port must be
+///     empty or ':' followed only by ASCII digits. A '%' in the port
+///     fails this raw-digit gate even when it would parse as a legal
+///     escape ("h:8%C3%A9" escapes a host-mode escape scan but not this
+///     gate — Go rejects it in ReadRequest, silent close on the CONNECT
+///     arm, while the old code dialed and rendered 400).
+///
+///   - bracketed hosts additionally get Go's RFC 6874 zone split: when
+///     the inside-brackets text contains "%25", the region from the
+///     FIRST "%25" to the ']' is checked in encodeZone mode — an escape
+///     there is legal when it decodes to a space or to a byte that would
+///     not need escaping in encodeHost mode ("%41" inside a zone passes)
+///     — and the rest of the string in encodeHost mode.
 fn authority_has_invalid_escape(authority: &str) -> bool {
-    let b = authority.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            if i + 2 >= b.len() || hex_val(b[i + 1]).is_none() || hex_val(b[i + 2]).is_none() {
+    let bytes = authority.as_bytes();
+    // Userinfo: split at the LAST literal '@' (Go parseAuthority).
+    let hostport = match authority.rfind('@') {
+        Some(at) => {
+            if !valid_userinfo_bytes(&bytes[..at]) || !escape_well_formed(&bytes[..at]) {
                 return true;
             }
-            let first_hex = hex_val(b[i + 1]).unwrap();
-            // %25's hex digits are case-invariant (2 and 5 are digits),
-            // so the literal comparison needs no fold.
-            if first_hex < 8 && &authority[i..i + 3] != "%25" {
+            &bytes[at + 1..]
+        }
+        None => bytes,
+    };
+    if hostport.first() == Some(&b'[') {
+        // Bracketed host: Go parseHost splits after the LAST ']' and
+        // validOptionalPort-checks the raw text after it; a missing ']'
+        // is an error.
+        let Some(close) = hostport.iter().rposition(|&c| c == b']') else {
+            return true;
+        };
+        if !valid_optional_port(&hostport[close + 1..]) {
+            return true;
+        }
+        // RFC 6874 zone split at the FIRST "%25" inside the brackets.
+        match hostport[..close].windows(3).position(|w| w == b"%25") {
+            Some(zone) => {
+                encode_host_escape_invalid(&hostport[..zone])
+                    || encode_zone_escape_invalid(&hostport[zone..close])
+                    || encode_host_escape_invalid(&hostport[close..])
+            }
+            None => encode_host_escape_invalid(hostport),
+        }
+    } else {
+        // Unbracketed: the port region is everything from the LAST ':'
+        // (colon included); no colon means the whole text is the host
+        // region. validOptionalPort ran on the RAW text, then the escape
+        // gate covers the whole string (the port cannot carry a '%' past
+        // the raw-digit gate, so region vs whole-string is identical).
+        if let Some(i) = hostport.iter().rposition(|&c| c == b':') {
+            if !valid_optional_port(&hostport[i..]) {
+                return true;
+            }
+        }
+        encode_host_escape_invalid(hostport)
+    }
+}
+
+/// Go validUserinfo charset (url.go): unreserved + sub-delims + ':' +
+/// '%' + '@' — an inner '@' is legal (the split takes the LAST '@', and
+/// validUserinfo itself permits more '@'s — issue 3439/22655).
+fn valid_userinfo_bytes(s: &[u8]) -> bool {
+    s.iter().all(|&c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'%'
+                    | b'@'
+            )
+    })
+}
+
+/// Every '%' begins a valid two-hex-digit escape (the only escape shape
+/// any unescape mode accepts).
+fn escape_well_formed(s: &[u8]) -> bool {
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'%' {
+            if i + 2 >= s.len() || hex_val(s[i + 1]).is_none() || hex_val(s[i + 2]).is_none() {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+/// Go validOptionalPort (url.go): the port text is legal when empty or
+/// when it starts with ':' followed only by ASCII digits. The text is
+/// RAW — a '%' or any non-digit fails even when it would parse as a
+/// legal escape (round-17 audit finding C).
+fn valid_optional_port(port: &[u8]) -> bool {
+    if port.is_empty() {
+        return true;
+    }
+    if port[0] != b':' {
+        return false;
+    }
+    port[1..].iter().all(|b| b.is_ascii_digit())
+}
+
+/// encodeHost-mode escape gate over a host-region slice: a well-formed
+/// escape is an error when it decodes to an ASCII byte (first hex digit
+/// < 8) unless it is the literal "%25" (RFC 6874 zone exemption —
+/// case-invariant, since 2 and 5 are digits); a malformed escape is an
+/// error. Mirrors Go unescape's encodeHost arms (url.go).
+fn encode_host_escape_invalid(s: &[u8]) -> bool {
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'%' {
+            if i + 2 >= s.len() || hex_val(s[i + 1]).is_none() || hex_val(s[i + 2]).is_none() {
+                return true;
+            }
+            let first_hex = hex_val(s[i + 1]).unwrap();
+            if first_hex < 8 && s[i..i + 3] != *b"%25" {
                 return true;
             }
             i += 3;
@@ -769,6 +944,58 @@ fn authority_has_invalid_escape(authority: &str) -> bool {
         }
     }
     false
+}
+
+/// encodeZone-mode escape gate (Go unescape's encodeZone arm, url.go —
+/// the RFC 6874 zone part of a bracketed host): a malformed escape is an
+/// error; a well-formed one is an error only when it is not the literal
+/// "%25" and its decoded byte is not a space and would need escaping in
+/// encodeHost mode ("%41" inside a zone is legal — redundant escaping of
+/// a host-legal byte).
+fn encode_zone_escape_invalid(s: &[u8]) -> bool {
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'%' {
+            if i + 2 >= s.len() || hex_val(s[i + 1]).is_none() || hex_val(s[i + 2]).is_none() {
+                return true;
+            }
+            let v = hex_val(s[i + 1]).unwrap() * 16 + hex_val(s[i + 2]).unwrap();
+            if s[i..i + 3] != *b"%25" && v != b' ' && should_escape_encode_host(v) {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Go shouldEscape(c, encodeHost) (url.go): alphanumerics plus the
+/// host-allowed set (sub-delims, ':', '[', ']', '<', '>', '"').
+fn should_escape_encode_host(c: u8) -> bool {
+    if c.is_ascii_alphanumeric() {
+        return false;
+    }
+    !matches!(
+        c,
+        b'!' | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'['
+            | b']'
+            | b'<'
+            | b'>'
+            | b'"'
+    )
 }
 
 /// Whether the pre-'?' portion of a request-target contains a '%' that
@@ -868,6 +1095,11 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     let buf = tokio::time::timeout(PLUGIN_HEADER_READ_TIMEOUT, async {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 512];
+        // Round-17 audit D: the carried scanner replaces the per-chunk
+        // full-buffer `head_end` rescan (O(n²) over the chunks of one
+        // head) with a resume-from-line-start scan; byte-identical
+        // results for this feed-until-terminator loop.
+        let mut scanner = frp_core::textproto::HeadEndScanner::new();
         loop {
             let n = stream
                 .read(&mut chunk)
@@ -877,7 +1109,7 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
                 return Err("connection closed".into());
             }
             buf.extend_from_slice(&chunk[..n]);
-            if frp_core::textproto::head_end(&buf).is_some() {
+            if scanner.feed(&buf).is_some() {
                 break;
             }
             // Deliberate divergence from the Go http.Server faces of the
@@ -899,9 +1131,10 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     .map_err(|_elapsed| "timed out reading request headers".to_string())??;
 
     // Split the head from any pre-read body bytes at the first empty line
-    // (Go textproto semantics — the same helper the read loop above used,
-    // so the split lands exactly where the loop stopped; for CRLF input the
-    // index is byte-identical to the old \r\n\r\n scan).
+    // (Go textproto semantics — the same rule the read loop above applied
+    // through the scanner, so the split lands exactly where the loop
+    // stopped; for CRLF input the index is byte-identical to the old
+    // \r\n\r\n scan).
     let header_end = frp_core::textproto::head_end(&buf).unwrap_or(buf.len());
     let headers_str = String::from_utf8_lossy(&buf[..header_end]);
     let mut lines = headers_str.lines();
@@ -915,14 +1148,41 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // is the acknowledged divergence for this operator-local listener
     // class, same rationale as the 64 KiB cap above.
     let request_line = lines.next().ok_or("empty request")?;
-    let Some((method, path, _version)) = parse_request_line(request_line) else {
+    let Some((method, path, version)) = parse_request_line(request_line) else {
         return Err(format!("bad request line: {request_line}"));
     };
+
+    // Round-17 audit E: Go readTransfer gates the whole Transfer-Encoding
+    // read on protoAtLeast(1, 1) (transfer.go, Issue 12785) — an
+    // HTTP/1.0 request IGNORES its Transfer-Encoding (the header is
+    // dropped silently, never chunked-framed). For every parseable >=1.1
+    // head (parse_request_line accepts HTTP/1.1..1.9), the TE group must
+    // be exactly one header line whose value is EqualFold-"chunked" — a
+    // different count ("too many transfer-encoding values") or a
+    // different value ("unsupported transfer encoding") is a readRequest
+    // error: 501 on the Go http.Server faces of the sibling plugins, the
+    // established Err-to-bare-close policy of this operator-local
+    // listener class here. The old code forwarded such heads (the TE line
+    // was stripped hop-by-hop and the body CL-framed) where Go rejects.
+    let te_checked = version != "HTTP/1.0";
+    if te_checked && !transfer_encoding_group_ok(lines.clone()) {
+        return Err("unsupported transfer encoding".into());
+    }
 
     // Body framing is parsed from the original headers — Transfer-Encoding
     // is stripped below as hop-by-hop and re-added only when the request is
     // chunked (the forwarded body bytes keep the client's own framing).
-    let framing = parse_request_body_framing(lines.clone());
+    // The protoAtLeast(1,1) gate above carries into the framing: an
+    // HTTP/1.0 head (whose TE was ignored, not rejected) resolves
+    // Content-Length alone.
+    let framing = if te_checked {
+        parse_request_body_framing(lines.clone())
+    } else {
+        resolve_content_length(lines.clone())
+            .ok()
+            .flatten()
+            .map(BodyFraming::Length)
+    };
     // Content-Length is resolved per RFC 7230 §3.3.2 ("reject or replace
     // with a single value") under Go fixLength/parseContentLength
     // semantics: duplicate identical values collapse to one line, while
@@ -2534,6 +2794,54 @@ mod tests {
         assert!(
             fwd.head.contains("X-A: 1\r\n"),
             "LF header line must be forwarded: {}",
+            fwd.head
+        );
+        assert!(fwd.body_prefix.is_empty(), "no body bytes were pre-read");
+    }
+
+    /// Round-17 audit E pins (mod.rs sibling legs): Go parseTransferEncoding
+    /// gates its whole read on protoAtLeast(1, 1) (transfer.go, Issue
+    /// 12785) — the 1.0 ignore-arm and the >=1.1 reject-arm of this
+    /// operator-local listener class. RED on pre-fix code: a garbage-TE
+    /// 1.1 head was forwarded (TE stripped hop-by-hop, body CL-framed)
+    /// where Go's http.Server faces answer their 501; a garbage-TE 1.0
+    /// head reached the chunked-framing resolution where Go drops the
+    /// header and reads a body-less request.
+    #[tokio::test]
+    async fn transfer_encoding_garbage_rejects_11_ignores_10() {
+        use tokio::io::AsyncWriteExt;
+        // HTTP/1.1 + non-chunked TE → Err (the sibling-face 501 class).
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+        client_io
+            .write_all(b"GET /p HTTP/1.1\r\nHost: b\r\nTransfer-Encoding: gzip\r\n\r\n")
+            .await
+            .unwrap();
+        match read_request_and_build_forward(&mut server_io, "", &Default::default(), None).await {
+            Err(e) => assert_eq!(e, "unsupported transfer encoding"),
+            Ok(fwd) => panic!(
+                "1.1 garbage TE must reject the read, forwarded: {}",
+                fwd.head
+            ),
+        }
+        // HTTP/1.0 + garbage TE → the header is ignored (Issue 12785):
+        // the head forwards with the TE line dropped and no chunked
+        // framing (CL resolution only — no CL header, no body expected).
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+        client_io
+            .write_all(b"GET /p HTTP/1.0\r\nTransfer-Encoding: gzip\r\n\r\n")
+            .await
+            .unwrap();
+        let fwd = read_request_and_build_forward(&mut server_io, "", &Default::default(), None)
+            .await
+            .expect("1.0 garbage Transfer-Encoding must be ignored, not rejected");
+        assert!(
+            !fwd.head.contains("Transfer-Encoding"),
+            "the ignored TE header must be dropped from the forward: {}",
+            fwd.head
+        );
+        assert!(
+            !fwd.head.contains("chunked"),
+            "1.0 framing must not resolve chunked: {}",
             fwd.head
         );
         assert!(fwd.body_prefix.is_empty(), "no body bytes were pre-read");
