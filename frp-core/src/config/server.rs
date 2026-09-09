@@ -921,6 +921,12 @@ pub struct ServerTransportConfig {
     pub tcp_mux: Option<bool>,
     #[serde(default, alias = "tcpMuxKeepaliveInterval")]
     pub tcp_mux_keepalive_interval: i64,
+    /// Idle-dead silence bound for the yamux dead-session reaper, in seconds.
+    /// `0` = auto (3 × keepalive, floored 30s); `>0` = explicit bound
+    /// (floored 30s); `<0` = disable the reaper. Default: 0. Not reloadable
+    /// (restart-only, like the keepalive interval).
+    #[serde(default, alias = "tcpMuxKeepaliveTimeout")]
+    pub tcp_mux_keepalive_timeout: i64,
     /// Heartbeat timeout in seconds. Server disconnects if no Ping
     /// received within this interval. Default: 90.
     /// Go frp compat: transport.heartbeatTimeout.
@@ -954,6 +960,7 @@ impl Default for ServerTransportConfig {
         Self {
             tcp_mux: default_tcp_mux_option(),
             tcp_mux_keepalive_interval: 30,
+            tcp_mux_keepalive_timeout: 0,
             heartbeat_timeout: default_heartbeat_timeout(),
             max_pool_count: default_max_pool_count(),
             tcp_keepalive: default_tcp_keepalive(),

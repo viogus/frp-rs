@@ -219,6 +219,7 @@ impl Service {
             sub_host,
             cfg.transport.tcp_mux.unwrap_or(true),
             cfg.transport.tcp_mux_keepalive_interval,
+            frp_core::mux::idle_dead_timeout_from_secs(cfg.transport.tcp_mux_keepalive_timeout),
             cfg.transport.tcp_keepalive,
             cfg.transport.tcp_send_buffer_size,
             cfg.transport.tcp_recv_buffer_size,
@@ -477,6 +478,7 @@ impl Service {
                                                             keepalive_interval: std::time::Duration::from_secs(
                                                                 state.tcp_mux_keepalive.max(1) as u64
                                                             ),
+                                                            idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
                                                         ..Default::default()
                                                         };
@@ -560,6 +562,7 @@ impl Service {
                                                     keepalive_interval: std::time::Duration::from_secs(
                                                         state.tcp_mux_keepalive.max(1) as u64
                                                     ),
+                                                    idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
                                                 ..Default::default()
                                                 };
@@ -910,6 +913,7 @@ impl Service {
                                                         keepalive_interval: std::time::Duration::from_secs(
                                                             state.tcp_mux_keepalive.max(1) as u64
                                                         ),
+                                                        idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
                                                     ..Default::default()
                                                     };
@@ -1121,6 +1125,7 @@ impl Service {
                                                 keepalive_interval: std::time::Duration::from_secs(
                                                     state.tcp_mux_keepalive.max(1) as u64
                                                 ),
+                                                idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
                                             ..Default::default()
                                             };

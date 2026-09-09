@@ -967,6 +967,7 @@ impl Service {
                         oidc_client: oidc_client.clone(),
                         tcp_mux: cfg.tcp_mux,
                         tcp_mux_keepalive_interval: cfg.tcp_mux_keepalive_interval,
+                        tcp_mux_keepalive_timeout: cfg.tcp_mux_keepalive_timeout,
                         proxy_url: opt_if_empty!(cfg.proxy_url.clone()),
                         dns_server: opt_if_empty!(cfg.dns_server.clone()),
                         dial_timeout_secs: cfg.dial_server_timeout.max(1) as u64,
@@ -1597,6 +1598,7 @@ impl Service {
             cfg_local.disable_custom_tls_first_byte,
             cfg_local.dial_server_keepalive.max(0) as u64,
             cfg_local.tcp_mux_keepalive_interval,
+            cfg_local.tcp_mux_keepalive_timeout,
             opt_if_empty!(cfg_local.connect_server_local_ip),
             cfg_local.v2,
             cfg_local.tcp_send_buffer_size,
@@ -2520,6 +2522,8 @@ impl Service {
                         let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
                         let transport_tcp_mux = cfg_local.tcp_mux;
                         let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
+                        let transport_tcp_mux_keepalive_timeout =
+                            cfg_local.tcp_mux_keepalive_timeout;
                         let transport_dial_timeout = cfg_local.dial_server_timeout.max(1) as u64;
                         let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
                         let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
@@ -2553,6 +2557,7 @@ impl Service {
                                     run_id: rid,
                                     tcp_mux: transport_tcp_mux,
                                     tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
+                                    tcp_mux_keepalive_timeout: transport_tcp_mux_keepalive_timeout,
                                     proxy_url: transport_proxy_url.clone(),
                                     dns_server: transport_dns.clone(),
                                     dial_timeout_secs: transport_dial_timeout,
@@ -2596,6 +2601,7 @@ impl Service {
             let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
             let transport_tcp_mux = cfg_local.tcp_mux;
             let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
+            let transport_tcp_mux_keepalive_timeout = cfg_local.tcp_mux_keepalive_timeout;
             let transport_dial_timeout = cfg_local.dial_server_timeout.max(1) as u64;
             let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
             let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
@@ -2672,6 +2678,7 @@ impl Service {
                     run_id: rid,
                     tcp_mux: transport_tcp_mux,
                     tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
+                    tcp_mux_keepalive_timeout: transport_tcp_mux_keepalive_timeout,
                     proxy_url: transport_proxy_url.clone(),
                     dns_server: transport_dns.clone(),
                     dial_timeout_secs: transport_dial_timeout,
